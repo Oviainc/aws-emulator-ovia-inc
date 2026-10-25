@@ -353,7 +353,7 @@ async fn open_tunnel_mints_a_tunnel_that_describe_tunnel_reads_back() {
         .lock()
         .tunnels
         .keys()
-        .cloned()
+        .map(|(_, tunnel_id)| tunnel_id.clone())
         .collect();
     assert_eq!(
         stored.len(),
@@ -445,7 +445,11 @@ async fn list_tunnels_filters_by_thing_name_and_reports_newest_first() {
     // Each summary is computed from the stored tunnel.
     for summary in listed["tunnelSummaries"].as_array().unwrap_or(&vec![]) {
         let id = summary["tunnelId"].as_str().unwrap_or_default().to_string();
-        let stored = engine.state::<TunnelState>().lock().tunnels.get(&id).cloned();
+        let stored = engine
+            .state::<TunnelState>()
+            .lock()
+            .tunnel(REGION, &id)
+            .cloned();
         let stored = stored.unwrap_or_else(|| panic!("summary {id:?} names no stored tunnel"));
         assert_eq!(
             summary["tunnelArn"].as_str(),
@@ -566,8 +570,7 @@ async fn rotate_tunnel_access_token_replaces_only_the_selected_tokens() {
         let before = engine
             .state::<TunnelState>()
             .lock()
-            .tunnels
-            .get(&tunnel_id)
+            .tunnel(REGION, &tunnel_id)
             .cloned()
             .unwrap_or_else(|| panic!("case {mode:?}: the opened tunnel was not persisted"));
 
@@ -606,8 +609,7 @@ async fn rotate_tunnel_access_token_replaces_only_the_selected_tokens() {
         let after = engine
             .state::<TunnelState>()
             .lock()
-            .tunnels
-            .get(&tunnel_id)
+            .tunnel(REGION, &tunnel_id)
             .cloned()
             .unwrap_or_else(|| panic!("case {mode:?}: the tunnel vanished on rotate"));
 
@@ -776,11 +778,11 @@ async fn close_tunnel_closes_the_tunnel_and_delete_removes_it() {
                 "case {label:?}: a deleted tunnel must not be listed, got {listed:?}"
             );
             assert!(
-                !engine
+                engine
                     .state::<TunnelState>()
                     .lock()
-                    .tunnels
-                    .contains_key(&tunnel_id),
+                    .tunnel(REGION, &tunnel_id)
+                    .is_none(),
                 "case {label:?}: the record must be removed from the store"
             );
         }
@@ -1026,8 +1028,7 @@ async fn a_tunnel_closes_once_its_max_lifetime_has_elapsed() {
             let state = engine.state::<TunnelState>();
             let mut store = state.lock();
             let tunnel = store
-                .tunnels
-                .get_mut(&tunnel_id)
+                .tunnel_mut(REGION, &tunnel_id)
                 .unwrap_or_else(|| panic!("case {minutes}: the opened tunnel was not persisted"));
             tunnel.created_at -= shift;
             tunnel.last_updated_at -= shift;
@@ -1054,8 +1055,7 @@ async fn a_tunnel_closes_once_its_max_lifetime_has_elapsed() {
         let stored_last_updated = engine
             .state::<TunnelState>()
             .lock()
-            .tunnels
-            .get(&tunnel_id)
+            .tunnel(REGION, &tunnel_id)
             .map(|tunnel| tunnel.last_updated_at);
         assert_eq!(
             stored_last_updated,
@@ -1102,8 +1102,7 @@ async fn open_tunnel_refuses_once_the_store_holds_its_limit_of_tunnels() {
         let state = engine.state::<TunnelState>();
         let mut store = state.lock();
         let seed: StoredTunnel = store
-            .tunnels
-            .get(&seed_id)
+            .tunnel(REGION, &seed_id)
             .cloned()
             .expect("the opened tunnel was not persisted");
         let mut filler = 0_usize;
@@ -1113,8 +1112,7 @@ async fn open_tunnel_refuses_once_the_store_holds_its_limit_of_tunnels() {
             let mut tunnel = seed.clone();
             tunnel.tunnel_id = tunnel_id.clone();
             tunnel.tunnel_arn = tunnel_arn.clone();
-            store.arn_index.insert(tunnel_arn, tunnel_id.clone());
-            store.tunnels.insert(tunnel_id, tunnel);
+            store.insert_tunnel(REGION, tunnel);
             filler += 1;
         }
     }

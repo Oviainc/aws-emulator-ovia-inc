@@ -3,9 +3,10 @@
 //! @op CreateChangeSet
 //! IMPLEMENTED: persists a change set — its template, parameters, tags, capabilities and
 //! the rest of the request's configuration — together with the resource-level change list
-//! computed by comparing the REVISION it submits (that template with those parameter
-//! values) against the one in force on the stack, and answers the change set's ARN and its
-//! stack's id.
+//! computed by comparing the PROCESSED stage of that template, with the parameter values
+//! it submits, against the revision in force on the stack, and answers the change set's
+//! ARN and its stack's id. The plan is therefore over the resources the execution would
+//! actually deploy, a resource a transform expands included.
 //!
 //! A change-set name the stack already carries is answered by COMPARING the attributes the
 //! request submits with the ones the stored change set carries: the same attributes name
@@ -24,8 +25,9 @@
 //! CloudFormation answers this call while it is still computing the change set ("After the
 //! CreateChangeSet call successfully completes, CloudFormation starts creating the change
 //! set"), so the change set is answered `CREATE_PENDING` and settles to `CREATE_COMPLETE`
-//! (or to `FAILED`, when it would change nothing) once the clock makes that due — which is
-//! what `DescribeChangeSet` reports and what `ExecuteChangeSet` waits for.
+//! (or to `FAILED`, when it would change nothing, or when this service cannot apply the
+//! transforms its template declares) once the clock makes that due — which is what
+//! `DescribeChangeSet` reports and what `ExecuteChangeSet` waits for.
 //!
 //! The change list is read by the same template reader a deployment uses
 //! (`crate::state::template`) and computed by `crate::state::change_plan`, so it covers the
@@ -361,6 +363,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::validate_resource_types(body)
                 .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         }
+        // The PROCESSED stage of a submitted body: the document the change set is PLANNED
+        // from and the one its execution deploys, so the plan a caller reviews and the
+        // deployment that is carried out cannot disagree. Applying a template's transforms
+        // is caller-sized work, so it happens HERE — before the store lock below — the way
+        // `CreateStack` does it. A change set reusing the stack's template takes the stage
+        // the stack already stores instead, so nothing expands a template under the lock.
+        let submitted_processed = input
+            .template_body
+            .as_deref()
+            .map(crate::state::template::process);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // This service was mounted on an engine that is not the shared in-memory one,
@@ -462,19 +474,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // The stack's current template, parameters and DEPLOYED resources, which the
-        // change set is computed against, plus the identity its pseudo parameters resolve
-        // to. A stack that does not exist yet has none of them — and so does a stack id
-        // that resolves to nothing, which is the same case: there is nothing to compare
+        // The stack's current template (with the processed stage it already stores),
+        // parameters and DEPLOYED resources, which the change set is computed against, plus
+        // the identity its pseudo parameters resolve to. A stack that does not exist yet has
+        // none of them — and so does a stack id that resolves to nothing in the Region the
+        // request is signed for, which is the same case: there is nothing to compare
         // against, and the arm below is the one a new stack takes.
-        let (previous_template, previous_parameters, deployed, stack_identity) =
+        let (previous_template, previous_processed, previous_parameters, deployed, stack_identity) =
             match target_stack_id
                 .as_deref()
                 .and_then(|stack_id| store.resolve(&region, stack_id))
             {
-                None => (None, Vec::new(), Vec::new(), None),
+                None => (
+                    None,
+                    crate::state::template::Processed::Same,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                ),
                 Some(stack) => (
                     stack.template_body.clone(),
+                    stack.processed_template.clone(),
                     stack.parameters.clone(),
                     stack.resources.clone(),
                     Some((
@@ -485,16 +505,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             };
         // "Whether to reuse the template that's associated with the stack to create the
-        // change set."
-        let template_body = match &input.template_body {
-            Some(body) => body.clone(),
-            None => previous_template.clone().ok_or_else(|| {
-                crate::scaffolded::Scaffolded::validation_error(format!(
-                    "Stack [{}] has no template to reuse",
-                    input.stack_name
-                ))
-            })?,
-        };
+        // change set." Either way the body and its processed stage travel together, which
+        // `zip` is what expresses: a submitted body ALWAYS has the stage computed for it
+        // above the lock, and a reused one takes the stage its stack already stores.
+        let (template_body, processed_template) =
+            match input.template_body.clone().zip(submitted_processed) {
+                Some(submitted) => submitted,
+                None => (
+                    previous_template.clone().ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::validation_error(format!(
+                            "Stack [{}] has no template to reuse",
+                            input.stack_name
+                        ))
+                    })?,
+                    previous_processed.clone(),
+                ),
+            };
         // "In some cases, you must explicitly acknowledge that your stack template contains
         // certain capabilities ... If you don't specify either of these capabilities,
         // CloudFormation returns an InsufficientCapabilities error": the template this
@@ -513,6 +539,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        // The macro acknowledgement (`CAPABILITY_AUTO_EXPAND`) that `CreateStack` and
+        // `UpdateStack` hold a transform-declaring template to is deliberately NOT asked
+        // for here: "this capacity doesn't apply to creating change sets, and specifying it
+        // when creating change sets has no effect" — reviewing a macro's expansion in a
+        // change set is the very thing the acknowledgement stands in for.
+
         let mut parameters =
             crate::state::merged_parameters(&previous_parameters, input.parameters.as_deref())
                 .map_err(crate::scaffolded::Scaffolded::validation_error)?;
@@ -525,48 +557,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The change list is what a change set IS: "Creates a list of changes that will be
         // applied to a stack so that you can review the changes before executing them."
         // It is computed here, once — never on a read — by the SAME template reader a
-        // deployment uses, so a change set covers the JSON and YAML bodies `CreateStack`
-        // deploys, and from the stack's REVISION rather than its template alone:
-        // CloudFormation "compares the stack's information with the information that you
-        // submit in the change set", and the parameter values in force are part of that
-        // information.
-        let Some(submitted) = crate::state::declared_template(&template_body) else {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                "Template format error: the TemplateBody is not a template this service can \
-                 read",
-            ));
+        // deployment uses, from the PROCESSED stage of both templates, so the plan covers
+        // exactly the resources the execution would deploy (a resource a transform expands
+        // included) for the JSON and YAML bodies `CreateStack` deploys alike; and from the
+        // stack's REVISION rather than its template alone: CloudFormation "compares the
+        // stack's information with the information that you submit in the change set", and
+        // the parameter values in force are part of that information.
+        //
+        // A template whose transforms this service cannot apply has no processed stage, so
+        // there is nothing to plan from: the change set is still created, and settles to
+        // `FAILED` with that reason below — the same answer `CreateStack` gives such a
+        // template, and never a plan over a document nobody processed.
+        let unprocessable = processed_template.unavailable_reason().map(str::to_string);
+        let processed_body = processed_template.body(&template_body).map(str::to_string);
+        let submitted = match &processed_body {
+            Some(body) => {
+                let Some(submitted) = crate::state::declared_template(body) else {
+                    return Err(crate::scaffolded::Scaffolded::validation_error(
+                        "Template format error: the TemplateBody is not a template this \
+                         service can read",
+                    ));
+                };
+                if submitted.resources.is_empty() {
+                    // A change set is a plan over resources, so a template that declares
+                    // none has nothing to plan: "Template format error: At least one
+                    // Resources member must be defined."
+                    return Err(crate::scaffolded::Scaffolded::validation_error(
+                        "Template format error: At least one Resources member must be \
+                         defined.",
+                    ));
+                }
+                submitted
+            }
+            // No document was processed, so none is read: the plan below is empty for the
+            // same reason.
+            None => crate::state::template::Template::default(),
         };
-        if submitted.resources.is_empty() {
-            // A change set is a plan over resources, so a template that declares none has
-            // nothing to plan: "Template format error: At least one Resources member must
-            // be defined."
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                "Template format error: At least one Resources member must be defined.",
-            ));
-        }
-        // The stack's own template is read the same way. A stack with no template yet, or
-        // one whose template declares no resources, simply has none to compare against, so
-        // every resource the submitted template declares is an addition.
+        // The stack's own template is read at its processed stage too, for the same reason.
+        // A stack with no template yet, or one whose template declares no resources, simply
+        // has none to compare against, so every resource the submitted template declares is
+        // an addition.
         let current = previous_template
             .as_deref()
+            .and_then(|body| previous_processed.body(body))
             .and_then(crate::state::declared_template)
             .unwrap_or_default();
-        let changes = crate::state::computed_changes(
-            stack_identity.as_ref().map(|(region, stack_name, stack_id)| {
-                crate::state::StackRevision {
-                    stack: crate::state::template::StackScope {
-                        region,
-                        stack_name,
-                        stack_id,
-                    },
-                    template: &current,
-                    parameters: &previous_parameters,
-                    deployed: &deployed,
-                }
-            }),
-            &submitted,
-            &parameters,
-        );
+        // The plan itself, over the two processed stages. A template with NO processed
+        // stage leaves the change set with no plan at all: not a removal of everything the
+        // stack holds (which is what comparing against an empty declaration set would
+        // read as), because nothing was computed from any document — the change set
+        // settles to `FAILED` with the reason instead.
+        let changes = if unprocessable.is_some() {
+            Vec::new()
+        } else {
+            crate::state::computed_changes(
+                stack_identity.as_ref().map(|(region, stack_name, stack_id)| {
+                    crate::state::StackRevision {
+                        stack: crate::state::template::StackScope {
+                            region,
+                            stack_name,
+                            stack_id,
+                        },
+                        template: &current,
+                        parameters: &previous_parameters,
+                        deployed: &deployed,
+                    }
+                }),
+                &submitted,
+                &parameters,
+            )
+        };
 
         // The configuration the change set would carry, resolved once: it is what the
         // comparison below holds a re-created name to AND what the record stores.
@@ -739,11 +799,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "CloudFormation starts creating the change set": it is answered CREATE_PENDING
         // and settles once the clock makes the terminal status due. A change set that would
-        // change nothing settles to FAILED instead, with the reason CloudFormation gives.
-        let settles_to = if changes.is_empty() {
-            (change_set_status::FAILED, execution_status::UNAVAILABLE)
-        } else {
-            (change_set_status::CREATE_COMPLETE, execution_status::AVAILABLE)
+        // change nothing settles to FAILED instead, with the reason CloudFormation gives —
+        // and so does one whose template has no processed stage here, with the reason that
+        // says what could not be applied, so a plan nobody could compute is never offered
+        // for execution.
+        let settles_to = match &unprocessable {
+            Some(reason) => (
+                change_set_status::FAILED,
+                execution_status::UNAVAILABLE,
+                Some(format!(
+                    "The template's transforms could not be applied: {reason}"
+                )),
+            ),
+            None if changes.is_empty() => (
+                change_set_status::FAILED,
+                execution_status::UNAVAILABLE,
+                Some(crate::state::NO_CHANGES_REASON.to_string()),
+            ),
+            None => (
+                change_set_status::CREATE_COMPLETE,
+                execution_status::AVAILABLE,
+                None,
+            ),
         };
         let stack_name = store
             .resolve(&region, &stack_id)
@@ -767,6 +844,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             change_set_type: stored_change_set_type.to_string(),
             description: input.description.clone(),
             template_body,
+            processed_template,
             parameters,
             capabilities,
             tags,
@@ -786,9 +864,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             execution_status: execution_status::UNAVAILABLE.to_string(),
             pending: Some(crate::state::PendingChangeSetStatus {
                 status: Some(settles_to.0.to_string()),
-                status_reason: changes
-                    .is_empty()
-                    .then(|| crate::state::NO_CHANGES_REASON.to_string()),
+                status_reason: settles_to.2,
                 execution_status: Some(settles_to.1.to_string()),
                 due_at: now + crate::state::STATUS_TRANSITION_DELAY,
             }),

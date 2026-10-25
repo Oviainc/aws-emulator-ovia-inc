@@ -23,6 +23,8 @@ mod associate_pricing_rules;
 mod auto_associate_billing_group_cap;
 #[path = "all/batch_disassociate_resources_from_custom_line_item.rs"]
 mod batch_disassociate_resources_from_custom_line_item;
+#[path = "all/billing_group_billing_periods.rs"]
+mod billing_group_billing_periods;
 #[path = "all/billing_group_core_loop.rs"]
 mod billing_group_core_loop;
 #[path = "all/billing_group_cost_report.rs"]

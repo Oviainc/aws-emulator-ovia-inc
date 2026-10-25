@@ -47,6 +47,10 @@ mod resource_tags;
 mod rollback_stage;
 #[path = "all/rule_executions.rs"]
 mod rule_executions;
+#[path = "all/s3_deploy_object_key.rs"]
+mod s3_deploy_object_key;
+#[path = "all/stage_condition_rules.rs"]
+mod stage_condition_rules;
 #[path = "all/stage_transitions.rs"]
 mod stage_transitions;
 #[path = "all/state_roundtrip.rs"]
@@ -59,6 +63,8 @@ mod third_party_job_failure_results;
 mod third_party_job_results;
 #[path = "all/third_party_jobs.rs"]
 mod third_party_jobs;
+#[path = "all/third_party_webhooks.rs"]
+mod third_party_webhooks;
 #[path = "all/update_pipeline.rs"]
 mod update_pipeline;
 #[path = "all/validation_and_messages.rs"]

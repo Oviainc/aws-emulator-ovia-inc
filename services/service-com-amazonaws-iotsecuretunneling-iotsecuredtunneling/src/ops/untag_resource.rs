@@ -128,12 +128,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("UntagResource"))?;
 
+        // A resource is untagged through the endpoint of its own Region: an ARN of
+        // another Region names nothing this endpoint holds.
+        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
-        if store.tunnel_id_for_arn(&input.resource_arn).is_none() {
+        if store
+            .tunnel_id_for_arn(&region, &input.resource_arn)
+            .is_none()
+        {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     // The tunnel the ARN names, named the way every other

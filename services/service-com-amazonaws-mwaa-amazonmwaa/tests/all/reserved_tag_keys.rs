@@ -17,6 +17,13 @@
 //! prefix test: a key that merely STARTS WITH `aws` without the colon, or carries the
 //! prefix somewhere other than the start, is an ordinary caller-owned key and round-trips
 //! through all three operations.
+//!
+//! A third table varies the SIZE and SHAPE of the request instead of the key: how many
+//! ordinary keys travel beside the reserved one (none, one, five, a full-size request),
+//! how many reserved keys there are, and where they sit in `UntagResource`'s ordered
+//! `tagKeys` list (first, middle, last). Each row is paired with a control that sends the
+//! same request MINUS the reserved keys and must be accepted and stored, so what the
+//! refusal turns on is the reserved key and not the count.
 
 use std::sync::Arc;
 
@@ -497,6 +504,332 @@ async fn create_environment_refuses_a_reserved_tag_key_and_records_no_environmen
             read.status,
             read.text()
         );
+    }
+}
+
+/// One request shape: how many ordinary keys it carries beside how many reserved ones,
+/// and where the reserved ones sit among them. `Tags` is a JSON object, so the position
+/// only bites `UntagResource`, whose `tagKeys` is an ordered list — a refusal that looked
+/// only at the first (or the last) key it was handed would pass one row and fail another.
+struct MixCase {
+    case: &'static str,
+    ordinary: usize,
+    reserved: usize,
+    position: Position,
+}
+
+/// Where the reserved keys sit among the ordinary ones. An enum rather than a string, so
+/// the match in [`with_reserved_keys_at`] is exhaustive and a new row cannot silently mean
+/// `Middle`.
+#[derive(Clone, Copy, Debug)]
+enum Position {
+    First,
+    Middle,
+    Last,
+}
+
+/// Requests mixing ordinary and reserved keys. The counts stay inside `TagMap`'s and
+/// `TagKeyList`'s own `@length` ceilings of 50
+/// (`smithy_query(query="shape",shape="TagMap,TagKeyList",model_path="services/service-com-amazonaws-mwaa-amazonmwaa/smithy-model/com-amazonaws-mwaa-amazonmwaa.json")`),
+/// so every row is a request the boundary validator accepts and the handler has to judge;
+/// the last row is the largest such request.
+fn mix_cases() -> Vec<MixCase> {
+    vec![
+        MixCase {
+            case: "one reserved key and nothing else",
+            ordinary: 0,
+            reserved: 1,
+            position: Position::First,
+        },
+        MixCase {
+            case: "a reserved key ahead of one ordinary key",
+            ordinary: 1,
+            reserved: 1,
+            position: Position::First,
+        },
+        MixCase {
+            case: "a reserved key among five ordinary keys",
+            ordinary: 5,
+            reserved: 1,
+            position: Position::Middle,
+        },
+        MixCase {
+            case: "a reserved key behind five ordinary keys",
+            ordinary: 5,
+            reserved: 1,
+            position: Position::Last,
+        },
+        MixCase {
+            case: "two reserved keys in a full-size request",
+            ordinary: 48,
+            reserved: 2,
+            position: Position::Middle,
+        },
+    ]
+}
+
+/// `count` ordinary tag pairs, every key and value legal under `TagKey`'s and
+/// `TagValue`'s shared pattern.
+fn ordinary_pairs(count: usize) -> Vec<(String, String)> {
+    (0..count)
+        .map(|index| (format!("team-{index}"), format!("value-{index}")))
+        .collect()
+}
+
+/// `count` distinct pairs whose keys lie in the reserved namespace.
+fn reserved_pairs(count: usize) -> Vec<(String, String)> {
+    (0..count)
+        .map(|index| {
+            (
+                format!("{}system-{index}", state::RESERVED_TAG_KEY_PREFIX),
+                format!("value-{index}"),
+            )
+        })
+        .collect()
+}
+
+/// The owned pairs as a `TagMap` JSON object.
+fn map_of(pairs: &[(String, String)]) -> Value {
+    let borrowed: Vec<(&str, &str)> = pairs
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    tag_map(&borrowed)
+}
+
+/// The keys of `ordinary` with the keys of `reserved` inserted at `position`. Several
+/// reserved keys are spread one ordinary key apart rather than bunched together, so a row
+/// carrying two of them covers two different offsets in the list at once.
+fn with_reserved_keys_at(
+    ordinary: &[(String, String)],
+    reserved: &[(String, String)],
+    position: Position,
+) -> Vec<String> {
+    let mut keys: Vec<String> = ordinary.iter().map(|(key, _)| key.clone()).collect();
+    for (offset, (key, _)) in reserved.iter().enumerate() {
+        let at = match position {
+            Position::First => 0,
+            Position::Middle => keys.len() / 2,
+            Position::Last => keys.len(),
+        };
+        // `+ offset` keeps the insertion point inside the list as it grows, and spreads
+        // the reserved keys apart for the rows that carry more than one.
+        keys.insert((at + offset).min(keys.len()), key.clone());
+    }
+    keys
+}
+
+#[tokio::test]
+async fn tag_resource_refuses_any_request_that_names_a_reserved_key_whatever_else_it_carries() {
+    let harness = Harness::new();
+
+    for (index, row) in mix_cases().into_iter().enumerate() {
+        let case = row.case;
+        let name = format!("TagMix{index}");
+        assert_eq!(
+            harness.create(&name, None).await.status,
+            200,
+            "case {case:?}: the fixture create must succeed"
+        );
+        let arn = environment_arn(&name);
+
+        let ordinary = ordinary_pairs(row.ordinary);
+        let reserved = reserved_pairs(row.reserved);
+        let mut requested = ordinary.clone();
+        requested.extend(reserved.iter().cloned());
+
+        let answer = harness.tag(&arn, map_of(&requested)).await;
+        assert_eq!(
+            answer.status,
+            400,
+            "case {case:?}: TagResource over {} keys must be refused, got {} {}",
+            requested.len(),
+            answer.status,
+            answer.text()
+        );
+        assert_eq!(
+            answer.error_code(),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {:?}",
+            answer.error_code()
+        );
+        assert!(
+            answer.message().contains("Tags")
+                && reserved
+                    .iter()
+                    .any(|(key, _)| answer.message().contains(key)),
+            "case {case:?}: the refusal must name the member and a reserved key, got {:?}",
+            answer.message()
+        );
+        assert_eq!(
+            harness.tags(&arn).await,
+            Value::Null,
+            "case {case:?}: not one pair of the refused request may be written"
+        );
+
+        // The control: the SAME ordinary pairs on their own are accepted and stored, so
+        // what the refusal above turned on is the reserved key and not the request's size.
+        if !ordinary.is_empty() {
+            let accepted = harness.tag(&arn, map_of(&ordinary)).await;
+            assert_eq!(
+                accepted.status,
+                200,
+                "case {case:?}: the same {} ordinary keys alone must be accepted, got {} {}",
+                ordinary.len(),
+                accepted.status,
+                accepted.text()
+            );
+            assert_eq!(
+                harness.tags(&arn).await,
+                map_of(&ordinary),
+                "case {case:?}: every ordinary pair must read back"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn untag_resource_refuses_any_key_list_that_names_a_reserved_key_wherever_it_sits() {
+    let harness = Harness::new();
+
+    for (index, row) in mix_cases().into_iter().enumerate() {
+        let case = row.case;
+        let name = format!("UntagMix{index}");
+        let ordinary = ordinary_pairs(row.ordinary);
+        let reserved = reserved_pairs(row.reserved);
+        let seeded = if ordinary.is_empty() {
+            None
+        } else {
+            Some(map_of(&ordinary))
+        };
+        assert_eq!(
+            harness.create(&name, seeded.clone()).await.status,
+            200,
+            "case {case:?}: the fixture create must succeed"
+        );
+        let arn = environment_arn(&name);
+        let stored = seeded.clone().unwrap_or(Value::Null);
+
+        let keys = with_reserved_keys_at(&ordinary, &reserved, row.position);
+        let borrowed: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let answer = harness.untag(&arn, &borrowed).await;
+        assert_eq!(
+            answer.status,
+            400,
+            "case {case:?}: UntagResource over {} keys must be refused, got {} {}",
+            keys.len(),
+            answer.status,
+            answer.text()
+        );
+        assert_eq!(
+            answer.error_code(),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {:?}",
+            answer.error_code()
+        );
+        assert!(
+            answer.message().contains("tagKeys")
+                && reserved
+                    .iter()
+                    .any(|(key, _)| answer.message().contains(key)),
+            "case {case:?}: the refusal must name the member and a reserved key, got {:?}",
+            answer.message()
+        );
+        assert_eq!(
+            harness.tags(&arn).await,
+            stored,
+            "case {case:?}: not one key of the refused request may be removed"
+        );
+
+        // The control: the same list WITHOUT the reserved keys removes every ordinary key.
+        if !ordinary.is_empty() {
+            let ordinary_keys: Vec<String> =
+                ordinary.iter().map(|(key, _)| key.clone()).collect();
+            let borrowed: Vec<&str> = ordinary_keys.iter().map(String::as_str).collect();
+            let accepted = harness.untag(&arn, &borrowed).await;
+            assert_eq!(
+                accepted.status,
+                200,
+                "case {case:?}: the same {} ordinary keys alone must be accepted, got {} {}",
+                ordinary_keys.len(),
+                accepted.status,
+                accepted.text()
+            );
+            assert_eq!(
+                harness.tags(&arn).await,
+                Value::Null,
+                "case {case:?}: every ordinary key named must be gone"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn create_environment_refuses_any_tag_map_that_names_a_reserved_key() {
+    let harness = Harness::new();
+
+    for (index, row) in mix_cases().into_iter().enumerate() {
+        let case = row.case;
+        let name = format!("CreateMix{index}");
+        let ordinary = ordinary_pairs(row.ordinary);
+        let reserved = reserved_pairs(row.reserved);
+        let mut requested = ordinary.clone();
+        requested.extend(reserved.iter().cloned());
+
+        let answer = harness.create(&name, Some(map_of(&requested))).await;
+        assert_eq!(
+            answer.status,
+            400,
+            "case {case:?}: CreateEnvironment over {} tags must be refused, got {} {}",
+            requested.len(),
+            answer.status,
+            answer.text()
+        );
+        assert_eq!(
+            answer.error_code(),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {:?}",
+            answer.error_code()
+        );
+        assert!(
+            answer.message().contains("Tags")
+                && reserved
+                    .iter()
+                    .any(|(key, _)| answer.message().contains(key)),
+            "case {case:?}: the refusal must name the member and a reserved key, got {:?}",
+            answer.message()
+        );
+        let read = harness.get(&name).await;
+        assert_eq!(
+            read.status, 404,
+            "case {case:?}: a refused create must record no environment, got {} {}",
+            read.status,
+            read.text()
+        );
+
+        // The control: the same create carrying only the ordinary pairs is accepted and
+        // reports them back, so the refusal turned on the reserved key alone.
+        if !ordinary.is_empty() {
+            let accepted = harness.create(&name, Some(map_of(&ordinary))).await;
+            assert_eq!(
+                accepted.status,
+                200,
+                "case {case:?}: the same {} ordinary tags alone must be accepted, got {} {}",
+                ordinary.len(),
+                accepted.status,
+                accepted.text()
+            );
+            let read = harness.get(&name).await;
+            assert_eq!(
+                read.json()
+                    .get("Environment")
+                    .and_then(|environment| environment.get("Tags"))
+                    .cloned(),
+                Some(map_of(&ordinary)),
+                "case {case:?}: GetEnvironment must report every ordinary tag, got {}",
+                read.text()
+            );
+        }
     }
 }
 

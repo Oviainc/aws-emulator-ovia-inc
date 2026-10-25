@@ -924,6 +924,83 @@ fn holds_arn(stored: &StoredConnection, arn: &str) -> bool {
     stored.connection.arn == arn && stored.connection.state != DELETED_CONNECTION_STATE
 }
 
+/// The `ConnectionState` a connection whose proposal has not been accepted yet
+/// reports ("requested: The initial state of a connection. The state will remain here
+/// until the Connection is accepted on the Partner portal").
+///
+/// It is the one state an acceptance can be made from: before it there is no
+/// connection to accept, and after it the acceptance has already happened.
+pub const AWAITING_ACCEPTANCE_CONNECTION_STATE: &str = "requested";
+
+/// The `ConnectionState` an accepted proposal's connection enters ("pending: The
+/// connection has been accepted and is being provisioned between AWS and the
+/// Partner"), which is the first leg of the progression the clock then owes it.
+pub const ACCEPTED_CONNECTION_STATE: &str = "pending";
+
+/// The `ConnectionState` values a connection whose proposal HAS been accepted, and
+/// whose circuit has not since been torn down or failed, reports: the accepted state
+/// itself, the fully provisioned one, the one a provisioned circuit that is not
+/// passing traffic reports, and the one an in-flight change reports.
+pub const ACCEPTED_CONNECTION_STATES: [&str; 4] =
+    [ACCEPTED_CONNECTION_STATE, "available", "down", "updating"];
+
+/// Whether `state` is one a connection reports once its proposal has been accepted.
+pub fn is_accepted_state(state: &str) -> bool {
+    ACCEPTED_CONNECTION_STATES.contains(&state)
+}
+
+/// Whether accepting `connection`'s proposal with `attach_point`, `description` and
+/// `tags` would leave the connection exactly as it already is.
+///
+/// What makes a repeated acceptance the SAME acceptance: the attach point it asks the
+/// connection to be associated with is the one the connection holds, and every member
+/// it supplies is already the connection's. One that asks for anything else is a
+/// different acceptance of a proposal that has already been accepted, so it is
+/// refused instead of re-associating a connection that is already provisioning.
+pub fn acceptance_already_applied(
+    connection: &Connection,
+    attach_point: &AttachPoint,
+    description: Option<&String>,
+    tags: Option<&std::collections::HashMap<String, String>>,
+) -> bool {
+    attach_point_eq(&connection.attach_point, attach_point)
+        && description.is_none_or(|supplied| *supplied == connection.description)
+        && tags.is_none_or(|supplied| {
+            supplied.iter().all(|(key, value)| {
+                connection
+                    .tags
+                    .as_ref()
+                    .and_then(|held| held.get(key))
+                    .is_some_and(|held| held == value)
+            })
+        })
+}
+
+/// How the service words an acceptance of a proposal whose connection has already
+/// been accepted and asks for something that connection does not hold.
+///
+/// `ActivationKey` is `@sensitive`, so the message names the MEMBER the request
+/// carried the key in and the connection the acceptance already made, never the key.
+pub fn proposal_already_accepted_message(connection_id: &str) -> String {
+    format!(
+        "{REFUSAL_ENVELOPE}The connection proposal for the supplied activationKey has already \
+         been accepted as connection {connection_id}, whose attach point cannot be changed"
+    )
+}
+
+/// How the service words an acceptance of a proposal whose connection is no longer
+/// one an acceptance can be made on — it is being deleted, deleted, or failed.
+///
+/// Built from the store rather than from the request: the state the connection is in
+/// is what refuses the call, so the message names it, and the sensitive
+/// `activationKey` is named only as a member.
+pub fn proposal_not_acceptable_message(connection_id: &str, state: &str) -> String {
+    format!(
+        "{REFUSAL_ENVELOPE}The connection proposal for the supplied activationKey names connection \
+         {connection_id}, which is {state}, so it can no longer be accepted"
+    )
+}
+
 /// The `ConnectionState` values an `UpdateConnection` is permitted FROM.
 ///
 /// The service states the rule in its own refusal ("only connections in 'requested'

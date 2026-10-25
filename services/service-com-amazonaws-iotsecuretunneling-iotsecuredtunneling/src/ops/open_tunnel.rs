@@ -6,6 +6,10 @@
 //! client access tokens, all stored in [`crate::state`] so `DescribeTunnel`,
 //! `ListTunnels`, `RotateTunnelAccessToken` and `CloseTunnel` read the same record.
 //!
+//! The tunnel is a resource of the Region whose endpoint the request arrived at —
+//! the Region its ARN names — so it is stored under that Region and no other
+//! Region's endpoint reaches it.
+//!
 //! A request whose `destinationConfig.services` names more streams than a
 //! tunnel is multiplexed over ([`crate::state::MAX_SERVICES_PER_TUNNEL`]) is
 //! refused with HTTP 400 `ValidationException` before anything is minted,
@@ -275,8 +279,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 stored.insert(tag.key.clone(), tag.value.clone());
             }
         }
-        store.arn_index.insert(tunnel_arn.clone(), tunnel_id.clone());
-        store.tunnels.insert(tunnel_id.clone(), tunnel);
+        // The record is a resource of the Region whose endpoint opened it, so it
+        // is stored under that Region and is reachable through no other.
+        store.insert_tunnel(&region, tunnel);
         // Tell the expiry sweep when this tunnel's lifetime runs out, so it can
         // skip the store entirely until something is due.
         store.note_open_expiry(expires_at);

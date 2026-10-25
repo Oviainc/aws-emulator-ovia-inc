@@ -22,17 +22,9 @@
 //! `core/router/tests/all/cloudformation_provisions_stack_resources.rs`, which is where
 //! the create really happens.
 
-use std::time::Duration;
-
 use serde_json::json;
-use service_com_amazonaws_cloudformation_cloudformation::state::STATUS_TRANSITION_DELAY;
 
-use crate::stack_lifecycle::{call, member, xml_text, xml_texts};
-
-/// Wait past the instant a stack operation's terminal status becomes due.
-async fn wait_for_the_transition() {
-    tokio::time::sleep(STATUS_TRANSITION_DELAY + Duration::from_millis(250)).await;
-}
+use crate::stack_lifecycle::{call, member, wait_for_the_transition, xml_text, xml_texts};
 
 /// Create a stack from `template` and answer the `DescribeStacks` body for it once its
 /// create has settled.

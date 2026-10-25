@@ -160,7 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let provider = pool
             .identity_providers
             .get(&input.provider_name)
-            .ok_or_else(|| provider_not_found(&input.provider_name))?;
+            .ok_or_else(|| provider_not_found(&input.provider_name, &input.user_pool_id))?;
 
         // Rendered from the STORED provider: this read changes nothing.
         Ok(DescribeIdentityProviderOutput {
@@ -178,10 +178,14 @@ fn user_pool_not_found(user_pool_id: &str) -> DescribeIdentityProviderError {
 }
 
 /// This operation's `ResourceNotFoundException` for a provider name the pool does
-/// not hold.
-fn provider_not_found(provider_name: &str) -> DescribeIdentityProviderError {
+/// not hold, worded as every operation that resolves an IdP against a pool words
+/// it ([`crate::state::identity_provider_not_found_message`]).
+fn provider_not_found(provider_name: &str, user_pool_id: &str) -> DescribeIdentityProviderError {
     DescribeIdentityProviderErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("Identity provider not found: {provider_name}")),
+        message: Some(crate::state::identity_provider_not_found_message(
+            provider_name,
+            user_pool_id,
+        )),
     })
     .into()
 }

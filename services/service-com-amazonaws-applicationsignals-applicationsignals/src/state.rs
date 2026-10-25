@@ -75,6 +75,20 @@ pub const EVALUATION_TYPE_REQUEST_BASED: &str = "RequestBased";
 /// (`range 1..50`), since the member declares no default.
 pub const MAX_SLO_PAGE: i32 = 50;
 
+/// The largest page `ListServiceStates` serves: the modelled maximum of
+/// `ListServiceStatesMaxResults` (`smithy_query(query="shape",
+/// shape="ListServiceStatesMaxResults")` -> `range ..250`), which is also the modelled
+/// maximum length of the `ServiceStates` list a page is reported in.
+pub const MAX_SERVICE_STATES_PAGE: i32 = 250;
+
+/// The smallest page a caller of any list of this service may ask for.
+///
+/// A page bound is a COUNT of items, so one is the smallest that names a page at all; it is
+/// also the minimum every `MaxResults` member of this service that states one states
+/// (`range 1..N`), so enforcing it where a member leaves it unstated keeps one bound across
+/// the service's lists rather than one per operation.
+const MIN_PAGE_BOUND: i32 = 1;
+
 /// The most SLOs this service holds, after which a create is refused with the modelled
 /// `ServiceQuotaExceededException`.
 ///
@@ -1300,6 +1314,38 @@ pub fn decode_cursor(tag: &str, token: &str) -> Option<String> {
     decoded.strip_prefix(tag).map(ToString::to_string)
 }
 
+/// The page size a list read serves for the `MaxResults` a request states, or the refusal
+/// for a bound outside the range that member admits: at least [`MIN_PAGE_BOUND`] and at
+/// most `maximum`.
+///
+/// Where a `MaxResults` member's own model declares both bounds, the centralized walk
+/// enforces them before any handler runs, and the handler reads the value straight off the
+/// input. This is the same rule for a member whose model declares a maximum ONLY: a bound is
+/// never coerced, because a page smaller than the bound means "the list ends here" and a page
+/// clamped up to one entry plus a `NextToken` would answer a request nobody made. The minimum
+/// is the same for every list of this service ([`MIN_PAGE_BOUND`]), so a member that leaves it
+/// unstated is held to it here and the service holds ONE position on the rule.
+///
+/// The refusal is worded by the service's one constraint-violation builder — member path
+/// and requirement, with no echo of the rejected value ([`constraint_clause`]) — so a bound
+/// refused here reads exactly like the same bound refused at the boundary for the lists
+/// whose model states its minimum.
+pub fn page_bound(member_path: &str, max_results: i32, maximum: i32) -> Result<usize, String> {
+    if max_results < MIN_PAGE_BOUND {
+        return Err(validation_envelope(&[constraint_clause(
+            member_path,
+            &format!("Member must have value greater than or equal to {MIN_PAGE_BOUND}"),
+        )]));
+    }
+    if max_results > maximum {
+        return Err(validation_envelope(&[constraint_clause(
+            member_path,
+            &format!("Member must have value less than or equal to {maximum}"),
+        )]));
+    }
+    Ok(max_results as usize)
+}
+
 /// One page of a derived projection, plus the token for the page after it.
 ///
 /// The projections the time-ranged topology reads page over are DERIVED (they are
@@ -1315,8 +1361,11 @@ pub fn page_of<T>(
     page_size: usize,
 ) -> Result<(Vec<T>, Option<String>), String> {
     // A page of nothing could not advance its own cursor, so a caller following `NextToken`
-    // would loop for ever. Every caller's `MaxResults` is modelled with a minimum of 1, so
-    // this only ever clamps a bound no request can state.
+    // would loop for ever. A non-positive bound is therefore REFUSED before any read gets
+    // here — by the boundary validator for a `MaxResults` whose model states the minimum,
+    // and by [`page_bound`] for one whose model states a maximum only — so this floor is
+    // only what keeps the invariant local to this function, never a bound a request can
+    // reach.
     let page_size = page_size.max(1);
     let offset = match token {
         None => 0,

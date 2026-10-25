@@ -50,11 +50,18 @@
 //! [`TEMPLATE_BODY_MAX_BYTES`] per stored template body (the documented `TemplateBody`
 //! maximum, which the model carries no `@length` for), [`MAX_CHANGE_SETS_PER_STACK`]
 //! change sets per stack and [`MAX_CHANGE_SETS`] across the store (past either
-//! `CreateChangeSet` answers the modelled `LimitExceededException`), [`PAGE_SIZE`]
-//! items per paginated response and [`MAX_DESCRIBED_STACK_RESOURCES`] resources per
-//! `DescribeStackResources` response (the documented cap on that unpaginated read),
-//! [`hook_results::MAX_HOOK_RESULTS`] recorded Hook invocation results and
-//! [`change_set_hooks::MAX_CHANGE_SET_HOOKS`] Hook invocations planned for one change set.
+//! `CreateChangeSet` answers the modelled `LimitExceededException`),
+//! [`template::MAX_EXPANDED_ENTRIES`] / [`template::MAX_EXPANDED_BYTES`] /
+//! [`template::MAX_EXPANSION_DEPTH`] on what a template's transforms may expand to (the
+//! expansion is multiplicative, so the submitted body's own bound does not bound it),
+//! [`MAX_EVENT_PROPERTIES_BYTES`] of `ResourceProperties` per event and
+//! [`MAX_EVENT_PROPERTIES_BYTES_PER_STACK`] across one stack's log (oldest-first, since
+//! that document is caller-sized as well as caller-counted),
+//! [`PAGE_SIZE`] items per paginated response and [`MAX_DESCRIBED_STACK_RESOURCES`]
+//! resources per `DescribeStackResources` response (the documented cap on that
+//! unpaginated read), [`hook_results::MAX_HOOK_RESULTS`] recorded Hook invocation results
+//! and [`change_set_hooks::MAX_CHANGE_SET_HOOKS`] Hook invocations planned for one change
+//! set.
 //!
 //! Reading a stack's template body and evaluating what it declares is bounded by the
 //! [`template`] module's own caps (nodes, depth, the documented per-template quotas and
@@ -71,13 +78,26 @@
 //! carries it. Nothing sleeps, and no read invents a transition the clock had not
 //! already made due.
 //!
+//! ## The template pipeline, the resources it declares, and their events
+//!
+//! A stack deploys the PROCESSED stage of its template, not the submitted body:
+//! [`template::process`] computes that stage (see the transform section of that module for
+//! which transforms this service can apply and what it answers for the ones it cannot),
+//! and `GetTemplate` serves whichever stage the request asks for.
+//!
+//! A CHANGE SET is planned and executed against that same stage: `CreateChangeSet`
+//! computes it once and stores it beside the submitted body
+//! ([`StoredChangeSet::processed_template`]), so the plan a caller reviews, the template
+//! `GetTemplate` serves for that change set and the deployment `ExecuteChangeSet` carries
+//! out are one document rather than three readings of one body.
+//!
 //! A change set's own creation is asynchronous the same way ("After the CreateChangeSet
 //! call successfully completes, CloudFormation starts creating the change set"), so it
 //! carries a [`PendingChangeSetStatus`]: it is answered `CREATE_PENDING` and settles to
 //! `CREATE_COMPLETE` — or to `FAILED`, when the plan it computed is empty — which is what
 //! `ExecuteChangeSet` waits for.
 //!
-//! What a create or update DEPLOYS — the resources the template declares and the outputs
+//! What a create or update DEPLOYS — the resources that stage declares and the outputs
 //! evaluated over them (see [`template`]) — rides on that same clock: the call computes
 //! the deployment ([`StoredStack::deploy_template`]) and `settle` installs it with the
 //! terminal status, so a stack always reports the resources and outputs of the template
@@ -90,6 +110,32 @@
 //! deploying operation drives with no lock held — and which leaves the stack
 //! `CREATE_FAILED` with the owning service's own refusal as the reason rather than
 //! reporting a success whose resources do not exist.
+//!
+//! A stack operation therefore owes more than its own two events. As each resource
+//! transitions in the service that owns it, `provisioning` records that transition
+//! ([`provisioning::ResourceTransition`]) and the operation appends it to the stack's event
+//! log ([`StoredStack::record_resource_events`]) — the resource's logical id, its type, the
+//! properties it was deployed with and the owning service's own refusal where it failed —
+//! so each of those events sits between the stack's opening and terminal ones, and all of
+//! them carry one token ("All events triggered by a given stack operation are assigned the
+//! same client request token"). A resource the operation does not act on reports nothing,
+//! and a template this service cannot read declares nothing at all, so an operation
+//! deploying one acts on no resource rather than reporting creations or deletions nobody
+//! asked about.
+//!
+//! A resource's record here and the resource ITSELF are two things: `provisioning` asks
+//! the owning service to create every type it has a provisioner for, so a
+//! `CREATE_COMPLETE` for an `AWS::SSM::Parameter` means CloudFormation recorded the
+//! resource AND that service really holds it ([`StoredResource::materialised`] is what says
+//! which). A declared type with no provisioner is recorded and nothing is claimed of any
+//! service for it: the record then states what the template declares, never that something
+//! was created elsewhere.
+//!
+//! The expansion of a transform is bounded too: see [`template::MAX_EXPANDED_ENTRIES`],
+//! [`template::MAX_EXPANDED_BYTES`] and [`template::MAX_EXPANSION_DEPTH`]. A handler
+//! computes it BEFORE it takes the store lock, so one caller's template never blocks
+//! another caller's request; a stage already computed is read from the store rather than
+//! recomputed, and NO read path expands a template.
 //!
 //! ## The extension registry
 //!
@@ -216,6 +262,20 @@ pub const ARN_NAMESPACE: &str = "cloudformation";
 
 /// The resource type CloudFormation reports on a stack-level event.
 pub const STACK_RESOURCE_TYPE: &str = "AWS::CloudFormation::Stack";
+
+/// The capability a caller acknowledges to create or update a stack directly from a
+/// template that declares a transform.
+///
+/// `CreateStackInput$Capabilities`: "Some template contain macros. [...] If your stack
+/// template contains one or more macros, and you choose to create a stack directly from
+/// the processed template, without first reviewing the resulting changes in a change set,
+/// you must acknowledge this capability. This includes the AWS::Include and AWS::Serverless
+/// transforms, which are macros hosted by CloudFormation."
+pub const CAPABILITY_AUTO_EXPAND: &str = "CAPABILITY_AUTO_EXPAND";
+
+/// The reason CloudFormation records on the second `CREATE_IN_PROGRESS` event of a
+/// resource — the one that reports the create request reached the resource's provisioner.
+pub const RESOURCE_CREATION_INITIATED: &str = "Resource creation Initiated";
 
 /// `StackDriftStatus` for a stack no drift detection has run against yet:
 /// "CloudFormation hasn't checked if the stack differs from its expected template
@@ -344,8 +404,33 @@ pub const MAX_DELETED_STACKS_RETAINED: usize = 200;
 ///
 /// CloudFormation bounds a stack's event history by age, not by count; a caller here can
 /// drive an unbounded number of updates against one stack, so the emulator bounds the log
-/// by count. Chosen: far more than the handful of events any client workflow reads.
-pub const MAX_EVENTS_PER_STACK: usize = 1_000;
+/// by count. Chosen, and deliberately above the worst case of ONE operation — a stack at
+/// the documented [`template::MAX_RESOURCES_PER_TEMPLATE`] quota owes `2 + 3 × 500` =
+/// 1,502 events for a single create — with the rest as headroom for the operations whose
+/// events a client is reading beside it, so eviction never discards part of the operation
+/// it is reading.
+pub const MAX_EVENTS_PER_STACK: usize = 4 * template::MAX_RESOURCES_PER_TEMPLATE;
+
+/// The most bytes of `StackEvent$ResourceProperties` ONE event carries.
+///
+/// That member is the properties document of one resource, which is caller-sized: it comes
+/// out of the template body, whose own ceiling ([`TEMPLATE_BODY_MAX_BYTES`]) a transform's
+/// expansion may multiply ([`template::MAX_EXPANDED_BYTES`]). An event is a DIAGNOSTIC, so
+/// past this much the event reports no properties rather than a truncated document that is
+/// no longer the document (the member is optional, and a cut-off blob would not parse).
+/// Chosen: comfortably above the property sets of real resource declarations, and small
+/// enough that [`MAX_EVENTS_PER_STACK`] of them is bounded in megabytes rather than
+/// hundreds.
+pub const MAX_EVENT_PROPERTIES_BYTES: usize = 4 * 1024;
+
+/// The most bytes of `ResourceProperties` ONE stack's whole event log retains.
+///
+/// The count bound above is what keeps the log's ENTRIES bounded; this is what keeps its
+/// BYTES bounded, because a caller chooses how big each retained properties document is as
+/// well as how many events it causes. Past it the oldest events are evicted until the log
+/// fits, exactly as the count bound evicts. The product of the two factors is therefore
+/// this constant and not `MAX_EVENTS_PER_STACK × MAX_EVENT_PROPERTIES_BYTES`.
+pub const MAX_EVENT_PROPERTIES_BYTES_PER_STACK: usize = 256 * 1024;
 
 /// The most resource signals one stack retains, oldest evicted first.
 ///
@@ -389,6 +474,28 @@ pub fn validate_template_body(template_body: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// `CAPABILITY_AUTO_EXPAND` when the template declares a transform the request has not
+/// acknowledged, and nothing when it has (or when there is no transform to acknowledge).
+///
+/// `CreateStackInput$Capabilities` requires the acknowledgement for a template that
+/// "contains one or more macros", and both `CreateStack` and `UpdateStack` model
+/// `InsufficientCapabilitiesException` for the request that omits it. The IAM
+/// acknowledgements (`CAPABILITY_IAM` / `CAPABILITY_NAMED_IAM`) are a separate rule about
+/// a template's RESOURCES and are not decided here.
+pub fn missing_auto_expand_capability(
+    template_body: &str,
+    acknowledged: &[String],
+) -> Vec<String> {
+    let declares_transform = !template::body_declared_transforms(template_body).is_empty();
+    let acknowledged_auto_expand = acknowledged
+        .iter()
+        .any(|capability| capability == CAPABILITY_AUTO_EXPAND);
+    if declares_transform && !acknowledged_auto_expand {
+        return vec![CAPABILITY_AUTO_EXPAND.to_string()];
+    }
+    Vec::new()
 }
 
 /// `Err(message)` for a template body past one of the documented per-template quotas —
@@ -458,9 +565,13 @@ pub mod account_limit_name {
 pub mod status {
     pub const CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
     pub const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
+    /// The terminal status of a create this service could not carry out — a template whose
+    /// transforms it cannot apply, or one its reader will not read.
     pub const CREATE_FAILED: &str = "CREATE_FAILED";
     pub const UPDATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
     pub const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
+    /// The terminal status of an update this service could not carry out, for the same
+    /// reasons [`CREATE_FAILED`] covers on a create.
     pub const UPDATE_FAILED: &str = "UPDATE_FAILED";
     pub const DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
     pub const DELETE_COMPLETE: &str = "DELETE_COMPLETE";
@@ -651,13 +762,28 @@ pub struct StoredResource {
     /// The resource's declared `Properties` with every intrinsic function EVALUATED — the
     /// request the owning service's create API takes
     /// ([`provisioning`](crate::state::provisioning)). `Null` for a resource that declared
-    /// none.
+    /// none. This is also what `StackEvent$ResourceProperties` reports ("BLOB of the
+    /// properties used to create the resource"), via [`StoredResource::properties_blob`].
     pub properties: ::serde_json::Value,
     /// Whether the resource was CREATED in the service that owns it, so the stack's
     /// deletion has to delete it there. `false` for a resource type this emulator has no
     /// provisioner for: nothing was created for it anywhere (see
     /// [`provisioning`](crate::state::provisioning)).
     pub materialised: bool,
+}
+
+impl StoredResource {
+    /// `StackEvent$ResourceProperties`: "BLOB of the properties used to create the
+    /// resource" — the properties this resource was provisioned with, as the JSON document
+    /// its events report, and `None` for a resource whose template declared none (there is
+    /// no blob to report rather than an empty one).
+    ///
+    /// Serialised by [`template::properties_blob`], which writes the members in KEY order:
+    /// `serde_json`'s own map order depends on a feature any crate in the build may enable,
+    /// and an event's text must not depend on how the workspace was compiled.
+    pub fn properties_blob(&self) -> Option<String> {
+        template::properties_blob(&self.properties)
+    }
 }
 
 /// One resource a stack has DEPLOYED: what the template declared it as, plus the
@@ -788,7 +914,21 @@ pub struct StoredEvent {
     pub timestamp: SystemTime,
     pub resource_status: String,
     pub resource_status_reason: Option<String>,
+    /// `StackEvent$ResourceProperties`: "BLOB of the properties used to create the
+    /// resource" — carried by a resource-level event, absent on the stack's own.
+    pub resource_properties: Option<String>,
     pub client_request_token: Option<String>,
+}
+
+/// The bytes of one event that a CALLER sized: its `ResourceProperties` document. Every
+/// other member is an identifier, a status or a timestamp this service minted, so this is
+/// what [`StoredStack::push_event`] meters the log in.
+fn event_properties_bytes(event: &StoredEvent) -> usize {
+    event
+        .resource_properties
+        .as_ref()
+        .map(String::len)
+        .unwrap_or_default()
 }
 
 /// One resource signal `SignalResource` recorded against a stack.
@@ -813,8 +953,9 @@ pub struct StoredResourceSignal {
 pub struct PendingStatus {
     pub status: String,
     /// The `StackStatusReason` that status carries, for an operation that is headed for a
-    /// FAILED one: a failure has to say what failed, and a success states no reason
-    /// (`StoredStack::fail_transition`).
+    /// FAILED one (see [`StoredStack::fail_pending_transition`], and
+    /// [`StoredStack::fail_transition`] for a failure discovered while the operation is in
+    /// flight): a failure has to say what failed, and a success states no reason.
     pub status_reason: Option<String>,
     pub due_at: SystemTime,
     pub operation_id: Option<String>,
@@ -852,14 +993,23 @@ pub struct StoredStack {
     /// `CREATE` change set creates its stack "with a unique stack ID, but no template or
     /// resources", and the template becomes the stack's when the change set is executed.
     pub template_body: Option<String>,
-    /// The template as CloudFormation PROCESSED it, where processing needed something only
+    /// The `Processed` stage of the template this stack carries, computed once when the
+    /// body is stored: `GetTemplate(TemplateStage=Processed)` serves it, and the resources
+    /// this stack deploys are the ones it declares. Computed over
+    /// [`Self::included_template_body`] — the submitted body with any `AWS::Include`
+    /// snippets already spliced in — so one stage is the whole processing pipeline's.
+    /// `Processed::Same` for a stack with no template, which has no stage to serve either
+    /// way.
+    pub processed_template: template::Processed,
+    /// The template as CloudFormation processed it where processing needed something only
     /// the stack operation could read: the `AWS::Include` snippets its `Fn::Transform`s
     /// name, spliced in ([`include::process`]). `None` when the submitted body needed no
     /// such processing, which is every template that names no such transform.
     ///
-    /// This is the body the stack DEPLOYS from ([`Self::template_scope`]): a snippet is
-    /// read once, by the operation that submits the template, and every later read of the
-    /// stack sees the processed template rather than reaching into Amazon S3 again.
+    /// This is the body the DECLARED transforms are then applied to, and what the stack
+    /// deploys from ([`Self::template_scope`]): a snippet is read once, by the operation
+    /// that submits the template, and every later read of the stack sees the processed
+    /// template rather than reaching into Amazon S3 again.
     pub processed_template_body: Option<String>,
     /// The template's own `Description`, parsed once when the body is stored rather than
     /// on every read: this is where CloudFormation takes both `Stack$Description` and
@@ -881,7 +1031,8 @@ pub struct StoredStack {
     pub deployment_config: Option<StoredDeploymentConfig>,
     pub rollback_configuration: Option<StoredRollbackConfiguration>,
     pub deletion_mode: Option<String>,
-    /// The stack policy body in force, as `CreateStack`/`UpdateStack` last supplied it.
+    /// The stack policy body in force, as `SetStackPolicy` or `CreateStack`/`UpdateStack`
+    /// last supplied it.
     ///
     /// A stack policy governs which of a stack's RESOURCES an update may change; this
     /// service records the resources a template declares but performs no resource
@@ -924,6 +1075,10 @@ pub struct StoredStack {
     pub deletion_time: Option<SystemTime>,
     pub client_request_token: Option<String>,
     pub events: ::std::collections::VecDeque<StoredEvent>,
+    /// The bytes of caller-sized `ResourceProperties` the event log is holding right now,
+    /// kept alongside it so [`StoredStack::push_event`] can honour
+    /// [`MAX_EVENT_PROPERTIES_BYTES_PER_STACK`] without walking the log.
+    pub retained_event_properties_bytes: usize,
     /// The resource signals this stack has been sent (`SignalResource`), in arrival
     /// order, one per `UniqueId` per logical resource and bounded at
     /// [`MAX_SIGNALS_PER_STACK`]. A signal is kept whatever the stack was doing when it
@@ -946,10 +1101,30 @@ impl StoredStack {
     /// A stack as `CreateStack` first stores it: the identity and the template, with every
     /// optional member at its default. The caller fills in what the request supplied and
     /// then opens the create transition.
+    ///
+    /// Computes the template's processed stage, so a HANDLER uses
+    /// [`Self::new_processed`] instead: the expansion is caller-sized work and must not be
+    /// done while the store lock is held.
     pub fn new(
         stack_id: String,
         stack_name: String,
         template_body: Option<String>,
+        now: SystemTime,
+    ) -> Self {
+        let processed_template = template_body
+            .as_deref()
+            .map(template::process)
+            .unwrap_or(template::Processed::Same);
+        Self::new_processed(stack_id, stack_name, template_body, processed_template, now)
+    }
+
+    /// [`Self::new`] for a caller that computed the template's processed stage already —
+    /// off the store lock.
+    pub fn new_processed(
+        stack_id: String,
+        stack_name: String,
+        template_body: Option<String>,
+        processed_template: template::Processed,
         now: SystemTime,
     ) -> Self {
         Self {
@@ -957,6 +1132,7 @@ impl StoredStack {
             stack_name,
             region: DEFAULT_REGION.to_string(),
             template_description: template_body.as_deref().and_then(template::description),
+            processed_template,
             template_body,
             processed_template_body: None,
             change_set_id: None,
@@ -987,19 +1163,30 @@ impl StoredStack {
             deletion_time: None,
             client_request_token: None,
             events: ::std::collections::VecDeque::new(),
+            retained_event_properties_bytes: 0,
             signals: ::std::collections::VecDeque::new(),
             drift_status: DRIFT_STATUS_NOT_CHECKED.to_string(),
             drift_last_check: None,
         }
     }
 
-    /// Replace the stored template body, re-deriving the description it carries.
-    pub fn set_template_body(&mut self, template_body: String) {
+    /// Replace the stored template body with one whose processed stage was computed
+    /// already — off the store lock.
+    ///
+    /// The only way a body reaches a stored stack: there is deliberately no variant that
+    /// computes the stage itself, so no handler can expand a caller-sized template while
+    /// holding the store lock.
+    pub fn set_template_body(
+        &mut self,
+        template_body: String,
+        processed_template: template::Processed,
+    ) {
         self.template_description = template::description(&template_body);
+        self.processed_template = processed_template;
         self.template_body = Some(template_body);
-        // The processed body belonged to the body that was there: a new one has not been
-        // processed yet, and the operation that submitted it is what records its
-        // processing ([`Self::set_processed_template_body`]).
+        // The spliced body belonged to the body that was there: a new one has not been
+        // through that processing yet, and the operation that submitted it is what records
+        // it ([`Self::set_processed_template_body`]).
         self.processed_template_body = None;
     }
 
@@ -1021,9 +1208,28 @@ impl StoredStack {
         self.pending_deployment = Some(PendingDeployment::default());
     }
 
+    /// The body the stack's DECLARED transforms are applied to: the submitted body with
+    /// the `AWS::Include` snippets the operation read spliced into it, and the submitted
+    /// body itself for a template that names no such transform.
+    pub fn included_template_body(&self) -> Option<&str> {
+        self.processed_template_body
+            .as_deref()
+            .or(self.template_body.as_deref())
+    }
+
+    /// The body `GetTemplate(TemplateStage=Processed)` serves, or `None` when the stack has
+    /// no template at all or this service could not process the transforms it declares.
+    pub fn processed_stage_body(&self) -> Option<&str> {
+        self.processed_template.body(self.included_template_body()?)
+    }
+
     /// Materialise what the stored template declares: one record per declared resource,
-    /// with its properties evaluated, and the stack's outputs evaluated against those
-    /// resources, the stack's parameters and the pseudo parameters.
+    /// with its properties evaluated, the stack's outputs evaluated against those
+    /// resources, the stack's parameters and the pseudo parameters, and what the operation
+    /// does to each resource.
+    ///
+    /// What is deployed is the template's PROCESSED stage — the document CloudFormation
+    /// deploys — so a transform's expansion is part of what the stack provisions.
     ///
     /// Called by the operation that DEPLOYS the template (`CreateStack`, `UpdateStack`,
     /// `ExecuteChangeSet`), never by a read: the values are a function of the template body
@@ -1036,20 +1242,44 @@ impl StoredStack {
     /// [`Self::settle`] completes that operation — a stack reports the resources and
     /// outputs of the template that finished deploying, so a caller reading a stack whose
     /// create is still in progress sees none, and one reading mid-update still sees the
-    /// values in force rather than the ones the update is about to install. A template
-    /// this service cannot read declares nothing, and leaves the stack with no resources
-    /// and no outputs rather than with the previous template's.
+    /// values in force rather than the ones the update is about to install.
     ///
-    /// What this computes is what the resources ARE; CREATING them in the services that
-    /// own them is [`provisioning::reconcile`](provisioning::reconcile), which the
-    /// deploying operation calls with these records once the store is unlocked.
-    pub fn deploy_template(&mut self) {
-        let Some((declared, parameters)) = self.template_scope() else {
-            // No template at all (a stack a CREATE change set created and nothing has
-            // executed yet), or one this service will not read: either way the stack is
-            // left with no resources and no outputs rather than with invented ones.
+    /// `Err(reason)` when this service cannot deploy that template AT ALL: its PROCESSED
+    /// stage is one the transform section cannot compute, or its body is one the reader
+    /// will not read. Nothing is deployed then, and the caller (the handler that opened the
+    /// operation) ends the operation in the service's modelled FAILURE state with that
+    /// reason — never in a completion reporting work nothing performed. A stack with no
+    /// template at all is not such a case: there is nothing to deploy, which is what a
+    /// stack a `CREATE` change set created is for.
+    pub fn deploy_template(&mut self) -> Result<(), String> {
+        if self.template_body.is_none() {
+            // No template to deploy: the stack a CREATE change set created, which carries
+            // no resources until that change set is executed.
             self.pending_deployment = Some(PendingDeployment::default());
-            return;
+            return Ok(());
+        }
+        if self.processed_stage_body().is_none() {
+            // The template's PROCESSED stage is unavailable, so what it declares is
+            // UNKNOWN rather than empty: nothing is deployed, and the resources and
+            // outputs in force are left alone.
+            let reason = self
+                .processed_template
+                .unavailable_reason()
+                .unwrap_or("the template's processed stage is unavailable")
+                .to_string();
+            self.pending_deployment = None;
+            return Err(reason);
+        }
+        let Some((declared, parameters)) = self.template_scope() else {
+            // A template this service will not read — a body it cannot parse, or one past a
+            // documented per-template quota: the stack is left with no resources and no
+            // outputs rather than with invented ones, and the operation fails.
+            self.pending_deployment = None;
+            return Err(
+                "the template is not one this service can read: it is malformed, or past a \
+                 documented per-template quota"
+                    .to_string(),
+            );
         };
         let stack = template::StackScope {
             region: &self.region,
@@ -1085,7 +1315,8 @@ impl StoredStack {
         // A second pass: each resource's properties are evaluated against the whole set,
         // so a property naming another resource (a stream's `RoleARN` from an
         // `Fn::GetAtt`) carries that resource's value. This is the request the service
-        // that owns the resource is asked to create it with.
+        // that owns the resource is asked to create it with, and the properties blob its
+        // events report.
         template::resolve_properties(&declared, &mut resources, &resolved, &mut budget);
         // A resource this stack ALREADY created in the service that owns it, and that this
         // template declares again unchanged, is still that same created resource: the
@@ -1157,6 +1388,25 @@ impl StoredStack {
             outputs,
             wait_conditions,
         });
+        Ok(())
+    }
+
+    /// Redirect the PENDING transition to a FAILURE: the terminal status the operation in
+    /// flight settles to, and the reason that status carries.
+    ///
+    /// Called where this service cannot carry out what the request asked for — a template
+    /// whose transforms it cannot apply, or one its reader will not read — so the operation
+    /// reaches the service's modelled failure state with a reason that says so, rather than
+    /// a completion reporting work nothing performed. The operation is still ANSWERED and
+    /// still takes its clock-owed span: a caller reading straight after the call sees
+    /// `*_IN_PROGRESS`, and one reading past the due instant sees the failure and the event
+    /// that carries it. [`Self::fail_transition`] is the other case — a failure discovered
+    /// after the call, which is reported at the instant it happened.
+    pub fn fail_pending_transition(&mut self, settles_to: &str, reason: String) {
+        if let Some(pending) = self.pending.as_mut() {
+            pending.status = settles_to.to_string();
+            pending.status_reason = Some(reason);
+        }
     }
 
     /// The stack's declared outputs, evaluated against `resources`.
@@ -1195,14 +1445,13 @@ impl StoredStack {
     ///
     /// `None` for a stack with no template, or one this service cannot read: there is
     /// nothing to evaluate then.
+    ///
+    /// The document read here is the template's PROCESSED stage — what CloudFormation
+    /// deploys — so a resource or an output a transform's expansion declares is part of
+    /// what the stack has, and a stage this service could not compute evaluates to
+    /// nothing rather than to the unexpanded document.
     fn template_scope(&self) -> Option<(template::Template, BTreeMap<String, String>)> {
-        // The PROCESSED template where there is one: that is the template CloudFormation
-        // deploys, and the one whose resources and outputs the stack reports.
-        let body = self
-            .processed_template_body
-            .as_deref()
-            .or(self.template_body.as_deref())?;
-        let declared = template::parse(body)?;
+        let declared = self.processed_stage_body().and_then(template::parse)?;
         let mut parameters = declared.parameter_defaults();
         for parameter in &self.parameters {
             parameters.insert(parameter.key.clone(), parameter.value.clone());
@@ -1286,6 +1535,9 @@ impl StoredStack {
             STACK_RESOURCE_TYPE,
             resource_status,
             resource_status_reason,
+            // The stack's own event reports no `ResourceProperties`: the stack is not a
+            // resource the template declared properties for.
+            None,
             operation_id,
             client_request_token,
         );
@@ -1294,11 +1546,13 @@ impl StoredStack {
     /// Append an event about ONE of the stack's resources, which is what
     /// `DescribeStackEvents` reports beside the stack's own events ("all stack related
     /// events"): the resource's logical and physical ids and its type, with the status it
-    /// is in and the reason it is in it.
+    /// is in, the reason it is in it and the properties it was deployed with
+    /// (`StackEvent$ResourceProperties`: "BLOB of the properties used to create the
+    /// resource").
     ///
     /// [`Self::record_event`] is the stack-level case of this writer (the stack's own
-    /// resource), so the [`MAX_EVENTS_PER_STACK`] bound and the oldest-first eviction live
-    /// here once.
+    /// resource); every event of either goes through [`Self::push_event`], so the
+    /// [`MAX_EVENTS_PER_STACK`] bound and the oldest-first eviction live there once.
     #[allow(clippy::too_many_arguments)]
     pub fn record_resource_event(
         &mut self,
@@ -1308,15 +1562,11 @@ impl StoredStack {
         resource_type: &str,
         resource_status: &str,
         resource_status_reason: Option<String>,
+        resource_properties: Option<String>,
         operation_id: Option<String>,
         client_request_token: Option<String>,
     ) {
-        // Oldest-first eviction off the FRONT of a deque, so the bound costs O(1) rather
-        // than a shift of the whole log.
-        while self.events.len() >= MAX_EVENTS_PER_STACK {
-            self.events.pop_front();
-        }
-        self.events.push_back(StoredEvent {
+        self.push_event(StoredEvent {
             event_id: new_identifier(&self.stack_id),
             stack_id: self.stack_id.clone(),
             stack_name: self.stack_name.clone(),
@@ -1327,8 +1577,43 @@ impl StoredStack {
             timestamp: at,
             resource_status: resource_status.to_string(),
             resource_status_reason,
+            resource_properties,
             client_request_token,
         });
+    }
+
+    /// Append one event, oldest-first eviction off the FRONT of the deque so each bound
+    /// costs O(1) rather than a shift of the whole log.
+    ///
+    /// TWO bounds, because a caller chooses both how many events it causes and how big the
+    /// properties document each of them carries: [`MAX_EVENTS_PER_STACK`] entries, and
+    /// [`MAX_EVENT_PROPERTIES_BYTES_PER_STACK`] bytes of retained
+    /// `StackEvent$ResourceProperties` — with [`MAX_EVENT_PROPERTIES_BYTES`] the ceiling on
+    /// any ONE of them, past which the event reports no properties at all rather than a
+    /// document cut in half.
+    fn push_event(&mut self, mut event: StoredEvent) {
+        if event
+            .resource_properties
+            .as_ref()
+            .is_some_and(|properties| properties.len() > MAX_EVENT_PROPERTIES_BYTES)
+        {
+            event.resource_properties = None;
+        }
+        let properties_bytes = event_properties_bytes(&event);
+        while self.events.len() >= MAX_EVENTS_PER_STACK
+            || (!self.events.is_empty()
+                && self.retained_event_properties_bytes + properties_bytes
+                    > MAX_EVENT_PROPERTIES_BYTES_PER_STACK)
+        {
+            let Some(evicted) = self.events.pop_front() else {
+                break;
+            };
+            self.retained_event_properties_bytes = self
+                .retained_event_properties_bytes
+                .saturating_sub(event_properties_bytes(&evicted));
+        }
+        self.retained_event_properties_bytes += properties_bytes;
+        self.events.push_back(event);
     }
 
     /// Append the event each RESOURCE transition of a stack operation owes, through
@@ -1358,6 +1643,7 @@ impl StoredStack {
                 &transition.resource_type,
                 &transition.status,
                 transition.reason.clone(),
+                transition.resource_properties.clone(),
                 operation_id.clone(),
                 client_request_token.clone(),
             );
@@ -1431,9 +1717,18 @@ impl StoredStack {
         // signal and the completion it makes due.
         self.wait_conditions.clear();
         let pending = self.pending.take().expect("checked just above");
+        let completing_deletion = pending.status == status::DELETE_COMPLETE;
+        let deployed = self.pending_deployment.take();
+        // The per-RESOURCE events of this operation were recorded by the operation itself,
+        // as each resource transitioned in the service that owns it
+        // ([`Self::record_resource_events`]) — so by now the only event still owed is the
+        // stack's own terminal one, which closes the operation after them.
+        let at = pending.due_at;
         self.status = pending.status;
+        // The reason the terminal status carries: the one the operation failed with, and
+        // nothing for one that completed.
         self.status_reason = pending.status_reason.clone();
-        if self.status == status::DELETE_COMPLETE {
+        if completing_deletion {
             self.deletion_time = Some(pending.due_at);
             // The deletion completed, so every resource of the stack was deleted as of
             // that instant — reported, not dropped: "For deleted stacks,
@@ -1445,25 +1740,24 @@ impl StoredStack {
                 deployed.status_timestamp = pending.due_at;
             }
             self.outputs.clear();
-            self.pending_deployment = None;
         } else if self.status == status::ROLLBACK_COMPLETE {
             // The create was ROLLED BACK: the template it was deploying never came into
             // force, and the resources it had made were removed again, so nothing is
             // installed and no output resolves — the stack reports what it really has,
-            // which is nothing.
-            self.pending_deployment = None;
+            // which is nothing. (The deployment was taken above, so there is nothing left
+            // to install.)
             self.outputs.clear();
-        } else if let Some(deployed) = self.pending_deployment.take() {
+        } else if let Some(deployment) = deployed {
             // The create or update completed: the template it deployed is what the stack
             // reports resources and outputs for from here on.
             self.resources =
-                installed_resources(&self.resources, deployed.resources, pending.due_at);
-            self.outputs = deployed.outputs;
+                installed_resources(&self.resources, deployment.resources, pending.due_at);
+            self.outputs = deployment.outputs;
         }
         let status = self.status.clone();
         let reason = pending.status_reason;
         self.record_event(
-            pending.due_at,
+            at,
             &status,
             reason,
             pending.operation_id,
@@ -2010,8 +2304,18 @@ pub struct StoredChangeSet {
     /// that updates an existing stack.
     pub change_set_type: String,
     pub description: Option<String>,
-    /// The template the change set would put on the stack.
+    /// The template the change set would put on the stack, as the request submitted it:
+    /// the `Original` stage `GetTemplate` serves for this change set.
     pub template_body: String,
+    /// The PROCESSED stage of that body — the document this change set would actually
+    /// deploy — computed ONCE when the change set was created, like
+    /// [`StoredStack::processed_template`]. It is what the change list was planned from,
+    /// what `GetTemplate(TemplateStage=Processed)` serves for this change set and what
+    /// `ExecuteChangeSet` puts on the stack, so the plan a caller reviews and the
+    /// deployment that is carried out are the same document. `Processed::Unavailable` for a
+    /// transform this service cannot apply, which is why such a change set settles to
+    /// `FAILED`.
+    pub processed_template: template::Processed,
     pub parameters: Vec<StoredParameter>,
     pub capabilities: Vec<String>,
     pub tags: Vec<StoredTag>,
@@ -2101,6 +2405,22 @@ impl StoredChangeSet {
     pub fn is_executable(&self) -> bool {
         self.status == change_set_status::CREATE_COMPLETE
             && self.execution_status == execution_status::AVAILABLE
+    }
+
+    /// The body `GetTemplate(TemplateStage=Processed)` serves for this change set, or `None`
+    /// when this service could not compute that stage from the submitted body.
+    pub fn processed_template_body(&self) -> Option<&str> {
+        self.processed_template.body(&self.template_body)
+    }
+
+    /// Whether the change set's own creation has settled.
+    ///
+    /// `GetTemplate`: "For change sets, the Original template is always available. After
+    /// CloudFormation finishes creating the change set, the Processed template becomes
+    /// available" — so the processed stage is serveable only once the creation this store
+    /// answered `CREATE_PENDING` has reached its terminal status.
+    pub fn creation_settled(&self) -> bool {
+        self.status != change_set_status::CREATE_PENDING
     }
 
     /// The first attribute this stored change set states differently from a request that
@@ -3101,6 +3421,17 @@ pub fn new_operation_id() -> String {
     new_identifier("operation")
 }
 
+/// Mint the client request token CloudFormation assigns a stack operation whose caller
+/// supplied none.
+///
+/// `StackEvent$ClientRequestToken`: "All events triggered by a given stack operation are
+/// assigned the same client request token, which you can use to track operations" — so an
+/// operation HAS a token whether or not the request named one. The value satisfies the
+/// modelled `ClientRequestToken` (length 1..128, pattern `^[a-zA-Z0-9][-a-zA-Z0-9]*$`).
+pub fn new_client_request_token() -> String {
+    new_identifier("client-request-token")
+}
+
 /// Mint an id for one drift-detection operation (`DetectStackDriftOutput`'s
 /// `StackDriftDetectionId`, which `DescribeStackDriftDetectionStatus` reads a result back
 /// by): the same 8-4-4-4-12 form as every other identifier this service mints, which is 36
@@ -3784,5 +4115,24 @@ pub fn refuse_unassumable_role<Eng: Send + Sync + 'static, E>(
     match refusal {
         Some(message) => Err(crate::scaffolded::Scaffolded::validation_error(message)),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`CAPABILITY_AUTO_EXPAND`] names one value of the modelled `Capability` enum, whose
+    /// value set codegen carries as `CAPABILITY_VALUES` — so the constant this crate
+    /// compares an acknowledgement against cannot drift from the value a caller can
+    /// actually send.
+    #[test]
+    fn the_auto_expand_capability_is_a_modelled_capability_value() {
+        let modelled = crate::ops::types::CAPABILITY_VALUES;
+        assert!(
+            modelled.contains(&CAPABILITY_AUTO_EXPAND),
+            "case {CAPABILITY_AUTO_EXPAND:?}: expected the modelled Capability value set to \
+             carry it, got {modelled:?}"
+        );
     }
 }

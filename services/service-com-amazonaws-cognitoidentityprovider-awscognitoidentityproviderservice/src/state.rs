@@ -156,6 +156,19 @@ pub const DEVICE_REMEMBERING_NOT_CONFIGURED_MESSAGE: &str =
 /// exactly as [`USER_NOT_FOUND_MESSAGE`] is reported for a username.
 pub const GROUP_NOT_FOUND_MESSAGE: &str = "Group not found.";
 
+/// The message a `ResourceNotFoundException` carries when the identity provider
+/// an operation names is not one the named pool holds.
+///
+/// Amazon Cognito reports an unresolved user pool IdP by naming what the request
+/// asked for — `asked_for` is the `ProviderName` an operation looked the IdP up
+/// by, or the `IdpIdentifier` when it looked it up by identifier — beside the
+/// pool it was looked up in, which the sentence calls the tenant. Every
+/// operation that resolves an IdP against a pool reports it the same way, so a
+/// read and a delete of the same absent provider answer the same sentence.
+pub fn identity_provider_not_found_message(asked_for: &str, user_pool_id: &str) -> String {
+    format!("Identity provider {asked_for} for tenantId {user_pool_id} does not exist.")
+}
+
 /// The message a `TermsExistsException` carries for a `TermsName` the app client
 /// already holds terms documents under.
 ///

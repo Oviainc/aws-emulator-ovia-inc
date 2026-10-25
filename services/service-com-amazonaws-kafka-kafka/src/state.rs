@@ -155,6 +155,41 @@ pub const CLUSTER_STATE_CREATING: &str = "CREATING";
 /// The `ClusterState` of a cluster an accepted update is still being applied to.
 pub const CLUSTER_STATE_UPDATING: &str = "UPDATING";
 
+/// The `ClusterState` of a cluster whose provisioning or repair did not succeed.
+pub const CLUSTER_STATE_FAILED: &str = "FAILED";
+
+/// The `ClusterState` values a cluster delete is accepted from.
+///
+/// These are the two values of the model's `ClusterState` enum
+/// (`crate::ops::types::CLUSTER_STATE_VALUES`) a cluster STAYS in until a caller
+/// asks for something else; every other value (`CREATING`, `UPDATING`,
+/// `DELETING`, `HEALING`, `MAINTENANCE`, `REBOOTING_BROKER`) is one the cluster
+/// is still moving out of under the service's own control, and a destructive
+/// call made while it is in flight is refused rather than applied. A cluster
+/// whose provisioning failed is still deletable — otherwise nothing could ever
+/// clear it.
+pub const CLUSTER_STATES_DELETE_IS_ACCEPTED_FROM: [&str; 2] =
+    [CLUSTER_STATE_ACTIVE, CLUSTER_STATE_FAILED];
+
+/// Whether a cluster reported in `state` may be deleted, per
+/// [`CLUSTER_STATES_DELETE_IS_ACCEPTED_FROM`]. One predicate, so every caller
+/// that destroys a cluster decides it the same way.
+pub fn is_deletable_cluster_state(state: &str) -> bool {
+    CLUSTER_STATES_DELETE_IS_ACCEPTED_FROM.contains(&state)
+}
+
+/// Whether a cluster reported in `state` has its broker nodes yet.
+///
+/// A cluster the service is still provisioning has none — that is what
+/// `CREATING` means — so an operation whose answer IS the brokers (their
+/// endpoints, their node records) or which acts on one of them has nothing to
+/// serve from until the cluster leaves that state. Every later state has the
+/// brokers, including the ones a cluster passes through while an update or a
+/// repair is applied to them.
+pub fn cluster_has_broker_nodes(state: &str) -> bool {
+    state != CLUSTER_STATE_CREATING
+}
+
 /// How long a cluster update (`UpdateConnectivity`, `UpdateStorage`,
 /// `UpdateBrokerStorage` and the
 /// sibling update operations) stays in flight before the cluster leaves
@@ -596,6 +631,28 @@ pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The requested resource doesn\u{201
 /// replicator by ARN answers one form instead of describing its own state.
 pub fn parameter_not_found_message(member: &str) -> String {
     format!("Invalid parameter {member}: {RESOURCE_NOT_FOUND_MESSAGE}")
+}
+
+/// The message Amazon MSK answers a cluster call it refuses because the cluster
+/// is not in a state that call is accepted from.
+///
+/// One fixed sentence per call, in the wording the service uses for that call —
+/// they are not one template — with one variable part each: the state the cluster
+/// is actually in, read from the stored record, so the caller is told why the
+/// call was refused and when to retry it.
+pub fn cluster_not_deletable_message(state: &str) -> String {
+    format!("You can't delete cluster in {state} state.")
+}
+
+/// The same refusal, for the reader of a cluster's bootstrap endpoints: there
+/// are no brokers to bootstrap against until the cluster has them.
+pub fn bootstrap_brokers_unavailable_message(state: &str) -> String {
+    format!("You can't get bootstrap brokers for a cluster that is in the {state} state.")
+}
+
+/// The same refusal, for the reader of a cluster's broker nodes.
+pub fn nodes_unavailable_message(state: &str) -> String {
+    format!("You can't list the nodes for a cluster that is in the {state} state.")
 }
 
 /// The input member every replicator operation resolves its target through, named

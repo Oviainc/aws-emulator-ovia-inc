@@ -161,3 +161,8 @@ mod refusal_message_fidelity;
 // authenticates twice, which drives both writers through the `ModifyUser` suite's reader.
 #[path = "all/user_authentication_mode_conflict.rs"]
 mod user_authentication_mode_conflict;
+
+// Appended for the same reason: the access-string refusal-wording suite, which drives
+// both writers of a rule list through the `ModifyUser` suite's reader.
+#[path = "all/access_string_refusal_wording.rs"]
+mod access_string_refusal_wording;

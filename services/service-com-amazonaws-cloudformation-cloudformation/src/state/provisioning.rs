@@ -292,7 +292,8 @@ impl StackProvenance {
 ///
 /// A stack operation is not one transition but a walk over the template's resources, and
 /// CloudFormation records the walk: an `*_IN_PROGRESS` event when it starts acting on a
-/// resource and a `*_COMPLETE` or `*_FAILED` event when the owning service has answered.
+/// resource, a second one that says the create was initiated in the service that owns it,
+/// and a `*_COMPLETE` or `*_FAILED` event when that service has answered.
 /// That is what names the resource a deployment failed on, and what carries the owning
 /// service's own refusal ([`Self::reason`]) — neither of which the STACK's own events can
 /// say, since they describe the operation as a whole.
@@ -317,15 +318,19 @@ pub struct ResourceTransition {
     /// resource" — the owning service's refusal for a failed transition, and nothing for
     /// one that succeeded.
     pub reason: Option<String>,
+    /// `StackEvent$ResourceProperties`: "BLOB of the properties used to create the
+    /// resource" — the properties document the template declares for it, which is what the
+    /// deployment asked the owning service for.
+    pub resource_properties: Option<String>,
     /// When the transition happened, which is the event's `Timestamp` ("Time the status was
     /// updated").
     pub at: SystemTime,
 }
 
 impl ResourceTransition {
-    /// The transition a resource is STARTING: `*_IN_PROGRESS`, with no identifier yet —
-    /// the owning service has not answered, so there is nothing to report as the physical
-    /// id.
+    /// The transition a resource is STARTING: `*_IN_PROGRESS`, reporting the identifier the
+    /// resource has at that point — the one it already carries for a change to a resource
+    /// that exists, and none for a create, where the owning service has not answered yet.
     fn starting(resource: &StoredResource, status: &str) -> Self {
         Self {
             logical_id: resource.logical_id.clone(),
@@ -333,7 +338,33 @@ impl ResourceTransition {
             physical_resource_id: None,
             status: status.to_string(),
             reason: None,
+            resource_properties: resource.properties_blob(),
             at: SystemTime::now(),
+        }
+    }
+
+    /// The transition that OPENS a resource's create: `CREATE_IN_PROGRESS` before anything
+    /// exists.
+    ///
+    /// `StackEvent$PhysicalResourceId` is "the name or unique identifier associated with
+    /// the physical instance of the resource", and there is no such instance yet, so this
+    /// event names an EMPTY one — the member is reported, and what it reports is that
+    /// nothing has been created under it so far.
+    fn creating(resource: &StoredResource) -> Self {
+        Self {
+            physical_resource_id: Some(String::new()),
+            ..Self::starting(resource, super::resource_status::CREATE_IN_PROGRESS)
+        }
+    }
+
+    /// The transition that reports the create of a resource was INITIATED: the second
+    /// `CREATE_IN_PROGRESS` CloudFormation records for it, once the request to create it
+    /// has gone to the service that owns it, naming the identifier it is being created
+    /// under.
+    fn initiated(resource: &StoredResource) -> Self {
+        Self {
+            reason: Some(super::RESOURCE_CREATION_INITIATED.to_string()),
+            ..Self::finished(resource, super::resource_status::CREATE_IN_PROGRESS, None)
         }
     }
 
@@ -346,6 +377,7 @@ impl ResourceTransition {
             physical_resource_id: super::physical_resource_id(resource),
             status: status.to_string(),
             reason,
+            resource_properties: resource.properties_blob(),
             at: SystemTime::now(),
         }
     }
@@ -510,10 +542,9 @@ pub async fn reconcile(
         // The deployment is CREATING this resource: the stack records it as one it created
         // once this is through, whether the create reaches an owning service or not, so the
         // transition that opens it is recorded here.
-        outcome.transitions.push(ResourceTransition::starting(
-            &resource,
-            super::resource_status::CREATE_IN_PROGRESS,
-        ));
+        outcome
+            .transitions
+            .push(ResourceTransition::creating(&resource));
         let created = match provisioner_for(&resource.resource_type) {
             // The resource is created WITH the tags CloudFormation gives it: the stack's
             // own, plus the three that name the stack and this resource's place in it.
@@ -526,6 +557,9 @@ pub async fn reconcile(
             // created, under the identifier the naming rules computed, so the completion of
             // that record is recorded too.
             None => {
+                outcome
+                    .transitions
+                    .push(ResourceTransition::initiated(&resource));
                 outcome.transitions.push(ResourceTransition::finished(
                     &resource,
                     super::resource_status::CREATE_COMPLETE,
@@ -544,6 +578,9 @@ pub async fn reconcile(
                 adopt_minted_identity(&mut resource, created.physical_resource_id);
                 resource.attributes.extend(created.attributes);
                 resource.materialised = true;
+                outcome
+                    .transitions
+                    .push(ResourceTransition::initiated(&resource));
                 outcome.transitions.push(ResourceTransition::finished(
                     &resource,
                     super::resource_status::CREATE_COMPLETE,

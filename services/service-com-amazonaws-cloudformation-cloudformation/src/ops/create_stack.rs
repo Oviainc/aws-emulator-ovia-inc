@@ -4,15 +4,17 @@
 //! IMPLEMENTED: allocates a stack id, persists the stack (template body verbatim,
 //! parameters, tags, capabilities, notification ARNs, stack policy and the rest of the
 //! request's configuration) in this service's store, records its `CREATE_IN_PROGRESS`
-//! event and answers the stack id. The template is then DEPLOYED: each resource it
-//! declares becomes a stack-resource record carrying the physical resource id
-//! CloudFormation's documented naming rules give it, and each declared output is
-//! evaluated against those resources and the stack's parameters, which is what
-//! `DescribeStacks` reports once the create completes. A request naming a live stack's
-//! name IN THE REGION IT IS SIGNED FOR is refused with the modelled
+//! event and answers the stack id. The template's PROCESSED stage is then DEPLOYED: each
+//! resource it declares becomes a stack-resource record carrying the physical resource id
+//! CloudFormation's documented naming rules give it, each one reporting its own events,
+//! and each declared output is evaluated against those resources and the stack's
+//! parameters, which is what `DescribeStacks` reports once the create completes. A request
+//! naming a live stack's name IN THE REGION IT IS SIGNED FOR is refused with the modelled
 //! `AlreadyExistsException` — a stack name is a per-Region namespace, so the same name in
-//! another Region is a second stack — and one naming a `RoleARN`
-//! the account's IAM records show CloudFormation cannot assume is refused with the
+//! another Region is a second stack — one whose template declares a transform it has not
+//! acknowledged with `CAPABILITY_AUTO_EXPAND` with the modelled
+//! `InsufficientCapabilitiesException`, and one naming a `RoleARN` the account's IAM
+//! records show CloudFormation cannot assume with the
 //! service's `ValidationError` (see `crate::state::role_trust_refusal`).
 //!
 //! It then CREATES those resources in the services that own them, through this
@@ -36,23 +38,27 @@
 //! `Capabilities` is WEIGHED against the template's own declarations: a template declaring
 //! an IAM resource the request did not acknowledge is refused with the modelled
 //! `InsufficientCapabilitiesException`, before the stack is created — see
-//! [`crate::state::insufficient_capabilities`]. It is weighed against the PROCESSED
+//! [`crate::state::insufficient_capabilities`] — and so is one that declares a TRANSFORM
+//! without `CAPABILITY_AUTO_EXPAND`. It is weighed against the PROCESSED
 //! template too, since a resource an included snippet contributes is one this stack would
 //! deploy.
 //!
 //! The template is PROCESSED before it is deployed: an `Fn::Transform` naming
 //! `AWS::Include` is the Amazon S3 object its `Location` names, read through this
 //! emulator's own in-process callback and spliced into the template
-//! ([`crate::state::include`]), so the members a snippet contributes reach the service that
-//! owns the resource and the intrinsic reaches nothing. A snippet that cannot be read fails
-//! the STACK — the create is accepted and answers a stack id, and the stack then fails and
-//! rolls back carrying the transform's own reason, with nothing provisioned.
+//! ([`crate::state::include`]), and the transforms the template declares are then applied
+//! to that spliced document ([`crate::state::template::process`]) — which is the stage
+//! `GetTemplate(TemplateStage=Processed)` serves and the stack deploys. A snippet that
+//! cannot be read fails the STACK — the create is accepted and answers a stack id, and the
+//! stack then fails and rolls back carrying the transform's own reason, with nothing
+//! provisioned.
 //!
-//! Two gaps are deliberate and predate the output evaluation, so a test author can see
-//! them: `ClientRequestToken` is stored as the operation's token but not checked for
-//! reuse, so the modelled `TokenAlreadyExistsException` is never answered; and a
-//! `TemplateBody` that is neither JSON nor YAML is stored (and declares no resources and
-//! no outputs) rather than refused with a template-format `ValidationError`.
+//! Two gaps are deliberate, so a test author can see them: `ClientRequestToken` is stored
+//! as the operation's token but not checked for reuse, so the modelled
+//! `TokenAlreadyExistsException` is never answered; and a `TemplateBody` that is neither
+//! JSON nor YAML is stored rather than refused with a template-format `ValidationError`
+//! (the create it opens then ends in the modelled `CREATE_FAILED`, because this service
+//! cannot deploy a template it cannot read).
 //!
 //! A template whose `Resources` section declares a resource type CloudFormation does not
 //! recognise IS refused, with HTTP 400 `ValidationError` naming those types, before the
@@ -350,6 +356,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a stored body is caller-sized otherwise.
         crate::state::validate_template_body(&template_body)
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // "If your stack template contains one or more macros, and you choose to create a
+        // stack directly from the processed template [...] you must acknowledge this
+        // capability" — the modelled refusal for the request that has not.
+        let missing = crate::state::missing_auto_expand_capability(
+            &template_body,
+            input.capabilities.as_deref().unwrap_or_default(),
+        );
+        if !missing.is_empty() {
+            return Err(CreateStackErrorModeled::InsufficientCapabilitiesException(
+                InsufficientCapabilitiesException {
+                    message: Some(crate::state::template::insufficient_capabilities_message(
+                        &missing,
+                    )),
+                },
+            )
+            .into());
+        }
         // The documented per-template quotas, which `DescribeAccountLimits` advertises as
         // this account's limits: a body declaring more than one of them allows is refused
         // HERE rather than created as a stack holding none of what it declares.
@@ -385,6 +408,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // empty previous set.
         let parameters = crate::state::merged_parameters(&[], input.parameters.as_deref())
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // Applying the template's transforms is caller-sized work, so it happens HERE —
+        // before the store lock below — and never while every other request waits on that
+        // lock. The stage it computes is what the stack deploys.
+        let processed_template = crate::state::template::process(&template_body);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // This service was mounted on an engine that is not the shared in-memory
@@ -434,10 +461,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // read from the store), so nothing below the lock has to compute anything from the
         // body.
         let operation_id = crate::state::new_operation_id();
-        let mut stack = StoredStack::new(
+        // "All events triggered by a given stack operation are assigned the same client
+        // request token": the caller's token when it named one, otherwise the one
+        // CloudFormation assigns the operation itself.
+        let client_request_token = input
+            .client_request_token
+            .clone()
+            .unwrap_or_else(crate::state::new_client_request_token);
+        let mut stack = StoredStack::new_processed(
             crate::state::new_stack_id(&region, &input.stack_name),
             input.stack_name.clone(),
             Some(template_body),
+            processed_template,
             now,
         );
         stack.region = region.clone();
@@ -462,32 +497,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::stored_deployment_config(input.deployment_config.as_ref());
         stack.rollback_configuration =
             crate::state::stored_rollback_configuration(input.rollback_configuration.as_ref());
-        stack.client_request_token = input.client_request_token.clone();
+        stack.client_request_token = Some(client_request_token.clone());
         stack.stack_policy_body = input.stack_policy_body.clone();
         stack.resource_types = input.resource_types.clone().unwrap_or_default();
 
         // What the template's processing left: the processed body is the one the stack
-        // deploys, and a processing FAILURE is the stack's own failure reason.
+        // deploys, and a processing FAILURE is the stack's own failure reason. The
+        // transforms the template declares are applied to the SPLICED document, so the
+        // stage served and deployed is the whole pipeline's — and, like the first pass
+        // above, that expansion happens before the store lock.
         let transform_failure = match processing {
             crate::state::include::Processed::Unchanged => None,
             crate::state::include::Processed::Expanded(processed) => {
+                stack.processed_template = crate::state::template::process(&processed);
                 stack.set_processed_template_body(processed);
                 None
             }
             crate::state::include::Processed::Failed(reason) => Some(reason),
         };
 
-        if transform_failure.is_some() {
+        // Everything the template's resources and outputs are computed from is now in
+        // place: materialise the resources its PROCESSED stage declares and evaluate its
+        // outputs, which `DescribeStacks` reports once the create completes. A template
+        // this service cannot deploy at all answers the reason here, and the create below
+        // ends in the modelled CREATE_FAILED with it.
+        let cannot_deploy = if transform_failure.is_some() {
             // Processing the template failed, so the create never reached the stage that
             // provisions anything: the stack declares no resource and no output, and the
             // reason below is the transform's rather than an owning service's.
             stack.deploy_nothing();
+            None
         } else {
-            // Everything the template's resources and outputs are computed from is now in
-            // place: materialise the resources it declares and evaluate its outputs, which
-            // `DescribeStacks` reports once the create completes.
-            stack.deploy_template();
-        }
+            stack.deploy_template().err()
+        };
 
         // The store lock is taken for the write and RELEASED at the end of this block:
         // the calls that create the stack's resources run after it, and each of those
@@ -575,14 +617,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "After the call completes successfully, the stack creation starts": the
             // stack is answered in CREATE_IN_PROGRESS and settles to CREATE_COMPLETE once
             // the clock makes that due. `begin_transition` is what records the operation
-            // the stack reports as its last.
+            // the stack reports as its last, and the token every event of this operation
+            // carries.
             stack.begin_transition(
                 now,
                 status::CREATE_IN_PROGRESS,
                 status::CREATE_COMPLETE,
                 Some(operation_id.clone()),
-                input.client_request_token.clone(),
+                Some(client_request_token),
             );
+            // The create was accepted — the request is valid and the stack exists — but
+            // this service cannot deploy that template, so the operation it started ends
+            // in the modelled CREATE_FAILED with the reason, never in a CREATE_COMPLETE
+            // reporting resources nothing created.
+            if let Some(reason) = cannot_deploy {
+                stack.fail_pending_transition(status::CREATE_FAILED, reason);
+            }
             let stack_id = stack.stack_id.clone();
             // What the template declared, as the deployment computed it: the resources
             // whose owning services now have to create them, and the stack identity and

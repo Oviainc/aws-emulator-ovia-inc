@@ -4,12 +4,12 @@
 //! Reads billing groups back out of state, applying the modelled filters and
 //! `MaxResults`/`NextToken` paging. A pure read: it writes nothing.
 //!
-//! LIMITATION: `BillingPeriod` selects the month to report for. A group's `Size` is
-//! the membership that was in force in that month
-//! (`crate::state::billing_group_sizes_in`); this emulator keeps no
-//! per-billing-period history of a group's own preferences, so those report the
-//! group's CURRENT ones. A page is always bounded — by the request's `MaxResults`, or
-//! by `crate::state::DEFAULT_PAGE_SIZE` when it names none.
+//! `BillingPeriod` selects the month to report for: a group is listed only for the
+//! periods from the one it was created in onward, its `Size` is the membership that was
+//! in force in that month (`crate::state::billing_group_sizes_in`) and its own
+//! preferences are the generation that was in force then
+//! (`crate::state::BillingGroupRecord::effective_in`). A page is always bounded — by the
+//! request's `MaxResults`, or by `crate::state::DEFAULT_PAGE_SIZE` when it names none.
 //!
 //! ## Shape of an operation
 //!
@@ -128,13 +128,16 @@ fn validation(reason: &str, field: &str, message: String) -> ListBillingGroupsEr
     .into()
 }
 
-/// Does `group` pass every filter the request set?
+/// Does `group`, as the generation `version` left it, pass every filter the request set?
 ///
 /// Each member of `ListBillingGroupsFilter` is an independent predicate and an
 /// absent one filters nothing; a list member matches when the group's value is one
-/// of the listed ones.
+/// of the listed ones. A filter selects on the values the period being read reports, so
+/// the members a write can change are taken from that period's generation and the ones
+/// no write can change from the record.
 fn matches(
     group: &crate::state::BillingGroupRecord,
+    version: &crate::state::BillingGroupVersion,
     filters: &ListBillingGroupsFilter,
 ) -> Result<bool, ListBillingGroupsError> {
     if let Some(arns) = &filters.arns {
@@ -147,17 +150,20 @@ fn matches(
         }
     }
     if let Some(pricing_plan) = &filters.pricing_plan {
-        if crate::state::normalize_pricing_plan_arn(pricing_plan) != group.pricing_plan_arn {
+        if crate::state::normalize_pricing_plan_arn(pricing_plan) != version.pricing_plan_arn {
             return Ok(false);
         }
     }
     if let Some(statuses) = &filters.statuses {
-        if !statuses.iter().any(|status| status == group.status()) {
+        if !statuses
+            .iter()
+            .any(|status| status == group.status_of(version))
+        {
             return Ok(false);
         }
     }
     if let Some(auto_associate) = filters.auto_associate {
-        if group.auto_associate.unwrap_or(false) != auto_associate {
+        if version.auto_associate.unwrap_or(false) != auto_associate {
             return Ok(false);
         }
     }
@@ -189,33 +195,40 @@ fn matches(
                 format!("unsupported search option {}", search.search_option),
             ));
         }
-        if !group.name.starts_with(&search.search_value) {
+        if !version.name.starts_with(&search.search_value) {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
-/// The modelled view of a stored group. `Size`, `Status`, `StatusReason` and
-/// `BillingGroupType` are derived from the record, never stored beside it; `Size` is
-/// the membership in force in the billing period the read is scoped to, which the
-/// caller passes in.
-fn element(group: &crate::state::BillingGroupRecord, size: i64) -> BillingGroupListElement {
+/// The modelled view of a stored group AS IT STOOD in the billing period being read:
+/// the generation in force then (`version`) carries the members a write can change, the
+/// record carries the ones no write can change, and `Size` is the membership in force in
+/// that period, which the caller passes in.
+///
+/// `Size`, `Status`, `StatusReason` and `BillingGroupType` are derived, never stored
+/// beside the group, so they cannot drift from what they are computed from.
+fn element(
+    group: &crate::state::BillingGroupRecord,
+    version: &crate::state::BillingGroupVersion,
+    size: i64,
+) -> BillingGroupListElement {
     BillingGroupListElement {
-        name: Some(group.name.clone()),
+        name: Some(version.name.clone()),
         arn: Some(group.arn.clone()),
-        description: group.description.clone(),
+        description: version.description.clone(),
         primary_account_id: group.primary_account_id.clone(),
         computation_preference: Some(ComputationPreference {
-            pricing_plan_arn: group.pricing_plan_arn.clone(),
+            pricing_plan_arn: version.pricing_plan_arn.clone(),
         }),
         size,
         creation_time: group.creation_time_millis,
-        last_modified_time: group.last_modified_time_millis,
-        status: Some(group.status().to_string()),
-        status_reason: group.status_reason(),
+        last_modified_time: version.last_modified_time_millis,
+        status: Some(group.status_of(version).to_string()),
+        status_reason: group.status_reason_of(version),
         account_grouping: Some(ListBillingGroupAccountGrouping {
-            auto_associate: group.auto_associate,
+            auto_associate: version.auto_associate,
             responsibility_transfer_arn: group.responsibility_transfer_arn.clone(),
         }),
         billing_group_type: Some(group.billing_group_type().to_string()),
@@ -272,19 +285,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `BillingPeriod` selects the month the report is read for, and an absent one
         // means the current month ("If you don't provide a billing group, the current
-        // billing period is used"): a group's `Size` is the membership that was in
-        // force then. The modelled pattern is enforced before the handler runs.
+        // billing period is used"): the listing answers for THAT month, so a group is
+        // reported only for the periods it existed in — from the one it was created in
+        // onward — with the generation of it that was in force then
+        // (`crate::state::BillingGroupRecord::effective_in`) and the membership that was
+        // in force then. The modelled pattern is enforced before the handler runs.
         let billing_period = input
             .billing_period
             .unwrap_or_else(crate::state::current_billing_period);
         let filters = input.filters.unwrap_or_default();
-        let mut selected: Vec<(String, &crate::state::BillingGroupRecord)> = Vec::new();
+        let mut selected: Vec<(
+            String,
+            (
+                &crate::state::BillingGroupRecord,
+                crate::state::BillingGroupVersion,
+            ),
+        )> = Vec::new();
         // `billing_groups` is ordered by ARN, and an ARN carries the monotonic id
         // this service mints, so the sequence is creation order and a `NextToken`
         // names the same cut point on the next call.
         for (arn, group) in &state.billing_groups {
-            if matches(group, &filters)? {
-                selected.push((arn.clone(), group));
+            let Some(version) = group.effective_in(&billing_period) else {
+                continue;
+            };
+            if matches(group, &version, &filters)? {
+                selected.push((arn.clone(), (group, version)));
             }
         }
 
@@ -294,13 +319,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // memberships rather than one pass per stored group.
         let (page, next_token) =
             crate::state::paginate(selected, input.next_token.as_deref(), input.max_results);
-        let page_arns: Vec<String> = page.iter().map(|group| group.arn.clone()).collect();
+        let page_arns: Vec<String> = page.iter().map(|(group, _)| group.arn.clone()).collect();
         let sizes = state.billing_group_sizes_in(&page_arns, &billing_period);
         let billing_groups: Vec<BillingGroupListElement> = page
             .iter()
-            .map(|group| {
+            .map(|(group, version)| {
                 element(
                     group,
+                    version,
                     sizes.get(&group.arn).copied().unwrap_or_default(),
                 )
             })

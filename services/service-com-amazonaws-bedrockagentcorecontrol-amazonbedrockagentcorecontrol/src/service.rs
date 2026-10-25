@@ -108,6 +108,13 @@ const ENDPOINT_PREFIX: &str = "bedrock-agentcore-control";
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The SAME shared engine the entry constructed every operation from, kept so
+    /// the pre-authorization seam below can read this service's store. A routing
+    /// decision that depends on stored state has no handler to read it in.
+    engine: Arc<Eng>,
+    /// The denial that seam serves, built once (it holds nothing per-request)
+    /// because `override_operation` hands back a borrow of `&self`.
+    denial: CapacityProviderDenial,
     /// Serves the MCP wire surface a gateway publishes — the endpoint `CreateGateway`
     /// hands back in `gatewayUrl`. Held on the service because
     /// [`Service::override_operation`] hands the router a BORROW of one of its own
@@ -120,6 +127,41 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// the generated table uses — and built from the SAME shared engine, so a wrapped
     /// operation reads and writes the one store.
     stated: OperationRoutingTable,
+}
+
+/// Answers one request with this service's modelled permissions refusal: HTTP 403
+/// `AccessDeniedException`, in the service's OWN protocol envelope.
+///
+/// An [`ErasedOperation`] rather than a modelled `Operation` because it answers a
+/// request the framework's centralized walk would refuse FIRST: that walk validates
+/// the model's input constraints before any handler runs, and this refusal is an
+/// authorization decision, which AWS takes before it validates. The envelope is not
+/// hand-rolled: it is rendered by the service's own model-derived renderer
+/// (`ErasedServiceDefinition::framework_error_response`), the same one every
+/// framework-level refusal of this service goes through, so the code, the status and
+/// the `x-amzn-errortype` header are the protocol's and not this file's.
+///
+/// The WORDS are the service's, stated once in
+/// [`crate::state::CAPACITY_PROVIDER_DENIAL`] and shared with the handler, so the seam
+/// and the operation cannot tell a caller two different things.
+struct CapacityProviderDenial;
+
+impl ErasedOperation for CapacityProviderDenial {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        let _ = (req, ctx);
+        Box::pin(async move {
+            svc.definition()
+                .framework_error_response(ProtocolError::Unauthenticated {
+                    code: crate::state::ACCESS_DENIED_SHAPE,
+                    message: crate::state::CAPACITY_PROVIDER_DENIAL,
+                })
+        })
+    }
 }
 
 /// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
@@ -332,7 +374,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         );
         Self {
             gateway_mcp: mcp::GatewayMcpSurface::new(Arc::clone(&engine)),
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
+            denial: CapacityProviderDenial,
             stated,
         }
     }
@@ -475,6 +519,30 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
+        // `ListAgentRuntimeVersionsByCapacityProvider` AUTHORIZES the capacity
+        // provider its path names before the request's input is validated: the
+        // operation models `AccessDeniedException` (403) and no not-found error, and
+        // the recorded service answers 403 `AccessDeniedException` — not 400 — for a
+        // `capacityProviderId` that names nothing in the account, including one
+        // outside the member's modelled format, which no capacity provider can have.
+        //
+        // The framework's centralized walk runs the model's constraint validation
+        // BEFORE any handler, so a handler cannot take a decision that precedes it;
+        // this seam can, which is the only reason the check is reached from here.
+        // The rule, and the same refusal for every id that gets past validation,
+        // live in the operation's own file. A provider this account holds falls
+        // through to the modelled operation below, whose walk validates the request
+        // as usual.
+        if let Some(id) =
+            crate::state::capacity_provider_runtime_versions_id(req.method(), req.uri())
+        {
+            let unheld = crate::state::service_state(&*self.engine)
+                .is_some_and(|state| !state.lock().holds_capacity_provider(&id));
+            if unheld {
+                return Some(&self.denial as &dyn ErasedOperation);
+            }
+        }
+
         // NOT a re-route: the key is the one the generated table's own protocol resolves,
         // and the operation it names is the one served — wrapped in
         // [`StatedPerOperation`] so a request that breaks a modelled constraint is refused

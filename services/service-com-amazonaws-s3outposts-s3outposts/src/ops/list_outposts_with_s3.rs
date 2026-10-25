@@ -153,53 +153,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The cursor is the Outpost id the next page starts at.
-        if let Some(token) = input.next_token.as_deref() {
-            if !crate::state::is_outpost_id(token) {
-                return Err(ListOutpostsWithS3ErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(format!(
-                            "NextToken {token:?} is not a token returned by ListOutpostsWithS3"
-                        )),
-                    },
-                )
-                .into());
-            }
-        }
+        // The cursor is the Outpost id the next page starts at. A token this
+        // service never issued is refused rather than served as an arbitrary
+        // page.
+        let resume = crate::state::outpost_cursor(input.next_token.as_deref(), Self::NAME)
+            .map_err(ListOutpostsWithS3ErrorModeled::ValidationException)?;
 
-        let page_size = crate::state::page_size(input.max_results);
         let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
 
-        let mut outposts = Vec::with_capacity(page_size);
-        let mut next_token = None;
-        for (outpost_id, outpost) in &store.outposts {
-            // Resume at the first id at or after the cursor.
-            if input
-                .next_token
-                .as_deref()
-                .is_some_and(|token| outpost_id.as_str() < token)
-            {
-                continue;
-            }
-            if outposts.len() == page_size {
-                next_token = Some(outpost_id.clone());
-                break;
-            }
-            // Every Outpost in the store has S3 capacity provisioned and is
-            // either owned by this caller or shared with it, which is what this
-            // operation reports.
-            outposts.push(outpost.to_outpost(&region));
-        }
+        // The walk, the page bound and the cursor are the one listing rule this
+        // service's listings serve, so they live in `crate::state`; what is this
+        // operation's own is the inventory it walks and the `Outpost` shape it
+        // projects each record into.
+        let page = crate::state::outpost_page(&store, &region, input.max_results, resume);
 
         // An account with no S3 on Outposts capacity provisioned holds no
-        // Outpost records, so the page above is empty — and `next_token` is set
-        // only where the loop found a record BEYOND the page it served, so the
+        // Outpost records, so the page above is empty — and the cursor is minted
+        // only where the walk found a record BEYOND the page it served, so the
         // last page of any listing, an empty one included, carries no token at
         // all.
         Ok(ListOutpostsWithS3Output {
-            outposts: Some(outposts),
-            next_token,
+            outposts: Some(page.items),
+            next_token: page.next_token,
         })
     }
 }

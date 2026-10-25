@@ -14,7 +14,8 @@
 //! ordered list into pages with the modelled `Token` the next page resumes from, the
 //! orderable-instance-type catalog and the catalog of orderable hardware
 //! configurations this service publishes, the hardware an Outpost of a given form
-//! factor is installed with, pricing a renewal of the subscription an
+//! factor is installed with, the instance types an Outpost's EC2 capacity is
+//! configured with, pricing a renewal of the subscription an
 //! Outpost's orders hold, and
 //! the two rules this service words its refusals by — the `NotFoundException`
 //! identifier echo and the value-omitting `ValidationException` report.
@@ -27,7 +28,7 @@ use smithy_server_runtime::{Violation, ViolationKind};
 use crate::ops::types::{
     Address, AssetInfo, AssetInstance, AssetLocation, CapacityTaskFailure, CatalogItem,
     ComputeAttributes, ConnectionDetails, DetailedInstanceTypeItem, EC2Capacity, FormFactorConfig,
-    InstanceTypeCapacity, InstancesToExclude, Order, Outpost, PricingOption,
+    InstanceTypeCapacity, InstanceTypeItem, InstancesToExclude, Order, Outpost, PricingOption,
     PrivateConnectivityConfig, Quote, Site, SubscriptionPricingDetails,
 };
 
@@ -2156,15 +2157,151 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         in_region_mut(&mut self.orders, region, order_id)
     }
 
+    /// The hardware configuration this service publishes under the `SkuCode`
+    /// `catalog_item_id`, or `None` for a code of that form it publishes nothing
+    /// under — which this service holds no published hardware facts for.
+    pub fn catalog_item(&self, catalog_item_id: &str) -> Option<&CatalogItemRecord> {
+        self.catalog_items
+            .iter()
+            .find(|record| record.item.catalog_item_id.as_deref() == Some(catalog_item_id))
+    }
+
     /// How many vCPUs of EC2 capacity this service publishes for the catalog item
     /// `catalog_item_id` names, or `None` for a SKU it publishes no configuration
     /// under — a code of the modelled `SkuCode` form that names nothing in the
     /// catalog, which this service holds no published hardware facts for.
     pub fn catalog_item_capacity_vcpus(&self, catalog_item_id: &str) -> Option<i32> {
-        self.catalog_items
-            .iter()
-            .find(|record| record.item.catalog_item_id.as_deref() == Some(catalog_item_id))
+        self.catalog_item(catalog_item_id)
             .map(|record| record.capacity_vcpus)
+    }
+
+    /// The number of DEFAULT vCPUs this service publishes for one instance type, or
+    /// `None` for a type its catalog does not publish — a figure the emulator does
+    /// not have, and never one it invents.
+    ///
+    /// Read off the one orderable-instance-type catalog
+    /// ([`Self::orderable_instance_types`]), so what any report of this service says
+    /// about an instance type cannot disagree with what `ListOrderableInstanceTypes`
+    /// says about it.
+    pub fn published_vcpus(&self, instance_type: &str) -> Option<i32> {
+        self.orderable_instance_types
+            .iter()
+            .find(|record| record.instance_type.instance_type.as_deref() == Some(instance_type))
+            .and_then(|record| record.instance_type.vcp_us)
+    }
+
+    /// The instance types the EC2 capacity of the Outpost `outpost_id` names in
+    /// `region` is CURRENTLY CONFIGURED with, in one stable order and each carrying
+    /// the number of default vCPUs the catalog publishes for it.
+    ///
+    /// What an Outpost's capacity is configured with is a record of this store, not a
+    /// fact about what its hardware could run — that wider question is the capability
+    /// report, which "will generally include instance types that are not currently
+    /// configured". Two records configure it, and a capacity task is the later of
+    /// them:
+    ///
+    /// * a COMPLETED capacity task. "The instance type capacities configured for this
+    ///   asset. This can be changed through a capacity task", as
+    ///   `ComputeAttributes$InstanceTypeCapacities` documents it, so the pools of such
+    ///   a task are the capacity configured on the hardware that task named — one
+    ///   asset of the Outpost, or the Outpost itself when the task named none — and on
+    ///   each of those the task that completed LAST is the configuration that stands.
+    ///   A task still being worked through, or one that failed or was cancelled, has
+    ///   configured nothing; and a pool of `Count` zero ("the number of instances for
+    ///   the specified instance type") configures no instance of its type, so it names
+    ///   no configured instance type.
+    /// * the ORDER its hardware arrived on, until a capacity task reconfigures it. A
+    ///   published configuration carries EC2 capacity of one or more instance
+    ///   families, each at the largest size that hardware runs ([`ec2_capacities`]),
+    ///   so an Outpost is configured with those sizes of the configurations its
+    ///   uncancelled orders subscribe to — the same records the subscribed capacity is
+    ///   read off ([`Self::subscribed_capacity_vcpus`]). A line item naming a catalog
+    ///   item this service publishes no configuration for contributes nothing.
+    ///   Capacity is configured ON compute hardware, so an Outpost holding none —
+    ///   one still provisioning, or one whose form factor names no configuration this
+    ///   service installs — is configured with nothing.
+    pub fn configured_instance_types(
+        &self,
+        region: &str,
+        outpost_id: &str,
+    ) -> Vec<InstanceTypeItem> {
+        self.configured_instance_type_names(region, outpost_id)
+            .into_iter()
+            .map(|instance_type| InstanceTypeItem {
+                vcp_us: self.published_vcpus(&instance_type),
+                instance_type: Some(instance_type),
+            })
+            .collect()
+    }
+
+    /// The instance types [`Self::configured_instance_types`] reports, as the bare
+    /// type names in the order they are reported in.
+    fn configured_instance_type_names(&self, region: &str, outpost_id: &str) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        // The capacity task that stands on each piece of hardware a task has
+        // configured on this Outpost. Walked in the hardware's own key order (the
+        // Outpost itself first, then its assets by id) so one store answers the
+        // configured types in the same order on every read.
+        let mut standing: BTreeMap<Option<&str>, &CapacityTaskRecord> = BTreeMap::new();
+        for task in self.capacity_tasks.values().filter(|task| {
+            task.outpost_id == outpost_id && task.status == CAPACITY_TASK_COMPLETED
+        }) {
+            let scope = task.asset_id.as_deref();
+            let supersedes = standing.get(&scope).is_none_or(|standing| {
+                (standing.completed_at, standing.sequence) < (task.completed_at, task.sequence)
+            });
+            if supersedes {
+                standing.insert(scope, task);
+            }
+        }
+        if !standing.is_empty() {
+            for task in standing.values() {
+                for pool in &task.requested_instance_pools {
+                    if pool.count > 0 {
+                        push_once(&mut names, &pool.instance_type);
+                    }
+                }
+            }
+            return names;
+        }
+        // Nothing has reconfigured this Outpost, so what is configured on it is what
+        // its hardware arrived carrying — and an Outpost holding no compute hardware
+        // carries no capacity at all.
+        let holds_compute = self.outpost(region, outpost_id).is_some_and(|record| {
+            record
+                .assets
+                .iter()
+                .any(|asset| asset.compute_attributes.is_some())
+        });
+        if !holds_compute {
+            return names;
+        }
+        let mut orders: Vec<&OrderRecord> = all_in_region(&self.orders, region)
+            .filter(|record| {
+                record.order.outpost_id.as_deref() == Some(outpost_id)
+                    && record.order.status.as_deref() != Some(ORDER_STATUS_CANCELLED)
+            })
+            .collect();
+        // In the order the hardware was ordered, so the report does not depend on how
+        // the order store happens to be keyed.
+        orders.sort_by_key(|record| record.sequence);
+        for record in orders {
+            for item in record.order.line_items.iter().flatten() {
+                let Some(catalog_item) = item
+                    .catalog_item_id
+                    .as_deref()
+                    .and_then(|catalog_item_id| self.catalog_item(catalog_item_id))
+                else {
+                    continue;
+                };
+                for capacity in catalog_item.item.ec2_capacities.iter().flatten() {
+                    if let Some(max_size) = capacity.max_size.as_deref() {
+                        push_once(&mut names, max_size);
+                    }
+                }
+            }
+        }
+        names
     }
 
     /// The EC2 capacity, in vCPUs, UNDER SUBSCRIPTION on the Outpost `outpost_id`
@@ -3769,6 +3906,16 @@ pub const ASSET_INSTANCE_PAGE: &str = "assetInstances";
 /// them is therefore not a boundary of the other. See [`OUTPOST_PAGE`].
 pub const SUPPORTED_INSTANCE_TYPE_PAGE: &str = "supportedInstanceTypes";
 
+/// The stamp a `GetOutpostInstanceTypes` page token carries.
+///
+/// What that report pages through is the instance types one Outpost's capacity is
+/// CONFIGURED with
+/// ([`ComAmazonawsOutpostsOutpostsolafserviceState::configured_instance_types`]) — a
+/// different list from the capability report [`SUPPORTED_INSTANCE_TYPE_PAGE`] stamps
+/// and from the published catalog [`ORDERABLE_INSTANCE_TYPE_PAGE`] stamps — so a
+/// token issued for one of them is not a boundary of another. See [`OUTPOST_PAGE`].
+pub const CONFIGURED_INSTANCE_TYPE_PAGE: &str = "outpostInstanceTypes";
+
 /// The page size a list uses when the caller named no `MaxResults`, which is also
 /// the ceiling the model declares for it (`MaxResults1000`, `range(1..1000)`).
 pub const MAX_RESULTS: i32 = 1000;
@@ -3839,6 +3986,19 @@ pub fn page_size(max_results: Option<i32>) -> usize {
     usize::try_from(max_results.unwrap_or(MAX_RESULTS))
         .unwrap_or(MAX_RESULTS as usize)
         .clamp(1, MAX_RESULTS as usize)
+}
+
+/// Append `value` to `values` unless it is already there, keeping the position it
+/// first appeared in.
+///
+/// What a caller is reported is a LIST of distinct values, and more than one record
+/// of this store can name the same one (two orders of the same configuration, two
+/// pieces of hardware configured with the same instance type), so the first record
+/// that names a value fixes where it is reported and the next changes nothing.
+fn push_once(values: &mut Vec<String>, value: &str) {
+    if !values.iter().any(|held| held == value) {
+        values.push(value.to_string());
+    }
 }
 
 /// Cut one page out of an already-filtered sequence of records, and issue the token

@@ -31,6 +31,8 @@ mod cors_configuration;
 mod constraint_refusal;
 #[path = "all/create_api_modelled_outcomes.rs"]
 mod create_api_modelled_outcomes;
+#[path = "all/deployment_deletion.rs"]
+mod deployment_deletion;
 #[path = "all/deployment_lifecycle.rs"]
 mod deployment_lifecycle;
 #[path = "all/deployment_pagination.rs"]

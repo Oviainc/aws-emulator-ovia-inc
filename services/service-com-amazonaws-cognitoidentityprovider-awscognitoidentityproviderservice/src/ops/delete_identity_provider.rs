@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIdentityProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteIdentityProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteIdentityProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -176,20 +167,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteIdentityProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteIdentityProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteIdentityProvider"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let mut guard = state.lock();
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // "Deletes a user pool identity provider (IdP)" — the IdP has to be one the
+        // named pool holds. `ProviderNameType` carries no case-insensitivity trait,
+        // so the name is matched exactly as `CreateIdentityProvider` stored it, and
+        // the IdP identifiers the provider carried go with it, so a later lookup by
+        // identifier no longer finds it either.
+        if pool.identity_providers.remove(&input.provider_name).is_none() {
+            return Err(provider_not_found(
+                &input.provider_name,
+                &input.user_pool_id,
+            ));
+        }
+
+        // "After you delete an IdP, users can no longer sign in to your user pool
+        // through that IdP" (this operation's model documentation): an app client
+        // offers only IdPs its pool still holds, so the deleted name is dropped from
+        // every app client that listed it in `SupportedIdentityProviders` rather than
+        // left behind naming a provider that no longer exists. A client that listed
+        // only this IdP keeps the member it was configured with, now holding none.
+        for client in pool.clients.values_mut() {
+            if let Some(supported) = client.supported_identity_providers.as_mut() {
+                supported.retain(|supported_name| supported_name != &input.provider_name);
+            }
+        }
+
+        Ok(DeleteIdentityProviderOutput)
     }
 }
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> DeleteIdentityProviderError {
+    DeleteIdentityProviderErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for a provider name the pool does
+/// not hold, worded as every operation that resolves an IdP against a pool words
+/// it ([`crate::state::identity_provider_not_found_message`]).
+fn provider_not_found(provider_name: &str, user_pool_id: &str) -> DeleteIdentityProviderError {
+    DeleteIdentityProviderErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::identity_provider_not_found_message(
+            provider_name,
+            user_pool_id,
+        )),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> DeleteIdentityProviderError {
+    DeleteIdentityProviderErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
+}
+

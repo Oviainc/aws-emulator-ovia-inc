@@ -134,17 +134,18 @@ impl From<TagResourceErrorModeled> for TagResourceError {
 
 /// Why this request's `Tags` map cannot be served, or `None` when it can.
 ///
-/// Each key's and value's length and form are MODELLED (`TagsMap`'s `@length` and
-/// `@pattern`), so the centralized walk has already refused anything outside them; what
-/// the model does not say is how MANY entries the map may carry, so the only bound left
-/// is the store's own (`crate::state::MAX_TAGS`, the most tags one configuration manager
-/// may carry), checked before the store lock is taken. An EMPTY map needs no refusal:
-/// assigning no pair is the same no-op as re-assigning a value a key already holds.
+/// Two rules, both applied before the store lock is taken, because each key's and each
+/// value's length and form are MODELLED (`TagsMap`'s `@length` and `@pattern`) and so
+/// already refused by the centralized walk:
 ///
-/// The key pattern admits `:`, so it also admits a key under the AWS-reserved prefix,
-/// which names a tag that is not the caller's to assign: that is refused here too, by
-/// `crate::state::reserved_tag_key_rejection` — the one place that rule lives, shared
-/// with every other member of this service that takes tag keys from the caller.
+/// * the model does not say how MANY entries the map may carry, so that bound is the
+///   store's own (`crate::state::MAX_TAGS`, the most tags one configuration manager may
+///   carry). An EMPTY map needs no refusal: assigning no pair is the same no-op as
+///   re-assigning a value a key already holds;
+/// * the key pattern admits `:`, so it also admits a key under the AWS-reserved prefix,
+///   which names a tag that is not the caller's to assign: that is refused by
+///   `crate::state::reserved_tag_key_rejection` — the one place that rule lives, shared
+///   with every other member of this service that takes tag keys from the caller.
 fn tags_rejection(tags: &::std::collections::HashMap<String, String>) -> Option<String> {
     if tags.len() > crate::state::MAX_TAGS {
         return Some(format!(

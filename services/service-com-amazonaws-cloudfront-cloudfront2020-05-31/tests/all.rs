@@ -121,6 +121,8 @@ mod tenant_distribution_and_method_order;
 mod tenant_invalidations;
 #[path = "all/tenant_web_acl_association.rs"]
 mod tenant_web_acl_association;
+#[path = "all/tenant_web_acl_disassociation_scope.rs"]
+mod tenant_web_acl_disassociation_scope;
 #[path = "all/verify_dns_configuration.rs"]
 mod verify_dns_configuration;
 #[path = "all/web_acl_association.rs"]

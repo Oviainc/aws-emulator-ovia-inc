@@ -18,10 +18,10 @@
 //! count of declared outputs. The issue's own case (a YAML `AWS::SNS::Topic` template
 //! whose one output is `!Ref` of the topic) is the first row.
 
-use crate::stack_lifecycle::{
-    acknowledging_iam, call, create_stack, describe_stack, expected_status, member, router,
-    wait_for_the_transition, xml_text, xml_unescape, ACCOUNT_ID, REGION,
+use crate::harness::{
+    call, create_stack, member, router, wait_for_the_transition, xml_text, xml_unescape, REGION,
 };
+use crate::stack_lifecycle::{acknowledging_iam, describe_stack, expected_status, ACCOUNT_ID};
 use service_com_amazonaws_cloudformation_cloudformation::state::template::MAX_OUTPUTS_PER_TEMPLATE;
 use service_com_amazonaws_cloudformation_cloudformation::state::{
     status, TEMPLATE_BODY_MAX_BYTES,

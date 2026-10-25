@@ -347,6 +347,9 @@ async fn a_tool_call_is_translated_into_an_invocation_of_the_target_function() {
     let router = router();
     let lambda_arn = create_function(&router, "mcp-writer").await;
     let (gateway_id, url) = create_gateway(&router, "callgateway").await;
+    // A gateway takes a target only once the clock-owed transition out of `CREATING` has
+    // come due, so this waits that transition out before the target is added.
+    tokio::time::sleep(PAST_SETTLE).await;
     create_target(&router, &gateway_id, "writer", "put_object", &lambda_arn).await;
     tokio::time::sleep(PAST_SETTLE).await;
 
