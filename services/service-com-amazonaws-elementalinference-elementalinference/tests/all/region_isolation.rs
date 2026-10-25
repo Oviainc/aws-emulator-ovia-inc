@@ -19,17 +19,14 @@
 //! service holds (feed and dictionary), and across EVERY operation that reaches one by
 //! its id — the probes in [`feed_probes`] and [`dictionary_probes`].
 
-use crate::harness::{call_in_region, minimal_feed, output_config, router, tags_path};
+use crate::harness::{
+    call_in_region, listed_ids, minimal_feed, output_config, router, tags_path,
+};
 use serde_json::{json, Value};
 use service_com_amazonaws_elementalinference_elementalinference::state::{
     MAX_DICTIONARIES, MAX_FEEDS, NOT_FOUND_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
-
-/// The largest page a list of this service admits
-/// (`smithy_query(query="operation",operation="ListFeeds")` gives `maxResults` the
-/// range `{min: 1, max: 100}`), so one call reports everything a Region holds here.
-const PAGE_SIZE: usize = 100;
 
 /// The Regions these cases sign for.
 ///
@@ -216,39 +213,6 @@ async fn create_dictionary_in(
             .expect("a created dictionary carries an arn")
             .to_string(),
     )
-}
-
-/// The ids one endpoint's list operation reports, sorted so a comparison does not
-/// depend on which Region minted an id first.
-async fn listed_ids(
-    router: &MultiServiceRouter,
-    region: &str,
-    path: &str,
-    member: &str,
-) -> Vec<String> {
-    let uri = format!("{path}?maxResults={PAGE_SIZE}");
-    let (status, page) = call_in_region(router, region, "GET", &uri, None).await;
-    assert_eq!(
-        status, 200,
-        "case {region:?}: GET {uri} answers 200, got {status} with {page}"
-    );
-    assert!(
-        page["nextToken"].is_null(),
-        "case {region:?}: every resource of this Region fits in one page, got {page}"
-    );
-    let mut ids: Vec<String> = page[member]
-        .as_array()
-        .unwrap_or_else(|| panic!("case {region:?}: GET {uri} reports a {member} array, got {page}"))
-        .iter()
-        .map(|summary| {
-            summary["id"]
-                .as_str()
-                .expect("a summary carries an id")
-                .to_string()
-        })
-        .collect();
-    ids.sort();
-    ids
 }
 
 /// The ids `owner` minted among `owned`, sorted — what that Region's list must report.
