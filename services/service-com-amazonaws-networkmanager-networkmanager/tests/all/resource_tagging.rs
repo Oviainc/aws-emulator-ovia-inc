@@ -31,7 +31,7 @@ pub(crate) const MAX_KEY_CHARS: usize = 128;
 pub(crate) const MAX_VALUE_CHARS: usize = 256;
 
 /// AWS's published tagging limit — 50 tags per resource.
-const MAX_TAGS: usize = 50;
+pub(crate) const MAX_TAGS: usize = 50;
 
 /// Percent-encode `value` so it survives one URI segment or one query value.
 ///
