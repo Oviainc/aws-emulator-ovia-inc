@@ -14,7 +14,8 @@
 //!
 //! The table in [`rows`] is the class the rule ranges over: one row per paginated
 //! operation of this service, the rows differing in the store the page is drawn
-//! from (policies, organization accounts, resource sets, applications and
+//! from (policies, organization accounts, resource sets, one resource set's
+//! membership, applications and
 //! protocols lists, a vendor's firewall policies, compliance entries, the
 //! organization's administrators, a Shield Advanced attack inventory, and the
 //! cross-service inventory `ListDiscoveredResources` discovers), in whether the
@@ -329,6 +330,47 @@ async fn seeded() -> (MultiServiceRouter, Vec<Paginated>) {
         .await;
     }
 
+    // A resource set holding `SEEDED` resources, so the membership
+    // `ListResourceSetResources` pages is a collection of its own. The resources
+    // belong to an account the scoped policy above names, which is what puts
+    // them in the organization and makes them associable.
+    let created = ok(
+        &router,
+        "membership-set",
+        "PutResourceSet",
+        &json!({
+            "ResourceSet": {
+                "Name": "membership-set",
+                "ResourceTypeList": [state::RESOURCE_TYPE_EC2_INSTANCE],
+            },
+        }),
+    )
+    .await;
+    let membership_set = created["ResourceSet"]["Id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case membership-set: PutResourceSet reported no Id: {created}"))
+        .to_string();
+    let members: Vec<String> = (0..SEEDED)
+        .map(|index| {
+            format!(
+                "arn:aws:ec2:{REGION}:{}:instance/i-{index:017x}",
+                SCOPE_ACCOUNTS[0]
+            )
+        })
+        .collect();
+    let associated = ok(
+        &router,
+        "membership-set",
+        "BatchAssociateResource",
+        &json!({ "ResourceSetIdentifier": membership_set, "Items": members }),
+    )
+    .await;
+    assert_eq!(
+        associated["FailedItems"],
+        json!([]),
+        "case membership-set: every seeded member must associate, got {associated}"
+    );
+
     with_store(&engine, |store| {
         // A third-party firewall policy is created in the VENDOR's console and no
         // Firewall Manager operation creates one, so the only honest source of
@@ -425,6 +467,15 @@ async fn seeded() -> (MultiServiceRouter, Vec<Paginated>) {
             operation: "ListResourceSets",
             request: json!({}),
             page: Page::Structs("ResourceSets", "Id"),
+            max_results_required: false,
+            // The `SEEDED` sets of the loop above plus the one holding the
+            // membership `ListResourceSetResources` pages.
+            seeded: SEEDED + 1,
+        },
+        Paginated {
+            operation: "ListResourceSetResources",
+            request: json!({ "Identifier": membership_set }),
+            page: Page::Structs("Items", "URI"),
             max_results_required: false,
             seeded: SEEDED,
         },

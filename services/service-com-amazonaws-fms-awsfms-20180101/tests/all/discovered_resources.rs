@@ -1138,15 +1138,22 @@ async fn a_discovered_resource_is_associable() {
         &json!({ "Identifier": id }),
     )
     .await;
-    // The membership is read through the store below, because the modelled
-    // reader is still a scaffold stub tracked by its own issue. Whether it
-    // answers 501 today or the resources once it is implemented is that issue's
-    // business, not this suite's: either is accepted, so implementing it cannot
-    // fail a discovery test.
-    assert!(
-        status == 501 || status == 200,
-        "ListResourceSetResources must either answer its membership or refuse as the \
-         unimplemented operation it is, got {status} with {listed}"
+    // The modelled reader answers the membership, so a discovered resource is
+    // reportable through the API the whole way round: discovery, association,
+    // then the membership report.
+    assert_eq!(
+        status, 200,
+        "ListResourceSetResources must answer the set's membership, got {status} with {listed}"
+    );
+    let reported: Vec<String> = listed["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the response must carry an Items list, got {listed}"))
+        .iter()
+        .map(|item| item["URI"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        reported, discovered,
+        "the reported membership must be the discovered resource, got {listed}"
     );
     let held = with_store(&engine, |store| {
         store.resource_sets[&id]
