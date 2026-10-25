@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetSecretValue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetSecretValue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetSecretValue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads the current value of up to twenty secrets in one call: the caller either
+//! lists the secrets or selects them with filters, a problem with the REQUEST
+//! fails the whole call, and a problem with ONE secret is an entry in `Errors`
+//! inside a 200.
 //!
 //! ## Shape of an operation
 //!
@@ -179,20 +174,215 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetSecretValue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetSecretValueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetSecretValue"))
+        // "To choose which secrets to retrieve, you can specify a list of
+        // secrets by name or ARN, or you can use filters", and "You must include
+        // Filters or SecretIdList, but not both."
+        // (`BatchGetSecretValueRequest$SecretIdList`, this service's Smithy
+        // model.) A problem with the REQUEST fails the whole call; a problem with
+        // one secret INSIDE a valid request is reported per entry in `Errors`.
+        let ids = input.secret_id_list.as_deref();
+        let filters = input.filters.as_deref();
+        match (ids, filters) {
+            (None, None) => {
+                return Err(invalid_parameter(
+                    "You must specify a list of Secret IDs or a filter value.",
+                ));
+            }
+            (Some(_), Some(_)) => {
+                return Err(invalid_parameter(
+                    "You can't specify both SecretIdList and Filters in the same request.",
+                ));
+            }
+            _ => {}
+        }
+        if let Some(ids) = ids {
+            // The batch is bounded at `SECRETS_PER_BATCH` ids; past that the
+            // request itself is wrong, so the whole call is refused rather than
+            // the surplus ids being reported per entry.
+            if ids.len() > crate::state::SECRETS_PER_BATCH {
+                return Err(invalid_parameter(too_many_ids_message()));
+            }
+            // "You cannot enter duplicate secrets in the secret ID list": the
+            // same secret twice in one batch would be answered twice, so the
+            // request is refused and names the id that repeats.
+            for (position, id) in ids.iter().enumerate() {
+                if ids.iter().take(position).any(|earlier| earlier == id) {
+                    return Err(BatchGetSecretValueErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(format!(
+                                "Duplicate secret ID encountered: {id}. You cannot enter \
+                                 duplicate secrets in the secret ID list."
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let mut store = state.lock();
+        // The only write this read performs: dropping secrets whose deletion the
+        // clock has already made due, which was owed at this instant whether or
+        // not anybody called.
+        let now = ::std::time::SystemTime::now();
+        store.expire_due(now);
+
+        // What this call selects, in the order it answers: the ids the caller
+        // listed, or — for the filter form — the names of the secrets every
+        // filter holds for. A secret inside its recovery window is left out of
+        // the filter form, the same way the listing leaves it out unless the
+        // caller asks for it: the filter form selects secrets, it does not
+        // address them.
+        let selected: Vec<String> = match (ids, filters) {
+            (Some(ids), _) => ids.to_vec(),
+            (None, filters) => {
+                let filters = filters.unwrap_or_default();
+                store
+                    .secrets
+                    .values()
+                    .filter(|secret| !secret.scheduled_for_deletion())
+                    .filter(|secret| {
+                        filters
+                            .iter()
+                            .all(|filter| crate::state::matches_filter(secret, filter))
+                    })
+                    .map(|secret| secret.name.clone())
+                    .collect()
+            }
+        };
+
+        // The cursor names the first selection of the page to answer, so the
+        // next page resumes exactly where this one ends.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resume = crate::state::decode_next_token(token)
+                    .and_then(|cursor| selected.iter().position(|id| *id == cursor));
+                match resume {
+                    Some(index) => index,
+                    None => {
+                        return Err(
+                            BatchGetSecretValueErrorModeled::InvalidNextTokenException(
+                                InvalidNextTokenException {
+                                    message: Some(
+                                        crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                                    ),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                }
+            }
+        };
+        // "The number of results to include in the response. If there are more
+        // results available, in the response, Secrets Manager includes
+        // NextToken." With no `MaxResults` the page is the whole batch this
+        // operation reads — "up to 20 secrets" (see `state::SECRETS_PER_BATCH`).
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(crate::state::SECRETS_PER_BATCH)
+            .clamp(1, crate::state::SECRETS_PER_BATCH);
+
+        let mut values = Vec::new();
+        let mut errors = Vec::new();
+        for secret_id in selected.iter().skip(start).take(page_size) {
+            match entry_for(&store, secret_id) {
+                Ok(entry) => values.push(entry),
+                Err(error) => errors.push(error),
+            }
+        }
+        let next_token = selected
+            .get(start + values.len() + errors.len())
+            .map(|cursor| crate::state::encode_next_token(cursor));
+
+        Ok(BatchGetSecretValueOutput {
+            secret_values: Some(values),
+            errors: Some(errors),
+            next_token,
+        })
     }
+}
+
+/// One selection's answer: the value of its current version, or the per-entry
+/// error that secret alone failed with.
+///
+/// "If Secrets Manager encounters errors such as `AccessDeniedException` while
+/// attempting to retrieve any of the secrets, you can see the errors in `Errors`
+/// in the response." (`BatchGetSecretValue`, this service's Smithy model.) So a
+/// secret this service does not hold, one inside its recovery window, and one
+/// with no current version are each ONE entry in `Errors` inside a 200 — never
+/// the whole call failing.
+fn entry_for(
+    store: &crate::state::ComAmazonawsSecretsmanagerSecretsmanagerState,
+    secret_id: &str,
+) -> Result<SecretValueEntry, APIErrorType> {
+    let error = |code: &str, message: String| APIErrorType {
+        secret_id: Some(secret_id.to_string()),
+        error_code: Some(code.to_string()),
+        message: Some(message),
+    };
+    let Some(secret) = store.get(secret_id) else {
+        return Err(error(
+            "ResourceNotFoundException",
+            crate::state::SECRET_NOT_FOUND_MESSAGE.to_string(),
+        ));
+    };
+    if secret.scheduled_for_deletion() {
+        return Err(error(
+            "InvalidRequestException",
+            crate::state::MARKED_FOR_DELETION_MESSAGE.to_string(),
+        ));
+    }
+    // The batched read answers the current value of each secret, the version
+    // `GetSecretValue` resolves when the caller names neither a version nor a
+    // stage; a secret created with no value has none.
+    let Some(version) = secret.version_with_stage(crate::state::STAGE_CURRENT) else {
+        return Err(error(
+            "ResourceNotFoundException",
+            crate::state::stage_not_found_message(crate::state::STAGE_CURRENT),
+        ));
+    };
+    Ok(SecretValueEntry {
+        arn: Some(secret.arn.clone()),
+        name: Some(secret.name.clone()),
+        version_id: Some(version.version_id.clone()),
+        secret_binary: version.secret_binary.clone(),
+        secret_string: version.secret_string.clone(),
+        version_stages: version.stages_out(),
+        created_date: Some(crate::state::timestamp(version.created_date)),
+    })
+}
+
+/// The `InvalidParameterException` message for a `SecretIdList` longer than one
+/// batch, stating the bound it exceeded (see [`crate::state::SECRETS_PER_BATCH`])
+/// and echoing nothing the caller sent.
+pub(crate) fn too_many_ids_message() -> String {
+    format!(
+        "The secret ID list has too many IDs. You can include up to {} secret IDs.",
+        crate::state::SECRETS_PER_BATCH
+    )
+}
+
+/// `InvalidParameterException` — "the parameter name or value is invalid" — for a
+/// request whose selection parameters cannot hold together.
+fn invalid_parameter(message: impl Into<String>) -> BatchGetSecretValueError {
+    BatchGetSecretValueErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The modelled server error for a request that cannot reach this service's
+/// store. `service_state` answers `None` only when the engine is not the shared
+/// in-memory one, which is a server-side fault, never a bad request.
+fn state_unavailable() -> BatchGetSecretValueError {
+    BatchGetSecretValueErrorModeled::InternalServiceError(InternalServiceError {
+        message: Some("the Secrets Manager emulator's state store is unavailable".to_string()),
+    })
+    .into()
 }
