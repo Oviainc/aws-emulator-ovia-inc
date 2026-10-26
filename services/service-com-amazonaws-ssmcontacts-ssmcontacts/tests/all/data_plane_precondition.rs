@@ -52,8 +52,12 @@ const DAILY_RECURRENCE: &str = r#"{
     "DailySettings": [{"HourOfDay": 9, "MinuteOfHour": 0}]
 }"#;
 
-/// A well-formed resource policy document.
-const A_POLICY: &str = r#"{"Version": "2012-10-17", "Statement": []}"#;
+/// A well-formed resource policy document: a resource-based policy states the principal
+/// each of its statements grants an action to, so one with no statement at all is not one.
+const A_POLICY: &str = r#"{"Version": "2012-10-17", "Statement": [
+    {"Effect": "Allow", "Principal": {"AWS": "000000000000"},
+     "Action": "ssm-contacts:GetContact"}
+]}"#;
 
 /// A fixed wall-clock instant, as `StartEngagement` stamps one.
 fn at_epoch_secs(secs: u64) -> SystemTime {
@@ -1357,10 +1361,10 @@ async fn a_contacts_policy_is_the_last_one_put() {
         "a contact with no policy must report none, got {body:?}"
     );
 
-    // The rows differ along the shape of the document: an empty object, a statement list, a
-    // nested condition, and one at the modelled Policy's minimum length past `{}`.
+    // The rows differ along the shape of the document: the forms a `Statement` takes (one
+    // object, a list), and the forms its elements take (a string, a list, the `{"AWS": …}`
+    // object a principal is written as, with a nested condition beside them).
     let documents: &[(&str, &str)] = &[
-        ("an empty policy object", "{}"),
         (
             "a policy with one statement",
             r#"{"Version": "2012-10-17", "Statement": [
@@ -1371,9 +1375,16 @@ async fn a_contacts_policy_is_the_last_one_put() {
             ]}"#,
         ),
         (
+            "a policy whose statement is the object itself",
+            r#"{"Version": "2012-10-17", "Statement":
+                {"Effect": "Allow", "Principal": "*", "Action": "ssm-contacts:GetContact"}
+            }"#,
+        ),
+        (
             "a policy whose statement carries a nested condition",
             r#"{"Version": "2012-10-17", "Statement": [
-                {"Effect": "Deny", "Action": ["ssm-contacts:*"], "Resource": "*",
+                {"Effect": "Deny", "Principal": "*",
+                 "Action": ["ssm-contacts:*"], "Resource": "*",
                  "Condition": {"StringNotEquals": {"aws:PrincipalOrgID": ["o-1234567890"]}}}
             ]}"#,
         ),
@@ -1411,7 +1422,9 @@ async fn a_contacts_policy_is_the_last_one_put() {
         );
     }
 
-    // A document that is not a JSON object is refused, and leaves the stored policy alone.
+    // A document that is not a resource-based policy is refused, and leaves the stored
+    // policy alone. `tests/all/contact_policy_document.rs` is the suite about the grammar;
+    // these rows are the ones that were already here.
     let stored = documents.last().expect("the table is not empty").1;
     let refused: &[(&str, &str)] = &[
         ("a document that is not JSON at all", "not json"),
@@ -1419,6 +1432,7 @@ async fn a_contacts_policy_is_the_last_one_put() {
         ("a JSON string", "\"policy\""),
         ("a JSON number", "17"),
         ("a truncated object", "{\"Version\":"),
+        ("an empty policy object", "{}"),
     ];
     for (case, document) in refused {
         let (status, body) = emulator

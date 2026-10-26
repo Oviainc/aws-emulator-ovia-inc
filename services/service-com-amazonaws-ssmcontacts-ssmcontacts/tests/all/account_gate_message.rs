@@ -45,8 +45,12 @@ const WINDOW_END: i64 = 1_735_693_200;
 /// `smithy_query(query="operation",operation="DeleteRotationOverride")`).
 const AN_OVERRIDE_ID: &str = "00000000-0000-0000-0000-000000000000";
 
-/// A well-formed resource policy document.
-const A_POLICY: &str = r#"{"Version": "2012-10-17", "Statement": []}"#;
+/// A well-formed resource policy document: a resource-based policy states the principal
+/// each of its statements grants an action to, so one with no statement at all is not one.
+const A_POLICY: &str = r#"{"Version": "2012-10-17", "Statement": [
+    {"Effect": "Allow", "Principal": {"AWS": "000000000000"},
+     "Action": "ssm-contacts:GetContact"}
+]}"#;
 
 // ---------------------------------------------------------------------------
 // The subjects the gated requests name

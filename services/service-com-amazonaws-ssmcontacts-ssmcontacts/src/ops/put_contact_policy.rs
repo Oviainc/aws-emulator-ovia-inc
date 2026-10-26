@@ -15,11 +15,14 @@
 //!    `ValidationException` (HTTP 400) — BEFORE `ContactArn` is resolved and before the
 //!    policy document is looked at at all, so a non-onboarded account never gets a
 //!    policy-shape complaint.
-//! 2. The policy document: a resource policy is a JSON policy document, so one that is not
-//!    a JSON object names no statements and is refused with the modelled
-//!    `ValidationException` naming `policy`. The modelled `Policy` constrains only its
-//!    length (1..395000) and that it is not all whitespace (`pattern` `\S`), so nothing
-//!    beyond that is required of its contents here.
+//! 2. The policy document: what this call attaches is a RESOURCE-BASED policy — the
+//!    document that states which principals are granted which actions on the contact —
+//!    so the text has to be one, judged through the workspace's ONE policy grammar
+//!    ([`service_common::iam_policy::resource_policy_defect`]). A body outside that
+//!    grammar is refused with the modelled `ValidationException` naming `policy`, rather
+//!    than stored as a policy no reader could evaluate. The modelled `Policy` constrains
+//!    only its length (1..395000) and that it is not all whitespace (`pattern` `\S`), so
+//!    the grammar is checked here and not by the framework's boundary validator.
 //! 3. The resource lookup: an onboarded account naming a contact the store does not hold
 //!    gets the modelled `ResourceNotFoundException` (HTTP 404).
 //!
@@ -188,14 +191,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .require_active_replication_set()
             .map_err(account_precondition_failed)?;
 
-        // A resource policy is a JSON policy document.
-        if !serde_json::from_str::<serde_json::Value>(&input.policy)
-            .is_ok_and(|document| document.is_object())
-        {
-            return Err(validation(
-                "Value at 'policy' failed to satisfy constraint: Member must be a JSON policy \
-                 document",
-            ));
+        // A resource policy is a document in the IAM JSON policy language, not any JSON
+        // value: asking `serde_json` only whether the text parses as an object accepts
+        // `{}` and `{"foo": 1}` and then reports them back as the contact's policy.
+        if let Some(defect) = ::service_common::iam_policy::resource_policy_defect(&input.policy) {
+            return Err(invalid_policy(defect));
         }
 
         let Some(contact) = state.contacts.get_mut(&input.contact_arn) else {
@@ -233,14 +233,23 @@ fn account_precondition_failed(message: String) -> PutContactPolicyError {
     .into()
 }
 
-/// A member-level refusal: the same modelled `ValidationException`, naming the field.
-fn validation(message: impl Into<String>) -> PutContactPolicyError {
+/// The member this operation's document-level refusal names, spelled as the service spells
+/// an input member in a `ValidationException` (lower camel case, as the other handlers do).
+const POLICY_MEMBER: &str = "policy";
+
+/// A member-level refusal for a `Policy` that is not a resource-based policy document: the
+/// same modelled `ValidationException`, naming the member and the clause of the policy
+/// grammar the submitted document broke.
+fn invalid_policy(defect: ::service_common::iam_policy::PolicyDefect) -> PutContactPolicyError {
     PutContactPolicyErrorModeled::ValidationException(ValidationException {
-        message: message.into(),
+        message: format!(
+            "Value at '{POLICY_MEMBER}' failed to satisfy constraint: Member must be a \
+             resource-based policy document formatted in JSON ({defect})"
+        ),
         reason: Some("FIELD_VALIDATION_FAILED".to_string()),
         fields: Some(vec![ValidationExceptionField {
-            name: "policy".to_string(),
-            message: "The resource policy must be a JSON policy document".to_string(),
+            name: POLICY_MEMBER.to_string(),
+            message: defect.as_str().to_string(),
         }]),
     })
     .into()

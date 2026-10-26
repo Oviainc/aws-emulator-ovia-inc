@@ -31,6 +31,8 @@ mod contact_channel_updates;
 mod contact_lifecycle;
 #[path = "all/contact_plan_references.rs"]
 mod contact_plan_references;
+#[path = "all/contact_policy_document.rs"]
+mod contact_policy_document;
 #[path = "all/contact_rotation_membership.rs"]
 mod contact_rotation_membership;
 #[path = "all/contact_updates.rs"]
