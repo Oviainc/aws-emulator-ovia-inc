@@ -16,6 +16,14 @@
 //! `ValidationException` and stores no profile: those keys are the ones
 //! `TagResource` writes, held to the same modelled `TagKey` rule.
 //!
+//! The `platformId` is resolved against the signing-platform catalog
+//! `GetSigningPlatform` / `ListSigningPlatforms` publish: an id that catalog holds
+//! no entry for names no platform, so the create is refused 404
+//! `ResourceNotFoundException` (code `PlatformNotFound`) exactly as a read of that
+//! platform is, and an `overrides.signingConfiguration` value outside the
+//! platform's published `allowedValues` is refused 400 `ValidationException`.
+//! Neither refusal stores anything.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -188,18 +196,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
 
+        // A profile is a template bound to one of the signing platforms the
+        // service publishes, and the platform is what supplies the signing
+        // configuration a later job runs under — so the platform is resolved
+        // against the published catalog FIRST. An id the catalog holds no entry
+        // for names no platform at all, which is the same condition the platform
+        // readers report, answered with the same modelled 404 and code: nothing
+        // else in this handler can be decided without an entry, and a profile on
+        // a platform this service says does not exist must never reach the store.
+        let Some(platform) = crate::state::signing_platform(&input.platform_id) else {
+            return Err(PutSigningProfileErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::platform_not_found_message(&input.platform_id)),
+                    code: Some(crate::state::ERROR_CODE_PLATFORM_NOT_FOUND.to_string()),
+                },
+            )
+            .into());
+        };
+
         // A signing profile signs with a certificate, and which platforms hold
-        // that certificate on the profile — rather than having AWS Signer issue it
-        // — is what `crate::state::platform_requires_signing_material` states,
+        // that certificate on the profile — rather than having AWS Signer issue
+        // it — is what the platform publishes
+        // ([`crate::state::SigningPlatformEntry::requires_signing_material`]),
         // with the recorded evidence for the split. Refused HERE, before anything
         // is written, so a profile that could not exist on AWS never reaches the
         // store.
-        if input.signing_material.is_none()
-            && crate::state::platform_requires_signing_material(&input.platform_id)
-        {
+        if input.signing_material.is_none() && platform.requires_signing_material {
             return Err(PutSigningProfileErrorModeled::ValidationException(
                 ValidationException {
                     message: Some("signing material cannot be null.".to_string()),
+                    code: Some(crate::state::ERROR_CODE_VALIDATION.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // An override SELECTS among the algorithms the platform publishes as
+        // allowed, so a value outside its `allowedValues` asks for a signing
+        // configuration the platform publishes none of — refused for the value it
+        // carried (400), before anything is written, so no profile asks to be
+        // signed under an algorithm its platform cannot sign under.
+        if let Some((member, value)) = crate::state::unsupported_signing_configuration_override(
+            platform,
+            input.overrides.as_ref(),
+        ) {
+            return Err(PutSigningProfileErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::unsupported_override_message(
+                        platform, member, value,
+                    )),
                     code: Some(crate::state::ERROR_CODE_VALIDATION.to_string()),
                 },
             )
@@ -260,7 +305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn,
             profile_version_arn,
             profile_token,
-            platform_display_name: crate::state::platform_display_name(&input.platform_id),
+            platform_display_name: platform.display_name.map(str::to_string),
             platform_id: input.platform_id,
             signing_material: input.signing_material,
             // A request that names no validity period does not leave the profile

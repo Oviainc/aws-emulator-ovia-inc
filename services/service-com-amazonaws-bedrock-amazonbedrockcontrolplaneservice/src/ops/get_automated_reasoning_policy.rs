@@ -164,10 +164,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let store = state.lock();
 
-        // The ARN is matched as the caller spelled it, so an ARN of another region, and a
-        // versioned ARN of a version nothing has minted, both name no policy this account
-        // holds.
-        let Some(policy) = store.automated_reasoning_policy(&input.policy_arn) else {
+        // The ARN is matched as the caller spelled it, so an ARN of another region names no
+        // policy this account holds; the `:<version>` suffix the shape admits selects a
+        // version this policy has cut, and the unversioned ARN its working draft.
+        let Some((policy, version)) = store.automated_reasoning_policy_revision(&input.policy_arn)
+        else {
             return Err(
                 GetAutomatedReasoningPolicyErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -181,18 +182,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        Ok(GetAutomatedReasoningPolicyOutput {
-            policy_arn: policy.arn.clone(),
-            name: policy.name.clone(),
-            // The unversioned ARN names the policy's working version, which the create
-            // documents as always DRAFT.
-            version: crate::state::DRAFT_VERSION.to_string(),
-            policy_id: policy.id.clone(),
-            description: policy.description.clone(),
-            definition_hash: policy.definition_hash.clone(),
-            kms_key_arn: policy.kms_key_arn.clone(),
-            created_at: Some(crate::state::date_time(policy.created_at)),
-            updated_at: crate::state::date_time(policy.updated_at),
+        Ok(match version {
+            // A numbered version: the immutable snapshot it froze, reported under its own
+            // versioned ARN. `kmsKeyArn` and `policyId` are the POLICY's — a version is a
+            // revision of that one resource, not a second resource.
+            Some(version) => GetAutomatedReasoningPolicyOutput {
+                policy_arn: version.arn.clone(),
+                name: version.name.clone(),
+                version: version.version.to_string(),
+                policy_id: policy.id.clone(),
+                description: version.description.clone(),
+                definition_hash: version.definition_hash.clone(),
+                kms_key_arn: policy.kms_key_arn.clone(),
+                created_at: Some(crate::state::date_time(version.created_at)),
+                // Nothing rewrites a version, so the instant it was cut is also the
+                // instant it was last written.
+                updated_at: crate::state::date_time(version.created_at),
+            },
+            None => GetAutomatedReasoningPolicyOutput {
+                policy_arn: policy.arn.clone(),
+                name: policy.name.clone(),
+                // The unversioned ARN names the policy's working version, which the create
+                // documents as always DRAFT.
+                version: crate::state::DRAFT_VERSION.to_string(),
+                policy_id: policy.id.clone(),
+                description: policy.description.clone(),
+                definition_hash: policy.definition_hash.clone(),
+                kms_key_arn: policy.kms_key_arn.clone(),
+                created_at: Some(crate::state::date_time(policy.created_at)),
+                updated_at: crate::state::date_time(policy.updated_at),
+            },
         })
     }
 }

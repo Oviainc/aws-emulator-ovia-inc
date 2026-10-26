@@ -27,6 +27,7 @@ use crate::ops::types::{
     Interface, ListedBridge, ListedEntitlement, ListedFlow,
     ListedGateway,
     ListedGatewayInstance,
+    ListedRouterOutput,
     Maintenance, MaintenanceConfiguration, MaintenanceSchedule,
     MediaConnectFlowRouterInputStreamDetails,
     MediaConnectFlowRouterOutputStreamDetails, MediaStream,
@@ -4030,6 +4031,46 @@ impl StoredRouterOutput {
                 .map(|_| MAINTENANCE_SCHEDULE_TYPE_WINDOW.to_string()),
             maintenance_schedule: self.maintenance_schedule.clone(),
             fabric_configuration: self.fabric_configuration.clone(),
+        }
+    }
+
+    /// The modelled `ListedRouterOutput` summary for this record — what ListRouterOutputs
+    /// reports for it.
+    ///
+    /// The summary is a PROJECTION of the same record [`Self::to_router_output`] reports, so
+    /// every member it shares with the full resource is the same value read from the same
+    /// field, and the members the summary does not declare (the configuration, the stream
+    /// details, the address, the tier, the tags, the messages themselves) stay on the read
+    /// side.
+    pub fn to_listed_router_output(&self) -> ListedRouterOutput {
+        ListedRouterOutput {
+            name: self.name.clone(),
+            arn: self.arn.clone(),
+            id: self.id.clone(),
+            output_type: self.output_type().to_string(),
+            state: self.state.clone(),
+            routed_state: self.routed_state().to_string(),
+            region_name: self.region_name.clone(),
+            availability_zone: self.availability_zone.clone(),
+            maximum_bitrate: self.maximum_bitrate,
+            routing_scope: self.routing_scope.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(self.updated_at),
+            // `ListedRouterOutput$MessageCount` is "the number of messages associated with
+            // the router output": the count of the messages the record holds, which is what
+            // `RouterOutput$Messages` reports in full.
+            message_count: i32::try_from(self.messages.len()).unwrap_or(i32::MAX),
+            routed_input_arn: self.routed_input_arn.clone(),
+            // "The ARN of the network interface associated with the router output" — the
+            // interface the output egresses from, which only a configuration that names one
+            // has ([`router_output_network_interface_arn`]).
+            network_interface_arn: router_output_network_interface_arn(&self.configuration)
+                .map(ToString::to_string),
+            maintenance_schedule_type: self
+                .maintenance_schedule
+                .as_ref()
+                .map(|_| MAINTENANCE_SCHEDULE_TYPE_WINDOW.to_string()),
+            maintenance_schedule: self.maintenance_schedule.clone(),
         }
     }
 }

@@ -1756,6 +1756,20 @@ impl UpgradeRun {
             .collect()
     }
 
+    /// The step this run is performing at `now`, and that step's status —
+    /// `GetUpgradeStatusResponse`'s `UpgradeStep` and `StepStatus`, "the status of the
+    /// current step that an upgrade is on".
+    ///
+    /// The current step is the LAST one the run has started, which is the last entry of
+    /// [`Self::step_progress`] — the same derivation `GetUpgradeHistory` reports every
+    /// step from, so the step a caller polls and the step the history lists for the same
+    /// run cannot disagree. A finished run is reported on its last step, succeeded.
+    pub fn current_step(&self, now: SystemTime) -> Option<(&'static str, &'static str)> {
+        let steps = self.steps();
+        let (index, status, _) = self.step_progress(now).into_iter().next_back()?;
+        Some((*steps.get(index)?, status))
+    }
+
     /// `UpgradeHistory$UpgradeName`: "a string that describes the upgrade".
     ///
     /// The model declares no form for it, so it is derived from the record rather
