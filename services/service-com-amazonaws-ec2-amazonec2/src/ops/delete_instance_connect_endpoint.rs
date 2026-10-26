@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteInstanceConnectEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteInstanceConnectEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteInstanceConnectEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: starts deleting the EC2 Instance Connect Endpoint the request names in
+//! [`crate::state`] and answers it as the store then holds it, where
+//! `DescribeInstanceConnectEndpoints` reads the same endpoint back. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +130,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteInstanceConnectEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteInstanceConnectEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteInstanceConnectEndpoint"))
+        use crate::state;
+        use ::std::time::Instant;
+
+        // `ctx` carries request metadata only; this operation reads none of it — an endpoint
+        // is named by id, which is unique across Regions in this store, and every member the
+        // answer carries was derived when the endpoint was created. The store is reached
+        // through the engine held on `self`.
+        let _ = ctx;
+
+        let endpoints = state::require_service_state(&*self.engine)?;
+        let mut store = endpoints.lock();
+
+        // "Deletes the specified EC2 Instance Connect Endpoint": the id is read for its
+        // SYNTAX first and only then looked up, which is the order EC2 answers the two
+        // questions in — something that is not an endpoint id at all is
+        // `InvalidInstanceConnectEndpointId.Malformed` before any lookup, and a well-formed
+        // id the account holds no endpoint for is
+        // `InvalidInstanceConnectEndpointId.NotFound`. Neither is a no-op: a caller has to
+        // be able to tell the deletion it performed from one it did not, and a typo from a
+        // resource that is gone. The crate's ONE reader of that pair answers both, so this
+        // operation and the describe refuse an id the same way.
+        state::require_known_instance_connect_endpoint(
+            &store,
+            &input.instance_connect_endpoint_id,
+        )?;
+
+        // DryRun sits AFTER the named endpoint has been resolved and BEFORE the write: the
+        // flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        let now = Instant::now();
+        // The deletion is owed to the clock rather than finished here: the endpoint answers
+        // `delete-in-progress` until the stored instant falls due and `delete-complete`
+        // after it, so a caller acting straight after this call still sees the transient
+        // state. The record itself stays in the store — both delete states are states the
+        // model reports for an endpoint — so the bytes it holds stay charged to the store's
+        // budget, which still holds them, and a repeat of this call reports the deletion
+        // already under way rather than restarting its clock.
+        let instance_connect_endpoint = store
+            .begin_instance_connect_endpoint_deletion(
+                &input.instance_connect_endpoint_id,
+                now,
+                now + state::TRANSITION_DELAY,
+            )
+            .ok_or_else(|| {
+                state::internal_error(format!(
+                    "the EC2 Instance Connect Endpoint '{}' checked a moment ago could not \
+                     be deleted",
+                    input.instance_connect_endpoint_id
+                ))
+            })?;
+
+        // "Information about the EC2 Instance Connect Endpoint"
+        // (`DeleteInstanceConnectEndpointResult$InstanceConnectEndpoint`), read back OUT of
+        // the store, so the caller sees what a later `DescribeInstanceConnectEndpoints` will
+        // see rather than the request object.
+        Ok(DeleteInstanceConnectEndpointOutput {
+            instance_connect_endpoint: Some(instance_connect_endpoint),
+        })
     }
 }
