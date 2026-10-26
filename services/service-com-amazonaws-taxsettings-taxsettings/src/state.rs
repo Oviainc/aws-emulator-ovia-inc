@@ -1600,13 +1600,62 @@ pub const GEORGIA_PERSON_TYPES: &[&str] = &["Physical Person", "Business"];
 
 /// The `TaxRegistrationType` values the model documents as valid for Malaysia
 /// ("`RegistrationType` valid values are `NRIC` for individual, and TIN and
-/// sales and service tax (SST) for Business").
+/// sales and service tax (SST) for Business") — the VALUE SET that sentence
+/// states. Which of those values each `sector` admits is the other half of it,
+/// and lives in [`SECTOR_REGISTRATION_TYPES`].
 pub const MALAYSIA_REGISTRATION_TYPES: &[&str] = &["NRIC", "TIN", "SST"];
 
 /// The Malaysian registration types the model documents as the business ones,
 /// for which "you must specify a `businessRegistrationNumber` in
 /// `MalaysiaAdditionalInfo`".
 pub const MALAYSIA_BUSINESS_REGISTRATION_TYPES: &[&str] = &["TIN", "SST"];
+
+/// The Malaysian registration type the model documents as the individual one
+/// ("`RegistrationType` valid values are `NRIC` for individual"), and for which
+/// "for individual, you can specify the `taxInformationNumber` in
+/// `MalaysiaAdditionalInfo` with NRIC type".
+pub const MALAYSIA_INDIVIDUAL_REGISTRATION_TYPES: &[&str] = &["NRIC"];
+
+/// The `TaxRegistrationType` values a country's documentation pairs with ONE
+/// `Sector`: the `Address$countryCode`, the sector, and the registration types
+/// an entry declaring that sector may choose from.
+///
+/// A country whose documentation states which type goes with which sector
+/// constrains the two members TOGETHER, so the country's value set alone
+/// ([`MALAYSIA_REGISTRATION_TYPES`], the union of its rows here) is only half the
+/// rule: the other half is which of those values the declared sector admits. One
+/// row per sector the documentation names a set for; a sector with no row is one
+/// the documentation pairs no types with, which this table therefore says nothing
+/// about.
+///
+/// Malaysia is the only country `PutTaxRegistration`'s documentation states such
+/// a pairing for
+/// (`smithy_query(query="doc",shape="com.amazonaws.taxsettings#PutTaxRegistration")`):
+/// "`RegistrationType` valid values are `NRIC` for individual, and TIN and sales
+/// and service tax (SST) for Business."
+pub const SECTOR_REGISTRATION_TYPES: &[(&str, &str, &[&str])] = &[
+    ("MY", "Individual", MALAYSIA_INDIVIDUAL_REGISTRATION_TYPES),
+    ("MY", "Business", MALAYSIA_BUSINESS_REGISTRATION_TYPES),
+];
+
+/// The registration types a registration held in `country_code` whose entry
+/// declares `sector` may carry, or `None` where the documentation pairs the two
+/// members for neither — see [`SECTOR_REGISTRATION_TYPES`].
+///
+/// `country_code` is compared case-insensitively, as every reader of an
+/// `Address$countryCode` here is; `sector` is an enum value the boundary
+/// validator has already matched exactly.
+pub fn sector_registration_types(
+    country_code: &str,
+    sector: &str,
+) -> Option<&'static [&'static str]> {
+    SECTOR_REGISTRATION_TYPES
+        .iter()
+        .find(|(code, documented, _)| {
+            code.eq_ignore_ascii_case(country_code) && *documented == sector
+        })
+        .map(|(_, _, types)| *types)
+}
 
 /// The Malaysian registration type of a business reseller, for which "you must
 /// specify a `businessRegistrationNumber` and `taxInformationNumber` in
@@ -1741,6 +1790,31 @@ fn has_registration_document(entry: &TaxRegistrationEntry) -> bool {
 /// `taxRegistrationEntry.sector`, if the entry carries one.
 fn sector(entry: &TaxRegistrationEntry) -> Option<&str> {
     entry.sector.as_deref()
+}
+
+/// The registration types the entry's own jurisdiction pairs with the `sector` it
+/// declares — [`sector_registration_types`] for the entry's country and sector.
+///
+/// `None` for an entry that declares no sector, identifies no jurisdiction, or is
+/// held where the documentation pairs the two members for no sector: nothing
+/// about such an entry states which types its sector admits.
+fn entry_sector_registration_types(
+    entry: &TaxRegistrationEntry,
+) -> Option<&'static [&'static str]> {
+    sector_registration_types(entry_country_code(entry)?, sector(entry)?)
+}
+
+/// What makes the pairing rule apply: the entry declares a sector its
+/// jurisdiction pairs registration types with.
+fn sector_pairs_registration_types(entry: &TaxRegistrationEntry) -> bool {
+    entry_sector_registration_types(entry).is_some()
+}
+
+/// Whether the entry's `registrationType` is one its jurisdiction pairs with the
+/// `sector` it declares. An entry the pairing says nothing about satisfies it.
+fn registration_type_fits_sector(entry: &TaxRegistrationEntry) -> bool {
+    entry_sector_registration_types(entry)
+        .is_none_or(|types| types.contains(&entry.registration_type.as_str()))
 }
 
 /// Whether the entry's `sector` is one of `SECTORS_BUSINESS_OR_INDIVIDUAL`, for
@@ -2006,6 +2080,18 @@ pub const COUNTRY_RULES: &[CountryRule] = &[
         satisfied: |entry: &TaxRegistrationEntry| {
             MALAYSIA_REGISTRATION_TYPES.contains(&entry.registration_type.as_str())
         },
+    },
+    // Malaysia: the same sentence's OTHER half — which of those values goes with
+    // which sector, rather than the union of them — see
+    // [`SECTOR_REGISTRATION_TYPES`].
+    CountryRule {
+        country_code: "MY",
+        member_path: "taxRegistrationEntry.registrationType",
+        error_code: ERROR_CODE_FIELD_VALIDATION_FAILED,
+        message: "The valid registrationType values for a tax registration in Malaysia are NRIC \
+                  for Individual, and TIN and SST for Business.",
+        applies: sector_pairs_registration_types,
+        satisfied: registration_type_fits_sector,
     },
     // Malaysia: "For business, you must specify a businessRegistrationNumber in
     // MalaysiaAdditionalInfo with a TIN type and tax identification number."
