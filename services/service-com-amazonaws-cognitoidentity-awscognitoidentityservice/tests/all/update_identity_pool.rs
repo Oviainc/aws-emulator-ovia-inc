@@ -10,6 +10,10 @@
 //!   value" (this service's model) — so a member an earlier call set and this one omits is
 //!   gone afterwards, not carried over. What the update answers is what the pool's readers
 //!   report, and the pool keeps the id it was minted with.
+//! * A pool's TAGS are the exception, because they are not part of that configuration:
+//!   they are the facet this service's tagging operations own, so an update that carries
+//!   no `IdentityPoolTags` leaves the tag set the pool holds, and one that carries the
+//!   member states the pool's whole tag set.
 //! * An update naming a pool this service does not hold — one never created, or one
 //!   already deleted — is the modelled 404 `ResourceNotFoundException`, and writes nothing:
 //!   every other pool keeps the configuration it had.
@@ -18,24 +22,27 @@
 //! `MultiServiceRouter` the production router builds.
 
 use serde_json::{json, Map, Value};
+use service_com_amazonaws_cognitoidentity_awscognitoidentityservice::state::identity_pool_arn;
 
 use crate::identity_pool_flow::{error_code, Emulator, ABSENT_POOL_ID};
+use crate::resource_tags::{listed_tags, tag, tag_map, tagged_pool};
 
 /// The operation under test, spelled once.
 const OPERATION: &str = "UpdateIdentityPool";
 
-/// Every OPTIONAL member `UpdateIdentityPoolInput` declares, from
+/// Every OPTIONAL CONFIGURATION member `UpdateIdentityPoolInput` declares, from
 /// `smithy_query(query="operation", operation="UpdateIdentityPool")`. A row that omits one
 /// must leave the stored pool without it, which is what makes this catalog the thing to
-/// check after each update.
-const OPTIONAL_MEMBERS: [&str; 7] = [
+/// check after each update. `IdentityPoolTags` is deliberately NOT here: a pool's tags are
+/// not configuration this call replaces, and `tags_outlive_an_update_that_omits_them`
+/// covers them.
+const OPTIONAL_MEMBERS: [&str; 6] = [
     "AllowClassicFlow",
     "SupportedLoginProviders",
     "DeveloperProviderName",
     "OpenIdConnectProviderARNs",
     "CognitoIdentityProviders",
     "SamlProviderARNs",
-    "IdentityPoolTags",
 ];
 
 /// An update request for `identity_pool_id` carrying `configuration`'s members.
@@ -299,4 +306,240 @@ async fn an_update_of_a_pool_this_service_does_not_hold_is_not_found() {
         kept_now, kept_before,
         "the stored pool expected {kept_before} after the refused updates, got {kept_now}"
     );
+}
+
+/// What an update leaves on a pool's tag set, as `(case, the tags the pool was created
+/// with, the `IdentityPoolTags` the update carries, the tag set the pool has afterwards)`.
+/// A `None` means the member is not sent at all, and a `Value::Null` expectation means the
+/// pool carries no tag member at all afterwards.
+///
+/// The rows differ in the count of tags, in whether the update carries the member, in
+/// whether the set it carries overlaps the stored one, and in key and value length:
+/// `IdentityPoolTagsType` maps `TagKeysType` (len 1..128) to `TagValueType` (len 0..256),
+/// from `smithy_query(query="shape",shape="IdentityPoolTagsType")`.
+fn tag_cases() -> Vec<(&'static str, Option<Value>, Option<Value>, Value)> {
+    vec![
+        (
+            "tags assigned at create, an update that omits the member",
+            Some(json!({"Env": "test", "Owner": "platform"})),
+            None,
+            json!({"Env": "test", "Owner": "platform"}),
+        ),
+        (
+            "no tags at all, an update that omits the member",
+            None,
+            None,
+            Value::Null,
+        ),
+        (
+            "an update carrying a disjoint set replaces the stored one",
+            Some(json!({"Env": "test", "Owner": "platform"})),
+            Some(json!({"CostCenter": "4711"})),
+            json!({"CostCenter": "4711"}),
+        ),
+        (
+            "an update carrying an overlapping set replaces the stored one",
+            Some(json!({"Env": "test", "Owner": "platform"})),
+            Some(json!({"Env": "prod"})),
+            json!({"Env": "prod"}),
+        ),
+        (
+            "an update carrying an empty map leaves the pool with no tags",
+            Some(json!({"Env": "test"})),
+            Some(json!({})),
+            json!({}),
+        ),
+        (
+            "an update carrying tags for a pool that had none assigns them",
+            None,
+            Some(json!({"Env": "prod"})),
+            json!({"Env": "prod"}),
+        ),
+        (
+            "a key at the modelled maximum length of 128 survives an update",
+            Some(tag_map([tag(&"k".repeat(128), "at-the-key-bound")])),
+            None,
+            tag_map([tag(&"k".repeat(128), "at-the-key-bound")]),
+        ),
+        (
+            "values at the modelled bounds, 256 and 0, survive an update",
+            Some(tag_map([
+                tag("Description", &"v".repeat(256)),
+                tag("Unset", ""),
+            ])),
+            None,
+            tag_map([
+                tag("Description", &"v".repeat(256)),
+                tag("Unset", ""),
+            ]),
+        ),
+        (
+            "the 50 tags an identity pool can have survive an update",
+            Some(tag_map(
+                (0..50).map(|position| tag(&format!("key-{position}"), &format!("value-{position}"))),
+            )),
+            None,
+            tag_map(
+                (0..50).map(|position| tag(&format!("key-{position}"), &format!("value-{position}"))),
+            ),
+        ),
+    ]
+}
+
+/// RULE: a pool's tags are not configuration this call replaces, so an update that carries
+/// no `IdentityPoolTags` leaves the tag set the pool holds, while one that carries the
+/// member states the pool's whole tag set — and both readers of that set, the pool's
+/// describe and the tag listing, report what the update left.
+#[tokio::test]
+async fn an_update_replaces_the_tag_set_only_when_it_carries_one() {
+    let emulator = Emulator::new();
+    for (case, created_with, update_carries, expected) in tag_cases() {
+        let identity_pool_id =
+            tagged_pool(&emulator, "tagged-before-update", created_with.as_ref()).await;
+        let mut request = json!({
+            "IdentityPoolId": &identity_pool_id,
+            "IdentityPoolName": "renamed-by-the-update",
+            "AllowUnauthenticatedIdentities": true,
+        });
+        if let Some(tags) = &update_carries {
+            request["IdentityPoolTags"] = tags.clone();
+        }
+
+        let updated = emulator.ok(OPERATION, &request).await;
+        let answered = updated
+            .get("IdentityPoolTags")
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert_eq!(
+            answered, expected,
+            "case {case:?}: the update answered IdentityPoolTags {answered}, expected \
+             {expected}"
+        );
+
+        // The rest of the configuration IS replaced by the same call, so the tag set
+        // surviving is not the whole record surviving.
+        let described = emulator
+            .ok(
+                "DescribeIdentityPool",
+                &json!({"IdentityPoolId": &identity_pool_id}),
+            )
+            .await;
+        assert_eq!(
+            described["IdentityPoolName"],
+            json!("renamed-by-the-update"),
+            "case {case:?}: expected the update to rename the pool, got {described}"
+        );
+        let described_tags = described
+            .get("IdentityPoolTags")
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert_eq!(
+            described_tags, expected,
+            "case {case:?}: DescribeIdentityPool reported IdentityPoolTags \
+             {described_tags}, expected {expected}"
+        );
+
+        // The tag listing reports the same set, as the empty map for a pool carrying none.
+        let listed = listed_tags(&emulator, &identity_pool_id).await;
+        let expected_listed = if expected.is_null() {
+            tag_map([])
+        } else {
+            expected.clone()
+        };
+        assert_eq!(
+            listed, expected_listed,
+            "case {case:?}: ListTagsForResource reported {listed}, expected \
+             {expected_listed}"
+        );
+    }
+}
+
+/// RULE: the same holds for tags a pool was given through the tagging operations rather
+/// than at create time, however many updates later — and an update that carries the member
+/// still states the whole set.
+#[tokio::test]
+async fn tags_assigned_through_the_tagging_operations_outlive_later_updates() {
+    let emulator = Emulator::new();
+    let assigned_sets: Vec<(&str, Value)> = vec![
+        ("one tag", tag_map([tag("Env", "test")])),
+        (
+            "several tags",
+            tag_map([
+                tag("Env", "test"),
+                tag("Owner", "platform"),
+                tag("CostCenter", "4711"),
+            ]),
+        ),
+        (
+            "a value at the modelled maximum length of 256",
+            tag_map([tag("Description", &"v".repeat(256))]),
+        ),
+    ];
+    for (case, assigned) in assigned_sets {
+        let identity_pool_id = tagged_pool(&emulator, "tagged-by-the-api", None).await;
+        emulator
+            .ok(
+                "TagResource",
+                &json!({
+                    "ResourceArn": identity_pool_arn(&identity_pool_id),
+                    "Tags": assigned.clone(),
+                }),
+            )
+            .await;
+
+        // Two updates in a row, neither carrying the member: the set is still there.
+        for round in 1..=2 {
+            let updated = emulator
+                .ok(
+                    OPERATION,
+                    &json!({
+                        "IdentityPoolId": &identity_pool_id,
+                        "IdentityPoolName": format!("update-round-{round}"),
+                        "AllowUnauthenticatedIdentities": false,
+                    }),
+                )
+                .await;
+            let answered = updated
+                .get("IdentityPoolTags")
+                .cloned()
+                .unwrap_or(Value::Null);
+            assert_eq!(
+                answered, assigned,
+                "case {case:?}, update {round}: the update answered IdentityPoolTags \
+                 {answered}, expected {assigned}"
+            );
+            let listed = listed_tags(&emulator, &identity_pool_id).await;
+            assert_eq!(
+                listed, assigned,
+                "case {case:?}, update {round}: ListTagsForResource reported {listed}, \
+                 expected {assigned}"
+            );
+        }
+
+        // And an update that does carry the member states the whole set, dropping every
+        // key it leaves out.
+        let replacement = tag_map([tag("Env", "prod")]);
+        let updated = emulator
+            .ok(
+                OPERATION,
+                &json!({
+                    "IdentityPoolId": &identity_pool_id,
+                    "IdentityPoolName": "update-carrying-tags",
+                    "AllowUnauthenticatedIdentities": false,
+                    "IdentityPoolTags": replacement.clone(),
+                }),
+            )
+            .await;
+        assert_eq!(
+            updated["IdentityPoolTags"], replacement,
+            "case {case:?}: an update carrying tags answered {}, expected {replacement}",
+            updated["IdentityPoolTags"]
+        );
+        let listed = listed_tags(&emulator, &identity_pool_id).await;
+        assert_eq!(
+            listed, replacement,
+            "case {case:?}: ListTagsForResource reported {listed} after an update carrying \
+             tags, expected {replacement}"
+        );
+    }
 }

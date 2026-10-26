@@ -48,7 +48,7 @@ fn canonical_arn(identity_pool_id: &str) -> String {
 
 /// A JSON tag map from `(key, value)` pairs, so a case can carry keys and values that are
 /// computed rather than written out.
-fn tag_map<I: IntoIterator<Item = (String, String)>>(pairs: I) -> Value {
+pub(crate) fn tag_map<I: IntoIterator<Item = (String, String)>>(pairs: I) -> Value {
     Value::Object(
         pairs
             .into_iter()
@@ -58,7 +58,7 @@ fn tag_map<I: IntoIterator<Item = (String, String)>>(pairs: I) -> Value {
 }
 
 /// `(key, value)` as owned strings, for [`tag_map`].
-fn tag(key: &str, value: &str) -> (String, String) {
+pub(crate) fn tag(key: &str, value: &str) -> (String, String) {
     (key.to_string(), value.to_string())
 }
 
@@ -113,7 +113,11 @@ fn tag_sets() -> Vec<(&'static str, Option<Value>)> {
 
 /// Create a pool carrying `tags` (the member is sent only when the case has one) and
 /// return its minted `IdentityPoolId`.
-async fn tagged_pool(emulator: &Emulator, name: &str, tags: Option<&Value>) -> String {
+pub(crate) async fn tagged_pool(
+    emulator: &Emulator,
+    name: &str,
+    tags: Option<&Value>,
+) -> String {
     let mut request = json!({
         "IdentityPoolName": name,
         "AllowUnauthenticatedIdentities": false,
@@ -129,7 +133,7 @@ async fn tagged_pool(emulator: &Emulator, name: &str, tags: Option<&Value>) -> S
 }
 
 /// List the tags of the pool `identity_pool_id` through its canonical ARN.
-async fn listed_tags(emulator: &Emulator, identity_pool_id: &str) -> Value {
+pub(crate) async fn listed_tags(emulator: &Emulator, identity_pool_id: &str) -> Value {
     let listed = emulator
         .ok(
             "ListTagsForResource",

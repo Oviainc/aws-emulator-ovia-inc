@@ -2,6 +2,8 @@
 
 //! @op UpdateIdentityPool
 //! Replaces the configuration of a stored identity pool with the one the request carries.
+//! The pool's tags are not that configuration — they are the facet this service's tagging
+//! operations own — so a request that carries no `IdentityPoolTags` leaves them alone.
 //!
 //! ## Shape of an operation
 //!
@@ -261,7 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UpdateIdentityPoo
         let mut store = state.lock();
         // An update names an existing pool: there is nothing to update about one this
         // service does not hold, whether it was never created or has been deleted.
-        if !store.identity_pools.contains_key(&input.identity_pool_id) {
+        let Some(stored) = store.identity_pools.get(&input.identity_pool_id) else {
             return Err(UpdateIdentityPoolErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!(
@@ -271,7 +273,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UpdateIdentityPoo
                 },
             )
             .into());
-        }
+        };
+
+        // A pool's tags are not part of the configuration this call replaces: they are a
+        // facet of the resource the tagging operations of this service own
+        // (`TagResource`/`UntagResource`, which address the pool by its ARN), so an
+        // update that carries no `IdentityPoolTags` leaves the tag set the pool already
+        // holds. One that DOES carry the member states the pool's whole tag set, exactly
+        // as the other configuration members do.
+        let identity_pool_tags = match input.identity_pool_tags {
+            Some(tags) => Some(tags.into_iter().collect()),
+            None => stored.identity_pool_tags.clone(),
+        };
 
         // "If you don't provide a value for a parameter, Amazon Cognito sets it to its
         // default value" (this service's model), so the request REPLACES the pool's
@@ -290,9 +303,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UpdateIdentityPoo
             open_id_connect_provider_arns: input.open_id_connect_provider_ar_ns,
             cognito_identity_providers: input.cognito_identity_providers,
             saml_provider_arns: input.saml_provider_ar_ns,
-            identity_pool_tags: input
-                .identity_pool_tags
-                .map(|tags| tags.into_iter().collect()),
+            identity_pool_tags,
         };
 
         // The response is the stored record, so what the caller reads back is what the
