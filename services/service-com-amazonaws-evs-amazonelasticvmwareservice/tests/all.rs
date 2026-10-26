@@ -64,6 +64,8 @@ mod host_ec2_instances;
 mod host_placement_references;
 #[path = "all/hosts.rs"]
 mod hosts;
+#[path = "all/identity_policy_sources.rs"]
+mod identity_policy_sources;
 #[path = "all/list_vm_entitlements_connector.rs"]
 mod list_vm_entitlements_connector;
 #[path = "all/list_while_initializing.rs"]

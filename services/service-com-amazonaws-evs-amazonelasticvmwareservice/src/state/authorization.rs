@@ -18,9 +18,10 @@
 //!    principal a refusal blames is the one the caller reads back from STS for the
 //!    credentials it signed with;
 //! 2. **what it may do** — the identity-based policy documents the IAM store holds for
-//!    that principal (a role's inline policies and the default versions of the managed
-//!    policies attached to it, a user's inline policies), read out of the IAM service's
-//!    OWN store so this service sees exactly what IAM's handlers wrote;
+//!    that principal: its inline policies and the default versions of the managed
+//!    policies attached to it, whichever kind of principal it is (a role or a user),
+//!    read out of the IAM service's OWN store so this service sees exactly what IAM's
+//!    handlers wrote;
 //! 3. **the decision** — [`::service_common::iam_authorization`], the ONE shared
 //!    evaluation of those documents against `(action, resource)`, so this service and
 //!    every other one handed the same documents answer alike.
@@ -165,33 +166,37 @@ pub fn caller<Eng: Send + Sync + 'static>(
         return caller;
     };
     let store = iam.lock();
-    if let Some(role_name) = assumed_role_name(&caller.arn) {
+    // The documents in force on an identity are its INLINE policies plus the default
+    // version of every MANAGED policy attached to it — the same two sources for every
+    // kind of principal, so the two branches differ only in which maps they are read
+    // from.
+    let (inline, attached) = if let Some(role_name) = assumed_role_name(&caller.arn) {
         let role_key = iam_store::name_key(role_name);
-        caller
-            .documents
-            .extend(inline_documents(&store.role_inline_policies, &role_key));
-        for attached in store
-            .role_attached_policies
-            .get(&role_key)
-            .into_iter()
-            .flatten()
-        {
-            // A policy the account does not hold a document for — an AWS-managed one,
-            // which AWS owns — carries no statement this gate can read. It is evidence
-            // of nothing, and since only an explicit deny refuses here, nothing follows
-            // from it either way.
-            if let Some(document) = store
-                .policy_by_arn(attached)
-                .and_then(default_version_document)
-            {
-                caller.documents.push(document);
-            }
-        }
+        (
+            inline_documents(&store.role_inline_policies, &role_key),
+            store.role_attached_policies.get(&role_key),
+        )
     } else if let Some(user_name) = iam_user_name(&caller.arn) {
-        caller.documents.extend(inline_documents(
-            &store.user_inline_policies,
-            &iam_store::name_key(user_name),
-        ));
+        let user_key = iam_store::name_key(user_name);
+        (
+            inline_documents(&store.user_inline_policies, &user_key),
+            store.user_attached_policies.get(&user_key),
+        )
+    } else {
+        (Vec::new(), None)
+    };
+    caller.documents.extend(inline);
+    for attachment in attached.into_iter().flatten() {
+        // A policy the account does not hold a document for — an AWS-managed one,
+        // which AWS owns — carries no statement this gate can read. It is evidence
+        // of nothing, and since only an explicit deny refuses here, nothing follows
+        // from it either way.
+        if let Some(document) = store
+            .policy_by_arn(attachment)
+            .and_then(default_version_document)
+        {
+            caller.documents.push(document);
+        }
     }
     caller
 }
