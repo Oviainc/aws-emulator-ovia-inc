@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyAuthenticationProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyAuthenticationProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyAuthenticationProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the content of an authentication profile this service's store
+//! already holds and reports back what it persisted: the name as given and the
+//! new content, which every later read reports from then on. A name that
+//! identifies no profile is refused with `AuthenticationProfileNotFoundFault`
+//! and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -91,12 +88,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `ModifyAuthenticationProfileError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#ModifyAuthenticationProfile")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#ModifyAuthenticationProfile",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum ModifyAuthenticationProfileErrorModeled {
     AuthenticationProfileNotFoundFault(AuthenticationProfileNotFoundFault),
     AuthenticationProfileQuotaExceededFault(AuthenticationProfileQuotaExceededFault),
     InvalidAuthenticationProfileRequestFault(InvalidAuthenticationProfileRequestFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -148,20 +149,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyAuthenticationProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyAuthenticationProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyAuthenticationProfile"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                ModifyAuthenticationProfileErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The size and the form of the content are the two things about this
+        // request the model does not constrain, and both are checked by the same
+        // rule the create uses, so a profile can never hold content a create
+        // would have refused.
+        if let Err(refusal) =
+            st::check_authentication_profile_content(&input.authentication_profile_content)
+        {
+            return Err(match refusal {
+                st::AuthenticationProfileContentRefusal::NotJson(message) => {
+                    ModifyAuthenticationProfileErrorModeled::InvalidAuthenticationProfileRequestFault(
+                        InvalidAuthenticationProfileRequestFault {
+                            message: Some(message),
+                        },
+                    )
+                    .into()
+                }
+                st::AuthenticationProfileContentRefusal::TooLong(message) => {
+                    ModifyAuthenticationProfileErrorModeled::AuthenticationProfileQuotaExceededFault(
+                        AuthenticationProfileQuotaExceededFault {
+                            message: Some(message),
+                        },
+                    )
+                    .into()
+                }
+            });
+        }
+
+        let mut store = state.lock();
+
+        // A modify changes a profile the account already holds, so its only
+        // precondition is that the name identifies one.
+        let Some(position) =
+            store.authentication_profile_position(&input.authentication_profile_name)
+        else {
+            return Err(
+                ModifyAuthenticationProfileErrorModeled::AuthenticationProfileNotFoundFault(
+                    AuthenticationProfileNotFoundFault {
+                        message: Some(st::authentication_profile_not_found_message(
+                            &input.authentication_profile_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The content REPLACES what the profile held — the member is the whole
+        // of a profile's configuration, not a patch on it — and the record keeps
+        // its place, so the order a later read reports is unchanged.
+        let profile = &mut store.authentication_profiles[position];
+        profile.authentication_profile_content = Some(input.authentication_profile_content.clone());
+
+        Ok(ModifyAuthenticationProfileOutput {
+            authentication_profile_name: profile.authentication_profile_name.clone(),
+            authentication_profile_content: profile.authentication_profile_content.clone(),
+        })
     }
 }

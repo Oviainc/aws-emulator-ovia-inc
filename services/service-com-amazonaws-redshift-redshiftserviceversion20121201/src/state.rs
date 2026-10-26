@@ -12,7 +12,9 @@
 //! that expose a cluster's or a serverless namespace's data to a consumer
 //! account through the Glue Data Catalog, and the event notification
 //! subscriptions that say which Amazon Redshift events are published to an
-//! Amazon SNS topic. Every collection keeps
+//! Amazon SNS topic, and the authentication profiles that hold, under a name a
+//! client names instead of repeating them, the connection settings it connects
+//! with. Every collection keeps
 //! INSERTION ORDER, so the `Marker`
 //! cursor the paginated `Describe*` operations hand out is a stable, resumable
 //! offset into the same sequence a later page walks.
@@ -34,7 +36,7 @@
 
 use crate::ops::types::{
     AccountAttribute, AccountWithRestoreAccess, AquaConfiguration, AttributeValueTarget,
-    AvailabilityZone, Cluster, ClusterIamRole,
+    AuthenticationProfile, AvailabilityZone, Cluster, ClusterIamRole,
     ClusterNode, ClusterParameterGroup, ClusterParameterGroupStatus, ClusterParameterStatus,
     ClusterSubnetGroup, ClusterVersion, CreateUsageLimitOutput, EventSubscription,
     HsmConfiguration, MaintenanceTrack,
@@ -1580,6 +1582,107 @@ pub const SNAPSHOT_COPY_GRANT_QUOTA: usize = 10_000;
 /// `DeleteEventSubscription`.
 pub const EVENT_SUBSCRIPTION_QUOTA: usize = 10_000;
 
+/// How many authentication profiles the store holds before
+/// `CreateAuthenticationProfile` refuses with the modelled
+/// `AuthenticationProfileQuotaExceededFault`.
+///
+/// The same reasoning as [`EVENT_SUBSCRIPTION_QUOTA`]: the emulator's own bound
+/// on
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::authentication_profiles`],
+/// not a claim about an account's published limit — the modelled doc
+/// (`smithy_query(query="doc", shape="CreateAuthenticationProfileMessage",
+/// member="AuthenticationProfileContent")`) says the allowance "is determined by
+/// a quota for your account", so there is no published number to enforce. A
+/// profile's identity is the name its create gives it, and names are unlimited
+/// in number, so this bound is what stops the collection growing without end; it
+/// is set far above any workflow an emulator serves, and every record it holds is
+/// released by `DeleteAuthenticationProfile`.
+pub const AUTHENTICATION_PROFILE_QUOTA: usize = 10_000;
+
+/// Why a request naming no authentication profile is refused, naming the profile
+/// it could not find.
+///
+/// Shared by every operation that looks one up — the read, the modify and the
+/// delete — so a client sees one message for one condition.
+pub fn authentication_profile_not_found_message(name: &str) -> String {
+    format!("Authentication profile not found: {name}")
+}
+
+/// Why a create under a name the account already holds a profile under is
+/// refused, naming that profile.
+///
+/// The NAME is what an account's authentication profiles are unique on, so the
+/// refusal names it: the caller has to pick another one.
+pub fn authentication_profile_exists_message(name: &str) -> String {
+    format!("Authentication profile already exists: {name}")
+}
+
+/// Why a request carrying authentication profile content this service cannot
+/// read is refused.
+///
+/// Source: `smithy_query(query="doc", shape="CreateAuthenticationProfileMessage",
+/// member="AuthenticationProfileContent")` — "The content of the authentication
+/// profile in JSON format."
+pub const AUTHENTICATION_PROFILE_CONTENT_NOT_JSON: &str =
+    "The content of the authentication profile must be in JSON format.";
+
+/// How long one authentication profile's content may be, in characters, before a
+/// write refuses it with the modelled
+/// `AuthenticationProfileQuotaExceededFault`.
+///
+/// The emulator's own bound, for the same reason as
+/// [`AUTHENTICATION_PROFILE_QUOTA`] and set against the one JSON configuration
+/// document this service does publish a maximum for: a workload management
+/// configuration's 8000 characters (see [`parameter_value_max_len`]). The
+/// modelled doc (`smithy_query(query="doc",
+/// shape="CreateAuthenticationProfileMessage",
+/// member="AuthenticationProfileContent")`) says the maximum length of the JSON
+/// string "is determined by a quota for your account", so there is no published
+/// number to enforce — and the content is held in the store for as long as the
+/// profile is, so without a bound one request could size the store.
+pub const MAX_AUTHENTICATION_PROFILE_CONTENT_LEN: usize = 8_000;
+
+/// Why authentication profile content cannot be stored, classified so each
+/// operation answers it with the fault its own model declares for that class.
+///
+/// One classification for the create and the modify path, so a profile can never
+/// hold content the other would have refused.
+#[derive(Debug)]
+pub enum AuthenticationProfileContentRefusal {
+    /// Content that is not one JSON document — the form the member is
+    /// documented to carry, so this is
+    /// `InvalidAuthenticationProfileRequestFault`.
+    NotJson(String),
+    /// Content longer than this service stores under one profile —
+    /// `AuthenticationProfileQuotaExceededFault`, the fault the model declares
+    /// for the SIZE of a profile as well as for the number of them.
+    TooLong(String),
+}
+
+/// Whether authentication profile content is something this service can store.
+///
+/// The content is kept and reported back VERBATIM, so a write can only check its
+/// SIZE and its FORM: it has to be at most
+/// [`MAX_AUTHENTICATION_PROFILE_CONTENT_LEN`] characters, and it has to parse as
+/// one JSON document. The size is checked FIRST, so a request cannot make the
+/// service parse more than it would ever store.
+pub fn check_authentication_profile_content(
+    content: &str,
+) -> Result<(), AuthenticationProfileContentRefusal> {
+    let length = content.chars().count();
+    if length > MAX_AUTHENTICATION_PROFILE_CONTENT_LEN {
+        return Err(AuthenticationProfileContentRefusal::TooLong(format!(
+            "The content of the authentication profile is {length} characters long, which exceeds the maximum of {MAX_AUTHENTICATION_PROFILE_CONTENT_LEN} characters."
+        )));
+    }
+    if serde_json::from_str::<serde_json::Value>(content).is_err() {
+        return Err(AuthenticationProfileContentRefusal::NotJson(
+            AUTHENTICATION_PROFILE_CONTENT_NOT_JSON.to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// How many entries one request's `SourceIds` list may carry.
 ///
 /// The emulator's own bound, and for the same reason as the collection quotas
@@ -2478,6 +2581,15 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::snapshot_copy_grants`],
     /// this collection needs no `Stored*` wrapper.
     pub event_subscriptions: Vec<EventSubscription>,
+    /// Every authentication profile, keyed by `AuthenticationProfileName`, in
+    /// creation order.
+    ///
+    /// The modelled `AuthenticationProfile` shape IS the whole record — a
+    /// profile is its name and the content a write gave it, and carries no
+    /// status the clock moves — so, like
+    /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::event_subscriptions`],
+    /// this collection needs no `Stored*` wrapper.
+    pub authentication_profiles: Vec<AuthenticationProfile>,
 }
 
 /// Where in the store one resource an ARN names sits: its collection and its
@@ -2522,6 +2634,7 @@ impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             reserved_node_offerings: published_reserved_node_offerings(),
             namespace_registrations: Vec::new(),
             event_subscriptions: Vec::new(),
+            authentication_profiles: Vec::new(),
         }
     }
 }
@@ -2847,6 +2960,32 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         self.snapshot_copy_grants
             .iter()
             .find(|grant| grant.snapshot_copy_grant_name.as_deref() == Some(name))
+    }
+
+    /// The authentication profile with this `AuthenticationProfileName`, if any.
+    ///
+    /// The name is compared exactly as the create that minted the profile
+    /// spelled it: the modelled syntax
+    /// (`smithy_query(query="operation", operation="CreateAuthenticationProfile")`
+    /// — `^[a-zA-Z0-9\-]+$`) admits both cases and states no folding, so a
+    /// caller naming it in another case names no profile.
+    pub fn authentication_profile(&self, name: &str) -> Option<&AuthenticationProfile> {
+        self.authentication_profiles
+            .iter()
+            .find(|profile| profile.authentication_profile_name.as_deref() == Some(name))
+    }
+
+    /// The position of the authentication profile with this
+    /// `AuthenticationProfileName`, if any.
+    ///
+    /// The name is compared exactly as [`Self::authentication_profile`] compares
+    /// it. A position rather than a reference, because the callers of it — the
+    /// modify and the delete — need to write or remove the record they find,
+    /// and `remove` keeps the insertion order a later read reports.
+    pub fn authentication_profile_position(&self, name: &str) -> Option<usize> {
+        self.authentication_profiles
+            .iter()
+            .position(|profile| profile.authentication_profile_name.as_deref() == Some(name))
     }
 
     /// The event notification subscription with this name, if any.
