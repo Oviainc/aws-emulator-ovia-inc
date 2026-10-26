@@ -210,7 +210,7 @@ async fn an_absent_subresource_is_refused_with_its_codes_published_message() {
             subresource: "replication",
             status: 404,
             code: "ReplicationConfigurationNotFoundError",
-            message: "There is no replication configuration for this bucket",
+            message: "The replication configuration was not found",
         },
         Row {
             case: "a bucket with no ownership controls",

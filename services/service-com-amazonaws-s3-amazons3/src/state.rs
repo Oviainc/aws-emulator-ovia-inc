@@ -4219,6 +4219,19 @@ impl Bucket {
         self.replication = Some(configuration);
     }
 
+    /// Remove the bucket's replication configuration, reporting whether it carried one.
+    ///
+    /// What `DeleteBucketReplication` does — it "deletes the replication configuration from
+    /// the bucket" (that operation's own documentation) — which puts the bucket back in the
+    /// state it was created in, so a later `GetBucketReplication` reports no configuration
+    /// again ([`REPLICATION_CONFIGURATION_NOT_FOUND_CODE`]). Scoped to this one
+    /// subresource: the bucket's versioning, its objects and every other configuration are
+    /// left exactly as they were, the way [`Self::clear_lifecycle`] is scoped to the
+    /// lifecycle one.
+    pub fn clear_replication(&mut self) -> bool {
+        self.replication.take().is_some()
+    }
+
     /// The bucket's lifecycle configuration, or `None` while no configuration is associated
     /// with it.
     pub fn lifecycle(&self) -> Option<&BucketLifecycle> {
@@ -7377,13 +7390,16 @@ pub const INVALID_CONFIG_ID_STATUS: u16 = 400;
 pub const MAX_CONFIGURATION_ID_CHARS: usize = 64;
 
 /// The code S3 answers a `GetBucketReplication` for a bucket that has no replication
-/// configuration with: "ReplicationConfigurationNotFoundError - There is no replication
-/// configuration for this bucket" (Amazon S3 "Error responses", list of error codes), with
-/// HTTP 404.
+/// configuration with: `ReplicationConfigurationNotFoundError` (Amazon S3 "Error
+/// responses", list of error codes), with HTTP 404.
 pub const REPLICATION_CONFIGURATION_NOT_FOUND_CODE: &str = "ReplicationConfigurationNotFoundError";
-/// See [`REPLICATION_CONFIGURATION_NOT_FOUND_CODE`].
+/// The message S3 answers [`REPLICATION_CONFIGURATION_NOT_FOUND_CODE`] with: "The
+/// replication configuration was not found" — fixed text, nothing of which comes from the
+/// request, phrased the way the service words it on the wire rather than the way the
+/// error-code list describes the condition ("there is no replication configuration for this
+/// bucket"), which is a description of the case and not the `<Message>` a client reads.
 pub const REPLICATION_CONFIGURATION_NOT_FOUND_MESSAGE: &str =
-    "There is no replication configuration for this bucket";
+    "The replication configuration was not found";
 /// The HTTP status [`REPLICATION_CONFIGURATION_NOT_FOUND_CODE`] is rendered with: 404,
 /// from the same list.
 pub const REPLICATION_CONFIGURATION_NOT_FOUND_STATUS: u16 = 404;
