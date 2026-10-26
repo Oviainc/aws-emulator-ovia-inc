@@ -1007,6 +1007,32 @@ pub const ATTRIBUTE_PRIVILEGED_CONTAINER: &str = "com.amazonaws.ecs.capability.p
 /// the driver name (`LogConfiguration$logDriver`) completes it.
 pub const ATTRIBUTE_LOGGING_DRIVER_PREFIX: &str = "com.amazonaws.ecs.capability.logging-driver.";
 
+/// How many attributes ONE attribute write may carry.
+/// `DeleteAttributes$attributes`: "You can specify up to 10 attributes for each
+/// request" — the bound `PutAttributes$attributes` states for the same list ("You can
+/// specify up to 10 attributes in a single call"), so both read it from here.
+pub const MAX_ATTRIBUTES_PER_REQUEST: usize = 10;
+
+/// `TargetNotFoundException$message`: the shape's own doc sentence, which names no
+/// target (`smithy_query` query="shape" shape="TargetNotFoundException"). No recording
+/// fixes this one; what the rule fixes is that the sentence is the SAME for every
+/// request whose attribute names a resource the cluster does not hold.
+pub const TARGET_NOT_FOUND_MESSAGE: &str = "The specified target wasn't found.";
+
+/// `InvalidParameterException$message` for an `Attribute` of an attribute WRITE that
+/// names no target at all. `DeleteAttributes$attributes`: "For custom attributes,
+/// specify the attribute name and target ID" — an attribute with no `targetId` names no
+/// resource to write to, so the refusal names the member that is missing.
+pub const ATTRIBUTE_TARGET_ID_REQUIRED_MESSAGE: &str =
+    "attributes.targetId is required to name the resource the attribute is on";
+
+/// `InvalidParameterException$message` for an `Attribute` whose `targetId` is the short
+/// form id of a resource with no `targetType` beside it. `Attribute$targetType`: "This
+/// parameter is required if you use the short form ID for a resource instead of the full
+/// ARN."
+pub const ATTRIBUTE_TARGET_TYPE_REQUIRED_MESSAGE: &str =
+    "attributes.targetType is required when targetId is the short form id of a resource";
+
 /// `healthStatus` this emulator reports. The `Container$healthStatus` doc: "If health
 /// checks aren't configured for this container in its task definition, then it reports
 /// the health status as UNKNOWN." Nothing executes a container here, so no container

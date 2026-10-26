@@ -2,9 +2,10 @@
 
 //! @op DeleteVectors
 //! IMPLEMENTED: removes the named vectors from the stored vector index in
-//! [`crate::state`]. A mutation, and `@idempotent`: a key the index no longer holds is
-//! already in the state the request asks for, so it is not an error. This is the ONLY
-//! file to touch for this operation.
+//! [`crate::state`], leaving a tombstone behind for each one that was there — the
+//! candidate slot a later QueryVectors still spends on it. A mutation, and `@idempotent`:
+//! a key the index no longer holds is already in the state the request asks for, so it is
+//! not an error. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,7 +163,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteVectorsErrorModeled::ServiceUnavailableException(
                 ServiceUnavailableException {
@@ -179,15 +179,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(refusal)?;
 
+        // Who the request speaks for, resolved before this service's own store is
+        // locked, so only one store is ever held at a time.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
         let mut store = state.lock();
+        // The vector bucket's own resource policy decides this call before it deletes
+        // anything: an explicit Deny of the action refuses it.
+        if let Some(message) = store
+            .authorization_target(&bucket_name, Some(&index_name))
+            .map_err(refusal)?
+            .refusal(&caller, &[Self::NAME])
+        {
+            return Err(DeleteVectorsErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
         // The index is resolved first, so deleting from an index that is not there is
         // the modelled 404 rather than a silent success.
         let index = store.index_mut(&bucket_name, &index_name).map_err(refusal)?;
         for key in &input.keys {
             // Removing a key the index does not hold is a no-op: the operation is
             // `@idempotent`, so a repeat of a delete that already succeeded answers the
-            // same success. A key repeated inside one batch is the same no-op.
-            index.vectors.remove(key);
+            // same success. A key repeated inside one batch is the same no-op. A key the
+            // index DID hold leaves a tombstone behind, which is what keeps the
+            // candidate slot the deleted vector occupies taken.
+            index.tombstone(key);
         }
 
         Ok(DeleteVectorsOutput {})

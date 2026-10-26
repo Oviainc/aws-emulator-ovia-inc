@@ -90,11 +90,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3vectors-s3vectors.jso
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.s3vectors#ListIndexes",
-    extra_errors = ["ValidationException"]
+    extra_errors = ["ValidationException", "AccessDeniedException"]
 )]
 #[derive(Debug)]
 pub enum ListIndexesErrorModeled {
     ValidationException(ValidationException),
+    AccessDeniedException(AccessDeniedException),
     NotFoundException(NotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
 }
@@ -150,7 +151,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListIndexesErrorModeled::ServiceUnavailableException(
                 ServiceUnavailableException {
@@ -166,8 +166,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(refusal)?;
 
+        // Who the request speaks for, resolved before this service's own store is
+        // locked, so only one store is ever held at a time.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
         let store = state.lock();
         let bucket = store.bucket(&bucket_name).map_err(refusal)?;
+
+        // The vector bucket's own resource policy decides this call before it reports
+        // anything: an explicit Deny of the action refuses it.
+        if let Some(message) = store
+            .authorization_target(&bucket_name, None)
+            .map_err(refusal)?
+            .refusal(&caller, &[Self::NAME])
+        {
+            return Err(ListIndexesErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
         let names: Vec<&str> = bucket.indexes.keys().map(String::as_str).collect();
         let (page, next_token) = crate::state::page_of(
             names,

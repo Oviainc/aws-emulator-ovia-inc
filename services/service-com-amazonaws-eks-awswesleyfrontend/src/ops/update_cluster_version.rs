@@ -103,7 +103,7 @@ use std::time::SystemTime;
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    self, kubernetes_minor_version, PendingClusterConfig, UpdateRecord,
+    self, kubernetes_minor_version, PendingClusterConfig, UpdateRecord, UpdateScope,
     MAX_ROLLBACK_TIMEOUT_MINUTES, MIN_ROLLBACK_TIMEOUT_MINUTES, PLATFORM_VERSION, STATUS_ACTIVE,
     STATUS_UPDATING, UPDATE_COMPLETION_DELAY, UPDATE_IN_PROGRESS, UPDATE_PARAM_PLATFORM_VERSION,
     UPDATE_PARAM_VERSION, UPDATE_TYPE_VERSION, UPDATE_TYPE_VERSION_ROLLBACK,
@@ -474,6 +474,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // update": none has been, so `CancelUpdate` is the only writer of either.
             cancellation: None,
             cancellation_request_token: None,
+            // The Kubernetes version this moves is the cluster's own control
+            // plane's, not a resource inside the cluster.
+            scope: UpdateScope::Cluster,
         };
         let answer = update.to_update();
 

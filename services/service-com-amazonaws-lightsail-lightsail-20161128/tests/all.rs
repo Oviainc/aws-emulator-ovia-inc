@@ -243,6 +243,8 @@ mod state_roundtrip;
 mod static_ip_allocation;
 #[path = "all/static_ip_listing.rs"]
 mod static_ip_listing;
+#[path = "all/static_ip_release.rs"]
+mod static_ip_release;
 #[path = "all/tagged_resource_coverage.rs"]
 mod tagged_resource_coverage;
 #[path = "all/vpc_peering.rs"]

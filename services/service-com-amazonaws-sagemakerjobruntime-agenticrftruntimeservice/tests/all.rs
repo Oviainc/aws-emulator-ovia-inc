@@ -17,6 +17,9 @@ mod job_resolution;
 #[path = "all/modelled_rejections.rs"]
 mod modelled_rejections;
 
+#[path = "all/refused_sampling_leaves_no_trajectory.rs"]
+mod refused_sampling_leaves_no_trajectory;
+
 #[path = "all/rejected_value_echo.rs"]
 mod rejected_value_echo;
 
