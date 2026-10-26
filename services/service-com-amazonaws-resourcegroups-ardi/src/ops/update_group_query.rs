@@ -12,10 +12,11 @@
 //! accept are refused and kept the same way ([`crate::state::check_resource_query`]).
 //!
 //! A group contains either a resource query or a service configuration, never both, so a
-//! group whose stored configuration carries an item cannot be given a query at all: that
-//! is the modelled `BadRequestException`, the same mutual exclusion `CreateGroup` refuses
-//! a request for. A group that carries neither is not excluded by that rule, so it keeps
-//! the query this call stores.
+//! group whose configuration carries an item — the one in effect, or one an accepted
+//! `PutGroupConfiguration` is about to put in effect — cannot be given a query at all:
+//! that is the modelled `BadRequestException`, the same mutual exclusion `CreateGroup`
+//! refuses a request for. A group that carries neither is not excluded by that rule, so
+//! it keeps the query this call stores.
 //!
 //! ## Shape of an operation
 //!
@@ -206,14 +207,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // region is where the identifier is resolved: a group of another region is not
         // updatable from here.
         let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
         let key = store.lookup(&region, identifier).ok_or_else(not_found)?;
         let record = store.groups.get_mut(&key).ok_or_else(not_found)?;
         // Modelled: "A resource group can contain either a Configuration or a
-        // ResourceQuery, but not both" — so a group whose stored configuration
-        // carries an item has no query to update and is given none here. A group that
-        // carries neither contains no configuration, so the exclusion does not reach
-        // it and the query below becomes the one it is queried by.
-        if let Some(configured) = record.configuration_types().next() {
+        // ResourceQuery, but not both" — so a group whose configuration carries an
+        // item has no query to update and is given none here, whether that
+        // configuration is the one in effect or one an accepted update is about to
+        // put in effect. A group that carries neither contains no configuration, so
+        // the exclusion does not reach it and the query below becomes the one it is
+        // queried by.
+        if let Some(configured) = record.configured_type(now) {
             let message = format!(
                 "a resource group can contain either a ResourceQuery or a Configuration, \
                  but not both, and the group {} is configured as {configured}",
