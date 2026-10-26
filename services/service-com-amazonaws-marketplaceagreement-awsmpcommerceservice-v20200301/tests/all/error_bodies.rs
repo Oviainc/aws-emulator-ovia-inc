@@ -119,7 +119,12 @@ fn unresolvable_agreement_ids() -> Vec<(&'static str, String)> {
 /// the `reason` naming the offending member, one `fields` entry at that
 /// member's own request path, and none of the members a not-found refusal would
 /// have carried instead.
-fn assert_input_fault(case: &str, reason: &str, field: &str, answer: &Answer) {
+///
+/// `pub(crate)` because the suite that spans the inactive-agreement refusal over
+/// every operation that requires an active agreement
+/// (`tests/all/inactive_agreement_refusals.rs`) asserts the same envelope rather
+/// than keeping a second copy of it.
+pub(crate) fn assert_input_fault(case: &str, reason: &str, field: &str, answer: &Answer) {
     assert_eq!(
         answer.status, 400,
         "case {case:?}: an input fault is answered at the modelled HTTP 400, got {} with {:?}",

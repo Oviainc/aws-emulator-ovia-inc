@@ -245,7 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The agreement must be active": `ValidationExceptionReason` models
             // this case as `INACTIVE_AGREEMENT`.
             return Err(SendAgreementPaymentRequestErrorModeled::ValidationException(
-                crate::state::validation_exception("INACTIVE_AGREEMENT", "agreementId"),
+                crate::state::inactive_agreement(),
             )
             .into());
         }
