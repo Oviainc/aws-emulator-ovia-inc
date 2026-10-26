@@ -33,7 +33,7 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The Region of a request is whatever its credential scope carries, so what the rule
 /// generalises over is the Region VALUE: this table spans four Region codes from four
 /// different geographies, only the first two of which the reported case used.
-const REGIONS: [&str; 4] = ["us-west-2", "us-east-1", "eu-central-1", "ap-southeast-2"];
+pub const REGIONS: [&str; 4] = ["us-west-2", "us-east-1", "eu-central-1", "ap-southeast-2"];
 
 /// The `language` every dictionary below is created with — one value the
 /// `DictionaryLanguage` enum admits (`smithy_query(query="shape",
@@ -147,7 +147,7 @@ fn dictionary_probes(id: &str) -> Vec<Probe> {
 
 /// The modelled not-found refusal, as every operation of this service answers it for an
 /// id (or an ARN) that names no resource of the endpoint it was sent to.
-fn assert_not_found(label: &str, status: u16, body: &Value) {
+pub fn assert_not_found(label: &str, status: u16, body: &Value) {
     assert_eq!(
         status, 404,
         "case {label:?}: expected HTTP 404, got {status} with {body}"
@@ -230,7 +230,7 @@ fn ids_owned_by(owned: &[(&str, String, String)], owner: &str) -> Vec<String> {
 }
 
 /// The Region field of an ARN (`arn:<partition>:<service>:<region>:…`).
-fn arn_region(arn: &str) -> &str {
+pub fn arn_region(arn: &str) -> &str {
     arn.split(':').nth(3).expect("an ARN carries a region")
 }
 
