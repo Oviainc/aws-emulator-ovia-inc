@@ -602,10 +602,11 @@ async fn a_repeated_request_id_creates_one_channel() {
 
 /// Rule: the channel store is bounded, so a create loop is refused with the
 /// operation's modelled throttle rather than growing the emulator's heap, and
-/// `ListChannels` never projects more than a finite page even when the request
-/// names no `MaxResults`.
+/// `ListChannels` answers a page as large as the request asks for — up to the
+/// service's published `MaxResults` ceiling — so a full store is reported in one
+/// page rather than cut short beside a continuation token.
 #[tokio::test]
-async fn the_store_is_bounded_and_the_default_page_is_finite() {
+async fn the_store_is_bounded_and_a_full_store_fits_one_page() {
     use service_com_amazonaws_medialive_medialive::state::{MAX_CHANNELS, MAX_LIST_PAGE_SIZE};
 
     let router = medialive();
@@ -630,30 +631,57 @@ async fn the_store_is_bounded_and_the_default_page_is_finite() {
         "case {MAX_CHANNELS} stored: expected TooManyRequestsException, got {body}"
     );
 
-    // No maxResults: the page is the service's own finite ceiling, and it hands
-    // out a token because channels are left over.
-    let (status, page) = call(&router, "GET", "/prod/channels", None).await;
+    // The page the whole store fits in: the ceiling is the published `MaxResults`
+    // bound, above what the store can hold, so no channel is left over and no
+    // token is handed out — with no maxResults, with one at the store's size and
+    // with one past the ceiling alike.
+    const {
+        assert!(
+            MAX_CHANNELS <= MAX_LIST_PAGE_SIZE,
+            "the page ceiling must admit a full channel store"
+        )
+    };
+    for case in [
+        String::new(),
+        format!("?maxResults={MAX_CHANNELS}"),
+        format!("?maxResults={}", MAX_LIST_PAGE_SIZE + 500),
+    ] {
+        let (status, page) = call(&router, "GET", &format!("/prod/channels{case}"), None).await;
+        assert_eq!(status, 200, "case {case:?}: ListChannels: got {status}: {page}");
+        assert_eq!(
+            page["channels"].as_array().map(Vec::len),
+            Some(MAX_CHANNELS),
+            "case {case:?}: expected the page to hold all {MAX_CHANNELS} channels, got {:?}",
+            page["channels"].as_array().map(Vec::len)
+        );
+        assert!(
+            page["nextToken"].is_null(),
+            "case {case:?}: expected no token beside a page holding every channel, got {:?}",
+            page["nextToken"]
+        );
+    }
+
+    // A maxResults BELOW the store's size is honoured verbatim, and a token is
+    // handed out because channels are left over.
+    let asked_for = MAX_CHANNELS - 1;
+    let (status, page) = call(
+        &router,
+        "GET",
+        &format!("/prod/channels?maxResults={asked_for}"),
+        None,
+    )
+    .await;
     assert_eq!(status, 200, "ListChannels: got {status}: {page}");
     assert_eq!(
         page["channels"].as_array().map(Vec::len),
-        Some(MAX_LIST_PAGE_SIZE),
-        "expected the default page to hold {MAX_LIST_PAGE_SIZE} channels, got {:?}",
+        Some(asked_for),
+        "expected the page to hold the {asked_for} channels asked for, got {:?}",
         page["channels"].as_array().map(Vec::len)
     );
     assert!(
         page["nextToken"].is_string(),
         "expected a token while channels are left over, got {:?}",
         page["nextToken"]
-    );
-
-    // A maxResults above that ceiling is clamped to it rather than honoured.
-    let (status, page) = call(&router, "GET", "/prod/channels?maxResults=10000", None).await;
-    assert_eq!(status, 200, "ListChannels: got {status}: {page}");
-    assert_eq!(
-        page["channels"].as_array().map(Vec::len),
-        Some(MAX_LIST_PAGE_SIZE),
-        "expected an over-large maxResults to be clamped to {MAX_LIST_PAGE_SIZE}, got {:?}",
-        page["channels"].as_array().map(Vec::len)
     );
 }
 
