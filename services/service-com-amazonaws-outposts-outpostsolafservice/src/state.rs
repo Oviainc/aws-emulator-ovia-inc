@@ -7,7 +7,9 @@
 //! `@httpLabel` patterns accept, projecting a resource's tag map and an Outpost's
 //! two Availability Zone identities, selecting a site's two addresses by the
 //! modelled `AddressType` and keeping the `Site` projection of the operating one in
-//! step with it, materialising the Outpost lifecycle transition,
+//! step with it, projecting an Outpost's private connectivity configuration
+//! together with the IAM roles AWS Outposts uses for it,
+//! materialising the Outpost lifecycle transition,
 //! the quote expiry, the order's progress and the capacity-task progression the
 //! clock owes, allocating the
 //! tunnel an Outpost-server installation connection is reported as, cutting an
@@ -32,7 +34,7 @@ use crate::ops::types::{
     Address, AssetInfo, AssetInstance, AssetLocation, CapacityTaskFailure, CatalogItem,
     ComputeAttributes, ConnectionDetails, DetailedInstanceTypeItem, EC2Capacity, FormFactorConfig,
     InstanceTypeCapacity, InstanceTypeItem, InstancesToExclude, Order, Outpost, PricingOption,
-    PrivateConnectivityConfig, Quote, Site, SubscriptionPricingDetails,
+    PrivateConnectivityConfig, Quote, Site, SubscriptionPricingDetails, VpcInformation,
 };
 
 /// The region every minted ARN falls back to when the request carries no SigV4
@@ -3614,6 +3616,87 @@ pub fn site_arn(region: &str, site_id: &str) -> String {
 /// An `OutpostArn`: `arn:<partition>:outposts:<region>:<account>:outpost/op-…`.
 pub fn outpost_arn(region: &str, outpost_id: &str) -> String {
     resource_arn(region, OUTPOST_RESOURCE_TYPE, outpost_id)
+}
+
+/// One IAM role ARN: `arn:<partition>:iam::<account>:role/<name>`.
+///
+/// IAM is a GLOBAL service, so the region segment of its ARNs is empty — which is
+/// exactly what the modelled `RoleArn` pattern
+/// (`^arn:aws([a-z-]+)?:iam::\d{12}:role\/[a-zA-Z_0-9+=,.@\-_\/]+$`) spells. The
+/// partition is still the one the region the role's resource lives in belongs to
+/// ([`partition_for`]), and the account the one emulator account, as in
+/// [`resource_arn`].
+fn iam_role_arn(region: &str, role_name: &str) -> String {
+    format!(
+        "arn:{}:iam::{}:role/{role_name}",
+        partition_for(region),
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The `RoleArn` of an Outpost's private connectivity configuration: the
+/// service-linked role AWS Outposts creates to provision and attach the private
+/// connectivity network interfaces in the caller's VPC.
+///
+/// A service-linked role lives under the reserved `aws-service-role/<service
+/// principal>/` IAM path and is named for the service that owns it. This one is
+/// derived PER OUTPOST because the member's own documentation says its permissions
+/// are scoped to the specific Outpost and VPC, so the configuration of one Outpost
+/// cannot report the role of another; what the model requires of the value is the
+/// `RoleArn` form and that stability, not a particular name.
+pub fn private_connectivity_role_arn(region: &str, outpost_id: &str) -> String {
+    iam_role_arn(
+        region,
+        &format!("aws-service-role/outposts.amazonaws.com/AWSServiceRoleForOutposts_{outpost_id}"),
+    )
+}
+
+/// The `ProvisioningRoleArn` of an Outpost's private connectivity configuration:
+/// the role in the caller's own account that AWS Outposts uses to establish the
+/// service link connection while the Outpost is installed.
+///
+/// This one is NOT a service-linked role — the member documents it as a role in
+/// the caller's account — so it carries no reserved path. AWS publishes no name for
+/// it, so the name is this emulator's own: derived from the Outpost the role
+/// provisions, so it is stable across reads and distinct per Outpost, in the
+/// modelled `RoleArn` form for the request's partition and the emulator account.
+/// What is required of the value is that form and that per-Outpost stability; the
+/// literal name follows no published naming, so a reader should not take it for
+/// one.
+pub fn private_connectivity_provisioning_role_arn(region: &str, outpost_id: &str) -> String {
+    iam_role_arn(region, &format!("AWSOutpostsProvisioning_{outpost_id}"))
+}
+
+/// The `PrivateConnectivityConfig` an Outpost configured with `vpc_information_list`
+/// holds.
+///
+/// One builder, so the configuration a create reports and the one stored for every
+/// later read to answer cannot disagree:
+///
+/// * the VPC, its subnets and the VPC endpoint are the caller's, kept as sent;
+/// * the status is the terminal [`PRIVATE_CONNECTIVITY_ENABLED`];
+/// * `RoleArn` is the service-linked role of this Outpost's private connectivity
+///   ([`private_connectivity_role_arn`]) — it exists for any configuration, since
+///   the network interfaces it provisions are what private connectivity IS;
+/// * `ProvisioningRoleArn` is reported only for a configuration that is VPC
+///   ENDPOINT-based, which its own documentation makes the single condition on that
+///   member, and a configuration is endpoint-based exactly when its VPC information
+///   names an interface VPC endpoint.
+pub fn private_connectivity_config(
+    region: &str,
+    outpost_id: &str,
+    vpc_information_list: Vec<VpcInformation>,
+) -> PrivateConnectivityConfig {
+    let endpoint_based = vpc_information_list
+        .iter()
+        .any(|vpc| vpc.vpc_endpoint_id.is_some());
+    PrivateConnectivityConfig {
+        role_arn: Some(private_connectivity_role_arn(region, outpost_id)),
+        private_connectivity_status: Some(PRIVATE_CONNECTIVITY_ENABLED.to_string()),
+        vpc_information_list: Some(vpc_information_list),
+        provisioning_role_arn: endpoint_based
+            .then(|| private_connectivity_provisioning_role_arn(region, outpost_id)),
+    }
 }
 
 /// The bare resource id an Outposts identifier names, whether it arrived as the id
