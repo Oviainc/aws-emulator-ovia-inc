@@ -45,6 +45,8 @@ mod resolver_rule_association_listing;
 mod resolver_rule_deletion;
 #[path = "all/resolver_rule_error_bodies.rs"]
 mod resolver_rule_error_bodies;
+#[path = "all/resolver_rule_policies.rs"]
+mod resolver_rule_policies;
 #[path = "all/resolver_rule_updates.rs"]
 mod resolver_rule_updates;
 #[path = "all/resolver_rules.rs"]

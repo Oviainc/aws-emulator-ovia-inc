@@ -17,10 +17,10 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     FirewallConfig, FirewallDomainList, FirewallDomainListMetadata, InvalidParameterException,
-    InvalidRequestException, IpAddressResponse, IpAddressUpdate, LimitExceededException,
-    OutpostResolver, ResolverConfig, ResolverDnssecConfig, ResolverEndpoint, ResolverRule,
-    ResolverRuleAssociation, ResourceExistsException, ResourceInUseException,
-    ResourceNotFoundException, Tag, TargetAddress, ValidationException,
+    InvalidPolicyDocument, InvalidRequestException, IpAddressResponse, IpAddressUpdate,
+    LimitExceededException, OutpostResolver, ResolverConfig, ResolverDnssecConfig, ResolverEndpoint,
+    ResolverRule, ResolverRuleAssociation, ResourceExistsException, ResourceInUseException,
+    ResourceNotFoundException, Tag, TargetAddress, UnknownResourceException, ValidationException,
 };
 
 /// The region an ARN carries when the request's SigV4 scope names none.
@@ -800,6 +800,143 @@ pub fn resolver_rule_in_use() -> ResourceInUseException {
     }
 }
 
+/// The `UnknownResourceException` the Resolver rule policy operations answer
+/// for an `Arn` the store holds no Resolver rule under.
+///
+/// Both operations address the rule by its ARN rather than by its id, so the
+/// sentence names what the request asked for: the ARN it was handed. No
+/// recorded response available here states a service error code for this fault
+/// — as for [`resolver_rule_association_not_found`] — so none is invented, and
+/// the HTTP status (400) and the error shape are what the contract fixes.
+pub fn unknown_resolver_rule_arn(arn: &str) -> UnknownResourceException {
+    UnknownResourceException {
+        message: Some(format!(r#"Resolver rule with ARN "{arn}" does not exist."#)),
+    }
+}
+
+/// The `InvalidPolicyDocument` a resource-policy write answers for a document
+/// outside the policy grammar, with `fault` stating which part of the grammar it
+/// misses (from [`policy_document_fault`]).
+///
+/// The opening sentence is the fault the model states for the shape ("The
+/// specified Resolver rule policy is invalid"); what follows names the element
+/// the document is missing, so the caller can fix the document from the message
+/// alone.
+pub fn invalid_policy_document(fault: &str) -> InvalidPolicyDocument {
+    InvalidPolicyDocument {
+        message: Some(format!(
+            "The specified Resolver rule policy is invalid: {fault}."
+        )),
+    }
+}
+
+/// The policy document a resource with no stored resource policy reports: the
+/// empty JSON object, a document that states no statement and so shares the
+/// resource with nobody. Inside `ResolverRulePolicy`'s modelled length
+/// (0..30000, `smithy_query(query="shape",shape="ResolverRulePolicy")`).
+pub const EMPTY_POLICY_DOCUMENT: &str = "{}";
+
+/// Why `policy` is not a policy document, or `None` when it is one.
+///
+/// A JSON policy document is an object, and each statement of its `Statement`
+/// element — one statement or an array of them — is an object that states an
+/// `Effect` and an `Action` (the elements the IAM JSON policy grammar requires
+/// of every statement). A document that states no statement at all is still a
+/// document: it grants nothing, which is what [`EMPTY_POLICY_DOCUMENT`] is.
+///
+/// The modelled `ResolverRulePolicy` length (0..30000) admits the empty string
+/// and any other text, so the grammar is what a policy write checks here,
+/// before it touches the store: a document outside it is refused with
+/// `InvalidPolicyDocument` and the resource keeps the policy it had.
+pub fn policy_document_fault(policy: &str) -> Option<String> {
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(policy) else {
+        return Some("a policy document is JSON".to_string());
+    };
+    if !document.is_object() {
+        return Some("a policy document is a JSON object".to_string());
+    }
+    for (index, statement) in policy_statements(&document).iter().enumerate() {
+        let Some(members) = statement.as_object() else {
+            return Some(format!("statement {index} is not a JSON object"));
+        };
+        for element in ["Effect", "Action"] {
+            if !members.contains_key(element) {
+                return Some(format!("statement {index} states no {element} element"));
+            }
+        }
+    }
+    None
+}
+
+/// The statements of a policy document: the elements of its `Statement` array,
+/// or the single statement when the element is one statement rather than an
+/// array, or none when the document states no `Statement` at all.
+fn policy_statements(document: &serde_json::Value) -> Vec<&serde_json::Value> {
+    match document.get("Statement") {
+        Some(serde_json::Value::Array(items)) => items.iter().collect(),
+        Some(single) => vec![single],
+        None => Vec::new(),
+    }
+}
+
+/// Every principal one statement's `Principal` element names, in the forms the
+/// policy grammar writes them: the element is either one string (`*`) or a map
+/// from principal type to one value or a list of values.
+fn policy_principals(principal: &serde_json::Value) -> Vec<&str> {
+    match principal {
+        serde_json::Value::String(value) => vec![value.as_str()],
+        serde_json::Value::Object(by_type) => by_type
+            .values()
+            .flat_map(|value| match value {
+                serde_json::Value::Array(items) => {
+                    items.iter().filter_map(serde_json::Value::as_str).collect()
+                }
+                single => single.as_str().into_iter().collect::<Vec<&str>>(),
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The account one principal value names: the account field of an ARN
+/// (`arn:<partition>:<service>:<region>:<account>:<resource>`), or the value
+/// itself when it is a bare account id.
+///
+/// `None` for anything that names no single account — `*`, or a principal of
+/// another kind such as a service — and none of those is the owning account.
+fn principal_account(value: &str) -> Option<&str> {
+    if let Some(rest) = value.strip_prefix("arn:") {
+        return rest.split(':').nth(3).filter(|account| !account.is_empty());
+    }
+    if !value.is_empty() && value.chars().all(|character| character.is_ascii_digit()) {
+        return Some(value);
+    }
+    None
+}
+
+/// Whether `policy` grants anything to a principal other than `owner_account`,
+/// the account that owns the resource the policy would be attached to.
+///
+/// A resource policy on a Resolver resource is how it is shared with ANOTHER
+/// account, so a document whose principals are all the owning account — or that
+/// names no principal at all — shares the resource with nobody and leaves it
+/// with no policy. Read with [`policy_principals`] and [`principal_account`], so
+/// an account named by its id and the same account named by an ARN carrying it
+/// count as the one account.
+pub fn policy_shares_with_other_account(policy: &str, owner_account: &str) -> bool {
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(policy) else {
+        return false;
+    };
+    policy_statements(&document).iter().any(|statement| {
+        statement
+            .get("Principal")
+            .map(policy_principals)
+            .unwrap_or_default()
+            .iter()
+            .any(|value| principal_account(value) != Some(owner_account))
+    })
+}
+
 /// Canonicalise the domain name a Resolver rule selects on to a fully-qualified
 /// DNS name: the name followed by exactly one root label, written as a trailing
 /// dot (RFC 1035 §3.1 — the final zero-length label of a name relative to the
@@ -1502,6 +1639,15 @@ pub struct ResolverRuleRecord {
     pub tags: Vec<Tag>,
     pub creation_time: String,
     pub modification_time: String,
+    /// The resource policy attached to this rule, as the last
+    /// `PutResolverRulePolicy` for it wrote it, and `None` while no policy has
+    /// been attached.
+    ///
+    /// Held on the rule's own record, not in a table beside it, because a
+    /// resource policy belongs to the resource it shares: a read of the rule's
+    /// policy resolves through the same record every other rule operation
+    /// reads, and a rule the store no longer holds has no policy to report.
+    pub resolver_rule_policy: Option<String>,
 }
 
 impl ResolverRuleRecord {
@@ -2327,6 +2473,24 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
         self.resolver_rule_associations
             .values()
             .find(|record| record.resolver_rule_id == resolver_rule_id && record.vpc_id == vpc_id)
+    }
+
+    /// The stored Resolver rule `arn` names, if the store holds one.
+    ///
+    /// The rule policy operations address a rule by its `Arn` and not by its
+    /// `ResolverRuleId`, so they resolve it through this. The whole ARN is
+    /// compared, so an ARN naming another account, another region or another
+    /// resource type matches no rule. The scan is over a store bounded by
+    /// [`MAX_STORED_RULES`].
+    pub fn rule_by_arn(&self, arn: &str) -> Option<&ResolverRuleRecord> {
+        self.resolver_rules.values().find(|record| record.arn == arn)
+    }
+
+    /// The same lookup as [`Self::rule_by_arn`], for the write side.
+    pub fn rule_by_arn_mut(&mut self, arn: &str) -> Option<&mut ResolverRuleRecord> {
+        self.resolver_rules
+            .values_mut()
+            .find(|record| record.arn == arn)
     }
 
     /// How many VPCs a rule is still associated with.

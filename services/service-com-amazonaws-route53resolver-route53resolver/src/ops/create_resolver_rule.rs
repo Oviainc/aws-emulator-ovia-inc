@@ -388,6 +388,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.clone().unwrap_or_default(),
             creation_time: timestamp.clone(),
             modification_time: timestamp,
+            // A new rule is shared with nobody, so it carries no resource
+            // policy until `PutResolverRulePolicy` attaches one.
+            resolver_rule_policy: None,
         };
 
         let rule = record.to_rule();
