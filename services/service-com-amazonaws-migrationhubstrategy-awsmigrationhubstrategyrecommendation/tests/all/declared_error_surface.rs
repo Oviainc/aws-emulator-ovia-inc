@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::import_and_assess::{
-    call, emulator, minimal_import, start_assessment, start_import, Answer,
+    call, emulator, emulator_with_collector, minimal_import, start_assessment, start_import, Answer,
 };
 
 /// The `errors` list each reporting operation under test declares, from
@@ -356,7 +356,7 @@ async fn an_unproducible_report_is_refused_with_an_error_the_operation_declares(
 /// the answer follows every later start.
 #[tokio::test]
 async fn the_latest_assessment_id_refusal_tracks_the_accounts_assessments() {
-    let router = emulator();
+    let router = emulator_with_collector();
 
     let empty = read(&router, "GetLatestAssessmentId").await;
     assert_eq!(

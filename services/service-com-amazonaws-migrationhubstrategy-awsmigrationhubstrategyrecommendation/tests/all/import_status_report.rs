@@ -107,6 +107,51 @@ async fn create_bucket(case: &str, router: &MultiServiceRouter, name: &str) {
     );
 }
 
+/// Create the bucket `name` through S3's own front door, as the account's owner would
+/// before naming it to an import — without asserting, for a bucket a row may already have
+/// created.
+async fn ensure_bucket(router: &MultiServiceRouter, name: &str) {
+    let payload = "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                   <LocationConstraint>eu-west-1</LocationConstraint>\
+                   </CreateBucketConfiguration>";
+    let _ = s3_with_body(
+        router,
+        "PUT",
+        &format!("/{name}"),
+        Bytes::from_static(payload.as_bytes()),
+    )
+    .await;
+}
+
+/// Write the import file the request names, so the import under test reads a real import
+/// document and runs to the status of an import that ingested it — which is the import
+/// whose status report this suite follows. What the ingestion itself produces is the
+/// subject of `import_ingestion.rs`.
+async fn put_input_file(case: &str, router: &MultiServiceRouter, request: &Value) {
+    let bucket = request["S3Bucket"].as_str().unwrap_or_default();
+    let key = request["s3key"].as_str().unwrap_or_default();
+    ensure_bucket(router, bucket).await;
+    let document = json!({
+        "ImportFormatVersion": 1,
+        "Resources": [{
+            "ResourceType": "SERVER",
+            "ResourceId": "server-1",
+            "ResourceName": format!("server-for-{}", request["name"].as_str().unwrap_or_default()),
+            "OSType": "Linux",
+            "OSVersion": "Ubuntu 20.04",
+        }],
+    })
+    .to_string();
+    let (status, body) =
+        s3_with_body(router, "PUT", &format!("/{bucket}/{key}"), Bytes::from(document)).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: writing the import file to s3://{bucket}/{key} must succeed, got \
+         {status} with {:?}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
 /// `GET /list-import-file-task`'s entry for `id`, or `Value::Null` when the listing does
 /// not carry it.
 async fn listed(router: &MultiServiceRouter, id: &str) -> Value {
@@ -231,6 +276,7 @@ async fn a_completed_import_reports_the_status_report_it_wrote() {
         if let Some(bucket) = create {
             create_bucket(case, &router, bucket).await;
         }
+        put_input_file(case, &router, &request).await;
 
         let started = start_import(&router, request.clone()).await;
         assert_eq!(
@@ -410,6 +456,7 @@ async fn a_running_import_reports_no_status_report_key_yet() {
         ),
     ] {
         request["s3bucketForReportData"] = json!(bucket);
+        put_input_file(case, &router, &request).await;
         let id = start_import(&router, request).await.string("/id");
 
         // The transient half is asserted off the STATUS the task reports rather than off

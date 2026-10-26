@@ -216,6 +216,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
+        // An assessment is made of the data a collector collects from the environment, so
+        // an account with no data source has nothing for one to assess: the start is
+        // refused with the service's `ValidationException` (HTTP 400) telling the caller
+        // to register a collector first, rather than minting an assessment of nothing.
+        // Decided through the read-only accessor and BEFORE anything is minted, so a
+        // refused start leaves neither an assessment nor a Region partition behind.
+        if !store.region(&region).has_data_source() {
+            return Err(StartAssessmentErrorModeled::ValidationException(
+                crate::state::no_registered_collector(),
+            )
+            .into());
+        }
+
         // The store is bounded: past its quota an assessment is refused rather than
         // adding another record. `ServiceQuotaExceededException` is this operation's
         // modelled refusal for reaching a quota. The quota is this Region's, as the
@@ -247,13 +260,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // An assessment collects data for the servers the data source holds when it
-        // starts, so count them with every completion the clock already owed
-        // materialised first — the servers of this Region's portfolio.
+        // An assessment collects data for the servers the portfolio holds when it starts,
+        // so count them with every completion the clock already owed materialised first —
+        // including the records an import whose completion is now due brought in.
         let id = store.mint_assessment_id(&region);
         let portfolio = store.region_entry(&region);
         portfolio.settle_all(now);
-        let servers = portfolio.imported_server_count();
+        let servers = portfolio.server_count();
 
         let assessment = crate::state::Assessment {
             id: id.clone(),

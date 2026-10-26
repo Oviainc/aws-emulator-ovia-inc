@@ -30,7 +30,7 @@ use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommenda
 use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommendation::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::import_and_assess::{at, emulator, Answer};
+use crate::import_and_assess::{at, emulator, emulator_with_collector_in, register_collector_in, Answer};
 
 /// The Regions every table below spans: the one this crate serves an unsigned request
 /// in, two more commercial Regions in different geographies, and one outside the `aws`
@@ -61,6 +61,7 @@ fn emulator_with_servers_per_region(
             }
         }
     }
+    register_collector_in(&engine, REGIONS);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(engine));
@@ -253,7 +254,7 @@ async fn create_everything_in(router: &MultiServiceRouter, index: usize) -> Port
 /// are that Region's own.
 #[tokio::test]
 async fn a_resource_is_reported_only_through_the_region_it_was_created_in() {
-    let router = emulator();
+    let router = emulator_with_collector_in(REGIONS);
     let mut created: Vec<Portfolio> = Vec::new();
     for index in 0..REGIONS.len() {
         created.push(create_everything_in(&router, index).await);
@@ -438,7 +439,7 @@ async fn a_resource_is_reported_only_through_the_region_it_was_created_in() {
 async fn a_region_nothing_was_created_in_reads_as_an_empty_account() {
     // Everything is created through ONE Region, and every OTHER Region is then read.
     for (index, owner) in REGIONS.iter().enumerate() {
-        let router = emulator();
+        let router = emulator_with_collector_in(REGIONS);
         let created = create_everything_in(&router, index).await;
 
         for region in REGIONS.iter().filter(|region| *region != owner) {

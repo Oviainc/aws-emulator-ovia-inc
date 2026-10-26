@@ -23,7 +23,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::enum_support::undeclared_values;
 use crate::import_and_assess::{
-    at, call, emulator, get_assessment, start_assessment, start_import, Answer,
+    at, call, emulator, emulator_with_collector, get_assessment, start_assessment, start_import,
+    Answer,
 };
 
 /// This service's one sentence for a value that fails a rule it enforces, spelled out
@@ -285,7 +286,7 @@ async fn every_value_the_enumeration_declares_is_accepted() {
     for member in enum_members() {
         for declared in member.declared {
             let case = format!("{}${} = {declared:?}", member.operation, member.member);
-            let router = emulator();
+            let router = emulator_with_collector();
             let answer = start(&router, member.operation, (member.request)(declared)).await;
 
             assert_eq!(
@@ -311,7 +312,7 @@ async fn every_value_the_enumeration_declares_is_accepted() {
 /// what would have echoed an undeclared condition back.
 #[tokio::test]
 async fn a_declared_condition_round_trips_through_get_assessment() {
-    let router = emulator();
+    let router = emulator_with_collector();
 
     for condition in CONDITION {
         let request = assessment_with_condition(condition);

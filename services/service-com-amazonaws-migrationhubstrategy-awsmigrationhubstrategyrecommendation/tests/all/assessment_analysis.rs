@@ -46,8 +46,8 @@ use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommenda
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::import_and_assess::{
-    at, call, get_assessment, minimal_assessment, start_assessment, stop_assessment, Answer,
-    TEST_REGION,
+    at, call, get_assessment, minimal_assessment, register_collector_in, start_assessment,
+    stop_assessment, Answer, TEST_REGION,
 };
 
 /// `StrategyRecommendation`'s value for a strategy the service itself recommends, from
@@ -368,6 +368,9 @@ fn portfolio() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
                 .insert(component.id.to_string(), component.record());
         }
     }
+    // An assessment is made of the data a collector collects from the environment, so the
+    // account has to hold one registered for a start call to be accepted at all.
+    register_collector_in(&engine, &[TEST_REGION]);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(engine.clone()));

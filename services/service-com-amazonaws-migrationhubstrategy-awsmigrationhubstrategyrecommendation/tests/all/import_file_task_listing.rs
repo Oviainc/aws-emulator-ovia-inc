@@ -32,9 +32,12 @@ use crate::import_and_assess::{
 const DOCUMENTED_MAX_RESULTS: i64 = 100;
 
 /// `ImportFileTaskStatus`'s non-terminal import status, and the terminal one the clock
-/// owes a task — spelled out for the same reason.
+/// owes a task whose import file this emulator holds no object for — spelled out for the
+/// same reason. This suite carries Strategy Recommendations alone, so nothing holds the
+/// object the import names and the import reads none of it; what a readable import file
+/// produces is the subject of `import_ingestion.rs`.
 const IMPORT_IN_PROGRESS: &str = "ImportInProgress";
-const IMPORT_SUCCESS: &str = "ImportSuccess";
+const IMPORT_FAILED: &str = "ImportFailed";
 
 /// This service's one sentence for a value that fails a rule it enforces.
 const INVALID_REQUEST_BODY: &str = "Invalid request body";
@@ -226,8 +229,8 @@ async fn a_listed_task_is_the_record_the_single_task_read_reports() {
         let entry = &entries[index];
         assert_eq!(
             at(entry, "/status"),
-            json!(IMPORT_SUCCESS),
-            "case {case:?}: once the span has passed the listed task is {IMPORT_SUCCESS}, got {entry:?}"
+            json!(IMPORT_FAILED),
+            "case {case:?}: once the span has passed the listed task is {IMPORT_FAILED}, got {entry:?}"
         );
         let reported = get_import(&router, id).await;
         assert_eq!(

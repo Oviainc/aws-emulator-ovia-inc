@@ -56,6 +56,9 @@ mod import_and_assess;
 #[path = "all/import_file_task_listing.rs"]
 mod import_file_task_listing;
 
+#[path = "all/import_ingestion.rs"]
+mod import_ingestion;
+
 #[path = "all/import_status_report.rs"]
 mod import_status_report;
 
@@ -91,6 +94,9 @@ mod server_inventory;
 
 #[path = "all/server_strategies.rs"]
 mod server_strategies;
+
+#[path = "all/start_call_preconditions.rs"]
+mod start_call_preconditions;
 
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

@@ -25,7 +25,8 @@ use serde_json::json;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::import_and_assess::{
-    call, emulator, minimal_import, start_assessment, start_import, stop_assessment, Answer,
+    call, emulator_with_collector, minimal_import, start_assessment, start_import, stop_assessment,
+    Answer,
 };
 
 /// Every read of this service whose input shape has no members and whose answer names a
@@ -234,8 +235,10 @@ async fn an_input_less_read_with_no_resource_answers_the_services_not_found() {
     {
         for (operation, uri) in INPUT_LESS_READS {
             // A fresh emulator per (row, operation), so the account holds only what the
-            // row set up and no earlier read can have changed it.
-            let router = emulator();
+            // row set up and no earlier read can have changed it. Its account holds a
+            // registered data collector, because a row that starts an assessment needs
+            // the data source one is made of.
+            let router = emulator_with_collector();
             prepare(&router, case, account).await;
 
             let answer = call(&router, "GET", uri, None).await;
@@ -319,7 +322,7 @@ async fn assert_both_absent(router: &MultiServiceRouter, case: &str) {
 #[tokio::test]
 async fn creating_the_resource_turns_the_not_found_into_a_report() {
     // Half one: start an assessment, which is the record `GetLatestAssessmentId` names.
-    let router = emulator();
+    let router = emulator_with_collector();
     assert_both_absent(&router, "before a start").await;
 
     let started = start_assessment(&router, accepted_start()).await;
@@ -345,7 +348,7 @@ async fn creating_the_resource_turns_the_not_found_into_a_report() {
     );
 
     // Half two: save preferences, which is the record `GetPortfolioPreferences` names.
-    let router = emulator();
+    let router = emulator_with_collector();
     assert_both_absent(&router, "before a save").await;
 
     let saved = save_preferences(&router).await;

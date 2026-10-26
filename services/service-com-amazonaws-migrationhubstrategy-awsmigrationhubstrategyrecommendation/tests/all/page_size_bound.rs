@@ -138,11 +138,16 @@ fn fixture_import_task(index: usize) -> ImportFileTask {
         status_report_s3_bucket: None,
         status_report_s3_key: None,
         status: IMPORT_SUCCESS.to_string(),
+        terminal_status: IMPORT_SUCCESS.to_string(),
         start_time: started,
         completion_time: Some(started + Duration::from_secs(60)),
         number_of_records_success: 1,
         number_of_records_failed: 0,
         completion_due: None,
+        // A completed task holds no record back: the one it imported is in the inventory
+        // the fixture seeds beside it.
+        pending_servers: Vec::new(),
+        pending_components: Vec::new(),
     }
 }
 

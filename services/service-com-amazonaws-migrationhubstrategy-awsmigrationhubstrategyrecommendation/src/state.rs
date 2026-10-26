@@ -89,6 +89,10 @@ pub mod regions;
 /// preferences and the resources' own stored members.
 pub mod analysis;
 
+/// The import file an import file task reads, and the records it ingests from it into the
+/// portfolio the read path reports.
+pub mod import_file;
+
 pub use regions::{
     request_region, ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState,
     DEFAULT_REGION, MAX_REGIONS,
@@ -98,13 +102,30 @@ pub use regions::{
 /// the instant `StartImportFileTask` returns until the clock owes it a terminal one.
 pub const IMPORT_IN_PROGRESS: &str = "ImportInProgress";
 
-/// The terminal `ImportFileTaskStatus` an import file task reaches.
+/// The terminal `ImportFileTaskStatus` an import file task that ingested every record its
+/// file declared reaches.
 ///
-/// The contents of the import file are not read, so the task completes having imported
-/// no records, and [`ImportFileTask::number_of_records_success`]
-/// / [`ImportFileTask::number_of_records_failed`] report exactly that — zero — rather
-/// than a count nothing produced.
+/// Reaching a terminal status is what makes the records the import ingested part of the
+/// portfolio: the resources the import file declared were read when the start call ran
+/// ([`import_file`]) and enter the inventory the read path reports when the clock owes the
+/// task that status ([`RegionState::settle_imports`]), which is also when
+/// [`ImportFileTask::number_of_records_success`] /
+/// [`ImportFileTask::number_of_records_failed`] report what it ingested. WHICH of the three
+/// terminal statuses a task reaches is what its ingestion produced
+/// ([`import_file::Ingestion::terminal_status`]).
 pub const IMPORT_SUCCESS: &str = "ImportSuccess";
+
+/// The terminal `ImportFileTaskStatus` an import that ingested some of the records its
+/// file declared and failed on others reaches.
+pub const IMPORT_PARTIAL_SUCCESS: &str = "ImportPartialSuccess";
+
+/// The terminal `ImportFileTaskStatus` an import that ingested nothing it was asked to
+/// reaches: its file could not be read at all, or every record the file declared failed.
+///
+/// It is NOT the status of an import whose file declared no resource: that import did
+/// everything its file asked of it, so it reaches [`IMPORT_SUCCESS`] with both record
+/// counts at zero.
+pub const IMPORT_FAILED: &str = "ImportFailed";
 
 /// `AssessmentStatus`'s non-terminal value: an assessment is collecting data.
 pub const ASSESSMENT_IN_PROGRESS: &str = "IN_PROGRESS";
@@ -131,6 +152,11 @@ pub const COLLECTION_STOPPED: &str = "dataCollectionTaskStopped";
 /// The `RunTimeAssessmentStatus` a server still collecting carries once the assessment
 /// ran to the end — the per-server face of [`ASSESSMENT_COMPLETE`].
 pub const COLLECTION_SUCCESS: &str = "dataCollectionTaskSuccess";
+
+/// The `RunTimeAssessmentStatus` a server carries from the moment an import brings it
+/// into the portfolio: no assessment has covered it yet, so the collection task on it is
+/// still to be scheduled.
+pub const COLLECTION_TO_BE_SCHEDULED: &str = "dataCollectionTaskToBeScheduled";
 
 /// The `RunTimeAssessmentStatus` values that mean a collection task is RUNNING on the
 /// server, and so the ones a terminal assessment status moves off that server.
@@ -231,20 +257,39 @@ pub struct ImportFileTask {
     pub status_report_s3_key: Option<String>,
     /// One of `ImportFileTaskStatus`'s values.
     pub status: String,
+    /// The terminal `ImportFileTaskStatus` the clock owes this task — what its ingestion
+    /// produced ([`import_file::Ingestion::terminal_status`]), settled by the start call
+    /// that ran the import and written onto [`Self::status`] when the completion comes
+    /// due.
+    pub terminal_status: String,
     pub start_time: SystemTime,
     pub completion_time: Option<SystemTime>,
     pub number_of_records_success: i32,
     pub number_of_records_failed: i32,
     /// The instant the clock owes this task its terminal status, while it has one.
     pub completion_due: Option<SystemTime>,
+    /// The servers this import ingested from its file, held here until the task reaches
+    /// its terminal status and they enter the inventory
+    /// ([`RegionState::settle_imports`]).
+    ///
+    /// The read path reports the portfolio of a FINISHED import, so a task still
+    /// importing holds its records rather than publishing them: the records themselves
+    /// (ids included) were settled by the start call, so completing the task only moves
+    /// them.
+    pub pending_servers: Vec<ServerRecord>,
+    /// The application components it ingested, held for the same span and for the same
+    /// reason.
+    pub pending_components: Vec<ApplicationComponentRecord>,
 }
 
 impl ImportFileTask {
     /// Materialise the completion the clock owes this task, if `now` is past its due
     /// instant.
     ///
-    /// `completion_time` is the DUE instant rather than `now`, so a task reports the
-    /// same completion time however late it is first read.
+    /// The status it reaches is [`Self::terminal_status`], the one its ingestion produced,
+    /// so a task that read nothing does not report the status of one that imported
+    /// everything. `completion_time` is the DUE instant rather than `now`, so a task
+    /// reports the same completion time however late it is first read.
     pub fn settle(&mut self, now: SystemTime) {
         let Some(due) = self.completion_due else {
             return;
@@ -252,7 +297,7 @@ impl ImportFileTask {
         if now < due {
             return;
         }
-        self.status = IMPORT_SUCCESS.to_string();
+        self.status = self.terminal_status.clone();
         self.completion_time = Some(due);
         self.completion_due = None;
     }
@@ -579,9 +624,8 @@ pub struct Assessment {
     pub start_time: SystemTime,
     pub completion_time: Option<SystemTime>,
     pub status_message: Option<String>,
-    /// How many servers this assessment covers: the servers the service's data source
-    /// held when the assessment started (see
-    /// [`RegionState::imported_server_count`]).
+    /// How many servers this assessment covers: the servers of the portfolio it was
+    /// started in (see [`RegionState::server_count`]).
     pub servers: i32,
     pub success: i32,
     pub failed: i32,
@@ -986,11 +1030,11 @@ pub struct ServerDiscovery {
 
 /// One server of this account's portfolio, as this emulator persists it.
 ///
-/// A server enters the portfolio when an import file task ingests it — that ingestion
-/// (and the record counts behind it) is filed separately as the import-loop issue, which
-/// is why a freshly booted emulator holds no server at all. This record is what the read
-/// path computes from: `ListServers` reports it as a [`ServerDetail`], filters it by the
-/// member a `ServerCriteria` names, and scopes it by the import groups it came in with.
+/// A server enters the portfolio when an import file task ingests it from its import file
+/// ([`import_file`]), which is why a freshly booted emulator holds no server at all. This
+/// record is what the read path computes from: `ListServers` reports it as a
+/// [`ServerDetail`], filters it by the member a `ServerCriteria` names, and scopes it by
+/// the import groups it came in with.
 ///
 /// Every member is what the import stored, so nothing here is derived from the request
 /// that reads it.
@@ -1243,8 +1287,8 @@ fn in_any_group(held: &[Group], wanted: &[Group]) -> bool {
 /// An application component is "the process or database running on a server" that the
 /// portfolio holds a recommendation for, so it is a resource of its own beside
 /// [`ServerRecord`] rather than a member of it. Like a server it enters this service
-/// through the data the account brings in (an import file task's ingestion, filed
-/// separately as the import-loop issue), which is why a freshly booted emulator holds no
+/// through the data the account brings in (an import file task's ingestion,
+/// [`import_file`]), which is why a freshly booted emulator holds no
 /// application component at all.
 ///
 /// Every member below is what that ingestion stored, so nothing in a read is derived from
@@ -1632,9 +1676,35 @@ impl RegionState {
         id: &str,
         now: SystemTime,
     ) -> Option<&mut ImportFileTask> {
-        let task = self.import_tasks.get_mut(id)?;
-        task.settle(now);
-        Some(task)
+        self.settle_imports(now);
+        self.import_tasks.get_mut(id)
+    }
+
+    /// Materialise what the clock owes every import file task of this portfolio: the
+    /// terminal status the task reaches, and the records it ingested entering the
+    /// inventory the read path reports.
+    ///
+    /// One site for both, so no caller can materialise an import's terminal status
+    /// without the records that status means the import brought in. The records were
+    /// built by the start call, so this only moves them — and it moves each one once,
+    /// because a completed task no longer holds any.
+    pub fn settle_imports(&mut self, now: SystemTime) {
+        let mut servers: Vec<ServerRecord> = Vec::new();
+        let mut components: Vec<ApplicationComponentRecord> = Vec::new();
+        for task in self.import_tasks.values_mut() {
+            task.settle(now);
+            if task.is_complete() {
+                servers.append(&mut task.pending_servers);
+                components.append(&mut task.pending_components);
+            }
+        }
+        for record in servers {
+            self.servers.insert(record.id.clone(), record);
+        }
+        for record in components {
+            self.application_components
+                .insert(record.id.clone(), record);
+        }
     }
 
     /// The assessment `id` names, with any completion the clock owes it already
@@ -1852,9 +1922,7 @@ impl RegionState {
     /// analysis per sweep into one per assessment, and it does not change that the
     /// completion is what records the analysis.
     pub fn settle_all(&mut self, now: SystemTime) {
-        for task in self.import_tasks.values_mut() {
-            task.settle(now);
-        }
+        self.settle_imports(now);
         let mut completed: Option<SystemTime> = None;
         for assessment in self.assessments.values_mut() {
             if let Some(at) = assessment.settle(now) {
@@ -1891,6 +1959,11 @@ impl RegionState {
         now: SystemTime,
     ) -> Result<ImportTaskPage, ValidationException> {
         let limit = page_size(max_results)?;
+        // Every task of this store gets the completion the clock already owed it first —
+        // owed at this same instant even if nobody had called — so the page reports the
+        // statuses the clock has reached and the records a completed import brought in
+        // are in the inventory.
+        self.settle_imports(now);
 
         let after = match next_token {
             Some(token) => {
@@ -1904,11 +1977,10 @@ impl RegionState {
             None => Bound::Unbounded,
         };
 
-        let mut rest = self.import_tasks.range_mut((after, Bound::Unbounded));
+        let mut rest = self.import_tasks.range((after, Bound::Unbounded));
         let mut task_infos = Vec::new();
         let mut last: Option<String> = None;
         for (id, task) in rest.by_ref().take(limit) {
-            task.settle(now);
             task_infos.push(task.to_task_information());
             last = Some(id.clone());
         }
@@ -1973,17 +2045,33 @@ impl RegionState {
 
     /// How many servers an assessment started now would cover.
     ///
-    /// An import file task is the only way a server enters this service's state — the
-    /// Application Discovery Service and collector data sources are not emulated — so
-    /// the answer is every record the completed imports brought in. Call
-    /// [`Self::settle_all`] first so a task whose completion is already due is counted.
-    pub fn imported_server_count(&self) -> i32 {
-        self.import_tasks
-            .values()
-            .filter(|task| task.is_complete())
-            .fold(0i32, |total, task| {
-                total.saturating_add(task.number_of_records_success)
-            })
+    /// Every server of this Region's inventory: an assessment "starts the assessment of an
+    /// on-premises environment", so what it covers is the portfolio the service holds when
+    /// it starts. Call [`Self::settle_all`] first so a server brought in by an import whose
+    /// completion is already due is counted.
+    pub fn server_count(&self) -> i32 {
+        i32::try_from(self.servers.len()).unwrap_or(i32::MAX)
+    }
+
+    /// Whether this account has a data source for an assessment to collect from in this
+    /// Region.
+    ///
+    /// `StartAssessment` "starts the assessment of an on-premises environment", and what
+    /// collects the data that assessment is made of is the Strategy Recommendations data
+    /// collector installed in that environment ([`CollectorRecord`]) — either registered
+    /// with the service, or already holding the discovery data it fetched for a server of
+    /// the inventory ([`ServerDiscovery`]). An account with neither has nothing for an
+    /// assessment to collect from, so the start is refused ([`no_registered_collector`])
+    /// rather than answered with an assessment of nothing.
+    ///
+    /// Resources a file IMPORT brought in are not such a source: an import declares the
+    /// resources to assess, it does not collect from them.
+    pub fn has_data_source(&self) -> bool {
+        !self.collectors.is_empty()
+            || self
+                .servers
+                .values()
+                .any(|server| server.discovery.is_some())
     }
 }
 
@@ -2113,12 +2201,25 @@ pub const NOTHING_TO_REPORT: &str = "Something went wrong, please try again late
 /// the boundary validator passes a non-conforming name and the handler enforces it.
 pub const BUCKET_NAME_PREFIX: &str = "migrationhub-strategy-";
 
+/// The refusal a bucket member naming a bucket this service cannot use earns, word for
+/// word as Strategy Recommendations words it.
+///
+/// It is the PERMISSIONS refusal: the service reaches the account's bucket across accounts
+/// and names the prefix a bucket it may reach has to carry, which is what the caller has to
+/// fix — a permanent condition, and deliberately not the not-found one, which says the
+/// service could not reach a bucket that may appear later and which a caller is expected to
+/// retry. The sentence names the prefix without its trailing separator, as the service
+/// states it, and interpolates nothing from the request: the caller already holds the name
+/// it sent.
+pub const BUCKET_PERMISSIONS_REFUSAL: &str = "The service doesn't have permissions to \
+     specified S3 Bucket Service doesn't hv permissions to access bucket, please make sure \
+     bucket name begins with \"migrationhub-strategy\". [S3PermissionsIsIncorrect]";
+
 /// Refuse a bucket naming one this service cannot use.
 ///
 /// `Ok` for an absent member (nothing was named) and for a name carrying
 /// [`BUCKET_NAME_PREFIX`]; otherwise the `ValidationException` (HTTP 400) the service
-/// answers for a bucket it cannot reach, naming the bucket the way it reports any such
-/// bucket.
+/// answers for a bucket it may not reach ([`BUCKET_PERMISSIONS_REFUSAL`]).
 ///
 /// The prefix is the whole of the check: it is the one property of a name this check can
 /// decide without a lookup, and a conforming name is taken to name a bucket the service
@@ -2126,11 +2227,33 @@ pub const BUCKET_NAME_PREFIX: &str = "migrationhub-strategy-";
 pub fn check_bucket_usable(value: Option<&str>) -> Result<(), ValidationException> {
     match value {
         Some(bucket) if !bucket.starts_with(BUCKET_NAME_PREFIX) => Err(ValidationException {
-            message: Some(format!(
-                "S3 bucket \"{bucket}\" does not exist or is not accessible [S3BucketNotFound]"
-            )),
+            message: Some(BUCKET_PERMISSIONS_REFUSAL.to_string()),
         }),
         _ => Ok(()),
+    }
+}
+
+/// `StartAssessment`'s refusal in an account that has registered no data collector, word
+/// for word as Strategy Recommendations words it.
+///
+/// An assessment is made of the data a collector collects from the environment, so an
+/// account that registered none has no data source for one
+/// ([`RegionState::has_data_source`]): the service refuses the start with
+/// `ValidationException` (HTTP 400) and tells the caller to register a collector first,
+/// rather than minting an assessment of an environment nothing can collect from. It is the
+/// answer whatever `assessmentDataSourceType` the request names — recorded wire behaviour
+/// of `POST /start-assessment` shows the same refusal for the default and for
+/// `ManualImport`, because the type says where the resources to assess came from and not
+/// what collects their data. The operation's own error list omits the shape, so it is
+/// widened into its error channel with `extra_errors`.
+pub const NO_REGISTERED_COLLECTOR: &str =
+    "No connectors are registered. please register collector to perform assessment";
+
+/// That refusal as the shape it is answered with. It carries nothing from the request:
+/// the condition is one of the ACCOUNT, not of what the caller sent.
+pub fn no_registered_collector() -> ValidationException {
+    ValidationException {
+        message: Some(NO_REGISTERED_COLLECTOR.to_string()),
     }
 }
 
@@ -2338,29 +2461,92 @@ fn rendered_timestamp(at: SystemTime) -> Option<String> {
         .ok()
 }
 
-/// The status report document the import file task `task` writes to its report bucket.
+/// The status report document the import file task `task` writes to its report bucket,
+/// reporting the outcome `ingestion` of every record its file declared.
 ///
 /// `GetImportFileTaskResponse$statusReportS3Key` documents what the object holds — "The
 /// report contains details about whether each record imported successfully or why it did
-/// not" — so every value here comes from the task's own record: the import it belongs to,
-/// where its input file was read from, the two record counts it reports, and one entry
-/// per record outcome it holds. The serialization (JSON) is the emulator's choice; the
+/// not" — so every value here comes from the import itself: the task it belongs to, where
+/// its input file was read from, the two record counts it reports, and one entry per
+/// record outcome, carrying the id the record was imported under or the reason it was not.
+/// For an import whose file could not be read at all there is no record to list, so the
+/// document reports why instead. The serialization (JSON) is the emulator's choice; the
 /// content is computed from state and never canned.
-pub fn import_status_report_document(task: &ImportFileTask) -> String {
+pub fn import_status_report_document(
+    task: &ImportFileTask,
+    ingestion: &import_file::Ingestion,
+) -> String {
+    let records: Vec<::serde_json::Value> = ingestion
+        .outcomes
+        .iter()
+        .map(|outcome| {
+            ::serde_json::json!({
+                "resourceType": outcome.resource_type,
+                "resourceName": outcome.resource_name,
+                "resourceId": outcome.resource_id,
+                "imported": outcome.imported(),
+                "failureReason": outcome.reason,
+            })
+        })
+        .collect();
     ::serde_json::json!({
         "importTaskId": task.id,
         "importName": task.import_name,
         "importFileS3Bucket": task.input_s3_bucket,
         "importFileS3Key": task.input_s3_key,
         "startTime": rendered_timestamp(task.start_time),
+        "status": task.terminal_status,
         "numberOfRecordsSuccess": task.number_of_records_success,
         "numberOfRecordsFailed": task.number_of_records_failed,
-        // One entry per record the import brought in, each carrying that record's own
-        // outcome. The task holds no record outcomes, so there is none to list — which
-        // is exactly what the two counts above report.
-        "records": [],
+        // Why the import read no record at all, for an import that could not read its
+        // file; absent for one that did read it.
+        "failureReason": ingestion.unreadable,
+        // One entry per record the import read from its file, each carrying that record's
+        // own outcome — which is what the two counts above count.
+        "records": records,
     })
     .to_string()
+}
+
+/// Read the import file at (`bucket`, `key`) through the in-process callback, as the text
+/// of the document it holds.
+///
+/// The object is one a caller wrote, so its size is caller-chosen: the body is read a
+/// chunk at a time and the read is abandoned the moment it passes
+/// [`import_file::MAX_IMPORT_FILE_BYTES`], so nothing larger than that ceiling is ever
+/// buffered, whatever length the response advertises. The `Err` carries the reason the
+/// object could not be read — no bucket of that name, no object under that key, an object
+/// past the ceiling — for the caller to report rather than to count records nothing read.
+pub async fn fetch_import_file(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket: &str,
+    key: &str,
+) -> Result<String, String> {
+    let object = s3_client(ctx, region)
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .map_err(|error| {
+            ::aws_smithy_types::error::display::DisplayErrorContext(&error).to_string()
+        })?;
+    let too_large = || {
+        format!(
+            "the import file is larger than the {} bytes an import reads",
+            import_file::MAX_IMPORT_FILE_BYTES
+        )
+    };
+    let mut body = object.body;
+    let mut read: Vec<u8> = Vec::new();
+    while let Some(chunk) = body.try_next().await.map_err(|error| error.to_string())? {
+        if read.len().saturating_add(chunk.len()) > import_file::MAX_IMPORT_FILE_BYTES {
+            return Err(too_large());
+        }
+        read.extend_from_slice(&chunk);
+    }
+    String::from_utf8(read).map_err(|error| error.to_string())
 }
 
 /// An Amazon S3 client over the in-process callback into this same emulator.

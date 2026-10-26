@@ -36,10 +36,10 @@ use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommenda
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::import_and_assess::{
-    at, call, get_assessment, minimal_assessment, start_assessment, stop_assessment, Answer,
-    TEST_REGION,
+    at, call, get_assessment, minimal_assessment, register_collector_in, start_assessment,
+    stop_assessment, Answer, TEST_REGION,
 };
-use crate::server_inventory::{emulator_with, server};
+use crate::server_inventory::server;
 
 /// Every value `RunTimeAssessmentStatus` admits, from
 /// `smithy_query(query="shape",shape="RunTimeAssessmentStatus")`. Spelled out here so the
@@ -72,6 +72,30 @@ const SERVER_IDS: &[&str] = &["0a", "0b", "1a", "1b", "2a", "2b", "ab"];
 
 async fn list_servers(router: &MultiServiceRouter, request: Value) -> Answer {
     call(router, "POST", "/list-servers", Some(request)).await
+}
+
+/// One emulator holding `servers` in the Region every request here is signed for, and a
+/// registered data collector beside them.
+///
+/// Both are the maps the paths that create them write: an import's ingestion writes the
+/// servers, and the collector appliance's registration writes the collector — which an
+/// assessment needs, because it is made of the data that collector collects.
+fn emulator_assessing(servers: Vec<ServerRecord>) -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    {
+        let state = engine
+            .state::<ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState>();
+        let mut store = state.lock();
+        let portfolio = store.region_entry(TEST_REGION);
+        for record in servers {
+            portfolio.servers.insert(record.id.clone(), record);
+        }
+    }
+    register_collector_in(&engine, &[TEST_REGION]);
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(engine));
+    router
 }
 
 async fn get_server_details(router: &MultiServiceRouter, id: &str) -> Answer {
@@ -179,7 +203,7 @@ fn inventories() -> Vec<Inventory> {
 async fn an_assessment_is_observed_on_the_servers_it_covers() {
     for Inventory { what, servers } in inventories() {
         let ids: Vec<String> = servers.iter().map(|record| record.id.clone()).collect();
-        let router = emulator_with(servers);
+        let router = emulator_assessing(servers);
 
         let started_at = Instant::now();
         let started = start_assessment(&router, minimal_assessment()).await;
@@ -276,7 +300,7 @@ async fn an_assessment_is_observed_on_the_servers_it_covers() {
 async fn a_completion_the_clock_owes_is_observed_on_the_servers() {
     for Inventory { what, servers } in inventories() {
         let ids: Vec<String> = servers.iter().map(|record| record.id.clone()).collect();
-        let router = emulator_with(servers);
+        let router = emulator_assessing(servers);
 
         let assessment_id = start_assessment(&router, minimal_assessment())
             .await

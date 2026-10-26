@@ -122,6 +122,10 @@ const MODE_UNKNOWN: &str = "UNKNOWN";
 /// gets no recommendation and counts towards no server's.
 pub const EXCLUDE_FROM_ASSESSMENT: &str = "excludeFromAssessment";
 
+/// `InclusionStatus`'s other value: the component counts towards its server's
+/// recommendation, which is where an imported component starts.
+pub const INCLUDE_IN_ASSESSMENT: &str = "includeInAssessment";
+
 /// `ResourceSubType`'s values that make a component a DATABASE, so the saved DATABASE
 /// preferences are the ones that select its destination rather than the application ones.
 const DATABASE_SUB_TYPES: &[&str] = &["Database", "DatabaseProcess"];
@@ -325,6 +329,20 @@ fn database_recommendation(
 fn runs_windows(os_version: Option<&str>, app_type: Option<&str>) -> bool {
     os_version.is_some_and(|version| version.to_ascii_lowercase().contains("windows"))
         || app_type.is_some_and(|app_type| WINDOWS_WEB_APP_TYPES.contains(&app_type))
+}
+
+/// The recommendation a server carries from the moment an import ingests it, before any
+/// assessment has analysed the portfolio.
+///
+/// An imported server is a workload the service knows nothing about yet beyond what the
+/// import file declared, and the move that applies to any such workload is to take it to
+/// AWS as it is: `Rehost` onto Amazon EC2, performed by the tool the catalog names for
+/// that move. It is the same recommendation [`application_recommendation`] computes for
+/// the Amazon EC2 destination, so the baseline and an analysis that selects EC2 cannot
+/// drift apart; an assessment that completes replaces it with whatever the account's saved
+/// preferences select ([`server_recommendation`]).
+pub fn import_baseline() -> Recommendation {
+    application_recommendation(Some(DESTINATION_EC2), false)
 }
 
 /// The recommendation the analysis computes for one server of the portfolio.

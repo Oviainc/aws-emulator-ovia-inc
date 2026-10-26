@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommendation::state::COMPLETION_SPAN;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::import_and_assess::{call, emulator, stop_assessment, Answer};
+use crate::import_and_assess::{call, emulator_with_collector, stop_assessment, Answer};
 
 /// The wire error code a save refused for an ongoing task carries, and its status.
 const CONFLICT_EXCEPTION: &str = "ConflictException";
@@ -185,7 +185,7 @@ async fn a_save_during_an_ongoing_task_is_refused_with_the_modelled_conflict() {
     let mut observed = 0usize;
     for (case, starts) in ongoing_cases() {
         // A fresh emulator per row, so the only work in flight is the row's own.
-        let router = emulator();
+        let router = emulator_with_collector();
         let established = establish(&router, &case).await;
         let started_at = start_all(&router, &case, &starts).await;
 
@@ -240,7 +240,7 @@ async fn a_save_during_an_ongoing_task_is_refused_with_the_modelled_conflict() {
 #[tokio::test]
 async fn a_save_is_accepted_once_the_clock_has_completed_the_tasks() {
     for (case, starts) in ongoing_cases() {
-        let router = emulator();
+        let router = emulator_with_collector();
         let _ = establish(&router, &case).await;
         let _ = start_all(&router, &case, &starts).await;
 
@@ -268,7 +268,7 @@ async fn a_save_is_accepted_once_the_clock_has_completed_the_tasks() {
 /// accepted as soon as the stop is in — without waiting for any clock.
 #[tokio::test]
 async fn a_save_is_accepted_once_the_only_task_has_been_stopped() {
-    let router = emulator();
+    let router = emulator_with_collector();
     let established = establish(&router, "a stopped assessment").await;
 
     let started_at = Instant::now();
@@ -326,7 +326,7 @@ async fn a_save_is_accepted_once_the_only_task_has_been_stopped() {
 /// refusal writes anything.
 #[tokio::test]
 async fn an_undeclared_value_is_still_refused_as_a_validation_failure() {
-    let router = emulator();
+    let router = emulator_with_collector();
     let established = establish(&router, "an invalid save during a task").await;
     let started_at = start_all(
         &router,

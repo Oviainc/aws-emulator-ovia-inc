@@ -113,47 +113,90 @@ impl ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState 
 
     /// The next value of the shared id counter.
     ///
-    /// It wraps rather than overflowing, and each `mint_*` below skips an id already
-    /// taken, so a wrap cannot hand out an id twice.
+    /// It wraps rather than overflowing, and [`Self::mint_id`] skips an id already taken,
+    /// so a wrap cannot hand out an id twice.
     fn next_sequence(&mut self) -> u64 {
         self.next_id = self.next_id.wrapping_add(1);
         self.next_id
     }
 
-    /// Mint an import file task id unused in `region`.
+    /// Mint an id `taken` does not already report as `region`'s, rendering each candidate
+    /// from the shared counter with `render`.
     ///
-    /// `StartImportFileTaskResponse$id` is a `String` bounded to 1024 with pattern
-    /// `.*\S.*`, so the shape of the id is the emulator's choice; the loop skips an id
-    /// already taken, which is what makes the counter's wrap safe.
-    pub fn mint_import_file_task_id(&mut self, region: &str) -> String {
+    /// The ONE mint loop of this store: every resource of this service gets its id this
+    /// way, so the counter is shared across them (an id names a resource of at most one
+    /// kind in at most one Region) and the skip that makes the counter's wrap safe is
+    /// written once. `render` is what decides the id's shape, which each resource's own
+    /// `mint_*` states from the member that reports it.
+    fn mint_id(
+        &mut self,
+        region: &str,
+        render: impl Fn(u64) -> String,
+        taken: impl Fn(&RegionState, &str) -> bool,
+    ) -> String {
         loop {
-            let id = format!("import-file-task-{:012x}", self.next_sequence());
-            if !self.region(region).import_tasks.contains_key(&id) {
+            let id = render(self.next_sequence());
+            if !taken(self.region(region), &id) {
                 return id;
             }
         }
     }
 
+    /// Mint an import file task id unused in `region`.
+    ///
+    /// `StartImportFileTaskResponse$id` is a `String` bounded to 1024 with pattern
+    /// `.*\S.*`, so the shape of the id is the emulator's choice.
+    pub fn mint_import_file_task_id(&mut self, region: &str) -> String {
+        self.mint_id(
+            region,
+            |sequence| format!("import-file-task-{sequence:012x}"),
+            |portfolio, id| portfolio.import_tasks.contains_key(id),
+        )
+    }
+
     /// Mint an assessment id unused in `region`, matching `AsyncTaskId`'s `[0-9a-z-:]+`
     /// within its 52-character bound.
     pub fn mint_assessment_id(&mut self, region: &str) -> String {
-        loop {
-            let id = format!("assessment-{:012x}", self.next_sequence());
-            if !self.region(region).assessments.contains_key(&id) {
-                return id;
-            }
-        }
+        self.mint_id(
+            region,
+            |sequence| format!("assessment-{sequence:012x}"),
+            |portfolio, id| portfolio.assessments.contains_key(id),
+        )
     }
 
     /// Mint a recommendation report task id unused in `region`, matching
     /// `RecommendationTaskId`'s `[0-9a-z-:]+` within its 52-character bound (this one is
     /// 34 characters).
     pub fn mint_recommendation_report_id(&mut self, region: &str) -> String {
-        loop {
-            let id = format!("recommendation-report-{:012x}", self.next_sequence());
-            if !self.region(region).recommendation_reports.contains_key(&id) {
-                return id;
-            }
-        }
+        self.mint_id(
+            region,
+            |sequence| format!("recommendation-report-{sequence:012x}"),
+            |portfolio, id| portfolio.recommendation_reports.contains_key(id),
+        )
+    }
+
+    /// Mint a server id unused in `region`, for a server an import file task ingested.
+    ///
+    /// `ServerDetail$id` is a `ResourceId`, whose `^[0-9a-b]+` and `@length(max: 44)`
+    /// admit only those twelve characters at the start of the name: the id is an `a`
+    /// (servers) and the counter in decimal, so every character of it is one the pattern
+    /// admits and it stays far inside the bound.
+    pub fn mint_server_id(&mut self, region: &str) -> String {
+        self.mint_id(
+            region,
+            |sequence| format!("a{sequence:011}"),
+            |portfolio, id| portfolio.servers.contains_key(id),
+        )
+    }
+
+    /// Mint an application component id unused in `region`, under the same `ResourceId`
+    /// rule as a server's and with `b` for a component, so one id never reads as the
+    /// other's.
+    pub fn mint_application_component_id(&mut self, region: &str) -> String {
+        self.mint_id(
+            region,
+            |sequence| format!("b{sequence:011}"),
+            |portfolio, id| portfolio.application_components.contains_key(id),
+        )
     }
 }

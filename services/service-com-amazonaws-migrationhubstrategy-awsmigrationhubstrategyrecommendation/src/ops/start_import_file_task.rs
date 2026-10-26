@@ -197,6 +197,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for: the task is started there and is reported only by reads signed for that
         // same Region.
         let region = crate::state::request_region(ctx.parts());
+
+        // The import file itself: `S3Bucket`/`s3key` name "the S3 bucket where the import
+        // file is located" and "the Amazon S3 key name of the import file", so the import
+        // READS that object and ingests the resources it declares. The read is an
+        // in-process call into the emulator's own S3 service, so it is made before the
+        // store is locked. A file that cannot be read — no such object, one past the
+        // ceiling, bytes that are not an import document — is carried as the failure it
+        // is: the task then brings in no record and reaches the terminal status for an
+        // import that read nothing, rather than reporting the success of an import of a
+        // file nobody read.
+        let declared = match crate::state::fetch_import_file(
+            ctx,
+            &region,
+            input.s3_bucket.as_str(),
+            input.s3key.as_str(),
+        )
+        .await
+        {
+            Ok(body) => crate::state::import_file::declared_resources(&body).ok_or_else(|| {
+                "the object under this key is not an import document".to_string()
+            }),
+            Err(reason) => Err(reason),
+        };
+        if let Err(reason) = &declared {
+            ::tracing::warn!(
+                bucket = %input.s3_bucket,
+                key = %input.s3key,
+                %reason,
+                "the import file could not be read, so the import brings in no record",
+            );
+        }
+
         let (id, report) = {
             let mut store = state.lock();
 
@@ -237,6 +269,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             let id = store.mint_import_file_task_id(&region);
+            // The resources the file declared become the records this import brings in,
+            // each under an id minted here, in this Region's portfolio. They enter the
+            // inventory the read path reports when the clock owes the task its terminal
+            // status (`RegionState::settle_imports`): the portfolio a caller reads is the
+            // portfolio of a FINISHED import.
+            let ingestion = match &declared {
+                Ok(resources) => {
+                    crate::state::import_file::ingest(&mut store, &region, resources, &group_id)
+                }
+                Err(reason) => crate::state::import_file::Ingestion::unreadable(reason.clone()),
+            };
             let task = crate::state::ImportFileTask {
                 id: id.clone(),
                 import_name: input.name,
@@ -250,14 +293,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 status_report_s3_bucket: input.s3bucket_for_report_data,
                 status_report_s3_key: None,
                 // The import is not done the instant the call returns; the clock owes it
-                // a terminal status once the completion span has passed.
+                // a terminal status once the completion span has passed — the one this
+                // ingestion produced.
                 status: crate::state::IMPORT_IN_PROGRESS.to_string(),
+                terminal_status: ingestion.terminal_status().to_string(),
                 start_time: now,
                 completion_time: None,
-                // No records are counted until the task completes.
-                number_of_records_success: 0,
-                number_of_records_failed: 0,
+                // What the import read from its file: the records it ingested and the
+                // ones it could not. Both are REPORTED only once the task completes
+                // (`ImportFileTask::to_output`), as its completion time is.
+                number_of_records_success: ingestion.records_success(),
+                number_of_records_failed: ingestion.records_failed(),
                 completion_due: Some(now + crate::state::COMPLETION_SPAN),
+                pending_servers: ingestion.servers.clone(),
+                pending_components: ingestion.components.clone(),
             };
             // The import's status report: the object a caller follows
             // `statusReportS3Bucket` and `statusReportS3Key` to in order to read the
@@ -278,7 +327,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 (
                     bucket,
                     crate::state::import_status_report_key(&task),
-                    crate::state::import_status_report_document(&task),
+                    crate::state::import_status_report_document(&task, &ingestion),
                 )
             });
             store.region_entry(&region).import_tasks.insert(id.clone(), task);

@@ -13,7 +13,10 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommendation::state::COMPLETION_SPAN;
+use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommendation::state::{
+    CollectorRecord, ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState,
+    COMPLETION_SPAN,
+};
 use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommendation::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
@@ -52,10 +55,15 @@ const DATA_SOURCE_TYPES: &[&str] = &[
 ];
 
 /// `ImportFileTaskStatus`'s non-terminal import status, and the terminal one the clock
-/// owes a task. Spelled out independently of the crate's constants so a wrong status in
-/// `src/state.rs` fails here.
+/// owes a task whose import file this emulator holds no object for. Spelled out
+/// independently of the crate's constants so a wrong status in `src/state.rs` fails here.
+///
+/// This suite's emulator carries Strategy Recommendations alone, so there is no S3 service
+/// holding the object the import names: the import reads nothing and reaches the terminal
+/// status for an import that read none of what it was asked to read. What a readable
+/// import file produces is the subject of `import_ingestion.rs`, whose emulator mounts S3.
 const IMPORT_IN_PROGRESS: &str = "ImportInProgress";
-const IMPORT_SUCCESS: &str = "ImportSuccess";
+const IMPORT_FAILED: &str = "ImportFailed";
 
 /// The `AssessmentStatus` values this slice moves an assessment between, spelled out for
 /// the same reason.
@@ -83,6 +91,62 @@ pub(crate) fn emulator() -> MultiServiceRouter {
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(engine));
     router
+}
+
+/// One data collector, as the appliance installed in the account's environment recorded
+/// its own registration (`Collector$registeredTimeStamp` — "Time when the collector
+/// registered with the service").
+///
+/// `pub(crate)` so every suite that needs the account to HAVE a data source registers the
+/// same one.
+pub(crate) fn registered_collector() -> CollectorRecord {
+    CollectorRecord {
+        id: "collector-0001".to_string(),
+        host_name: Some("collector-host".to_string()),
+        ip_address: Some("10.0.0.4".to_string()),
+        health: Some("COLLECTOR_HEALTHY".to_string()),
+        ..Default::default()
+    }
+}
+
+/// Register [`registered_collector`] in each of `regions` on `engine`'s store — the same
+/// `collectors` map the appliance's registration writes, `ListCollectors` reports and
+/// `StartAssessment` reads as its data source.
+///
+/// `pub(crate)` so a suite standing up its own harness (one seeding servers, say) gives
+/// the account its data source the same way.
+pub(crate) fn register_collector_in(engine: &Arc<engine::InMemoryEngine>, regions: &[&str]) {
+    let state =
+        engine.state::<ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState>();
+    let mut store = state.lock();
+    for region in regions {
+        let record = registered_collector();
+        store
+            .region_entry(region)
+            .collectors
+            .insert(record.id.clone(), record);
+    }
+}
+
+/// One emulator whose account holds a registered data collector in each of `regions`.
+///
+/// An assessment is made of the data a collector collects from the environment, so an
+/// account that registered none cannot start one at all: a suite that drives
+/// `StartAssessment` through to an assessment runs against this harness, and the one that
+/// drives it against an account with NO data source runs against [`emulator`].
+pub(crate) fn emulator_with_collector_in(regions: &[&str]) -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    register_collector_in(&engine, regions);
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(engine));
+    router
+}
+
+/// [`emulator_with_collector_in`] for the one Region every request [`call`] builds is
+/// signed for.
+pub(crate) fn emulator_with_collector() -> MultiServiceRouter {
+    emulator_with_collector_in(&[TEST_REGION])
 }
 
 /// What the emulator answered: the HTTP status and the JSON body.
@@ -357,8 +421,8 @@ async fn an_import_file_task_completes_when_the_clock_owes_it() {
         let settled = get_import(&router, &id).await;
         assert_eq!(
             at(&settled.body, "/status"),
-            json!(IMPORT_SUCCESS),
-            "case {case:?}: once the completion span has passed the task is {IMPORT_SUCCESS}, \
+            json!(IMPORT_FAILED),
+            "case {case:?}: once the completion span has passed the task is {IMPORT_FAILED}, \
              got {:?}",
             at(&settled.body, "/status")
         );
@@ -367,8 +431,8 @@ async fn an_import_file_task_completes_when_the_clock_owes_it() {
             "case {case:?}: a completed task reports a completion time, got {:?}",
             at(&settled.body, "/completionTime")
         );
-        // This emulator serves no S3 data plane, so no import file is read and no
-        // records are imported: the counts report zero rather than an invented count.
+        // No S3 service holds the object this import names, so nothing was read and no
+        // record was imported: the counts report zero rather than an invented count.
         assert_eq!(
             at(&settled.body, "/numberOfRecordsSuccess"),
             json!(0),
@@ -507,7 +571,7 @@ fn assessment_cases() -> Vec<(&'static str, Value)> {
 /// and timestamps.
 #[tokio::test]
 async fn an_assessment_is_reported_from_what_was_stored() {
-    let router = emulator();
+    let router = emulator_with_collector();
     let mut seen_ids: Vec<String> = Vec::new();
 
     for (case, request) in assessment_cases() {
@@ -625,7 +689,7 @@ fn assert_counters_add_up(case: &str, body: &Value) {
 async fn an_assessments_server_count_comes_from_the_imports_in_state() {
     for imports in [0usize, 1, 3] {
         let case = format!("{imports} completed import(s)");
-        let router = emulator();
+        let router = emulator_with_collector();
 
         let mut ids = Vec::new();
         for index in 0..imports {
@@ -673,7 +737,7 @@ async fn an_assessments_server_count_comes_from_the_imports_in_state() {
 async fn stopping_an_assessment_is_observed_by_the_next_read() {
     for (case, request) in assessment_cases() {
         // A fresh emulator per row, so each row's assessment is the latest one.
-        let router = emulator();
+        let router = emulator_with_collector();
         let started_at = Instant::now();
         let id = start_assessment(&router, request.clone())
             .await
@@ -749,7 +813,7 @@ async fn stopping_an_assessment_is_observed_by_the_next_read() {
 /// its counters move with it: nothing is collecting any more.
 #[tokio::test]
 async fn an_assessment_completes_when_the_clock_owes_it() {
-    let router = emulator();
+    let router = emulator_with_collector();
     let id = start_assessment(
         &router,
         json!({
@@ -795,7 +859,7 @@ async fn an_assessment_completes_when_the_clock_owes_it() {
 /// that the happy path follows the last start.
 #[tokio::test]
 async fn the_latest_assessment_id_follows_the_most_recent_start() {
-    let router = emulator();
+    let router = emulator_with_collector();
 
     let empty = get_latest_assessment_id(&router).await;
     assert_eq!(

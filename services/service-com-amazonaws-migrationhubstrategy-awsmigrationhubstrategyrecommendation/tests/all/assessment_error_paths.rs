@@ -19,7 +19,8 @@
 //!    `migrationhub-strategy-`" — is enforced by the handler, which refuses the request
 //!    with `ValidationException` (400) before any state is created: naming the member and
 //!    the prefix when the operation cannot run without a bucket it was not given, and
-//!    naming the bucket when the name it was given is not one the service can use.
+//!    naming the prefix requirement and the permissions reason behind it when the name it
+//!    was given is not one the service may reach.
 //!
 //! Every row goes through the router, so each case exercises routing, the boundary
 //! validator, the handler and error serialization — the same path a client takes.
@@ -28,13 +29,21 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::import_and_assess::{
-    emulator, get_assessment, get_latest_assessment_id, start_assessment, start_import,
-    stop_assessment, Answer,
+    emulator, emulator_with_collector, get_assessment, get_latest_assessment_id, start_assessment,
+    start_import, stop_assessment, Answer,
 };
 
 /// The prefix every bucket member of this service documents. Spelled out here rather
 /// than taken from the crate so a wrong constant in `src/state.rs` fails this test.
 const REQUIRED_PREFIX: &str = "migrationhub-strategy-";
+
+/// The failure reason a refusal of a bucket name that does not carry that prefix has to
+/// name: the PERMISSIONS one, which tells the caller the name has to be fixed — and never
+/// the not-found one, which says the service could not reach a bucket that may appear
+/// later and which a client is expected to retry. Spelled out here for the same reason as
+/// the prefix.
+const PERMISSIONS_REASON: &str = "[S3PermissionsIsIncorrect]";
+const NOT_FOUND_REASON: &str = "[S3BucketNotFound]";
 
 /// What each operation that takes an assessment id answers when the id resolves to no
 /// assessment: the status and the `x-amzn-errortype` of the recorded wire behaviour of
@@ -88,7 +97,7 @@ fn unknown_ids(known: &str) -> Vec<(String, String)> {
 /// is the whole point: a client branching on the error type has to see the service's.
 #[tokio::test]
 async fn an_unresolvable_assessment_id_is_refused_per_operation() {
-    let router = emulator();
+    let router = emulator_with_collector();
     let known = start_assessment(
         &router,
         json!({"s3bucketForAnalysisData": "migrationhub-strategy-analysis"}),
@@ -191,8 +200,9 @@ enum Refusal {
     /// The operation cannot run without the bucket and was not given one: the message
     /// names the MEMBER and the prefix a bucket for it has to carry.
     Missing(&'static str),
-    /// The member names a bucket the service cannot use: the message names the BUCKET.
-    Unusable(&'static str),
+    /// The member names a bucket the service may not reach: the message names the prefix
+    /// a usable name has to begin with, under the permissions failure reason.
+    Prefix,
 }
 
 /// A `StartImportFileTask` request with the two members that are not buckets filled in.
@@ -236,19 +246,19 @@ fn bucket_cases() -> Vec<BucketCase> {
             case: "StartAssessment with a pattern-legal bucket that has no prefix",
             operation: "StartAssessment",
             request: json!({"s3bucketForAnalysisData": "my-bucket"}),
-            refusal: Some(Refusal::Unusable("my-bucket")),
+            refusal: Some(Refusal::Prefix),
         },
         BucketCase {
             case: "StartAssessment with the prefix one character short",
             operation: "StartAssessment",
             request: json!({"s3bucketForAnalysisData": "migrationhub-strategy"}),
-            refusal: Some(Refusal::Unusable("migrationhub-strategy")),
+            refusal: Some(Refusal::Prefix),
         },
         BucketCase {
             case: "StartAssessment with the prefix somewhere other than the start",
             operation: "StartAssessment",
             request: json!({"s3bucketForAnalysisData": "x-migrationhub-strategy-analysis"}),
-            refusal: Some(Refusal::Unusable("x-migrationhub-strategy-analysis")),
+            refusal: Some(Refusal::Prefix),
         },
         BucketCase {
             case: "StartAssessment with the shortest conforming analysis bucket",
@@ -263,7 +273,7 @@ fn bucket_cases() -> Vec<BucketCase> {
                 "s3bucketForAnalysisData": "migrationhub-strategy-analysis",
                 "s3bucketForReportData": "my-reports",
             }),
-            refusal: Some(Refusal::Unusable("my-reports")),
+            refusal: Some(Refusal::Prefix),
         },
         BucketCase {
             case: "StartAssessment with both buckets conforming",
@@ -279,13 +289,13 @@ fn bucket_cases() -> Vec<BucketCase> {
             case: "StartImportFileTask with a bare import bucket",
             operation: "StartImportFileTask",
             request: import_request("my-bucket", None),
-            refusal: Some(Refusal::Unusable("my-bucket")),
+            refusal: Some(Refusal::Prefix),
         },
         BucketCase {
             case: "StartImportFileTask with a conforming import bucket and a bare report bucket",
             operation: "StartImportFileTask",
             request: import_request("migrationhub-strategy-import", Some("reports")),
-            refusal: Some(Refusal::Unusable("reports")),
+            refusal: Some(Refusal::Prefix),
         },
         BucketCase {
             case: "StartImportFileTask with both buckets conforming",
@@ -301,8 +311,9 @@ fn bucket_cases() -> Vec<BucketCase> {
 
 /// A bucket the operation cannot run without and was not given, or a bucket name that
 /// does not begin with the documented prefix, is refused with `ValidationException`
-/// (HTTP 400) — the first naming the member and the prefix, the second naming the bucket
-/// — and nothing is minted. A conforming request is accepted on the same path.
+/// (HTTP 400) — the first naming the member and the prefix, the second naming the prefix
+/// requirement under the permissions failure reason — and nothing is minted. A conforming
+/// request is accepted on the same path.
 #[tokio::test]
 async fn a_bucket_name_is_held_to_the_documented_prefix() {
     for BucketCase {
@@ -312,8 +323,10 @@ async fn a_bucket_name_is_held_to_the_documented_prefix() {
         refusal,
     } in bucket_cases()
     {
-        // A fresh emulator per row, so "nothing was minted" is about THIS request.
-        let router = emulator();
+        // A fresh emulator per row, so "nothing was minted" is about THIS request; its
+        // account holds a registered collector, so an accepted row is accepted on the
+        // bucket rule rather than refused for having no data source.
+        let router = emulator_with_collector();
         let answer = match operation {
             "StartAssessment" => start_assessment(&router, request).await,
             "StartImportFileTask" => start_import(&router, request).await,
@@ -354,10 +367,21 @@ async fn a_bucket_name_is_held_to_the_documented_prefix() {
                      got {message:?}"
                 );
             }
-            Refusal::Unusable(bucket) => {
+            Refusal::Prefix => {
                 assert!(
-                    message.contains(bucket),
-                    "case {case:?}: the refusal must name the bucket {bucket:?}, got {message:?}"
+                    message.contains(PERMISSIONS_REASON),
+                    "case {case:?}: a name that does not carry the prefix is a permissions \
+                     failure, so the refusal must name {PERMISSIONS_REASON:?}, got {message:?}"
+                );
+                assert!(
+                    !message.contains(NOT_FOUND_REASON),
+                    "case {case:?}: a permanent naming failure must NOT be reported as the \
+                     transient {NOT_FOUND_REASON:?}, got {message:?}"
+                );
+                assert!(
+                    message.contains(REQUIRED_PREFIX.trim_end_matches('-')),
+                    "case {case:?}: the refusal must name the prefix a usable bucket name \
+                     begins with, got {message:?}"
                 );
             }
         }
@@ -369,7 +393,7 @@ async fn a_bucket_name_is_held_to_the_documented_prefix() {
 /// service accepts mints one.
 #[tokio::test]
 async fn a_refused_start_assessment_leaves_no_assessment_behind() {
-    let router = emulator();
+    let router = emulator_with_collector();
 
     for BucketCase {
         case,
