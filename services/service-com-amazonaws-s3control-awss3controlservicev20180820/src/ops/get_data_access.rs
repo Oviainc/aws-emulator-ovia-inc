@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDataAccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDataAccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDataAccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Vends a temporary credential for an S3 path the account's S3 Access Grants
+//! instance has granted: it selects the grant whose scope covers `Target` for
+//! the requested `Permission` and is closest to it, mints a session credential
+//! in the emulator's credential store for the session duration the request asks
+//! for, and reports it with the scope the token carries and the matched grant's
+//! grantee. A target no grant of the instance covers is refused with
+//! `AccessDenied` and no credential.
+//!
+//! Two parts of the modelled surface cannot change which grant is selected here,
+//! and are recorded rather than silently dropped:
+//!
+//! * The grant's `Grantee` and `ApplicationArn` are NOT compared against the
+//!   caller. A signed request carries an access key id, and this emulator has no
+//!   mapping from one to the IAM user or role, directory identity or Identity
+//!   Center application a grant names — so the identity half of the real
+//!   service's decision is not expressible, and the decision made here is the
+//!   scope-and-permission half. The matched grant's grantee is reported, so a
+//!   caller still sees which principal the grant it matched was issued to.
+//! * `TargetType` only states that the target is "a path to an object" rather
+//!   than a bucket or a bucket and prefix, which the target's own path already
+//!   says: coverage is decided by the shape of the path (see
+//!   [`crate::state::scope_coverage`]), so the member cannot move the answer
+//!   either way.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +185,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDataAccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDataAccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDataAccess"))
+        use ::emulator_server::aws_credentials::{AWS_SESSION, SECRET_ACCESS_KEY, SESSION_TOKEN};
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+
+        let region = crate::state::signing_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        // Who presented this request, for the audit record each arm below
+        // leaves. It comes from a request header, so it is recorded with `?`
+        // (Debug): the value is quoted and its control characters escaped, and
+        // cannot forge a line in the record.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+
+        // A vended credential whose expiration has passed is over whether or
+        // not anybody called, so the credentials this process holds are brought
+        // up to the clock before another is vended — and the material is
+        // forgotten with the record, so neither outlives the session. The state
+        // guard is dropped before the credential store is touched.
+        let expired = state.lock().expire_data_access_credentials(now);
+        for access_key_id in expired {
+            if ctx.credential_store().delete(&access_key_id).is_err() {
+                ::tracing::warn!(
+                    operation = Self::NAME,
+                    "an expired S3 Access Grants credential was already forgotten"
+                );
+            }
+        }
+
+        // The authorization decision: the grant of THIS account's instance in
+        // THIS Region whose scope covers the requested target for the requested
+        // permission and is closest to it. No grant covering it means no
+        // credential — the refusal, not an empty success.
+        let (grantee, grant_scope) = {
+            let store = state.lock();
+            let Some(grant) = store.grant_covering(
+                &input.account_id,
+                &region,
+                &input.target,
+                &input.permission,
+            ) else {
+                // Vending credentials is what this operation is for, so each
+                // decision leaves a record: the operation, who asked, what was
+                // asked for and how it was answered. Never the credential, and
+                // never the path asked about.
+                ::tracing::info!(
+                    operation = Self::NAME,
+                    caller = ?caller_akid,
+                    permission = ?input.permission,
+                    outcome = "denied",
+                    "no access grant covers the requested S3 path"
+                );
+                return Err(crate::state::data_access_denied(
+                    &input.permission,
+                    &input.target,
+                ));
+            };
+            (grant.grantee.clone(), grant.grant_scope.clone())
+        };
+
+        // "Minimal – The scope of the returned temporary access token is the
+        // same as the requested target scope as long as the requested scope is
+        // the same as or a subset of the grant scope", which the match above
+        // established; otherwise the token carries the scope of the matched
+        // grant (`Privilege`).
+        let minimal = input.privilege.as_deref() == Some(crate::state::PRIVILEGE_MINIMAL);
+        let matched_grant_target = if minimal {
+            input.target.clone()
+        } else {
+            grant_scope
+        };
+
+        // "The default value is 1 hour, but the grantee can specify a range from
+        // 900 seconds (15 minutes) up to 43200 seconds (12 hours)"
+        // (`DurationSeconds`) — the range is modelled, so a value outside it is
+        // already refused before this handler runs; the clamp keeps the
+        // invariant local, so the credential can never be minted already
+        // expired.
+        let duration_seconds = input
+            .duration_seconds
+            .unwrap_or(crate::state::DATA_ACCESS_DEFAULT_DURATION_SECONDS)
+            .clamp(
+                crate::state::DATA_ACCESS_MIN_DURATION_SECONDS,
+                crate::state::DATA_ACCESS_MAX_DURATION_SECONDS,
+            );
+        let expires_at =
+            now + ::std::time::Duration::from_secs(u64::from(duration_seconds.unsigned_abs()));
+
+        // The credential this call returns: created in the emulator's credential
+        // store, so the emulator accepts requests signed with it and neither the
+        // id nor the secrets are chosen here.
+        let minted = ctx.credential_store().create(&AWS_SESSION);
+        let (Some(secret_access_key), Some(session_token)) = (
+            minted.secret(SECRET_ACCESS_KEY).map(str::to_string),
+            minted.secret(SESSION_TOKEN).map(str::to_string),
+        ) else {
+            let _ = ctx.credential_store().delete(&minted.id);
+            return Err(crate::state::credential_without_secrets());
+        };
+
+        // The credentials this process has vended are bounded: past the bound
+        // the vend is refused rather than leaving behind material nothing will
+        // release until it expires. The bound is read and the record written
+        // under ONE guard, so two concurrent vends cannot both pass a bound only
+        // one of them fits in — and the credential a refused vend had already
+        // minted is forgotten again.
+        {
+            let mut store = state.lock();
+            if store.data_access_credentials.len() >= crate::state::DATA_ACCESS_CREDENTIAL_QUOTA {
+                drop(store);
+                let _ = ctx.credential_store().delete(&minted.id);
+                return Err(crate::state::data_access_credential_store_full());
+            }
+            store
+                .data_access_credentials
+                .insert(minted.id.clone(), expires_at);
+        }
+        ::tracing::info!(
+            operation = Self::NAME,
+            caller = ?caller_akid,
+            permission = ?input.permission,
+            duration_seconds,
+            outcome = "vended",
+            "vended a temporary credential for a granted S3 path"
+        );
+
+        Ok(GetDataAccessOutput {
+            credentials: Some(Credentials {
+                access_key_id: Some(minted.id),
+                secret_access_key: Some(secret_access_key),
+                session_token: Some(session_token),
+                expiration: Some(::aws_smithy_types::DateTime::from(expires_at)),
+            }),
+            matched_grant_target: Some(matched_grant_target),
+            grantee: Some(grantee),
+        })
     }
 }
