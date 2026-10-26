@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SubmitTaskStateChange
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SubmitTaskStateChange`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! The ECS AGENT reporting that one TASK changed state, with whatever it observed about
+//! that task's containers, attachments and managed agents in the same report.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SubmitTaskStateChange::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The report resolves what it names before it records anything: the cluster that hosts
+//! the task, then the task in that cluster, then every nested reference the report carries
+//! — so a report carrying one reference that resolves to nothing records none of its
+//! entries, exactly as the agent plane's other reports behave.
+//!
+//! The agent retries, so a report can arrive twice or behind a later one. What this
+//! handler stores is therefore the FURTHEST stage the task has been reported at (see
+//! `crate::state::task_stage_rank`), which is what keeps a stale replay from moving a
+//! stopped task back to running; the same ranking governs each container entry
+//! (`crate::state::container_stage_rank`). Everything the report observed — the image-pull
+//! and execution instants, each container's outcome, each attachment's state, each managed
+//! agent's status — is stored and reads back through `DescribeTasks`.
 //!
 //! ## Shape of an operation
 //!
@@ -130,6 +136,24 @@ impl From<SubmitTaskStateChangeErrorModeled> for SubmitTaskStateChangeError {
     }
 }
 
+/// The modelled refusal of a reference or a value this report cannot take:
+/// `InvalidParameterException` is "the specified parameter isn't valid", which is the
+/// condition every such refusal of this operation states.
+fn invalid_parameter(message: String) -> SubmitTaskStateChangeError {
+    SubmitTaskStateChangeErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Where in a task's containers the one called `name` sits, or `None` when it holds no
+/// container of that name.
+fn container_position(task: &crate::state::TaskRecord, name: &str) -> Option<usize> {
+    task.containers
+        .iter()
+        .position(|container| container.name.as_deref() == Some(name))
+}
+
 /// The `SubmitTaskStateChange` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -166,18 +190,308 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SubmitTaskStateChange` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SubmitTaskStateChangeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SubmitTaskStateChangeErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // The caller-sized members each container entry carries are bounded at the size
+        // their own docs state — before the store is locked, and before anything is
+        // stored, which is where the same members are bounded when the agent reports one
+        // container on its own.
+        for change in input.containers.iter().flatten() {
+            if change
+                .network_bindings
+                .as_ref()
+                .is_some_and(|bindings| bindings.len() > crate::state::MAX_NETWORK_BINDINGS)
+            {
+                return Err(invalid_parameter(crate::state::at_most_items_message(
+                    "network bindings",
+                    crate::state::MAX_NETWORK_BINDINGS,
+                )));
+            }
+            if change.reason.as_ref().is_some_and(|reason| {
+                reason.chars().count() > crate::state::MAX_CONTAINER_REASON_LENGTH
+            }) {
+                return Err(invalid_parameter(crate::state::at_most_characters_message(
+                    "reason",
+                    crate::state::MAX_CONTAINER_REASON_LENGTH,
+                )));
+            }
+        }
+
+        let mut guard = state.lock();
+        guard.advance_clock(now);
+
+        // "The short name or full Amazon Resource Name (ARN) of the cluster that hosts the
+        // task": the cluster is resolved FIRST, because the task a report can name is one
+        // that cluster holds. The agent plane states a missing cluster with the same fixed
+        // sentence every cluster-resolving operation does, under the error code this
+        // operation answers it with.
+        if !guard.has_active_cluster(&cluster_name) {
+            return Err(SubmitTaskStateChangeErrorModeled::ClientException(ClientException {
+                message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        }
+
+        // "The task ID or full ARN of the task in the state change request", scoped by the
+        // cluster the report named.
+        let task_reference = input.task.clone().unwrap_or_default();
+        let task_arn =
+            crate::state::task_arn_from_reference(&region, &cluster_name, &task_reference);
+        let Some(task) = guard
+            .tasks
+            .get(&task_arn)
+            .filter(|task| task.cluster_name == cluster_name)
+        else {
+            return Err(invalid_parameter(
+                crate::state::TASK_NOT_FOUND_MESSAGE.to_string(),
+            ));
+        };
+
+        // Every nested reference the report carries is resolved BEFORE any of them is
+        // recorded, so a report carrying one unknown reference stores nothing: it is
+        // refused whole, as it is when the cluster or the task resolves to nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SubmitTaskStateChange"))
+        // A container entry that names no container names the task's only container, the
+        // same way every other container-scoped member of this service resolves one.
+        let mut container_targets = Vec::new();
+        for change in input.containers.iter().flatten() {
+            let position = match change.container_name.as_deref() {
+                Some(requested) => container_position(task, requested),
+                None => (!task.containers.is_empty()).then_some(0),
+            };
+            let Some(position) = position else {
+                return Err(invalid_parameter(
+                    crate::state::CONTAINER_NOT_FOUND_MESSAGE.to_string(),
+                ));
+            };
+            container_targets.push((position, change.clone()));
+        }
+        // `ManagedAgentStateChange$containerName` is required, so a managed-agent entry
+        // always names the container the agent runs in.
+        let mut agent_targets = Vec::new();
+        for change in input.managed_agents.iter().flatten() {
+            let Some(position) = container_position(task, &change.container_name) else {
+                return Err(invalid_parameter(
+                    crate::state::CONTAINER_NOT_FOUND_MESSAGE.to_string(),
+                ));
+            };
+            agent_targets.push((position, change.clone()));
+        }
+        // An attachment entry names a resource of THIS task, in either of the two forms an
+        // `attachmentArn` takes, and the sentence for one that resolves to nothing names
+        // the id the report referred to.
+        let mut attachment_targets = Vec::new();
+        for change in input.attachments.iter().flatten() {
+            let attachment_id =
+                crate::state::attachment_id_from_reference(&change.attachment_arn).to_string();
+            if !task
+                .attachments
+                .iter()
+                .any(|attachment| attachment.id == attachment_id)
+            {
+                return Err(invalid_parameter(crate::state::attachment_not_found_message(
+                    &change.attachment_arn,
+                )));
+            }
+            attachment_targets.push((attachment_id, change.status.clone()));
+        }
+
+        let task = guard
+            .tasks
+            .get_mut(&task_arn)
+            .expect("the task was just found in this cluster");
+        // `Task$version`: "Every time a task experiences a change ... the version counter
+        // is incremented" — so a report that moves nothing leaves the counter alone.
+        let mut changed = false;
+
+        // "The status of the state change request": a report of a stage the task has
+        // already passed is a RETRY of one that landed, or one overtaken by a later
+        // report, so nothing it carries about the task replaces what the later stage
+        // recorded. A stage this service's own lifecycle does not name is not ranked
+        // against the stored one, so the agent's word on it stands.
+        if let Some(reported) = input.status.as_deref() {
+            let stale = matches!(
+                (
+                    crate::state::task_stage_rank(reported),
+                    crate::state::task_stage_rank(&task.last_status),
+                ),
+                (Some(reported), Some(stored)) if reported <= stored
+            );
+            if !stale {
+                task.last_status = reported.to_string();
+                changed = true;
+                // The agent's word overtakes what the clock still owed this task: a stage
+                // it has been reported AT cannot fall due again. The instants that stage
+                // carries are the instant of the report that reached it.
+                if reported == crate::state::STATUS_RUNNING {
+                    task.pending_due_at = None;
+                    task.running_due_at = None;
+                    // `Task$startedAt`: "the time when the task transitioned from the
+                    // PENDING state to the RUNNING state".
+                    task.started_at = task
+                        .started_at
+                        .or(Some(::aws_smithy_types::DateTime::from(now)));
+                }
+                if reported == crate::state::STATUS_DEACTIVATING {
+                    // `Task$stoppingAt`: "the time when the task transitions from the
+                    // RUNNING state to STOPPING".
+                    task.stopping_at = task
+                        .stopping_at
+                        .or(Some(::aws_smithy_types::DateTime::from(now)));
+                }
+                if reported == crate::state::STATUS_STOPPED {
+                    task.pending_due_at = None;
+                    task.running_due_at = None;
+                    task.stopped_due_at = None;
+                    // `Task$stoppedAt`: "the time when the task transitioned from the
+                    // RUNNING state to the STOPPED state".
+                    task.stopped_at = task
+                        .stopped_at
+                        .or(Some(::aws_smithy_types::DateTime::from(now)));
+                    // `Task$stoppedReason`: "The reason that the task was stopped" — "the
+                    // reason for the state change request" that stopped it.
+                    if let Some(reason) = input.reason.clone() {
+                        task.stopped_reason = Some(reason);
+                    }
+                }
+            }
+        }
+
+        // The instants only the AGENT observes. Each is a fact about the task rather than
+        // a stage of it, so it is stored whenever the report carries one and a report
+        // restating the one already stored changes nothing.
+        for (reported, stored) in [
+            (input.pull_started_at, &mut task.pull_started_at),
+            (input.pull_stopped_at, &mut task.pull_stopped_at),
+            (input.execution_stopped_at, &mut task.execution_stopped_at),
+        ] {
+            if let Some(instant) = reported {
+                if stored.map(crate::state::timestamp_key)
+                    != Some(crate::state::timestamp_key(instant))
+                {
+                    *stored = Some(instant);
+                    changed = true;
+                }
+            }
+        }
+
+        // "Any containers that's associated with the state change request": each entry
+        // moves ONE container of the task, ranked against where that container already is
+        // the same way a single-container report is.
+        for (position, change) in container_targets {
+            let Some(container) = task.containers.get_mut(position) else {
+                continue;
+            };
+            let stale = matches!(
+                (
+                    change.status.as_deref().and_then(crate::state::container_stage_rank),
+                    crate::state::container_stage_rank(&container.last_status),
+                ),
+                (Some(reported), Some(stored)) if reported <= stored
+            );
+            if stale {
+                continue;
+            }
+            if let Some(status) = change.status {
+                container.last_status = status;
+            }
+            if let Some(runtime_id) = change.runtime_id {
+                container.runtime_id = Some(runtime_id);
+            }
+            if let Some(image_digest) = change.image_digest {
+                container.image_digest = Some(image_digest);
+            }
+            if let Some(exit_code) = change.exit_code {
+                container.exit_code = Some(exit_code);
+            }
+            if let Some(reason) = change.reason {
+                container.reason = Some(reason);
+            }
+            if let Some(bindings) = change.network_bindings {
+                container.network_bindings = bindings;
+            }
+            changed = true;
+        }
+
+        // "The details for the managed agent that's associated with the task": the agent
+        // is what runs the managed agent, so its word on the status is stored as given,
+        // under the name the entry carries.
+        for (position, change) in agent_targets {
+            let Some(container) = task.containers.get_mut(position) else {
+                continue;
+            };
+            if !container
+                .managed_agents
+                .iter()
+                .any(|agent| agent.name == change.managed_agent_name)
+            {
+                container
+                    .managed_agents
+                    .push(crate::state::ManagedAgentRecord {
+                        name: change.managed_agent_name.clone(),
+                        // The status and reason the entry carries are applied below, so
+                        // an agent reported for the first time takes them there like any
+                        // other.
+                        last_status: String::new(),
+                        reason: None,
+                        last_started_at: None,
+                    });
+            }
+            let Some(agent) = container
+                .managed_agents
+                .iter_mut()
+                .find(|agent| agent.name == change.managed_agent_name)
+            else {
+                continue;
+            };
+            if agent.last_status != change.status || agent.reason != change.reason {
+                changed = true;
+            }
+            // `ManagedAgent$lastStartedAt`: "when the managed agent was last started" —
+            // the instant of the report that puts it at running, each time it gets there
+            // from somewhere else.
+            if change.status == crate::state::STATUS_RUNNING
+                && agent.last_status != crate::state::STATUS_RUNNING
+            {
+                agent.last_started_at = Some(::aws_smithy_types::DateTime::from(now));
+            }
+            agent.last_status = change.status.clone();
+            agent.reason = change.reason.clone();
+        }
+
+        // "Any attachments associated with the state change request": the state the agent
+        // reported for each resource of the task, stored as given — the agent is what
+        // attaches it.
+        for (attachment_id, status) in attachment_targets {
+            let Some(attachment) = task
+                .attachments
+                .iter_mut()
+                .find(|attachment| attachment.id == attachment_id)
+            else {
+                continue;
+            };
+            if attachment.status != status {
+                attachment.status = status;
+                changed = true;
+            }
+        }
+
+        if changed {
+            task.version += 1;
+        }
+
+        // "Acknowledgement of the state change" — the report was taken, which is what the
+        // agent plane answers a report it has recorded with.
+        Ok(SubmitTaskStateChangeOutput {
+            acknowledgment: Some(crate::state::STATE_CHANGE_ACKNOWLEDGMENT.to_string()),
+        })
     }
 }

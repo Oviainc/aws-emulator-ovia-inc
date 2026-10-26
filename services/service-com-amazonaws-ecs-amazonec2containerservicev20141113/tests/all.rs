@@ -117,3 +117,5 @@ mod task_provisioning;
 mod task_set_creation;
 #[path = "all/task_sets.rs"]
 mod task_sets;
+#[path = "all/task_state_reports.rs"]
+mod task_state_reports;

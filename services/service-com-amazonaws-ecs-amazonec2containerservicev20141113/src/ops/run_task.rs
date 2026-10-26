@@ -626,6 +626,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 stopping_at: None,
                 stopped_at: None,
                 execution_stopped_at: None,
+                // Only the agent's own report carries the image-pull instants.
+                pull_started_at: None,
+                pull_stopped_at: None,
                 stopped_reason: None,
                 stop_code: None,
                 version: 1,

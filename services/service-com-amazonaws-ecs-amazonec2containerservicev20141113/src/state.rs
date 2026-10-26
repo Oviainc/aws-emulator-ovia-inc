@@ -66,7 +66,7 @@ use crate::ops::types::{
     ECSExpressGatewayService, EphemeralStorage, ExpressGatewayContainer,
     ExpressGatewayScalingTarget, ExpressGatewayServiceConfiguration,
     ExpressGatewayServiceNetworkConfiguration, ExpressGatewayServiceStatus,
-    Failure, KeyValuePair, LoadBalancer, ManagedInstancesProvider, NetworkBinding,
+    Failure, KeyValuePair, LoadBalancer, ManagedAgent, ManagedInstancesProvider, NetworkBinding,
     NetworkConfiguration,
     PlacementConstraint, PlacementStrategy, PlatformDevice, PortMapping, ProtectedTask,
     ProxyConfiguration,
@@ -407,6 +407,27 @@ pub fn container_stage_rank(status: &str) -> Option<usize> {
     CONTAINER_LIFECYCLE
         .iter()
         .position(|stage| *stage == status)
+}
+
+/// The task lifecycle, in the order a task passes through it — the statuses this service
+/// stores on a task ([`TaskRecord::last_status`]), earliest first.
+///
+/// `SubmitTaskStateChange` is the AGENT reporting where a TASK has got to, and the agent
+/// retries exactly as it does for a container, so the order below is what makes a stale
+/// task report recognisable — see [`task_stage_rank`].
+pub const TASK_LIFECYCLE: [&str; 5] = [
+    STATUS_PROVISIONING,
+    STATUS_PENDING,
+    STATUS_RUNNING,
+    STATUS_DEACTIVATING,
+    STATUS_STOPPED,
+];
+
+/// How far through [`TASK_LIFECYCLE`] `status` is, or `None` for a status that lifecycle
+/// does not name (a stage a newer agent reports, which this service stores as reported
+/// rather than ranking against stages it does not know).
+pub fn task_stage_rank(status: &str) -> Option<usize> {
+    TASK_LIFECYCLE.iter().position(|stage| *stage == status)
 }
 
 /// `SubmitContainerStateChangeResponse$acknowledgment` for a state change this service
@@ -1989,6 +2010,45 @@ pub struct ContainerRecord {
     /// `Container$networkBindings`: the host/container port pairs the agent reported for
     /// this container.
     pub network_bindings: Vec<NetworkBinding>,
+    /// `Container$imageDigest`: "The container image manifest digest" — known only once
+    /// the agent has pulled the image and reported it
+    /// (`ContainerStateChange$imageDigest`), so absent until then.
+    pub image_digest: Option<String>,
+    /// `Container$managedAgents`: "The details of any Amazon ECS managed agents associated
+    /// with the container", each in the state the agent last reported for it
+    /// (`SubmitTaskStateChange$managedAgents`). Empty until the agent reports one.
+    pub managed_agents: Vec<ManagedAgentRecord>,
+}
+
+/// One Amazon ECS managed agent of a container, in the state the ECS agent last reported
+/// for it through `SubmitTaskStateChange$managedAgents` ("The details for the managed
+/// agent that's associated with the task").
+#[derive(Debug, Clone)]
+pub struct ManagedAgentRecord {
+    /// `ManagedAgent$name`: "The name of the managed agent", as the report named it.
+    pub name: String,
+    /// `ManagedAgent$lastStatus`: "The last known status of the managed agent" — the
+    /// agent's own word on it, stored as given.
+    pub last_status: String,
+    /// `ManagedAgent$reason`: "The reason for why the managed agent is in the state it is
+    /// in", and absent when the report carried none.
+    pub reason: Option<String>,
+    /// `ManagedAgent$lastStartedAt`: "The Unix timestamp for the time when the managed
+    /// agent was last started" — the instant a report first put it at
+    /// [`STATUS_RUNNING`], and `None` for an agent no report has started.
+    pub last_started_at: Option<DateTime>,
+}
+
+impl ManagedAgentRecord {
+    /// The `ManagedAgent` a container reports for this record.
+    pub fn view(&self) -> ManagedAgent {
+        ManagedAgent {
+            name: Some(self.name.clone()),
+            last_status: Some(self.last_status.clone()),
+            reason: self.reason.clone(),
+            last_started_at: self.last_started_at,
+        }
+    }
 }
 
 impl ContainerRecord {
@@ -2009,6 +2069,13 @@ impl ContainerRecord {
             reason: self.reason.clone(),
             network_bindings: Some(self.network_bindings.clone()),
             health_status: Some(HEALTH_UNKNOWN.to_string()),
+            image_digest: self.image_digest.clone(),
+            managed_agents: Some(
+                self.managed_agents
+                    .iter()
+                    .map(ManagedAgentRecord::view)
+                    .collect(),
+            ),
             ..Container::default()
         }
     }
@@ -2553,6 +2620,13 @@ pub struct TaskRecord {
     pub stopping_at: Option<DateTime>,
     pub stopped_at: Option<DateTime>,
     pub execution_stopped_at: Option<DateTime>,
+    /// `Task$pullStartedAt`: "The Unix timestamp for the time when the container image
+    /// pull began" — an instant only the AGENT observes, so it is absent until a report
+    /// carries it (`SubmitTaskStateChange$pullStartedAt`).
+    pub pull_started_at: Option<DateTime>,
+    /// `Task$pullStoppedAt`: "The Unix timestamp for the time when the container image
+    /// pull completed", reported the same way.
+    pub pull_stopped_at: Option<DateTime>,
     pub stopped_reason: Option<String>,
     pub stop_code: Option<String>,
     pub version: i64,
@@ -2607,6 +2681,8 @@ impl TaskRecord {
             platform_version: self.platform_version.clone(),
             memory: self.memory.clone(),
             overrides: self.overrides.clone(),
+            pull_started_at: self.pull_started_at,
+            pull_stopped_at: self.pull_stopped_at,
             started_at: self.started_at,
             started_by: self.started_by.clone(),
             stop_code: self.stop_code.clone(),
@@ -4410,6 +4486,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     exit_code: None,
                     reason: None,
                     network_bindings: Vec::new(),
+                    // Nothing has pulled the image or started a managed agent of the
+                    // container either, so the agent has reported neither.
+                    image_digest: None,
+                    managed_agents: Vec::new(),
                 }
             })
             .collect()
@@ -5735,6 +5815,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             stopping_at: None,
             stopped_at: None,
             execution_stopped_at: None,
+            // Only the agent's own report carries the image-pull instants.
+            pull_started_at: None,
+            pull_stopped_at: None,
             stopped_reason: None,
             stop_code: None,
             version: 1,
