@@ -901,9 +901,8 @@ fn trait_map_constraints(traits: Option<&::aws_smithy_schema::TraitMap>) -> Cons
     out
 }
 
-/// The refusal replaces nothing else: an operation that is still a scaffolded
-/// stub answers its 501 for a well-formed request, and a well-formed ARN naming
-/// no stored workflow is a lookup miss, not a validation failure.
+/// The refusal replaces nothing else: a well-formed ARN naming no stored
+/// workflow is a lookup miss, not a validation failure.
 #[tokio::test]
 async fn a_well_formed_request_keeps_the_answer_it_had() {
     let harness = Harness::new(REGION);
@@ -939,6 +938,10 @@ async fn a_well_formed_request_keeps_the_answer_it_had() {
         (
             "UntagResource",
             serde_json::json!({"ResourceArn": arn.clone(), "TagKeys": ["team"]}),
+        ),
+        (
+            "TagResource",
+            serde_json::json!({"ResourceArn": arn.clone(), "Tags": {"team": "data"}}),
         ),
         // A run of a workflow this endpoint does not hold is a lookup miss too: the
         // stop resolves the run, and a workflow that is absent holds none.
@@ -992,20 +995,6 @@ async fn a_well_formed_request_keeps_the_answer_it_had() {
             Some(0),
             "case {operation:?}: expected an empty {items} list, got {:?}",
             answered[items]
-        );
-    }
-
-    // Still-scaffolded operations keep their 501 for a well-formed request.
-    let stub_cases: Vec<(&str, serde_json::Value)> = vec![(
-        "TagResource",
-        serde_json::json!({"ResourceArn": arn.clone(), "Tags": {"team": "data"}}),
-    )];
-    for (operation, body) in stub_cases {
-        let (status, answered) = harness.call(operation, body).await;
-        assert_eq!(
-            status, 501,
-            "case {operation:?}: a well-formed request to a scaffolded operation must still \
-             answer 501, got {status} {answered:?}"
         );
     }
 }
