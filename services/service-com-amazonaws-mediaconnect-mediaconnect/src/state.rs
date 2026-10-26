@@ -27,6 +27,7 @@ use crate::ops::types::{
     Interface, ListedBridge, ListedEntitlement, ListedFlow,
     ListedGateway,
     ListedGatewayInstance,
+    ListedRouterNetworkInterface,
     ListedRouterOutput,
     Maintenance, MaintenanceConfiguration, MaintenanceSchedule,
     MediaConnectFlowRouterInputStreamDetails,
@@ -4490,6 +4491,33 @@ impl StoredRouterNetworkInterface {
                 .collect(),
         }
     }
+
+    /// The modelled `ListedRouterNetworkInterface` summary for this record — what
+    /// ListRouterNetworkInterfaces reports for it, with the two association counts resolved
+    /// by the caller exactly as [`Self::to_router_network_interface`] takes them.
+    ///
+    /// The summary is a PROJECTION of the same record the full read reports, so every member
+    /// it shares with the resource is the same value read from the same field, and the
+    /// members the summary does not declare (the configuration and the tags) stay on the
+    /// read side.
+    pub fn to_listed_router_network_interface(
+        &self,
+        associated_input_count: i32,
+        associated_output_count: i32,
+    ) -> ListedRouterNetworkInterface {
+        ListedRouterNetworkInterface {
+            name: self.name.clone(),
+            arn: self.arn.clone(),
+            id: self.id.clone(),
+            network_interface_type: self.network_interface_type().to_string(),
+            associated_output_count,
+            associated_input_count,
+            state: self.state.clone(),
+            region_name: self.region_name.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(self.updated_at),
+        }
+    }
 }
 
 /// The `CurrencyCode` every offering and reservation is priced in: "the currencyCode used
@@ -5437,6 +5465,25 @@ impl ComAmazonawsMediaconnectMediaconnectState {
     pub fn router_network_interface_projection(&self, arn: &str) -> Option<RouterNetworkInterface> {
         let interface = self.router_network_interfaces.get(arn)?;
         Some(interface.to_router_network_interface(
+            self.associated_router_input_count(arn),
+            self.associated_router_output_count(arn),
+        ))
+    }
+
+    /// The modelled `ListedRouterNetworkInterface` summary the store holds for `arn`, with
+    /// both association counts resolved the same way
+    /// [`Self::router_network_interface_projection`] resolves them — so the summary a listing
+    /// reports and the resource a read reports can never disagree about one interface.
+    ///
+    /// Does NOT settle the clock, for the same reason the full projection does not: a caller
+    /// settles the store once ([`Self::settle_due_transitions`]) and then projects every
+    /// record it reports.
+    pub fn listed_router_network_interface_projection(
+        &self,
+        arn: &str,
+    ) -> Option<ListedRouterNetworkInterface> {
+        let interface = self.router_network_interfaces.get(arn)?;
+        Some(interface.to_listed_router_network_interface(
             self.associated_router_input_count(arn),
             self.associated_router_output_count(arn),
         ))

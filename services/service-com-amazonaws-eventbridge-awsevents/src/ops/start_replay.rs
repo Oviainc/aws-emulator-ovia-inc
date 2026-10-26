@@ -260,11 +260,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "You can replay events only to the event bus specified to create
             // the archive" (`ReplayDestination$Arn`).
             if destination_bus != archive.event_bus_name {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "Parameter Destination.Arn is not valid. Reason: the events of archive {} \
-                     can be replayed only to the event bus they were archived from, {}.",
-                    archive.name, archive.event_source_arn
-                )));
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    CROSS_BUS_REPLAY_REFUSAL_DESTINATION,
+                ));
             }
             let archive_name = archive.name.clone();
 
@@ -331,10 +329,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(filters) = filters.as_deref() {
                 for filter in filters {
                     if !bus.rules.values().any(|rule| rule.arn == *filter) {
-                        return Err(crate::scaffolded::Scaffolded::validation(format!(
-                            "Parameter Destination.FilterArns is not valid. Reason: {filter:?} \
-                             is not the ARN of a rule on event bus {destination_bus}."
-                        )));
+                        return Err(crate::scaffolded::Scaffolded::validation(
+                            CROSS_BUS_REPLAY_REFUSAL_FILTER,
+                        ));
                     }
                 }
             }
@@ -475,6 +472,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// What a replay asked to re-publish onto a bus other than the one its archive
+/// was created from is refused with.
+///
+/// "You can replay events only to the event bus specified to create the archive"
+/// (`ReplayDestination$Arn`): a replay never leaves the event bus its events were
+/// archived from, so the refusal is a CONSTANT of that condition — the verdict is
+/// on which bus was named, not on any value of it — and carries none of the
+/// request's values.
+const CROSS_BUS_REPLAY_REFUSAL_DESTINATION: &str =
+    "Parameter Destination.Arn is not valid. Reason: Cross event bus replay is not permitted.";
+
+/// The same rule, reached through the FILTERS rather than the destination: "a
+/// list of ARNs for rules to replay events to"
+/// (`ReplayDestination$FilterArns`) names rules OF THE DESTINATION BUS, so a
+/// filter naming a rule of another bus — or no rule at all — would take the
+/// replay off that bus, which is the same thing this operation does not permit.
+/// It names the member that is wrong, and carries none of the request's values.
+const CROSS_BUS_REPLAY_REFUSAL_FILTER: &str = "Parameter Destination.FilterArns is not valid. \
+                                              Reason: Rule must be on the destination event bus.";
 
 /// A wire time stamp as the instant an archived event's own time is compared
 /// against, or `None` for one outside the range this emulator's clock type holds.

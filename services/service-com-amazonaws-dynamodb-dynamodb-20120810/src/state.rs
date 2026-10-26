@@ -23,10 +23,12 @@ use crate::ops::types::{
     ExpectedAttributeValue,
     GlobalSecondaryIndexDescription, GlobalSecondaryIndexInfo,
     GlobalSecondaryIndexWarmThroughputDescription,
+    ImportSummary,
     ItemCollectionMetrics, KeySchemaElement, LocalSecondaryIndexDescription,
     LocalSecondaryIndexInfo,
     PointInTimeRecoveryDescription, Projection,
-    ProvisionedThroughput, ProvisionedThroughputDescription, RestoreSummary, SourceTableDetails,
+    ProvisionedThroughput, ProvisionedThroughputDescription, RestoreSummary, S3BucketSource,
+    SourceTableDetails,
     OnDemandThroughput,
     SourceTableFeatureDetails, StreamSpecification, Tag,
     TableClassSummary, TableDescription, TableThroughputModeSummary,
@@ -2485,6 +2487,126 @@ pub fn check_backup_arn(backup_arn: &str, request_region: &str) -> Result<(), Re
     Ok(())
 }
 
+// =============================================================================
+// Imports of table data: the records the import surface reports
+// =============================================================================
+
+/// How far back a listing of imports reaches: "Lists completed imports within the past
+/// 90 days" (the `ListImports` doc), so a record older than that window is no longer
+/// reported. Measured on every read from the instant the import finished, and from the
+/// instant it began while it is still running, so nothing sleeps and no read writes.
+pub const IMPORT_HISTORY_WINDOW: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+
+/// A new import's `ImportArn`:
+/// `arn:aws:dynamodb:<region>:<account>:table/<table>/import/<millis>-<id>`, built
+/// through the same core ARN helper every other identifier here is minted with
+/// ([`table_arn`]), in the same construction as [`new_backup_arn`].
+///
+/// The last segment is the instant the import was requested, in zero-padded epoch
+/// milliseconds, followed by a unique suffix: the instant alone does not identify an
+/// import, because two calls can land in the same millisecond. Minted ONCE, when the
+/// import is recorded, and stored on it — and because the fixed-width instant sits
+/// inside it, ascending ARN order IS ascending (table, request instant) order, which is
+/// the order a listing reports and the `NextToken` cursor pages through.
+pub fn new_import_arn(region: &str, table: &str, requested_at: SystemTime) -> String {
+    let millis = requested_at
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    let unique = ::uuid::Uuid::new_v4().simple().to_string();
+    ::engine::emulator_arn(
+        "dynamodb",
+        region,
+        &format!(
+            "table/{table}/import/{millis:014}-{}",
+            unique.get(..8).unwrap_or(unique.as_str())
+        ),
+    )
+}
+
+/// One recorded import of table data: the source it read, the table it wrote into, and
+/// how far it got.
+///
+/// An import is a RESOURCE OF ITS OWN rather than part of a table: it is addressed by its
+/// own ARN, it outlives the table it imported into, and every member the import readers
+/// report is read from here.
+#[derive(Debug, Clone)]
+pub struct Import {
+    /// The `ImportArn` minted for this import when it was recorded
+    /// ([`new_import_arn`]), which is also the key the store holds it under.
+    pub arn: String,
+    /// The region this import lives in — the one the table it imported into lives in,
+    /// which is the scope every import operation resolves inside.
+    pub region: String,
+    /// The name of the table this import wrote into. The `TableArn` a reader reports is
+    /// minted from it and this region ([`table_arn`]), so one stored table identity
+    /// cannot drift from the ARN the table reports for itself.
+    pub table_name: String,
+    /// Where this import stands: one of the `ImportStatus` values the model declares.
+    pub status: String,
+    /// "The S3 bucket that provides the source for the import"
+    /// (`ImportTable$S3BucketSource`), as the request named it.
+    pub s3_bucket_source: S3BucketSource,
+    /// The log group the import wrote its errors to, where one was made for it
+    /// (`ImportSummary$CloudWatchLogGroupArn`).
+    pub cloud_watch_log_group_arn: Option<String>,
+    /// "The format of the source data" (`ImportSummary$InputFormat`): one of the
+    /// `InputFormat` values the model declares.
+    pub input_format: String,
+    /// "The time at which this import task began" (`ImportSummary$StartTime`).
+    pub started_at: SystemTime,
+    /// "The time at which this import task ended" (`ImportSummary$EndTime`) — `None`
+    /// while the import is still running, so no reader reports an end for work that has
+    /// not finished.
+    pub ended_at: Option<SystemTime>,
+}
+
+impl Import {
+    /// This import as `ListImports` reports it: every member read from the record.
+    pub fn summary(&self) -> ImportSummary {
+        ImportSummary {
+            import_arn: Some(self.arn.clone()),
+            import_status: Some(self.status.clone()),
+            table_arn: Some(table_arn(&self.region, &self.table_name)),
+            s3_bucket_source: Some(self.s3_bucket_source.clone()),
+            cloud_watch_log_group_arn: self.cloud_watch_log_group_arn.clone(),
+            input_format: Some(self.input_format.clone()),
+            start_time: Some(::aws_smithy_types::DateTime::from(self.started_at)),
+            end_time: self.ended_at.map(::aws_smithy_types::DateTime::from),
+        }
+    }
+
+    /// Whether this record still falls inside the window a listing reaches back over
+    /// ([`IMPORT_HISTORY_WINDOW`]), measured at `now` against the instant the import
+    /// finished — or, while it is still running, the instant it began.
+    pub fn within_history_window(&self, now: SystemTime) -> bool {
+        let marker = self.ended_at.unwrap_or(self.started_at);
+        match now.duration_since(marker) {
+            Ok(age) => age < IMPORT_HISTORY_WINDOW,
+            // Recorded at or after `now`: inside any window measured back from it.
+            Err(_) => true,
+        }
+    }
+}
+
+/// Hold an ARN-addressed TABLE member to the form such an ARN takes in the scope the
+/// request itself was made in, answering the table it names.
+///
+/// For a member the model calls `TableArn` and documents as "The Amazon Resource Name
+/// (ARN) associated with the table" (`ListImports$TableArn`) — not one of the `TableName`
+/// members that "can also" carry an ARN — so the value is held to the same two-part
+/// SHAPE and SCOPE rule [`resolve_resource_arn`] states, through that one function.
+/// Anything else addresses no table from this endpoint, so it is an INPUT failure rather
+/// than a lookup miss, stated over the member the request actually carries.
+pub fn check_table_arn(table_arn: &str, request_region: &str) -> Result<String, RequestError> {
+    resolve_resource_arn(table_arn, request_region)
+        .map(|resource| resource.table)
+        .map_err(|_| {
+            RequestError::Validation(format!(
+                "Invalid TableArn: Invalid TableArn provided as input {table_arn}"
+            ))
+        })
+}
+
 /// One stored table: its configuration, its lifecycle instants, and its items.
 #[derive(Debug)]
 pub struct Table {
@@ -3631,6 +3753,19 @@ pub struct ComAmazonawsDynamodbDynamodb20120810State {
     /// (nothing in `DeleteTable` removes a table's on-demand backups), and this is the
     /// only record of one.
     pub backups: BTreeMap<String, Backup>,
+    /// Every import of table data this emulator holds, keyed by its own `ImportArn`.
+    ///
+    /// ONE map rather than one per region, for the reason [`Self::backups`] is one: an
+    /// `ImportArn` already carries the region the import lives in, and each record
+    /// remembers that region, which is what scopes a listing to the region its request
+    /// reached. Ordered by that ARN, so the `NextToken` cursor a listing pages through is
+    /// a comparison over the keys rather than a sort per request ([`new_import_arn`]).
+    ///
+    /// A record is written by the IMPORT surface — `ImportTable` — which this slice does
+    /// not serve yet (it answers the scaffold's 501), so a store driven through this
+    /// slice's own API holds no import and the listing reports none, exactly as it does
+    /// for an account that has run no import.
+    pub imports: BTreeMap<String, Import>,
     /// The item-level changes landed writes owe their tables' streams, in the order
     /// they were made.
     ///
@@ -3954,6 +4089,19 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
         self.backups
             .values()
             .filter(move |backup| backup.region == region)
+    }
+
+    /// Every import of one region, in ascending `ImportArn` order, which is the scope a
+    /// listing reports and the order it pages through.
+    pub fn imports_in<'s>(&'s self, region: &'s str) -> impl Iterator<Item = &'s Import> + 's {
+        self.imports
+            .values()
+            .filter(move |import| import.region == region)
+    }
+
+    /// Record one import under the ARN minted for it.
+    pub fn insert_import(&mut self, import: Import) {
+        self.imports.insert(import.arn.clone(), import);
     }
 
     /// The backup that `BackupArn` names, inside the region the request reached.

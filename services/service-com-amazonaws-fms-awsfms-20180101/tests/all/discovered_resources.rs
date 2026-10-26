@@ -67,7 +67,7 @@ const AMI: &str = "ami-0123456789abcdef0";
 
 /// The emulator the tests drive: one shared engine with Firewall Manager and the
 /// services that own the resources it discovers mounted on one router.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -223,7 +223,7 @@ async fn api_gateway_call(
 
 /// An API Gateway call that must answer the modelled 201, and the body it
 /// answered.
-async fn api_gateway_created(
+pub(crate) async fn api_gateway_created(
     case: &str,
     router: &MultiServiceRouter,
     uri: &str,
@@ -238,7 +238,7 @@ async fn api_gateway_created(
 }
 
 /// An EC2 call that must succeed, and the XML it answered.
-async fn ec2_ok(
+pub(crate) async fn ec2_ok(
     case: &str,
     router: &MultiServiceRouter,
     action: &str,
@@ -299,7 +299,7 @@ fn elements(xml: &str, tag: &str) -> Vec<String> {
 
 /// The first `<tag>` text of an ec2Query XML body, which is the id a create
 /// answers with.
-fn element(case: &str, xml: &str, tag: &str) -> String {
+pub(crate) fn element(case: &str, xml: &str, tag: &str) -> String {
     elements(xml, tag)
         .into_iter()
         .next()
@@ -307,7 +307,7 @@ fn element(case: &str, xml: &str, tag: &str) -> String {
 }
 
 /// `(key, value)` form fields for [`ec2_call`].
-fn p(key: &'static str, value: &str) -> (&'static str, String) {
+pub(crate) fn p(key: &'static str, value: &str) -> (&'static str, String) {
     (key, value.to_string())
 }
 
@@ -356,7 +356,11 @@ fn items(body: &Value) -> Vec<(String, String, String, String)> {
 
 /// Every URI the inventory reports for one account and type, walking every page
 /// so a bound cannot hide a resource.
-async fn every_uri(router: &MultiServiceRouter, account: &str, resource_type: &str) -> Vec<String> {
+pub(crate) async fn every_uri(
+    router: &MultiServiceRouter,
+    account: &str,
+    resource_type: &str,
+) -> Vec<String> {
     let mut seen = Vec::new();
     let mut token: Option<String> = None;
     loop {

@@ -21,6 +21,8 @@ mod export_jobs;
 mod export_listing;
 #[path = "all/export_listing_order.rs"]
 mod export_listing_order;
+#[path = "all/export_refusal_classes.rs"]
+mod export_refusal_classes;
 #[path = "all/job_identifier_syntax.rs"]
 mod job_identifier_syntax;
 #[path = "all/owed_status_due_instants.rs"]

@@ -44,6 +44,18 @@ pub const ENTITY_FILTER_ROLE: &str = "Role";
 /// The `EntityType` value that names an IAM user. See [`ENTITY_FILTER_ROLE`].
 pub const ENTITY_FILTER_USER: &str = "User";
 
+/// The `EntityType` value that names an IAM group. See [`ENTITY_FILTER_ROLE`].
+pub const ENTITY_FILTER_GROUP: &str = "Group";
+
+/// The `EntityType` value that names a managed policy the ACCOUNT owns — "use the
+/// value LocalManagedPolicy to include customer managed policies"
+/// (`GetAccountAuthorizationDetails$Filter`). See [`ENTITY_FILTER_ROLE`].
+pub const ENTITY_FILTER_LOCAL_MANAGED_POLICY: &str = "LocalManagedPolicy";
+
+/// The `EntityType` value that names a managed policy AWS owns, the counterpart of
+/// [`ENTITY_FILTER_LOCAL_MANAGED_POLICY`]. See [`ENTITY_FILTER_ROLE`].
+pub const ENTITY_FILTER_AWS_MANAGED_POLICY: &str = "AWSManagedPolicy";
+
 /// The `PolicyUsageType` value that names a policy used as a permissions POLICY:
 /// "to list only permissions policies, set PolicyUsageFilter to PermissionsPolicy"
 /// (`ListEntitiesForPolicy$PolicyUsageFilter`). One of the two values the enum
@@ -480,6 +492,13 @@ pub const MARKER_SCOPE_POLICIES_GRANTING_SERVICE_ACCESS: &str =
 /// paging one entity's tags names no position in another entity's tag set — and no
 /// position in any other collection: see [`entity_tags_marker_scope`].
 pub const MARKER_SCOPE_ENTITY_TAGS: &str = "entity-tags";
+
+/// The marker scope of the account's whole authorization configuration — its users,
+/// groups, roles and managed policies — which `GetAccountAuthorizationDetails` pages
+/// over. One scope covers all four collections because that operation reports them
+/// in a SINGLE enumeration order ([`entity_page_key`]) under one `Marker`, and the
+/// entity types it is filtered by select within that order rather than changing it.
+pub const MARKER_SCOPE_ACCOUNT_AUTHORIZATION_DETAILS: &str = "account-authorization-details";
 
 /// The alphabet the suffix is drawn from: RFC 4648 base32, every character of
 /// which is an uppercase alphanumeric and so inside `idType`'s `^[\w]+$`.
@@ -1978,16 +1997,20 @@ pub fn entity_tags_marker_scope(entity_handle: &str) -> String {
     format!("{MARKER_SCOPE_ENTITY_TAGS}:{entity_handle}")
 }
 
-/// The page key of ONE entity in the order `ListEntitiesForPolicy` enumerates the
-/// entities a managed policy relates to: the entity's TYPE tag followed by
-/// [`name_key`] of its name.
+/// The page key of ONE entity in the order an operation that enumerates entities of
+/// SEVERAL types under one `Marker` walks them: the entity's TYPE tag followed by the
+/// key its own store holds it under ([`name_key`] of its name, or an ARN for a
+/// managed policy).
 ///
-/// The byte order of these keys IS the enumeration order, which is what lets the
+/// The byte order of these keys IS the enumeration order, which is what lets such an
 /// operation resume strictly after the key a `Marker` names even when the entity it
-/// named has since been deleted. The three tags ([`ENTITY_KEY_TAG_GROUP`],
-/// [`ENTITY_KEY_TAG_ROLE`], [`ENTITY_KEY_TAG_USER`]) sort in that order and each is
-/// followed by the same separator, so the keys group by entity type and then run
-/// ascending by name within a type — the order each store is already keyed in.
+/// named has since been deleted. Each tag is followed by the same separator, so the
+/// keys group by entity type, in the tags' own order, and then run ascending within a
+/// type — the order each store is already keyed in. `ListEntitiesForPolicy` tags the
+/// three entity kinds a policy relates to ([`ENTITY_KEY_TAG_GROUP`],
+/// [`ENTITY_KEY_TAG_ROLE`], [`ENTITY_KEY_TAG_USER`]);
+/// `GetAccountAuthorizationDetails` tags the five the `EntityType` enum names, which
+/// is also what its `Filter` selects by.
 pub fn entity_page_key(type_tag: &str, name_key: &str) -> String {
     format!("{type_tag}:{name_key}")
 }

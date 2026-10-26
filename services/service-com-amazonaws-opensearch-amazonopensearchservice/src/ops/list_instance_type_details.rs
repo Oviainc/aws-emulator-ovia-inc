@@ -4,7 +4,10 @@
 //!
 //! Reports the instance-type catalog one engine version publishes: one entry per
 //! instance type that version offers, each carrying the features it supports, from
-//! the derivation in [`crate::state::instance_type_details`].
+//! the derivation in [`crate::state::instance_type_details`]. The engine version is
+//! first RESOLVED against the catalog of releases the service publishes
+//! ([`crate::state::resolve_engine_version`], the set `ListVersions` advertises):
+//! there is no instance-type catalog for a release the service does not offer.
 //!
 //! An instance type is published BY the service, never created by a caller, so this
 //! is a pure read: it writes nothing, and the same request answers the same way on
@@ -188,14 +191,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The version of OpenSearch or Elasticsearch, in the format Elasticsearch_X.Y
-        // or OpenSearch_X.Y" — the catalog is a function of that version, so a value
-        // no version can be read out of is refused rather than answered with a catalog
-        // belonging to no engine release.
-        let version = crate::state::parse_engine_version(&input.engine_version).ok_or_else(|| {
-            ListInstanceTypeDetailsErrorModeled::ValidationException(
-                crate::state::malformed_engine_version("EngineVersion", &input.engine_version),
-            )
-        })?;
+        // or OpenSearch_X.Y" — the catalog is a function of that release, so the label
+        // is RESOLVED against the published catalog rather than merely read apart: a
+        // value the catalog does not hold names no release the service offers, and
+        // there is no catalog to report for an engine nothing runs. `VersionString`'s
+        // pattern admits plenty of such values, so passing it is not resolving.
+        let version = crate::state::resolve_engine_version("EngineVersion", &input.engine_version)
+            .map_err(ListInstanceTypeDetailsErrorModeled::ValidationException)?;
 
         // "An optional parameter that lists information for a given instance type" —
         // the filter narrows the listing to that one instance type.

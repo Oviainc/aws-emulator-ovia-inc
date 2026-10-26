@@ -29,6 +29,8 @@ mod data_source_service_role;
 mod data_source_update;
 #[path = "all/data_sources.rs"]
 mod data_sources;
+#[path = "all/delete_api_cache.rs"]
+mod delete_api_cache;
 #[path = "all/environment_variables.rs"]
 mod environment_variables;
 #[path = "all/error_contract.rs"]
