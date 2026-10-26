@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateWorkspaceAlias
-//! IMPLEMENTED: replaces the stored `alias` of one workspace, so every later
-//! DescribeWorkspace/ListWorkspaces reports the new value.
+//! IMPLEMENTED: replaces the stored `alias` of one workspace and accepts the rename
+//! asynchronously — the workspace reports `UPDATING` until the clock settles it back to
+//! `ACTIVE`, and every later DescribeWorkspace/ListWorkspaces reports the new value.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -184,8 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        store.materialize_due(::std::time::SystemTime::now());
+        store.materialize_due(now);
 
         let Some(workspace) = store.workspaces.get_mut(&input.workspace_id) else {
             return Err(UpdateWorkspaceAliasErrorModeled::ResourceNotFoundException(
@@ -198,11 +200,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `clientToken` carries `@idempotencyToken` on an `@idempotent` operation:
+        // re-sending the very call that started the pending rename is that same call, so
+        // it is accepted again and answers from the record it already wrote, instead of
+        // applying the change twice or pushing the owed settling out. The match is
+        // deliberately narrow — only while that update is in flight, which is the window
+        // the token identifies; `materialize_due` forgets the token when the update
+        // settles, so a later call reusing it is a new request.
+        let replays_pending_update = input.client_token.is_some()
+            && workspace.status_code == crate::state::STATUS_UPDATING
+            && workspace.update_token == input.client_token;
+
         // `WorkspaceStatusCode$UPDATING` documents the rule: "Updates are allowed only
-        // when status is ACTIVE." A workspace still being created or already being
-        // deleted cannot take one, and that is an inconsistent state, not a missing
-        // resource — so ConflictException (409).
-        if workspace.status_code != crate::state::STATUS_ACTIVE {
+        // when status is ACTIVE." A workspace still being created, already being deleted,
+        // or whose previous rename has not settled cannot take one, and that is an
+        // inconsistent state, not a missing resource — so ConflictException (409).
+        if !replays_pending_update && workspace.status_code != crate::state::STATUS_ACTIVE {
             return Err(UpdateWorkspaceAliasErrorModeled::ConflictException(
                 ConflictException {
                     message: format!(
@@ -217,11 +230,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The alias is metadata the service replaces outright: an omitted `alias`
-        // leaves the workspace with none, which is why `WorkspaceDescription$alias` is
-        // an optional member. `clientToken` needs no record here — the operation is
-        // `@idempotent`, so replaying it writes the same alias again.
-        workspace.alias = crate::state::normalize_alias(input.alias.as_deref());
+        if !replays_pending_update {
+            // The alias is metadata the service replaces outright: an omitted `alias`
+            // leaves the workspace with none, which is why `WorkspaceDescription$alias`
+            // is an optional member.
+            workspace.alias = crate::state::normalize_alias(input.alias.as_deref());
+
+            // The rename is accepted asynchronously (modelled 204 on an
+            // eventually-consistent resource): the workspace moves to `UPDATING` here and
+            // the clock owes its move back to `ACTIVE`, which
+            // `ComAmazonawsAmpAmazonprometheusserviceState::materialize_due` applies — so
+            // a caller reading straight after this call still sees `UPDATING`, with the
+            // status-gated refusals that go with it, and one reading later sees `ACTIVE`.
+            workspace.status_code = crate::state::STATUS_UPDATING.to_string();
+            workspace.transition_due = Some(now + crate::state::TRANSITION_DELAY);
+            workspace.update_token = input.client_token;
+        }
 
         Ok(UpdateWorkspaceAliasOutput)
     }

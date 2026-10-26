@@ -15,7 +15,7 @@
 use bytes::Bytes;
 use service_com_amazonaws_amp_amazonprometheusservice::ops::types::WORKSPACE_STATUS_CODE_VALUES;
 use service_com_amazonaws_amp_amazonprometheusservice::state::{
-    RESOURCE_NOT_FOUND_CODE, STATUS_ACTIVE, STATUS_CREATING, STATUS_DELETING,
+    RESOURCE_NOT_FOUND_CODE, STATUS_ACTIVE, STATUS_CREATING, STATUS_DELETING, STATUS_UPDATING,
     TAGS_PER_RESOURCE_LIMIT, TRANSITION_DELAY, WORKSPACE_QUOTA,
 };
 use service_com_amazonaws_amp_amazonprometheusservice::EmulatedService;
@@ -131,12 +131,12 @@ impl Amp {
             .await
     }
 
-    async fn describe(&self, region: &str, workspace_id: &str) -> Reply {
+    pub(crate) async fn describe(&self, region: &str, workspace_id: &str) -> Reply {
         self.call("GET", &format!("/workspaces/{workspace_id}"), region, "")
             .await
     }
 
-    async fn list(&self, region: &str, query: &str) -> Reply {
+    pub(crate) async fn list(&self, region: &str, query: &str) -> Reply {
         let uri = if query.is_empty() {
             "/workspaces".to_string()
         } else {
@@ -145,7 +145,12 @@ impl Amp {
         self.call("GET", &uri, region, "").await
     }
 
-    async fn rename(&self, region: &str, workspace_id: &str, body: &serde_json::Value) -> Reply {
+    pub(crate) async fn rename(
+        &self,
+        region: &str,
+        workspace_id: &str,
+        body: &serde_json::Value,
+    ) -> Reply {
         self.call(
             "POST",
             &format!("/workspaces/{workspace_id}/alias"),
@@ -333,7 +338,7 @@ fn assert_well_formed_workspace_arn(case: &str, arn: &str, region: &str, workspa
 /// declares — the catalog comes from the model, not from this test.
 #[test]
 fn reported_statuses_are_modelled_workspace_status_codes() {
-    for status in [STATUS_CREATING, STATUS_ACTIVE, STATUS_DELETING] {
+    for status in [STATUS_CREATING, STATUS_ACTIVE, STATUS_UPDATING, STATUS_DELETING] {
         assert!(
             WORKSPACE_STATUS_CODE_VALUES.contains(&status),
             "case {status:?}: not a modelled WorkspaceStatusCode ({WORKSPACE_STATUS_CODE_VALUES:?})"
@@ -810,7 +815,10 @@ async fn list_workspaces_pages_with_max_results_and_next_token() {
 }
 
 /// `UpdateWorkspaceAlias` replaces the stored alias, so every later read reports the
-/// new value — one row per form the new alias takes.
+/// new value — one row per form the new alias takes. Each rename is accepted
+/// asynchronously, so the row waits for the owed settling before the next one renames
+/// the same workspace again (the status rule itself is pinned by
+/// `workspace_rename_is_accepted_asynchronously`).
 #[tokio::test]
 async fn update_workspace_alias_changes_what_later_reads_report() {
     let amp = Amp::new();
@@ -868,6 +876,7 @@ async fn update_workspace_alias_changes_what_later_reads_report() {
             expected,
             "case {case:?}: a listing must report the new alias, got {listed:?}"
         );
+        wait_for_due_transition();
     }
 
     let unknown = amp

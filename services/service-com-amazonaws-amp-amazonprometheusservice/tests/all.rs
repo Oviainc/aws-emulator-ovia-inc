@@ -77,3 +77,5 @@ mod wire_fidelity;
 mod workspace_configuration;
 #[path = "all/workspace_lifecycle.rs"]
 mod workspace_lifecycle;
+#[path = "all/workspace_rename.rs"]
+mod workspace_rename;

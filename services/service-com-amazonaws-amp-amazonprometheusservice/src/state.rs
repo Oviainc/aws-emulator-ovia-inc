@@ -20,9 +20,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// the modelled `com.amazonaws.amp#WorkspaceStatusCode` enum, whose own
 /// documentation states the lifecycle rules this crate enforces:
 /// `CREATING` — "Workspace is being created. Deletion is disallowed until status is
-/// ACTIVE."; `ACTIVE` — "Workspace has been created and is usable."; `DELETING` —
-/// "Workspace is being deleted. Deletions are allowed only when status is ACTIVE."
-/// (`crate::ops::types::WORKSPACE_STATUS_CODE_VALUES` carries the full list.)
+/// ACTIVE."; `ACTIVE` — "Workspace has been created and is usable."; `UPDATING` —
+/// "Workspace is being updated. Updates are allowed only when status is ACTIVE.";
+/// `DELETING` — "Workspace is being deleted. Deletions are allowed only when status is
+/// ACTIVE." (`crate::ops::types::WORKSPACE_STATUS_CODE_VALUES` carries the full list.)
 ///
 /// The same three literals are entries of `com.amazonaws.amp#AnomalyDetectorStatusCode`
 /// too (`crate::ops::types::ANOMALY_DETECTOR_STATUS_CODE_VALUES`), so an anomaly
@@ -41,7 +42,9 @@ pub const STATUS_DELETING: &str = "DELETING";
 /// See [`STATUS_CREATING`]. The transient status a resource whose UPDATE has been
 /// accepted reports until the clock settles it back to [`STATUS_ACTIVE`]: an entry of
 /// `com.amazonaws.amp#ScraperStatusCode` documented "Scraper is being updated. Deletion
-/// is disallowed until status is ACTIVE."
+/// is disallowed until status is ACTIVE.", and of `com.amazonaws.amp#WorkspaceStatusCode`
+/// documented "Workspace is being updated. Updates are allowed only when status is
+/// ACTIVE."
 pub const STATUS_UPDATING: &str = "UPDATING";
 
 /// `WorkspaceConfigurationStatusCode` values a workspace CONFIGURATION moves through
@@ -591,7 +594,8 @@ pub struct Workspace {
     /// `None` when the workspace carries no alias (none given, or one that was all
     /// blank space — see [`normalize_alias`]).
     pub alias: Option<String>,
-    /// One of [`STATUS_CREATING`], [`STATUS_ACTIVE`], [`STATUS_DELETING`].
+    /// One of [`STATUS_CREATING`], [`STATUS_ACTIVE`], [`STATUS_UPDATING`],
+    /// [`STATUS_DELETING`].
     pub status_code: String,
     pub prometheus_endpoint: String,
     pub created_at: SystemTime,
@@ -608,12 +612,19 @@ pub struct Workspace {
     /// idempotent per its `@idempotencyToken`.
     pub anomaly_detector_tokens: HashMap<String, String>,
     /// When the clock owes this workspace's next lifecycle transition, if one is
-    /// pending: `CREATING` becomes `ACTIVE`, `DELETING` is removed.
+    /// pending: `CREATING`/`UPDATING` become `ACTIVE`, `DELETING` is removed.
     pub transition_due: Option<SystemTime>,
     /// The `clientToken` of the `DeleteWorkspace` call that started a pending
     /// deletion, so replaying that exact call stays idempotent rather than
     /// conflicting with the deletion it already started.
     pub delete_token: Option<String>,
+    /// The `clientToken` of the `UpdateWorkspaceAlias` call whose update is still in
+    /// flight, which is what makes that `@idempotent` operation idempotent per its
+    /// `@idempotencyToken`: replaying it is accepted again instead of conflicting with
+    /// the update it already started. Forgotten the moment the update settles (see
+    /// [`ComAmazonawsAmpAmazonprometheusserviceState::materialize_due`]), so a later
+    /// call reusing the token is a new request.
+    pub update_token: Option<String>,
     /// This workspace's alert manager definition, of which it holds at most one:
     /// `CreateAlertManagerDefinition` "creates the alert manager definition in a
     /// workspace" and refuses a second one, so the record hangs off the workspace and
@@ -1092,6 +1103,9 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
                 deleted.push(workspace.workspace_id.clone());
             } else {
                 workspace.status_code = STATUS_ACTIVE.to_string();
+                // The token identified the update that just settled, so it stops
+                // standing for one: a later call carrying it is a new request.
+                workspace.update_token = None;
             }
         }
         for workspace_id in deleted {
