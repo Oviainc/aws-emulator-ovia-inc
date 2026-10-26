@@ -227,9 +227,9 @@ async fn every_response_class_carries_the_endpoints_header_policy() {
     let absent = absent_stage_arn("neverCreated");
 
     // Rows span the response CLASSES: a success whose output shape binds the members beside
-    // a body (three shapes of request, so the policy is not a function of the input), a
-    // success whose whole modelled output IS those members, a handler refusal, a boundary
-    // refusal, a not-found refusal, and a scaffold's 501.
+    // a body (three shapes of request, so the policy is not a function of the input), the
+    // two successes whose whole modelled output IS those members, a handler refusal, a
+    // boundary refusal, a not-found refusal, and a scaffold's 501.
     let cases: Vec<(&str, &str, Value, u16)> = vec![
         (
             "a created ingest configuration over RTMPS",
@@ -291,13 +291,19 @@ async fn every_response_class_carries_the_endpoints_header_policy() {
             404,
         ),
         (
-            "a scaffolded operation",
+            "a stopped replication, whose whole modelled output is those headers",
             "StopParticipantReplication",
             json!({
                 "sourceStageArn": source,
                 "destinationStageArn": destination,
                 "participantId": publisher,
             }),
+            200,
+        ),
+        (
+            "a scaffolded operation",
+            "ListPublicKeys",
+            json!({}),
             501,
         ),
     ];

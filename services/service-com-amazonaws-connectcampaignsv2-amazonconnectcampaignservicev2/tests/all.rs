@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/campaign_channel_subtype_config_deletion.rs"]
 mod campaign_channel_subtype_config_deletion;
+#[path = "all/campaign_channel_subtype_config_update.rs"]
+mod campaign_channel_subtype_config_update;
 #[path = "all/campaign_communication_limits.rs"]
 mod campaign_communication_limits;
 #[path = "all/campaign_communication_limits_deletion.rs"]

@@ -32,7 +32,12 @@
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::queries`], keyed the same way,
 //! each record carrying what running its statement produced, the instant it was
 //! submitted and the instant a cancel was recorded on it, from which a read
-//! DERIVES the status the clock has made due. An
+//! DERIVES the status the clock has made due. A
+//! workspace's enrichment jobs live in
+//! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::enrichment_jobs`], keyed by the
+//! workspace and the minted job id, each record carrying the configuration it
+//! was created from and the instant it was created, from which a read DERIVES
+//! the job's type, the data it analyses and the status the clock has made due. An
 //! execution of an action lives in
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::executions`], keyed by its own
 //! id, which is what `ListExecutions` summarises for the target resource a
@@ -89,7 +94,7 @@ use crate::ops::types::{
     ComputationModelDataBindingValue, ComputationModelStatus, ComputeNode,
     ComputeNodeExecutionDetails,
     ComputeNodeExecutionStatus, ConfigurationStatus, CustomerManagedS3Storage, DatasetConfig,
-    DatasetSource, DatasetStatus,
+    DatasetSource, DatasetStatus, EnrichmentJobConfiguration, EnrichmentJobSummary,
     ExecutionEnvironmentVariables, ExecutionStatus, ExecutionSummary, ExportErrorReportLocation,
     ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, HierarchyMapping, Identity,
     ImageLocation, LoggingOptions, Mount, MountOverrides, MultiLayerStorage,
@@ -3531,6 +3536,13 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// `ListQueries`; bounded by [`MAX_QUERIES`] and
     /// [`MAX_QUERIES_PER_WORKSPACE`].
     pub queries: HashMap<(String, String), QueryRecord>,
+    /// The enrichment jobs of every workspace, by [`enrichment_job_key`] — the
+    /// workspace they were created in and their own id — because every
+    /// operation on a job addresses it within a workspace. Written by
+    /// `CreateEnrichmentJob` and enumerated, one workspace at a time, by
+    /// `ListEnrichmentJobs`; bounded by [`MAX_ENRICHMENT_JOBS`] and
+    /// [`MAX_ENRICHMENT_JOBS_PER_WORKSPACE`].
+    pub enrichment_jobs: HashMap<(String, String), EnrichmentJobRecord>,
     /// Workspaces by `workspaceName`, which is what identifies one in an
     /// account and region.
     pub workspaces: HashMap<String, WorkspaceRecord>,
@@ -4072,6 +4084,54 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             .keys()
             .filter(|(workspace, _)| workspace == workspace_name)
             .count()
+    }
+
+    /// The enrichment job `workspace_name` already created under
+    /// `client_token`, if any.
+    ///
+    /// What makes `CreateEnrichmentJob` idempotent on its token: "If you submit
+    /// the same request with the same token within the idempotency window, you
+    /// receive the original job details without creating a duplicate." Scoped
+    /// to the workspace, since that is what a job is addressed within.
+    pub fn enrichment_job_for_client_token(
+        &self,
+        workspace_name: &str,
+        client_token: &str,
+    ) -> Option<&EnrichmentJobRecord> {
+        self.enrichment_jobs.values().find(|record| {
+            record.workspace_name == workspace_name
+                && record.client_token.as_deref() == Some(client_token)
+        })
+    }
+
+    /// How many enrichment jobs `workspace_name` holds — what the per-workspace
+    /// bound reads.
+    pub fn enrichment_jobs_in_workspace(&self, workspace_name: &str) -> usize {
+        self.enrichment_jobs
+            .keys()
+            .filter(|(workspace, _)| workspace == workspace_name)
+            .count()
+    }
+
+    /// The enrichment job of `workspace_name` that is doing the same work as
+    /// `configuration` and has not reached a terminal status at `now`, if any.
+    ///
+    /// What the duplicate-job rule reads: a create is refused while "a duplicate
+    /// job (same workspace, dataset, property, and job type) is currently
+    /// running", so two jobs are compared on the work they do
+    /// ([`enrichment_job_target`]) rather than on the whole request.
+    pub fn active_enrichment_job(
+        &self,
+        workspace_name: &str,
+        configuration: &EnrichmentJobConfiguration,
+        now: SystemTime,
+    ) -> Option<&EnrichmentJobRecord> {
+        let wanted = enrichment_job_target(configuration);
+        self.enrichment_jobs.values().find(|record| {
+            record.workspace_name == workspace_name
+                && enrichment_job_target(&record.configuration) == wanted
+                && record.is_active(now)
+        })
     }
 
     /// Store `segment` on the capture source `(workspace_name, time_series_id)`
@@ -7073,3 +7133,242 @@ pub fn dashboard_arn(region: &str, dashboard_id: &str) -> String {
 // `ComAmazonawsIotsitewiseAwsiotsitewiseState::tags_for_resource` resolves it
 // through.
 tagged_record!(DashboardRecord);
+
+// ---------------------------------------------------------------------------
+// The enrichment jobs of a workspace: what `CreateEnrichmentJob` starts and
+// `ListEnrichmentJobs` enumerates. `CreateEnrichmentJob` "returns immediately
+// with job details while processing continues in the background", so the job's
+// STATUS — and the instant of its last status change — are DERIVED from the
+// instant it was created, exactly as a dataset export job's and a query's are:
+// a read reports what the clock has made due without writing anything, and two
+// readers of one job cannot disagree about where it has got to.
+//
+// What a record does NOT hold is an embedding of any video: nothing in this
+// emulator analyses a time series, and no operation of this API answers an
+// embedding. The job's identity, the configuration it was created from and
+// where the lifecycle that create owed has got to are the whole of what a
+// client of this API can observe. An operation that comes to answer the
+// semantic search a completed job enables must derive its answer from the
+// store, never synthesise one to match the status reached here.
+// ---------------------------------------------------------------------------
+
+/// The `EnrichmentJobStatus` a job reports from the instant it is created:
+/// "Initial status of the enrichment job, typically PENDING"
+/// (`crate::ops::types::ENRICHMENT_JOB_STATUS_VALUES`).
+pub const ENRICHMENT_JOB_PENDING: &str = "PENDING";
+
+/// The value a job reports once the clock has started it processing: "The job
+/// will transition to RUNNING when processing begins".
+pub const ENRICHMENT_JOB_RUNNING: &str = "RUNNING";
+
+/// The value a job reports once the clock has finished processing it. Terminal.
+pub const ENRICHMENT_JOB_COMPLETED: &str = "COMPLETED";
+
+/// The `JobType` an `eventDetection` configuration makes a job: the type is
+/// "derived from the job configuration union member", so it is derived here
+/// rather than stored beside the configuration.
+pub const JOB_TYPE_EVENT_DETECTION: &str = "EVENT_DETECTION";
+
+/// How long each step of an enrichment job's lifecycle takes: a created job
+/// stays `PENDING` for this long, then reports `RUNNING` for this long, then is
+/// `COMPLETED`.
+///
+/// CHOSEN, not documented: AWS publishes no duration for either step — a job
+/// takes as long as the video it analyses. The span is deliberately NON-ZERO,
+/// so a caller that lists jobs straight after creating one still observes the
+/// transient status the real service reports, and short enough that a caller
+/// can poll a job through to its terminal status.
+pub const ENRICHMENT_JOB_STEP: Duration = Duration::from_millis(250);
+
+/// How many enrichment jobs one workspace holds.
+///
+/// CHOSEN: a create is the only thing that adds a job and nothing evicts one,
+/// so without a bound a stream of creates would grow one emulator process
+/// without limit. `CreateEnrichmentJob` refuses past it with the modelled
+/// `LimitExceededException` (HTTP 410), which its own documentation names for
+/// "Too many concurrent jobs or requests".
+pub const MAX_ENRICHMENT_JOBS_PER_WORKSPACE: usize = 100;
+
+/// How many enrichment jobs the store holds in total, across every workspace.
+/// The per-workspace cap cannot bound the store on its own, for the reason
+/// [`MAX_DATASET_EXPORT_JOBS`] states.
+pub const MAX_ENRICHMENT_JOBS: usize = 1_000;
+
+/// One enrichment job, as `CreateEnrichmentJob` started it.
+#[derive(Debug, Clone)]
+pub struct EnrichmentJobRecord {
+    /// The `jobId` this job was minted with ([`new_id`]).
+    pub job_id: String,
+    /// The workspace the job was created in. Every operation on a job
+    /// addresses it within a workspace, so the pair is the job's identity —
+    /// see [`enrichment_job_key`].
+    pub workspace_name: String,
+    /// The `jobConfiguration` the create carried, kept verbatim: it is what the
+    /// job IS, and every other value a reader reports about the job — its type,
+    /// the dataset it analyses and the time series it names — is DERIVED from
+    /// it rather than copied beside it, so the two cannot drift.
+    pub configuration: EnrichmentJobConfiguration,
+    /// The `clientToken` the create carried, if any: what makes a retry of that
+    /// same create replay this job rather than start a second one.
+    pub client_token: Option<String>,
+    /// When the job was created, which is the `createdAt` a read reports and
+    /// the instant its whole lifecycle is owed from.
+    pub created_at: SystemTime,
+}
+
+impl EnrichmentJobRecord {
+    /// The dataset this job analyses: `EventDetection`'s "IoT SiteWise dataset
+    /// ID containing the video time-series data to analyze".
+    pub fn dataset_id(&self) -> &str {
+        enrichment_job_target(&self.configuration).0
+    }
+
+    /// The `propertyAlias` the configuration named, if it identified the time
+    /// series that way: "Present when the job was created using a
+    /// propertyAlias".
+    pub fn property_alias(&self) -> Option<&str> {
+        enrichment_job_target(&self.configuration).1
+    }
+
+    /// The `timeSeriesId` the configuration named, if it identified the time
+    /// series that way: "Present when the job was created using a
+    /// timeSeriesId".
+    pub fn time_series_id(&self) -> Option<&str> {
+        enrichment_job_target(&self.configuration).2
+    }
+
+    /// The job's `jobType`, derived from the configuration's union member.
+    pub fn job_type(&self) -> &'static str {
+        enrichment_job_target(&self.configuration).3
+    }
+
+    /// The job's `status` at `now`: `PENDING` until the first
+    /// [`ENRICHMENT_JOB_STEP`] has elapsed, `RUNNING` until the second has,
+    /// `COMPLETED` after that. A terminal status never moves again.
+    ///
+    /// No job of this emulator fails or times out, so `FAILED` and `TIMED_OUT`
+    /// — and the `failureMessage` the model documents beside them — are
+    /// statuses nothing here reports.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        match self.completed_at(now) {
+            Some(_) => ENRICHMENT_JOB_COMPLETED,
+            None if now >= self.created_at + ENRICHMENT_JOB_STEP => ENRICHMENT_JOB_RUNNING,
+            None => ENRICHMENT_JOB_PENDING,
+        }
+    }
+
+    /// The instant the job's terminal status fell due, and `None` until it has.
+    pub fn completed_at(&self, now: SystemTime) -> Option<SystemTime> {
+        let completes_at = self.created_at + 2 * ENRICHMENT_JOB_STEP;
+        (now >= completes_at).then_some(completes_at)
+    }
+
+    /// "Timestamp of the last job status change": the instant of the latest
+    /// transition the clock has made due, and `None` for a job still in the
+    /// status its create answered with, which no transition has moved yet.
+    pub fn updated_at(&self, now: SystemTime) -> Option<SystemTime> {
+        let runs_at = self.created_at + ENRICHMENT_JOB_STEP;
+        self.completed_at(now)
+            .or_else(|| (now >= runs_at).then_some(runs_at))
+    }
+
+    /// Whether the status this job reports at `now` is one it can still move
+    /// out of — what the duplicate-job rule reads.
+    pub fn is_active(&self, now: SystemTime) -> bool {
+        self.completed_at(now).is_none()
+    }
+
+    /// This job as the summary a listing reports for it, at `now`.
+    ///
+    /// Derived here rather than in the handler so a listing and any later read
+    /// of one stored job cannot report different statuses or instants for it.
+    pub fn summary(&self, now: SystemTime) -> EnrichmentJobSummary {
+        EnrichmentJobSummary {
+            job_id: self.job_id.clone(),
+            status: self.status(now).to_string(),
+            workspace_name: self.workspace_name.clone(),
+            job_type: self.job_type().to_string(),
+            dataset_id: self.dataset_id().to_string(),
+            property_alias: self.property_alias().map(str::to_string),
+            time_series_id: self.time_series_id().map(str::to_string),
+            created_at: to_date_time(self.created_at),
+            updated_at: self.updated_at(now).map(to_date_time),
+        }
+    }
+}
+
+/// The key [`ComAmazonawsIotsitewiseAwsiotsitewiseState::enrichment_jobs`]
+/// holds a job under: the workspace it was created in and its own id, because
+/// every operation on a job addresses it within a workspace, so a job of one
+/// workspace is not reachable through another.
+pub fn enrichment_job_key(workspace_name: &str, job_id: &str) -> (String, String) {
+    (workspace_name.to_string(), job_id.to_string())
+}
+
+/// What identifies the WORK one enrichment job does, as the duplicate-job rule
+/// compares two jobs: the dataset, the time series by whichever identifier the
+/// configuration named, and the job type.
+///
+/// Also where every per-job value a reader derives comes from, so the record's
+/// accessors and that rule read ONE definition of the configuration's shape.
+pub fn enrichment_job_target(
+    configuration: &EnrichmentJobConfiguration,
+) -> (&str, Option<&str>, Option<&str>, &'static str) {
+    match configuration {
+        EnrichmentJobConfiguration::eventDetection(detection) => (
+            detection.dataset_id.as_str(),
+            detection.property_alias.as_deref(),
+            detection.time_series_id.as_deref(),
+            JOB_TYPE_EVENT_DETECTION,
+        ),
+    }
+}
+
+/// Refuse an `EnrichmentJobConfiguration` whose members break a rule its own
+/// shapes state, in the wording the refusal carries; `Ok` for one that keeps
+/// them.
+///
+/// The rules come from the shapes themselves: `EventDetection`'s time series is
+/// identified by one of two members ("Specify either timeSeriesId or
+/// propertyAlias, but not both"), and an `EnrichmentTrimSettings` end time
+/// "must be greater than startTime".
+pub fn check_enrichment_job_configuration(
+    configuration: &EnrichmentJobConfiguration,
+) -> Result<(), String> {
+    match configuration {
+        EnrichmentJobConfiguration::eventDetection(detection) => {
+            if detection.time_series_id.is_some() && detection.property_alias.is_some() {
+                return Err("jobConfiguration.eventDetection: timeSeriesId and propertyAlias \
+                            are mutually exclusive."
+                    .to_string());
+            }
+            if timestamp_key(&detection.trim_settings.end_time)
+                <= timestamp_key(&detection.trim_settings.start_time)
+            {
+                return Err("jobConfiguration.eventDetection.trimSettings.endTime must be \
+                            greater than trimSettings.startTime."
+                    .to_string());
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The ARN segment an enrichment job is named by in the one place this API
+/// reports a job's ARN: the required `resourceArn` of the conflict a duplicate
+/// create is refused with.
+///
+/// No modelled member of an enrichment job carries an ARN, so the form is this
+/// service's own — the `<type>/<id>` resource form every IoT SiteWise ARN
+/// takes, as [`parse_resource_arn`] reads them back.
+pub const ENRICHMENT_JOB_RESOURCE_TYPE: &str = "enrichment-job";
+
+/// The ARN of an enrichment job in `region`; see
+/// [`ENRICHMENT_JOB_RESOURCE_TYPE`].
+pub fn enrichment_job_arn(region: &str, job_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{ENRICHMENT_JOB_RESOURCE_TYPE}/{job_id}"),
+    )
+}

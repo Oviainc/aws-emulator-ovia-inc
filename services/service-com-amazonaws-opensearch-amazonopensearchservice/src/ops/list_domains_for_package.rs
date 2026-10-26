@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDomainsForPackage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDomainsForPackage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDomainsForPackage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages through the domains ONE package is associated with — the other side of the
+//! same link [`crate::ops::list_packages_for_domain`] reports — reporting each stored
+//! [`crate::state::PackageAssociation`] through the same `DomainPackageDetails`
+//! projection the call that MADE the association answered with, so the two listings
+//! and the associate's own answer cannot disagree.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +83,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{invalid_next_token, package_not_found};
+
+/// The largest page this operation answers with, and the page size a request that
+/// names none gets: `MaxResults` is `@range(max: 100)`, so 100 results is the most
+/// any request can ask for.
+const MAX_PAGE: usize = 100;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -158,18 +162,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDomainsForPackage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDomainsForPackageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDomainsForPackage"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The ONLY writes this report makes, and each writes only what the clock
+        // already owed a record at this instant had nobody called: a package whose copy
+        // has fallen due, and an association whose move has landed, are reported in the
+        // status they are then in.
+        store.settle_packages(now);
+        for domain in store.domains.values_mut() {
+            for association in domain.package_associations.values_mut() {
+                association.settle(now);
+            }
+        }
+
+        // The associations reported are the ones of ONE package, so an id that names no
+        // package of this account has no set to report: the modelled missing-resource
+        // refusal rather than an empty page. A package the account DOES hold that no
+        // domain has reports the empty set, which is what tells a caller the package is
+        // associated with nothing.
+        let package = store.packages.get(&input.package_id).ok_or_else(|| {
+            ListDomainsForPackageErrorModeled::ResourceNotFoundException(package_not_found(
+                &input.package_id,
+            ))
+        })?;
+
+        // Order-stable, because the store is keyed by domain name and a domain holds at
+        // most ONE association per package: the same request reports the same order
+        // twice, which is what lets a token name a place in the set.
+        let associated: Vec<(&String, &crate::state::PackageAssociation)> = store
+            .domains
+            .iter()
+            .filter_map(|(name, domain)| {
+                domain
+                    .package_associations
+                    .get(&input.package_id)
+                    .map(|association| (name, association))
+            })
+            .collect();
+
+        // A token names the domain the next page starts at, so paging resumes from a
+        // place in the set rather than from an offset an associate or a dissociate
+        // would have shifted. A token naming no domain of the set names no such place,
+        // which is a malformed request rather than an empty page.
+        let start = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            None => 0,
+            Some(token) => associated
+                .iter()
+                .position(|(name, _)| *name == token)
+                .ok_or_else(|| {
+                    ListDomainsForPackageErrorModeled::ValidationException(invalid_next_token())
+                })?,
+        };
+
+        // `MaxResults` is "an optional parameter": the model defaults it to 0, so a
+        // request that asks for no particular page size gets the largest page the model
+        // allows rather than an empty one.
+        let page_size = match usize::try_from(input.max_results) {
+            Ok(0) | Err(_) => MAX_PAGE,
+            Ok(size) => size.min(MAX_PAGE),
+        };
+        let end = start.saturating_add(page_size).min(associated.len());
+
+        let page: Vec<DomainPackageDetails> = associated[start..end]
+            .iter()
+            .map(|(name, association)| association.to_details(name, package))
+            .collect();
+
+        Ok(ListDomainsForPackageOutput {
+            domain_package_details_list: Some(page),
+            // "When nextToken is returned, there are more results available": the token
+            // is the domain the next page starts at, and there is none once this page
+            // ended the set.
+            next_token: associated.get(end).map(|(name, _)| (*name).clone()),
+        })
     }
 }

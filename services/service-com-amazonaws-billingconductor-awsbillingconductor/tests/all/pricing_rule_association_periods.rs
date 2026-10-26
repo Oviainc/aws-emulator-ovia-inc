@@ -211,9 +211,9 @@ impl Emulator {
     }
 
     /// Backdate every association the plan holds to `period`, as if the associating
-    /// call had been made in that billing period — and with it the rules those
-    /// associations name, since a rule has to exist in the period its association is in
-    /// force in.
+    /// call had been made in that billing period — and with it the plan and the rules
+    /// those associations name, since a resource has to exist in the period its
+    /// association is in force in.
     fn backdate(&self, plan: &str, period: &str) {
         let rules: Vec<String> = {
             let state = self.engine.state::<BillingConductorState>();
@@ -231,9 +231,40 @@ impl Emulator {
                 .map(|association| association.arn.clone())
                 .collect()
         };
+        self.create_plan_in(plan, period);
         for rule in rules {
             self.create_rule_in(&rule, period);
         }
+    }
+
+    /// Backdate `plan_arn`'s creation to `period`, as if the creating call had been made
+    /// in that billing period: the way a world where a plan already existed in a closed
+    /// period is set up, which no request can ask for (a create happens now).
+    pub(crate) fn create_plan_in(&self, plan_arn: &str, period: &str) {
+        let at = period_start_millis(period);
+        let state = self.engine.state::<BillingConductorState>();
+        let mut state = state.lock();
+        let record = state
+            .pricing_plans
+            .get_mut(plan_arn)
+            .expect("setup create_plan_in: the plan was created above");
+        record.creation_time_millis = at;
+        record.last_modified_time_millis = at;
+    }
+
+    /// Backdate the plan's CURRENT generation to `period`, as if the write that left the
+    /// plan as it stands had been made in that billing period: how a world whose
+    /// generations started in DIFFERENT periods is set up, which no request can ask for
+    /// (a write happens now).
+    pub(crate) fn restate_plan_generation_in(&self, plan_arn: &str, period: &str) {
+        let at = period_start_millis(period);
+        let state = self.engine.state::<BillingConductorState>();
+        let mut state = state.lock();
+        let record = state
+            .pricing_plans
+            .get_mut(plan_arn)
+            .expect("setup restate_plan_generation_in: the plan was created above");
+        record.last_modified_time_millis = at;
     }
 
     /// Backdate `rule_arn`'s creation to `period`, as if the creating call had been made
@@ -272,7 +303,7 @@ impl Emulator {
     /// (`tests/all/pricing_rule_association_billing_periods.rs`), which no request can
     /// ask for.
     pub(crate) fn start_association_in(&self, plan: &str, rule_arn: &str, period: &str) {
-        {
+        let plan_created_later = {
             let state = self.engine.state::<BillingConductorState>();
             let mut state = state.lock();
             let record = state
@@ -285,8 +316,13 @@ impl Emulator {
                 .find(|association| association.arn == rule_arn)
                 .expect("setup start_association_in: the association was made above");
             association.inclusive_start_billing_period = period.to_string();
+            record.creation_time_millis > period_start_millis(period)
+        };
+        // The plan and the rule both have to exist in the period their association is in
+        // force in, so the plan's creation moves back to the EARLIEST of those periods.
+        if plan_created_later {
+            self.create_plan_in(plan, period);
         }
-        // The rule has to exist in the period its association is in force in.
         self.create_rule_in(rule_arn, period);
     }
 
@@ -337,6 +373,12 @@ impl Emulator {
             status, 200,
             "case {case}: ListPricingPlans expected 200, got {status} with {answer:?}"
         );
+        // A plan is reported only for the billing periods from its creation onward, so a
+        // period in which the plan did not exist yet reports neither the plan nor any
+        // association of it: it associated no rule then.
+        if answer["PricingPlans"].as_array().is_none_or(Vec::is_empty) {
+            return 0;
+        }
         answer["PricingPlans"][0]["Size"]
             .as_i64()
             .unwrap_or_else(|| panic!("case {case}: ListPricingPlans reported no Size: {answer:?}"))
