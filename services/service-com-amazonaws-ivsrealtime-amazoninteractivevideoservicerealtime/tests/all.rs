@@ -57,6 +57,8 @@ mod list_participant_replicas_paging;
 mod participant_events;
 #[path = "all/participant_replication.rs"]
 mod participant_replication;
+#[path = "all/participant_replication_stop.rs"]
+mod participant_replication_stop;
 #[path = "all/participants.rs"]
 mod participants;
 #[path = "all/replicated_participant_views.rs"]

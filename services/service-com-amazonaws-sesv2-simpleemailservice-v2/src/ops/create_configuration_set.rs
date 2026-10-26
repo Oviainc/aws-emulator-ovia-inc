@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConfigurationSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConfigurationSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConfigurationSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores a configuration set under the name the request names, with the delivery,
+//! reputation, sending, suppression, tracking, VDM and message-security options it
+//! carried, and the tags. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -98,6 +92,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::ConfigurationSetRecord;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -172,18 +167,198 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConfigurationSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConfigurationSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConfigurationSet"))
+        // Request metadata is not needed: a configuration set is keyed by name within
+        // the one emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to write to. That is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateConfigurationSet without the shared emulator state",
+            ));
+        };
+
+        let name = input.configuration_set_name;
+        if !crate::state::configuration_set_name_is_valid(&name) {
+            return Err(bad_request(crate::state::configuration_set_name_invalid(
+                &name,
+            )));
+        }
+
+        // Members that select a resource no implemented operation of this emulator
+        // keeps: the dedicated IP pool `SendingPoolName` names is kept by the
+        // dedicated-IP operations, and the archive `ArchiveArn` names lives in
+        // MailManager. A request that names one is answered as unwritten rather than
+        // accepted as if the member had not been sent.
+        for (present, member) in [
+            (
+                input
+                    .delivery_options
+                    .as_ref()
+                    .is_some_and(|options| options.sending_pool_name.is_some()),
+                "DeliveryOptions.SendingPoolName",
+            ),
+            (
+                input
+                    .archiving_options
+                    .as_ref()
+                    .is_some_and(|options| options.archive_arn.is_some()),
+                "ArchivingOptions.ArchiveArn",
+            ),
+        ] {
+            if present {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "CreateConfigurationSet with {member}"
+                )));
+            }
+        }
+
+        // Every enum-valued member carries one of its own modelled values; the value
+        // sets are the generated consts, so they follow the model.
+        let mut record = ConfigurationSetRecord::new(&name, ::std::time::SystemTime::now());
+        if let Some(options) = input.delivery_options {
+            if let Some(policy) = options.tls_policy {
+                record.tls_policy = enum_value("TlsPolicy", policy, TLS_POLICY_VALUES)?;
+            }
+            // The modelled range (300..=50400 seconds) is refused before this handler
+            // runs, so a value that reaches here is one SES would attempt delivery for.
+            record.max_delivery_seconds = options.max_delivery_seconds;
+        }
+        if let Some(options) = input.tracking_options {
+            let https_policy = match options.https_policy {
+                Some(policy) => Some(enum_value("HttpsPolicy", policy, HTTPS_POLICY_VALUES)?),
+                None => None,
+            };
+            record.tracking_options = Some(TrackingOptions {
+                custom_redirect_domain: options.custom_redirect_domain,
+                https_policy,
+            });
+        }
+        if let Some(options) = input.reputation_options {
+            record.reputation_metrics_enabled = options.reputation_metrics_enabled;
+            // `LastFreshStart` is SES's own record of when the set's reputation
+            // metrics were last reset, not something a caller sets: the stored value
+            // is the create instant, whatever the request carried.
+        }
+        if let Some(options) = input.sending_options {
+            record.sending_enabled = options.sending_enabled;
+        }
+        if let Some(options) = input.suppression_options {
+            let suppressed_reasons = match options.suppressed_reasons {
+                Some(reasons) => Some(
+                    reasons
+                        .into_iter()
+                        .map(|reason| {
+                            enum_value(
+                                "SuppressedReasons",
+                                reason,
+                                SUPPRESSION_LIST_REASON_VALUES,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+                None => None,
+            };
+            let suppression_scope = match options.suppression_scope {
+                Some(scope) => Some(enum_value(
+                    "SuppressionScope",
+                    scope,
+                    SUPPRESSION_LIST_SCOPE_VALUES,
+                )?),
+                None => None,
+            };
+            record.suppression_options = Some(SuppressionOptions {
+                suppressed_reasons,
+                suppression_scope,
+                validation_options: options.validation_options,
+            });
+        }
+        if let Some(options) = input.vdm_options {
+            let dashboard_options = match options.dashboard_options {
+                Some(dashboard) => Some(DashboardOptions {
+                    engagement_metrics: match dashboard.engagement_metrics {
+                        Some(status) => {
+                            Some(enum_value("EngagementMetrics", status, FEATURE_STATUS_VALUES)?)
+                        }
+                        None => None,
+                    },
+                }),
+                None => None,
+            };
+            let guardian_options = match options.guardian_options {
+                Some(guardian) => Some(GuardianOptions {
+                    optimized_shared_delivery: match guardian.optimized_shared_delivery {
+                        Some(status) => Some(enum_value(
+                            "OptimizedSharedDelivery",
+                            status,
+                            FEATURE_STATUS_VALUES,
+                        )?),
+                        None => None,
+                    },
+                }),
+                None => None,
+            };
+            record.vdm_options = Some(VdmOptions {
+                dashboard_options,
+                guardian_options,
+            });
+        }
+        record.message_security_options = input.message_security_options;
+        record.tags = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+
+        let mut store = state.lock();
+        if store.configuration_sets.contains_key(&name) {
+            return Err(CreateConfigurationSetErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(format!("Configuration set {name} already exists.")),
+                },
+            )
+            .into());
+        }
+        if store.configuration_sets.len() >= crate::state::MAX_CONFIGURATION_SETS {
+            return Err(CreateConfigurationSetErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The account already holds the maximum of {} configuration sets.",
+                        crate::state::MAX_CONFIGURATION_SETS
+                    )),
+                },
+            )
+            .into());
+        }
+        store.configuration_sets.insert(name, record);
+
+        // `CreateConfigurationSetResponse` carries no members: the stored set is read
+        // back with `GetConfigurationSet`.
+        Ok(CreateConfigurationSetOutput {})
     }
+}
+
+/// Refuse the request with this service's input error.
+fn bad_request(message: impl Into<String>) -> CreateConfigurationSetError {
+    CreateConfigurationSetErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// `value` when it is one of `allowed`, and the refusal naming `member` otherwise.
+fn enum_value(
+    member: &str,
+    value: String,
+    allowed: &[&str],
+) -> Result<String, CreateConfigurationSetError> {
+    if allowed.contains(&value.as_str()) {
+        return Ok(value);
+    }
+    Err(bad_request(format!(
+        "{member} {value} is not one of {}.",
+        allowed.join(", ")
+    )))
 }

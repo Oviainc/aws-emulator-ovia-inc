@@ -25,6 +25,8 @@ mod missing_resource_lookups;
 mod region_isolation;
 #[path = "all/resource_tag_listing.rs"]
 mod resource_tag_listing;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/resource_untagging.rs"]
 mod resource_untagging;
 #[path = "all/run_lifecycle_progression.rs"]
