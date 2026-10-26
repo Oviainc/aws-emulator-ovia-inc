@@ -6508,6 +6508,65 @@ pub fn default_preferred_maintenance_window(
     })
 }
 
+/// The three versions of a managed relational database's master user password
+/// `GetRelationalDatabaseMasterUserPassword$passwordVersion` can name, from the
+/// modelled `RelationalDatabasePasswordVersion` enum.
+///
+/// `CURRENT` is the password the master user is reached with now, `PREVIOUS` the
+/// one it replaced, and `PENDING` the one a modification will rotate to
+/// `CURRENT`.
+pub const RELATIONAL_DATABASE_PASSWORD_VERSION_CURRENT: &str = "CURRENT";
+/// See [`RELATIONAL_DATABASE_PASSWORD_VERSION_CURRENT`].
+pub const RELATIONAL_DATABASE_PASSWORD_VERSION_PREVIOUS: &str = "PREVIOUS";
+/// See [`RELATIONAL_DATABASE_PASSWORD_VERSION_CURRENT`].
+pub const RELATIONAL_DATABASE_PASSWORD_VERSION_PENDING: &str = "PENDING";
+
+/// The password version a request that names none asks for: "Default: CURRENT"
+/// (the modelled `passwordVersion` documentation).
+pub const DEFAULT_RELATIONAL_DATABASE_PASSWORD_VERSION: &str =
+    RELATIONAL_DATABASE_PASSWORD_VERSION_CURRENT;
+
+/// ONE version of a managed relational database's master user password: the
+/// secret itself and the instant that version was created.
+///
+/// A version is created by the call that sets the password — the create or the
+/// `UpdateRelationalDatabase` that named or minted it — and keeps that instant
+/// for as long as it is held, so the instant
+/// `GetRelationalDatabaseMasterUserPassword$createdAt` reports for a version
+/// does not move when the version rotates from `PENDING` to `CURRENT` or from
+/// `CURRENT` to `PREVIOUS`.
+#[derive(Clone)]
+pub struct StoredMasterUserPassword {
+    /// The secret. Reported by `GetRelationalDatabaseMasterUserPassword` alone;
+    /// every other read of a database masks or omits it.
+    pub password: String,
+    /// Epoch milliseconds at which this version was created.
+    pub created_at_ms: i64,
+}
+
+impl StoredMasterUserPassword {
+    /// The version `password`, created at `created_at_ms`.
+    pub fn new(password: impl Into<String>, created_at_ms: i64) -> Self {
+        Self {
+            password: password.into(),
+            created_at_ms,
+        }
+    }
+}
+
+/// The stored database this version hangs off derives `Debug`, so a formatter
+/// reaches every field of it; this one writes the instant and withholds the
+/// secret, which is handed out by the one operation that answers with it and
+/// nowhere else.
+impl std::fmt::Debug for StoredMasterUserPassword {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredMasterUserPassword")
+            .field("created_at_ms", &self.created_at_ms)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The members of a database one `UpdateRelationalDatabase` call changes that
 /// can be left WAITING: the master user password, the engine version (which a
 /// major-version blueprint update moves) and the backup retention setting.
@@ -6520,9 +6579,11 @@ pub fn default_preferred_maintenance_window(
 /// An entry is `None` when the call did not ask for that member to change.
 #[derive(Debug, Clone, Default)]
 pub struct RelationalDatabaseModification {
-    /// The password the master user gets, whether the caller supplied it or
-    /// asked the service to mint one.
-    pub master_user_password: Option<String>,
+    /// The password version the master user gets, whether the caller supplied
+    /// the secret or asked the service to mint one. Created at the instant of
+    /// the call that asked for it, which is the instant it keeps once it reaches
+    /// the database.
+    pub master_user_password: Option<StoredMasterUserPassword>,
     /// The blueprint the database moves to: a later major version of the engine
     /// it already runs, which is what `engineVersion` then reports.
     pub blueprint: Option<RelationalDatabaseBlueprintSpec>,
@@ -6764,11 +6825,18 @@ pub struct StoredRelationalDatabase {
     pub bundle: RelationalDatabaseBundleSpec,
     pub master_database_name: String,
     pub master_username: String,
-    /// The master user password the request carried, kept because
-    /// `GetRelationalDatabaseMasterUserPassword` answers with it (its own
-    /// operation, with its own issue); no member of `RelationalDatabase` exposes
-    /// it. Absent when the request carried none.
-    pub master_user_password: Option<String>,
+    /// The CURRENT version of the master user password: the secret the request
+    /// carried, the one the service generated for a request that named none, or
+    /// the one a later `UpdateRelationalDatabase` set. Kept because
+    /// `GetRelationalDatabaseMasterUserPassword` is what answers with it; no
+    /// member of `RelationalDatabase` exposes it. Every database carries one —
+    /// it is the credential its engine authenticates the master user by.
+    pub master_user_password: StoredMasterUserPassword,
+    /// The PREVIOUS version of the master user password: the version the CURRENT
+    /// one replaced, which `GetRelationalDatabaseMasterUserPassword` answers for
+    /// `passwordVersion` `PREVIOUS`. Absent until a password change has replaced
+    /// one.
+    pub previous_master_user_password: Option<StoredMasterUserPassword>,
     pub preferred_backup_window: String,
     pub preferred_maintenance_window: String,
     pub publicly_accessible: bool,
@@ -7047,10 +7115,18 @@ impl StoredRelationalDatabase {
         // rule the members an update applies at once are held to.
         let mut changed: Vec<&'static str> = Vec::new();
         if let Some(password) = change.master_user_password {
-            if self.master_user_password.as_deref() != Some(password.as_str()) {
+            // A modification that asks for the password the database already
+            // holds replaces nothing: the version it holds keeps both its
+            // secret and the instant it was created at, so a read of CURRENT
+            // does not move.
+            if self.master_user_password.password != password.password {
                 changed.push("masterUserPassword");
+                // The version the new one replaces becomes PREVIOUS, keeping
+                // the instant it was created at: it is the same version, one
+                // step further back.
+                self.previous_master_user_password =
+                    Some(std::mem::replace(&mut self.master_user_password, password));
             }
-            self.master_user_password = Some(password);
         }
         if let Some(blueprint) = change.blueprint {
             if blueprint.blueprint_id() != self.blueprint.blueprint_id() {
@@ -7073,6 +7149,34 @@ impl StoredRelationalDatabase {
                 ),
                 &[RELATIONAL_DATABASE_EVENT_CATEGORY_CONFIGURATION_CHANGE],
             );
+        }
+    }
+
+    /// The version of this database's master user password `version` names —
+    /// one of the `RELATIONAL_DATABASE_PASSWORD_VERSION_*` values — or `None`
+    /// when this database holds no such version.
+    ///
+    /// `CURRENT` is the password the master user is reached with now, `PREVIOUS`
+    /// the version it replaced, and `PENDING` the version a modification
+    /// waiting for this database's maintenance window will rotate to `CURRENT`:
+    /// "After the PENDING password rotates to CURRENT, the PENDING password is
+    /// no longer available" (the modelled `passwordVersion` documentation),
+    /// which holds here because the version is taken from the modification
+    /// still outstanding, and the clock takes that away when it applies it.
+    pub fn master_user_password_version(
+        &self,
+        version: &str,
+    ) -> Option<&StoredMasterUserPassword> {
+        match version {
+            RELATIONAL_DATABASE_PASSWORD_VERSION_CURRENT => Some(&self.master_user_password),
+            RELATIONAL_DATABASE_PASSWORD_VERSION_PREVIOUS => {
+                self.previous_master_user_password.as_ref()
+            }
+            RELATIONAL_DATABASE_PASSWORD_VERSION_PENDING => self
+                .pending_modification
+                .as_ref()
+                .and_then(|pending| pending.change.master_user_password.as_ref()),
+            _ => None,
         }
     }
 
@@ -11933,7 +12037,7 @@ impl ComAmazonawsLightsailLightsail20161128State {
             // password.
             master_database_name: source.master_database_name.clone(),
             master_username: source.master_username.clone(),
-            master_user_password: source.master_user_password.clone(),
+            master_user_password: Some(source.master_user_password.password.clone()),
             state: RELATIONAL_DATABASE_SNAPSHOT_STATE_CREATING,
             due: Some(DueNamedState::after(
                 now_ms,

@@ -360,6 +360,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             let id = store.mint_uuid();
             let host_label = store.mint_endpoint_host_label();
+            // The master user password this database is reached with, which
+            // `GetRelationalDatabaseMasterUserPassword` is what answers with.
+            // A managed database always HAS one — it is the credential its
+            // engine authenticates the master user by — so a request that names
+            // none is served the strong one the service generates, drawn from
+            // the store's own allocator rather than from anything the request
+            // carried.
+            let master_user_password = crate::state::StoredMasterUserPassword::new(
+                match input.master_user_password.clone() {
+                    Some(password) => password,
+                    None => store.mint_master_user_password(),
+                },
+                now,
+            );
             // A new database is not serving yet: the clock owes it `available`,
             // which is why a read straight after this call still reports
             // `creating` — and no master endpoint — exactly as it does against
@@ -382,7 +396,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 bundle,
                 master_database_name: input.master_database_name.clone(),
                 master_username: input.master_username.clone(),
-                master_user_password: input.master_user_password.clone(),
+                master_user_password,
+                // Nothing has replaced the password this database was created
+                // with, so it has no PREVIOUS version yet.
+                previous_master_user_password: None,
                 preferred_backup_window,
                 preferred_maintenance_window,
                 publicly_accessible,

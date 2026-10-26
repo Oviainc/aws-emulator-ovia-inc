@@ -364,7 +364,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(password) => Some(password),
                 None => (input.rotate_master_user_password == Some(true))
                     .then(|| store.mint_master_user_password()),
-            };
+            }
+            // The version is created by THIS call, whether it reaches the
+            // database now or at its next maintenance window, so that is the
+            // instant `GetRelationalDatabaseMasterUserPassword` reports for it.
+            .map(|password| crate::state::StoredMasterUserPassword::new(password, now));
 
             let database = store
                 .relational_database_mut(&name)

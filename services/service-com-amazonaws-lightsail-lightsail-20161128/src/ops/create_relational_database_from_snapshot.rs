@@ -431,6 +431,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             let id = store.mint_uuid();
             let host_label = store.mint_endpoint_host_label();
+            // The restored database is reached with the master user password the
+            // snapshot captured, as a version created by this restore — the
+            // instant `GetRelationalDatabaseMasterUserPassword` reports for the
+            // CURRENT version of a database created here. A managed database
+            // always has a master password, so a snapshot that captured none
+            // restores onto the strong one the service generates.
+            let master_user_password = crate::state::StoredMasterUserPassword::new(
+                match master_user_password {
+                    Some(password) => password,
+                    None => store.mint_master_user_password(),
+                },
+                now,
+            );
             // A restored database is not serving yet: the clock owes it
             // `available`, which is why a read straight after this call still
             // reports `creating` — and no master endpoint — exactly as it does
@@ -454,6 +467,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 master_database_name,
                 master_username,
                 master_user_password,
+                // The restored database's password version is the one the
+                // snapshot captured, carried by this restore: it is the CURRENT
+                // version of a resource created here, so nothing has replaced
+                // it and there is no PREVIOUS version to report.
+                previous_master_user_password: None,
                 preferred_backup_window,
                 preferred_maintenance_window,
                 publicly_accessible,

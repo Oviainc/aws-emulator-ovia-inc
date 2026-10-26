@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRelationalDatabaseMasterUserPassword
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRelationalDatabaseMasterUserPassword`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRelationalDatabaseMasterUserPassword::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE version of a managed relational database's master user password,
+//! from the versions the store holds for that database: the secret itself and
+//! the instant that version was created.
+//!
+//! Reporting only: a read of a credential hands out no new one. The versions a
+//! database holds are written by the call that set the password (its create, or
+//! an `UpdateRelationalDatabase` that named or minted one), and the only thing
+//! this call can observe that nobody asked for is a modification the CLOCK has
+//! already made due, which `crate::state::with_state` applies for every handler
+//! alike. Calling this twice answers the same version twice, and calling it
+//! never changes what the next caller is reached with.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +173,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRelationalDatabaseMasterUserPassword` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRelationalDatabaseMasterUserPasswordErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRelationalDatabaseMasterUserPassword"))
+        // Reporting only: the answer is the version the stored database holds,
+        // and nothing about the request metadata takes part — a database is
+        // addressed by name alone.
+        let _ = ctx;
+
+        // `relationalDatabaseName` is a modelled `@required` member carrying the
+        // `ResourceName` pattern, so the centralized walk already refused an
+        // absent or malformed name.
+        let name = input.relational_database_name;
+
+        // "Default: CURRENT": a request that names no version asks for the
+        // password the master user is reached with now. A version the request
+        // DOES name is one of the modelled enum's values, because
+        // `passwordVersion` carries that enum and the centralized walk refuses
+        // anything outside it before this body runs.
+        let version = input.password_version.unwrap_or_else(|| {
+            crate::state::DEFAULT_RELATIONAL_DATABASE_PASSWORD_VERSION.to_string()
+        });
+
+        crate::state::with_state(&*self.engine, |store| {
+            // A well-formed name that names nothing is the service's
+            // `DoesNotExist` rejection, never a zeroed 200.
+            let database = store
+                .relational_database(&name)
+                .ok_or_else(|| not_found(&name))?;
+            // A version this database holds nothing for — `PREVIOUS` before any
+            // password has been replaced, and `PENDING` while no password change
+            // is waiting — is a version the service cannot find, which is the
+            // same `DoesNotExist` envelope every other missing-resource path of
+            // this crate answers with. `CURRENT` is always held: a managed
+            // database is reached with a master user password from the moment it
+            // is created.
+            let held = database
+                .master_user_password_version(&version)
+                .ok_or_else(|| version_not_found(&name, &version))?;
+            Ok(GetRelationalDatabaseMasterUserPasswordOutput {
+                master_user_password: Some(held.password.clone()),
+                created_at: Some(crate::state::timestamp(held.created_at_ms)),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// No managed relational database of that name is stored: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the
+/// requested name.
+fn not_found(name: &str) -> GetRelationalDatabaseMasterUserPasswordError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
+        name,
+    )
+}
+
+/// The database is stored but holds no version of its master user password under
+/// the name the request asked for — the same `DoesNotExist` envelope, with a
+/// message naming the version asked for and the database it was asked of.
+///
+/// Neither the model nor the operation's documentation publishes a sentence for
+/// this class, and no recorded response pins one, so the message keeps the
+/// SHAPE every other `DoesNotExist` of this service answers with ("The <thing>
+/// does not exist: <name>", as [`crate::scaffolded::Scaffolded::resource_does_not_exist`]
+/// builds it for a resource) and names the version in place of the resource
+/// type. Every variable part is taken from the request.
+fn version_not_found(name: &str, version: &str) -> GetRelationalDatabaseMasterUserPasswordError {
+    crate::scaffolded::Scaffolded::does_not_exist(format!(
+        "The {version} version of the master user password does not exist: {name}"
+    ))
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetRelationalDatabaseMasterUserPasswordError {
+    GetRelationalDatabaseMasterUserPasswordErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail relational database store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
