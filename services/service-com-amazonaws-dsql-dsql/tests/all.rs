@@ -19,6 +19,8 @@ mod cluster_lifecycle;
 mod cluster_mutation_status_gate;
 #[path = "all/cluster_policy.rs"]
 mod cluster_policy;
+#[path = "all/cluster_policy_mutation_status_gate.rs"]
+mod cluster_policy_mutation_status_gate;
 #[path = "all/delete_cluster_idempotency.rs"]
 mod delete_cluster_idempotency;
 #[path = "all/encryption_key_selection.rs"]

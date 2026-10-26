@@ -7,7 +7,9 @@
 //! `bypassPolicyLockoutSafetyCheck`, a document that would leave nobody able to
 //! replace it is refused; an `expectedPolicyVersion` that does not name the
 //! version currently attached is refused too, so two concurrent writers cannot
-//! lose one another's document.
+//! lose one another's document. A cluster whose status does not accept a
+//! mutation — one the clock still owes a transition, or one already on its way
+//! out — takes no policy at all and answers 409 `ConflictException`.
 //!
 //! ## Shape of an operation
 //!

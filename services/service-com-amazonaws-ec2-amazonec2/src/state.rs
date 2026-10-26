@@ -2793,9 +2793,9 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Every Amazon FPGA Image (AFI) the account holds, by `FpgaImageId` — see
     /// [`FpgaImageRecord`]. Ordered by id, which is the order a report of them pages over.
     pub fpga_images: BTreeMap<String, FpgaImageRecord>,
-    /// A `CreateFpgaImage` `ClientToken` and the AFI id it minted, so a repeat of the same
-    /// request answers with that AFI instead of creating a second one. Cleared for an AFI a
-    /// delete removes, so a token cannot name an image that is gone.
+    /// A `ClientToken` an AFI was minted under and the AFI id it minted, so a repeat of the
+    /// same request answers with that AFI instead of minting a second one. Cleared for an AFI
+    /// a delete removes, so a token cannot name an image that is gone.
     pub fpga_image_client_tokens: HashMap<String, String>,
     /// Every volume in the account's Recycle Bin, by `VolumeId`, as a
     /// [`RecycledVolumeRecord`]: the modelled [`VolumeRecycleBinInfo`] entry
@@ -24685,15 +24685,13 @@ pub fn inaccessible_storage_location<E>(message: impl Into<String>) -> Scaffolde
     Scaffolded::service_error(INACCESSIBLE_STORAGE_LOCATION, 400, message)
 }
 
-/// The bucket and key of a storage location a request named, refused the way EC2 refuses
-/// one it cannot read.
+/// The bucket and the key of a storage location a request named.
 ///
 /// `member` names the request member the location came from, so the message says which one
-/// was wrong. A location that names no bucket or no key names no object — there is nothing
-/// to read — and a bucket name outside [`s3_bucket_name_is_well_formed`] names no bucket at
-/// all, which is [`INACCESSIBLE_STORAGE_LOCATION`]. The bucket is checked BEFORE the key,
-/// because a name that is not a bucket name is already enough to answer with.
-pub fn readable_storage_location<'a, E>(
+/// was wrong. `StorageLocation` declares neither member required, so a location that names
+/// no bucket, or names a bucket and no key, names no object at all and is EC2's
+/// `MissingParameter` — a fact of the request, answered before anything is read.
+pub fn storage_location_object<'a, E>(
     location: &'a StorageLocation,
     member: &str,
 ) -> Result<(&'a str, &'a str), Scaffolded<E>> {
@@ -24702,20 +24700,26 @@ pub fn readable_storage_location<'a, E>(
         .as_deref()
         .filter(|bucket| !bucket.is_empty())
         .ok_or_else(|| missing_parameter(format!("{member} must name an S3 bucket")))?;
-    if !s3_bucket_name_is_well_formed(bucket) {
-        return Err(inaccessible_storage_location(format!(
-            "The S3 bucket '{bucket}' named by {member} is not an accessible storage \
-             location: an S3 bucket name holds {MIN_S3_BUCKET_NAME_CHARS} to \
-             {MAX_S3_BUCKET_NAME_CHARS} lowercase letters, digits, dots and hyphens, \
-             begins and ends with a letter or a digit, and is not formatted as an IP address"
-        )));
-    }
     let key = location
         .key
         .as_deref()
         .filter(|key| !key.is_empty())
         .ok_or_else(|| missing_parameter(format!("{member} must name an S3 object key")))?;
     Ok((bucket, key))
+}
+
+/// Refuse a request whose work was to read the Amazon S3 object at `bucket`/`key`, which
+/// this service could not access: HTTP 400 [`INACCESSIBLE_STORAGE_LOCATION`].
+///
+/// One answer for every reason a location cannot be read — the bucket is not a bucket name
+/// at all, holds no such object, or lies outside the Region the call was made in — because
+/// the caller is told the location that failed and what to check about it, which is what EC2
+/// answers with for this error class.
+pub fn inaccessible_s3_resource<E>(bucket: &str, key: &str) -> Scaffolded<E> {
+    inaccessible_storage_location(format!(
+        "Error accessing resource in S3. Check permissions, naming, and ensure the bucket \
+         is within the same region as the API endpoint. Bucket: {bucket}, Key: {key}."
+    ))
 }
 
 // =============================================================================
@@ -24760,7 +24764,8 @@ pub const INVALID_FPGA_IMAGE_ID_NOT_FOUND: &str = "InvalidFpgaImageID.NotFound";
 /// resource limit" (EC2 API error codes, `ResourceLimitExceeded`).
 pub const RESOURCE_LIMIT_EXCEEDED: &str = "ResourceLimitExceeded";
 
-/// How many Amazon FPGA Images this emulator stores before `CreateFpgaImage` is refused.
+/// How many Amazon FPGA Images this emulator stores before a call that mints one is
+/// refused.
 ///
 /// CHOSEN, like [`MAX_STORED_VOLUMES`] and for the same reason: the store lives in this
 /// process's memory, so the number of AFIs a caller can create has to be finite. It is well
@@ -24818,13 +24823,13 @@ pub fn invalid_fpga_image_id_malformed<E>(fpga_image_id: &str) -> Scaffolded<E> 
 /// two writers store two different words for it — the same way [`VolumeRecord`] treats a
 /// volume's state.
 ///
-/// "The create operation is asynchronous. To verify that the AFI was successfully created
-/// and is ready for use, check the output logs" (`CreateFpgaImage`): the call hands back a
-/// `pending` AFI, and the outcome of the creation is reported in the AFI's own state. This
-/// emulator stores no Amazon S3 objects, so nothing can read the design checkpoint the
-/// request named and no bitstream is ever produced — the creation therefore ends in the
-/// modelled `failed` state carrying [`FpgaImageRecord::failure_message`], which says so,
-/// rather than in an `available` AFI nothing built.
+/// Minting an AFI is asynchronous — "to verify that the AFI was successfully created and is
+/// ready for use, check the output logs" (`CreateFpgaImage`) — so the call that mints one
+/// hands back a `pending` AFI and the outcome is reported in that AFI's own state. This
+/// emulator holds no Amazon S3 objects, so no bitstream is ever built from a design
+/// checkpoint and no AFI of this store carries one: the move therefore ends in the modelled
+/// `failed` state carrying [`FpgaImageRecord::failure_message`], which says so, rather than
+/// in an `available` AFI nothing built.
 #[derive(Debug, Clone)]
 pub struct FpgaImageRecord {
     /// The AFI as the model shapes it, with `State` left for [`FpgaImageRecord::view_at`].

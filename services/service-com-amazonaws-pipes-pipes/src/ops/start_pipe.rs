@@ -150,9 +150,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The start is recorded on the stored pipe; nothing here depends on request
-        // metadata.
-        let _ = ctx;
+        // The start is recorded on the stored pipe; `ctx` is the callback the data-plane
+        // poller this start begins reaches the other services of this emulator through.
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartPipeErrorModeled::InternalException(InternalException {
                 message: "the pipes store is not reachable from this engine".to_string(),
@@ -174,13 +173,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         pipe.last_modified_time = ::std::time::SystemTime::now();
 
-        Ok(StartPipeOutput {
+        let output = StartPipeOutput {
             arn: Some(pipe.arn.clone()),
             name: Some(pipe.name.clone()),
             desired_state: Some(pipe.desired_state.clone()),
             current_state: Some(pipe.current_state.clone()),
             creation_time: Some(crate::state::timestamp(pipe.creation_time)),
             last_modified_time: Some(crate::state::timestamp(pipe.last_modified_time)),
-        })
+        };
+        // A started pipe RESUMES consumption of its source, including everything that
+        // accumulated while it was stopped: the poller is started here, outside the
+        // lock, and does nothing until the pipe's `STARTING` span has lapsed.
+        drop(state);
+        crate::state::data_plane::drive_pipe(ctx, &self.engine, &input.name);
+        Ok(output)
     }
 }
