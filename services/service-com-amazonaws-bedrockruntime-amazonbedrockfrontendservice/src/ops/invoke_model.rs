@@ -233,6 +233,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // When serving this request began: the span `InvocationLatency` is the
+        // measurement of, as the streaming surface times its own.
+        let started = ::std::time::Instant::now();
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(InvokeModelErrorModeled::InternalServerException(
                 InternalServerException {
@@ -318,10 +321,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         state.lock().log_invocation(logged.clone());
         // The token volume this call reports in the model family's own response
-        // envelope is also its contribution to the `AWS/Bedrock` series
-        // dimensioned on the invoked model, published with no state guard of
-        // this service held.
-        crate::state::invocation_metrics::publish_token_usage(&*self.engine, &logged);
+        // envelope, and the duration measured for serving it, are also its
+        // contribution to the `AWS/Bedrock` series dimensioned on the invoked
+        // model, beside the one successful request it is, published with no state
+        // guard of this service held.
+        crate::state::invocation_metrics::publish_served_invocation(
+            &*self.engine,
+            &logged,
+            crate::state::latency_ms(started.elapsed()),
+        );
 
         Ok(InvokeModelOutput {
             body,

@@ -204,10 +204,18 @@ impl<Eng: Send + Sync + 'static> InvokeModelWithResponseStream<Eng> {
             at_millis: crate::state::now_millis(),
         };
         state.lock().log_invocation(logged.clone());
-        // The token volume this call reports in the family's own metrics event is
-        // also its contribution to the `AWS/Bedrock` series dimensioned on the
-        // invoked model, published with no state guard of this service held.
-        crate::state::invocation_metrics::publish_token_usage(&*self.engine, &logged);
+        // The duration this call reports in the family's own metrics event,
+        // measured over serving the inference.
+        let invocation_latency_ms = crate::state::latency_ms(started.elapsed());
+        // The token volume and the latency this call reports in the family's own
+        // metrics event are also its contribution to the `AWS/Bedrock` series
+        // dimensioned on the invoked model, beside the one successful request it
+        // is, published with no state guard of this service held.
+        crate::state::invocation_metrics::publish_served_invocation(
+            &*self.engine,
+            &logged,
+            invocation_latency_ms,
+        );
 
         // One `chunk` event per streaming event of the model's own protocol, in
         // the order the family emits them.
@@ -218,7 +226,7 @@ impl<Eng: Send + Sync + 'static> InvokeModelWithResponseStream<Eng> {
             crate::state::InvocationMetrics {
                 input_tokens: turn.input_tokens,
                 output_tokens: turn.output_tokens,
-                invocation_latency_ms: crate::state::latency_ms(started.elapsed()),
+                invocation_latency_ms,
                 first_byte_latency_ms,
             },
         );

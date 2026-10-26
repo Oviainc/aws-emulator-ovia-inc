@@ -18,8 +18,9 @@
 //! * the **async-invoke** records, their idempotency index and the clock-owed
 //!   transition that moves a submitted invocation out of `InProgress`;
 //! * the **metric publication** ([`invocation_metrics`]) that turns a served
-//!   inference's token accounting into `AWS/Bedrock` metric data, so the counts
-//!   a response reports inline are the ones CloudWatch surfaces for it.
+//!   inference's token accounting, the request it is and the duration measured
+//!   for it into `AWS/Bedrock` metric data, so the counts and the latency a
+//!   response reports inline are the ones CloudWatch surfaces for it.
 //!
 //! No language model runs inside this emulator, so nothing here invents model
 //! output and presents it as inference: a synchronous completion carries, in the

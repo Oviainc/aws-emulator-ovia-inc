@@ -351,10 +351,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             at_millis: crate::state::now_millis(),
         };
         state.lock().log_invocation(logged.clone());
-        // The token volume this call reports inline is also its contribution to
-        // the `AWS/Bedrock` series dimensioned on the invoked model, published
-        // with no state guard of this service held.
-        crate::state::invocation_metrics::publish_token_usage(&*self.engine, &logged);
+        // The duration this call reports inline, measured over serving the turn.
+        let latency_ms = crate::state::latency_ms(started.elapsed());
+        // The token volume and the latency this call reports inline are also its
+        // contribution to the `AWS/Bedrock` series dimensioned on the invoked
+        // model, beside the one successful request it is, published with no state
+        // guard of this service held.
+        crate::state::invocation_metrics::publish_served_invocation(
+            &*self.engine,
+            &logged,
+            latency_ms,
+        );
 
         Ok(ConverseOutput {
             output: ConverseOutput2::Message(Message {
@@ -363,9 +370,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             stop_reason: turn.stop_reason().to_string(),
             usage: turn.usage(),
-            metrics: ConverseMetrics {
-                latency_ms: crate::state::latency_ms(started.elapsed()),
-            },
+            metrics: ConverseMetrics { latency_ms },
             additional_model_response_fields: None,
             trace: None,
             performance_config: input.performance_config.clone(),

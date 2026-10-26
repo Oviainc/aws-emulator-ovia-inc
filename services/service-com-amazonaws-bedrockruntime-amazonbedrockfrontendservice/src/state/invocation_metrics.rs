@@ -14,15 +14,32 @@
 //! and nothing else: a client that joins an invocation to its metered usage
 //! after the fact finds the series the response described.
 //!
+//! The same reference lists the REQUEST metrics every served invocation
+//! contributes beside its token volume: `Invocations`, in `Count`, is the
+//! "number of successful requests to the Converse, ConverseStream, InvokeModel,
+//! and InvokeModelWithResponseStream API operations", and `InvocationLatency`,
+//! in `Milliseconds`, the latency of those requests. One call is one successful
+//! request, so it contributes exactly one observation of each: the volume a
+//! client counts and the duration it measures are the call that was actually
+//! served, timed on the server side, which is the same measurement the
+//! surfaces reporting a latency inline (`ConverseMetrics$latencyMs`, the
+//! `invocationLatency` of an invoke stream's metrics event) hand back.
+//!
+//! A call that is REFUSED is not a successful request, so it publishes nothing
+//! here: publication is reached only once an inference has been served, after
+//! every refusal this service makes.
+//!
 //! The datapoints go into the CloudWatch emulator's own metric store — the SAME
 //! store `PutMetricData` writes and `GetMetricStatistics` / `ListMetrics` read —
 //! reached through the shared engine, so one metric has one home and the
 //! publishers cannot drift.
 //!
 //! `StartAsyncInvoke` does NOT publish here: it accepts a job rather than
-//! serving an inference, reports no `usage` of its own, and the job it records
-//! settles with nothing generated, so there is no token volume for that call to
-//! account for.
+//! serving an inference, reports no `usage` and no latency of its own, and the
+//! job it records settles with nothing generated, so there is no token volume
+//! for that call to account for and no served request for it to count. The
+//! request metrics name the four synchronous and streaming invocation
+//! operations, and those are the ones that publish.
 
 use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801 as cloudwatch;
 
@@ -41,9 +58,24 @@ pub const INPUT_TOKEN_COUNT: &str = "InputTokenCount";
 /// The metric carrying the tokens the model generated for a call.
 pub const OUTPUT_TOKEN_COUNT: &str = "OutputTokenCount";
 
-/// The unit a token count is observed in: the two metrics above count tokens,
-/// so neither is a time nor a size.
+/// The metric carrying the successful requests an invocation surface served.
+pub const INVOCATIONS: &str = "Invocations";
+
+/// The metric carrying how long serving one of those requests took.
+pub const INVOCATION_LATENCY: &str = "InvocationLatency";
+
+/// The unit a count is observed in: a token count and a request count are
+/// counts, so neither is a time nor a size.
 pub const COUNT_UNIT: &str = "Count";
+
+/// The unit a latency is observed in: `InvocationLatency` is published in
+/// milliseconds, the granularity this service measures and reports a served
+/// invocation's duration in.
+pub const MILLISECONDS_UNIT: &str = "Milliseconds";
+
+/// The requests one served call is: a call serves one inference, so it
+/// contributes exactly one successful request to the `Invocations` series.
+const ONE_REQUEST: f64 = 1.0;
 
 /// The resolution these metrics are stored at, in seconds — the regular
 /// resolution a metric has unless its publisher asks for the high-resolution
@@ -52,7 +84,10 @@ pub const COUNT_UNIT: &str = "Count";
 /// the Bedrock runtime metrics are published at.
 pub const STORAGE_RESOLUTION_SECS: i32 = 60;
 
-/// Publish the token volume `entry` accounts for as `AWS/Bedrock` metric data.
+/// Publish what one served call contributes to the `AWS/Bedrock` namespace: the
+/// token volume `entry` accounts for, the one successful request it is, and
+/// `latency_ms`, the whole milliseconds it took to serve (as
+/// [`super::latency_ms`] measures every latency this service reports).
 ///
 /// One datapoint per metric per call, dimensioned on the invoked model id alone,
 /// stamped with the instant the call was served: the dimension is part of a
@@ -65,7 +100,11 @@ pub const STORAGE_RESOLUTION_SECS: i32 = 60;
 /// are never locked at once. A store at its series capacity takes no new series;
 /// the inference it came from is not failed for that, because the call itself
 /// was served.
-pub fn publish_token_usage<Eng: Send + Sync + 'static>(engine: &Eng, entry: &InvocationLogEntry) {
+pub fn publish_served_invocation<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    entry: &InvocationLogEntry,
+    latency_ms: i64,
+) {
     let Some(state) = cloudwatch::state::service_state(engine) else {
         return;
     };
@@ -73,9 +112,19 @@ pub fn publish_token_usage<Eng: Send + Sync + 'static>(engine: &Eng, entry: &Inv
     // its own readers window by; an invocation is timed in milliseconds.
     let timestamp_secs = entry.at_millis as f64 / 1_000.0;
     let mut store = state.lock();
-    for (metric_name, tokens) in [
-        (INPUT_TOKEN_COUNT, entry.input_tokens),
-        (OUTPUT_TOKEN_COUNT, entry.output_tokens),
+    for (metric_name, value, unit) in [
+        (INPUT_TOKEN_COUNT, f64::from(entry.input_tokens), COUNT_UNIT),
+        (
+            OUTPUT_TOKEN_COUNT,
+            f64::from(entry.output_tokens),
+            COUNT_UNIT,
+        ),
+        (INVOCATIONS, ONE_REQUEST, COUNT_UNIT),
+        (
+            INVOCATION_LATENCY,
+            latency_ms as f64,
+            MILLISECONDS_UNIT,
+        ),
     ] {
         let key = cloudwatch::state::MetricKey {
             namespace: NAMESPACE.to_string(),
@@ -84,7 +133,6 @@ pub fn publish_token_usage<Eng: Send + Sync + 'static>(engine: &Eng, entry: &Inv
                 .into_iter()
                 .collect(),
         };
-        let value = f64::from(tokens);
         let datum = cloudwatch::state::StoredDatum {
             timestamp_secs,
             // One observation: this call's own contribution to the series.
@@ -92,7 +140,7 @@ pub fn publish_token_usage<Eng: Send + Sync + 'static>(engine: &Eng, entry: &Inv
             sum: value,
             minimum: value,
             maximum: value,
-            unit: Some(COUNT_UNIT.to_string()),
+            unit: Some(unit.to_string()),
             storage_resolution: STORAGE_RESOLUTION_SECS,
         };
         if store.append_datapoints(key, vec![datum]).is_err() {

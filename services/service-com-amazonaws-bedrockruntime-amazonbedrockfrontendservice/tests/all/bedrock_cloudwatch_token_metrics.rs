@@ -42,23 +42,23 @@ use crate::bedrock_runtime_streaming::{chunk_payloads, decode_frames};
 const CLOUDWATCH_TARGET_PREFIX: &str = "GraniteServiceVersion20100801";
 
 /// How many seconds either side of the calls the metric window spans.
-const WINDOW_SECS: f64 = 180.0;
+pub(crate) const WINDOW_SECS: f64 = 180.0;
 
 /// The aggregation period the Bedrock runtime metrics are published at, which is
 /// also the period every read below requests.
-const PERIOD_SECS: i64 = 60;
+pub(crate) const PERIOD_SECS: i64 = 60;
 
 /// The same period as a number of seconds, derived from the one constant above:
 /// a read's windows are anchored at the requested start time rounded DOWN to the
 /// minute, so a datapoint's own stamp — the start of the window it was folded out
 /// of — may precede the requested `StartTime` by at most one period.
 #[allow(clippy::cast_precision_loss)]
-const PERIOD_SECS_F64: f64 = PERIOD_SECS as f64;
+pub(crate) const PERIOD_SECS_F64: f64 = PERIOD_SECS as f64;
 
 /// Which surface a row drives the inference through, with the request body it
 /// sends and — for the unary `InvokeModel` surface, whose envelope is the model
 /// family's own — the JSON pointers its token counts are reported at.
-enum Surface {
+pub(crate) enum Surface {
     Converse {
         messages: Value,
     },
@@ -77,10 +77,10 @@ enum Surface {
 
 /// One row of the table: a case name, the model to invoke and the surface to
 /// invoke it through.
-struct Row {
-    case: &'static str,
-    model_id: &'static str,
-    surface: Surface,
+pub(crate) struct Row {
+    pub(crate) case: &'static str,
+    pub(crate) model_id: &'static str,
+    pub(crate) surface: Surface,
 }
 
 /// The table: every invocation surface, four response families, and token
@@ -90,7 +90,7 @@ struct Row {
 /// throughput)" and the request/response envelopes from "Inference request
 /// parameters and response fields for foundation models", both in the Amazon
 /// Bedrock User Guide.
-fn rows() -> Vec<Row> {
+pub(crate) fn rows() -> Vec<Row> {
     vec![
         Row {
             case: "Converse, one short turn",
@@ -158,7 +158,7 @@ fn rows() -> Vec<Row> {
 /// The emulator under test: the production router with the Bedrock Runtime data
 /// plane and CloudWatch mounted on ONE engine, which is what makes the metric
 /// store the inference writes the same one CloudWatch reads.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -173,7 +173,7 @@ fn emulator() -> MultiServiceRouter {
 
 /// Wall-clock now as epoch seconds, the clock a metric window is measured
 /// against.
-fn now_secs() -> f64 {
+pub(crate) fn now_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0.0, |since| since.as_secs_f64())
@@ -181,7 +181,11 @@ fn now_secs() -> f64 {
 
 /// One `awsJson1_0` CloudWatch call, requiring a 200 — the protocol and target
 /// prefix that service serves (its README / OPERATIONS.md "Wire protocol").
-async fn cloudwatch(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn cloudwatch(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> Value {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -228,7 +232,7 @@ fn count_at(case: &str, document: &Value, pointer: &str) -> f64 {
 
 /// Serve one inference through the row's surface and return the token counts the
 /// response reported INLINE — the oracle the published series is judged against.
-async fn reported_usage(router: &MultiServiceRouter, row: &Row) -> (f64, f64) {
+pub(crate) async fn reported_usage(router: &MultiServiceRouter, row: &Row) -> (f64, f64) {
     let case = row.case;
     let model_id = row.model_id;
     match &row.surface {
@@ -338,6 +342,19 @@ async fn datapoints(
     start: f64,
     end: f64,
 ) -> Vec<Value> {
+    statistics_of(router, metric, model_id, start, end, &["Sum"]).await
+}
+
+/// The same read, asking for the named `statistics`: a datapoint carries only
+/// the statistics its reader requested.
+pub(crate) async fn statistics_of(
+    router: &MultiServiceRouter,
+    metric: &str,
+    model_id: &str,
+    start: f64,
+    end: f64,
+    statistics: &[&str],
+) -> Vec<Value> {
     let answered = cloudwatch(
         router,
         "GetMetricStatistics",
@@ -348,7 +365,7 @@ async fn datapoints(
             "StartTime": start,
             "EndTime": end,
             "Period": PERIOD_SECS,
-            "Statistics": ["Sum"],
+            "Statistics": statistics,
         }),
     )
     .await;
@@ -361,7 +378,7 @@ async fn datapoints(
 
 /// The `Sum` of every datapoint of a span, which is the volume the series
 /// accounts for over it.
-fn total(points: &[Value]) -> f64 {
+pub(crate) fn total(points: &[Value]) -> f64 {
     points
         .iter()
         .filter_map(|point| point.get("Sum").and_then(Value::as_f64))

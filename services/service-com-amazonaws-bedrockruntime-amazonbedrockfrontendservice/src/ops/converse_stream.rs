@@ -191,10 +191,18 @@ impl<Eng: Send + Sync + 'static> ConverseStream<Eng> {
             at_millis: crate::state::now_millis(),
         };
         state.lock().log_invocation(logged.clone());
-        // The token volume this call reports in its metadata event is also its
-        // contribution to the `AWS/Bedrock` series dimensioned on the invoked
-        // model, published with no state guard of this service held.
-        crate::state::invocation_metrics::publish_token_usage(&*self.engine, &logged);
+        // The duration this call reports in its metadata event, measured over
+        // serving the turn.
+        let latency_ms = crate::state::latency_ms(started.elapsed());
+        // The token volume and the latency this call reports in its metadata
+        // event are also its contribution to the `AWS/Bedrock` series
+        // dimensioned on the invoked model, beside the one successful request it
+        // is, published with no state guard of this service held.
+        crate::state::invocation_metrics::publish_served_invocation(
+            &*self.engine,
+            &logged,
+            latency_ms,
+        );
 
         // The assistant message this turn is, block by block — the same message
         // `Converse` answers with, so the two surfaces cannot drift.
@@ -274,9 +282,7 @@ impl<Eng: Send + Sync + 'static> ConverseStream<Eng> {
             "metadata",
             &ConverseStreamMetadataEvent {
                 usage: turn.usage(),
-                metrics: ConverseStreamMetrics {
-                    latency_ms: crate::state::latency_ms(started.elapsed()),
-                },
+                metrics: ConverseStreamMetrics { latency_ms },
                 trace: None,
                 performance_config: input.performance_config.clone(),
                 service_tier: input.service_tier.clone(),

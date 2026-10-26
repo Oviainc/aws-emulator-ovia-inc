@@ -44,7 +44,7 @@ fn destination() -> serde_json::Value {
 /// "Amazon Nova Reel" (`taskType`, `textToVideoParams.text`,
 /// `videoGenerationConfig`) and "Luma AI Ray v2" (`prompt`, `aspect_ratio`,
 /// `loop`, `duration`, `resolution`).
-fn valid_model_input(model_id: &str) -> Option<serde_json::Value> {
+pub(crate) fn valid_model_input(model_id: &str) -> Option<serde_json::Value> {
     match model_id {
         "amazon.nova-reel-v1:0" | "amazon.nova-reel-v1:1" => Some(json!({
             "taskType": "TEXT_VIDEO",
@@ -68,7 +68,7 @@ fn valid_model_input(model_id: &str) -> Option<serde_json::Value> {
 }
 
 /// A `StartAsyncInvoke` request body for `model_id` carrying `model_input`.
-fn start_request(model_id: &str, model_input: serde_json::Value) -> serde_json::Value {
+pub(crate) fn start_request(model_id: &str, model_input: serde_json::Value) -> serde_json::Value {
     json!({
         "modelId": model_id,
         "modelInput": model_input,
