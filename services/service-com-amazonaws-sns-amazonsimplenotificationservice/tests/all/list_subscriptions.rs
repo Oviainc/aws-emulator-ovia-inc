@@ -17,10 +17,13 @@
 //!
 //! The sibling suite `account_subscriptions_listing.rs` covers the same operation over
 //! its own table; this one drives it through the shared wire harness this test target
-//! already has, and its own rows turn on the two things a second table can add: that
+//! already has, and its own rows turn on the three things a second table can add: that
 //! the account-wide listing and a topic's own listing agree MEMBER FOR MEMBER about the
-//! subscriptions they share, and that the page boundary sits exactly at the documented
-//! page size and does not move between reads.
+//! subscriptions they share, that the page boundary sits exactly at the documented
+//! page size and does not move between reads, and that EVERY page is computed from the
+//! store as it stands when the page is asked for — so after any set of removals a walk
+//! of the pages still reports exactly the stored subscriptions, once each, in the order
+//! the surviving records already had.
 
 use std::collections::{HashMap, HashSet};
 
@@ -481,4 +484,249 @@ async fn the_account_wide_listing_pages_at_the_documented_page_size() {
             answer.body
         );
     }
+}
+
+/// Walk every page of the account-wide listing, answering the subscriptions it reports
+/// in document order together with the size of each page it took.
+///
+/// Checks, on each page, the two things the operation's own documentation fixes: a page
+/// carries at most the documented page size, and a `NextToken` comes back exactly while
+/// subscriptions remain — so a page that carries one is a full page.
+async fn walk(sns: &Sns, case: &str) -> (Vec<Listed>, Vec<usize>) {
+    let mut found: Vec<Listed> = Vec::new();
+    let mut sizes: Vec<usize> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let params: Vec<(&str, &str)> = match token.as_deref() {
+            Some(token) => vec![("NextToken", token)],
+            None => Vec::new(),
+        };
+        let answer = list(sns, case, &params).await;
+        let page = reported(&answer);
+        assert!(
+            page.len() <= PAGE_SIZE,
+            "case {case:?}: page {} holds at most {PAGE_SIZE}, got {}",
+            sizes.len() + 1,
+            page.len()
+        );
+        sizes.push(page.len());
+        found.extend(page);
+        token = answer.element("NextToken");
+        if token.is_none() {
+            return (found, sizes);
+        }
+        assert_eq!(
+            *sizes.last().expect("a page was just walked"),
+            PAGE_SIZE,
+            "case {case:?}: page {} carries a NextToken, so it must be a full page, got {}",
+            sizes.len(),
+            answer.body
+        );
+        assert!(
+            sizes.len() < 64,
+            "case {case:?}: the pages must run out, got {} of them",
+            sizes.len()
+        );
+    }
+}
+
+/// Unsubscribe one subscription, asserting SNS answered the removal.
+async fn unsubscribe(sns: &Sns, case: &str, arn: &str) {
+    let answer = sns.call("Unsubscribe", &[("SubscriptionArn", arn)]).await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: Unsubscribe {arn} expected 200, got {} / {}",
+        answer.status, answer.body
+    );
+}
+
+/// How one row takes subscriptions out of the store, in terms of the order the listing
+/// last reported them — never in terms of one recorded subscription.
+#[derive(Debug, Clone, Copy)]
+enum Removal {
+    /// Unsubscribe the first `n` subscriptions of the surviving order (`0` removes
+    /// nothing, which is the baseline row).
+    FirstOfTheOrder(usize),
+    /// Unsubscribe every surviving subscription at an even offset, so the removals are
+    /// interleaved with the survivors rather than contiguous.
+    EveryOther,
+    /// Delete the topic at this index of the seeded topics, which takes that topic's
+    /// subscriptions with it — a removal no `Unsubscribe` call named.
+    Topic(usize),
+    /// Unsubscribe every surviving subscription but the last one.
+    AllButOne,
+    /// Unsubscribe everything that is left.
+    Everything,
+}
+
+/// The removal rows, applied in order to ONE store, so each walk sees a different
+/// population: none removed, a single record, a whole page's worth, an interleaved half,
+/// a topic's worth removed by `DeleteTopic`, down to one record, down to none.
+const REMOVALS: &[(&str, Removal)] = &[
+    ("nothing removed", Removal::FirstOfTheOrder(0)),
+    (
+        "the first subscription of the first page",
+        Removal::FirstOfTheOrder(1),
+    ),
+    (
+        "a whole page's worth from the front",
+        Removal::FirstOfTheOrder(PAGE_SIZE),
+    ),
+    ("every other survivor", Removal::EveryOther),
+    ("a whole topic, by DeleteTopic", Removal::Topic(2)),
+    ("all but one survivor", Removal::AllButOne),
+    ("every subscription left", Removal::Everything),
+];
+
+/// Every page is computed from the subscriptions the store holds WHEN THE PAGE IS ASKED
+/// FOR: after any set of removals, walking the pages reports exactly the subscriptions
+/// that are left, once each, in the order the survivors already had, paged at the
+/// documented size with a token only while more remain.
+///
+/// The rows run over a store seeded past two page boundaries and walk it down to empty,
+/// so the removals land before a page boundary, across one, and on a whole page — the
+/// paging and the removals interact rather than being exercised one at a time.
+#[tokio::test]
+async fn the_pages_follow_the_store_as_subscriptions_are_removed() {
+    let sns = Sns::new();
+    let topics = [
+        sns.topic("walked-a").await,
+        sns.topic("walked-b").await,
+        sns.topic("walked-c").await,
+    ];
+
+    // Protocols SNS confirms on subscribe, so every seeded subscription is listed under
+    // its own ARN and the walk can be compared record by record. The endpoint forms are
+    // the per-protocol catalog of the `SubscribeInput$Endpoint` doc.
+    let endpoint_of: [fn(usize) -> String; 3] = [
+        |index| format!("arn:aws:sqs:us-east-1:000000000000:walked-q-{index:04}"),
+        |index| format!("arn:aws:lambda:us-east-1:000000000000:function:walked-f-{index:04}"),
+        |index| format!("arn:aws:firehose:us-east-1:000000000000:deliverystream/w-{index:04}"),
+    ];
+    let protocols = ["sqs", "lambda", "firehose"];
+
+    // Past two page boundaries, spread over every topic, so no page is one topic's.
+    let total = PAGE_SIZE * 2 + 5;
+    let mut minted: HashSet<String> = HashSet::new();
+    for index in 0..total {
+        let slot = index % protocols.len();
+        let endpoint = endpoint_of[slot](index);
+        let case = format!("seeding {} {endpoint}", protocols[slot]);
+        let arn = subscribe(
+            &sns,
+            &case,
+            &topics[index % topics.len()],
+            protocols[slot],
+            &endpoint,
+        )
+        .await;
+        assert!(
+            minted.insert(arn.clone()),
+            "case {case:?}: every subscription must have its own ARN, {arn:?} repeats"
+        );
+    }
+
+    let (seeded, _) = walk(&sns, "the seeded store").await;
+    assert_eq!(
+        seeded.len(),
+        total,
+        "case \"the seeded store\": expected {total} subscriptions over the pages, got {}",
+        seeded.len()
+    );
+    assert_eq!(
+        seeded
+            .iter()
+            .map(|listed| listed.subscription_arn.clone())
+            .collect::<HashSet<String>>(),
+        minted,
+        "case \"the seeded store\": the pages must report exactly the subscriptions \
+         Subscribe minted"
+    );
+
+    let mut survivors = seeded;
+    for (case, removal) in REMOVALS {
+        let doomed: Vec<Listed> = match removal {
+            Removal::FirstOfTheOrder(count) => survivors.iter().take(*count).cloned().collect(),
+            Removal::EveryOther => survivors.iter().step_by(2).cloned().collect(),
+            Removal::Topic(index) => survivors
+                .iter()
+                .filter(|listed| listed.topic_arn == topics[*index])
+                .cloned()
+                .collect(),
+            Removal::AllButOne => survivors
+                .iter()
+                .take(survivors.len().saturating_sub(1))
+                .cloned()
+                .collect(),
+            Removal::Everything => survivors.clone(),
+        };
+
+        if let Removal::Topic(index) = removal {
+            let answer = sns
+                .call("DeleteTopic", &[("TopicArn", &topics[*index])])
+                .await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: DeleteTopic expected 200, got {} / {}",
+                answer.status, answer.body
+            );
+        } else {
+            for listed in &doomed {
+                unsubscribe(&sns, case, &listed.subscription_arn).await;
+            }
+        }
+
+        // What must be left: the survivors of the last walk, minus what this row
+        // removed, in the order they already had.
+        let gone: HashSet<&String> = doomed
+            .iter()
+            .map(|listed| &listed.subscription_arn)
+            .collect();
+        let expected: Vec<Listed> = survivors
+            .iter()
+            .filter(|listed| !gone.contains(&listed.subscription_arn))
+            .cloned()
+            .collect();
+
+        let (walked, sizes) = walk(&sns, case).await;
+        assert_eq!(
+            walked, expected,
+            "case {case:?}: the pages must report the surviving subscriptions in the \
+             order they had, got {walked:?}"
+        );
+        let distinct: HashSet<&String> = walked
+            .iter()
+            .map(|listed| &listed.subscription_arn)
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            expected.len(),
+            "case {case:?}: the pages must report each subscription exactly once, got {} \
+             distinct of {}",
+            distinct.len(),
+            walked.len()
+        );
+        assert_eq!(
+            sizes.len(),
+            expected.len().div_ceil(PAGE_SIZE).max(1),
+            "case {case:?}: {} subscriptions at {PAGE_SIZE} a page is {} page(s), got {sizes:?}",
+            expected.len(),
+            expected.len().div_ceil(PAGE_SIZE).max(1)
+        );
+
+        // Walking the pages changed nothing a later caller sees.
+        let (again, sizes_again) = walk(&sns, case).await;
+        assert_eq!(
+            (&again, &sizes_again),
+            (&walked, &sizes),
+            "case {case:?}: a walk must not change what the next one reports, got {again:?}"
+        );
+
+        survivors = walked;
+    }
+
+    assert!(
+        survivors.is_empty(),
+        "the last row removes everything, so the listing must end empty, got {survivors:?}"
+    );
 }
