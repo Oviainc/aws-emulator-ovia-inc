@@ -183,11 +183,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        // The clock-owed transitions are materialised FIRST, so a job whose completion
-        // was already due is deleted rather than refused for a status it had left.
-        let Some(record) = store
-            .transcription_jobs
-            .get_mut(&region, &input.transcription_job_name)
+        // The lookup materialises the clock-owed transitions FIRST, so a job whose
+        // completion was already due is deleted rather than refused for a status it
+        // had left.
+        let Some(record) =
+            store.transcription_job_mut(&region, &input.transcription_job_name, now)
         else {
             return Err(DeleteTranscriptionJobErrorModeled::BadRequestException(
                 BadRequestException {
@@ -196,7 +196,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        record.advance_clock(now);
 
         // "Your request didn't pass one or more validation tests. This can occur when
         // the entity you're trying to delete doesn't exist or if it's in a non-terminal

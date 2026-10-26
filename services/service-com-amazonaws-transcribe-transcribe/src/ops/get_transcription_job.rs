@@ -170,9 +170,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        let Some(record) = store
-            .transcription_jobs
-            .get_mut(&region, &input.transcription_job_name)
+        // Reporting only: the lookup's sole write is the status transition the clock
+        // already owed this job, which was due at its stored instant whether or not
+        // anybody called.
+        let Some(record) =
+            store.transcription_job_mut(&region, &input.transcription_job_name, now)
         else {
             return Err(GetTranscriptionJobErrorModeled::BadRequestException(
                 BadRequestException {
@@ -188,11 +190,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-
-        // Reporting only: the sole write is the status transition the clock already
-        // owed this job, which was due at its stored instant whether or not anybody
-        // called.
-        record.advance_clock(now);
 
         Ok(GetTranscriptionJobOutput {
             transcription_job: Some(record.to_job()),

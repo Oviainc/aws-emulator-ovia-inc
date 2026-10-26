@@ -97,6 +97,8 @@ mod transcription_job_language_identification;
 mod transcription_job_redacted_output;
 #[path = "all/transcription_job_request_rules.rs"]
 mod transcription_job_request_rules;
+#[path = "all/transcription_job_single_lookup.rs"]
+mod transcription_job_single_lookup;
 #[path = "all/transcription_jobs.rs"]
 mod transcription_jobs;
 #[path = "all/vocabularies.rs"]

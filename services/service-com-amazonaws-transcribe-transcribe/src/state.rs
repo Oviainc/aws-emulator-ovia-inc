@@ -1330,6 +1330,25 @@ impl ComAmazonawsTranscribeTranscribeState {
         self.next_sequence
     }
 
+    /// The transcription job named `name`, with every clock-owed transition of it
+    /// already materialised, or `None` when that Region has started no such job.
+    ///
+    /// The single lookup for this family, so every operation that reads or deletes a
+    /// transcription job sees the same status: the one the clock already owed it. The
+    /// transitions are materialised FIRST, before the caller decides anything from the
+    /// status, so a job whose completion was already due is reported — and deleted —
+    /// as completed rather than as the status it had left.
+    pub fn transcription_job_mut(
+        &mut self,
+        region: &str,
+        name: &str,
+        now: SystemTime,
+    ) -> Option<&mut TranscriptionJobRecord> {
+        let record = self.transcription_jobs.get_mut(region, name)?;
+        record.advance_clock(now);
+        Some(record)
+    }
+
     /// Materialise every clock-owed status transition of the jobs `region` holds, then
     /// those jobs newest first — the order `ListTranscriptionJobs` documents ("Jobs are
     /// ordered by creation date, with the newest job first").
