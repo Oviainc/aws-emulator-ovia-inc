@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the tags of a feed or a dictionary: tags are a property of the RESOURCE,
+//! stored on the ONE record every other handler of this service reads, so the map this
+//! operation answers with is the map `TagResource` merged into and `UntagResource`
+//! deleted from, and the same map `GetFeed`/`GetDictionary` report. The operation is
+//! `@readonly`, so it writes nothing of its own: a resource that carries no tag reports
+//! an EMPTY map (the tag set is a property every resource HAS), and the member does not
+//! start existing the moment the first tag is added.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The one thing it refuses is a `resourceArn` that is not the ARN a stored resource of
+//! the request's Region carries, since the tags it lists are those of a resource "in the
+//! current region" — reached through the same resolution `TagResource` and
+//! `UntagResource` use
+//! ([`crate::state::ComAmazonawsElementalinferenceElementalinferenceState::tagged_resource`]),
+//! so the reporting and the writing paths cannot disagree about what an ARN names. That
+//! refusal is a 404 carrying the error code `NotFoundException` and this route's own
+//! not-found sentence — RECORDED behaviour this route does not share with the id-based
+//! operations, see [`NotFoundException`]. A resource whose deletion has been ACCEPTED is
+//! still a resource this store holds, so its tags are still reported, right up to the
+//! instant its removal falls due and the record — tags and all — leaves the store.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +86,13 @@
 //! * `ValidationException` (HTTP 400) — The input fails to satisfy the constraints specified
 //!   by the service. Check the error message for details about which parameter or field is
 //!   invalid and correct the request before retrying.
+//!
+//! ## Beside the model
+//!
+//! The recorded refusal of this route's `resourceArn` lookup carries the error code
+//! `NotFoundException` and its own sentence, which the model declares on no shape,
+//! rather than the modelled `ResourceNotFoundException` the id-based operations answer
+//! with. See [`NotFoundException`] and [`NOT_FOUND_MESSAGE`].
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -101,18 +118,171 @@ pub enum ListTagsForResourceErrorModeled {
     ValidationException(ValidationException),
 }
 
+/// The `message` member of the [`NotFoundException`] this operation answers for an ARN
+/// that names no resource of the current Region.
+static NOT_FOUND_MESSAGE_MEMBER: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "smithy.framework#NotFoundException$message",
+            "smithy.framework",
+            "message",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "message",
+        0,
+    );
+
+/// Schema for the [`NotFoundException`] this operation's resource lookup answers with.
+///
+/// RECORDED behaviour, not modelled: no shape of this name is in the model
+/// (`smithy_query(query="shape",shape="NotFoundException")` finds none) — the recorded
+/// refusal of THIS operation's `resourceArn` lookup carries the error code
+/// `NotFoundException`, while the id-based control-plane operations of the service carry
+/// the modelled `ResourceNotFoundException`, so the tag-reporting route is answered with
+/// the code a client of it really sees. Deliberately in the `smithy.framework`
+/// namespace, as `crate::scaffolded`'s synthetic shapes are, so it cannot collide with a
+/// modelled shape; the wire `__type` and the `x-amzn-errortype` header come from
+/// [`ListTagsForResourceError::shape_name`], not from here.
+pub static NOT_FOUND_EXCEPTION_SCHEMA: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "smithy.framework#NotFoundException",
+            "smithy.framework",
+            "NotFoundException",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&NOT_FOUND_MESSAGE_MEMBER],
+    );
+
+/// The sentence a not-found refusal of this route carries.
+///
+/// RECORDED behaviour: this route's refusal words the rule as its own error class does
+/// ("Resource was not found"), where the id-based operations render
+/// [`crate::state::NOT_FOUND_MESSAGE`]. One fixed text, the same whichever ARN was
+/// presented, so the refusal reports no value of the request — as every not-found of
+/// this service does.
+pub const NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The refusal an ARN that names no resource of the current Region earns, carrying this
+/// route's own not-found sentence ([`NOT_FOUND_MESSAGE`]).
+#[derive(Debug, Clone)]
+pub struct NotFoundException {
+    pub message: String,
+}
+
+/// The HTTP status a not-found refusal of this operation carries.
+const NOT_FOUND_STATUS: u16 = 404;
+
+impl ::std::fmt::Display for NotFoundException {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        write!(f, "NotFoundException: {}", self.message)
+    }
+}
+
+impl ::std::error::Error for NotFoundException {}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for NotFoundException {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        serializer.write_string(&NOT_FOUND_MESSAGE_MEMBER, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::list_tags_for_resource::ListTagsForResourceError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type ListTagsForResourceError = crate::scaffolded::Scaffolded<ListTagsForResourceErrorModeled>;
+/// (`crate::ops::list_tags_for_resource::ListTagsForResourceError`).
+///
+/// Two channels, not one: the scaffold wrapper (this operation's modelled errors, plus
+/// the `ValidationException` a handler needs for a refusal its model cannot express),
+/// and this route's own [`NotFoundException`], which the model declares on no shape.
+#[derive(Debug)]
+pub enum ListTagsForResourceError {
+    /// A modelled error, or a refusal the scaffold channel words.
+    Scaffolded(crate::scaffolded::Scaffolded<ListTagsForResourceErrorModeled>),
+    /// The refusal of an ARN that names no resource of the current Region.
+    NotFound(NotFoundException),
+}
+
+impl ::std::fmt::Display for ListTagsForResourceError {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match self {
+            Self::Scaffolded(error) => write!(f, "{error}"),
+            Self::NotFound(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl ::std::error::Error for ListTagsForResourceError {
+    fn source(&self) -> Option<&(dyn ::std::error::Error + 'static)> {
+        match self {
+            Self::Scaffolded(error) => error.source(),
+            Self::NotFound(error) => error.source(),
+        }
+    }
+}
+
+/// Every method delegates to the channel the active variant belongs to, so the scaffold
+/// wrapper keeps rendering exactly as it does for every other operation and only this
+/// route's own variant answers its own code and status.
+impl smithy_server_runtime::OperationError for ListTagsForResourceError {
+    fn as_serializable(&self) -> &dyn ::aws_smithy_schema::serde::SerializableStruct {
+        match self {
+            Self::Scaffolded(error) => error.as_serializable(),
+            Self::NotFound(error) => error,
+        }
+    }
+
+    fn variant_schema(&self) -> &'static ::aws_smithy_schema::Schema {
+        match self {
+            Self::Scaffolded(error) => error.variant_schema(),
+            Self::NotFound(_) => &NOT_FOUND_EXCEPTION_SCHEMA,
+        }
+    }
+
+    /// The wire error code (`__type`, and the `x-amzn-errortype` header restJson1
+    /// resolves an error shape from). Keep the literal as it is: it is what a client
+    /// branches on.
+    fn shape_name(&self) -> &'static str {
+        match self {
+            Self::Scaffolded(error) => error.shape_name(),
+            Self::NotFound(_) => "NotFoundException",
+        }
+    }
+
+    fn http_status(&self) -> u16 {
+        match self {
+            Self::Scaffolded(error) => error.http_status(),
+            Self::NotFound(_) => NOT_FOUND_STATUS,
+        }
+    }
+
+    fn query_error_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Scaffolded(error) => error.query_error_code(),
+            // No `awsQueryError` trait to honour: the shape is in no model, and this
+            // service speaks restJson1 in any case.
+            Self::NotFound(_) => None,
+        }
+    }
+}
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// wrapper variant.
 impl From<ListTagsForResourceErrorModeled> for ListTagsForResourceError {
     fn from(modeled: ListTagsForResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Scaffolded(crate::scaffolded::Scaffolded::Modeled(modeled))
+    }
+}
+
+/// The same for a refusal the scaffold channel words (`Scaffolded::validation`).
+impl From<crate::scaffolded::Scaffolded<ListTagsForResourceErrorModeled>>
+    for ListTagsForResourceError
+{
+    fn from(scaffolded: crate::scaffolded::Scaffolded<ListTagsForResourceErrorModeled>) -> Self {
+        Self::Scaffolded(scaffolded)
     }
 }
 
@@ -153,17 +323,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // request metadata: here the Region the request was signed for, which is the
+        // endpoint it reached and so the Region whose resources it may read.
+        let region = crate::state::request_region(ctx.parts());
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the com.amazonaws.elementalinference state store is unavailable"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut state = state.lock();
+        // The moves the clock already owed at this instant, applied as every handler of
+        // this service applies them: they were due whether or not anybody called, so a
+        // report that materialises them shows nothing a later caller would not have seen
+        // anyway, and in particular a resource whose removal has fallen due is gone, so
+        // its ARN names nothing here.
+        state.settle_due_transitions(std::time::Instant::now());
+
+        // The ARN names the resource WHOLE (kind, id, region and account), so anything
+        // that is not the ARN a stored record carries names no resource of this store,
+        // and the record it names has to be one of the CURRENT Region's, since the tags
+        // this endpoint lists are those of a resource of its own Region.
+        let Some(resource) = state.tagged_resource(&region, &input.resource_arn) else {
+            return Err(ListTagsForResourceError::NotFound(NotFoundException {
+                message: NOT_FOUND_MESSAGE.to_string(),
+            }));
+        };
+
+        // The tag set is a property every resource HAS, so it is reported as a map even
+        // when the resource carries no tag.
+        Ok(ListTagsForResourceOutput {
+            tags: Some(resource.tag_map()),
+        })
     }
 }

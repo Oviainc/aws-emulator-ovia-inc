@@ -1247,10 +1247,7 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
         region: &str,
         resource_arn: &str,
     ) -> Option<TaggedResourceMut<'_>> {
-        // `arn:<partition>:<service>:<region>:<account>:<kind>/<id>` — field 5 is the
-        // resource segment, which the modelled `resourceArn` pattern spells
-        // `(feed|dictionary)/[a-zA-Z0-9]{1,19}`.
-        let (kind, id) = resource_arn.split(':').nth(5)?.split_once('/')?;
+        let (kind, id) = arn_kind_and_id(resource_arn)?;
         match kind {
             "feed" => self
                 .feed_mut(region, id)
@@ -1260,6 +1257,31 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
                 .dictionary_mut(region, id)
                 .filter(|dictionary| dictionary.arn == resource_arn)
                 .map(TaggedResourceMut::Dictionary),
+            _ => None,
+        }
+    }
+
+    /// The resource a `resourceArn` names IN `region`, for a caller that only READS it —
+    /// the reporting half of [`Self::tagged_resource_mut`], resolved by exactly the same
+    /// rule and through the same ARN parse, so the reporting and the mutating tagging
+    /// paths cannot disagree about what an ARN names.
+    ///
+    /// A record whose deletion has been ACCEPTED is still a resource this store holds
+    /// and so still resolves here: it is a mutation of it that is refused, not a report
+    /// of it, exactly as [`Self::feed`] and [`Self::dictionary`] still answer for one.
+    /// One whose deletion has COMPLETED is gone from the store and so resolves to
+    /// nothing.
+    pub fn tagged_resource(&self, region: &str, resource_arn: &str) -> Option<TaggedResource<'_>> {
+        let (kind, id) = arn_kind_and_id(resource_arn)?;
+        match kind {
+            "feed" => self
+                .feed(region, id)
+                .filter(|feed| feed.arn == resource_arn)
+                .map(TaggedResource::Feed),
+            "dictionary" => self
+                .dictionary(region, id)
+                .filter(|dictionary| dictionary.arn == resource_arn)
+                .map(TaggedResource::Dictionary),
             _ => None,
         }
     }
@@ -1417,6 +1439,47 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
                     .filter_map(|dictionary| dictionary.transition_due_at),
             )
             .min();
+    }
+}
+
+/// The resource KIND and id a `resourceArn` names, or `None` when the value carries no
+/// resource segment of the form a resource of this service has.
+///
+/// `arn:<partition>:<service>:<region>:<account>:<kind>/<id>` — field 5 is the resource
+/// segment, which the modelled `resourceArn` pattern spells
+/// `(feed|dictionary)/[a-zA-Z0-9]{1,19}`. One parse shared by every ARN-based lookup of
+/// this store ([`ComAmazonawsElementalinferenceElementalinferenceState::tagged_resource`],
+/// [`ComAmazonawsElementalinferenceElementalinferenceState::tagged_resource_mut`]), so
+/// reading and writing a resource's tags read the same fields out of the same ARN.
+fn arn_kind_and_id(resource_arn: &str) -> Option<(&str, &str)> {
+    resource_arn.split(':').nth(5)?.split_once('/')
+}
+
+/// A resource one of this service's tagging operations has reached by its
+/// `resourceArn`, borrowed out of the store it lives in
+/// ([`ComAmazonawsElementalinferenceElementalinferenceState::tagged_resource`]), for a
+/// caller that only reports it.
+///
+/// The reporting half of [`TaggedResourceMut`]: tags are a property of the RESOURCE,
+/// stored on the one record every other handler reads ([`Feed::tags`],
+/// [`Dictionary::tags`]), so the tag set `ListTagsForResource` reports is the one
+/// `GetFeed`/`GetDictionary` report and `TagResource`/`UntagResource` wrote.
+#[derive(Debug)]
+pub enum TaggedResource<'a> {
+    Feed(&'a Feed),
+    Dictionary(&'a Dictionary),
+}
+
+impl TaggedResource<'_> {
+    /// The tags stored on this resource, as the `TagMap` a tagging response carries —
+    /// the same projection the resource's own reader reports ([`Feed::tag_map`],
+    /// [`Dictionary::tag_map`]), so an untagged resource reports an EMPTY map rather
+    /// than an absent member.
+    pub fn tag_map(&self) -> std::collections::HashMap<String, String> {
+        match self {
+            Self::Feed(feed) => feed.tag_map(),
+            Self::Dictionary(dictionary) => dictionary.tag_map(),
+        }
     }
 }
 

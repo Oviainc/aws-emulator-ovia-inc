@@ -77,5 +77,7 @@ mod response_members;
 mod state_roundtrip;
 #[path = "all/supplied_tag_validation.rs"]
 mod supplied_tag_validation;
+#[path = "all/tag_listing.rs"]
+mod tag_listing;
 #[path = "all/tagging_region_scope.rs"]
 mod tagging_region_scope;
