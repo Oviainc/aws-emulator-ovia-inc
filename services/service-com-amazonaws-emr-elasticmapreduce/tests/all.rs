@@ -27,6 +27,8 @@ mod job_flow_lifecycle;
 mod job_flow_role;
 #[path = "all/managed_scaling_policy.rs"]
 mod managed_scaling_policy;
+#[path = "all/modify_instance_groups.rs"]
+mod modify_instance_groups;
 #[path = "all/notebook_executions.rs"]
 mod notebook_executions;
 #[path = "all/persistent_app_ui.rs"]

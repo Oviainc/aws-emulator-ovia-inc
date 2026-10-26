@@ -8,6 +8,11 @@
 //! the only way a suite can observe a refusal the framework states BEFORE a handler runs
 //! (this service rewords those in `src/service/validation.rs`).
 //!
+//! A suite whose rule is about the CREDENTIAL a registration names takes its emulator
+//! from [`harness_with_secrets_manager`], which mounts Secrets Manager beside this service
+//! on the same engine — the way the assembled emulator runs them — because
+//! `RegisterSubscriptionProvider` reads the secret its `SecretArn` names by calling it.
+//!
 //! `allow(dead_code)`: this module is the vocabulary for every suite, so an individual
 //! suite uses only the part of it that its rules need.
 #![allow(dead_code)]
@@ -65,13 +70,77 @@ pub struct Harness {
 }
 
 pub fn harness() -> Harness {
+    build_harness(false)
+}
+
+/// One emulator with Secrets Manager mounted BESIDE this service on the same engine,
+/// exactly as the assembled emulator runs them, because `RegisterSubscriptionProvider`
+/// reads the secret its `SecretArn` names by calling Secrets Manager in process.
+pub fn harness_with_secrets_manager() -> Harness {
+    build_harness(true)
+}
+
+fn build_harness(with_secrets_manager: bool) -> Harness {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The tests sign nothing; authentication is the framework's concern, not this
     // service's.
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    if with_secrets_manager {
+        router.register_service(
+            service_com_amazonaws_secretsmanager_secretsmanager::EmulatedService::new(Arc::clone(
+                &engine,
+            )),
+        );
+    }
     Harness { router, engine }
+}
+
+/// Store a secret through the MOUNTED Secrets Manager service and answer the ARN it
+/// minted, so a `SecretArn` a case means to be real is one Secrets Manager can read.
+///
+/// `members` are the `CreateSecret` members past `Name`, so a case can store the secret's
+/// value as a `SecretString` or as a `SecretBinary`. Secrets Manager is `awsJson1_1`
+/// (`POST /` with `X-Amz-Target: secretsmanager.<Operation>`), which is a different wire
+/// protocol from this service's `restJson1` — hence its own request builder here.
+pub async fn create_secret(h: &Harness, name: &str, members: &Value) -> String {
+    let mut body = json!({ "Name": name });
+    for (member, value) in members
+        .as_object()
+        .expect("the CreateSecret members are a JSON object")
+    {
+        body[member] = value.clone();
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!(
+            "https://secretsmanager.{REGION}.amazonaws.com/"
+        ))
+        .header("content-type", "application/x-amz-json-1.1")
+        .header("x-amz-target", "secretsmanager.CreateSecret")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDTESTEXAMPLE/20260101/{REGION}/secretsmanager\
+                 /aws4_request, SignedHeaders=host;x-amz-target, Signature=0"
+            ),
+        )
+        .body(bytes::Bytes::from(
+            serde_json::to_vec(&body).expect("the CreateSecret body serializes"),
+        ))
+        .expect("a well-formed request");
+    let response = h.router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let reply: Value = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+    assert_eq!(
+        status, 200,
+        "CreateSecret must succeed so a case has a real secret, got {status} with {reply:?}"
+    );
+    reply["ARN"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateSecret reports the new secret's ARN, got {reply:?}"))
+        .to_string()
 }
 
 /// What a call answered: the HTTP status, the wire error code (if any) and the body.

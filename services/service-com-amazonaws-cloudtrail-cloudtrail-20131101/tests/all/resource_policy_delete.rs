@@ -18,9 +18,9 @@
 //!   (`ResourceARNNotValidException`), a resource type that carries no
 //!   resource-based policy (`ResourceTypeNotSupportedException`), or a supported
 //!   type naming nothing stored (`ResourceNotFoundException`), all HTTP 400;
-//! * detaching a policy WRITES to the resource, so a resource CloudTrail is still
-//!   loading refuses it with `ConflictException` (HTTP 409) until the clock settles
-//!   it;
+//! * detaching a policy WRITES to the resource, so a resource another operation is
+//!   modifying refuses it with `ConflictException` (HTTP 409), while the dashboard a
+//!   create has just returned is served;
 //! * a `ResourceArn` outside the modelled `@length`/`@pattern` is refused before the
 //!   handler runs.
 //!
@@ -30,7 +30,6 @@
 //! still scaffold stubs with issues of their own).
 
 use serde_json::{json, Value};
-use std::thread::sleep;
 
 use service_com_amazonaws_cloudtrail_cloudtrail_20131101::state::{self, ResourceKind};
 
@@ -169,13 +168,13 @@ async fn a_resource_carrying_no_policy_has_none_to_detach() {
     ];
 
     for (case, resource_arn) in &rows {
-        delete(&emulator, resource_arn)
-            .await
-            .expect_error(case, 404, "ResourcePolicyNotFoundException");
+        let refused = delete(&emulator, resource_arn).await;
+        refused.expect_error(case, 404, "ResourcePolicyNotFoundException");
         assert_eq!(
-            state::resource_policy_not_found_message(resource_arn),
-            format!("No resource policy is attached to {resource_arn}"),
-            "case {case:?}: the refusal names the resource it found no policy for"
+            refused.message(),
+            state::RESOURCE_POLICY_NOT_FOUND_MESSAGE,
+            "case {case:?}: the refusal is the one fixed sentence this surface answers a \
+             resource carrying no policy with, got {refused:?}"
         );
 
         let attached = document(case);
@@ -333,15 +332,14 @@ async fn an_arn_naming_no_policy_carrying_resource_is_refused_by_its_case() {
     );
 }
 
-/// RULE: detaching a policy WRITES to the resource, so a resource CloudTrail has not
-/// finished loading refuses it with `ConflictException` until the clock settles the
-/// resource — and the refusal is decided before the policy is looked up, so a
-/// resource still loading answers the conflict rather than a 404.
+/// RULE: the dashboard `CreateDashboard` has returned is ready, so detaching a policy
+/// from it is served the moment the create answers — `ConflictException` is left for a
+/// resource another operation is modifying.
 #[tokio::test]
-async fn detaching_from_a_resource_that_is_still_loading_is_refused() {
+async fn detaching_from_a_dashboard_the_create_just_returned_is_served() {
     let emulator = Emulator::new();
     let created = emulator
-        .call("CreateDashboard", &json!({"Name": "still-loading"}))
+        .call("CreateDashboard", &json!({"Name": "just-created"}))
         .await;
     let resource_arn = created
         .expect_ok("create a dashboard to detach from")
@@ -350,30 +348,37 @@ async fn detaching_from_a_resource_that_is_still_loading_is_refused() {
         .unwrap_or_else(|| panic!("CreateDashboard reported no ARN: {created:?}"))
         .to_string();
 
-    delete(&emulator, &resource_arn).await.expect_error(
-        "a dashboard still loading",
-        409,
-        "ConflictException",
+    // Nothing is attached yet, so the detach has none to take — the 404 of this
+    // surface, NOT a conflict about the dashboard.
+    let refused = delete(&emulator, &resource_arn).await;
+    refused.expect_error(
+        "a dashboard the create just returned",
+        404,
+        "ResourcePolicyNotFoundException",
+    );
+    assert_eq!(
+        refused.message(),
+        state::RESOURCE_POLICY_NOT_FOUND_MESSAGE,
+        "case {:?}: expected the fixed no-policy sentence, got {refused:?}",
+        "a dashboard the create just returned"
     );
 
-    // Once the load the clock owes is due, the same resource takes a policy and gives
-    // it up again.
-    sleep(state::DASHBOARD_SETTLE_AFTER + std::time::Duration::from_millis(250));
-    let attached = document("detached-after-the-load");
+    // And the same dashboard takes a policy and gives it up again, with no wait.
+    let attached = document("detached-right-after-the-create");
     expect_policy(
-        "the settled dashboard",
+        "the dashboard the create just returned",
         &put(&emulator, &resource_arn, &attached).await,
         &resource_arn,
         &attached,
     );
     delete(&emulator, &resource_arn)
         .await
-        .expect_ok("detach from the settled dashboard");
+        .expect_ok("detach from the dashboard the create just returned");
     assert_eq!(
         stored_policy(&emulator, &resource_arn),
         None,
-        "case {:?}: the settled dashboard must carry no policy after the detach",
-        "the settled dashboard"
+        "case {:?}: the dashboard must carry no policy after the detach",
+        "the dashboard the create just returned"
     );
 }
 

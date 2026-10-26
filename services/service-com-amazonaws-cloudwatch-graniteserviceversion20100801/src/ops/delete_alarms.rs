@@ -108,6 +108,13 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteAlarmsOutput {
 // `InternalServiceFault` is widened in: it is THIS service's own server fault (every
 // metric operation declares it), and it is the only honest answer when the shared store
 // cannot be reached. Reporting that as a 4xx would tell the caller to fix its request.
+//
+// Neither modelled 4xx is answered by the handler below. A name this account holds no
+// alarm for deletes nothing and is a clean success, so there is no not-found to report;
+// and a request this operation refuses because the alarms it names cannot be deleted
+// together, or because a composite alarm would be left referencing a deleted child, is
+// refused with the service's own `ValidationError` (HTTP 400) — the code a CloudWatch
+// client branches on for a request whose parameters do not hold together.
 #[smithy_macros::operation_error(
     "com.amazonaws.cloudwatch#DeleteAlarms",
     extra_errors = ["InternalServiceFault"]
@@ -212,10 +219,9 @@ fn delete_named_alarms(
     composites.sort_unstable();
     composites.dedup();
     if composites.len() > 1 {
-        return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-            "AlarmNames names {} composite alarms, and one call can delete no more than one",
-            composites.len()
-        )));
+        return Err(crate::scaffolded::Scaffolded::validation_error(
+            "only one composite alarm delete is allowed per API call",
+        ));
     }
     // "Log alarms cannot be batch deleted." — a call that deletes a log alarm deletes that
     // alarm and nothing else, so one naming a log alarm beside any other alarm is refused
@@ -236,41 +242,48 @@ fn delete_named_alarms(
     }
     // "you can't delete any composite alarm that is part of [a cycle] because there is
     // always still a composite alarm that depends on that alarm that you want to delete"
-    // — generally: a composite alarm another composite alarm's `AlarmRule` references
-    // cannot be deleted while that reference stands. Only one composite alarm can be
-    // deleted per call, so a parent is never deleted by the same call.
-    if let Some(name) = composites.first() {
-        let parents = store.composite_alarm_parents(name.as_str());
-        if !parents.is_empty() {
-            return Err(DeleteAlarmsErrorModeled::ResourceConflict(ResourceConflict {
-                message: Some(format!(
-                    "composite alarm {name} is referenced by the AlarmRule of {}",
-                    parents.join(", ")
-                )),
-            })
-            .into());
+    // — generally: an alarm of ANY kind that a composite alarm this call leaves standing
+    // references, through its `AlarmRule` or as its `ActionsSuppressor`, cannot be deleted
+    // while that reference stands, because the composite alarm would be left evaluating a
+    // child that no longer exists. A composite alarm the same call removes takes its
+    // references with it, so it holds nothing back.
+    //
+    // Checked before anything is removed, so a refused request leaves the store exactly as
+    // it was.
+    let deleting: std::collections::HashSet<&str> =
+        named.iter().map(|name| name.as_str()).collect();
+    for name in &named {
+        // A name this store holds no alarm for removes nothing, so no reference to it can
+        // come to dangle through this call.
+        if store.alarm_kind(name).is_none() {
+            continue;
+        }
+        let held_back = store
+            .composite_alarm_referrers(name)
+            .into_iter()
+            .any(|parent| !deleting.contains(parent.as_str()));
+        if held_back {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "Cannot delete {name} as there are composite alarm(s) depending on it."
+            )));
         }
     }
 
     // "If you specify any incorrect alarm names, the alarms you specify with correct
-    // names are still deleted." (DeleteAlarms documentation) — so the names that do
-    // exist are removed, and the call still reports the ones that did not with the
-    // modelled `ResourceNotFound`.
+    // names are still deleted." (`DeleteAlarms` documentation) — and a name this store
+    // holds no alarm for is already in the state the request asks for, so it is deleted
+    // from nothing and reported as nothing: the call is a no-op success for it, which is
+    // what makes a retried or repeated teardown succeed.
     //
     // The alarm's HISTORY is deliberately left in place: "CloudWatch retains the
     // history of an alarm even if you delete the alarm" (`DescribeAlarmHistory`
     // documentation), so only the 14-day retention window ever removes it.
     // A name the request repeats names ONE alarm, so the deduplicated list is what is
-    // walked: deleting from the raw list would find the second mention of a name already
-    // removed by the first and report an alarm that did exist as missing.
-    let mut missing: Vec<&str> = Vec::new();
+    // walked.
     for name in &named {
-        let removed = store.alarms.remove(name.as_str()).is_some()
-            || store.composite_alarms.remove(name.as_str()).is_some()
-            || store.log_alarms.remove(name.as_str()).is_some();
-        if !removed {
-            missing.push(name.as_str());
-        }
+        store.alarms.remove(name.as_str());
+        store.composite_alarms.remove(name.as_str());
+        store.log_alarms.remove(name.as_str());
     }
     // A deleted alarm is an input every composite alarm whose rule references it loses,
     // so the alarms downstream of this call are evaluated before it returns.
@@ -281,13 +294,5 @@ fn delete_named_alarms(
         now,
         &mut crate::state::alarm_evaluation::EvaluationBudget::for_one_request(),
     );
-    missing.sort_unstable();
-    missing.dedup();
-    if !missing.is_empty() {
-        return Err(DeleteAlarmsErrorModeled::ResourceNotFound(ResourceNotFound {
-            message: Some(format!("no alarm named {}", missing.join(", "))),
-        })
-        .into());
-    }
     Ok(())
 }

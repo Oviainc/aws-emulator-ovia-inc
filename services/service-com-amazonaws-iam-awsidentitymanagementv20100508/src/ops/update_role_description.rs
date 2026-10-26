@@ -158,49 +158,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store alone: a name only `crate::state::service_provisioned_role` resolves is
         // still "a resource entity that does not exist" here, as that function's own
         // documentation records.
-        let key = crate::state::name_key(&input.role_name);
-        let Some(role) = store.roles.get(&key) else {
-            return Err(UpdateRoleDescriptionErrorModeled::NoSuchEntityException(
-                NoSuchEntityException {
-                    message: Some(format!(
-                        "The role with name {} cannot be found.",
-                        input.role_name
-                    )),
-                },
-            )
-            .into());
-        };
-        let role_name = role.role_name.clone();
-        // Which service a role is linked to is carried by its path, read through the
-        // one definition of that rule in `crate::state`.
-        let linked_service =
-            crate::state::service_linked_role_principal(&role.path).map(str::to_string);
-
-        // "Service-linked roles are protected Amazon Web Services resources. Only the
-        // service that depends on the service-linked role can modify or delete the role
-        // on your behalf", so a caller's description change is refused with the modelled
-        // `UnmodifiableEntityException`, whose documentation says the message "includes
-        // the name of the service that depends on this service-linked role".
-        if let Some(linked_service) = linked_service {
-            return Err(
-                UpdateRoleDescriptionErrorModeled::UnmodifiableEntityException(
-                    UnmodifiableEntityException {
-                        message: Some(format!(
-                            "Service role {role_name} cannot be modified: it is a \
-                             service-linked role, so the change must be requested through \
-                             {linked_service}"
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-
+        //
         // "Modifies only the description of a role": the new description REPLACES the
         // one the role held, spelled exactly as the request sent it, and no other member
         // of the record is touched. The response then "contains details about the
         // modified role" — the stored record as it now stands, the same view `GetRole`
         // reports.
+        //
+        // A description belongs to the account's own record of the role rather than to
+        // its permissions or its trust relationship, so a role a service links itself to
+        // is updated here like any other: the protected-entity refusal this operation
+        // also models guards the calls that change such a role's trust policy, its
+        // attached or inline permissions, or its existence (`UpdateAssumeRolePolicy`,
+        // `AttachRolePolicy`, `PutRolePolicy`, `DeleteRole`), not this setting. This
+        // operation "performs the same function as the Description parameter in the
+        // UpdateRole operation", which serves such a role for the same reason.
+        let key = crate::state::name_key(&input.role_name);
         let Some(role) = store.roles.get_mut(&key) else {
             return Err(UpdateRoleDescriptionErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {

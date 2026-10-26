@@ -21,11 +21,12 @@ use ::aws_smithy_schema_server::constraints::{validate, LengthTrait, PatternTrai
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    AutoParticipantRecordingConfiguration, Composition, ConflictException,
+    AutoParticipantRecordingConfiguration, Composition, CompositionSummary, ConflictException,
     CreateIngestConfigurationOutput, Destination, DestinationConfiguration, DestinationDetail,
-    EncoderConfiguration, Event, GridConfiguration, IngestConfiguration, InternalServerException,
-    LayoutConfiguration, Participant, ParticipantRecordingHlsConfiguration, ParticipantReplica,
-    ParticipantSummary, ParticipantThumbnailConfiguration, ParticipantToken, PipConfiguration,
+    DestinationSummary, EncoderConfiguration, Event, GridConfiguration, IngestConfiguration,
+    InternalServerException, LayoutConfiguration, Participant,
+    ParticipantRecordingHlsConfiguration, ParticipantReplica, ParticipantSummary,
+    ParticipantThumbnailConfiguration, ParticipantToken, PipConfiguration,
     RedundantIngestCredential, ResourceNotFoundException, S3StorageConfiguration,
     ServiceQuotaExceededException, Stage, StageEndpoints, StageSession, StageSessionSummary,
     StageSummary,
@@ -732,6 +733,12 @@ pub const DEFAULT_OMIT_STOPPED_VIDEO: bool = false;
 /// `ServiceQuotaExceededException` (HTTP 402).
 pub const MAX_COMPOSITIONS: usize = 1_000;
 
+/// Page size `ListCompositions` uses when the request omits `maxResults`.
+///
+/// The model documents it on `ListCompositionsRequest$maxResults`: "Maximum number of
+/// results to return. Default: 100."
+pub const DEFAULT_COMPOSITION_PAGE_SIZE: usize = 100;
+
 /// Characters in a minted composition id. The model's `CompositionArn` pattern allows
 /// `[a-zA-Z0-9-]+` after `composition/`, and caps the whole ARN at 128 characters.
 pub const COMPOSITION_ID_LEN: usize = 12;
@@ -859,6 +866,10 @@ const STAGE_SESSION_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-stage-session-after:
 /// The same marker for a `ListParticipantEvents` page, kept distinct from the others so
 /// a token issued by one listing names no position in another and is refused there.
 const PARTICIPANT_EVENT_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-participant-event-after:";
+
+/// The same marker for a `ListCompositions` page, kept distinct from the others so a
+/// token issued by one listing names no position in another and is refused there.
+const COMPOSITION_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-composition-after:";
 
 /// One stage, as `CreateStage` persisted it and `GetStage` / `ListStages` report it.
 #[derive(Debug, Clone)]
@@ -1222,6 +1233,29 @@ impl DestinationRecord {
         channel_reference || s3_reference
     }
 
+    /// Whether this destination has the ENCODER configuration `arn` attached: the
+    /// encoder configuration of a channel destination
+    /// (`ChannelDestinationConfiguration$encoderConfigurationArn`) or one of those of an
+    /// S3 one (`S3DestinationConfiguration$encoderConfigurationArns`).
+    ///
+    /// Narrower than [`Self::references`], which answers "does this destination name that
+    /// resource at all" for any resource of this store, a storage configuration included:
+    /// `ListCompositions`' `filterByEncoderConfigurationArn` selects on the encoder
+    /// configuration alone.
+    pub fn references_encoder_configuration(&self, arn: &str) -> bool {
+        let channel_reference = self
+            .configuration
+            .channel
+            .as_ref()
+            .is_some_and(|channel| channel.encoder_configuration_arn.as_deref() == Some(arn));
+        let s3_reference = self.configuration.s3.as_ref().is_some_and(|s3| {
+            s3.encoder_configuration_arns
+                .iter()
+                .any(|encoder_configuration_arn| encoder_configuration_arn == arn)
+        });
+        channel_reference || s3_reference
+    }
+
     /// The modelled `Destination` this record reports.
     pub fn to_destination(&self) -> Destination {
         Destination {
@@ -1231,6 +1265,23 @@ impl DestinationRecord {
             end_time: self.ended_at.map(::aws_smithy_types::DateTime::from),
             configuration: self.configuration.clone(),
             detail: self.detail.clone(),
+        }
+    }
+
+    /// The modelled `DestinationSummary` a `ListCompositions` page reports this
+    /// destination as.
+    ///
+    /// `DestinationSummary` carries the four members `Destination` carries besides the
+    /// configuration and the detail
+    /// (`smithy_query(query="shape",shape="Destination,DestinationSummary")`), each read
+    /// off the same field [`Self::to_destination`] reports it from, so a summary and a
+    /// read answer alike.
+    pub fn to_summary(&self) -> DestinationSummary {
+        DestinationSummary {
+            id: self.id.clone(),
+            state: self.state.clone(),
+            start_time: Some(::aws_smithy_types::DateTime::from(self.started_at)),
+            end_time: self.ended_at.map(::aws_smithy_types::DateTime::from),
         }
     }
 }
@@ -1359,6 +1410,43 @@ impl CompositionRecord {
             // Always reported, empty map included: `tags` is how a caller reads the
             // tags back, and an absent member is not the same answer as "none" — the
             // same rule [`StageRecord::to_stage`] follows.
+            tags: Some(self.tags.clone()),
+            start_time: Some(::aws_smithy_types::DateTime::from(self.started_at)),
+            end_time: self.ended_at.map(::aws_smithy_types::DateTime::from),
+        }
+    }
+
+    /// Whether any destination of this composition has the encoder configuration `arn`
+    /// attached — see [`DestinationRecord::references_encoder_configuration`].
+    ///
+    /// `ListCompositionsRequest$filterByEncoderConfigurationArn` filters the list "to
+    /// match the specified EncoderConfiguration attached to at least one of its output",
+    /// which is exactly this question.
+    pub fn uses_encoder_configuration(&self, arn: &str) -> bool {
+        self.destinations
+            .iter()
+            .any(|destination| destination.references_encoder_configuration(arn))
+    }
+
+    /// The modelled `CompositionSummary` this record reports in a `ListCompositions`
+    /// page.
+    ///
+    /// `CompositionSummary` carries the same members as `Composition` except the layout
+    /// and the per-destination configuration and detail
+    /// (`smithy_query(query="shape",shape="Composition,CompositionSummary")`), so a
+    /// summary and a read answer alike member for member on everything both carry.
+    pub fn to_summary(&self) -> CompositionSummary {
+        CompositionSummary {
+            arn: self.arn.clone(),
+            stage_arn: self.stage_arn.clone(),
+            destinations: self
+                .destinations
+                .iter()
+                .map(DestinationRecord::to_summary)
+                .collect(),
+            state: self.state.clone(),
+            // Always reported, empty map included, the way [`Self::to_composition`]
+            // reports it.
             tags: Some(self.tags.clone()),
             start_time: Some(::aws_smithy_types::DateTime::from(self.started_at)),
             end_time: self.ended_at.map(::aws_smithy_types::DateTime::from),
@@ -2862,6 +2950,15 @@ impl ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
         stages
     }
 
+    /// Every composition in start order — the order `ListCompositions` pages over, so a
+    /// composition starting or being reclaimed mid-pagination cannot shift a later page
+    /// onto an already-returned one.
+    pub fn compositions_in_order(&self) -> Vec<&CompositionRecord> {
+        let mut compositions: Vec<&CompositionRecord> = self.compositions.values().collect();
+        compositions.sort_by_key(|record| record.sequence);
+        compositions
+    }
+
     /// Every storage configuration in creation order — the order
     /// `ListStorageConfigurations` pages over.
     pub fn storage_configurations_in_order(&self) -> Vec<&StorageConfigurationRecord> {
@@ -3699,6 +3796,19 @@ pub fn encode_storage_configuration_page_token(after_sequence: u64) -> String {
 /// token from another listing included.
 pub fn decode_storage_configuration_page_token(token: &str) -> Option<u64> {
     decode_after(STORAGE_CONFIGURATION_PAGE_TOKEN_PREFIX, token)
+}
+
+/// [`encode_page_token`] for a `ListCompositions` page: the start sequence the next page
+/// of compositions resumes after, under that listing's own marker.
+pub fn encode_composition_page_token(after_sequence: u64) -> String {
+    encode_after(COMPOSITION_PAGE_TOKEN_PREFIX, after_sequence)
+}
+
+/// The start sequence a composition `nextToken` resumes after, or `None` when the token
+/// was not issued by [`encode_composition_page_token`] — a token from another listing
+/// included.
+pub fn decode_composition_page_token(token: &str) -> Option<u64> {
+    decode_after(COMPOSITION_PAGE_TOKEN_PREFIX, token)
 }
 
 /// The one page-token codec, so the listings cannot encode a position two ways.

@@ -24,7 +24,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_groundstation_groundstation::state::{
     parse_approved_uplink_bands, service_state, BAD_REQUEST_ERROR_CODE, INVALID_REQUEST_BODY,
-    RECORDING_BUCKET_DOES_NOT_EXIST, UNAPPROVED_UPLINK_FREQUENCY,
+    UNAPPROVED_UPLINK_FREQUENCY, UNRESOLVABLE_RECORDING_BUCKET,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -998,7 +998,7 @@ async fn an_arn_that_names_no_bucket_is_refused_without_resolving_anything() {
         );
         assert_eq!(
             reply.string("message"),
-            RECORDING_BUCKET_DOES_NOT_EXIST,
+            UNRESOLVABLE_RECORDING_BUCKET,
             "case {label}: wrong refusal text, got {}",
             reply.body
         );

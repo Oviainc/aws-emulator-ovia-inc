@@ -22,10 +22,13 @@
 //! 6. a map-value constraint is stated against the map, echoing every entry and listing
 //!    the value shape's whole constraint set;
 //! 7. an enum value set is listed in the order the service declares the enum;
-//! 8. a `@pattern` is reported WITHOUT the `^`/`$` anchors the model spells it with.
+//! 8. a `@pattern` is reported WITHOUT the `^`/`$` anchors the model spells it with;
+//! 9. a value outside the TRAINING instance types is told the condition it failed instead
+//!    of being handed that value set, wherever the member sits.
 
 use serde_json::{json, Map, Value};
 
+use crate::hyperparameter_tuning_job::valid_body as tuning_body;
 use crate::inference_deployment_lifecycle::{
     error_code, message, one_variant_config, primary_container, str_field, Emulator, ACCOUNT,
 };
@@ -119,6 +122,30 @@ fn training_body(name: &str, input_uri: &str) -> Value {
             "VolumeSizeInGB": 10,
         },
         "StoppingCondition": { "MaxRuntimeInSeconds": 3600 },
+    })
+}
+
+/// [`training_body`] with `resources` as its `ResourceConfig`, so a row varies the ML
+/// compute resources of an otherwise valid request.
+fn training_resources(name: &str, resources: Value) -> Value {
+    let mut body = training_body(name, "s3://demo-bucket/train/");
+    body["ResourceConfig"] = resources;
+    body
+}
+
+/// A `CreateAlgorithm` body whose `TrainingSpecification` supports `instance_types`.
+fn algorithm_body(name: &str, instance_types: Value) -> Value {
+    json!({
+        "AlgorithmName": name,
+        "TrainingSpecification": {
+            "TrainingImage": format!("{ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com/trainer:1"),
+            "SupportedTrainingInstanceTypes": instance_types,
+            "TrainingChannels": [{
+                "Name": "train",
+                "SupportedContentTypes": ["text/csv"],
+                "SupportedInputModes": ["File"],
+            }],
+        },
     })
 }
 
@@ -778,4 +805,137 @@ async fn a_reported_pattern_carries_no_anchors() {
             message(&refused)
         );
     }
+}
+
+/// RULE: a value outside the TRAINING instance types is refused with the CONDITION it
+/// failed — `Member must be a supported instance type` — rather than with the value set
+/// that would satisfy it, for every member targeting that set and wherever in the request
+/// it sits; every OTHER value set of this service is still listed in full, the hosting
+/// instance types among them.
+#[tokio::test]
+async fn a_training_instance_type_outside_the_set_states_the_condition_it_failed() {
+    let requirement = "Member must be a supported instance type";
+
+    // A `ResourceConfig` naming `instance_type`, with the other members the model allows
+    // beside it.
+    let resources = |instance_type: &str| {
+        json!({ "InstanceType": instance_type, "InstanceCount": 1, "VolumeSizeInGB": 10 })
+    };
+    let mut tuning = tuning_body("tuning-with-a-bad-type");
+    tuning["TrainingJobDefinition"]["ResourceConfig"]["InstanceType"] = json!("ml.m5.largex");
+
+    // Rows differ along the operation, the member's depth in the request (a nested
+    // structure, a structure inside a LIST, a list of bare enum values, a structure two
+    // levels down), and the rejected value's shape — a type of ANOTHER instance-type set
+    // (`smithy_query(query="shape",shape="ProductionVariantInstanceType")` lists
+    // `ml.t2.medium`, which the training set
+    // (`smithy_query(query="shape",shape="TrainingInstanceType")`) does not), a member of
+    // the set in the wrong case, a near miss of one, a word that is no instance type and
+    // the empty string.
+    let rows: Vec<(&str, &str, Value, &str, &str)> = vec![
+        (
+            "a type of the HOSTING set",
+            "CreateTrainingJob",
+            training_resources("trn-hosting-type", resources("ml.t2.medium")),
+            "ml.t2.medium",
+            "resourceConfig.instanceType",
+        ),
+        (
+            "a member of the set in the wrong case",
+            "CreateTrainingJob",
+            training_resources("trn-cased", resources("ML.M5.LARGE")),
+            "ML.M5.LARGE",
+            "resourceConfig.instanceType",
+        ),
+        (
+            "the empty string",
+            "CreateTrainingJob",
+            training_resources("trn-empty", resources("")),
+            "",
+            "resourceConfig.instanceType",
+        ),
+        (
+            "an instance group of a heterogeneous cluster",
+            "CreateTrainingJob",
+            training_resources(
+                "trn-group",
+                json!({
+                    "InstanceGroups": [{
+                        "InstanceGroupName": "group-one",
+                        "InstanceType": "ml.bogus.xlarge",
+                        "InstanceCount": 2,
+                    }],
+                    "VolumeSizeInGB": 10,
+                }),
+            ),
+            "ml.bogus.xlarge",
+            "resourceConfig.instanceGroups.1.member.instanceType",
+        ),
+        (
+            "an algorithm's supported training instance types",
+            "CreateAlgorithm",
+            algorithm_body("algo-bad-type", json!(["ml.m5.large", "ml.not.a.type"])),
+            "ml.not.a.type",
+            "trainingSpecification.supportedTrainingInstanceTypes.2.member",
+        ),
+        (
+            "a tuning job's training definition",
+            "CreateHyperParameterTuningJob",
+            tuning,
+            "ml.m5.largex",
+            "trainingJobDefinition.resourceConfig.instanceType",
+        ),
+    ];
+
+    for (case, operation, body, rejected, path) in rows {
+        let emulator = Emulator::new();
+        let (status, refused) = emulator.call(operation, &body).await;
+        assert_eq!(
+            (status, error_code(&refused).as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected 400 ValidationException, got {status} {refused:?}"
+        );
+        assert_eq!(
+            message(&refused),
+            one_violation(&clause(rejected, path, requirement)),
+            "case {case:?}: expected the condition the value failed, got {:?}",
+            message(&refused)
+        );
+    }
+
+    // The contrast: the HOSTING instance types are another value set, and a value outside
+    // it is still told the set — so the condition above is a property of the training set
+    // and not of every member named `InstanceType`.
+    let emulator = Emulator::new();
+    let (status, refused) = emulator
+        .call(
+            "CreateEndpointConfig",
+            &json!({
+                "EndpointConfigName": "hosting-type-cfg",
+                "ProductionVariants": [{
+                    "VariantName": "AllTraffic",
+                    "ModelName": "any-model",
+                    "InitialInstanceCount": 1,
+                    "InstanceType": "ml.t2.nano",
+                }],
+            }),
+        )
+        .await;
+    let stated = message(&refused);
+    let requirement_stated = stated
+        .rsplit_once(" failed to satisfy constraint: ")
+        .map(|(_, tail)| tail.to_string())
+        .unwrap_or_default();
+    assert_eq!(
+        (status, error_code(&refused).as_str()),
+        (400, "ValidationException"),
+        "case \"a hosting instance type outside its set\": expected 400 \
+         ValidationException, got {status} {refused:?}"
+    );
+    assert!(
+        requirement_stated.starts_with("Member must satisfy enum value set: [ml.t2.medium, ")
+            && requirement_stated != requirement,
+        "case \"a hosting instance type outside its set\": expected the value set to be \
+         listed, got {requirement_stated:?}"
+    );
 }

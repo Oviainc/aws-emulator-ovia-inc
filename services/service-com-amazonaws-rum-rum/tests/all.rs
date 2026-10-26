@@ -21,6 +21,8 @@ mod app_monitor_lifecycle;
 mod authorization;
 #[path = "all/batch_create_metric_definitions_targeting.rs"]
 mod batch_create_metric_definitions_targeting;
+#[path = "all/batch_delete_metric_definitions.rs"]
+mod batch_delete_metric_definitions;
 #[path = "all/create_app_monitor_tags.rs"]
 mod create_app_monitor_tags;
 #[path = "all/cw_log_delivery.rs"]

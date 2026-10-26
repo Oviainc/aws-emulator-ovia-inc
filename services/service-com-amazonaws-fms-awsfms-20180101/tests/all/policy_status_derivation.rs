@@ -24,6 +24,13 @@
 //! * it is derived on every read, so changing the scope moves a policy out of
 //!   scope and back without the policy itself being touched, and a reader in
 //!   one Region reports the same status as a reader in another.
+//!
+//! What that status lets a caller DO with the policy — a policy out of the
+//! governing scope is one "the administrator can view … but they can't edit or
+//! delete" — is the sibling suite [`crate::policy_mutation_admin_scope`], which
+//! drives the same scope table through `PutPolicy`'s update branch and
+//! `DeletePolicy`; the table and the request helpers here are `pub(crate)` so it
+//! reuses them rather than growing a second copy.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_fms_awsfms_20180101::ops::types::CUSTOMER_POLICY_STATUS_VALUES;
@@ -36,7 +43,7 @@ use crate::policy_lifecycle::{
 /// A second Region, so the Region a policy was created in is a dimension of the
 /// table rather than a constant, and so a read can be made from a Region other
 /// than the one the policy belongs to.
-const OTHER_REGION: &str = "eu-central-1";
+pub(crate) const OTHER_REGION: &str = "eu-central-1";
 
 /// The account id associated as the organisation's DEFAULT administrator in the
 /// scope tests. Deliberately NOT the calling account ([`ACCOUNT`]): the default
@@ -59,7 +66,7 @@ const DEFAULT_ADMIN: &str = "111111111111";
 /// and the types are members of `SecurityServiceType`, asserted below against
 /// the model's catalog — including `SECURITY_GROUPS_USAGE_AUDIT` and
 /// `THIRD_PARTY_FIREWALL`, which the issue did not cite.
-const POLICY_TYPES: &[(&str, &str)] = &[
+pub(crate) const POLICY_TYPES: &[(&str, &str)] = &[
     ("WAFV2", "AWS::ElasticLoadBalancingV2::LoadBalancer"),
     ("SHIELD_ADVANCED", "AWS::EC2::EIP"),
     ("NETWORK_FIREWALL", "AWS::EC2::VPC"),
@@ -74,7 +81,7 @@ const THIRD_PARTY_FIREWALL: &str = "THIRD_PARTY_FIREWALL";
 
 /// A minimal valid policy document of one type, optionally carrying the
 /// `PolicyStatus` a caller is not entitled to set.
-fn document(
+pub(crate) fn document(
     security_service_type: &str,
     resource_type: &str,
     requested_status: Option<&str>,
@@ -93,7 +100,7 @@ fn document(
 }
 
 /// Create one policy in `region` and answer the `Policy` `PutPolicy` reports.
-async fn put_new(
+pub(crate) async fn put_new(
     router: &MultiServiceRouter,
     case: &str,
     document: &Value,
@@ -108,7 +115,7 @@ async fn put_new(
 }
 
 /// The `PolicyStatus` `GetPolicy` reports for one policy, read from `region`.
-async fn get_policy_status(
+pub(crate) async fn get_policy_status(
     router: &MultiServiceRouter,
     case: &str,
     policy_id: &str,
@@ -160,7 +167,7 @@ async fn summary_policy_status(
 
 /// Onboard the CALLING account as a delegated administrator holding `scope`,
 /// which is the only way the scope governing its policies is narrowed.
-async fn put_admin_scope(router: &MultiServiceRouter, case: &str, scope: &Value) {
+pub(crate) async fn put_admin_scope(router: &MultiServiceRouter, case: &str, scope: &Value) {
     let (status, body) = call(
         router,
         "PutAdminAccount",
@@ -175,7 +182,7 @@ async fn put_admin_scope(router: &MultiServiceRouter, case: &str, scope: &Value)
 
 /// An emulator whose DEFAULT administrator is another account, so the calling
 /// account can hold a narrowed administrative scope of its own.
-async fn emulator_with_another_default_administrator() -> MultiServiceRouter {
+pub(crate) async fn emulator_with_another_default_administrator() -> MultiServiceRouter {
     let router = emulator();
     let (status, body) = call(
         &router,
@@ -193,7 +200,7 @@ async fn emulator_with_another_default_administrator() -> MultiServiceRouter {
 /// An `AdminScope` with every member the service validates present: the account
 /// scope a delegated administrator needs, plus the policy-type and Region
 /// scopes under test.
-fn admin_scope(policy_type_scope: Value, region_scope: Value) -> Value {
+pub(crate) fn admin_scope(policy_type_scope: Value, region_scope: Value) -> Value {
     json!({
         "AccountScope": { "AllAccountsEnabled": true },
         "PolicyTypeScope": policy_type_scope,
@@ -203,16 +210,16 @@ fn admin_scope(policy_type_scope: Value, region_scope: Value) -> Value {
 
 /// One row of the scope table: the scope the calling account holds, and which
 /// policy types and Regions that scope covers.
-struct ScopeCase {
-    name: &'static str,
-    scope: Value,
-    manages_policy_type: fn(&str) -> bool,
-    manages_region: fn(&str) -> bool,
+pub(crate) struct ScopeCase {
+    pub(crate) name: &'static str,
+    pub(crate) scope: Value,
+    pub(crate) manages_policy_type: fn(&str) -> bool,
+    pub(crate) manages_region: fn(&str) -> bool,
 }
 
 /// The administrative scopes the rule is asserted over: all-enabled and listed
 /// forms of both the policy-type and the Region scope, and each of them absent.
-fn scope_cases() -> Vec<ScopeCase> {
+pub(crate) fn scope_cases() -> Vec<ScopeCase> {
     vec![
         ScopeCase {
             name: "all-policy-types-and-all-regions",
@@ -279,7 +286,11 @@ fn scope_cases() -> Vec<ScopeCase> {
 
 /// The status the rule says a policy of `security_service_type` created in
 /// `region` has under one scope row.
-fn expected_status(case: &ScopeCase, security_service_type: &str, region: &str) -> &'static str {
+pub(crate) fn expected_status(
+    case: &ScopeCase,
+    security_service_type: &str,
+    region: &str,
+) -> &'static str {
     if (case.manages_policy_type)(security_service_type) && (case.manages_region)(region) {
         "ACTIVE"
     } else {

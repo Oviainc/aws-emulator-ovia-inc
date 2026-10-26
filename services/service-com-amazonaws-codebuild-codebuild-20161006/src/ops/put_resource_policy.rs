@@ -147,6 +147,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// so is a `policy` that is not the JSON-formatted document the member describes.
     /// An ARN of the right shape that this account holds no resource for is the missing
     /// resource.
+    ///
+    /// The document itself is read for ONE rule: a resource is shared read-only, so a
+    /// policy may contain only the read-only consumer actions of the kind of resource
+    /// the ARN names, and one containing any other action is refused with nothing
+    /// stored.
     async fn handle(
         &self,
         input: Self::Input,
@@ -181,6 +186,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_input(
                 crate::state::INVALID_POLICY_DOCUMENT_MESSAGE,
             ));
+        }
+
+        // Sharing a resource grants a consumer READ access to it, so a policy for one
+        // may contain only the read-only consumer actions of the KIND of resource the
+        // ARN names: a document containing any other action is refused, and the refusal
+        // names that kind rather than anything the caller wrote.
+        if crate::state::policy_contains_unshareable_action(&input.policy, target) {
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&input.resource_arn),
+            );
+            return Err(invalid_input(&crate::state::unshareable_action_message(
+                target,
+            )));
         }
 
         let now = crate::state::now_millis();

@@ -177,10 +177,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = stored.map(crate::state::PortalProduct::to_wire) else {
             return Err(GetPortalProductErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!(
-                        "Invalid PortalProduct identifier specified {}:{}",
-                        ::engine::emulator_account_id(),
-                        input.portal_product_id
+                    message: Some(crate::state::invalid_identifier_message(
+                        crate::state::PORTAL_PRODUCT_RESOURCE,
                     )),
                     resource_type: ::std::option::Option::None,
                 },

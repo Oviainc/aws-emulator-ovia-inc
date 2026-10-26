@@ -25,12 +25,12 @@ use crate::ops::types::{
     Cluster, ClusterStateChangeReason, ClusterStatus, ClusterSummary, ClusterTimeline,
     Configuration, EbsBlockDevice, Ec2InstanceAttributes, HadoopStepConfig, InstanceFleetConfig,
     InstanceGroup, InstanceGroupConfig, InstanceGroupStateChangeReason, InstanceGroupStatus,
-    InstanceGroupTimeline, JobFlowInstancesConfig, KerberosAttributes, ManagedScalingPolicy,
-    MonitoringConfiguration, NotebookExecution, NotebookExecutionSummary,
+    InstanceGroupTimeline, JobFlowInstancesConfig, KerberosAttributes,
+    ManagedScalingPolicy, MonitoringConfiguration, NotebookExecution, NotebookExecutionSummary,
     NotebookS3LocationForOutput, OSRelease, OutputNotebookS3LocationForOutput, PersistentAppUI,
-    PlacementGroupConfig, PortRange, Session, SessionMappingDetail, SimplifiedApplication,
-    StartNotebookExecutionInput, Step, StepConfig, StepStatus, StepSummary, StepTimeline, Studio,
-    SupportedInstanceType, Tag,
+    PlacementGroupConfig, PortRange, Session, SessionMappingDetail, ShrinkPolicy,
+    SimplifiedApplication, StartNotebookExecutionInput, Step, StepConfig, StepStatus, StepSummary,
+    StepTimeline, Studio, SupportedInstanceType, Tag,
 };
 
 /// `com.amazonaws.emr#ClusterState`, as the wire carries it.
@@ -79,8 +79,27 @@ pub mod instance_group_state {
     pub const PROVISIONING: &str = "PROVISIONING";
     /// The group's requested instances are up.
     pub const RUNNING: &str = "RUNNING";
+    /// The group is moving to the instance count a modification asked for.
+    pub const RESIZING: &str = "RESIZING";
+    /// The group is applying the configurations a modification asked for.
+    pub const RECONFIGURING: &str = "RECONFIGURING";
     /// The group is gone because its cluster is.
     pub const ENDED: &str = "ENDED";
+
+    /// The states a group's requested instances are up in, so a read reports them as
+    /// running: the group is up, and a resize or a reconfiguration leaves the instances
+    /// it already holds running while it is applied.
+    pub const UP: &[&str] = &[RUNNING, RESIZING, RECONFIGURING];
+}
+
+/// `com.amazonaws.emr#ReconfigurationType`: "Type of reconfiguration requested. Valid
+/// values are MERGE and OVERWRITE." (`InstanceGroupModifyConfig$ReconfigurationType`
+/// doc.)
+pub mod reconfiguration_type {
+    /// The submitted configurations are merged into the ones the group holds.
+    pub const MERGE: &str = "MERGE";
+    /// The submitted configurations replace the ones the group holds.
+    pub const OVERWRITE: &str = "OVERWRITE";
 }
 
 /// `com.amazonaws.emr#InstanceGroupStateChangeReasonCode`, for the codes this emulator
@@ -278,6 +297,45 @@ pub fn validate_managed_scaling_policy(policy: &ManagedScalingPolicy) -> Result<
         }
     }
     Ok(())
+}
+
+/// How an instance-group modification refuses an Amazon EC2 instance id that names no
+/// instance of the group.
+///
+/// This emulator launches no Amazon EC2 instances, so no id names one: the refusal — HTTP
+/// 400, naming the id the caller sent, through the same tail
+/// [`unknown_instance_group_message`] uses — is what keeps a termination the service
+/// cannot carry out from being answered as a success.
+pub fn unknown_ec2_instance_message(instance_id: &str) -> String {
+    format!("EC2 instance id {}", not_valid_message(instance_id))
+}
+
+/// The configurations one instance group may hold, counted over the whole nested tree.
+///
+/// CHOSEN, not documented: every entry is retained on the group's record and reported on
+/// every later read of it, and a `MERGE` reconfiguration adds to what is already there,
+/// so the stored tree needs a ceiling of its own. The same reasoning bounds
+/// [`MAX_SCALING_RULES`].
+pub const MAX_INSTANCE_GROUP_CONFIGURATIONS: usize = 100;
+
+/// The number of entries `configurations` holds, nested children included, stopping at
+/// `cap`.
+///
+/// Bounded by construction: the walk stops as soon as the count passes `cap`, so a tree
+/// that busts the ceiling is refused without being walked to its end.
+pub fn configuration_entries(configurations: &[Configuration], cap: usize) -> usize {
+    let mut seen = 0usize;
+    let mut pending: Vec<&Configuration> = configurations.iter().collect();
+    while let Some(configuration) = pending.pop() {
+        seen += 1;
+        if seen > cap {
+            return seen;
+        }
+        if let Some(children) = configuration.configurations.as_deref() {
+            pending.extend(children.iter());
+        }
+    }
+    seen
 }
 
 /// The region an ARN carries when the caller's request names none.
@@ -1986,6 +2044,29 @@ pub struct InstanceGroupRecord {
     /// scaling policy this group carries comes due, and `None` once that transition has
     /// been materialised or the group carries no policy.
     pub policy_attaching_due_at: Option<SystemTime>,
+    /// When the `RESIZING`/`RECONFIGURING` -> `RUNNING` transition the clock owes the
+    /// modification in flight comes due, and `None` when nothing is being applied.
+    pub change_due_at: Option<SystemTime>,
+    /// The instances still running while a resize is in flight — the count the group was
+    /// already up at — and `None` when no resize is.
+    pub resizing_from_count: Option<i32>,
+    /// "Policy for customizing shrink operations" (`InstanceGroup$ShrinkPolicy` doc): the
+    /// one the last modification submitted, and `None` until one does.
+    pub shrink_policy: Option<ShrinkPolicy>,
+    /// "The version number of the requested configuration specification for this
+    /// instance group" (`InstanceGroup$ConfigurationsVersion` doc): a reconfiguration
+    /// moves it on, so a group nothing has reconfigured carries none.
+    pub configurations_version: Option<i64>,
+    /// The version of the reconfiguration in flight, which becomes
+    /// [`InstanceGroupRecord::last_successfully_applied_configurations_version`] once the
+    /// clock makes it applied.
+    pub pending_configurations_version: Option<i64>,
+    /// "A list of configurations that were successfully applied for an instance group
+    /// last time" (`InstanceGroup$LastSuccessfullyAppliedConfigurations` doc).
+    pub last_successfully_applied_configurations: Option<Vec<Configuration>>,
+    /// The version of those configurations
+    /// (`InstanceGroup$LastSuccessfullyAppliedConfigurationsVersion` doc).
+    pub last_successfully_applied_configurations_version: Option<i64>,
 }
 
 impl InstanceGroupRecord {
@@ -2010,7 +2091,76 @@ impl InstanceGroupRecord {
             end_date_time: None,
             ready_due_at: Some(now + TRANSITION_SPAN),
             policy_attaching_due_at,
+            change_due_at: None,
+            resizing_from_count: None,
+            shrink_policy: None,
+            configurations_version: None,
+            pending_configurations_version: None,
+            last_successfully_applied_configurations: None,
+            last_successfully_applied_configurations_version: None,
         }
+    }
+
+    /// Start the resize to `target` instances a modification asked for.
+    ///
+    /// "ModifyInstanceGroups modifies the number of nodes … The input parameters include
+    /// the new target instance count for the group" (`ModifyInstanceGroups` doc, Smithy
+    /// model): the target is what the group requests from here on, which is what a later
+    /// read reports as its `RequestedInstanceCount`. A group whose instances are already
+    /// up is `RESIZING` until the clock makes the new count due, and goes on reporting the
+    /// instances it already runs while it is; one still provisioning stays
+    /// `PROVISIONING` — it is yet to acquire anything, and what it acquires is the new
+    /// target.
+    pub fn begin_resize(&mut self, target: i32, now: SystemTime) {
+        if instance_group_state::UP.contains(&self.state.as_str()) {
+            self.resizing_from_count = Some(self.running_instance_count());
+            self.state = instance_group_state::RESIZING.to_string();
+            self.change_due_at = Some(now + TRANSITION_SPAN);
+        }
+        self.config.instance_count = target;
+    }
+
+    /// Start the reconfiguration a modification asked for, merging `configurations` into
+    /// the ones this group holds when `merge` is set and replacing them otherwise.
+    ///
+    /// "Type of reconfiguration requested. Valid values are MERGE and OVERWRITE."
+    /// (`InstanceGroupModifyConfig$ReconfigurationType` doc.) A merge keeps every
+    /// classification the group holds that the request does not name again, in the order
+    /// it held them, so what the group requests is the two specifications merged; an
+    /// overwrite is the submitted specification alone. Either way the requested
+    /// specification moves to a new version, and that version only becomes the last
+    /// SUCCESSFULLY APPLIED one when the clock makes the reconfiguration applied.
+    pub fn begin_reconfiguration(
+        &mut self,
+        configurations: Vec<Configuration>,
+        merge: bool,
+        now: SystemTime,
+    ) {
+        let requested = if merge {
+            let mut merged = self.config.configurations.clone().unwrap_or_default();
+            for configuration in configurations {
+                match merged
+                    .iter_mut()
+                    .find(|held| held.classification == configuration.classification)
+                {
+                    Some(held) => *held = configuration,
+                    None => merged.push(configuration),
+                }
+            }
+            merged
+        } else {
+            configurations
+        };
+        self.config.configurations = Some(requested);
+        let version = self.configurations_version.unwrap_or(0).saturating_add(1);
+        self.configurations_version = Some(version);
+        self.pending_configurations_version = Some(version);
+        if instance_group_state::UP.contains(&self.state.as_str())
+            && self.state != instance_group_state::RESIZING
+        {
+            self.state = instance_group_state::RECONFIGURING.to_string();
+        }
+        self.change_due_at = Some(now + TRANSITION_SPAN);
     }
 
     /// Attach `policy` to this group, replacing whatever policy it carried before.
@@ -2043,13 +2193,31 @@ impl InstanceGroupRecord {
     }
 
     /// Materialise the transitions the clock already made due, and nothing else: a group
-    /// that was `PROVISIONING` is `RUNNING` once its span has passed, and a policy that
-    /// was `ATTACHING` is `ATTACHED` once its own has — each owed at that instant
-    /// whether or not anybody looked.
+    /// that was `PROVISIONING` is `RUNNING` once its span has passed, a group that was
+    /// `RESIZING` or `RECONFIGURING` is `RUNNING` once the modification's span has (with
+    /// the configurations it requested now the ones last successfully applied), and a
+    /// policy that was `ATTACHING` is `ATTACHED` once its own has — each owed at that
+    /// instant whether or not anybody looked.
     pub fn advance_to(&mut self, now: SystemTime) {
         if let Some(due) = self.policy_attaching_due_at {
             if now >= due {
                 self.policy_attaching_due_at = None;
+            }
+        }
+        if let Some(due) = self.change_due_at {
+            if now >= due {
+                self.change_due_at = None;
+                self.resizing_from_count = None;
+                if let Some(version) = self.pending_configurations_version.take() {
+                    self.last_successfully_applied_configurations =
+                        self.config.configurations.clone();
+                    self.last_successfully_applied_configurations_version = Some(version);
+                }
+                if self.state == instance_group_state::RESIZING
+                    || self.state == instance_group_state::RECONFIGURING
+                {
+                    self.state = instance_group_state::RUNNING.to_string();
+                }
             }
         }
         if self.state != instance_group_state::PROVISIONING {
@@ -2076,6 +2244,8 @@ impl InstanceGroupRecord {
         });
         self.ready_due_at = None;
         self.policy_attaching_due_at = None;
+        self.change_due_at = None;
+        self.resizing_from_count = None;
         self.end_date_time = Some(at);
     }
 
@@ -2093,13 +2263,15 @@ impl InstanceGroupRecord {
     /// "The number of instances currently running in this instance group."
     /// (`InstanceGroup$RunningInstanceCount` doc.) None are running while the group is
     /// still provisioning them or once it has ended; a group that is up runs the target
-    /// number it requested.
+    /// number it requested, and one part way through a resize goes on running the count
+    /// it was already up at until the new target comes due.
     fn running_instance_count(&self) -> i32 {
-        if self.state == instance_group_state::RUNNING {
-            self.config.instance_count.max(0)
-        } else {
-            0
+        if !instance_group_state::UP.contains(&self.state.as_str()) {
+            return 0;
         }
+        self.resizing_from_count
+            .unwrap_or(self.config.instance_count)
+            .max(0)
     }
 
     /// "The EBS block devices that are mapped to this instance group."
@@ -2203,24 +2375,27 @@ impl InstanceGroupRecord {
                 .configurations
                 .as_deref()
                 .and_then(optional_list),
-            // The configuration versions are what a RECONFIGURATION moves
-            // ("the version number of the requested configuration specification"), and
-            // `ModifyInstanceGroups` — still a scaffold stub under its own issue — is
-            // the only operation that reconfigures a group, so nothing has versioned
-            // this one's configurations yet.
-            configurations_version: None,
-            last_successfully_applied_configurations: None,
-            last_successfully_applied_configurations_version: None,
+            // The configuration versions are what a RECONFIGURATION moves ("the version
+            // number of the requested configuration specification"), so a group nothing
+            // has reconfigured carries none, and the ones last SUCCESSFULLY APPLIED are
+            // the specification of the last reconfiguration the clock has made applied —
+            // not the one still in flight.
+            configurations_version: self.configurations_version,
+            last_successfully_applied_configurations: self
+                .last_successfully_applied_configurations
+                .as_deref()
+                .and_then(optional_list),
+            last_successfully_applied_configurations_version: self
+                .last_successfully_applied_configurations_version,
             ebs_block_devices: optional_list(&self.ebs_block_devices()),
             ebs_optimized: self
                 .config
                 .ebs_configuration
                 .as_ref()
                 .and_then(|configuration| configuration.ebs_optimized),
-            // "Policy for customizing shrink operations" — a shrink policy arrives with
-            // a `ModifyInstanceGroups` resize (its own issue), so a group nobody has
-            // resized carries none.
-            shrink_policy: None,
+            // "Policy for customizing shrink operations" — a shrink policy arrives with a
+            // `ModifyInstanceGroups` resize, so a group nobody has resized carries none.
+            shrink_policy: self.shrink_policy.clone(),
             auto_scaling_policy: self.to_auto_scaling_policy(),
             custom_ami_id: self.config.custom_ami_id.clone(),
         }

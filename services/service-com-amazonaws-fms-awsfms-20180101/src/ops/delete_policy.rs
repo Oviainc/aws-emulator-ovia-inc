@@ -16,6 +16,13 @@
 //! the ones its model declares, and an authorization code is declared for no
 //! operation of this service.
 //!
+//! What the administrative scope governing the policy DOES decide is whether the
+//! policy may be removed at all: a policy reported `OUT_OF_ADMIN_SCOPE` is one
+//! the administrator "can view … but they can't edit or delete", so the delete
+//! is refused with the modelled `InvalidOperationException`
+//! ([`crate::state::ComAmazonawsFmsAwsfms20180101State::policy_mutation_refusal`])
+//! and nothing is removed — "existing policy protections stay in place".
+//!
 //! `DeleteAllPolicyResources` selects what becomes of the objects Firewall
 //! Manager holds BECAUSE of the policy, as opposed to the policy itself: the
 //! policy record and its tag-index entry go on every delete, and the policy's
@@ -202,6 +209,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
+        // A policy the administrative scope governing it does not cover is
+        // view-only, so the removal is refused on the SAME shared rule the edit
+        // takes, and decided before anything is removed. An id no stored policy
+        // carries reaches the not-found below instead: there is no record whose
+        // scope could refuse it.
+        if let Some(refusal) = store
+            .policies
+            .get(&input.policy_id)
+            .and_then(|existing| store.policy_mutation_refusal(existing))
+        {
+            return Err(DeletePolicyErrorModeled::InvalidOperationException(refusal).into());
+        }
         // `PolicyId` is an opaque lookup key: the store decides the answer, and
         // an id no stored policy carries is the modelled not-found, so nothing
         // is removed. The request's cleanup selector decides how far the

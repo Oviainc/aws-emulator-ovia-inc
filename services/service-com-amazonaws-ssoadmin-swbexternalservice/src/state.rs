@@ -3869,6 +3869,26 @@ pub fn cursor_application_grants(application_arn: &str) -> String {
     format!("applicationGrants|{application_arn}")
 }
 
+/// Cursor scope of a `ListApplicationAssignmentsForPrincipal` enumeration: the operation
+/// and the whole filter that selected the rows — the instance whose applications it walks,
+/// the principal whose assignments it reports and the `ListApplicationAssignmentsFilter`'s
+/// application — since the key (an `ApplicationArn`) only distinguishes rows WITHIN one
+/// such filter.
+///
+/// A filter member the caller omitted renders as an EMPTY segment, which is a scope of its
+/// own, exactly as in [`cursor_applications`].
+pub fn cursor_application_assignments_for_principal(
+    instance_arn: &str,
+    principal_type: &str,
+    principal_id: &str,
+    application_arn: Option<&str>,
+) -> String {
+    format!(
+        "applicationAssignmentsForPrincipal|{instance_arn}|{principal_type}|{principal_id}|{}",
+        application_arn.unwrap_or_default()
+    )
+}
+
 /// Cursor scope of a `ListTagsForResource` enumeration: the operation and the resource
 /// whose tags it walks, which is the whole filter that selected the rows.
 pub fn cursor_tags(resource_arn: &str) -> String {

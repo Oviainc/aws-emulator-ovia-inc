@@ -58,7 +58,9 @@ pub(crate) async fn create_policy(router: &MultiServiceRouter, body: &str) -> An
 }
 
 /// `GET /2020-05-31/response-headers-policy/{Id}`.
-async fn get_policy(router: &MultiServiceRouter, id: &str) -> Answer {
+///
+/// `pub(crate)` so a sibling suite reads a policy back through the same route.
+pub(crate) async fn get_policy(router: &MultiServiceRouter, id: &str) -> Answer {
     call(
         router,
         "GET",
@@ -346,7 +348,10 @@ fn strings(values: &[&str]) -> Vec<String> {
 /// both published bounds of `SamplingRate` (0 and 100), enum values drawn from the
 /// model's `FrameOptionsList` and `ReferrerPolicyList`, and text that is empty,
 /// non-ASCII or carries XML metacharacters.
-fn policy_table() -> Vec<Policy> {
+///
+/// `pub(crate)` so a sibling suite asserts a rule over the SAME rows rather than growing a
+/// second table beside this one.
+pub(crate) fn policy_table() -> Vec<Policy> {
     vec![
         Policy {
             case: "the name alone: every optional member left out",
@@ -590,7 +595,9 @@ fn assert_wrapper(
 
 /// Assert the `ResponseHeadersPolicyConfig` element `config` is the configuration
 /// `policy` submitted — every member it named, and no member it did not.
-fn assert_config(config: &Node, policy: &Policy, context: &str, raw: &str) {
+///
+/// `pub(crate)` so a sibling suite reads a configuration back the same way.
+pub(crate) fn assert_config(config: &Node, policy: &Policy, context: &str, raw: &str) {
     let case = policy.case;
 
     let name = text(config, "Name", case, context, raw);

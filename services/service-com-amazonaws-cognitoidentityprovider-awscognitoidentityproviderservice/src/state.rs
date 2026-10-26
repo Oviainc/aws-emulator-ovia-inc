@@ -21,7 +21,8 @@ use crate::ops::types::{
     DeviceConfigurationType, DeviceSecretVerifierConfigType, DeviceType, DomainDescriptionType,
     EmailConfigurationType, EmailMfaConfigType, GroupType, IdentityProviderType,
     IssuerConfigurationType,
-    KeyConfigurationType, LambdaConfigType, MFAOptionType, NewDeviceMetadataType,
+    KeyConfigurationType, LambdaConfigType, LogConfigurationType, LogDeliveryConfigurationType,
+    MFAOptionType, NewDeviceMetadataType,
     NumberAttributeConstraintsType, PasswordPolicyType, RefreshTokenRotationType,
     ResourceServerScopeType, ResourceServerType, RiskConfigurationType,
     RiskExceptionConfigurationType, RoutingType,
@@ -141,6 +142,13 @@ pub fn exclusive_auth_flow_violation(flows: &[String]) -> Option<&'static str> {
 
 /// `UserPoolTierType` defaults to `ESSENTIALS` (`CreateUserPool.UserPoolTier`).
 const DEFAULT_USER_POOL_TIER: &str = "ESSENTIALS";
+
+/// The feature plan threat-protection (`userAuthEvents`) activity logs need:
+/// `LogConfigurationType.EventSource` is "info-level logs about threat-protection
+/// user activity in user pools with the Plus feature plan" (this service's
+/// model); one of the modelled
+/// [`crate::ops::types::USER_POOL_TIER_TYPE_VALUES`].
+pub const PLUS_USER_POOL_TIER: &str = "PLUS";
 
 /// `UserPoolMfaType` is `OFF` for a pool that configures no MFA
 /// (`MfaConfiguration`: "Sets multi-factor authentication (MFA) to be on, off, or
@@ -1033,6 +1041,14 @@ pub struct UserPool {
     /// until a call sets it, so a pool nobody configured reports no settings and
     /// no modification instant.
     pub risk_configuration: Option<RiskConfiguration>,
+    /// This pool's log delivery configuration: the `LogConfigurations` a
+    /// `SetLogDeliveryConfiguration` call last stored, which is what
+    /// `GetLogDeliveryConfiguration` reports. Empty for a pool nothing has
+    /// configured logging for, and empty again once a call sets an empty
+    /// collection — `LogDeliveryConfigurationType.LogConfigurations` is a
+    /// modelled required member, so the collection is always reported, empty or
+    /// not.
+    pub log_configurations: Vec<LogConfigurationType>,
     pub tags: HashMap<String, String>,
     /// This pool's Amazon Cognito prefix domain, once one is created:
     /// `UserPoolType.Domain` is "The domain prefix, if the user pool has a
@@ -1703,6 +1719,21 @@ impl UserPool {
             sms_authentication_message: self.sms_authentication_message.clone(),
             sms_configuration: self.sms_configuration.clone(),
         })
+    }
+
+    /// The modelled view of this pool's log delivery configuration, rendered
+    /// from what is stored.
+    ///
+    /// `GetLogDeliveryConfiguration` and `SetLogDeliveryConfiguration` model the
+    /// same `LogDeliveryConfigurationType`, so both answer the pool this is
+    /// read from beside the collection it holds. A pool with no logging
+    /// configured reports an EMPTY collection rather than none: the member is
+    /// modelled required.
+    pub fn to_log_delivery_configuration(&self) -> LogDeliveryConfigurationType {
+        LogDeliveryConfigurationType {
+            user_pool_id: self.id.clone(),
+            log_configurations: self.log_configurations.clone(),
+        }
     }
 
     /// The modelled view of this pool, rendered from what is stored.
@@ -3550,6 +3581,7 @@ pub fn new_user_pool(name: String, region: &str, now: SystemTime) -> UserPool {
         software_token_mfa_configuration: None,
         email_mfa_configuration: None,
         web_authn_configuration: None,
+        log_configurations: Vec::new(),
         tags: HashMap::new(),
         domain: None,
         custom_domain: None,

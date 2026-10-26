@@ -157,11 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let Some(api) = store.apis.get(&input.api_id) else {
             return Err(GetStagesErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "Invalid API identifier specified {}:{}",
-                    ::engine::emulator_account_id(),
-                    input.api_id
-                )),
+                message: Some(crate::state::invalid_api_identifier_message(&input.api_id)),
                 resource_type: ::std::option::Option::None,
             })
             .into());

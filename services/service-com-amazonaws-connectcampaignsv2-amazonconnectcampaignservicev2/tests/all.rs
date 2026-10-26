@@ -39,6 +39,8 @@ mod campaign_rename;
 mod campaign_resume;
 #[path = "all/campaign_schedule_completion.rs"]
 mod campaign_schedule_completion;
+#[path = "all/campaign_stop.rs"]
+mod campaign_stop;
 #[path = "all/common.rs"]
 mod common;
 #[path = "all/connect_instance_config_deletion.rs"]
