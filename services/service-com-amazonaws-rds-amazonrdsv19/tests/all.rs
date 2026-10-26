@@ -47,6 +47,8 @@ mod db_parameter_group_deletion;
 mod db_parameter_groups;
 #[path = "all/db_parameters.rs"]
 mod db_parameters;
+#[path = "all/db_shard_group_primary_cluster.rs"]
+mod db_shard_group_primary_cluster;
 #[path = "all/db_shard_groups.rs"]
 mod db_shard_groups;
 #[path = "all/db_subnet_group_deletion.rs"]

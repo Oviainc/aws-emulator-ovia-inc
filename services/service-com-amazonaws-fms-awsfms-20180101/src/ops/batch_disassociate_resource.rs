@@ -24,7 +24,10 @@
 //! ([`crate::state::resource_set_item_failure_reason`], the SAME classifier
 //! `BatchAssociateResource` admits items by); and a URI that could be a member
 //! but is not one leaves nothing to remove. The rest of the batch is
-//! disassociated either way: a batch is not all-or-nothing.
+//! disassociated either way: a batch is not all-or-nothing. That classifier
+//! judges an item on the ARN fields it CARRIES, so a resource whose owning
+//! service leaves the Region or the account field empty is no failure here
+//! either.
 //!
 //! How many items one call may carry is BOUNDED
 //! ([`crate::state::MAX_RESOURCE_SET_ITEMS_PER_CALL`]), so the per-call work

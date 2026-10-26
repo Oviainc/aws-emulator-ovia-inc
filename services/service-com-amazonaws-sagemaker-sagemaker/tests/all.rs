@@ -87,6 +87,8 @@ mod lineage_group_reporting;
 mod lineage_groups;
 #[path = "all/list_artifacts.rs"]
 mod list_artifacts;
+#[path = "all/list_associations.rs"]
+mod list_associations;
 #[path = "all/list_code_repositories.rs"]
 mod list_code_repositories;
 #[path = "all/list_endpoints.rs"]

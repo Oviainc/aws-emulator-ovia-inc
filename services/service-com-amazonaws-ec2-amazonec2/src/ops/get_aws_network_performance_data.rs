@@ -5,26 +5,29 @@
 //! Answers one `DataResponse` per `DataQuery` the request carries, identifying the query
 //! it answers ("A user-defined ID associated with a data query that's returned in the
 //! `dataResponse` identifying the query" — `DataQuery$Id`) and carrying the metric points
-//! this emulator holds for the series that query names, one `MaxResults`-sized page of
-//! responses at a time.
+//! of the series that query names over the window the request asks about, one
+//! `MaxResults`-sized page of responses at a time.
 //!
 //! A REPORTING operation: it writes nothing, so two identical calls answer identically.
 //!
-//! A series is a pair of locations, a metric, a statistic and an aggregation period, and
-//! each of its metric points is a MEASUREMENT of the Amazon network between those two
-//! locations over one window of that period — "aggregate-latency" is the latency actually
-//! observed between them, reduced to its `p50`.
+//! A series is a pair of locations, a metric, a statistic and an aggregation period. One
+//! metric point covers one aggregation period of the requested window — "The value is
+//! aggregated from the `startDate` to the `endDate`" (`MetricPoint`) — so the window is
+//! reported as a run of period-long points from its `StartTime`, the last one ending at its
+//! `EndTime`, each carrying the round-trip `aggregate-latency` of the Amazon network
+//! between the two locations and the health of the network over that window.
 //!
-//! This emulator is one process. There is no network between a source and a destination
-//! for it to observe, and no operation of this service records an observation of one, so no
-//! window of any series ever had a measurement taken in it and every series is reported
-//! with an EMPTY `MetricPoints`, which is also what the service itself answers for a window
-//! it holds no data for. A latency derived from the request's two locations — however
-//! physical the derivation — would be a measurement of work nothing performed, which a
-//! client could not tell from a real one; this operation reports no such value.
+//! Nothing in this emulator observes a network, and no operation of this service records an
+//! observation of one, so the latency a point carries is a MODEL and not a measurement: it
+//! is what this emulator holds the series between the two locations to cost — the
+//! propagation delay of a fibre path between where AWS publishes those two Regions, which
+//! is the term that decides inter-Region round-trip latency, plus the fixed per-hop
+//! overhead ([`modelled_round_trip_ms`]). It is a function of the series alone — no clock,
+//! no counter and no request-scoped value enters it — so a series answers the same latency
+//! to every caller and to every repeat of a call, and nothing about the window shifts it.
 //!
-//! What the request does determine is computed here: which series are reported, in which
-//! order, how they page, and which requests are refused.
+//! Everything else the request determines is computed here too: which series are reported,
+//! in which order, how they page, and which requests are refused.
 //!
 //! ## Shape of an operation
 //!
@@ -238,8 +241,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "The request must contain the parameter DataQueries",
             ));
         }
+        // Validating a query also RESOLVES the aggregation period it names into the
+        // duration a metric point of it covers, so the duration is settled before any
+        // series is built and nothing downstream has to ask what to do about a period it
+        // cannot measure a window in.
+        let mut periods: Vec<i32> = Vec::with_capacity(queries.len());
         for query in queries {
-            validate_query(query)?;
+            periods.push(validate_query(query)?);
         }
 
         // The queries are answered in the order the request gave them, which is both the
@@ -269,8 +277,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(start_at..)
             .unwrap_or_default()
             .iter()
+            .zip(periods.get(start_at..).unwrap_or_default())
             .take(limit)
-            .map(data_response)
+            .map(|(query, period)| {
+                data_response(query, *period, start.as_secs_f64(), end.as_secs_f64())
+            })
             .collect();
 
         // "The token to use to retrieve the next page of results. This value is null when
@@ -303,13 +314,14 @@ const MIN_PAGE_SIZE: usize = 1;
 /// together.
 const MAX_RESPONSES_PER_PAGE: usize = 20;
 
-/// The `DataResponse` that answers one query.
+/// The `DataResponse` that answers one query, whose aggregation period lasts
+/// `period_secs` seconds, over the window `[start, end)` in seconds since the epoch.
 ///
 /// Every member of the query is reported back on it — `DataResponse` carries exactly the
 /// members of `DataQuery` plus `MetricPoints`, and `DataQuery$Id` is documented as being
 /// "returned in the `dataResponse` identifying the query" — so a caller that sent several
 /// queries can tell which series each response is.
-fn data_response(query: &DataQuery) -> DataResponse {
+fn data_response(query: &DataQuery, period_secs: i32, start: f64, end: f64) -> DataResponse {
     DataResponse {
         id: query.id.clone(),
         source: query.source.clone(),
@@ -317,30 +329,282 @@ fn data_response(query: &DataQuery) -> DataResponse {
         metric: query.metric.clone(),
         statistic: query.statistic.clone(),
         period: query.period.clone(),
-        // The metric points this emulator holds for the series: NONE, for every series,
-        // every period and every window.
-        //
-        // A metric point is a MEASUREMENT — "aggregate-latency" is the latency actually
-        // observed on the Amazon network between the two locations over one window of the
-        // period, reduced to its `p50`. This emulator is one process: there is no network
-        // between a source and a destination for it to observe, and no operation of this
-        // service records an observation of one, so no window of any series ever had a
-        // measurement taken in it.
-        //
-        // An empty `MetricPoints` says exactly that, and is what the service itself
-        // answers for a window it holds no data for. A latency derived from the request's
-        // two locations — even one derived from where those Regions are and the speed of
-        // light in a fibre — would be a measurement of work nothing performed, which a
-        // client could not tell from a real one; and a point carrying dates but no `Value`
-        // would need a `Status` word for "nothing was measured" that neither the model nor
-        // the documentation gives (`MetricPoint$Status` is only "The status of the metric
-        // point"). The `Statistic` and `Period` the query named select OVER the points, so
-        // with no points there is nothing for them to aggregate.
-        metric_points: Some(Vec::new()),
+        metric_points: Some(metric_points(query, period_secs, start, end)),
     }
 }
 
-/// Refuse a query this service cannot answer.
+/// The metric points of the series `query` names over the window `[start, end)`, each
+/// covering `period_secs` seconds.
+///
+/// "The value is aggregated from the `startDate` to the `endDate`" (`MetricPoint`), and the
+/// `Period` is "the aggregation period used for the data query" (`DataQuery$Period`), so
+/// the window is covered by period-long points starting at its `StartTime`: the point at
+/// index `k` aggregates `[start + k periods, start + (k + 1) periods)`, and the last one
+/// ends at the window's `EndTime` rather than past it, so every point reports over a span
+/// the request actually asked about. A window shorter than one period is one point.
+///
+/// The duration comes from [`validate_query`], which resolved it before any series was
+/// built, so there is no window this cannot be asked to cover.
+///
+/// Every point of a series carries the same `Value`, which is a MODEL and not a
+/// measurement: nothing in this emulator observes the network between two locations, so
+/// what the point reports is the latency [`modelled_round_trip_ms`] computes for the pair.
+/// That model has no time-varying term, and a point whose value moved between windows
+/// would report a change in the network that nothing observed.
+fn metric_points(query: &DataQuery, period_secs: i32, start: f64, end: f64) -> Vec<MetricPoint> {
+    let period = f64::from(period_secs);
+    let source = query.source.as_deref().unwrap_or_default();
+    let destination = query.destination.as_deref().unwrap_or_default();
+    let value = modelled_round_trip_ms(source, destination);
+
+    let windows = ((end - start) / period)
+        .ceil()
+        .clamp(1.0, MAX_METRIC_POINTS_PER_SERIES as f64) as usize;
+    (0..windows)
+        .map(|index| {
+            let point_start = start + index as f64 * period;
+            let point_end = (point_start + period).min(end);
+            MetricPoint {
+                start_date: Some(::aws_smithy_types::DateTime::from_secs_f64(point_start)),
+                end_date: Some(::aws_smithy_types::DateTime::from_secs_f64(point_end)),
+                value: Some(round_to_hundredths(value)),
+                status: Some(METRIC_POINT_STATUS_OK.to_string()),
+            }
+        })
+        .collect()
+}
+
+/// `milliseconds` as the `Float` a `MetricPoint$Value` carries, kept to hundredths of a
+/// millisecond: a latency is reported in milliseconds, and a value past that precision
+/// would claim a sharpness no aggregate of a network measurement has.
+fn round_to_hundredths(milliseconds: f64) -> f32 {
+    ((milliseconds * 100.0).round() / 100.0) as f32
+}
+
+/// How many metric points one series is reported with at most.
+///
+/// CHOSEN: `StartTime` and `EndTime` are unbounded `MillisecondDateTime`s and the shortest
+/// aggregation period is five minutes, so without a ceiling one request could ask for a
+/// response bounded only by the calendar. It is far above the number of points a caller
+/// plots — a whole day at the shortest period is 288 — and it bounds the response, never
+/// the request: a window is still answered, with the points that run from its `StartTime`.
+///
+/// A window needing more points than this is therefore answered with the FIRST
+/// [`MAX_METRIC_POINTS_PER_SERIES`] of them rather than refused, because `MaxResults` and
+/// `NextToken` page `DataResponses` and the API publishes no cursor inside a series
+/// (`smithy_query(query="operation",operation="GetAwsNetworkPerformanceData")` paginates
+/// `items: DataResponses`): there is nothing a caller could present to ask for the rest, so
+/// refusing the call would deny a window the real service answers, and the points that are
+/// reported are the ones the window begins with rather than a sample of it.
+const MAX_METRIC_POINTS_PER_SERIES: usize = 1_000;
+
+/// The `Status` a metric point of a window the network was healthy over carries.
+///
+/// `MetricPoint` "indicates whether the network was healthy or degraded at a particular
+/// point", and `MetricPoint$Status` is "the status of the metric point". Nothing in this
+/// emulator degrades the modelled network — the latency of a series never moves — so every
+/// point it reports is a healthy one.
+const METRIC_POINT_STATUS_OK: &str = "OK";
+
+/// The duration of each member of the modelled `PeriodType` enum, in seconds: the span one
+/// metric point of a series aggregates over.
+///
+/// SOURCE: `smithy_query(query="shape",shape="PeriodType")`, each of whose members names
+/// its own duration. Kept beside the handler that tiles a window with them so the two
+/// cannot disagree about how long a period is.
+const PERIOD_DURATIONS: &[(&str, i32)] = &[
+    ("five-minutes", 5 * 60),
+    ("fifteen-minutes", 15 * 60),
+    ("one-hour", 60 * 60),
+    ("three-hours", 3 * 60 * 60),
+    ("one-day", 24 * 60 * 60),
+    ("one-week", 7 * 24 * 60 * 60),
+];
+
+/// How long the aggregation period `period` lasts, or `None` when it names no member of
+/// the modelled `PeriodType` enum.
+fn period_duration_secs(period: &str) -> Option<i32> {
+    PERIOD_DURATIONS
+        .iter()
+        .find(|(name, _)| *name == period)
+        .map(|(_, seconds)| *seconds)
+}
+
+/// The round-trip `aggregate-latency` this emulator models between two locations, in
+/// milliseconds. A MODEL, not a measurement: nothing here observes the network, so this is
+/// what the emulator holds the series to cost, computed from the two locations alone.
+///
+/// A round trip between two places costs, at least, the time light needs to cross the
+/// fibre between them twice; for two Regions that propagation delay is the term that
+/// decides the latency, which is why it tracks how far apart they are. So the model is the
+/// physical one: the great-circle distance between where AWS publishes the two Regions
+/// ([`region_position`]), lengthened by [`ROUTE_LENGTH_FACTOR`] for a cable path that is
+/// not a straight arc, traversed twice at [`FIBRE_KM_PER_MS`], plus the
+/// [`FIXED_OVERHEAD_MS`] every hop adds on top of propagation — which is all that is left
+/// between two locations of one Region.
+///
+/// Nothing but the two locations enters it: the metric is the latency BETWEEN them, and
+/// this emulator has no measurement of one, so a value that moved with the clock, with how
+/// often the series was asked for, or with anything else of the request would report a
+/// change in the network that nothing observed. A pair of locations whose Regions have no
+/// position at all is reported at the overhead alone rather than at a distance nothing
+/// placed.
+fn modelled_round_trip_ms(source: &str, destination: &str) -> f64 {
+    let positions = region_of_location(source)
+        .and_then(region_position)
+        .zip(region_of_location(destination).and_then(region_position));
+    let Some((source_position, destination_position)) = positions else {
+        return FIXED_OVERHEAD_MS;
+    };
+    let kilometres = great_circle_km(source_position, destination_position);
+    FIXED_OVERHEAD_MS + 2.0 * kilometres * ROUTE_LENGTH_FACTOR / FIBRE_KM_PER_MS
+}
+
+/// How far light travels along an optical fibre in one millisecond, in kilometres: light
+/// moves through silica at about two thirds of its speed in vacuum (299,792 km/s).
+const FIBRE_KM_PER_MS: f64 = 299_792.0 * 2.0 / 3.0 / 1_000.0;
+
+/// How much longer a cable path between two places is than the great-circle line between
+/// them, as a factor: fibre follows coastlines, land corridors and existing conduit rather
+/// than the shortest arc.
+///
+/// CHOSEN: 1.4, which is what the model needs a figure for and nothing in the API
+/// publishes. It is the factor that puts the round trips this model reports in the range
+/// the Amazon backbone actually shows — a little over 50 ms between Oregon and Northern
+/// Virginia.
+const ROUTE_LENGTH_FACTOR: f64 = 1.4;
+
+/// The part of a round trip that is not propagation, in milliseconds: the switching,
+/// queuing and serialisation the hops along the path add. It is the whole latency between
+/// two locations the catalog places together, which is every pair inside one Region.
+///
+/// CHOSEN: 1 ms, nothing in the API publishing a figure for it.
+const FIXED_OVERHEAD_MS: f64 = 1.0;
+
+/// The great-circle distance between two `(latitude, longitude)` positions in degrees, in
+/// kilometres, by the haversine formula on a sphere of [`EARTH_RADIUS_KM`].
+///
+/// The Geo Routes and Geo Places services each compute the same distance over their own
+/// coordinates, inside their own crates: this one is here because a service crate holds
+/// its own state and helpers and this crate depends on neither of them, and the formula is
+/// four lines whose inputs are this operation's Region catalog. A shared geography helper
+/// would be the place for it the moment a third service needs one.
+fn great_circle_km(from: (f64, f64), to: (f64, f64)) -> f64 {
+    let (from_latitude, from_longitude) = (from.0.to_radians(), from.1.to_radians());
+    let (to_latitude, to_longitude) = (to.0.to_radians(), to.1.to_radians());
+    let latitude_delta = to_latitude - from_latitude;
+    let longitude_delta = to_longitude - from_longitude;
+    let haversine = (latitude_delta / 2.0).sin().powi(2)
+        + from_latitude.cos() * to_latitude.cos() * (longitude_delta / 2.0).sin().powi(2);
+    2.0 * EARTH_RADIUS_KM * haversine.sqrt().clamp(0.0, 1.0).asin()
+}
+
+/// The Earth's mean radius in kilometres, the sphere a great-circle distance is measured
+/// on.
+const EARTH_RADIUS_KM: f64 = 6_371.008_8;
+
+/// Where a Region is, as `(latitude, longitude)` in degrees, or `None` for a Region
+/// nothing places.
+///
+/// A Region in [`REGION_POSITIONS`] is at its own published position. A Region that
+/// catalog does not place — one added to the Region catalog after this one was written —
+/// is placed at the geography its code names ([`AREA_POSITIONS`]), so a Region the resolver
+/// accepts still has a position to be a distance from. `None` is left for a code that is
+/// in neither, which is then reported at the overhead alone rather than at a distance from
+/// a place picked for it.
+fn region_position(region: &str) -> Option<(f64, f64)> {
+    if let Some((_, latitude, longitude)) =
+        REGION_POSITIONS.iter().find(|(name, _, _)| *name == region)
+    {
+        return Some((*latitude, *longitude));
+    }
+    let area = region.split('-').next().unwrap_or_default();
+    AREA_POSITIONS
+        .iter()
+        .find(|(prefix, _, _)| *prefix == area)
+        .map(|(_, latitude, longitude)| (*latitude, *longitude))
+}
+
+/// Where AWS publishes each Region of the catalog, as `(Region code, latitude, longitude)`
+/// in degrees.
+///
+/// SOURCE: the geographic location AWS names for each Region in its Regions and
+/// Availability Zones list — `us-east-1` is Northern Virginia, `eu-west-1` is Ireland,
+/// `ap-northeast-1` is Tokyo — at that place's coordinates. The Regions of the isolated
+/// partitions, for which AWS publishes no city, are placed in the area their code names.
+///
+/// It covers every Region of `emulator_telemetry::policy::KNOWN_REGIONS`, the catalog
+/// [`region_of_location`] accepts a location out of, so the distance between any two
+/// locations this operation answers for is a distance between two published places.
+const REGION_POSITIONS: &[(&str, f64, f64)] = &[
+    ("af-south-1", -33.93, 18.42),
+    ("ap-east-1", 22.32, 114.17),
+    ("ap-east-2", 25.03, 121.57),
+    ("ap-northeast-1", 35.69, 139.69),
+    ("ap-northeast-2", 37.57, 126.98),
+    ("ap-northeast-3", 34.69, 135.50),
+    ("ap-south-1", 19.08, 72.88),
+    ("ap-south-2", 17.39, 78.49),
+    ("ap-southeast-1", 1.35, 103.82),
+    ("ap-southeast-2", -33.87, 151.21),
+    ("ap-southeast-3", -6.21, 106.85),
+    ("ap-southeast-4", -37.81, 144.96),
+    ("ap-southeast-5", 3.139, 101.687),
+    ("ap-southeast-6", -36.85, 174.76),
+    ("ap-southeast-7", 13.76, 100.50),
+    ("ca-central-1", 45.50, -73.57),
+    ("ca-west-1", 51.05, -114.07),
+    ("cn-north-1", 39.90, 116.41),
+    ("cn-northwest-1", 38.49, 106.23),
+    ("eu-central-1", 50.11, 8.68),
+    ("eu-central-2", 47.37, 8.54),
+    ("eu-isoe-west-1", 52.52, 13.40),
+    ("eu-north-1", 59.33, 18.07),
+    ("eu-south-1", 45.46, 9.19),
+    ("eu-south-2", 41.65, -0.89),
+    ("eu-west-1", 53.35, -6.26),
+    ("eu-west-2", 51.51, -0.13),
+    ("eu-west-3", 48.86, 2.35),
+    ("il-central-1", 32.09, 34.78),
+    ("me-central-1", 25.20, 55.27),
+    ("me-south-1", 26.23, 50.59),
+    ("mx-central-1", 20.59, -100.39),
+    ("sa-east-1", -23.55, -46.63),
+    ("us-east-1", 39.04, -77.49),
+    ("us-east-2", 39.96, -83.00),
+    ("us-gov-east-1", 39.04, -77.49),
+    ("us-gov-west-1", 45.84, -119.70),
+    ("us-iso-east-1", 39.04, -77.49),
+    ("us-iso-west-1", 45.84, -119.70),
+    ("us-isob-east-1", 39.96, -83.00),
+    ("us-isof-east-1", 39.04, -77.49),
+    ("us-isof-south-1", 32.78, -96.80),
+    ("us-west-1", 37.34, -121.89),
+    ("us-west-2", 45.84, -119.70),
+];
+
+/// Where the geography each Region code's area prefix names is, as `(prefix, latitude,
+/// longitude)` in degrees: the position a Region [`REGION_POSITIONS`] does not place yet
+/// is taken to be at.
+///
+/// SOURCE: the area each prefix of an AWS Region code names — `af` Africa, `ap` Asia
+/// Pacific, `ca` Canada, `cn` China, `eu` Europe, `il` Israel, `me` the Middle East, `mx`
+/// Mexico, `sa` South America, `us` the United States — at the middle of that area.
+const AREA_POSITIONS: &[(&str, f64, f64)] = &[
+    ("af", -8.78, 23.66),
+    ("ap", 13.41, 110.87),
+    ("ca", 56.13, -106.35),
+    ("cn", 35.86, 104.20),
+    ("eu", 50.00, 15.00),
+    ("il", 31.05, 34.85),
+    ("me", 25.00, 45.00),
+    ("mx", 23.63, -102.55),
+    ("sa", -14.24, -51.93),
+    ("us", 39.83, -98.58),
+];
+
+/// Refuse a query this service cannot answer, and answer the duration of the aggregation
+/// period it names, in seconds.
 ///
 /// "A query used for retrieving network health data" (`DataQuery`) names ONE series: the
 /// source and destination it is between (`DataQuery$Source`: "The Region or Availability
@@ -352,9 +616,10 @@ fn data_response(query: &DataQuery) -> DataResponse {
 ///
 /// `Metric`, `Statistic` and `Period` target the modelled `MetricType`, `StatisticType` and
 /// `PeriodType` enums, so a value outside one of them was already refused by the
-/// centralized request walk before this ran; what is left for here is the one thing the
-/// model cannot express, that a series needs all five of its members.
-fn validate_query(query: &DataQuery) -> Result<(), GetAwsNetworkPerformanceDataError> {
+/// centralized request walk before this ran; what is left for here is what the model cannot
+/// express — that a series needs all five of its members, and that its aggregation period
+/// is one this service holds a duration for.
+fn validate_query(query: &DataQuery) -> Result<i32, GetAwsNetworkPerformanceDataError> {
     for (parameter, location) in [
         ("Source", required(query.source.as_deref(), "Source")?),
         (
@@ -372,8 +637,20 @@ fn validate_query(query: &DataQuery) -> Result<(), GetAwsNetworkPerformanceDataE
 
     required(query.metric.as_deref(), "Metric")?;
     required(query.statistic.as_deref(), "Statistic")?;
-    required(query.period.as_deref(), "Period")?;
-    Ok(())
+    let period = required(query.period.as_deref(), "Period")?;
+    // The period is what a metric point aggregates over, so a series can only be reported
+    // over a period this service knows the duration of, and resolving it HERE is what lets
+    // the answer be built without that question coming up again. Every member of the
+    // modelled enum has a duration ([`PERIOD_DURATIONS`]), and the enum is what the
+    // centralized walk already held the value to, so this refuses nothing a caller can send
+    // today — it is what keeps a period added to the model from being answered with a
+    // window it does not cover.
+    period_duration_secs(period).ok_or_else(|| {
+        crate::state::invalid_parameter_value(format!(
+            "Value ({period}) for parameter Period is invalid. \
+             It must be an aggregation period this Region reports data for"
+        ))
+    })
 }
 
 /// The value of a member a query must carry, or EC2's HTTP 400 `MissingParameter`. An

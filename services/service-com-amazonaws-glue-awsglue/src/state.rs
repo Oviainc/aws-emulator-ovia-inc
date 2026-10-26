@@ -915,6 +915,21 @@ impl ComAmazonawsGlueAwsglueState {
             .and_then(|catalog| catalog.connections.get_mut(name))
     }
 
+    /// Remove the connection definition `name` from `catalog_id`, answering the record
+    /// that was removed, or `None` when either the catalog or the connection is absent.
+    ///
+    /// The whole record goes, tag set included: a connection's tags are held ON the entry
+    /// ([`Self::resource_tags`]), so the name a delete frees carries no tags into the next
+    /// create under it. The removed entry is handed back rather than dropped, so a caller
+    /// that has to report what it deleted reads it from here instead of looking the record
+    /// up again before removing it. Matched by name exactly as sent, the way the read path
+    /// matches it ([`Self::connection`]).
+    pub fn remove_connection(&mut self, catalog_id: &str, name: &str) -> Option<ConnectionEntry> {
+        self.catalogs
+            .get_mut(catalog_id)
+            .and_then(|catalog| catalog.connections.remove(name))
+    }
+
     /// How many records the whole store holds of one catalog-scoped kind: `count` says
     /// how many ONE catalog holds, and this sums it over every catalog.
     ///
@@ -4824,6 +4839,24 @@ pub mod messages {
     /// a `DatabaseInput$Name` already taken. Recorded constant: the requested name is
     /// deliberately withheld.
     pub const DATABASE_ALREADY_EXISTS: &str = "Database already exists.";
+
+    /// A READ that addresses ONE connection definition by name (`GetConnection`) for a
+    /// name the addressed Data Catalog holds none under. Recorded template: it names the
+    /// connection the request addressed and the account whose catalog was searched, both
+    /// read off the request — the name exactly as sent, and the catalog id the request
+    /// resolved to.
+    pub fn connection_not_found(name: &str, catalog_id: &str) -> String {
+        format!("Connection with name {name} in account {catalog_id} is not found")
+    }
+
+    /// A WRITE that addresses ONE connection definition by name (`UpdateConnection`, and
+    /// the `DeleteConnection` that addresses one the same way) for a name the addressed
+    /// Data Catalog holds none under. Recorded template of the update, and a DIFFERENT
+    /// sentence from the read's above — which is why the two are not one shared string:
+    /// it names the connection alone, built from the request, and no account.
+    pub fn connection_not_found_for_write(name: &str) -> String {
+        format!("Connection not found: {name}")
+    }
 
     /// `GetTable` for a table the database does not hold. Recorded constant: this
     /// read's refusal names neither the table nor the database.

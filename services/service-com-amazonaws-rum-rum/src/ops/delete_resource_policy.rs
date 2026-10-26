@@ -214,8 +214,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         // `PolicyRevisionId` makes the delete atomic against the revision the caller
-        // read: a stale id is refused with the policy left in place.
-        if let Some(mismatch) = record.policy_revision_refusal(input.policy_revision_id.as_deref())
+        // read: a stale id is refused with the policy left in place. The delete's own
+        // member conditions the refusal on the id "that you provide", so a delete that
+        // provides none asks for no atomicity and is unconditional.
+        if let Some(mismatch) =
+            record.policy_revision_refusal_on_provided(input.policy_revision_id.as_deref())
         {
             return Err(
                 DeleteResourcePolicyErrorModeled::InvalidPolicyRevisionIdException(mismatch)

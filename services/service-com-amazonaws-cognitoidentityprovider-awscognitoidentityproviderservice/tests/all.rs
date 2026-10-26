@@ -51,6 +51,8 @@ mod forgot_password_caller_identity;
 mod get_identity_provider_by_identifier;
 #[path = "all/get_user.rs"]
 mod get_user;
+#[path = "all/get_user_auth_factors.rs"]
+mod get_user_auth_factors;
 #[path = "all/group_lifecycle.rs"]
 mod group_lifecycle;
 #[path = "all/group_membership.rs"]

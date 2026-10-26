@@ -81,6 +81,8 @@ mod state_roundtrip;
 mod subscriber_address_validation;
 #[path = "all/subscriber_creation.rs"]
 mod subscriber_creation;
+#[path = "all/subscriber_deletion.rs"]
+mod subscriber_deletion;
 #[path = "all/subscriber_notification_reads.rs"]
 mod subscriber_notification_reads;
 #[path = "all/subscriber_set_identity.rs"]

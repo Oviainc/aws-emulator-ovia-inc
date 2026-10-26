@@ -89,26 +89,6 @@ pub const HERITAGE_STATUS_OPT_OUT: &str = "OptOut";
 /// there is no "unset" to report: an account that has not opted in is opted out.
 pub const DEFAULT_HERITAGE_STATUS: &str = HERITAGE_STATUS_OPT_OUT;
 
-/// Why `PutTaxInheritance` refuses a caller that is not an AWS Organizations
-/// management account.
-///
-/// Tax inheritance is an organization-level election — whether the member
-/// accounts of an organization inherit the management account's tax settings —
-/// and only that management account may make it. This emulator presents one
-/// standalone account ([`::engine::emulator_account_id`]) that belongs to no
-/// organization, so no caller it serves is a management account and the election
-/// cannot be made here; the call is answered with the refusal AWS gives a
-/// non-management caller rather than with a success that stores nothing AWS would
-/// have stored.
-///
-/// Comparing the caller against [`::engine::emulator_account_id`] is NOT the test
-/// that would admit a call: every caller resolves to that one account, so such a
-/// check would admit EVERY call — the opposite of what the service does.
-/// Management standing is a fact about an organization, which this service
-/// neither models nor is told about by any request it serves.
-pub const MANAGEMENT_ACCOUNT_ONLY: &str =
-    "Only AWS orgs management account is allowed to set tax inheritance.";
-
 /// The role the legal address stored with an account's tax registration plays
 /// for that account: one of the model's `AddressRoleType` values
 /// (`TaxAddress | BillingAddress | ContactAddress`).
@@ -492,11 +472,17 @@ pub struct ComAmazonawsTaxsettingsTaxsettingsState {
     /// `GetTaxInheritance` takes an account: both address the caller's own, and
     /// this emulator presents one account.
     ///
-    /// `None` while none is recorded, which is every call today: the only writer
-    /// AWS models is the management-account call no caller here can be (see
-    /// [`MANAGEMENT_ACCOUNT_ONLY`]), so this is the one place a writer that could
-    /// be would write, and `GetTaxInheritance` reports
-    /// [`DEFAULT_HERITAGE_STATUS`] until one does.
+    /// `None` until `PutTaxInheritance` records one, for as long as which
+    /// `GetTaxInheritance` reports [`DEFAULT_HERITAGE_STATUS`]; a write replaces
+    /// the value, because the account has exactly one election.
+    ///
+    /// The election is an organization-level one — whether an organization's
+    /// member accounts inherit the management account's tax settings — and the
+    /// one account this emulator presents stands for the organization it is the
+    /// management account of, so the election it asks to record is one it may
+    /// make. There is nothing here to tell one caller's standing from another's:
+    /// management standing is a fact about an organization, which this service
+    /// neither models nor is told about by any request it serves.
     pub tax_inheritance: Option<String>,
     /// The account's supplemental tax registrations, keyed by the `authorityId`
     /// this service minted for each when it was first stored.
@@ -658,8 +644,7 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
     ///
     /// Comparing a REQUEST-SUPPLIED id against [`::engine::emulator_account_id`]
     /// is a real discriminator (an id naming another account fails it), unlike
-    /// comparing the CALLER against it — see [`MANAGEMENT_ACCOUNT_ONLY`] for why
-    /// the latter would admit every call.
+    /// comparing the CALLER against it, which every caller passes.
     ///
     /// A read that names such an account reports it on its own per-account
     /// channel — the batch read's `failedAccounts` — so the accounts named
@@ -1319,21 +1304,6 @@ pub fn validation(
         field_list: Some(vec![ValidationExceptionField {
             name: parameter_name(member),
         }]),
-    }
-}
-
-/// This service's modelled `ValidationException` (HTTP 400) for a refusal that is
-/// about no one input member, so it carries no `fieldList`: that member names "the
-/// parameter that caused a `ValidationException` error", and a refusal of the
-/// CALL rather than of a parameter has none to name.
-pub fn validation_of_the_call(
-    error_code: &str,
-    message: impl Into<String>,
-) -> ValidationException {
-    ValidationException {
-        message: message.into(),
-        error_code: error_code.to_string(),
-        field_list: None,
     }
 }
 

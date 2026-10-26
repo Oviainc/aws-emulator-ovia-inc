@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemovePermission
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemovePermission`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemovePermission::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Revokes any permissions in the queue policy that matches the specified Label
+//! parameter": the statement whose `Sid` is that label goes out of the queue's `Policy`
+//! attribute and every other statement stays, through
+//! [`crate::state::Queue::revoke_permission`].
+//!
+//! A policy left with no statement at all is dropped rather than stored empty, so a
+//! queue whose last permission was revoked reports no `Policy` exactly as one that was
+//! never granted a permission does; either way the queue's `LastModifiedTimestamp`
+//! moves to now, as any other attribute change moves it. A label the policy does not
+//! grant is refused — there is no permission to revoke — rather than answered as a
+//! no-op.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +173,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemovePermission` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemovePermissionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemovePermission"))
+        use crate::state as sqs;
+
+        // Request metadata this call records: the access key id identifies the caller in
+        // the audit record below, the way the real service's trail does.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+
+        let store = sqs::service_state(&*self.engine).ok_or_else(|| {
+            RemovePermissionErrorModeled::UnsupportedOperation(sqs::store_unavailable())
+        })?;
+        let mut store = store.lock();
+
+        let name = sqs::queue_name_from_url(&input.queue_url)
+            .filter(|name| store.queues.contains_key(*name))
+            .map(str::to_string)
+            .ok_or_else(|| {
+                RemovePermissionErrorModeled::QueueDoesNotExist(sqs::queue_does_not_exist())
+            })?;
+        let queue = store
+            .queues
+            .get_mut(&name)
+            .expect("the queue was resolved out of this same store");
+
+        // A label is refused for its own form before it is looked for, so a value that
+        // could never have been granted is answered the same way whatever the queue's
+        // policy holds.
+        if let Some(message) = sqs::permission_label_refusal(&input.label) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                message,
+            ));
+        }
+        if !queue.revoke_permission(&input.label, ::std::time::SystemTime::now()) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                sqs::invalid_parameter_message(
+                    &input.label,
+                    sqs::PERMISSION_LABEL_PARAMETER,
+                    sqs::LABEL_NOT_FOUND,
+                ),
+            ));
+        }
+
+        // The audit record for a change of who may reach this queue: who asked, what
+        // changed, outcome. No secret and no credential material — only the access key id,
+        // the queue and the label whose permission is gone.
+        ::tracing::info!(
+            operation = "RemovePermission",
+            akid = %akid,
+            queue = %name,
+            label = %input.label,
+            outcome = "revoked",
+            "queue permission revoked"
+        );
+
+        Ok(RemovePermissionOutput)
     }
 }

@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAccountAuthorizationDetails
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAccountAuthorizationDetails`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAccountAuthorizationDetails::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: it reports the account's IAM configuration — every user, group, role
+//! and managed policy the account can see, each with the inline and managed policies
+//! attached to it — read from `crate::state`, and writes nothing.
+//!
+//! The four lists are ONE enumeration (`crate::state::entity_page_key`) under the
+//! single `Marker` the model binds (`paginated { inputToken: Marker, outputToken:
+//! Marker }`), so a page carries whichever of the four kinds falls in it and the next
+//! page resumes strictly after the key the `Marker` names. `Filter` selects the entity
+//! TYPES to include within that order; an absent `Filter` includes them all.
+//!
+//! The account's own managed policies are reported whether or not anything uses them —
+//! holding one is part of the account's configuration — while an AWS-owned policy,
+//! published to every account, is reported only while the account USES it: attached to
+//! an identity, or setting one's permissions boundary.
+//!
+//! A policy document is reported as the plain JSON text the account stored, which is
+//! how every reader in this crate reports one (`crate::ops::get_policy_version`): a
+//! URL-decoding client reads plain JSON unchanged, since RFC 3986 only escapes
+//! characters an IAM policy document need not carry.
 //!
 //! ## Shape of an operation
 //!
@@ -104,6 +115,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// This service's store, as the report builders below take it.
+use crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State as IamStore;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -172,18 +186,406 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAccountAuthorizationDetails` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAccountAuthorizationDetailsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAccountAuthorizationDetails"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetAccountAuthorizationDetailsErrorModeled::ServiceFailureException(
+                    ServiceFailureException {
+                        message: Some("the IAM store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The page resumes strictly after the POSITION in the account's enumeration
+        // order that the marker names, so a token this service's encoding cannot have
+        // produced is refused rather than silently read as "start from the beginning".
+        // This operation models no invalid-input error, so the refusal is the 400
+        // `ValidationException` an unmodelled bad request gets. A token that decodes
+        // but names an entity deleted since the previous page is NOT an error: paging
+        // resumes from the position, and that entity is simply no longer in the range.
+        let resume_after = match &input.marker {
+            Some(marker) => match crate::state::decode_marker(
+                crate::state::MARKER_SCOPE_ACCOUNT_AUTHORIZATION_DETAILS,
+                marker,
+            ) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "Invalid Marker: the value is not a marker this service issued",
+                    ))
+                }
+            },
+            None => None,
+        };
+        // `maxItemsType` is range 1..1000 and the boundary validator has already
+        // refused anything outside it, so the only choice left here is the default
+        // for an absent `MaxItems`: "the number of items defaults to 100". `.max(1)`
+        // is what makes the cast lossless.
+        let page_size = input
+            .max_items
+            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
+            .max(1) as usize;
+
+        // WHICH entity types the request asks about: "only the entities that match the
+        // types you specify are included in the output", so a `Filter` naming some of
+        // them leaves the rest out, and an absent one leaves nothing out — as does one
+        // carrying no member at all, which specifies no type and whose wire form is
+        // indistinguishable from the absent parameter. Each value is one of the
+        // modelled `EntityType` enum's, and the boundary validator has already refused
+        // any value outside the declared set (400 `ValidationException`).
+        let filter = input.filter.unwrap_or_default();
+        let selected = |entity_type: &str| {
+            filter.is_empty() || filter.iter().any(|wanted| wanted == entity_type)
+        };
+        let want_users = selected(crate::state::ENTITY_FILTER_USER);
+        let want_groups = selected(crate::state::ENTITY_FILTER_GROUP);
+        let want_roles = selected(crate::state::ENTITY_FILTER_ROLE);
+        let want_local_policies = selected(crate::state::ENTITY_FILTER_LOCAL_MANAGED_POLICY);
+        let want_aws_policies = selected(crate::state::ENTITY_FILTER_AWS_MANAGED_POLICY);
+
+        // A read: it reports the persisted configuration and writes nothing.
+        let store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies
+        // are evaluated before any detail is reported. This request addresses the
+        // account's whole configuration rather than one entity in it, so the decision
+        // is made on the account-wide resource.
+        crate::state::authorization::authorize(
+            &store,
+            ctx,
+            crate::state::authorization::GET_ACCOUNT_AUTHORIZATION_DETAILS,
+            crate::state::authorization::ACCOUNT_WIDE_RESOURCE,
+        )?;
+
+        // Every entity the request asks about, named in ONE enumeration order: the
+        // entity's type tag then the key its own store holds it under, so the byte
+        // order of the keys IS the order a single `Marker` pages over all four lists
+        // in. Only the NAMES are collected here, so the details a page does not carry
+        // are never built.
+        let mut ordered: Vec<(String, ReportedEntity)> = Vec::new();
+        if want_users {
+            for user_key in store.users.keys() {
+                ordered.push((
+                    crate::state::entity_page_key(crate::state::ENTITY_FILTER_USER, user_key),
+                    ReportedEntity::User(user_key.clone()),
+                ));
+            }
+        }
+        if want_groups {
+            for group_key in store.groups.keys() {
+                ordered.push((
+                    crate::state::entity_page_key(crate::state::ENTITY_FILTER_GROUP, group_key),
+                    ReportedEntity::Group(group_key.clone()),
+                ));
+            }
+        }
+        if want_roles {
+            for role_key in store.roles.keys() {
+                ordered.push((
+                    crate::state::entity_page_key(crate::state::ENTITY_FILTER_ROLE, role_key),
+                    ReportedEntity::Role(role_key.clone()),
+                ));
+            }
+        }
+        // A managed policy is named by its ARN, which is its identity and the key its
+        // own readers resolve it through.
+        if want_local_policies {
+            for arn in store
+                .policies
+                .values()
+                .filter_map(|held| held.policy.arn.clone())
+            {
+                ordered.push((
+                    crate::state::entity_page_key(
+                        crate::state::ENTITY_FILTER_LOCAL_MANAGED_POLICY,
+                        &arn,
+                    ),
+                    ReportedEntity::Policy(arn),
+                ));
+            }
+        }
+        if want_aws_policies {
+            for arn in crate::state::AWS_MANAGED_POLICIES
+                .iter()
+                .map(|entry| entry.arn())
+            {
+                // AWS owns its managed policies and publishes them to every account, so
+                // one of them is part of THIS account's configuration only insofar as
+                // the account USES it: what is reported is "a snapshot of the
+                // configuration of IAM permissions (users, groups, roles, and policies)
+                // in your account", and an AWS-owned policy nothing is attached to and
+                // nothing is bounded by is no part of that snapshot. The account's OWN
+                // policies are reported whether or not anything uses them, because
+                // holding one IS part of its configuration. The two relations tested
+                // here are the two `ListEntitiesForPolicy` separates, and the two the
+                // reported `AttachmentCount` and `PermissionsBoundaryUsageCount` count.
+                if store.policy_attachment_count(&arn) == 0
+                    && store.permissions_boundary_usage_count(&arn) == 0
+                {
+                    continue;
+                }
+                ordered.push((
+                    crate::state::entity_page_key(
+                        crate::state::ENTITY_FILTER_AWS_MANAGED_POLICY,
+                        &arn,
+                    ),
+                    ReportedEntity::Policy(arn),
+                ));
+            }
+        }
+        ordered.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        let mut user_detail_list = Vec::new();
+        let mut group_detail_list = Vec::new();
+        let mut role_detail_list = Vec::new();
+        let mut policies = Vec::new();
+        let mut is_truncated = false;
+        let mut last_key = None;
+        for (reported, (key, entity)) in ordered
+            .into_iter()
+            .filter(|(key, _)| resume_after.as_deref().is_none_or(|after| key.as_str() > after))
+            .enumerate()
+        {
+            if reported == page_size {
+                // There is at least one more selected entity, so the caller needs
+                // another page to see it.
+                is_truncated = true;
+                break;
+            }
+            // The entity's detail is built HERE, for the page that carries it: the
+            // store cannot change while this report holds its lock, so a name
+            // collected above still names the entity it was collected from.
+            match entity {
+                ReportedEntity::User(user_key) => {
+                    if let Some(user) = store.users.get(&user_key) {
+                        user_detail_list.push(user_detail(&store, &user_key, user));
+                    }
+                }
+                ReportedEntity::Group(group_key) => {
+                    if let Some(group) = store.groups.get(&group_key) {
+                        group_detail_list.push(group_detail(&store, &group_key, group));
+                    }
+                }
+                ReportedEntity::Role(role_key) => {
+                    if let Some(role) = store.roles.get(&role_key) {
+                        role_detail_list.push(role_detail(&store, &role_key, role));
+                    }
+                }
+                // ONE resolution, the one every reader of a managed policy reports
+                // from, so a reported policy carries the same record — and the same
+                // live attachment and boundary-usage counts — as its own `GetPolicy`
+                // read.
+                ReportedEntity::Policy(arn) => {
+                    if let Some(resolved) = store.resolve_policy(&arn) {
+                        policies.push(managed_policy_detail(&resolved));
+                    }
+                }
+            }
+            last_key = Some(key);
+        }
+
+        Ok(GetAccountAuthorizationDetailsOutput {
+            user_detail_list: Some(user_detail_list),
+            group_detail_list: Some(group_detail_list),
+            role_detail_list: Some(role_detail_list),
+            policies: Some(policies),
+            is_truncated,
+            marker: is_truncated
+                .then(|| {
+                    last_key.as_deref().map(|key| {
+                        crate::state::encode_marker(
+                            crate::state::MARKER_SCOPE_ACCOUNT_AUTHORIZATION_DETAILS,
+                            key,
+                        )
+                    })
+                })
+                .flatten(),
+        })
     }
+}
+
+/// ONE entity a page reports, named by the key its own store holds it under —
+/// [`name_key`](crate::state::name_key) of its name for a user, group or role, and the
+/// ARN for a managed policy.
+///
+/// The four output lists are pages of a single enumeration, so what falls in a page
+/// has to be carried as one value; the DETAIL is built from the named entity once the
+/// page it belongs to is known.
+#[derive(Debug)]
+enum ReportedEntity {
+    User(String),
+    Group(String),
+    Role(String),
+    Policy(String),
+}
+
+/// The user keyed by `user_key` as this operation reports it: the record the account
+/// holds, plus the policies attached to it.
+///
+/// `UserDetail` carries every attribute `GetUser` reports — this operation is a
+/// snapshot of the configuration rather than a resource listing, so `PermissionsBoundary`
+/// and `Tags` are reported rather than withheld.
+fn user_detail(store: &IamStore, user_key: &str, user: &User) -> UserDetail {
+    UserDetail {
+        path: Some(user.path.clone()),
+        user_name: Some(user.user_name.clone()),
+        user_id: Some(user.user_id.clone()),
+        arn: Some(user.arn.clone()),
+        create_date: Some(user.create_date),
+        user_policy_list: Some(inline_policy_details(&store.user_inline_policies, user_key)),
+        // "A list of IAM groups that the user is in": the memberships the account
+        // holds, each reported by the group's name as the account holds it — the
+        // membership is keyed by the case-folded name, so the name comes from the
+        // group's own record — in the key order that map is ordered on. While
+        // `AddUserToGroup` is a scaffolded 501 nothing fills the map, which this
+        // derivation answers with an empty list of its own accord.
+        group_list: Some(
+            store
+                .group_members
+                .iter()
+                .filter(|(_, members)| members.contains(user_key))
+                .filter_map(|(group_key, _)| store.groups.get(group_key))
+                .map(|group| group.group_name.clone())
+                .collect(),
+        ),
+        attached_managed_policies: Some(attached_policy_details(
+            store.user_attached_policies.get(user_key),
+        )),
+        permissions_boundary: user.permissions_boundary.clone(),
+        tags: user.tags.clone(),
+    }
+}
+
+/// The group keyed by `group_key` as this operation reports it: the record the account
+/// holds, plus the policies attached to it.
+fn group_detail(store: &IamStore, group_key: &str, group: &Group) -> GroupDetail {
+    GroupDetail {
+        path: Some(group.path.clone()),
+        group_name: Some(group.group_name.clone()),
+        group_id: Some(group.group_id.clone()),
+        arn: Some(group.arn.clone()),
+        create_date: Some(group.create_date),
+        group_policy_list: Some(inline_policy_details(
+            &store.group_inline_policies,
+            group_key,
+        )),
+        // `AttachGroupPolicy` is still a scaffolded 501, so a group the account holds
+        // carries no managed-policy attachment and the list is empty rather than
+        // invented, for the reason `crate::state` gives where a group's attachments
+        // would be read.
+        attached_managed_policies: Some(Vec::new()),
+    }
+}
+
+/// The role keyed by `role_key` as this operation reports it: the record the account
+/// holds, plus its trust policy, the instance profiles that contain it and the
+/// policies attached to it.
+fn role_detail(store: &IamStore, role_key: &str, role: &Role) -> RoleDetail {
+    RoleDetail {
+        path: Some(role.path.clone()),
+        role_name: Some(role.role_name.clone()),
+        role_id: Some(role.role_id.clone()),
+        arn: Some(role.arn.clone()),
+        create_date: Some(role.create_date),
+        assume_role_policy_document: role.assume_role_policy_document.clone(),
+        // "A list of instance profiles that contain this role": the bindings
+        // `AddRoleToInstanceProfile` wrote, each reported as the account holds the
+        // profile now (`crate::state::instance_profile_report`).
+        instance_profile_list: Some(
+            store
+                .instance_profiles_holding_role(role_key)
+                .iter()
+                .filter_map(|name| store.instance_profile_report(&crate::state::name_key(name)))
+                .collect(),
+        ),
+        role_policy_list: Some(inline_policy_details(&store.role_inline_policies, role_key)),
+        attached_managed_policies: Some(attached_policy_details(
+            store.role_attached_policies.get(role_key),
+        )),
+        permissions_boundary: role.permissions_boundary.clone(),
+        tags: role.tags.clone(),
+        role_last_used: role.role_last_used.clone(),
+    }
+}
+
+/// A resolved managed policy as this operation reports it: the metadata every reader
+/// of the policy reports, plus its versions.
+///
+/// `ManagedPolicyDetail` carries `Description` and a `PolicyVersionList` whose
+/// versions carry their documents, which is what makes this report the snapshot of the
+/// account's permissions its own documentation describes; the versions are ordered the
+/// way `ListPolicyVersions` enumerates them (ascending by version number,
+/// `crate::state::policy_version_page_key`).
+fn managed_policy_detail(resolved: &crate::state::ManagedPolicy) -> ManagedPolicyDetail {
+    let mut ordered: Vec<(String, PolicyVersion)> = resolved
+        .versions
+        .values()
+        .map(|version| {
+            (
+                crate::state::policy_version_page_key(
+                    version.version_id.as_deref().unwrap_or_default(),
+                ),
+                version.clone(),
+            )
+        })
+        .collect();
+    ordered.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let policy = &resolved.policy;
+    ManagedPolicyDetail {
+        policy_name: policy.policy_name.clone(),
+        policy_id: policy.policy_id.clone(),
+        arn: policy.arn.clone(),
+        path: policy.path.clone(),
+        default_version_id: policy.default_version_id.clone(),
+        attachment_count: policy.attachment_count,
+        permissions_boundary_usage_count: policy.permissions_boundary_usage_count,
+        is_attachable: policy.is_attachable,
+        description: policy.description.clone(),
+        create_date: policy.create_date,
+        update_date: policy.update_date,
+        policy_version_list: Some(ordered.into_iter().map(|(_, version)| version).collect()),
+    }
+}
+
+/// The inline policies `embedded` holds for the entity keyed by `entity_key`, each as
+/// the name and document `PolicyDetail` reports, in the policy-name order the
+/// embedding map holds them in.
+fn inline_policy_details(
+    embedded: &::std::collections::BTreeMap<
+        String,
+        ::std::collections::BTreeMap<String, crate::state::InlinePolicy>,
+    >,
+    entity_key: &str,
+) -> Vec<PolicyDetail> {
+    embedded
+        .get(entity_key)
+        .into_iter()
+        .flatten()
+        .map(|(_, policy)| PolicyDetail {
+            policy_name: Some(policy.policy_name.clone()),
+            policy_document: Some(policy.policy_document.clone()),
+        })
+        .collect()
+}
+
+/// The managed-policy attachments `attached` holds, each as the `AttachedPolicy` a
+/// reader of them reports.
+///
+/// Both members are carried by the ARN the attachment was made with: a managed
+/// policy's ARN ends in its path and friendly name, which is what it is reported
+/// under (`crate::state::parse_policy_arn`).
+fn attached_policy_details(
+    attached: Option<&::std::collections::BTreeSet<String>>,
+) -> Vec<AttachedPolicy> {
+    attached
+        .into_iter()
+        .flatten()
+        .filter_map(|arn| {
+            crate::state::parse_policy_arn(arn).map(|parsed| AttachedPolicy {
+                policy_name: Some(parsed.policy_name),
+                policy_arn: Some(arn.clone()),
+            })
+        })
+        .collect()
 }

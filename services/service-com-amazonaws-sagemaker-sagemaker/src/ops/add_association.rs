@@ -199,14 +199,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An association is an edge between STORED entities, so both ends must exist: an
         // ARN nothing created gets the not-found failure this operation models, never a
         // 200 recording an edge to nothing. The source is resolved first, so a request
-        // naming two unknown ARNs reports the first end it could not resolve.
-        for (member, arn) in [
-            ("SourceArn", &input.source_arn),
-            ("DestinationArn", &input.destination_arn),
-        ] {
+        // naming two unknown ARNs reports the first end it could not resolve. The refusal
+        // is the lineage family's recorded sentence
+        // (`crate::state::does_not_exist`), naming the end generically: an
+        // `AssociationEntityArn` admits five entity kinds and an ARN that resolves to
+        // none of them names no kind to report.
+        for arn in [&input.source_arn, &input.destination_arn] {
             if !store.lineage_entity_exists(&region, arn) {
                 return Err(AddAssociationErrorModeled::ResourceNotFound(ResourceNotFound {
-                    message: Some(format!("Could not find {member} \"{arn}\".")),
+                    message: Some(crate::state::does_not_exist(
+                        crate::state::ASSOCIATION_END_ENTITY,
+                        arn,
+                    )),
                 })
                 .into());
             }
@@ -243,6 +247,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         source_arn: input.source_arn.clone(),
                         destination_arn: input.destination_arn.clone(),
                         association_type: input.association_type.clone(),
+                        // The identity that created the edge, stored by the call that
+                        // created it rather than rebuilt per read, so a later reader
+                        // reports who really added this association.
+                        created_by: crate::state::caller_user_context(ctx),
                         creation_time: now,
                     },
                 );

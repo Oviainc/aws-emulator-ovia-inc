@@ -191,9 +191,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The update is applied to the stored pipe (the ARN was minted at create time),
-        // so nothing here depends on request metadata.
-        let _ = ctx;
+        // The update is applied to the stored pipe (the ARN was minted at create time);
+        // `ctx` is the callback the data-plane poller of a pipe this update leaves
+        // RUNNING reaches the other services of this emulator through.
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdatePipeErrorModeled::InternalException(InternalException {
                 message: "the pipes store is not reachable from this engine".to_string(),
@@ -312,14 +312,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         pipe.begin_transition(crate::state::pipe_state::UPDATING, &settled);
         pipe.last_modified_time = ::std::time::SystemTime::now();
 
-        Ok(UpdatePipeOutput {
+        let output = UpdatePipeOutput {
             arn: Some(pipe.arn.clone()),
             name: Some(pipe.name.clone()),
             desired_state: Some(pipe.desired_state.clone()),
             current_state: Some(pipe.current_state.clone()),
             creation_time: Some(crate::state::timestamp(pipe.creation_time)),
             last_modified_time: Some(crate::state::timestamp(pipe.last_modified_time)),
-        })
+        };
+        // An update that leaves the pipe meant to RUN starts its poller if the pipe has
+        // none — an update that stopped it needs no call, because the poller ends itself
+        // as soon as the pipe is no longer RUNNING.
+        let runnable = settled == crate::state::requested_state::RUNNING;
+        drop(state);
+        if runnable {
+            crate::state::data_plane::drive_pipe(ctx, &self.engine, &input.name);
+        }
+        Ok(output)
     }
 }
 
