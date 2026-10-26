@@ -65,6 +65,8 @@ mod list_tags_for_resource;
 mod max_results_range;
 #[path = "all/page_bounds.rs"]
 mod page_bounds;
+#[path = "all/paged_cursor_subject_binding.rs"]
+mod paged_cursor_subject_binding;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/service_dependency_metrics.rs"]
