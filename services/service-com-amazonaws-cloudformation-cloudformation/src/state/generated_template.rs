@@ -32,9 +32,29 @@
 //! [`StoredGeneratedTemplate::is_in_flight`] answers true for, and because the statuses it
 //! counts are the ones the clock retires, the cap LIFTS on its own as the generations it
 //! counted complete.
+//!
+//! ## The template body a generation produces
+//!
+//! What `GetGeneratedTemplate` answers is a TEMPLATE, rendered from the record rather than
+//! stored as text: the resources the generation covers, each keyed by the logical id it has
+//! in the final template ([`final_logical_ids`]) and carrying the `TemplateConfiguration`
+//! the record holds. It is rendered on demand because the language is the READ's choice —
+//! `GetGeneratedTemplateInput$Format` is "the language to use to retrieve for the generated
+//! template", `JSON` or `YAML` — so one record answers either spelling of the same
+//! template.
+//!
+//! Which generation that template is from is the documented part: "if the template is in an
+//! InProgress or Pending status then the template returned will be the template when the
+//! template was last in a Complete status", and "if the template has not yet been in a
+//! Complete status then an empty template will be returned". A record therefore carries the
+//! template of its last COMPLETE generation in [`StoredGeneratedTemplate::completed`], which
+//! [`StoredGeneratedTemplate::settle`] snapshots as it materialises that completion, and a
+//! record that has never completed renders the empty template.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
+
+use ::serde_json::{Map, Value};
 
 /// The `GeneratedTemplateStatus` values a generated template reports (the model's own enum,
 /// documented value by value on `DescribeGeneratedTemplateOutput$Status`).
@@ -51,6 +71,20 @@ pub mod status {
     pub const DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
     pub const COMPLETE: &str = "COMPLETE";
     pub const FAILED: &str = "FAILED";
+}
+
+/// The `TemplateFormat` values a read may ask a generated template's body in (the model's
+/// own enum: `JSON | YAML`), as `GetGeneratedTemplateInput$Format`.
+pub mod format {
+    pub const JSON: &str = "JSON";
+    pub const YAML: &str = "YAML";
+}
+
+/// The `GeneratedTemplateDeletionPolicy` / `GeneratedTemplateUpdateReplacePolicy` values a
+/// `TemplateConfiguration` carries (both modelled enums are `DELETE | RETAIN`).
+pub mod policy {
+    pub const DELETE: &str = "DELETE";
+    pub const RETAIN: &str = "RETAIN";
 }
 
 /// The `GeneratedTemplateResourceStatus` values one resource of a generated template
@@ -143,6 +177,20 @@ pub struct GeneratedResource {
     pub resource_identifier: BTreeMap<String, String>,
 }
 
+/// The template the last COMPLETE generation of one record produced: the resources it
+/// covered and the configuration assigned to them at that point.
+///
+/// Snapshotted rather than read live off the record, because "the template returned will be
+/// the template when the template was last in a Complete status": a generation started
+/// since (an `UpdateGeneratedTemplate`, which covers a different resource set) must not
+/// change what a read answers until that generation itself completes.
+#[derive(Debug, Clone)]
+pub struct CompletedGeneration {
+    pub resources: Vec<GeneratedResource>,
+    pub deletion_policy: Option<String>,
+    pub update_replace_policy: Option<String>,
+}
+
 /// The terminal status a generation is headed for, and the instant it is due.
 #[derive(Debug, Clone)]
 pub struct PendingGeneration {
@@ -180,6 +228,10 @@ pub struct StoredGeneratedTemplate {
     /// [`crate::state::ComAmazonawsCloudformationCloudformationState::settle`] materialises
     /// it.
     pub pending: Option<PendingGeneration>,
+    /// The template of the last generation of this record that reached `COMPLETE`, which is
+    /// the one a read of its body answers. `None` until one has, since "if the template has
+    /// not yet been in a Complete status then an empty template will be returned".
+    pub completed: Option<CompletedGeneration>,
 }
 
 impl StoredGeneratedTemplate {
@@ -208,6 +260,7 @@ impl StoredGeneratedTemplate {
                 status_reason: Some(GENERATION_COMPLETE_REASON.to_string()),
                 due_at: now + GENERATION_DELAY,
             }),
+            completed: None,
         }
     }
 
@@ -222,6 +275,17 @@ impl StoredGeneratedTemplate {
         let pending = self.pending.take().expect("checked just above");
         self.status = pending.status;
         self.status_reason = pending.status_reason;
+        // A generation that CONCLUDED produced a template, and that template is what every
+        // later read of the body answers until another generation concludes — so the
+        // resources and configuration it covered are snapshotted as the completion is
+        // materialised, not read live off a record a later generation may have moved on.
+        if self.status == status::COMPLETE {
+            self.completed = Some(CompletedGeneration {
+                resources: self.resources.clone(),
+                deletion_policy: self.deletion_policy.clone(),
+                update_replace_policy: self.update_replace_policy.clone(),
+            });
+        }
         // "The time the generated template was last updated": the generation concluding is
         // the update, so it is stamped with the instant that was due rather than with now.
         self.last_updated_time = pending.due_at;
@@ -271,6 +335,89 @@ impl StoredGeneratedTemplate {
             resources_failed: 0,
         }
     }
+
+    /// The body of this generated template, in the language the read asked for.
+    ///
+    /// `Format` is "the language to use to retrieve for the generated template. Supported
+    /// values are: JSON YAML"; a read that names neither is answered the JSON spelling,
+    /// which is the language a template body is written in when nothing says otherwise.
+    pub fn template_body(&self, format: Option<&str>) -> String {
+        let document = self.last_complete_template();
+        if format == Some(format::YAML) {
+            yaml_text(&document)
+        } else {
+            json_text(&document)
+        }
+    }
+
+    /// The template of this record's last COMPLETE generation, as a template document.
+    ///
+    /// "If the template has not yet been in a Complete status then an empty template will be
+    /// returned" — the empty template, not an absent body.
+    fn last_complete_template(&self) -> Value {
+        let Some(completed) = self.completed.as_ref() else {
+            return Value::Object(Map::new());
+        };
+        let mut resources = Map::new();
+        let logical_ids = final_logical_ids(&completed.resources);
+        for (logical_id, resource) in logical_ids.into_iter().zip(&completed.resources) {
+            let mut declared = Map::new();
+            declared.insert(
+                "Type".to_string(),
+                Value::String(resource.resource_type.clone()),
+            );
+            // "The DeletionPolicy assigned to resources in the generated template" — and the
+            // same for UpdateReplacePolicy: the configuration is assigned to every resource
+            // of the template, so it is rendered onto each one, and a configuration the
+            // record does not carry assigns no attribute at all.
+            for (attribute, configured) in [
+                ("DeletionPolicy", completed.deletion_policy.as_deref()),
+                (
+                    "UpdateReplacePolicy",
+                    completed.update_replace_policy.as_deref(),
+                ),
+            ] {
+                if let Some(value) = configured.and_then(attribute_policy) {
+                    declared.insert(attribute.to_string(), Value::String(value.to_string()));
+                }
+            }
+            // The properties of the resource that the record knows: the primary-identifier
+            // pairs it was identified by ("the key is the name of one of the primary
+            // identifiers for the resource", which is a property of the resource). A
+            // resource the record holds no property of declares none rather than an empty
+            // map.
+            if !resource.resource_identifier.is_empty() {
+                declared.insert(
+                    "Properties".to_string(),
+                    Value::Object(
+                        resource
+                            .resource_identifier
+                            .iter()
+                            .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+                            .collect(),
+                    ),
+                );
+            }
+            resources.insert(logical_id, Value::Object(declared));
+        }
+
+        let mut document = Map::new();
+        // The generated template's own id, carried by the template it generated, so the
+        // document says which record it came out of.
+        let mut metadata = Map::new();
+        metadata.insert(
+            "TemplateId".to_string(),
+            Value::String(self.generated_template_id.clone()),
+        );
+        document.insert("Metadata".to_string(), Value::Object(metadata));
+        // A generation may cover no resource at all ("if no resources are specified, the
+        // template will be created without any resources"), and a template declares no
+        // empty `Resources` section for that.
+        if !resources.is_empty() {
+            document.insert("Resources".to_string(), Value::Object(resources));
+        }
+        Value::Object(document)
+    }
 }
 
 /// The counts `TemplateProgress` reports for one generation.
@@ -286,4 +433,139 @@ pub struct GenerationProgress {
 /// holds no record of, built from what the request named.
 pub fn does_not_exist(name_or_id: &str) -> String {
     format!("Generated template {name_or_id} cannot be found")
+}
+
+/// The logical id each covered resource has IN THE FINAL GENERATED TEMPLATE, index by
+/// index with `resources`.
+///
+/// A template keys its resources by logical id, and `ResourceDetail$LogicalResourceId` is
+/// "the logical id for this resource in the final generated template" — while the logical
+/// id a request may supply for a resource it lists
+/// (`ResourceDefinition$LogicalResourceId`) is OPTIONAL. So the id supplied for a resource
+/// is the one it keeps, and a resource that was given none is still keyed by something: an
+/// id derived from its own resource type, which is the only thing known about it that says
+/// what it is. A derived id stays clear of every supplied one, and a collision either way
+/// is broken by the smallest ordinal suffix that is still free, so the ids of one template
+/// are pairwise distinct — "unique within the template" is what a template keying its
+/// resources by them requires — and the same record always renders the same ones.
+pub fn final_logical_ids(resources: &[GeneratedResource]) -> Vec<String> {
+    let supplied: BTreeSet<&str> = resources
+        .iter()
+        .filter_map(|resource| resource.logical_resource_id.as_deref())
+        .collect();
+    let mut used: BTreeSet<String> = BTreeSet::new();
+    let mut ids = Vec::with_capacity(resources.len());
+    for resource in resources {
+        let asked_for = resource.logical_resource_id.is_some();
+        let base = match resource.logical_resource_id.as_deref() {
+            Some(id) => id.to_string(),
+            None => logical_id_of_type(&resource.resource_type),
+        };
+        let mut candidate = base.clone();
+        let mut ordinal = 1usize;
+        // A derived id yields to every id the request asked for, wherever in the list that
+        // resource sits, so nothing takes a key a resource of this template was named by.
+        while used.contains(&candidate)
+            || (!asked_for && supplied.contains(candidate.as_str()))
+        {
+            ordinal += 1;
+            candidate = format!("{base}{ordinal}");
+        }
+        used.insert(candidate.clone());
+        ids.push(candidate);
+    }
+    ids
+}
+
+/// A logical id derived from a resource type: the type's own segments past the vendor
+/// prefix, letters and digits only (`AWS::DynamoDB::Table` -> `DynamoDBTable`).
+///
+/// A logical id is "alphanumeric (A-Za-z0-9) and unique within the template", so everything
+/// a type name carries that an id may not hold is dropped.
+fn logical_id_of_type(resource_type: &str) -> String {
+    let mut id = String::new();
+    for (position, segment) in resource_type.split("::").enumerate() {
+        if position == 0 && matches!(segment, "AWS" | "Alexa" | "Custom") {
+            continue;
+        }
+        id.extend(segment.chars().filter(|c| c.is_ascii_alphanumeric()));
+    }
+    if id.is_empty() {
+        // Nothing of the type name survives as an id (a type that is punctuation alone):
+        // the resource still needs a key, so it falls back to the generic noun and the
+        // ordinal suffix above is what keeps those distinct.
+        "Resource".to_string()
+    } else {
+        id
+    }
+}
+
+/// The resource-attribute spelling of a configured `DeletionPolicy` / `UpdateReplacePolicy`.
+///
+/// The configuration is modelled as an enum of `DELETE | RETAIN`, while the attribute it is
+/// assigned to in a template takes that attribute's own documented values (`Delete` /
+/// `Retain`), so the rendered template speaks the attribute's vocabulary rather than the
+/// API's.
+fn attribute_policy(configured: &str) -> Option<&'static str> {
+    match configured {
+        policy::DELETE => Some("Delete"),
+        policy::RETAIN => Some("Retain"),
+        _ => None,
+    }
+}
+
+/// A template document as JSON text.
+fn json_text(document: &Value) -> String {
+    // Indented, because a template body is a document a caller reads and edits. Infallible
+    // for a document built here (no non-string map key and no non-finite number), and a
+    // body is never absent, so the empty template is the fallback.
+    ::serde_json::to_string_pretty(document).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// A template document as YAML text.
+///
+/// "You can write CloudFormation templates in JSON or YAML", so the YAML spelling is
+/// emitted as YAML — through the same maintained YAML implementation this crate reads a
+/// submitted body with — rather than handed back as its JSON spelling.
+fn yaml_text(document: &Value) -> String {
+    let node = yaml_node(document);
+    let mut text = String::new();
+    let mut emitter = ::yaml_rust2::YamlEmitter::new(&mut text);
+    if emitter.dump(&node).is_err() {
+        return "{}".to_string();
+    }
+    // The emitter opens with YAML's document-start marker; a template body carries the
+    // document itself, so the marker line — and only it — is dropped.
+    let body = match text.strip_prefix("---") {
+        Some(rest) => rest.strip_prefix('\n').unwrap_or(rest),
+        None => text.as_str(),
+    };
+    if body.is_empty() {
+        "{}".to_string()
+    } else {
+        body.to_string()
+    }
+}
+
+/// One template node as the YAML implementation's own tree.
+fn yaml_node(value: &Value) -> ::yaml_rust2::Yaml {
+    use ::yaml_rust2::Yaml;
+
+    match value {
+        Value::Null => Yaml::Null,
+        Value::Bool(flag) => Yaml::Boolean(*flag),
+        Value::Number(number) => match number.as_i64() {
+            Some(integer) => Yaml::Integer(integer),
+            None => Yaml::Real(number.to_string()),
+        },
+        Value::String(text) => Yaml::String(text.clone()),
+        Value::Array(items) => Yaml::Array(items.iter().map(yaml_node).collect()),
+        Value::Object(members) => {
+            let mut mapping = ::yaml_rust2::yaml::Hash::new();
+            for (key, member) in members {
+                mapping.insert(Yaml::String(key.clone()), yaml_node(member));
+            }
+            Yaml::Hash(mapping)
+        }
+    }
 }

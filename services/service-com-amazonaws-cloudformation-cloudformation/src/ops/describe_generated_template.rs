@@ -196,6 +196,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let resource_status = template.resource_status();
         let progress = template.progress();
+        // "The logical id for this resource in the final generated template": the id the
+        // template `GetGeneratedTemplate` renders keys the resource by, so the two reads
+        // agree on the template they are describing.
+        let logical_ids =
+            crate::state::generated_template::final_logical_ids(&template.resources);
         Ok(DescribeGeneratedTemplateOutput {
             generated_template_id: Some(template.generated_template_id.clone()),
             generated_template_name: Some(template.generated_template_name.clone()),
@@ -206,9 +211,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 template
                     .resources
                     .iter()
-                    .map(|resource| ResourceDetail {
+                    .zip(logical_ids)
+                    .map(|(resource, logical_id)| ResourceDetail {
                         resource_type: Some(resource.resource_type.clone()),
-                        logical_resource_id: resource.logical_resource_id.clone(),
+                        logical_resource_id: Some(logical_id),
                         resource_identifier: (!resource.resource_identifier.is_empty()).then(
                             || {
                                 resource

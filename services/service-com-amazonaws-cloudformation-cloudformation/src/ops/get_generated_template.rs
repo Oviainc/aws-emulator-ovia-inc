@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetGeneratedTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetGeneratedTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetGeneratedTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads the TEMPLATE one generated-template record produced, in the language the request
+//! asks for: the resources that generation covered, each keyed by the logical id it has in
+//! the final template and carrying the record's `TemplateConfiguration`, rendered from the
+//! record by [`crate::state::generated_template::StoredGeneratedTemplate::template_body`].
+//! Which generation's template that is follows this operation's own documentation: the
+//! last one that reached a complete status, and the empty template until one has, so a
+//! read during a generation still in flight answers the template from before it. A
+//! reporting operation: the only write it makes is through `crate::state::...::settle`,
+//! which materialises the generation conclusion the clock had already made due. A name this
+//! account and Region holds no record for is refused with the modelled
+//! `GeneratedTemplateNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +157,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetGeneratedTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetGeneratedTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetGeneratedTemplate"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no generated template to read, so
+            // this answers 501 rather than a template body nothing stands behind.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetGeneratedTemplate",
+            ));
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a transition the clock had
+        // already made due — the generation's own conclusion, which was owed at the same
+        // instant whether or not anybody read it, and which decides both the status this
+        // answers and the template it answers.
+        store.settle(::std::time::SystemTime::now());
+
+        let template = store
+            .resolve_generated_template(&region, &input.generated_template_name)
+            .ok_or_else(|| {
+                GetGeneratedTemplateErrorModeled::GeneratedTemplateNotFoundException(
+                    GeneratedTemplateNotFoundException {
+                        message: Some(crate::state::generated_template::does_not_exist(
+                            &input.generated_template_name,
+                        )),
+                    },
+                )
+            })?;
+
+        Ok(GetGeneratedTemplateOutput {
+            status: Some(template.status.clone()),
+            template_body: Some(template.template_body(input.format.as_deref())),
+        })
     }
 }
