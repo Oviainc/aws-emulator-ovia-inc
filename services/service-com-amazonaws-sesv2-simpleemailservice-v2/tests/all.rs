@@ -21,5 +21,7 @@ mod contact_lists;
 mod email_identity_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/suppressed_destinations.rs"]
+mod suppressed_destinations;
 #[path = "all/tenants.rs"]
 mod tenants;

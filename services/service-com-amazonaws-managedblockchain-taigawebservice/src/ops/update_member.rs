@@ -3,7 +3,8 @@
 //! @op UpdateMember
 //!
 //! `UpdateMember` applies the member configuration parameters a request names to the
-//! stored member record; `GetMember` reads the result back.
+//! stored member record and starts the change the member reports as `UPDATING` until the
+//! clock owes it `AVAILABLE` again; `GetMember` reads both back.
 //!
 //! ## Shape of an operation
 //!
@@ -160,8 +161,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
-        guard.settle(::std::time::SystemTime::now());
+        guard.settle(now);
 
         // `PATCH /networks/{NetworkId}/members/{MemberId}` nests the member INSIDE the
         // network, so the path labels resolve left to right: a `NetworkId` this service
@@ -191,6 +193,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(requested) = input.log_publishing_configuration {
             let merged = merge_member_logs(member.log_publishing_configuration.take(), requested);
             member.log_publishing_configuration = Some(merged);
+            // The update STARTS the change rather than completing it: "`UPDATING` - The
+            // member is in the process of being updated" (`Member$Status`), which
+            // `GetMember` reports and the `ListMembers` `Status` filter selects on, until
+            // the clock owes the member `AVAILABLE` again. A request that named no
+            // configuration changed nothing, so it starts nothing.
+            member.begin_update(now);
         }
 
         // `UpdateMemberOutput` models no members: the updated record is read back through
