@@ -204,3 +204,5 @@ mod update_domain_name;
 mod test_invoke_method;
 #[path = "all/usage_plan_key_collection.rs"]
 mod usage_plan_key_collection;
+#[path = "all/stage_invoke_request_id.rs"]
+mod stage_invoke_request_id;

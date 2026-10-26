@@ -900,11 +900,15 @@ pub fn invalid_tagging(reason: String) -> InvalidTagging {
 }
 
 /// The modelled `NoSuchResource` for an ARN no resource this emulator holds carries.
-pub fn no_such_resource(arn: &str) -> NoSuchResource {
+///
+/// The wording is the one CloudFront answers for this error class, and it names no part
+/// of the request: the ARN that was asked about is not part of the message, so nothing
+/// here is built out of the call.
+pub fn no_such_resource() -> NoSuchResource {
     NoSuchResource {
-        message: Some(format!(
-            "The specified CloudFront resource does not exist: {arn}"
-        )),
+        message: Some(
+            "The specified resource doesn't exist. Update your request and try again.".to_string(),
+        ),
     }
 }
 
@@ -3900,10 +3904,19 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         }
         // The connection function arm, resolved against the STORED ARN exactly as the tag
         // read resolves it, and against the field for the same borrow reason as above.
-        self.connection_functions
+        if let Some(function) = self
+            .connection_functions
             .values_mut()
             .find(|function| function.arn == arn)
-            .map(|function| &mut function.tags)
+        {
+            return Some(&mut function.tags);
+        }
+        // The distribution tenant arm, so a tagging call and a tag read agree about every
+        // resource kind this store holds and tags.
+        self.distribution_tenants
+            .values_mut()
+            .find(|tenant| tenant.arn == arn)
+            .map(|tenant| &mut tenant.tags)
     }
 
     /// Persist a new distribution carrying `config` and `tags`, and report the record
