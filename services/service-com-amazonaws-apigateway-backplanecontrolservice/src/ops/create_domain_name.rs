@@ -511,6 +511,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             available_at: (!regional && !private).then(|| {
                 ::std::time::Instant::now() + crate::state::DOMAIN_NAME_CREATE_SPAN
             }),
+            // Nothing is migrating a record this call just created; see
+            // `DomainNameEntry::status`.
+            updating_until: None,
             // An "optional text message containing detailed information about status of
             // the DomainName migration": nothing here has detail to add to the status.
             domain_name_status_message: None,

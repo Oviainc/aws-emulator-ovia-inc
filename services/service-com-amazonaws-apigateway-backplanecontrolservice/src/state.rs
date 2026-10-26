@@ -806,6 +806,11 @@ pub struct DomainNameEntry {
     /// [`DOMAIN_NAME_AVAILABLE`]; absent for a domain name that was ready when it was
     /// created. See [`DomainNameEntry::status`] and [`DOMAIN_NAME_CREATE_SPAN`].
     pub available_at: Option<::std::time::Instant>,
+    /// When the endpoint migration an update started is complete, until which the record
+    /// reports [`DOMAIN_NAME_UPDATING`]; absent for a domain name no update has moved to
+    /// another endpoint type. See [`DomainNameEntry::status`] and
+    /// [`DOMAIN_NAME_MIGRATION_SPAN`].
+    pub updating_until: Option<::std::time::Instant>,
     pub domain_name_status_message: Option<String>,
     /// What the request set, or [`DEFAULT_SECURITY_POLICY`]: the service picks a value
     /// at create time, so a stored domain name always has one.
@@ -833,12 +838,19 @@ impl DomainNameEntry {
     /// ready when it is created and has no span to wait out. The transition is one the
     /// CLOCK owes, materialised from the stored due instant rather than by sleeping or
     /// by being read.
+    ///
+    /// An update that moves the record to another endpoint type starts the migration the
+    /// status is named for — "the status of the DomainName migration" — so such a record
+    /// reports [`DOMAIN_NAME_UPDATING`] until that migration is due, which is the status
+    /// the member documents for a domain name whose existing operation is not complete.
     pub fn status(&self) -> &'static str {
+        let now = ::std::time::Instant::now();
+        if self.updating_until.is_some_and(|due| now < due) {
+            return DOMAIN_NAME_UPDATING;
+        }
         match self.available_at {
             None => DOMAIN_NAME_AVAILABLE,
-            Some(available_at) if ::std::time::Instant::now() < available_at => {
-                DOMAIN_NAME_PENDING
-            }
+            Some(available_at) if now < available_at => DOMAIN_NAME_PENDING,
             Some(_) => DOMAIN_NAME_AVAILABLE,
         }
     }
@@ -962,6 +974,12 @@ pub const DOMAIN_NAME_AVAILABLE: &str = "AVAILABLE";
 /// a value of the modelled `DomainNameStatus` enum
 /// (`smithy_query(query="shape", shape="DomainNameStatus")`).
 pub const DOMAIN_NAME_PENDING: &str = "PENDING";
+
+/// The `domainNameStatus` of a custom domain name whose endpoint is being moved to
+/// another endpoint type: the second of the two values `DomainName$domainNameStatus`
+/// documents ("The valid values are AVAILABLE and UPDATING. If the status is UPDATING,
+/// the domain cannot be modified further until the existing operation is complete").
+pub const DOMAIN_NAME_UPDATING: &str = "UPDATING";
 
 /// The `distributionDomainName` of an edge-optimized custom domain name: the CloudFront
 /// distribution API Gateway puts in front of it, which is "the domain name of the Amazon
@@ -1448,6 +1466,14 @@ pub const VPC_LINK_PROVISION_SPAN: ::std::time::Duration = ::std::time::Duration
 /// caller reading straight after `CreateDomainName` still observes
 /// [`DOMAIN_NAME_PENDING`].
 pub const DOMAIN_NAME_CREATE_SPAN: ::std::time::Duration =
+    ::std::time::Duration::from_millis(500);
+
+/// How long a custom domain name stays [`DOMAIN_NAME_UPDATING`] after an update moved it
+/// to another endpoint type, after which it reports [`DOMAIN_NAME_AVAILABLE`] again. API
+/// Gateway documents no duration for the migration either, so this span is the
+/// emulator's own, chosen on the grounds [`DOMAIN_NAME_CREATE_SPAN`] gives: a caller
+/// reading straight after the update still observes the migration.
+pub const DOMAIN_NAME_MIGRATION_SPAN: ::std::time::Duration =
     ::std::time::Duration::from_millis(500);
 
 /// From `Authorizer$authorizerResultTtlInSeconds`'s own documentation: "If this field
