@@ -632,27 +632,36 @@ pub struct RequestPolicy {
     pub other: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
+impl HealthyRetryPolicy {
+    /// SNS's own retry policy — the "account system defaults" every effective delivery
+    /// policy is taken over: "the default delivery policy ... numRetries 3 ...
+    /// minDelayTarget 20 ... maxDelayTarget 20 ... backoffFunction linear" (SNS
+    /// Developer Guide, "Amazon SNS message delivery retries").
+    ///
+    /// ONE definition of the defaults, because a topic's delivery policy and a
+    /// subscription's are laid over the same ones.
+    pub fn system_default() -> Self {
+        Self {
+            min_delay_target: 20,
+            max_delay_target: 20,
+            num_retries: 3,
+            num_max_delay_retries: 0,
+            num_no_delay_retries: 0,
+            num_min_delay_retries: 0,
+            backoff_function: "linear".to_string(),
+            other: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
 impl DeliveryPolicy {
     /// SNS's own delivery policy — the "system defaults" an `EffectiveDeliveryPolicy`
-    /// is taken over (`GetTopicAttributesResponse$Attributes` doc). The numbers are
-    /// SNS's documented defaults for a topic no caller has given a `DeliveryPolicy`:
-    /// "the default delivery policy ... numRetries 3 ... minDelayTarget 20 ...
-    /// maxDelayTarget 20 ... backoffFunction linear" (SNS Developer Guide, "Amazon SNS
-    /// message delivery retries"), with the plain-text `defaultRequestPolicy` recorded
-    /// AWS responses carry.
+    /// is taken over (`GetTopicAttributesResponse$Attributes` doc), with the plain-text
+    /// `defaultRequestPolicy` recorded AWS responses carry.
     pub fn system_default() -> Self {
         Self {
             http: HttpDeliveryPolicy {
-                default_healthy_retry_policy: HealthyRetryPolicy {
-                    min_delay_target: 20,
-                    max_delay_target: 20,
-                    num_retries: 3,
-                    num_max_delay_retries: 0,
-                    num_no_delay_retries: 0,
-                    num_min_delay_retries: 0,
-                    backoff_function: "linear".to_string(),
-                    other: std::collections::BTreeMap::new(),
-                },
+                default_healthy_retry_policy: HealthyRetryPolicy::system_default(),
                 disable_subscription_overrides: false,
                 default_request_policy: RequestPolicy {
                     header_content_type: "text/plain; charset=UTF-8".to_string(),
@@ -709,6 +718,39 @@ pub struct ConfiguredRequestPolicy {
     pub other: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
+impl ConfiguredRetryPolicy {
+    /// Overlay the retry members the caller set onto `held`, member by member: a member
+    /// the caller left out keeps the value `held` already carries.
+    ///
+    /// ONE overlay for every document a retry policy appears in — a topic's
+    /// `http.defaultHealthyRetryPolicy` and a subscription's own `healthyRetryPolicy` —
+    /// so the two cannot drift.
+    pub fn overlay(self, held: &mut HealthyRetryPolicy) {
+        if let Some(value) = self.min_delay_target {
+            held.min_delay_target = value;
+        }
+        if let Some(value) = self.max_delay_target {
+            held.max_delay_target = value;
+        }
+        if let Some(value) = self.num_retries {
+            held.num_retries = value;
+        }
+        if let Some(value) = self.num_max_delay_retries {
+            held.num_max_delay_retries = value;
+        }
+        if let Some(value) = self.num_no_delay_retries {
+            held.num_no_delay_retries = value;
+        }
+        if let Some(value) = self.num_min_delay_retries {
+            held.num_min_delay_retries = value;
+        }
+        if let Some(value) = self.backoff_function {
+            held.backoff_function = value;
+        }
+        held.other.extend(self.other);
+    }
+}
+
 impl ConfiguredDeliveryPolicy {
     /// Overlay what the caller set onto `defaults`, member by member: a member the
     /// caller left out keeps SNS's default.
@@ -720,29 +762,7 @@ impl ConfiguredDeliveryPolicy {
             defaults.http.disable_subscription_overrides = disable;
         }
         if let Some(retry) = http.default_healthy_retry_policy {
-            let held = &mut defaults.http.default_healthy_retry_policy;
-            if let Some(value) = retry.min_delay_target {
-                held.min_delay_target = value;
-            }
-            if let Some(value) = retry.max_delay_target {
-                held.max_delay_target = value;
-            }
-            if let Some(value) = retry.num_retries {
-                held.num_retries = value;
-            }
-            if let Some(value) = retry.num_max_delay_retries {
-                held.num_max_delay_retries = value;
-            }
-            if let Some(value) = retry.num_no_delay_retries {
-                held.num_no_delay_retries = value;
-            }
-            if let Some(value) = retry.num_min_delay_retries {
-                held.num_min_delay_retries = value;
-            }
-            if let Some(value) = retry.backoff_function {
-                held.backoff_function = value;
-            }
-            held.other.extend(retry.other);
+            retry.overlay(&mut defaults.http.default_healthy_retry_policy);
         }
         if let Some(request) = http.default_request_policy {
             if let Some(value) = request.header_content_type {
@@ -782,6 +802,112 @@ pub fn effective_delivery_policy(topic: &TopicRecord) -> String {
         configured.overlay(&mut effective);
     }
     serde_json::to_string(&effective).unwrap_or_default()
+}
+
+// =============================================================================
+// The delivery policy document of a SUBSCRIPTION
+// =============================================================================
+
+/// A SUBSCRIPTION's delivery policy document, as SNS serializes it: the retry policy at
+/// the top level, rather than under the protocol key a TOPIC's policy groups its
+/// defaults by.
+///
+/// The two documents are different shapes of the same idea — "the JSON serialization of
+/// the subscription's delivery policy" (`GetSubscriptionAttributesResponse$Attributes`
+/// doc) governs ONE subscription, so it names no protocol and no
+/// `disableSubscriptionOverrides`, and its retry policy is `healthyRetryPolicy`.
+///
+/// Every member of the shape is serialized, including the ones a subscription has no
+/// value for: the policy is a serialization of the whole document rather than of the
+/// members a caller happened to name, so a retry policy for an unhealthy endpoint and a
+/// throttle policy nobody set are reported as the nulls they are, and the delivery
+/// guarantee as the flag it is. Members this emulator gives no meaning to ride in `other`
+/// so a document is reported WITH them rather than silently shortened.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionDeliveryPolicy {
+    pub healthy_retry_policy: HealthyRetryPolicy,
+    pub sickly_retry_policy: Option<serde_json::Value>,
+    pub throttle_policy: Option<serde_json::Value>,
+    pub guaranteed: bool,
+    #[serde(flatten)]
+    pub other: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl SubscriptionDeliveryPolicy {
+    /// The policy a subscription nobody has given one delivers under: the account system
+    /// defaults ([`HealthyRetryPolicy::system_default`]), no policy of its own for an
+    /// unhealthy endpoint, no throttling and no delivery guarantee.
+    pub fn system_default() -> Self {
+        Self {
+            healthy_retry_policy: HealthyRetryPolicy::system_default(),
+            sickly_retry_policy: None,
+            throttle_policy: None,
+            guaranteed: false,
+            other: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+/// A subscription's delivery policy as a CALLER wrote it: every member optional,
+/// because a caller sets only the ones it wants to override.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ConfiguredSubscriptionDeliveryPolicy {
+    pub healthy_retry_policy: Option<ConfiguredRetryPolicy>,
+    pub sickly_retry_policy: Option<serde_json::Value>,
+    pub throttle_policy: Option<serde_json::Value>,
+    pub guaranteed: Option<bool>,
+    #[serde(flatten)]
+    pub other: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl ConfiguredSubscriptionDeliveryPolicy {
+    /// Overlay what the caller set onto `defaults`, member by member: a retry member the
+    /// caller left out keeps the system default, which is what NORMALIZING a stored
+    /// policy means.
+    pub fn overlay(self, defaults: &mut SubscriptionDeliveryPolicy) {
+        defaults.other.extend(self.other);
+        if let Some(retry) = self.healthy_retry_policy {
+            retry.overlay(&mut defaults.healthy_retry_policy);
+        }
+        if self.sickly_retry_policy.is_some() {
+            defaults.sickly_retry_policy = self.sickly_retry_policy;
+        }
+        if self.throttle_policy.is_some() {
+            defaults.throttle_policy = self.throttle_policy;
+        }
+        if let Some(guaranteed) = self.guaranteed {
+            defaults.guaranteed = guaranteed;
+        }
+    }
+}
+
+/// Why `value` is not a delivery policy document a SUBSCRIPTION can hold, or `None`
+/// when it is one.
+///
+/// The same parse [`normalized_subscription_delivery_policy`] performs, so the write
+/// refuses exactly what the read could not honour.
+pub fn subscription_delivery_policy_refusal(value: &str) -> Option<String> {
+    serde_json::from_str::<ConfiguredSubscriptionDeliveryPolicy>(value)
+        .err()
+        .map(|error| format!("the value must be a delivery policy document: {error}"))
+}
+
+/// The document a subscription's `DeliveryPolicy` is STORED and reported as: what the
+/// caller wrote, laid over the account system defaults, so a read reports the retry
+/// policy whole however few of its members the caller named.
+///
+/// A value the parse cannot read is returned unchanged — the write path refuses one
+/// first ([`subscription_delivery_policy_refusal`]), so this is only the fallback that
+/// keeps a caller's bytes rather than dropping them.
+pub fn normalized_subscription_delivery_policy(value: &str) -> String {
+    let Ok(configured) = serde_json::from_str::<ConfiguredSubscriptionDeliveryPolicy>(value) else {
+        return value.to_string();
+    };
+    let mut normalized = SubscriptionDeliveryPolicy::system_default();
+    configured.overlay(&mut normalized);
+    serde_json::to_string(&normalized).unwrap_or_else(|_| value.to_string())
 }
 
 /// One subscription of one topic, as `Subscribe` minted it.
@@ -859,15 +985,27 @@ pub fn attribute_flag(value: bool) -> String {
     if value { "true" } else { "false" }.to_string()
 }
 
-/// The protocols a DELIVERY POLICY governs: "DeliveryPolicy – The policy that defines
-/// how Amazon SNS retries failed deliveries to HTTP/S endpoints"
-/// (`SetSubscriptionAttributesInput$AttributeName` doc). A subscription over any other
-/// protocol has no retry policy to report, so none is reported for it.
-pub const DELIVERY_POLICY_PROTOCOLS: &[&str] = &["http", "https"];
+/// The canonical form of a FLAG-valued attribute value, or `None` when the value is
+/// neither of the two words a flag takes.
+///
+/// A flag is the WORD `true` or `false`, matched without regard to case — the value is
+/// a boolean carried as a string, and a boolean is the same whichever case a client (or
+/// the template of an infrastructure tool) spelled it in — and it is held, and reported,
+/// in the lower-case form [`attribute_flag`] writes. The emulator already reads a
+/// topic's own flags this way (`FifoTopic`, `ContentBasedDeduplication`), so one
+/// definition now serves every attribute whose value is a flag.
+pub fn flag_attribute_value(value: &str) -> Option<&'static str> {
+    ["true", "false"]
+        .into_iter()
+        .find(|word| value.eq_ignore_ascii_case(word))
+}
 
-/// Whether a delivery policy governs delivery to `protocol`'s endpoints.
-pub fn protocol_has_delivery_policy(protocol: &str) -> bool {
-    DELIVERY_POLICY_PROTOCOLS.contains(&protocol)
+/// Whether a flag-valued attribute READS as set: the word `true` in any case, and
+/// nothing else — the reading side of [`flag_attribute_value`], so every attribute whose
+/// value is a flag is written, stored and read through the one definition of its two
+/// words.
+pub fn flag_attribute_enabled(value: &str) -> bool {
+    flag_attribute_value(value) == Some("true")
 }
 
 // =============================================================================
@@ -916,12 +1054,16 @@ pub const RAW_MESSAGE_DELIVERY_ENABLED: &str = "true";
 /// (`SetSubscriptionAttributesInput$AttributeName` doc).
 pub const FILTER_POLICY_SCOPES: &[&str] = &[DEFAULT_FILTER_POLICY_SCOPE, "MessageBody"];
 
-/// The protocols raw message delivery may be ENABLED for: "RawMessageDelivery – When
-/// set to true, enables raw message delivery to Amazon SQS or HTTP/S endpoints"
-/// (`SetSubscriptionAttributesInput$AttributeName` doc). A subscription over any other
-/// protocol always carries SNS's JSON envelope, so there is no raw delivery to switch
-/// on for it.
-pub const RAW_MESSAGE_DELIVERY_PROTOCOLS: &[&str] = &["sqs", "http", "https"];
+/// The protocols raw message delivery may be ENABLED for: the ones whose endpoint
+/// receives the published body ITSELF — "RawMessageDelivery – When set to true, enables
+/// raw message delivery to Amazon SQS or HTTP/S endpoints"
+/// (`SetSubscriptionAttributesInput$AttributeName` doc), and a Firehose delivery stream,
+/// which takes the bare message bodies when raw delivery is enabled ("Fanout to
+/// Firehose delivery streams", SNS Developer Guide). A subscription over any other
+/// protocol always carries SNS's JSON envelope — the body reaches a mailbox, a phone or
+/// a function invocation rather than a stream of bodies — so there is no raw delivery to
+/// switch on for it.
+pub const RAW_MESSAGE_DELIVERY_PROTOCOLS: &[&str] = &["sqs", "http", "https", "firehose"];
 
 /// The protocols a `SubscriptionRoleArn` applies to: "The following attribute applies
 /// only to Amazon Data Firehose delivery stream subscriptions: SubscriptionRoleArn"
@@ -1045,15 +1187,13 @@ pub fn subscription_attribute_refusal(name: &str, value: &str) -> Option<String>
     let attribute_reason = |reason: String| format!("Invalid parameter: Attributes Reason: {reason}");
     match name {
         // A flag, carried as a word because SNS carries every attribute value as a
-        // string (see [`attribute_flag`]).
-        RAW_MESSAGE_DELIVERY_ATTRIBUTE => (value != RAW_MESSAGE_DELIVERY_ENABLED
-            && value != RAW_MESSAGE_DELIVERY_DISABLED)
-            .then(|| {
-                attribute_reason(format!(
-                    "{name} - the value must be {RAW_MESSAGE_DELIVERY_ENABLED} or \
-                     {RAW_MESSAGE_DELIVERY_DISABLED}"
-                ))
-            }),
+        // string (see [`attribute_flag`]), in either case.
+        RAW_MESSAGE_DELIVERY_ATTRIBUTE => flag_attribute_value(value).is_none().then(|| {
+            attribute_reason(format!(
+                "{name} - the value must be {RAW_MESSAGE_DELIVERY_ENABLED} or \
+                 {RAW_MESSAGE_DELIVERY_DISABLED}"
+            ))
+        }),
         FILTER_POLICY_SCOPE_ATTRIBUTE => {
             (!FILTER_POLICY_SCOPES.contains(&value)).then(|| filter_policy_scope_refusal(value))
         }
@@ -1071,9 +1211,9 @@ pub fn subscription_attribute_refusal(name: &str, value: &str) -> Option<String>
                  the message properties to match"
             ))),
         },
-        // The SAME parse the effective policy is computed with, so a document the read
-        // path could not honour is never stored.
-        DELIVERY_POLICY_ATTRIBUTE => delivery_policy_refusal(value)
+        // The SAME parse the stored, normalized document is computed with, so a
+        // document the read path could not honour is never stored.
+        DELIVERY_POLICY_ATTRIBUTE => subscription_delivery_policy_refusal(value)
             .map(|reason| attribute_reason(format!("{name} - {reason}"))),
         REDRIVE_POLICY_ATTRIBUTE => match json_object(value) {
             // A value that is not a policy document at all carries no dead-letter
@@ -1115,6 +1255,15 @@ pub fn subscription_attribute_refusal(name: &str, value: &str) -> Option<String>
 /// governed by. Shared by every operation that writes a subscription attribute, so the
 /// scope does not depend on which call wrote it.
 ///
+/// Only the attributes the model SCOPES are scoped: raw message delivery, which asks for
+/// a form of delivery only an endpoint that takes bare bodies has, and the Firehose role
+/// — "The following attribute applies only to Amazon Data Firehose delivery stream
+/// subscriptions: SubscriptionRoleArn" (`SubscribeInput$Attributes` doc). The delivery
+/// policy is NOT: `DeliveryPolicy` and `EffectiveDeliveryPolicy` are listed among the
+/// attributes a subscription's map carries with no protocol qualifying them
+/// (`GetSubscriptionAttributesResponse$Attributes` doc), so every subscription accepts
+/// and reports one.
+///
 /// The message is the complete sentence SNS states for this condition, directly after
 /// `Invalid parameter: ` — this refusal is about the SUBSCRIPTION the attribute was set
 /// on rather than about the value of one request member, so it is not nested in the
@@ -1131,10 +1280,11 @@ pub fn subscription_attribute_protocol_refusal(
         // Raw delivery is a property of the envelope SNS puts a notification in, so
         // only switching it ON is scoped: every protocol carries the JSON envelope by
         // default, which is what the flag's other value asks for.
-        RAW_MESSAGE_DELIVERY_ATTRIBUTE if value == RAW_MESSAGE_DELIVERY_ENABLED => {
+        RAW_MESSAGE_DELIVERY_ATTRIBUTE
+            if flag_attribute_value(value) == Some(RAW_MESSAGE_DELIVERY_ENABLED) =>
+        {
             (RAW_MESSAGE_DELIVERY_PROTOCOLS, "raw message delivery")
         }
-        DELIVERY_POLICY_ATTRIBUTE => (DELIVERY_POLICY_PROTOCOLS, "a delivery policy"),
         SUBSCRIPTION_ROLE_ARN_ATTRIBUTE => {
             (SUBSCRIPTION_ROLE_ARN_PROTOCOLS, "a subscription role")
         }
@@ -1148,11 +1298,40 @@ pub fn subscription_attribute_protocol_refusal(
     })
 }
 
-/// The effective delivery policy of one SUBSCRIPTION: the system defaults, the
+/// The form a subscription attribute is STORED in: what the caller wrote, in the shape
+/// SNS reports it back in.
+///
+/// SNS holds the MEANING of an attribute value rather than the caller's bytes, so a read
+/// reports the canonical form: a flag is the lower-case word whichever case it arrived
+/// in, and a delivery policy is the whole retry policy with the members the caller left
+/// out filled from the account system defaults. Every other attribute is a document or
+/// an ARN SNS keeps verbatim.
+///
+/// Shared by every operation that writes a subscription attribute, so a value does not
+/// read back differently for having arrived on `Subscribe` rather than
+/// `SetSubscriptionAttributes`. The value is validated FIRST
+/// ([`subscription_attribute_refusal`]), so nothing canonicalized here was refusable.
+pub fn stored_subscription_attribute_value(name: &str, value: &str) -> String {
+    match name {
+        RAW_MESSAGE_DELIVERY_ATTRIBUTE => flag_attribute_value(value)
+            .unwrap_or(value)
+            .to_string(),
+        DELIVERY_POLICY_ATTRIBUTE => normalized_subscription_delivery_policy(value),
+        _ => value.to_string(),
+    }
+}
+
+/// The effective delivery policy of one SUBSCRIPTION: the account system defaults, the
 /// `DeliveryPolicy` of the topic laid over them, and then the subscription's own
 /// `DeliveryPolicy` — "the effective delivery policy that takes into account the topic
 /// delivery policy and account system defaults"
 /// (`GetSubscriptionAttributesResponse$Attributes` doc).
+///
+/// It is reported in the SUBSCRIPTION's document shape
+/// ([`SubscriptionDeliveryPolicy`]), because it is the policy ONE subscription's
+/// deliveries run under: the topic's document contributes the defaults it states for the
+/// protocol group (`http.defaultHealthyRetryPolicy`), and the subscription's own retry
+/// policy is laid over them.
 ///
 /// A topic whose policy sets `disableSubscriptionOverrides` keeps its own policy: that
 /// is what the member disables, so the subscription's policy is not laid over it.
@@ -1160,18 +1339,22 @@ pub fn effective_subscription_delivery_policy(
     topic: Option<&TopicRecord>,
     subscription: &SubscriptionRecord,
 ) -> String {
-    let mut effective = DeliveryPolicy::system_default();
+    let mut from_topic = DeliveryPolicy::system_default();
     if let Some(configured) = topic
         .and_then(|topic| topic.attributes.get(DELIVERY_POLICY_ATTRIBUTE))
         .and_then(|raw| serde_json::from_str::<ConfiguredDeliveryPolicy>(raw).ok())
     {
-        configured.overlay(&mut effective);
+        configured.overlay(&mut from_topic);
     }
-    if !effective.http.disable_subscription_overrides {
+    let mut effective = SubscriptionDeliveryPolicy {
+        healthy_retry_policy: from_topic.http.default_healthy_retry_policy,
+        ..SubscriptionDeliveryPolicy::system_default()
+    };
+    if !from_topic.http.disable_subscription_overrides {
         if let Some(configured) = subscription
             .attributes
             .get(DELIVERY_POLICY_ATTRIBUTE)
-            .and_then(|raw| serde_json::from_str::<ConfiguredDeliveryPolicy>(raw).ok())
+            .and_then(|raw| serde_json::from_str::<ConfiguredSubscriptionDeliveryPolicy>(raw).ok())
         {
             configured.overlay(&mut effective);
         }
@@ -1216,13 +1399,31 @@ pub fn malformed_subscription_arn(arn: &str) -> Option<String> {
 // The per-message rules every publishing operation shares
 // =============================================================================
 
-/// The only value `MessageStructure` accepts ("Valid value: json" —
-/// `PublishInput$MessageStructure` doc).
+/// The value of `MessageStructure` that structures a message body by delivery protocol:
+/// "Valid value: json" (`PublishInput$MessageStructure` doc).
 pub const JSON_MESSAGE_STRUCTURE: &str = "json";
+
+/// Whether `structure` names the one message structure SNS reads a body under.
+///
+/// The member SELECTS a reading rather than carrying data, and the model constrains it to
+/// no value set at all (`messageStructure` is a plain string with no enum or pattern), so
+/// a value that is not this one names no structure: the body is then one message for
+/// every protocol, not a document of branches. Recorded evidence: a publish carrying a
+/// structure value SNS defines nothing for is SERVED, so the member's value is not a
+/// closed set this emulator may refuse outside of.
+///
+/// ONE definition, shared by the message rules and the fan-out, so a body judged as
+/// structured is the body delivered as structured.
+pub fn is_json_message_structure(structure: &str) -> bool {
+    structure == JSON_MESSAGE_STRUCTURE
+}
 
 /// The key a JSON-structured message must carry: "contain at least a top-level JSON
 /// key of \"default\" with a value that is a string" (`PublishInput$MessageStructure`
-/// doc).
+/// doc) — the body every protocol no branch names receives. A value that is a scalar
+/// rather than a string names that body as the text SNS writes it (see [`default_body`]);
+/// one that names no body at all leaves the document with no default entry
+/// ([`NO_DEFAULT_ENTRY_REFUSAL`]).
 pub const DEFAULT_JSON_KEY: &str = "default";
 
 /// "By default, a message can be at most 256 KiB in size (262,144 bytes)"
@@ -1296,6 +1497,18 @@ pub const DESTINATIONS_NOT_EXCLUSIVE_REFUSAL: &str =
 /// answers `400 InvalidParameter` with exactly this.
 pub const EMPTY_MESSAGE_REFUSAL: &str = "Invalid parameter: Empty message";
 
+/// The sentence SNS refuses a `MessageStructure: json` body that names no default
+/// message with: the condition is about the message STRUCTURE rather than the body's
+/// bytes, and the member the structure is missing is the default entry.
+///
+/// It answers both ways a body can name no default: a document with no `default` member
+/// at all, and one whose `default` names no message SNS could deliver (see
+/// [`default_body`]) — a composite value is not an entry SNS can deliver, so a document
+/// carrying one has no default entry. Recorded evidence: a publish of
+/// `{"default":{…}}` under the json structure is refused for having no default entry.
+pub const NO_DEFAULT_ENTRY_REFUSAL: &str =
+    "Invalid parameter: Message Structure - No default entry in JSON message body";
+
 /// The sentence SNS refuses a body past the topic's ceiling with: the condition, with
 /// neither the body's size nor the ceiling in it.
 pub const MESSAGE_TOO_LONG_REFUSAL: &str = "Invalid parameter: Message too long";
@@ -1323,22 +1536,96 @@ pub fn ordering_id_refusal(member: &str) -> String {
     )
 }
 
-/// Check a `MessageStructure: json` body: a JSON object with a string `default`
-/// member, every other member a string too. Returns the reason it is not.
+/// Check a `MessageStructure: json` body: a JSON object. Returns the reason it is not
+/// one.
+///
+/// The other rule the member documents — "contain at least a top-level JSON key of
+/// \"default\"" (`PublishInput$MessageStructure` doc) — is judged by
+/// [`default_branch_body`], because a `default` member and a `default` member that names
+/// a message are the same requirement: see [`NO_DEFAULT_ENTRY_REFUSAL`].
 fn json_message_error(message: &str) -> Option<&'static str> {
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(message) else {
         return Some("message must be a syntactically valid JSON object");
     };
-    let Some(members) = parsed.as_object() else {
+    if !parsed.is_object() {
         return Some("message must be a syntactically valid JSON object");
-    };
-    if !members.get(DEFAULT_JSON_KEY).is_some_and(|v| v.is_string()) {
-        return Some("message must carry a top-level \"default\" key whose value is a string");
-    }
-    if members.values().any(|value| !value.is_string()) {
-        return Some("every top-level value of the message must be a string");
     }
     None
+}
+
+/// The body a PROTOCOL-keyed branch of a structured message names, or `None` when it
+/// names none.
+///
+/// A protocol's branch carries the message that protocol's subscribers receive, and the
+/// member documents what such a branch may be: the keys "must have simple JSON string
+/// values" and "Non-string values will cause the key to be ignored"
+/// (`PublishInput$Message` doc). A branch that is anything but a string therefore names
+/// no body, and its protocol receives what it would have received had the branch not been
+/// there at all.
+fn protocol_branch_body(value: &serde_json::Value) -> Option<String> {
+    value.as_str().map(str::to_string)
+}
+
+/// The body the `default` member names, or `None` when it names none.
+///
+/// The `default` member is not a protocol branch: it is the message every protocol no
+/// branch names receives, so a document naming no default body names no message at all
+/// ([`NO_DEFAULT_ENTRY_REFUSAL`]) rather than leaving one protocol without a branch. It
+/// is read as TEXT — a string is the body itself and any other SCALAR is the body written
+/// out as SNS writes that value, which is what the recording shows being served where
+/// this emulator refused a `default` that was not a string. A composite value (an object
+/// or a list) is no message, so it names no body.
+fn default_body(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(flag) => Some(flag.to_string()),
+        serde_json::Value::Null => Some("null".to_string()),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => None,
+    }
+}
+
+/// The body the `default` member of a structured message names, or `None` when it names
+/// none — which is what makes a structured publish one with no message in it.
+fn default_branch_body(message: &str) -> Option<String> {
+    json_object(message)?
+        .get(DEFAULT_JSON_KEY)
+        .and_then(default_body)
+}
+
+/// The body a subscriber over `protocol` receives of a published message.
+///
+/// A message published with `MessageStructure` of `json` carries ONE body per delivery
+/// protocol: "You can define other top-level keys that define the message you want to
+/// send to a specific transport protocol" (`PublishInput$MessageStructure` doc), so the
+/// member named for the protocol is the body that protocol's subscribers receive and the
+/// `default` member is the body for every protocol no member names. A branch that names
+/// no body is IGNORED (see [`protocol_branch_body`]), so its protocol falls back to
+/// `default` exactly as if the branch were absent.
+///
+/// A message published with no `MessageStructure` is one body for every protocol, and is
+/// delivered as it was published. So is one whose structure names nothing SNS reads: the
+/// document is then the message rather than a set of branches.
+pub fn structured_message_body(
+    message: &str,
+    message_structure: Option<&str>,
+    protocol: &str,
+) -> String {
+    if !message_structure.is_some_and(is_json_message_structure) {
+        return message.to_string();
+    }
+    let Some(members) = json_object(message) else {
+        return message.to_string();
+    };
+    members
+        .get(protocol)
+        .and_then(protocol_branch_body)
+        // A structured message SNS accepted has a `default` naming a body, so this is
+        // the body of every protocol no branch names rather than a fallback: a message
+        // whose `default` names none is refused by [`message_refusal`] before it is
+        // ever published.
+        .or_else(|| members.get(DEFAULT_JSON_KEY).and_then(default_body))
+        .unwrap_or_else(|| message.to_string())
 }
 
 /// One message as a caller supplied it: the members `PublishInput` and
@@ -1363,15 +1650,22 @@ pub struct MessageRequest<'a> {
 /// refuses. The reason names the member and the constraint it failed, built from the
 /// request.
 pub fn message_refusal(request: MessageRequest<'_>) -> Option<String> {
-    if let Some(structure) = request.message_structure {
-        if structure != JSON_MESSAGE_STRUCTURE {
-            return Some(format!(
-                "Invalid parameter: MessageStructure Reason: the only valid value is \
-                 {JSON_MESSAGE_STRUCTURE}"
-            ));
-        }
+    // The one structure SNS defines for a message body is `json`, and the model
+    // constrains the member to no value set at all (`messageStructure` is a plain
+    // string): a value that names no structure SNS reads leaves the message ONE body for
+    // every protocol rather than failing the publish.
+    if request
+        .message_structure
+        .is_some_and(is_json_message_structure)
+    {
         if let Some(reason) = json_message_error(request.message) {
             return Some(format!("Invalid parameter: Message - {reason}"));
+        }
+        // "contain at least a top-level JSON key of "default"" that names a message:
+        // the body every protocol no other member names receives. A document without
+        // one has no default entry, whether the member is absent or names no message.
+        if default_branch_body(request.message).is_none() {
+            return Some(NO_DEFAULT_ENTRY_REFUSAL.to_string());
         }
     }
 
@@ -1452,7 +1746,7 @@ pub fn topic_message_refusal(
     let content_based = topic
         .attributes
         .get(CONTENT_BASED_DEDUPLICATION_ATTRIBUTE)
-        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+        .is_some_and(|value| flag_attribute_enabled(value));
     match request.message_deduplication_id {
         Some(id) => Ok(Some(id.to_string())),
         // "Amazon SNS uses a SHA-256 hash to generate the MessageDeduplicationId using
