@@ -40,6 +40,8 @@ mod readiness_summary_shared_rule;
 mod recovery_group_lifecycle;
 #[path = "all/recovery_group_readiness_summary.rs"]
 mod recovery_group_readiness_summary;
+#[path = "all/recovery_group_update.rs"]
+mod recovery_group_update;
 #[path = "all/resource_set_type_catalog.rs"]
 mod resource_set_type_catalog;
 #[path = "all/resource_set_update.rs"]
