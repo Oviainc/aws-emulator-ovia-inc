@@ -27,6 +27,7 @@
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     MANAGED_RESPONSE_HEADERS_POLICIES, MAX_ITEMS, NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE,
+    RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -142,7 +143,13 @@ fn policy_table() -> Vec<Policy> {
 
 /// `GET /2020-05-31/distributionsByResponseHeadersPolicyId/{ResponseHeadersPolicyId}` plus the
 /// query the caller pages with — the route the model binds this operation to.
-async fn list_by_policy(router: &MultiServiceRouter, policy_id: &str, query: &str) -> Answer {
+///
+/// `pub(crate)` so a sibling suite drives this listing's id resolution through the same route.
+pub(crate) async fn list_by_policy(
+    router: &MultiServiceRouter,
+    policy_id: &str,
+    query: &str,
+) -> Answer {
     call(
         router,
         "GET",
@@ -562,7 +569,9 @@ async fn a_policy_aws_published_lists_what_attaches_it() {
 }
 
 /// An id no response headers policy holds is `NoSuchResponseHeadersPolicy`, whatever shape the
-/// id takes — never an empty page, which would claim the policy exists.
+/// id takes — never an empty page, which would claim the policy exists. The refusal's MESSAGE
+/// states which of the two conditions it is: an identifier outside the shape a response
+/// headers policy id takes is unusable, while a well-formed id simply names no policy.
 #[tokio::test]
 async fn an_id_no_policy_holds_is_refused() {
     let router = emulator();
@@ -572,24 +581,35 @@ async fn an_id_no_policy_holds_is_refused() {
     let mut flipped: Vec<char> = known.chars().collect();
     let last = flipped.len() - 1;
     flipped[last] = if flipped[last] == 'a' { 'b' } else { 'a' };
-    let absent: [(&str, String); 5] = [
+    let absent: [(&str, String, &str); 5] = [
         (
             "a UUID never minted",
             "00000000-0000-0000-0000-000000000000".to_string(),
+            NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE,
         ),
         (
             "a known id with one character changed",
             flipped.into_iter().collect(),
+            NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE,
         ),
-        ("a known id in upper case", known.to_uppercase()),
-        ("a token that is no UUID", "not-a-policy-id".to_string()),
+        (
+            "a known id in upper case",
+            known.to_uppercase(),
+            RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE,
+        ),
+        (
+            "a token that is no UUID",
+            "not-a-policy-id".to_string(),
+            RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE,
+        ),
         (
             "a policy name rather than an id",
             "by-response-headers-policy-0".to_string(),
+            RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE,
         ),
     ];
 
-    for (case, candidate) in absent {
+    for (case, candidate, expected) in absent {
         let answer = list_by_policy(&router, &candidate, "").await;
         assert_eq!(
             answer.status, 404,
@@ -604,8 +624,8 @@ async fn an_id_no_policy_holds_is_refused() {
         );
         let message = answer.root().find_text("Message").unwrap_or_default();
         assert_eq!(
-            message, NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE,
-            "case {case}: expected the modelled message, got {message:?}"
+            message, expected,
+            "case {case}: expected {expected:?} for {candidate:?}, got {message:?}"
         );
     }
 }

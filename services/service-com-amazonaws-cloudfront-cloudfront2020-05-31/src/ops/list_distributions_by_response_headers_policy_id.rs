@@ -207,7 +207,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(
                 ListDistributionsByResponseHeadersPolicyIdErrorModeled::NoSuchResponseHeadersPolicy(
-                    crate::state::no_such_response_headers_policy(),
+                    crate::state::no_such_response_headers_policy(
+                        &input.response_headers_policy_id,
+                    ),
                 )
                 .into(),
             );

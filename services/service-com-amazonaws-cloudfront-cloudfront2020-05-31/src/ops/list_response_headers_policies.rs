@@ -214,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if store.readable_response_headers_policy(marker).is_none() {
                 return Err(
                     ListResponseHeadersPoliciesErrorModeled::NoSuchResponseHeadersPolicy(
-                        crate::state::no_such_response_headers_policy(),
+                        crate::state::no_such_response_headers_policy(marker),
                     )
                     .into(),
                 );
