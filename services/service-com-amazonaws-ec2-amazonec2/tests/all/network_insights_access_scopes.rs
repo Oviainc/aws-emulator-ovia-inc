@@ -15,8 +15,8 @@
 
 use ec2::ops::types::Tag;
 use ec2::state::{
-    ComAmazonawsEc2Amazonec2State as Ec2State, MAX_ECHOED_PAGE_TOKEN_CHARS, MAX_RESOURCE_IDS,
-    MAX_STORED_RECORDS_PER_STORE, RESOURCE_TYPE_NETWORK_INSIGHTS_ACCESS_SCOPE,
+    AccessScopePaths, ComAmazonawsEc2Amazonec2State as Ec2State, MAX_ECHOED_PAGE_TOKEN_CHARS,
+    MAX_RESOURCE_IDS, MAX_STORED_RECORDS_PER_STORE, RESOURCE_TYPE_NETWORK_INSIGHTS_ACCESS_SCOPE,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -136,7 +136,12 @@ fn seed(engine: &engine::InMemoryEngine) -> Vec<String> {
         .into_iter()
         .map(|fixture| {
             guard
-                .insert_network_insights_access_scope(REGION, fixture.tags)
+                .insert_network_insights_access_scope(
+                    REGION,
+                    fixture.tags,
+                    AccessScopePaths::default(),
+                    None,
+                )
                 .expect("the store must have room for the seeded scope")
         })
         .collect()
@@ -191,7 +196,12 @@ async fn every_stored_scope_is_reported_and_a_later_write_is_visible() {
     let late_id = engine
         .state::<Ec2State>()
         .lock()
-        .insert_network_insights_access_scope(REGION, vec![tag("Name", "late")])
+        .insert_network_insights_access_scope(
+            REGION,
+            vec![tag("Name", "late")],
+            AccessScopePaths::default(),
+            None,
+        )
         .expect("the store must have room for one more scope");
 
     let after = described_ids(&router, "after a later write", &[]).await;
@@ -691,12 +701,22 @@ async fn the_store_refuses_a_scope_past_its_ceiling_and_the_describe_still_pages
         for ordinal in 0..MAX_STORED_RECORDS_PER_STORE {
             assert!(
                 guard
-                    .insert_network_insights_access_scope(REGION, Vec::new())
+                    .insert_network_insights_access_scope(
+                        REGION,
+                        Vec::new(),
+                        AccessScopePaths::default(),
+                        None,
+                    )
                     .is_some(),
                 "scope {ordinal}: expected the store to have room below its ceiling"
             );
         }
-        let past_ceiling = guard.insert_network_insights_access_scope(REGION, Vec::new());
+        let past_ceiling = guard.insert_network_insights_access_scope(
+            REGION,
+            Vec::new(),
+            AccessScopePaths::default(),
+            None,
+        );
         assert!(
             past_ceiling.is_none(),
             "past the ceiling: expected no scope to be stored, got {past_ceiling:?}"

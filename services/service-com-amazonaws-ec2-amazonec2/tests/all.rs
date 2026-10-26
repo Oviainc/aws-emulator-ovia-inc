@@ -469,3 +469,9 @@ mod flow_logs;
 // it.
 #[path = "all/transit_gateway_policy_tables.rs"]
 mod transit_gateway_policy_tables;
+// Declared LAST for the reason the header gives: the sorted region of this file is where
+// every new ec2 suite inserts its lines. What `CreateNetworkInsightsAccessScope` persists —
+// the scope and the content it was given — and what `GetNetworkInsightsAccessScopeContent`
+// reports back out of that store.
+#[path = "all/network_insights_access_scope_content.rs"]
+mod network_insights_access_scope_content;
