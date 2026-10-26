@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAttachmentRoutingPolicyLabel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAttachmentRoutingPolicyLabel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAttachmentRoutingPolicyLabel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies a routing policy label to ONE attachment of ONE core network: the label the
+//! request carries REPLACES whatever label that attachment held — from its create or from
+//! an earlier call of this operation — and is what
+//! `ListAttachmentRoutingPolicyAssociations` then reports as the attachment's routing
+//! policy association. A mutating operation that addresses two resources which must
+//! already be stored, so it mints nothing. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,17 +161,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAttachmentRoutingPolicyLabel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAttachmentRoutingPolicyLabelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // request metadata.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutAttachmentRoutingPolicyLabelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the networkmanager store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // Both ids ADDRESS resources that have to be stored already — this call labels an
+        // attachment that exists rather than minting one — so an id naming nothing stored is
+        // the service's not-found refusal rather than the field failure a create gives for a
+        // reference it would hang a new resource off. The resource the request reaches the
+        // attachment THROUGH is checked first, the rule every other operation of this service
+        // that addresses a child of a core network follows.
+        if !store.core_networks.contains_key(&input.core_network_id) {
+            return Err(
+                PutAttachmentRoutingPolicyLabelErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::CORE_NETWORK_KIND,
+                        &input.core_network_id,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // The attachment is resolved WITHIN that core network: one id space holds every
+        // attachment kind and a label applies to any of them, so the kind is never checked —
+        // but an attachment stored under a DIFFERENT core network is not an attachment of
+        // the one addressed, so it is as absent here as an id nothing was ever stored for.
+        let record = store
+            .attachments
+            .get_mut(&input.attachment_id)
+            .filter(|record| record.core_network_id == input.core_network_id)
+            .ok_or_else(|| {
+                PutAttachmentRoutingPolicyLabelErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::ATTACHMENT_KIND,
+                        &input.attachment_id,
+                    ),
+                )
+            })?;
+
+        // An attachment carries ONE routing policy label, so this call overwrites the stored
+        // one whatever it was and whatever lifecycle state the attachment is in: a label is
+        // carried from the create onwards, including while the attachment still waits for
+        // the acceptance its core network policy asked for, so no state gates the call. The
+        // label is a value this service stores and reports rather than one it interprets, so
+        // every string the member's own constraints admit — including the empty one its
+        // `length 0..256` allows — is stored exactly as given. Nothing else about the
+        // attachment changes: the modelled `Attachment` carries no label member, so a read
+        // of the attachment itself answers precisely what it answered before.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAttachmentRoutingPolicyLabel"))
+        // `ClientToken` is this operation's modelled `@idempotencyToken` and needs no record
+        // of its own: the whole effect of the call is the label it carries, so a retry under
+        // the same token writes the same label and answers the same payload as the call it
+        // repeats, while a later call carrying another label is how a caller CHANGES the
+        // label rather than a request to refuse.
+        record.routing_policy_label = Some(input.routing_policy_label);
+
+        // Answered from the stored record, so the payload cannot report a core network, an
+        // attachment or a label the store does not hold.
+        Ok(PutAttachmentRoutingPolicyLabelOutput {
+            core_network_id: Some(record.core_network_id.clone()),
+            attachment_id: Some(record.id.clone()),
+            routing_policy_label: record.routing_policy_label.clone(),
+        })
     }
 }
+
