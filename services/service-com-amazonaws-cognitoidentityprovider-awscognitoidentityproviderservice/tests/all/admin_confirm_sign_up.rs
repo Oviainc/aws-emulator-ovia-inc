@@ -273,6 +273,17 @@ async fn stored_attributes(
         .collect()
 }
 
+/// The `sub` attribute `AdminGetUser` reports for `username`: the user's
+/// immutable id, which `UsernameType` documents a request may name it by.
+async fn stored_sub(router: &MultiServiceRouter, user_pool_id: &str, username: &str) -> String {
+    let attributes = stored_attributes(router, user_pool_id, username).await;
+    attributes
+        .iter()
+        .find(|(name, _)| name == "sub")
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| panic!("a stored user carries a sub, got {attributes:?}"))
+}
+
 /// The `UserStatus` `AdminGetUser` reports for `username`.
 async fn stored_status(
     router: &MultiServiceRouter,
@@ -528,4 +539,264 @@ async fn an_absent_pool_or_user_is_refused_and_confirms_nothing() {
         status_now, "UNCONFIRMED",
         "a refused confirmation confirms no other user, got {status_now}"
     );
+}
+
+/// How a row names the user that signed up.
+#[derive(Clone, Copy, Debug)]
+enum Naming {
+    /// The username exactly as the sign-up stored it.
+    AsStored,
+    /// That username upper-cased.
+    UpperCased,
+    /// That username lower-cased.
+    LowerCased,
+    /// The user's immutable id — its `sub`.
+    Sub,
+}
+
+/// The username every resolution row signs up, in mixed case so a row that
+/// re-cases it names a different string. Matches `UsernameType`'s pattern
+/// `^[\p{L}\p{M}\p{S}\p{N}\p{P}]+$`
+/// (`smithy_query(query="shape",shape="UsernameType")`).
+const MIXED_CASE_USERNAME: &str = "Mixed.Case-User";
+
+/// RULE: the confirmation resolves the `Username` the named pool resolves it
+/// to — the stored username under that pool's own case comparison
+/// (`UsernameConfigurationType.CaseSensitive`, from
+/// `smithy_query(query="shape",shape="UsernameConfigurationType")`), or the
+/// user's `sub`, which `UsernameType` documents as what the value "must be" when
+/// it is not a username or an alias — and refuses any other string as an absent
+/// user.
+#[tokio::test]
+async fn the_confirmation_resolves_the_user_the_named_pool_resolves() {
+    let engine = engine();
+    let setup = router(&engine, false);
+    let emulator = router(&engine, true);
+
+    // Rows: the pool's case-sensitivity setting (`None` configures none at all,
+    // which compares case-sensitively), how the request names the user, and
+    // whether that naming resolves the stored user.
+    let rows = [
+        (
+            "no case-sensitivity configured, named as stored",
+            None,
+            Naming::AsStored,
+            true,
+        ),
+        (
+            "a case-sensitive pool, named as stored",
+            Some(true),
+            Naming::AsStored,
+            true,
+        ),
+        (
+            "a case-sensitive pool, named by the user's immutable id",
+            Some(true),
+            Naming::Sub,
+            true,
+        ),
+        (
+            "a case-sensitive pool, named upper-cased",
+            Some(true),
+            Naming::UpperCased,
+            false,
+        ),
+        (
+            "a case-sensitive pool, named lower-cased",
+            Some(true),
+            Naming::LowerCased,
+            false,
+        ),
+        (
+            "a case-insensitive pool, named as stored",
+            Some(false),
+            Naming::AsStored,
+            true,
+        ),
+        (
+            "a case-insensitive pool, named upper-cased",
+            Some(false),
+            Naming::UpperCased,
+            true,
+        ),
+        (
+            "a case-insensitive pool, named lower-cased",
+            Some(false),
+            Naming::LowerCased,
+            true,
+        ),
+        (
+            "a case-insensitive pool, named by the user's immutable id",
+            Some(false),
+            Naming::Sub,
+            true,
+        ),
+    ];
+
+    for (index, (case, case_sensitive, naming, resolves)) in rows.into_iter().enumerate() {
+        let mut configuration = json!({});
+        if let Some(case_sensitive) = case_sensitive {
+            configuration["UsernameConfiguration"] = json!({ "CaseSensitive": case_sensitive });
+        }
+        // One pool per row, so no row observes another's confirmation.
+        let user_pool_id = pool(
+            &setup,
+            &format!("admin-confirm-resolution-{index}"),
+            configuration,
+        )
+        .await;
+        let client_id = app_client(&setup, &user_pool_id, "open").await;
+        sign_up(&emulator, &client_id, MIXED_CASE_USERNAME).await;
+
+        let named = match naming {
+            Naming::AsStored => MIXED_CASE_USERNAME.to_string(),
+            Naming::UpperCased => MIXED_CASE_USERNAME.to_uppercase(),
+            Naming::LowerCased => MIXED_CASE_USERNAME.to_lowercase(),
+            Naming::Sub => stored_sub(&setup, &user_pool_id, MIXED_CASE_USERNAME).await,
+        };
+        let (status, payload) = dispatch(
+            &setup,
+            Addressing::Signed,
+            "AdminConfirmSignUp",
+            &json!({ "UserPoolId": user_pool_id, "Username": named }),
+        )
+        .await;
+
+        if resolves {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: {named:?} resolves the signed-up user, got {status} with {payload}"
+            );
+            let status_now = stored_status(&setup, &user_pool_id, MIXED_CASE_USERNAME).await;
+            assert_eq!(
+                status_now, "CONFIRMED",
+                "case {case:?}: expected CONFIRMED, got {status_now}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            (status, error_code(&payload)),
+            (404, "UserNotFoundException"),
+            "case {case:?}: {named:?} resolves no user, so expected a 404 \
+             UserNotFoundException, got {status} with {payload}"
+        );
+        let message = error_message(&payload);
+        assert_eq!(
+            message, USER_NOT_FOUND_MESSAGE,
+            "case {case:?}: expected {USER_NOT_FOUND_MESSAGE:?}, got {message:?}"
+        );
+        let status_now = stored_status(&setup, &user_pool_id, MIXED_CASE_USERNAME).await;
+        assert_eq!(
+            status_now, "UNCONFIRMED",
+            "case {case:?}: a refused confirmation changes nothing, got {status_now}"
+        );
+    }
+}
+
+/// RULE: the confirmation reaches the user of "the user pool where you want to
+/// confirm a user's sign-up request" (`AdminConfirmSignUp.UserPoolId`) and of no
+/// other pool, so the same username signed up in several pools is confirmed one
+/// pool at a time.
+#[tokio::test]
+async fn the_confirmation_reaches_only_the_pool_the_request_names() {
+    let engine = engine();
+    let setup = router(&engine, false);
+    let emulator = router(&engine, true);
+
+    // Three pools, so a confirmation in one is observed against more than one
+    // pool it must leave alone.
+    let mut pools = Vec::new();
+    for index in 0..3 {
+        let user_pool_id = pool(&setup, &format!("admin-confirm-scope-{index}"), json!({})).await;
+        let client_id = app_client(&setup, &user_pool_id, "open").await;
+        sign_up(&emulator, &client_id, "shared-name").await;
+        pools.push(user_pool_id);
+    }
+
+    for (confirmed_so_far, user_pool_id) in pools.iter().enumerate() {
+        let case = format!("confirming in pool {confirmed_so_far}");
+        ok(
+            &setup,
+            "AdminConfirmSignUp",
+            &json!({ "UserPoolId": user_pool_id, "Username": "shared-name" }),
+        )
+        .await;
+
+        for (index, other) in pools.iter().enumerate() {
+            let expected = if index <= confirmed_so_far {
+                "CONFIRMED"
+            } else {
+                "UNCONFIRMED"
+            };
+            let status_now = stored_status(&setup, other, "shared-name").await;
+            assert_eq!(
+                status_now, expected,
+                "case {case:?}: pool {index} must report {expected}, got {status_now}"
+            );
+        }
+    }
+}
+
+/// RULE: `ClientMetadata` is "input for any custom workflows that this action
+/// triggers" (`AdminConfirmSignUp.ClientMetadata`) — it is passed to the
+/// triggers, never stored on the user — so whatever a request carries in it, the
+/// confirmation stores exactly what it stores without it.
+#[tokio::test]
+async fn client_metadata_is_input_for_triggers_and_is_stored_nowhere() {
+    let engine = engine();
+    let setup = router(&engine, false);
+    let emulator = router(&engine, true);
+
+    let rows = [
+        ("no ClientMetadata at all", Value::Null),
+        ("one pair", json!({ "tenant": "acme" })),
+        (
+            "several pairs, one of them named like a user attribute",
+            json!({
+                "email": "elsewhere@example.test",
+                "email_verified": "true",
+                "sub": "00000000-0000-0000-0000-000000000000",
+            }),
+        ),
+        ("an empty map", json!({})),
+    ];
+
+    let user_pool_id = pool(&setup, "admin-confirm-client-metadata", json!({})).await;
+    let client_id = app_client(&setup, &user_pool_id, "open").await;
+
+    for (index, (case, metadata)) in rows.into_iter().enumerate() {
+        let username = format!("metadata-user-{index}");
+        sign_up(&emulator, &client_id, &username).await;
+        let before = stored_attributes(&setup, &user_pool_id, &username).await;
+
+        let mut request = json!({ "UserPoolId": user_pool_id, "Username": username });
+        if !metadata.is_null() {
+            request["ClientMetadata"] = metadata;
+        }
+        let (status, payload) = dispatch(
+            &setup,
+            Addressing::Signed,
+            "AdminConfirmSignUp",
+            &request,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the confirmation is served whatever the metadata, got {status} with \
+             {payload}"
+        );
+
+        let status_now = stored_status(&setup, &user_pool_id, &username).await;
+        assert_eq!(
+            status_now, "CONFIRMED",
+            "case {case:?}: expected CONFIRMED, got {status_now}"
+        );
+        let after = stored_attributes(&setup, &user_pool_id, &username).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: the metadata is stored nowhere, so the attributes must be unchanged, \
+             got {after:?}"
+        );
+    }
 }
