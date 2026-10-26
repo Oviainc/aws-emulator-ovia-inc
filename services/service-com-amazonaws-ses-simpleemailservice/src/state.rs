@@ -19,9 +19,9 @@
 //! sets at [`MAX_CONFIGURATION_SETS`], the receipt rule sets at
 //! [`MAX_RECEIPT_RULE_SETS`], the receipt IP address filters at
 //! [`MAX_RECEIPT_FILTERS`], and the send log
-//! at the account's own 24-hour quota, with the window's expiry applied on
-//! append ([`ComAmazonawsSesSimpleemailserviceState::log_sent_message`]) and
-//! [`MAX_SENT_LOG_ENTRIES`] as the backstop. The text one log entry keeps is
+//! at the activity its longest report covers, with that retention's expiry
+//! applied on append ([`ComAmazonawsSesSimpleemailserviceState::log_sent_message`])
+//! and [`MAX_SENT_LOG_ENTRIES`] as the backstop. The text one log entry keeps is
 //! capped at [`MAX_LOGGED_TEXT`]. The template store is bounded the same way, at
 //! [`MAX_TEMPLATES`].
 //!
@@ -40,6 +40,26 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// and `SentLast24Hours` is "The number of emails sent during the previous 24
 /// hours".
 pub const SEND_QUOTA_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The trailing window the sending statistics are reported over.
+///
+/// `GetSendStatistics` documents it: "The result is a list of data points,
+/// representing the last two weeks of sending activity."
+pub const SEND_STATISTICS_WINDOW: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+/// How long an accepted message stays in the send log: the LONGEST window any
+/// reader of the log reports over, which is the sending statistics' two weeks
+/// ([`SEND_STATISTICS_WINDOW`]) rather than the sending quota's 24 hours. An
+/// entry the quota has stopped counting is still part of the statistics, so the
+/// log cannot drop it any earlier without making a documented report impossible
+/// to serve.
+pub const SEND_LOG_RETENTION: Duration = SEND_STATISTICS_WINDOW;
+
+/// The period one sending-statistics data point aggregates.
+///
+/// `GetSendStatistics` documents it: "Each data point in the list contains
+/// statistics for a 15-minute period of time", and `SendDataPoint` repeats it.
+pub const SEND_STATISTICS_PERIOD: Duration = Duration::from_secs(15 * 60);
 
 /// The account's daily sending quota in the Amazon SES sandbox, which is where a
 /// fresh account (and therefore this emulator's account) starts.
@@ -75,10 +95,11 @@ pub const MAX_CONFIGURATION_SET_NAME: usize = 64;
 
 /// The entries the send log may hold at once.
 ///
-/// The 24-hour quota is the real ceiling — a day's accepted sends are at most
-/// `max_24_hour_send` recipients — and the window's expiry is applied on every
-/// append, so this is the backstop that still bounds the store if the stored
-/// quota is raised later.
+/// The account's own quota is the real ceiling — a day's accepted sends are at
+/// most `max_24_hour_send` recipients, and [`SEND_LOG_RETENTION`] bounds how
+/// many days of them the log keeps — and that retention's expiry is applied on
+/// every append, so this is the backstop that still bounds the store if the
+/// stored quota is raised later.
 pub const MAX_SENT_LOG_ENTRIES: usize = 1_000;
 
 /// The receipt rule sets one account may hold, and so the ceiling on the rule-set
@@ -590,19 +611,20 @@ impl ComAmazonawsSesSimpleemailserviceState {
 
     /// Append an accepted message to the send log, bounding it as it grows.
     ///
-    /// Two bounds, applied here so every writer gets them: the entries the
-    /// 24-hour window has already left are dropped — the quota computation
-    /// treats them as gone, so this only materialises an expiry the clock has
-    /// already made due — and, as a backstop, the oldest entries past
-    /// [`MAX_SENT_LOG_ENTRIES`].
+    /// Two bounds, applied here so every writer gets them: the entries that have
+    /// left [`SEND_LOG_RETENTION`] are dropped — no reader counts them any more,
+    /// so this only materialises an expiry the clock has already made due — and,
+    /// as a backstop, the oldest entries past [`MAX_SENT_LOG_ENTRIES`].
+    ///
+    /// The expiry is the LONGEST window a reader reports over, not the shortest:
+    /// an entry the sending quota has stopped counting is still inside the
+    /// window the sending statistics report, so dropping it at the quota's
+    /// window would leave the statistics unable to report the two weeks they
+    /// document.
     pub fn log_sent_message(&mut self, message: SentMessage) {
         let now = message.sent_at;
-        self.sent_messages.retain(|logged| {
-            logged
-                .sent_at
-                .checked_add(SEND_QUOTA_WINDOW)
-                .is_none_or(|leaves_window| leaves_window > now)
-        });
+        self.sent_messages
+            .retain(|logged| within_window(logged.sent_at, now, SEND_LOG_RETENTION));
         self.sent_messages.push(message);
         if let Some(excess) = self
             .sent_messages
@@ -726,15 +748,65 @@ impl ComAmazonawsSesSimpleemailserviceState {
         let recipients: usize = self
             .sent_messages
             .iter()
-            .filter(|message| {
-                message
-                    .sent_at
-                    .checked_add(SEND_QUOTA_WINDOW)
-                    .is_none_or(|leaves_window| leaves_window > now)
-            })
+            .filter(|message| within_window(message.sent_at, now, SEND_QUOTA_WINDOW))
             .map(|message| message.destinations.len())
             .sum();
         recipients as f64
+    }
+
+    /// The sending activity of the trailing [`SEND_STATISTICS_WINDOW`], bucketed
+    /// into the [`SEND_STATISTICS_PERIOD`] data points `GetSendStatistics`
+    /// reports: `(the period's start, the deliveries attempted in that period)`,
+    /// oldest period first.
+    ///
+    /// DERIVED from the send log on every read, like [`Self::sent_last_24_hours`],
+    /// so a period's numbers never drift from the messages the log holds and the
+    /// list shortens again as activity ages out of the window.
+    ///
+    /// Every RECIPIENT is one delivery attempt, for the reason
+    /// [`Self::sent_last_24_hours`] counts recipients: SES counts each recipient
+    /// of a message as an email sent. A period the log has no message in is NOT a
+    /// data point — the statistics report the periods there was activity in, not
+    /// one entry per period of the window.
+    pub fn send_data_points(&self, now: SystemTime) -> Vec<(SystemTime, u64)> {
+        // Keyed by the period's start so the buckets come out in one stable,
+        // chronological order however the log is ordered.
+        let mut periods: BTreeMap<u64, u64> = BTreeMap::new();
+        for message in self
+            .sent_messages
+            .iter()
+            .filter(|message| within_window(message.sent_at, now, SEND_STATISTICS_WINDOW))
+        {
+            let Some(period) = statistics_period_start(message.sent_at) else {
+                continue;
+            };
+            let deliveries = periods.entry(period).or_default();
+            *deliveries = deliveries.saturating_add(message.destinations.len() as u64);
+        }
+        periods
+            .into_iter()
+            .filter_map(|(period, deliveries)| {
+                let start = UNIX_EPOCH.checked_add(Duration::from_secs(period))?;
+                Some((start, deliveries))
+            })
+            .collect()
+    }
+
+    /// The verified EMAIL ADDRESS identities of this account, in one stable
+    /// (lexicographic) order — the view `ListVerifiedEmailAddresses` reports.
+    ///
+    /// A domain identity is not an email address, so it is not in this list;
+    /// `ListIdentities` is the operation that reports both classes, which is what
+    /// the deprecated listing's documentation points a caller at.
+    pub fn verified_email_addresses(&self) -> Vec<String> {
+        self.identities
+            .values()
+            .filter(|identity| {
+                identity.identity_type == IdentityType::EmailAddress
+                    && identity.verification_status == VerificationStatus::Success
+            })
+            .map(|identity| identity.name.clone())
+            .collect()
     }
 
     /// A fresh opaque token for this store, as 64 hex characters.
@@ -869,6 +941,32 @@ impl ComAmazonawsSesSimpleemailserviceState {
         self.receipt_filters.insert(filter.name.clone(), filter);
         true
     }
+}
+
+/// Whether a message accepted at `sent_at` is still inside the trailing `window`
+/// at `now`.
+///
+/// The one rule every window in this store is read by — the sending quota's and
+/// the sending statistics' — so a message is in or out of a window in exactly
+/// one place. A message whose window end cannot be represented is still inside
+/// it: it cannot have left a window that does not end.
+fn within_window(sent_at: SystemTime, now: SystemTime, window: Duration) -> bool {
+    sent_at
+        .checked_add(window)
+        .is_none_or(|leaves_window| leaves_window > now)
+}
+
+/// The start of the [`SEND_STATISTICS_PERIOD`] bucket `at` falls in, as whole
+/// seconds since the epoch; `None` for an instant before the epoch, which no
+/// accepted message carries.
+///
+/// The buckets are aligned to the epoch rather than to the time of the call, so
+/// one message always falls in the same period however often the statistics are
+/// read.
+fn statistics_period_start(at: SystemTime) -> Option<u64> {
+    let since_epoch = at.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let period = SEND_STATISTICS_PERIOD.as_secs();
+    Some(since_epoch - since_epoch % period)
 }
 
 /// Whether `value` is a receipt rule or rule set name in the form SES documents.

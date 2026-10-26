@@ -5,7 +5,7 @@
 //! Every request reaching this emulator can grow one of these stores, so each has
 //! a ceiling: the identity list at `MAX_IDENTITIES`, the configuration sets at
 //! `MAX_CONFIGURATION_SETS`, the send log at
-//! `MAX_SENT_LOG_ENTRIES` with the 24-hour window applied on append, and the text
+//! `MAX_SENT_LOG_ENTRIES` with the log's retention applied on append, and the text
 //! one log entry keeps at `MAX_LOGGED_TEXT`. What is asserted here is the RULE
 //! each bound follows over a SET of sizes — at the ceiling, one past it, and well
 //! inside it — reached through the same `state` API the handlers use, because the
@@ -15,7 +15,7 @@
 use service_com_amazonaws_ses_simpleemailservice::state::{
     logged_text, ComAmazonawsSesSimpleemailserviceState, IdentityType, SentMessage,
     MAX_CONFIGURATION_SETS, MAX_IDENTITIES, MAX_LOGGED_TEXT, MAX_SENT_LOG_ENTRIES,
-    SEND_QUOTA_WINDOW,
+    SEND_LOG_RETENTION, SEND_QUOTA_WINDOW,
 };
 use std::time::{Duration, SystemTime};
 
@@ -240,7 +240,10 @@ async fn the_quota_window_drops_what_has_aged_out() {
     }
 
     // An append also materialises the expiry the clock has already made due, so
-    // the store does not keep what no reader counts.
+    // the store does not keep what NO reader counts. That expiry is the log's
+    // retention, which is longer than this quota window: an entry the quota has
+    // stopped counting is still part of the sending statistics, so it stays in
+    // the log until it leaves the retention too.
     let mut state = ComAmazonawsSesSimpleemailserviceState::default();
     state.log_sent_message(message(
         0,
@@ -251,14 +254,35 @@ async fn the_quota_window_drops_what_has_aged_out() {
     state.log_sent_message(message(1, 1, now));
     assert_eq!(
         state.sent_messages.len(),
-        1,
-        "case append after the window: the aged-out entry is dropped, got {:?}",
+        2,
+        "case append past the quota window: the entry is kept for the longer report, got {:?}",
         state.sent_messages
     );
     assert_eq!(
         state.sent_last_24_hours(now),
         1.0,
-        "case append after the window: only the entry inside the window counts"
+        "case append past the quota window: only the entry inside the window counts"
+    );
+
+    // Past the retention, the append drops it: nothing reports it any more.
+    let mut state = ComAmazonawsSesSimpleemailserviceState::default();
+    state.log_sent_message(message(
+        0,
+        1,
+        now.checked_sub(SEND_LOG_RETENTION + Duration::from_secs(60))
+            .expect("the test clock stays after the epoch"),
+    ));
+    state.log_sent_message(message(1, 1, now));
+    assert_eq!(
+        state.sent_messages.len(),
+        1,
+        "case append past the retention: the aged-out entry is dropped, got {:?}",
+        state.sent_messages
+    );
+    assert_eq!(
+        state.sent_last_24_hours(now),
+        1.0,
+        "case append past the retention: only the entry inside the window counts"
     );
 }
 

@@ -43,8 +43,10 @@ pub mod get_identity_dkim_attributes_types;
 pub mod get_identity_mail_from_domain_attributes_types;
 pub mod get_identity_notification_attributes_types;
 pub mod get_identity_policies_types;
+pub mod get_account_sending_enabled_types;
 pub mod get_identity_verification_attributes_types;
 pub mod get_send_quota_types;
+pub mod get_send_statistics_types;
 pub mod get_template_types;
 pub mod list_configuration_sets_types;
 pub mod list_custom_verification_email_templates_types;
@@ -53,6 +55,7 @@ pub mod list_identity_policies_types;
 pub mod list_receipt_filters_types;
 pub mod list_receipt_rule_sets_types;
 pub mod list_templates_types;
+pub mod list_verified_email_addresses_types;
 pub mod put_configuration_set_delivery_options_types;
 pub mod put_identity_policy_types;
 pub mod reorder_receipt_rule_set_types;
@@ -143,9 +146,13 @@ pub use get_identity_notification_attributes_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_identity_policies_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
+pub use get_account_sending_enabled_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_identity_verification_attributes_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_send_quota_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use get_send_statistics_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_template_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
@@ -162,6 +169,8 @@ pub use list_receipt_filters_types::*;
 pub use list_receipt_rule_sets_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use list_templates_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use list_verified_email_addresses_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use put_configuration_set_delivery_options_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

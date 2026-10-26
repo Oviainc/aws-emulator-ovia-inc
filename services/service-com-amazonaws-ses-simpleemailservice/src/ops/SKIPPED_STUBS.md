@@ -18,11 +18,19 @@ union can be declared as `{Op}Output`. A `@required` union member and a
 `@required`-member reference cycle are NOT decline reasons — a scaffolded
 handler returns an error, so it never has to construct a value.
 
-// SKIPPED: GetAccountSendingEnabled — unsupported shape construct: operation 'GetAccountSendingEnabled' has a Unit/absent input, which the generator does not emit yet
-// SKIPPED: GetSendStatistics — unsupported shape construct: operation 'GetSendStatistics' has a Unit/absent input, which the generator does not emit yet
-// SKIPPED: ListVerifiedEmailAddresses — unsupported shape construct: operation 'ListVerifiedEmailAddresses' has a Unit/absent input, which the generator does not emit yet
-
 // HAND-AUTHORED since: GetSendQuota — the generator declined it for the same
 // Unit-input reason, and it is now written out in `ops/get_send_quota.rs` (with
 // its two shapes in `ops/types/get_send_quota_types.rs`), so it is typed, in the
 // service's `operations(...)` allow-list, and served like every other operation.
+
+// HAND-AUTHORED since: GetAccountSendingEnabled — written out in
+// `ops/get_account_sending_enabled.rs`, shapes in
+// `ops/types/get_account_sending_enabled_types.rs`.
+
+// HAND-AUTHORED since: GetSendStatistics — written out in
+// `ops/get_send_statistics.rs`, shapes in
+// `ops/types/get_send_statistics_types.rs`.
+
+// HAND-AUTHORED since: ListVerifiedEmailAddresses — written out in
+// `ops/list_verified_email_addresses.rs`, shapes in
+// `ops/types/list_verified_email_addresses_types.rs`.

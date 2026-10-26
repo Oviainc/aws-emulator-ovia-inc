@@ -12,9 +12,9 @@
 //! * the operations this slice did NOT implement still answer HTTP 501
 //!   `NotImplemented` — never an empty 200 that a caller could mistake for real
 //!   behaviour.
-//! * the operations the generator still declines stay on the
-//!   unroutable-operation path, which is the honest answer for an operation
-//!   this service does not serve.
+//! * EVERY operation the generator declined for that same Unit-input reason is
+//!   hand-authored and routed now, so this service leaves no modeled operation
+//!   on the unroutable-operation path.
 
 use crate::harness::{call, emulator, field};
 use smithy_server_runtime::MultiServiceRouter;
@@ -79,25 +79,27 @@ async fn operations_this_slice_left_unimplemented_still_answer_501() {
 }
 
 #[tokio::test]
-async fn operations_the_generator_still_declines_are_not_served() {
+async fn every_operation_the_generator_declined_is_routed() {
     let router = emulator();
-    // Still listed in `src/ops/SKIPPED_STUBS.md`: modeled but unwired, so they
-    // are answered by the framework's unroutable-operation path rather than
-    // pretending to be implemented.
+    // Each was declined for the same reason (a `smithy.api#Unit` input) and is
+    // hand-authored now, so each must be reached as a modeled operation: the
+    // query envelope named after the action, carrying its own result element —
+    // never the unroutable-operation path's `400 InvalidAction`.
     for action in [
+        "GetSendQuota",
         "GetAccountSendingEnabled",
         "GetSendStatistics",
         "ListVerifiedEmailAddresses",
     ] {
         let (status, body) = probe(&router, action, &[]).await;
         assert_eq!(
-            status, 400,
-            "case {action}: an unwired operation takes the query protocol's \
-             unroutable-operation path (400 InvalidAction), got {status} with {body}"
+            status, 200,
+            "case {action}: expected a routed operation answering 200, got {status} with {body}"
         );
         assert!(
-            body.contains("<Code>InvalidAction</Code>"),
-            "case {action}: expected InvalidAction, got {body}"
+            body.contains(&format!("<{action}Response"))
+                && body.contains(&format!("<{action}Result>")),
+            "case {action}: expected the awsQuery envelope for this operation, got {body}"
         );
     }
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAccountSendingEnabled
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAccountSendingEnabled`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAccountSendingEnabled::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enables or disables email sending for the whole account, which is the state
+//! `GetAccountSendingEnabled` reports and every send is checked against.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +145,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAccountSendingEnabled` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAccountSendingEnabledErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAccountSendingEnabled"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and it models no server
+            // error of its own.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateAccountSendingEnabled",
+            ));
+        };
+        // "Enables or disables email sending across your entire Amazon SES
+        // account": the flag is written on the account record every send is
+        // checked against, so pausing sending here is what a later send is
+        // refused by and what `GetAccountSendingEnabled` reports. Idempotent —
+        // setting the value it already holds is the same request.
+        state.lock().account.sending_enabled = input.enabled;
+
+        // The modelled output has no members: what the call produced is the state
+        // it wrote, which `GetAccountSendingEnabled` reports.
+        Ok(UpdateAccountSendingEnabledOutput)
     }
 }
