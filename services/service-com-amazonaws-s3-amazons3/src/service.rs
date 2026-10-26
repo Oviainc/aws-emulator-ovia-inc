@@ -28,9 +28,10 @@
 //!   error codes (see `s3_refusal`), never the framework's generic
 //!   `ValidationException`, because a client branches on the S3 code.
 //! - `override_routing_error` — how this service words a request that reached it
-//!   but named no modeled operation. The default returns `None`, so the entry
-//!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
-//!   404, …). Return `Some(resp)` to answer in your own envelope if desired.
+//!   but named no modeled operation. S3's SELECT data plane is the one such request
+//!   this service words itself: no routing-table entry claims `?select`, and S3
+//!   refuses a Select request with `MethodNotAllowed` (405) rather than the
+//!   framework's "not written yet" 501. Everything else keeps the default.
 //! - `override_framework_error` — how this service words a transport-level
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
@@ -53,6 +54,7 @@ use smithy_server_runtime::{
 use std::sync::Arc;
 
 use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
+use aws_smithy_schema_server::protocol::ServerProtocol;
 
 use wire::UnwrappedXmlRestXml;
 
@@ -275,6 +277,46 @@ fn published_refusal(violation: &Violation) -> Option<Refused> {
     })
 }
 
+/// The query parameter that addresses S3's Select data plane.
+///
+/// `SelectObjectContent` is bound at `POST /{Bucket}/{Key+}?select&select-type=2`
+/// (`smithy_query(query="operation",operation="SelectObjectContent",
+/// model_path="services/service-com-amazonaws-s3-amazons3/smithy-model/com-amazonaws-s3-amazons3.json")`
+/// reports that `@http` uri; `OPERATIONS.md` restates it), so the `select` SUBRESOURCE is
+/// what names the feature — `select-type` only says which generation of it the client
+/// speaks, and the refusal below is the same for every value of it.
+const SELECT_SUBRESOURCE: &str = "select";
+
+/// Whether `query` — a request URI's query string — carries the parameter `name`, with or
+/// without a value. A subresource arrives as a bare flag (`?select`), so a reader that
+/// insisted on `=` would miss it.
+fn query_carries(query: &str, name: &str) -> bool {
+    query
+        .split('&')
+        .any(|parameter| parameter.split('=').next().unwrap_or(parameter) == name)
+}
+
+/// Whether `path` addresses an OBJECT — S3's `/{Bucket}/{Key+}`, a non-empty bucket
+/// segment with a non-empty key below it — rather than a bucket or the service root.
+fn addresses_object(path: &str) -> bool {
+    match path.trim_start_matches('/').split_once('/') {
+        Some((bucket, key)) => !bucket.is_empty() && !key.is_empty(),
+        None => false,
+    }
+}
+
+/// Whether `uri` addresses the S3 Select data plane: the `select` subresource of an
+/// object.
+///
+/// The method is deliberately not part of this predicate, and costs nothing: it is
+/// consulted ONLY for a request no modeled operation claimed, and every other method on an
+/// object path (`GET`/`HEAD`/`PUT`/`DELETE`) resolves to its own modeled operation before
+/// ever reaching here. What is left is a request that asked S3 for Select and nothing else.
+fn addresses_s3_select(uri: &str) -> bool {
+    query_carries(wire::request_query(uri), SELECT_SUBRESOURCE)
+        && addresses_object(wire::request_path(uri))
+}
+
 /// The `com-amazonaws-s3-amazons3` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -298,6 +340,38 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             entry: crate::ServiceDefinition::new(engine),
             protocol: UnwrappedXmlRestXml::new(),
         }
+    }
+
+    /// The refusal S3 answers a request against a resource it does not serve at all:
+    /// HTTP 405 with the error code `MethodNotAllowed` and that code's published message
+    /// (see [`crate::state::METHOD_NOT_ALLOWED_CODE`]).
+    ///
+    /// Rendered through THIS service's own protocol, in the same
+    /// [`crate::scaffolded::Unmodeled`] channel an implemented handler answers this code
+    /// with (`GetObjectTorrent` is the one beside it), so the envelope a client parses —
+    /// the bare `<Error>` root with its `<Code>`, `<Message>` and request-correlation
+    /// elements, and the matching `x-amz-request-id` / `x-amz-id-2` headers — is byte for
+    /// byte the one every other S3 refusal carries. No `Allow` header accompanies it: the
+    /// feature is withdrawn rather than bound to some other method, so there is no method
+    /// against this resource to name.
+    ///
+    /// `None` on the serializer failure a fixed code and a fixed message cannot actually
+    /// provoke, which leaves the framework's own routing refusal to answer rather than
+    /// panicking in the request path.
+    fn method_not_allowed(&self) -> Option<aws_smithy_runtime_api::http::Response> {
+        let refusal = crate::scaffolded::Unmodeled {
+            code: crate::state::METHOD_NOT_ALLOWED_CODE,
+            status: crate::state::METHOD_NOT_ALLOWED_STATUS,
+            message: crate::state::METHOD_NOT_ALLOWED_MESSAGE.to_string(),
+        };
+        self.protocol
+            .serialize_error(
+                &refusal,
+                &crate::scaffolded::UNMODELED_SCHEMA,
+                refusal.code,
+                refusal.status,
+            )
+            .ok()
     }
 }
 
@@ -364,10 +438,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // modeled operation — neither `override_operation` nor the generated
         // routing table resolved it. Returning `None` renders the protocol-correct
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501).
+        //
+        // S3's SELECT data plane is exactly that case: `SelectObjectContent` is the one
+        // operation of this model whose output is a `@streaming` event-stream union, which
+        // the scaffold generator declines to type (`src/ops/SKIPPED_STUBS.md`), so no
+        // routing-table entry claims `?select` and the default would answer the framework's
+        // 501 `NotImplemented` — "nobody has written this yet". That is not one of the two
+        // things S3 answers a Select request with: it either serves the rows, or — having
+        // withdrawn S3 Select from every account that had not already enabled it — refuses
+        // the request outright, with the 405 `MethodNotAllowed` it answers any resource that
+        // does not serve the method asked of it (`GetObjectTorrent`, which no account can
+        // enable, is refused the same way). The withdrawal is account-wide rather than
+        // per-object, so the refusal is the same for every Select request, whatever
+        // expression, serialization, scan range or encryption it carries and whichever
+        // bucket or key it names — and a client that probes Select and falls back on this
+        // code sees the code it branches on instead of an unmodeled exception.
+        //
+        // Everything else keeps the framework's default, so an operation that really is
+        // merely unwritten still answers the 501 that counts it as such.
+        if !addresses_s3_select(req.uri()) {
+            return None;
+        }
+        self.method_not_allowed()
     }
 
     fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {

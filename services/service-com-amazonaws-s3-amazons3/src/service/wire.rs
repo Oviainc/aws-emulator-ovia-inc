@@ -699,7 +699,12 @@ fn elements_as_attributes(document: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// The path component of a request URI, without the scheme, the authority or the query.
-fn request_path(uri: &str) -> &str {
+///
+/// `pub(super)`, with [`request_query`] below it: [`super`]'s routing seam reads the same
+/// two components off a request URI, and one reader for both keeps the request this
+/// service ROUTES and the request it DESERIALIZES from disagreeing about which path and
+/// which query string arrived.
+pub(super) fn request_path(uri: &str) -> &str {
     let after_authority = match uri.find("://") {
         None => uri,
         Some(scheme_end) => match uri[scheme_end + 3..].find('/') {
@@ -715,7 +720,7 @@ fn request_path(uri: &str) -> &str {
 
 /// The query component of a request URI (everything after the first `?`), or the empty
 /// string when it has none.
-fn request_query(uri: &str) -> &str {
+pub(super) fn request_query(uri: &str) -> &str {
     match uri.find('?') {
         Some(mark) => &uri[mark + 1..],
         None => "",

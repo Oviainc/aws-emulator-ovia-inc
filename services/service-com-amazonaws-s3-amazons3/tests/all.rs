@@ -135,6 +135,8 @@ mod object_listing_v1;
 mod object_retention;
 #[path = "all/object_restore.rs"]
 mod object_restore;
+#[path = "all/object_select_content.rs"]
+mod object_select_content;
 #[path = "all/object_storage.rs"]
 mod object_storage;
 #[path = "all/object_tag_set_removal.rs"]
