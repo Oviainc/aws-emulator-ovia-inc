@@ -186,6 +186,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             CreateSchemaError::from(CreateSchemaErrorModeled::BadRequestException(refusal))
         })?;
 
+        // The names this create supplies are checked against the service's own
+        // constraints for them before the store is reached: a name outside one names no
+        // schema this service could ever have created, so it is refused on the request
+        // rather than stored under an ARN this service could not mint. See
+        // `crate::state::validate_names`.
+        crate::state::validate_names(Some(&input.registry_name), Some(&input.schema_name)).map_err(
+            |refusal| CreateSchemaError::from(CreateSchemaErrorModeled::BadRequestException(refusal)),
+        )?;
+
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateSchemaError::from(CreateSchemaErrorModeled::InternalServerErrorException(
                 crate::state::internal_error(),

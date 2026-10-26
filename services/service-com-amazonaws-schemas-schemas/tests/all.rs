@@ -47,6 +47,8 @@ mod json_refusal_diagnostics;
 mod list_discoverers;
 #[path = "all/malformed_content_and_policy_deletion.rs"]
 mod malformed_content_and_policy_deletion;
+#[path = "all/name_constraints.rs"]
+mod name_constraints;
 #[path = "all/published_document_bytes.rs"]
 mod published_document_bytes;
 #[path = "all/registry_schema_lifecycle.rs"]

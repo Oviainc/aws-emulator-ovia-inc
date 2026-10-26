@@ -144,6 +144,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service-owned one was created by no request, so its ARN names the region
         // THIS request is signed for.
         let region = crate::state::request_region(ctx.parts());
+        // The names this request supplies are checked against the service's own
+        // constraints for them before the store is reached: a name outside one names no
+        // resource anywhere, so the request is refused on its form rather than answered
+        // as if the name merely named nothing yet. See `crate::state::validate_names`.
+        crate::state::validate_names(Some(&input.registry_name), None).map_err(|refusal| {
+            DescribeRegistryError::from(DescribeRegistryErrorModeled::BadRequestException(refusal))
+        })?;
+
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeRegistryError::from(DescribeRegistryErrorModeled::InternalServerErrorException(
                 crate::state::internal_error(),

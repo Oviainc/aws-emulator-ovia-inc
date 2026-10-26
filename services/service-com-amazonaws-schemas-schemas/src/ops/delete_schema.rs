@@ -160,6 +160,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `ctx` carries request metadata only; a delete needs nothing from it.
         let _ = ctx;
+        // The names this request supplies are checked against the service's own
+        // constraints for them before the store is reached: a name outside one names no
+        // resource anywhere, so the request is refused on its form rather than answered
+        // as if the name merely named nothing yet. See `crate::state::validate_names`.
+        crate::state::validate_names(Some(&input.registry_name), Some(&input.schema_name))
+            .map_err(|refusal| {
+                DeleteSchemaError::from(DeleteSchemaErrorModeled::BadRequestException(refusal))
+            })?;
+
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteSchemaError::from(DeleteSchemaErrorModeled::InternalServerErrorException(
                 crate::state::internal_error(),

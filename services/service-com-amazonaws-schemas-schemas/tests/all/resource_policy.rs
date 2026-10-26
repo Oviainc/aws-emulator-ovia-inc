@@ -476,9 +476,11 @@ async fn a_request_that_names_no_existing_registry_is_refused() {
     let emulator = Emulator::new();
     create_registry(&emulator, "real-registry").await;
 
-    // Rows: a name nothing created, one differing only in case, and one differing
-    // only by a trailing space (percent-encoded, so the URI itself stays well-formed).
-    for case in ["absent-registry", "Real-Registry", "real-registry%20"] {
+    // Rows: a name nothing created, one differing only in case, and one differing only
+    // by a trailing separator. Every row is a name the service ACCEPTS, so what the
+    // case observes is the registry being absent; a name the service does not accept at
+    // all is refused on its form instead, which `name_constraints.rs` pins.
+    for case in ["absent-registry", "Real-Registry", "real-registry."] {
         for (operation, answer) in [
             (
                 "GetResourcePolicy",

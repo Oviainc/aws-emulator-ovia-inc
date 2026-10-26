@@ -2580,6 +2580,170 @@ pub fn code_binding_language(requested: &str) -> Option<&'static str> {
         .find(|language| *language == requested)
 }
 
+/// The constraint this service holds one of its caller-supplied resource NAMES to:
+/// the parameter a refusal names it by, the characters an acceptable name is built
+/// from, and the longest name the service accepts.
+///
+/// Both names a caller supplies here — `RegistryName` and `SchemaName` — are modelled
+/// as a plain `__string` with no `@length` and no `@pattern`
+/// (`smithy_query(query="shape",shape="CreateRegistryRequest,CreateSchemaRequest")`),
+/// so the boundary validator enforces nothing and the constraint is the SERVICE's,
+/// exactly as it is for the `Language` label ([`CODE_BINDING_LANGUAGES`]). A name the
+/// service does not accept names no resource it could ever have created, so it is
+/// refused on the REQUEST — before any resource is resolved and before anything is
+/// stored — rather than recorded under a name whose ARN this service could not mint.
+#[derive(Debug)]
+pub struct NameConstraint {
+    /// The request parameter the name arrives in, as the service's own refusal names
+    /// it.
+    pub parameter: &'static str,
+    /// The characters an acceptable name is built from, as inclusive ranges in the
+    /// order the service's published pattern lists them (a single character is a range
+    /// of itself).
+    ///
+    /// This is the ONE place the accepted set is written down: the check reads these
+    /// ranges ([`NameConstraint::validate`]) and the pattern the refusal quotes is
+    /// rendered from them ([`NameConstraint::pattern`]), so the sentence cannot state a
+    /// rule the check does not apply.
+    pub characters: &'static [(char, char)],
+    /// The longest name the service accepts, in characters.
+    pub max_length: usize,
+}
+
+impl NameConstraint {
+    /// The pattern an acceptable name matches, as the refusal quotes it: the accepted
+    /// ranges as one anchored character class.
+    pub fn pattern(&self) -> String {
+        let mut class = String::new();
+        for (first, last) in self.characters {
+            Self::write_class_character(&mut class, *first);
+            if first != last {
+                class.push('-');
+                Self::write_class_character(&mut class, *last);
+            }
+        }
+        format!("^[{class}]+$")
+    }
+
+    /// One character of the class, escaped where a class would otherwise read it as
+    /// syntax rather than as itself.
+    fn write_class_character(class: &mut String, character: char) {
+        if matches!(character, '.' | '-' | '^' | ']' | '\\') {
+            class.push('\\');
+        }
+        class.push(character);
+    }
+
+    /// Whether `character` is one of the characters this constraint accepts.
+    fn permits(&self, character: char) -> bool {
+        self.characters
+            .iter()
+            .any(|(first, last)| (*first..=*last).contains(&character))
+    }
+
+    /// Check a name this constraint governs.
+    ///
+    /// `Err` is the refusal to answer, in the service's own parameter-validation voice:
+    /// it names the parameter it checked and the rule that parameter broke, so a caller
+    /// can fix the request from the message alone. One rule per refusal, and the length
+    /// is decided first, so a name that breaks both is reported against its length.
+    ///
+    /// The rejected value is never echoed back: the caller already holds what it sent,
+    /// and the rule is what it needs.
+    pub fn validate(&self, name: &str) -> Result<(), BadRequestException> {
+        if name.chars().count() > self.max_length {
+            return Err(bad_request(format!(
+                "Parameter {} must have length less than or equal to {}",
+                self.parameter, self.max_length
+            )));
+        }
+        // The class is `+`-quantified, so the empty name satisfies no pattern either.
+        if name.is_empty() || !name.chars().all(|character| self.permits(character)) {
+            return Err(bad_request(format!(
+                "Parameter {} doesn't match pattern {}",
+                self.parameter,
+                self.pattern()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The characters a registry name is built from, which a schema name extends: letters,
+/// digits and the three separators, in the order the published pattern lists them.
+const REGISTRY_NAME_CHARACTERS: &[(char, char)] = &[
+    ('.', '.'),
+    ('-', '-'),
+    ('_', '_'),
+    ('A', 'Z'),
+    ('a', 'z'),
+    ('0', '9'),
+];
+
+/// [`REGISTRY_NAME_CHARACTERS`] plus the `@` a schema name may also carry.
+const SCHEMA_NAME_CHARACTERS: &[(char, char)] = &[
+    ('.', '.'),
+    ('-', '-'),
+    ('_', '_'),
+    ('A', 'Z'),
+    ('a', 'z'),
+    ('0', '9'),
+    ('@', '@'),
+];
+
+/// The constraint a `RegistryName` a caller supplies must satisfy: letters, digits and
+/// the three separators `.`, `-` and `_`, up to 64 characters.
+///
+/// Source: the constraint the service publishes for a registry's name —
+/// `AWS::EventSchemas::Registry`'s `RegistryName` (pattern `[\.\-_A-Za-z0-9]+`,
+/// maximum length 64), which is the same name this API takes in its `RegistryName`
+/// label. The service-owned registry [`AWS_MANAGED_REGISTRY`] satisfies it, as every
+/// name this service could have issued an ARN for does.
+pub static REGISTRY_NAME: NameConstraint = NameConstraint {
+    parameter: "RegistryName",
+    characters: REGISTRY_NAME_CHARACTERS,
+    max_length: 64,
+};
+
+/// The constraint a `SchemaName` a caller supplies must satisfy: the registry name's
+/// character set plus `@`, up to 385 characters.
+///
+/// Source: the constraint the service publishes for a schema's name —
+/// `AWS::EventSchemas::Schema`'s `SchemaName` (pattern `[\.\-_A-Za-z0-9@]+`, maximum
+/// length 385). `@` is in the set because it is the separator the published catalogue's
+/// own names carry between an event source and its event type
+/// (`aws.events@ScheduledEvent`), and those are schema names of this service.
+pub static SCHEMA_NAME: NameConstraint = NameConstraint {
+    parameter: "SchemaName",
+    characters: SCHEMA_NAME_CHARACTERS,
+    max_length: 385,
+};
+
+/// Check the caller-supplied NAMES one request carries, in the order the operation's
+/// URI states them: the registry first, then the schema.
+///
+/// Every operation that takes one of these names routes through here — a reporting one
+/// as much as a mutating one, the way both of the code-binding operations check their
+/// `Language` label ([`unsupported_code_binding_language`]) — so no two of them can
+/// disagree about which names this service accepts. A name the service does not accept
+/// names no resource anywhere, so the request is refused on its form rather than
+/// answered as if the name simply named nothing yet.
+///
+/// `None` is a name the operation does not take, or an optional one the request left
+/// out; there is nothing to check in either case.
+pub fn validate_names(
+    registry: Option<&str>,
+    schema: Option<&str>,
+) -> Result<(), BadRequestException> {
+    if let Some(registry) = registry {
+        REGISTRY_NAME.validate(registry)?;
+    }
+    if let Some(schema) = schema {
+        SCHEMA_NAME.validate(schema)?;
+    }
+    Ok(())
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.

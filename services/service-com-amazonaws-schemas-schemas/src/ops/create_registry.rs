@@ -144,6 +144,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx.parts());
+        // The name a create supplies is checked against the service's own constraint
+        // for it FIRST, on the request alone: a name outside that constraint names no
+        // registry this service could ever have created, so it is refused before the
+        // store is even reached rather than stored under an ARN this service could not
+        // mint. See `crate::state::validate_names`.
+        crate::state::validate_names(Some(&input.registry_name), None).map_err(|refusal| {
+            CreateRegistryError::from(CreateRegistryErrorModeled::BadRequestException(refusal))
+        })?;
+
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateRegistryError::from(CreateRegistryErrorModeled::InternalServerErrorException(
                 crate::state::internal_error(),

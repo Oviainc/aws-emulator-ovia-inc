@@ -153,6 +153,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // belongs to and carries no ARN, so this handler needs nothing from it.
         let _ = ctx;
 
+        // The names this request supplies are checked against the service's own
+        // constraints for them first, in the order the URI states them: a name outside
+        // one names no resource anywhere, so the request is refused on its form rather
+        // than answered as if the name merely named nothing yet. See
+        // `crate::state::validate_names`.
+        crate::state::validate_names(Some(&input.registry_name), Some(&input.schema_name))
+            .map_err(|refusal| {
+                DescribeCodeBindingError::from(
+                    DescribeCodeBindingErrorModeled::BadRequestException(refusal),
+                )
+            })?;
+
         // Same request-level constraint as `PutCodeBinding`: a language this service
         // generates no bindings for is refused as a bad request, before any lookup —
         // it is not a binding that happens to be missing.

@@ -193,6 +193,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
+        // And the registry it names is checked against the service's own constraint for
+        // a registry name: a name outside it names no registry anywhere, so the request
+        // is refused on its form rather than answered as if the registry merely did not
+        // exist yet. See `crate::state::validate_names`.
+        crate::state::validate_names(Some(&registry_name), None).map_err(|refusal| {
+            PutResourcePolicyError::from(PutResourcePolicyErrorModeled::BadRequestException(
+                refusal,
+            ))
+        })?;
+
         // The store retains one policy per registry for the life of the process, so
         // how large one may be is capped. Checked BEFORE the document is parsed, so an
         // oversized document is refused without being walked. See

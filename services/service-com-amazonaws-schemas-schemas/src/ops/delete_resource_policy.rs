@@ -172,6 +172,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
+        // The registry this request names is checked against the service's own
+        // constraint for a registry name before the store is reached: a name outside it
+        // names no registry anywhere, so the request is refused on its form rather than
+        // answered as if the registry merely did not exist yet. See
+        // `crate::state::validate_names`.
+        crate::state::validate_names(Some(&registry_name), None).map_err(|refusal| {
+            DeleteResourcePolicyError::from(DeleteResourcePolicyErrorModeled::BadRequestException(
+                refusal,
+            ))
+        })?;
+
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteResourcePolicyError::from(
                 DeleteResourcePolicyErrorModeled::InternalServerErrorException(
