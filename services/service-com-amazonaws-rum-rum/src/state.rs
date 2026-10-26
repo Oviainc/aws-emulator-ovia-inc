@@ -443,7 +443,7 @@ impl MetricDestinationRecord {
 /// the `Name` the request named (both `@required` there). The rest is kept exactly as the
 /// request carried it, including a member the destination kind ignores, so what a read
 /// reports is the definition that was written.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricDefinitionRecord {
     /// The minted `MetricDefinitionId`, the identity `UpdateRumMetricDefinition` and
     /// `BatchDeleteRumMetricDefinitions` address one definition by.
@@ -485,6 +485,40 @@ impl MetricDefinitionRecord {
             event_pattern: request.event_pattern.clone(),
             namespace: request.namespace.clone(),
         }
+    }
+
+    /// Whether this stored definition is the definition `request` defines — i.e. whether a
+    /// request asking for `request` is asking for the definition already stored here.
+    ///
+    /// A definition IS the metric it defines: the members a request carries. The
+    /// `MetricDefinitionId` is the handle the service minted so later calls can address the
+    /// definition, so it is NOT part of what distinguishes one definition from another, and
+    /// the comparison runs the request through [`Self::from_request`] rather than member by
+    /// member, so a request and a stored record are compared in the ONE canonical form a
+    /// definition is stored in (which is also why a `DimensionKeys` map written in a
+    /// different order is the same definition). The two members that tell most definitions
+    /// apart — the metric's name and its namespace — are compared first, directly, so a
+    /// scan over a destination's definitions canonicalises only the request it may actually
+    /// match rather than once per stored definition.
+    pub fn defines(&self, request: &MetricDefinitionRequest) -> bool {
+        self.name == request.name
+            && self.namespace == request.namespace
+            && *self == Self::from_request(&self.metric_definition_id, request)
+    }
+
+    /// Whether two REQUESTED definitions define the same metric, judged in the same
+    /// canonical form [`Self::defines`] judges a stored one in — for the caller that has to
+    /// decide whether one request names the same definition twice.
+    pub fn same_definition(
+        left: &MetricDefinitionRequest,
+        right: &MetricDefinitionRequest,
+    ) -> bool {
+        // One id for BOTH sides, so what is compared is the definitions themselves and not
+        // the handle the service would mint for them.
+        const UNMINTED: &str = "";
+        left.name == right.name
+            && left.namespace == right.namespace
+            && Self::from_request(UNMINTED, left) == Self::from_request(UNMINTED, right)
     }
 
     /// Project the stored record onto the model's `MetricDefinition` — the one conversion
@@ -770,6 +804,28 @@ impl AppMonitorRecord {
     ) -> usize {
         self.metric_definitions_for(destination, destination_arn)
             .map_or(0, BTreeMap::len)
+    }
+
+    /// The definition this destination ALREADY stores for `request`, or `None` while it
+    /// stores none.
+    ///
+    /// What makes the create of a metric definition idempotent, as the model declares it:
+    /// the identity of a definition is the definition itself ([`MetricDefinitionRecord::defines`]),
+    /// so a request for a definition the destination already holds names that stored
+    /// definition — under the id it already carries — rather than a second one. Keyed
+    /// through the same [`metric_destination_key`] the create, the read and the update use,
+    /// so the lookup cannot consult a different destination from the one a create writes to.
+    /// The map is ordered by id, so a destination that somehow holds two equal definitions
+    /// resolves to the same one every time.
+    pub fn metric_definition_defining(
+        &self,
+        destination: &str,
+        destination_arn: Option<&str>,
+        request: &MetricDefinitionRequest,
+    ) -> Option<&MetricDefinitionRecord> {
+        self.metric_definitions_for(destination, destination_arn)?
+            .values()
+            .find(|stored| stored.defines(request))
     }
 
     /// The ONE stored definition the `(Destination, DestinationArn, MetricDefinitionId)`

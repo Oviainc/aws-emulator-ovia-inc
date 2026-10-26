@@ -20,9 +20,12 @@
 //! each row against both destination kinds; the refusal table walks one refused target or
 //! one refused definition per row and then shows the stored definition unchanged; the
 //! namespace table walks both sides of the reserved-prefix boundary; the pagination test is
-//! an invariant check over a grid of store sizes and page sizes; and the `MaxResults` table
+//! an invariant check over a grid of store sizes and page sizes; the `MaxResults` table
 //! walks each published bound of the modelled range plus one past each, beside the
-//! documented default page size.
+//! documented default page size; and the `@idempotent` table re-sends a batch of definitions
+//! over both destination kinds, batch sizes and member combinations, beside a batch that
+//! repeats and adds, a definition differing in one member, and one identity named twice in
+//! a single batch.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -1564,4 +1567,178 @@ async fn definitions_belong_to_the_destination_they_were_created_under() {
         orphaned.status,
         String::from_utf8_lossy(&orphaned.body)
     );
+}
+
+#[tokio::test]
+async fn a_repeated_batch_create_stores_no_second_copy_of_a_definition() {
+    let (router, _engine) = emulator();
+
+    // One row per batch to create and then re-send. `@idempotent` is a rule about the
+    // IDENTITY a create is keyed by, not about one request, so the rows differ along what
+    // that identity is read off: which destination the definitions live under, how many
+    // definitions one call carries, and which members a definition uses — from an extended
+    // metric carrying dimensions down to a custom metric carrying only what it must.
+    let rows: [(&str, Destination, Vec<Value>); 4] = [
+        (
+            "one extended definition",
+            Destination::cloud_watch(),
+            vec![extended(EXTENDED_METRICS[0].name)],
+        ),
+        (
+            "three definitions, every optional member between them",
+            Destination::cloud_watch(),
+            vec![
+                extended_with_dimensions(EXTENDED_METRICS[5].name, &EXTENDED_DIMENSION_KEYS[..2]),
+                with(custom("Checkouts", "MyApp/Funnel"), "UnitLabel", json!("Count")),
+                custom("Signups", "MyApp/Funnel"),
+            ],
+        ),
+        (
+            "an Evidently destination",
+            Destination::evidently("checkout-ab"),
+            vec![
+                extended(EXTENDED_METRICS[12].name),
+                custom("Abandonments", "MyApp/Checkout"),
+            ],
+        ),
+        (
+            "a custom metric defined off an event pattern and its dimensions",
+            Destination::evidently("signup-ab"),
+            vec![with(
+                with(
+                    custom("Conversions", "MyApp/Signup"),
+                    "EventPattern",
+                    json!(event_pattern(
+                        "com.example.signup",
+                        &["metadata.browserName"]
+                    )),
+                ),
+                "DimensionKeys",
+                dimension_keys(&EXTENDED_DIMENSION_KEYS[1..2]),
+            )],
+        ),
+    ];
+
+    for (index, (case, destination, definitions)) in rows.into_iter().enumerate() {
+        let monitor = format!("repeat-{index}-{}", destination.slug());
+        create_monitor(&router, case, &monitor).await;
+        put_destination(&router, case, &monitor, &destination).await;
+
+        // What the first delivery of the batch created.
+        let first = create_definitions(&router, case, &monitor, &destination, &definitions).await;
+        let ids: Vec<String> = first.iter().map(|one| id_of(case, one)).collect();
+        let stored = stored_by_id(&router, case, &monitor, &destination).await;
+        assert_eq!(
+            stored.len(),
+            definitions.len(),
+            "case {case:?}: expected one stored definition per requested one, got {stored:?}"
+        );
+
+        // The SAME request again — what `@idempotent` licenses a retry to send: every
+        // definition is reported under the id the first delivery minted for it, and the
+        // stored state is exactly the one that delivery left.
+        let repeated =
+            create_definitions(&router, case, &monitor, &destination, &definitions).await;
+        assert_eq!(
+            repeated.len(),
+            definitions.len(),
+            "case {case:?}: expected the repeat to report one definition per requested one, \
+             got {repeated:?}"
+        );
+        for ((requested, id), reported) in definitions.iter().zip(&ids).zip(&repeated) {
+            assert_definition(case, reported, requested, id);
+        }
+        let after_repeat = stored_by_id(&router, case, &monitor, &destination).await;
+        assert_eq!(
+            after_repeat, stored,
+            "case {case:?}: repeating the batch changed the stored definitions, got \
+             {after_repeat:?}"
+        );
+
+        // A batch that repeats those definitions and adds ONE the destination does not
+        // hold: only the addition is created, and the repeated ones keep their ids.
+        let added = custom(&format!("Added{index}"), "MyApp/Added");
+        let mut with_added = definitions.clone();
+        with_added.push(added.clone());
+        let answered = create_definitions(&router, case, &monitor, &destination, &with_added).await;
+        let answered_ids: Vec<String> = answered.iter().map(|one| id_of(case, one)).collect();
+        assert_eq!(
+            &answered_ids[..ids.len()],
+            &ids[..],
+            "case {case:?}: expected the repeated definitions to keep their ids, got \
+             {answered_ids:?}"
+        );
+        let added_id = answered_ids
+            .last()
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: the call reported nothing: {answered:?}"));
+        assert!(
+            !ids.contains(&added_id),
+            "case {case:?}: expected the added definition to get an id of its own, got \
+             {added_id:?} among {ids:?}"
+        );
+        assert_definition(
+            case,
+            answered.last().expect("the call reported the addition"),
+            &added,
+            &added_id,
+        );
+        let after_addition = stored_by_id(&router, case, &monitor, &destination).await;
+        assert_eq!(
+            after_addition.len(),
+            definitions.len() + 1,
+            "case {case:?}: expected only the added definition to be stored beside the \
+             existing ones, got {after_addition:?}"
+        );
+
+        // A definition that differs from a stored one in ONE member defines another metric,
+        // so it IS created — the identity is the definition, not the name it carries.
+        let changed = with(definitions[0].clone(), "UnitLabel", json!("Milliseconds"));
+        let answered = create_definitions(
+            &router,
+            case,
+            &monitor,
+            &destination,
+            std::slice::from_ref(&changed),
+        )
+        .await;
+        let changed_id = id_of(case, &answered[0]);
+        assert!(
+            !ids.contains(&changed_id) && changed_id != added_id,
+            "case {case:?}: expected a changed definition to be created under an id of its \
+             own, got {changed_id:?}"
+        );
+        assert_definition(case, &answered[0], &changed, &changed_id);
+
+        // And the same identity named twice in ONE batch is one definition too: both
+        // entries report the definition the call stored once.
+        let twice = custom(&format!("Twice{index}"), "MyApp/Added");
+        let answered = create_definitions(
+            &router,
+            case,
+            &monitor,
+            &destination,
+            &[twice.clone(), twice.clone()],
+        )
+        .await;
+        assert_eq!(
+            answered.len(),
+            2,
+            "case {case:?}: expected one report per requested definition, got {answered:?}"
+        );
+        let twice_id = id_of(case, &answered[0]);
+        assert_eq!(
+            id_of(case, &answered[1]),
+            twice_id,
+            "case {case:?}: expected both entries to name the one stored definition, got \
+             {answered:?}"
+        );
+        let finally = stored_by_id(&router, case, &monitor, &destination).await;
+        assert_eq!(
+            finally.len(),
+            definitions.len() + 3,
+            "case {case:?}: expected the three definitions this row added beside the \
+             repeated ones, got {finally:?}"
+        );
+    }
 }
