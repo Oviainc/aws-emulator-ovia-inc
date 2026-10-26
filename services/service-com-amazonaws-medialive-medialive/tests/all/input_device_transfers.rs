@@ -582,6 +582,12 @@ async fn every_page(
     (ids, pages)
 }
 
+/// A collection larger than the page size a client would ask for by hand, and
+/// within the store's own bound (`MAX_INPUT_DEVICES`): what a row uses to assert
+/// that the service never cuts a page below the `MaxResults` the request asked
+/// for.
+const A_LARGE_COLLECTION: usize = 57;
+
 /// One row of the pagination table: how many claimed devices are being
 /// transferred, how many are claimed but not transferred, and the page size the
 /// request asks for.
@@ -602,8 +608,8 @@ struct Paging {
 /// devices NOT being transferred (which the pages must skip rather than count
 /// against the page size) and the page size asked for — none, one, a size that
 /// divides the transfers unevenly, no size at all, a size past the ceiling, and
-/// more transfers than one default page holds — because that is what the rule
-/// generalises over.
+/// more transfers than a hand-written page size would hold — because that is
+/// what the rule generalises over.
 #[tokio::test]
 async fn the_listing_pages_through_every_pending_transfer_in_device_id_order() {
     let table = [
@@ -650,10 +656,11 @@ async fn the_listing_pages_through_every_pending_transfer_in_device_id_order() {
             page_size: Some(MAX_LIST_PAGE_SIZE as i32 + 500),
         },
         Paging {
-            // More transfers than a single default page holds, so the default
-            // page size is itself a cut and not just a ceiling nobody reaches.
-            case: "more transfers than one default page holds",
-            transferring: MAX_LIST_PAGE_SIZE + 7,
+            // A collection far larger than any page a caller would ask for by
+            // hand: the service's ceiling is the published `MaxResults` bound,
+            // well above what the store can hold, so one page carries them all.
+            case: "a large collection, no page size",
+            transferring: A_LARGE_COLLECTION,
             idle: 0,
             page_size: None,
         },

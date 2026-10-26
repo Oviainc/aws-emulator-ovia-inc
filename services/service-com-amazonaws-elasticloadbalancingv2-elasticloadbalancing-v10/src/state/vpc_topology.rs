@@ -14,7 +14,10 @@ use std::net::IpAddr;
 
 use ipnet::IpNet;
 
-use super::network::{parse_ip_target, resolve_ip_target, SubnetFacts, AVAILABILITY_ZONE_REQUIRED};
+use super::network::{
+    address_in_no_subnet_message, address_not_allowed_message, availability_zone_required_message,
+    parse_ip_target, resolve_ip_target, SubnetFacts,
+};
 
 /// The VPC every table below resolves against: one CIDR block and two subnets in two
 /// zones, as EC2 would report them.
@@ -71,7 +74,7 @@ fn an_address_in_a_subnet_of_the_vpc_takes_that_subnets_zone() {
         ),
     ];
     for (case, value, requested, expected) in rows {
-        let resolved = resolve_ip_target(address(value), requested, "vpc-1", &cidrs, &subnets);
+        let resolved = resolve_ip_target(address(value), requested, &cidrs, &subnets);
         assert_eq!(
             resolved_as_refs(&resolved),
             Ok(Some(expected)),
@@ -84,16 +87,64 @@ fn an_address_in_a_subnet_of_the_vpc_takes_that_subnets_zone() {
 fn an_address_of_the_vpc_that_no_subnet_holds_is_refused() {
     let (cidrs, subnets) = vpc();
     // The zone plays no part: the address is in no zone the load balancer reaches either
-    // way, so both rows are refused and the refusal names the address and the VPC.
-    for (case, requested) in [("with no zone", None), ("with a zone", Some("us-west-2a"))] {
-        let resolved = resolve_ip_target(address("10.80.9.9"), requested, "vpc-1", &cidrs, &subnets);
-        let message = resolved.clone().expect_err(&format!(
-            "case {case:?}: an address of the VPC that no subnet holds must be refused, \
-             got {resolved:?}"
-        ));
-        assert!(
-            message.contains("10.80.9.9") && message.contains("vpc-1"),
-            "case {case:?}: the refusal must name the address and the VPC, got {message:?}"
+    // way, so every row is refused for the same reason, and the refusal states that
+    // constraint against the address the request carried — naming no VPC id, which the
+    // request never carried.
+    let rows: [(&str, &str, Option<&str>); 4] = [
+        ("with no zone", "10.80.9.9", None),
+        ("with a zone", "10.80.9.10", Some("us-west-2a")),
+        ("with all zones", "10.80.9.11", Some("all")),
+        // Between the two subnets rather than past them, and the first address of a block
+        // the VPC holds: still no subnet of it.
+        ("between the subnets", "10.80.3.0", None),
+    ];
+    for (case, value, requested) in rows {
+        let resolved = resolve_ip_target(address(value), requested, &cidrs, &subnets);
+        assert_eq!(
+            resolved_as_refs(&resolved),
+            Err(address_in_no_subnet_message(address(value)).as_str()),
+            "case {case:?}: an address of the VPC that no subnet holds must be refused for \
+             that, got {resolved:?}"
+        );
+    }
+}
+
+#[test]
+fn each_refusal_class_states_its_own_constraint_against_the_address() {
+    // The three sentences, written out rather than taken from the builders the rows above
+    // call: those rows pin WHICH class fires for an address, and this one pins what each
+    // class SAYS, so a rewording fails here instead of passing unnoticed. One address per
+    // class, none of them a subnet address of the VPC.
+    let (cidrs, subnets) = vpc();
+    let rows: [(&str, &str, Option<&str>, &str); 3] = [
+        (
+            "an address of the VPC that no subnet holds",
+            "10.80.9.9",
+            None,
+            "The IP address '10.80.9.9' is within the VPC, but is not within a VPC subnet \
+             so it can't be registered",
+        ),
+        (
+            "an address of no range an ip target may come from",
+            "8.8.8.8",
+            Some("all"),
+            "The IP address '8.8.8.8' is not allowed, as it must be an address from a VPC \
+             subnet, RFC1918, or RFC6598",
+        ),
+        (
+            "an address outside the VPC with no zone to serve it",
+            "192.168.5.6",
+            None,
+            "You must specify a valid Availability Zone or select 'all' for all enabled \
+             Availability zones, since the IP address '192.168.5.6' is outside the VPC",
+        ),
+    ];
+    for (case, value, requested, expected) in rows {
+        let resolved = resolve_ip_target(address(value), requested, &cidrs, &subnets);
+        assert_eq!(
+            resolved_as_refs(&resolved),
+            Err(expected),
+            "case {case:?}: expected the refusal {expected:?}, got {resolved:?}"
         );
     }
 }
@@ -118,7 +169,7 @@ fn an_address_outside_the_vpc_is_judged_against_the_ranges_before_the_zone() {
         /// Refused because the address itself is not one an `ip` target may carry.
         NotRegistrable,
     }
-    let rows: [(&str, &str, Option<&str>, Want); 9] = [
+    let rows: [(&str, &str, Option<&str>, Want); 11] = [
         (
             "an RFC 1918 address with the zone to serve it",
             "192.168.5.5",
@@ -173,32 +224,42 @@ fn an_address_outside_the_vpc_is_judged_against_the_ranges_before_the_zone() {
             Some("us-west-2a"),
             Want::Zone("us-west-2a"),
         ),
+        (
+            "a publicly routable IPv6 address with a zone",
+            "2001:4860:4860::8888",
+            Some("us-west-2a"),
+            Want::NotRegistrable,
+        ),
+        (
+            "an RFC 6598 address with no zone",
+            "100.64.3.4",
+            None,
+            Want::ZoneRequired,
+        ),
     ];
     for (case, value, requested, want) in rows {
-        let resolved = resolve_ip_target(address(value), requested, "vpc-1", &cidrs, &subnets);
+        let resolved = resolve_ip_target(address(value), requested, &cidrs, &subnets);
         match want {
             Want::Zone(zone) => assert_eq!(
                 resolved_as_refs(&resolved),
                 Ok(Some(zone)),
                 "case {case:?}: expected the zone the request named, got {resolved:?}"
             ),
+            // The class a registration earns is decided by the ADDRESS, so each refusal is
+            // pinned to its own sentence: an address the group may carry is asked for the
+            // zone that is to serve it, and one it may not is refused for being that
+            // whether or not the request named a zone.
             Want::ZoneRequired => assert_eq!(
                 resolved_as_refs(&resolved),
-                Err(AVAILABILITY_ZONE_REQUIRED),
-                "case {case:?}: expected the Availability Zone to be required, got \
-                 {resolved:?}"
+                Err(availability_zone_required_message(address(value)).as_str()),
+                "case {case:?}: expected the Availability Zone to be required for this \
+                 address, got {resolved:?}"
             ),
-            Want::NotRegistrable => {
-                let message = resolved.clone().expect_err(&format!(
-                    "case {case:?}: a publicly routable address must be refused, got \
-                     {resolved:?}"
-                ));
-                assert!(
-                    message.contains(value) && message != AVAILABILITY_ZONE_REQUIRED,
-                    "case {case:?}: the refusal must be about the address itself and name \
-                     it, got {message:?}"
-                );
-            }
+            Want::NotRegistrable => assert_eq!(
+                resolved_as_refs(&resolved),
+                Err(address_not_allowed_message(address(value)).as_str()),
+                "case {case:?}: expected the address itself to be refused, got {resolved:?}"
+            ),
         }
     }
 }

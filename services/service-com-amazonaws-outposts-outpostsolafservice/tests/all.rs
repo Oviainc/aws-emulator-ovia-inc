@@ -73,6 +73,8 @@ mod renewal_contract;
 mod renewal_pricing;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/resource_untagging.rs"]
+mod resource_untagging;
 #[path = "all/site_address.rs"]
 mod site_address;
 #[path = "all/site_and_outpost_lifecycle.rs"]

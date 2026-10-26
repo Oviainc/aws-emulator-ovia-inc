@@ -158,9 +158,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         Ok(GetReviewTemplateOutput {
-            review_template: Some(
-                record.to_review_template(store.review_template_update_status(record)),
-            ),
+            review_template: Some(record.to_review_template(
+                store.review_template_update_status(record),
+                // The content of the lenses this template applies, resolved from the whole
+                // lens catalog: the question roll-up counts a custom lens's imported
+                // questions exactly as it counts an official lens's.
+                &store.reviewed_lens_content(&record.lenses),
+            )),
         })
     }
 }

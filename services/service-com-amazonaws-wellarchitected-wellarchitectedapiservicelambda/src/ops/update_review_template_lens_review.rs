@@ -188,6 +188,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let reviewed = store.reviewed_lens(&input.template_arn, &input.lens_alias, &region);
+        // The content of the lenses this template applies, resolved from the whole lens
+        // catalog before the template is taken for writing: a pillar of a CUSTOM lens is
+        // one its imported document defines, exactly as an official lens's is its catalog
+        // row's. This write does not change which lenses the template applies.
+        let content = store
+            .review_templates
+            .get(&input.template_arn)
+            .map(|template| store.reviewed_lens_content(&template.lenses))
+            .unwrap_or_default();
         // The resource is resolved BEFORE the request's values are judged, so a request
         // that names a template or a lens review that does not exist is answered with
         // that 404 whatever else it carries.
@@ -222,6 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(exception) = crate::state::undefined_pillar_refusal(
             crate::state::PILLAR_NOTES_MEMBER,
             &input.lens_alias,
+            content.of(&input.lens_alias),
             input
                 .pillar_notes
                 .iter()
@@ -252,7 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(UpdateReviewTemplateLensReviewOutput {
             // The template as STORED, which is the resource this lens review belongs to.
             template_arn: Some(template.template_arn.clone()),
-            lens_review: Some(template.to_lens_review(&input.lens_alias, &reviewed)),
+            lens_review: Some(template.to_lens_review(&input.lens_alias, &reviewed, &content)),
         })
     }
 }

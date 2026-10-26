@@ -151,6 +151,11 @@ mod elb_classic_and_v2_signing_name_routing;
 // conflicts with every other landing in the same window.
 #[path = "all/elbv2_network_resolution.rs"]
 mod elbv2_network_resolution;
+// Declared beside the suite it is the sibling of, in this span of the sorted list, for the
+// same reason: the tail of this file is where every concurrently landing router suite
+// appends its line.
+#[path = "all/elbv2_ip_target_refusal_classes.rs"]
+mod elbv2_ip_target_refusal_classes;
 // Alphabetically between the `elbv2_` and `es_` suites, rather than appended at the end
 // of this file, which is where every new suite lands and therefore where two changes
 // collide.

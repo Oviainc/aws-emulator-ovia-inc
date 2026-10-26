@@ -183,6 +183,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             pinned.as_deref(),
             &crate::state::request_region(ctx.parts()),
         );
+        // The content of the lenses this workload reviews, resolved from the whole lens
+        // catalog in the same one view of the store and before the workload is borrowed for
+        // writing: a pillar or a question of a CUSTOM lens is the one its imported document
+        // defines, exactly as an official lens's is its catalog row's. Nothing this
+        // operation writes changes which lenses the workload reviews.
+        let content = store
+            .workloads
+            .get(&input.workload_id)
+            .map(|workload| store.reviewed_lens_content(&workload.lenses))
+            .unwrap_or_default();
 
         // The resource is resolved BEFORE the request's values are judged, so a request
         // that names a workload or a lens review that does not exist is answered with that
@@ -211,6 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(exception) = crate::state::undefined_pillar_refusal(
             crate::state::PILLAR_NOTES_MEMBER,
             &input.lens_alias,
+            content.of(&input.lens_alias),
             input
                 .pillar_notes
                 .iter()
@@ -230,6 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(exception) = crate::state::undefined_pillar_refusal(
             crate::state::JIRA_CONFIGURATION_MEMBER,
             &input.lens_alias,
+            content.of(&input.lens_alias),
             selected_pillars
                 .iter()
                 .filter_map(|pillar| pillar.pillar_id.as_deref()),
@@ -249,6 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
                 &input.lens_alias,
                 pillar_id,
+                content.of(&input.lens_alias),
                 pillar
                     .selected_question_ids
                     .iter()
@@ -290,7 +303,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // and the lens as the REQUEST named it, beside what the catalog says about the
             // version the review is against.
             workload_id: Some(workload.workload_id.clone()),
-            lens_review: Some(workload.to_lens_review(&input.lens_alias, &reviewed)),
+            lens_review: Some(workload.to_lens_review(&input.lens_alias, &reviewed, &content)),
         })
     }
 }

@@ -143,6 +143,11 @@ async fn every_page(
     (ids, pages)
 }
 
+/// A collection larger than the page size a client would ask for by hand, and
+/// within the store's own bound (`MAX_CLUSTERS`): what a row uses to assert that
+/// the service never cuts a page below the `MaxResults` the request asked for.
+const A_LARGE_COLLECTION: usize = 53;
+
 /// One row of the pagination table: how many clusters the store holds and the
 /// page size the request asks for.
 struct Paging {
@@ -210,16 +215,17 @@ async fn list_clusters_pages_through_every_stored_cluster_in_mint_order() {
             clusters: 2,
             page_size: Some(MAX_LIST_PAGE_SIZE as i32 + 500),
         },
-        // More clusters than one page can carry whatever the request asks for,
-        // so the ceiling itself is what cuts the pages.
+        // A collection far larger than any page a caller would ask for by hand:
+        // the service's ceiling is the published `MaxResults` bound, well above
+        // what the store can hold, so these are reported in ONE page.
         Paging {
-            case: "past the ceiling, no page size",
-            clusters: MAX_LIST_PAGE_SIZE + 3,
+            case: "a large collection, no page size",
+            clusters: A_LARGE_COLLECTION,
             page_size: None,
         },
         Paging {
-            case: "past the ceiling, page size past the ceiling",
-            clusters: MAX_LIST_PAGE_SIZE + 3,
+            case: "a large collection, page size past the ceiling",
+            clusters: A_LARGE_COLLECTION,
             page_size: Some(MAX_LIST_PAGE_SIZE as i32 * 2),
         },
     ];

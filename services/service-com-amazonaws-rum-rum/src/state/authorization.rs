@@ -110,6 +110,9 @@ pub const LIST_TAGS_FOR_RESOURCE: &str = "rum:ListTagsForResource";
 /// `rum:BatchCreateRumMetricDefinitions`.
 pub const BATCH_CREATE_RUM_METRIC_DEFINITIONS: &str = "rum:BatchCreateRumMetricDefinitions";
 
+/// `rum:BatchDeleteRumMetricDefinitions`.
+pub const BATCH_DELETE_RUM_METRIC_DEFINITIONS: &str = "rum:BatchDeleteRumMetricDefinitions";
+
 /// `rum:BatchGetRumMetricDefinitions`.
 pub const BATCH_GET_RUM_METRIC_DEFINITIONS: &str = "rum:BatchGetRumMetricDefinitions";
 

@@ -59,15 +59,22 @@ const EXPORT_FORMAT: &str = "CSV";
 
 /// An account id that is not the one this emulator serves — what an export to "a destination
 /// bucket in a different account" names.
-const FOREIGN_ACCOUNT_ID: &str = "111122223333";
+///
+/// `pub(crate)`, like the harness in [`super::bucket_lifecycle`]: the listing suite beside
+/// this one names the same account rather than spelling a second one.
+pub(crate) const FOREIGN_ACCOUNT_ID: &str = "111122223333";
 
 /// One `AnalyticsFilter`, as a request carries it and as a report brings it back.
 ///
 /// The variants are the members `smithy_query(query="shape",shape="AnalyticsFilter")`
 /// declares for that union; the same type on both sides, so a round-trip assertion compares
 /// what was sent with what was reported rather than with a hand-spelled expectation.
+///
+/// `pub(crate)`, like the harness in [`super::bucket_lifecycle`]: the listing suite beside
+/// this one puts and reads configurations through these same helpers, so the two suites
+/// cannot drift on how an `AnalyticsConfiguration` is spelled.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Filter {
+pub(crate) enum Filter {
     Prefix(String),
     Tag(String, String),
     And {
@@ -101,7 +108,7 @@ impl Filter {
 
     /// An `And` of `prefix` and `tags`, the conjunction form a request uses when one
     /// predicate is not enough.
-    fn and(prefix: Option<&str>, tags: &[(&str, &str)]) -> Self {
+    pub(crate) fn and(prefix: Option<&str>, tags: &[(&str, &str)]) -> Self {
         Self::And {
             prefix: prefix.map(str::to_string),
             tags: tags
@@ -120,7 +127,7 @@ fn tag_xml(key: &str, value: &str) -> String {
 /// The `StorageClassAnalysis$DataExport` of a configuration — "where to publish the
 /// analytics results" — flattened to the members a request names and a report brings back.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DataExport {
+pub(crate) struct DataExport {
     output_schema_version: String,
     format: String,
     bucket: String,
@@ -131,7 +138,7 @@ struct DataExport {
 impl DataExport {
     /// An export to `bucket`, owned by `bucket_account_id` when the request names one, under
     /// `prefix` when it names one.
-    fn new(bucket: &str, bucket_account_id: Option<&str>, prefix: Option<&str>) -> Self {
+    pub(crate) fn new(bucket: &str, bucket_account_id: Option<&str>, prefix: Option<&str>) -> Self {
         Self {
             output_schema_version: SCHEMA_VERSION.to_string(),
             format: EXPORT_FORMAT.to_string(),
@@ -161,9 +168,9 @@ impl DataExport {
 }
 
 /// One whole `AnalyticsConfiguration`, as a put carries it and as a read reports it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Configuration {
-    id: String,
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Configuration {
+    pub(crate) id: String,
     filter: Option<Filter>,
     data_export: Option<DataExport>,
 }
@@ -189,7 +196,7 @@ impl Configuration {
 }
 
 /// The payload for `id`, with `filter` and `data_export` when the row names them.
-fn configuration(
+pub(crate) fn configuration(
     id: &str,
     filter: Option<Filter>,
     data_export: Option<DataExport>,
@@ -202,7 +209,7 @@ fn configuration(
 }
 
 /// `PUT /<bucket>?analytics&id=<id>` — `PutBucketAnalyticsConfiguration`.
-async fn put_analytics(
+pub(crate) async fn put_analytics(
     router: &MultiServiceRouter,
     bucket: &str,
     wanted: &Configuration,
@@ -230,7 +237,7 @@ async fn put_analytics_payload(
 }
 
 /// `GET /<bucket>?analytics&id=<id>` — `GetBucketAnalyticsConfiguration`.
-async fn get_analytics(router: &MultiServiceRouter, bucket: &str, id: &str) -> Answer {
+pub(crate) async fn get_analytics(router: &MultiServiceRouter, bucket: &str, id: &str) -> Answer {
     get_analytics_with_headers(router, bucket, id, &[]).await
 }
 
@@ -251,21 +258,32 @@ async fn get_analytics_with_headers(
     .await
 }
 
-/// The configuration a `GetBucketAnalyticsConfiguration` body reports.
+/// The one configuration a `GetBucketAnalyticsConfiguration` body reports.
+fn reported_configuration(answer: &Answer) -> Configuration {
+    reported_configurations(answer)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+}
+
+/// EVERY `AnalyticsConfiguration` a body reports, in document order: one for a
+/// `GetBucketAnalyticsConfiguration` body, as many as the page carries for a
+/// `ListBucketAnalyticsConfigurations` body (which the listing suite beside this one reads
+/// through this same parser rather than a second one).
 ///
 /// Parsed with `quick-xml` (already a dependency of this workspace), the way the metrics
 /// suite beside this one reads a container, rather than by slicing the body. The member a
 /// value belongs to is its PATH, not its tag: `Prefix` sits on a `Filter`, inside its `And`
 /// and on the export destination alike, and `Bucket` names the destination bucket.
-fn reported_configuration(answer: &Answer) -> Configuration {
+pub(crate) fn reported_configurations(answer: &Answer) -> Vec<Configuration> {
     let body = String::from_utf8_lossy(&answer.body).into_owned();
     let mut reader = Reader::from_str(&body);
 
-    let mut reported = Configuration {
-        id: String::new(),
-        filter: None,
-        data_export: None,
-    };
+    let mut all: Vec<Configuration> = Vec::new();
+    // The configuration being read: an `AnalyticsConfiguration` opening starts a new one, so
+    // the previous one is complete and is pushed then.
+    let mut reported = Configuration::default();
+    let mut reading = false;
     let mut path: Vec<String> = Vec::new();
     // An element OPENING is what declares which member is present, so a member whose value
     // is the empty string (`<Prefix></Prefix>`, which carries no text event at all) is
@@ -326,6 +344,12 @@ fn reported_configuration(answer: &Answer) -> Configuration {
             }
             Event::Start(start) => {
                 let name = String::from_utf8_lossy(start.name().as_ref()).into_owned();
+                if name == "AnalyticsConfiguration" {
+                    if reading {
+                        all.push(std::mem::take(&mut reported));
+                    }
+                    reading = true;
+                }
                 begin(&name, &path, &mut reported);
                 path.push(name);
             }
@@ -390,11 +414,14 @@ fn reported_configuration(answer: &Answer) -> Configuration {
             _ => {}
         }
     }
-    reported
+    if reading {
+        all.push(reported);
+    }
+    all
 }
 
 /// Stand up a bucket named `name`, which is what an analytics configuration is put on.
-async fn bucket(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn bucket(router: &MultiServiceRouter, name: &str) {
     let created = create_bucket(router, name, None, None).await;
     assert_eq!(
         created.status, 200,

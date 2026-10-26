@@ -59,6 +59,9 @@ mod custom_lens_import;
 #[path = "all/custom_lens_review_answers.rs"]
 mod custom_lens_review_answers;
 
+#[path = "all/custom_lens_review_rollup.rs"]
+mod custom_lens_review_rollup;
+
 #[path = "all/custom_lens_versions.rs"]
 mod custom_lens_versions;
 

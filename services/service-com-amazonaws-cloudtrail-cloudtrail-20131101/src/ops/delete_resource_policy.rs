@@ -185,8 +185,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .resolve_policy_resource(&input.resource_arn, now)
             .map_err(resource_rejection)?;
 
-        // Detaching a policy WRITES to the resource, so a resource CloudTrail has not
-        // finished loading is refused the way every resource-policy write refuses it.
+        // Detaching a policy WRITES to the resource, so a resource another operation
+        // is modifying is refused the way every resource-policy write refuses it.
         if !resource.ready {
             return Err(
                 DeleteResourcePolicyErrorModeled::ConflictException(ConflictException {
@@ -206,9 +206,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteResourcePolicyErrorModeled::ResourcePolicyNotFoundException(
                     ResourcePolicyNotFoundException {
-                        message: Some(crate::state::resource_policy_not_found_message(
-                            &resource.arn,
-                        )),
+                        message: Some(
+                            crate::state::RESOURCE_POLICY_NOT_FOUND_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),

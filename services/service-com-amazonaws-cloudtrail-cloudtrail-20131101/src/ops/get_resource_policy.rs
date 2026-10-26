@@ -207,9 +207,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 GetResourcePolicyErrorModeled::ResourcePolicyNotFoundException(
                     ResourcePolicyNotFoundException {
-                        message: Some(crate::state::resource_policy_not_found_message(
-                            &resource.arn,
-                        )),
+                        message: Some(
+                            crate::state::RESOURCE_POLICY_NOT_FOUND_MESSAGE.to_string(),
+                        ),
                     },
                 )
             })?;

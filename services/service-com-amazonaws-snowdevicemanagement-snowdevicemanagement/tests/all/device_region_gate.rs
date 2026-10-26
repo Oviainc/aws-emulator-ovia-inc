@@ -723,15 +723,16 @@ async fn the_tagging_operations_are_not_gated_and_still_resolve_their_resource()
         }
     }
 
-    // And a tagging call in that same device-free Region still SUCCEEDS against a
-    // record this account really holds: the ARN carries everything the operation
-    // addresses, so the signed Region does not gate it.
+    // And the counterpart, so the refusals above are about the record and not about the
+    // operation: in the Region that DOES hold the record, the same tagging call
+    // succeeds. A record of this service lives in one Region, so the ARN that reaches it
+    // names that Region and the request is signed for it (`tagging_region_scope.rs`).
     let label = encode_label(&format!(
         "arn:aws:{ARN_SERVICE}:{STOCKED_REGION}:{ACCOUNT}:managed-device/{device}"
     ));
     let tagged = call(
         &router,
-        region,
+        STOCKED_REGION,
         "POST",
         &format!("/tags/{label}"),
         Some(json!({ "tags": { "owner": "fleet" } })),
@@ -743,7 +744,14 @@ async fn the_tagging_operations_are_not_gated_and_still_resolve_their_resource()
          with {}",
         tagged.status, tagged.body
     );
-    let read = call(&router, region, "GET", &format!("/tags/{label}"), None).await;
+    let read = call(
+        &router,
+        STOCKED_REGION,
+        "GET",
+        &format!("/tags/{label}"),
+        None,
+    )
+    .await;
     assert_eq!(
         read.body["tags"],
         json!({ "owner": "fleet" }),

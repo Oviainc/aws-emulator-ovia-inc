@@ -85,5 +85,7 @@ mod state_roundtrip;
 mod store_capacity;
 #[path = "all/table_versions.rs"]
 mod table_versions;
+#[path = "all/usage_profiles.rs"]
+mod usage_profiles;
 #[path = "all/wire.rs"]
 mod wire;

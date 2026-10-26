@@ -3,18 +3,19 @@
 //! The tagging operations resolve a `resourceArn` to a stored record through ONE rule,
 //! whether they read the tags or write them.
 //!
-//! The rule: a tagging operation's `resourceArn` is parsed into a kind and an id
-//! (`managed-device/<id>` or `task/<id>`), and that pair alone selects the stored record
+//! The rule: a tagging operation's `resourceArn` is parsed into a Region, a kind and an
+//! id (`managed-device/<id>` or `task/<id>`), and that triple selects the stored record
 //! whose tags the call reports or changes — so `ListTagsForResource`, `TagResource` and
 //! `UntagResource` address exactly the same record for the same ARN, and answer the same
 //! class when it addresses none. This suite drives that one path through BOTH write
 //! operations and the read operation, so a write that resolved an ARN differently from a
-//! read — or from the other write — fails here.
+//! read — or from the other write — fails here. Which Region's records a `resourceArn`
+//! may name at all is `tagging_region_scope.rs`.
 //!
 //! Rows differ along what the rule generalises over: the resource KIND (device, task),
-//! the ARN fields that are not part of the record's identity (its region, its
+//! the spelling of the ARN's fields that are not part of the record's identity (its
 //! partition), and, for the refusal table, which field makes the ARN address no record
-//! of this account (its syntax, its account, its id).
+//! this endpoint serves (its syntax, its account, its Region, its id).
 //!
 //! Every case goes through the router, so nothing reaches into the state struct: a write
 //! is read back through an implemented reporting operation (`ListTagsForResource`, plus
@@ -154,7 +155,7 @@ async fn described_tags(router: &MultiServiceRouter, row: &Addressed) -> BTreeMa
 }
 
 /// Both write paths and the read path resolve one ARN to one record, for every resource
-/// kind and whatever the ARN's region or partition says.
+/// kind and whatever the ARN's partition says.
 #[tokio::test]
 async fn the_tag_write_paths_resolve_a_resource_arn_the_way_the_tag_read_does() {
     let router = emulator();
@@ -182,20 +183,6 @@ async fn the_tag_write_paths_resolve_a_resource_arn_the_way_the_tag_read_does() 
             id: device_id.clone(),
         },
         Addressed {
-            // A device id is unique across the account's Regions, so the ARN's region
-            // field is not part of the record's identity.
-            case: "a device, by an ARN naming another region of this account",
-            kind: Kind::Device,
-            addressed: arn(
-                "aws",
-                "eu-west-1",
-                ACCOUNT,
-                &format!("managed-device/{device_id}"),
-            ),
-            issued: device_arn.clone(),
-            id: device_id.clone(),
-        },
-        Addressed {
             case: "a device, by an ARN naming another partition",
             kind: Kind::Device,
             addressed: arn(
@@ -211,13 +198,6 @@ async fn the_tag_write_paths_resolve_a_resource_arn_the_way_the_tag_read_does() 
             case: "a task, by the ARN CreateTask returned",
             kind: Kind::Task,
             addressed: task_arn.clone(),
-            issued: task_arn.clone(),
-            id: task_id.clone(),
-        },
-        Addressed {
-            case: "a task, by an ARN naming another region of this account",
-            kind: Kind::Task,
-            addressed: arn("aws", "us-east-1", ACCOUNT, &format!("task/{task_id}")),
             issued: task_arn.clone(),
             id: task_id.clone(),
         },
@@ -276,14 +256,14 @@ async fn the_tag_write_paths_resolve_a_resource_arn_the_way_the_tag_read_does() 
     let device_tags = reported_tags(&ok(&list_tags(&router, &device_arn).await, case), case);
     assert_eq!(
         device_tags,
-        BTreeMap::from([("owner".to_string(), "fleet-ops-2".to_string())]),
+        BTreeMap::from([("owner".to_string(), "fleet-ops-1".to_string())]),
         "case {case:?}: the device must carry the last value written to IT, got {device_tags:?}"
     );
     let case = "the task after every row";
     let task_tags = reported_tags(&ok(&list_tags(&router, &task_arn).await, case), case);
     assert_eq!(
         task_tags,
-        BTreeMap::from([("owner".to_string(), "fleet-ops-4".to_string())]),
+        BTreeMap::from([("owner".to_string(), "fleet-ops-2".to_string())]),
         "case {case:?}: the task must carry the last value written to IT, got {task_tags:?}"
     );
 }
@@ -400,6 +380,21 @@ async fn the_tagging_operations_agree_on_a_resource_arn_that_addresses_no_record
         Row {
             case: "this account's ARN for a task id it does not hold",
             resource_arn: arn("aws", SIGNED_REGION, ACCOUNT, "task/st-ffffffffffffffff"),
+            status: 404,
+            code: "NotFoundException",
+        },
+        Row {
+            // A record of this service lives in ONE Region, so an ARN naming another
+            // Region of this account addresses nothing this endpoint serves — even
+            // carrying an id this account really holds elsewhere
+            // (`tagging_region_scope.rs` is the whole rule).
+            case: "this account's ARN for a device it holds, naming another Region",
+            resource_arn: arn(
+                "aws",
+                "eu-west-1",
+                ACCOUNT,
+                &format!("managed-device/{device_id}"),
+            ),
             status: 404,
             code: "NotFoundException",
         },

@@ -1198,116 +1198,108 @@ pub fn bound_origin_endpoint_durations(
     cmaf_package: Option<&CmafPackageCreateOrUpdateParameters>,
     mss_package: Option<&MssPackage>,
 ) -> Result<(), ServiceError> {
-    /// One group of members whose paths are fixed: refuse the first negative one.
-    fn judge(members: &[(&str, Option<i32>)]) -> Result<(), ServiceError> {
+    /// One group of members sharing a path PREFIX: refuse the first one below the floor,
+    /// keyed by the whole path the wire names it by (`<prefix><member>`).
+    ///
+    /// This is the one place the floor is compared and the one place its refusal is built,
+    /// for every group — including a group nested in a LIST, whose prefix carries the
+    /// entry's index: `prefix` is anything that renders itself, so a caller with an index
+    /// passes `format_args!` and the prefix, like the path, costs nothing until a member
+    /// of that group is the one refused.
+    fn judge(
+        prefix: impl std::fmt::Display,
+        members: &[(&str, Option<i32>)],
+    ) -> Result<(), ServiceError> {
         for (member, seconds) in members {
             if seconds.is_some_and(|seconds| seconds < MIN_DURATION_SECONDS) {
-                return Err(duration_refusal(member));
+                return Err(duration_refusal(&format!("{prefix}{member}")));
             }
         }
         Ok(())
     }
 
     bound_startover_window(startover_window_seconds)?;
-    judge(&[("timeDelaySeconds", time_delay_seconds)])?;
+    judge("", &[("timeDelaySeconds", time_delay_seconds)])?;
     if let Some(package) = hls_package {
-        judge(&[
-            (
-                "hlsPackage.playlistWindowSeconds",
-                package.playlist_window_seconds,
-            ),
-            (
-                "hlsPackage.programDateTimeIntervalSeconds",
-                package.program_date_time_interval_seconds,
-            ),
-            (
-                "hlsPackage.segmentDurationSeconds",
-                package.segment_duration_seconds,
-            ),
-            (
-                "hlsPackage.encryption.keyRotationIntervalSeconds",
-                package
-                    .encryption
-                    .as_ref()
-                    .and_then(|encryption| encryption.key_rotation_interval_seconds),
-            ),
-        ])?;
-    }
-    if let Some(package) = dash_package {
-        judge(&[
-            (
-                "dashPackage.manifestWindowSeconds",
-                package.manifest_window_seconds,
-            ),
-            (
-                "dashPackage.minBufferTimeSeconds",
-                package.min_buffer_time_seconds,
-            ),
-            (
-                "dashPackage.minUpdatePeriodSeconds",
-                package.min_update_period_seconds,
-            ),
-            (
-                "dashPackage.segmentDurationSeconds",
-                package.segment_duration_seconds,
-            ),
-            (
-                "dashPackage.suggestedPresentationDelaySeconds",
-                package.suggested_presentation_delay_seconds,
-            ),
-            (
-                "dashPackage.encryption.keyRotationIntervalSeconds",
-                package
-                    .encryption
-                    .as_ref()
-                    .and_then(|encryption| encryption.key_rotation_interval_seconds),
-            ),
-        ])?;
-    }
-    if let Some(package) = cmaf_package {
-        judge(&[
-            (
-                "cmafPackage.segmentDurationSeconds",
-                package.segment_duration_seconds,
-            ),
-            (
-                "cmafPackage.encryption.keyRotationIntervalSeconds",
-                package
-                    .encryption
-                    .as_ref()
-                    .and_then(|encryption| encryption.key_rotation_interval_seconds),
-            ),
-        ])?;
-        // A CMAF package's child HLS manifests carry the same two window members an
-        // `HlsPackage` does, so the same floor holds for each of them, named by its index
-        // the way the wire indexes a list member — rendered only for the one refused.
-        for (index, manifest) in package.hls_manifests.iter().flatten().enumerate() {
-            for (member, seconds) in [
-                ("playlistWindowSeconds", manifest.playlist_window_seconds),
+        judge(
+            "hlsPackage.",
+            &[
+                ("playlistWindowSeconds", package.playlist_window_seconds),
                 (
                     "programDateTimeIntervalSeconds",
-                    manifest.program_date_time_interval_seconds,
+                    package.program_date_time_interval_seconds,
                 ),
-            ] {
-                if seconds.is_some_and(|seconds| seconds < MIN_DURATION_SECONDS) {
-                    return Err(duration_refusal(&format!(
-                        "cmafPackage.hlsManifests[{index}].{member}"
-                    )));
-                }
-            }
+                ("segmentDurationSeconds", package.segment_duration_seconds),
+                (
+                    "encryption.keyRotationIntervalSeconds",
+                    package
+                        .encryption
+                        .as_ref()
+                        .and_then(|encryption| encryption.key_rotation_interval_seconds),
+                ),
+            ],
+        )?;
+    }
+    if let Some(package) = dash_package {
+        judge(
+            "dashPackage.",
+            &[
+                ("manifestWindowSeconds", package.manifest_window_seconds),
+                ("minBufferTimeSeconds", package.min_buffer_time_seconds),
+                ("minUpdatePeriodSeconds", package.min_update_period_seconds),
+                ("segmentDurationSeconds", package.segment_duration_seconds),
+                (
+                    "suggestedPresentationDelaySeconds",
+                    package.suggested_presentation_delay_seconds,
+                ),
+                (
+                    "encryption.keyRotationIntervalSeconds",
+                    package
+                        .encryption
+                        .as_ref()
+                        .and_then(|encryption| encryption.key_rotation_interval_seconds),
+                ),
+            ],
+        )?;
+    }
+    if let Some(package) = cmaf_package {
+        judge(
+            "cmafPackage.",
+            &[
+                ("segmentDurationSeconds", package.segment_duration_seconds),
+                (
+                    "encryption.keyRotationIntervalSeconds",
+                    package
+                        .encryption
+                        .as_ref()
+                        .and_then(|encryption| encryption.key_rotation_interval_seconds),
+                ),
+            ],
+        )?;
+        // A CMAF package's child HLS manifests carry the same two window members an
+        // `HlsPackage` does, so the same floor holds for each of them — judged by the same
+        // helper, under a prefix naming the entry the way the wire indexes a list member.
+        for (index, manifest) in package.hls_manifests.iter().flatten().enumerate() {
+            judge(
+                format_args!("cmafPackage.hlsManifests[{index}]."),
+                &[
+                    ("playlistWindowSeconds", manifest.playlist_window_seconds),
+                    (
+                        "programDateTimeIntervalSeconds",
+                        manifest.program_date_time_interval_seconds,
+                    ),
+                ],
+            )?;
         }
     }
     if let Some(package) = mss_package {
-        judge(&[
-            (
-                "mssPackage.manifestWindowSeconds",
-                package.manifest_window_seconds,
-            ),
-            (
-                "mssPackage.segmentDurationSeconds",
-                package.segment_duration_seconds,
-            ),
-        ])?;
+        judge(
+            "mssPackage.",
+            &[
+                ("manifestWindowSeconds", package.manifest_window_seconds),
+                ("segmentDurationSeconds", package.segment_duration_seconds),
+            ],
+        )?;
     }
     Ok(())
 }
