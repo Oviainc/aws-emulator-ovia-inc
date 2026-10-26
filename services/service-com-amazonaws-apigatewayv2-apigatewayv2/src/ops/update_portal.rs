@@ -253,9 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The message a portal reader answers for an id the account holds no portal
             // under; the same wording `get_portal` uses.
             return Err(UpdatePortalErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::invalid_identifier_message(
-                    crate::state::PORTAL_RESOURCE,
-                )),
+                message: Some(crate::state::PORTAL_NOT_FOUND_MESSAGE.to_string()),
                 resource_type: ::std::option::Option::None,
             })
             .into());

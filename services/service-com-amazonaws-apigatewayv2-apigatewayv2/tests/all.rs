@@ -79,6 +79,8 @@ mod model_lifecycle;
 mod model_template;
 #[path = "all/portal_data_plane.rs"]
 mod portal_data_plane;
+#[path = "all/portal_deletion.rs"]
+mod portal_deletion;
 #[path = "all/portal_lifecycle.rs"]
 mod portal_lifecycle;
 #[path = "all/portal_pagination.rs"]

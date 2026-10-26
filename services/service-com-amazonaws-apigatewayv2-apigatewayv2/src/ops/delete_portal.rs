@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePortal
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePortal`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePortal::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the [`crate::state::Portal`] the URI addresses from the store —
+//! with whatever publication, preview and in-flight build it held, so its domain serves
+//! nothing afterwards and no reader reports it — and answers the modelled 204; 404
+//! `NotFoundException` when the account holds no portal under that id. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -62,6 +58,9 @@
 //!   incomplete or incorrect. See the accompanying error message for details.
 //! * `TooManyRequestsException` (HTTP 429) — A limit has been exceeded. See the accompanying
 //!   error message for details.
+//! * `NotFoundException` (HTTP 404) — widened in through `extra_errors` (see the note on
+//!   the error enum below): the refusal every other operation addressing a portal by id
+//!   answers for an id the account holds no portal under.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -101,11 +100,23 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeletePortalOutput {
 // here — hence the `DeletePortalError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.apigatewayv2#DeletePortal")]
+//
+// Widened with `NotFoundException`: `PortalId` is an http label that may name no portal
+// at all, and every sibling operation addressing a portal by that same label
+// (`GetPortal`, `UpdatePortal`, `PublishPortal`, `PreviewPortal`, `DisablePortal`, and
+// `DeletePortalProduct` for its own resource) declares `NotFoundException` for exactly
+// that case. This operation's own `errors` list omits it, so it is widened in here
+// through `extra_errors` rather than answered as some other status. The shape is this
+// service's own (`com.amazonaws.apigatewayv2#NotFoundException`, HTTP 404).
+#[smithy_macros::operation_error(
+    "com.amazonaws.apigatewayv2#DeletePortal",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum DeletePortalErrorModeled {
     AccessDeniedException(AccessDeniedException),
     BadRequestException(BadRequestException),
+    NotFoundException(NotFoundException),
     TooManyRequestsException(TooManyRequestsException),
 }
 
@@ -162,16 +173,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePortal` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePortalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePortal"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("DeletePortal"));
+        };
+        let mut store = state.lock();
+
+        // The record OWNS everything the portal holds — its content, its publication, the
+        // preview it built and any build still in flight — so removing its entry is the
+        // whole delete: no second map can keep a portal this one no longer holds, and the
+        // portal data plane, which resolves a request against this same store, stops
+        // serving the domains the record carried.
+        if store.portals.remove(&input.portal_id).is_none() {
+            // The sentence every portal reader and writer answers for an id the account
+            // holds no portal under; the one the portal plane names its resource type
+            // alone in.
+            return Err(DeletePortalErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::PORTAL_NOT_FOUND_MESSAGE.to_string()),
+                resource_type: ::std::option::Option::None,
+            })
+            .into());
+        }
+
+        Ok(DeletePortalOutput)
     }
 }

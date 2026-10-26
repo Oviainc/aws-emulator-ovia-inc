@@ -1754,9 +1754,17 @@ pub const MODEL_RESOURCE: &str = "Model";
 /// identifier specified").
 pub const AUTHORIZER_RESOURCE: &str = "Authorizer";
 
-/// How [`invalid_identifier_message`] names a PORTAL, which API Gateway spells in lower
-/// case.
-pub const PORTAL_RESOURCE: &str = "portal";
+/// The sentence this service answers `NotFoundException` with for a `PortalId` the account
+/// holds no portal under.
+///
+/// A portal is one of this API's PORTAL-plane resources, and those report an identifier
+/// that resolves to nothing by naming the resource TYPE alone — the form
+/// [`PRODUCT_REST_ENDPOINT_PAGE_NOT_FOUND_MESSAGE`] also takes — rather than with the
+/// `Invalid {resource} identifier specified` sentence the older api-level resources use
+/// (see [`invalid_identifier_message`]). So the sentence carries neither the account nor
+/// the identifier the request already holds. Held here once, so the wording cannot drift
+/// between the readers, the writers and the delete of one portal.
+pub const PORTAL_NOT_FOUND_MESSAGE: &str = "Portal not found";
 
 /// How [`invalid_identifier_message`] names a PORTAL PRODUCT.
 pub const PORTAL_PRODUCT_RESOURCE: &str = "PortalProduct";
