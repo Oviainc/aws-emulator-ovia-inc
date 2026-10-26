@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAppAuthorization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAppAuthorization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! REMOVES one app authorization from the app bundle that owns it, so a later
+//! `GetAppAuthorization` or `ListAppAuthorizations` no longer reports it: the
+//! delete is a write against the same store `CreateAppAuthorization` wrote the
+//! record into.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAppAuthorization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The operation is `@idempotent`, so a delete of an authorization the bundle no
+//! longer holds changes nothing and still answers 204 — the end state the caller
+//! asked for is already the state of the store. That is this service's recorded
+//! answer on a delete path whose target it does not hold (the sibling
+//! `DeleteIngestion`, whose recorded no-op this mirrors), so the modelled
+//! `ResourceNotFoundException` is reserved for the PARENT of the path: an app
+//! bundle that does not exist is a resource in its own right, and this operation
+//! declares that error (the sibling `GetAppAuthorization` and
+//! `ListAppAuthorizations` answer an unknown bundle the same way).
+//!
+//! AWS documents one precondition for this call — "You must delete the associated
+//! ingestion before you can delete an app authorization" — so an authorization
+//! whose (application, tenant) pair the bundle still holds an ingestion for is
+//! refused with the modelled `ValidationException` rather than deleted. That pair
+//! is what ties the two together: an ingestion exists only for a pair whose app
+//! authorization has completed the connect handshake (see
+//! [`crate::state::AppBundleRecord::ingestion_for`]).
+//!
+//! Authorization is NOT modelled here (nor anywhere in this emulator): every
+//! request's signature is verified by the framework, but no IAM evaluation runs,
+//! so the modelled `AccessDeniedException` is never returned and a 204 from this
+//! operation says nothing about whether the caller would be permitted on AWS.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +165,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAppAuthorization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAppAuthorizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAppAuthorization"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteAppAuthorizationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AppFabric emulator could not reach its state store".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // ONE lock for the whole decision: the precondition below and the
+        // removal that follows it are taken without releasing it, so an
+        // ingestion created in between cannot be left without its authorization.
+        let mut store = state.lock();
+        // The bundle is the parent of this path and a resource of its own: an
+        // identifier naming no stored bundle is the not-found this operation
+        // models, worded the way AppFabric words it on a WRITE path (see
+        // `crate::state::app_bundle_id_not_valid`).
+        let Some(bundle) = store.resolve_bundle_mut(&input.app_bundle_identifier) else {
+            return Err(DeleteAppAuthorizationErrorModeled::ResourceNotFoundException(
+                crate::state::app_bundle_id_not_valid(&input.app_bundle_identifier),
+            )
+            .into());
+        };
+
+        // ONE lookup of the record, by either `Identifier` form. @idempotent: a
+        // target this bundle does not hold leaves the store in exactly the state
+        // the request asks for, so nothing is written and the call succeeds.
+        let Some(authorization) =
+            bundle.resolve_app_authorization(&input.app_authorization_identifier)
+        else {
+            crate::state::audit_resource_change(
+                ctx.parts(),
+                Self::NAME,
+                "AppAuthorization",
+                &input.app_authorization_identifier,
+                "already absent",
+            );
+            return Ok(DeleteAppAuthorizationOutput {});
+        };
+        // Read off the record the lookup resolved: its own key, so the remove
+        // below cannot name anything else, and the (application, tenant) pair
+        // the associated ingestion is found by.
+        let authorization_key = authorization.id.clone();
+        let authorization_arn = authorization.arn.clone();
+        let app = authorization.app.clone();
+        let tenant = authorization.tenant_identifier.clone();
+
+        // The precondition the operation documents: "You must delete the
+        // associated ingestion before you can delete an app authorization."
+        if let Some(ingestion) = bundle.ingestion_for(&app, &tenant) {
+            return Err(DeleteAppAuthorizationErrorModeled::ValidationException(
+                crate::state::precondition_not_met(format!(
+                    "App authorization {authorization_arn} is associated with ingestion {}; \
+                     you must delete the associated ingestion before you can delete an app \
+                     authorization.",
+                    ingestion.arn
+                )),
+            )
+            .into());
+        }
+
+        bundle.app_authorizations.remove(&authorization_key);
+        crate::state::audit_resource_change(
+            ctx.parts(),
+            Self::NAME,
+            "AppAuthorization",
+            &authorization_key,
+            "deleted",
+        );
+        Ok(DeleteAppAuthorizationOutput {})
     }
 }
