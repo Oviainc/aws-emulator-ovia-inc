@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTimeToLive
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTimeToLive`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTimeToLive::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Turns this table's Time to Live on or off and reports the specification that leaves
+//! in force. The setting is STORED on the table (`crate::state::TimeToLive`) and its
+//! status is derived from the clock on every read, so this operation and
+//! `DescribeTimeToLive` report one answer — and the items the stored attribute has
+//! expired are deleted by the store's own sweep
+//! (`crate::state::Table::apply_due_expirations`).
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +174,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTimeToLive` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTimeToLiveErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTimeToLive"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        // "You can also provide the Amazon Resource Name (ARN) of the table in this
+        // parameter" (`UpdateTimeToLive$TableName`), so either form resolves to the
+        // stored name. `Enabled` and `AttributeName` are both required and the name's
+        // 1..255 length is the MODEL's own, so a request that omits or oversizes either
+        // is already refused before this handler runs.
+        let name = crate::state::resolve_table_name(&input.table_name)
+            .map_err(|error| lift(&input.table_name, error))?;
+        let specification = input.time_to_live_specification.clone();
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+        let table = store
+            .table_mut(&region, &name)
+            .map_err(|error| lift(&name, error))?;
+        // TTL is a table setting, so the table has to be settled before it is changed:
+        // the same refusals `UpdateTable` answers for a table that is still being
+        // created or updated, and a table on its way out is already gone as far as its
+        // configuration goes.
+        match table.status(now) {
+            crate::state::TableStatus::Active => {}
+            crate::state::TableStatus::Creating => {
+                return Err(resource_in_use(&format!("Table is being created: {name}")))
+            }
+            crate::state::TableStatus::Updating => {
+                return Err(resource_in_use(&format!("Table is being updated: {name}")))
+            }
+            crate::state::TableStatus::Deleting => {
+                return Err(UpdateTimeToLiveErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Requested resource not found: Table: {name} not found"
+                        )),
+                    },
+                )
+                .into())
+            }
+        }
+        // "It can take up to one hour for the change to fully process. Any additional
+        // UpdateTimeToLive calls for the same table during this one hour duration result
+        // in a ValidationException" (the doc above): while the change this table was
+        // last given is still processing, this one is refused and nothing is stored.
+        if !table.time_to_live.settled(now) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::TIME_TO_LIVE_MODIFIED_TOO_OFTEN_MESSAGE,
+            ));
+        }
+        // A table whose TTL is on expires its items by ONE attribute, and this API does
+        // not move it: a specification naming another attribute is refused, and told
+        // which attribute is in force.
+        if let Some(attribute) = table.time_to_live.attribute_in_force(now) {
+            if attribute != specification.attribute_name {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::time_to_live_attribute_mismatch(attribute),
+                ));
+            }
+        }
+        // This API enables or disables TTL, so a call that asks for the state the table
+        // is already in is refused rather than applied.
+        let in_force = table.time_to_live.status(now);
+        if specification.enabled && in_force == crate::state::TIME_TO_LIVE_ENABLED {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::TIME_TO_LIVE_ALREADY_ENABLED_MESSAGE,
+            ));
+        }
+        if !specification.enabled && in_force == crate::state::TIME_TO_LIVE_DISABLED {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::TIME_TO_LIVE_ALREADY_DISABLED_MESSAGE,
+            ));
+        }
+        table
+            .time_to_live
+            .apply(specification.enabled, &specification.attribute_name, now);
+        let status = table.time_to_live.status(now);
+
+        // The audit record for a state-changing call: who asked, what was changed and
+        // that it succeeded. Never a credential — only the access key id the caller
+        // presented.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            table_name = %name,
+            time_to_live_status = %status,
+            "time to live updated"
+        );
+
+        // "A successful UpdateTimeToLive call returns the current TimeToLiveSpecification"
+        // (the doc above): the specification this call has just stored, which is what
+        // `DescribeTimeToLive` reports from this moment on.
+        Ok(UpdateTimeToLiveOutput {
+            time_to_live_specification: Some(specification),
+        })
+    }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> UpdateTimeToLiveError {
+    UpdateTimeToLiveErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// A table whose configuration cannot be changed while it is in the state `state`
+/// describes: "You tried to update a resource that was already being updated"
+/// (`ResourceInUseException`).
+fn resource_in_use(state: &str) -> UpdateTimeToLiveError {
+    UpdateTimeToLiveErrorModeled::ResourceInUseException(ResourceInUseException {
+        message: Some(format!(
+            "Attempt to change a resource which is still in use: {state}"
+        )),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel: a table this operation
+/// cannot find is the `ResourceNotFoundException` it models — "The operation tried to
+/// access a nonexistent table or index" — and a value it cannot address at all a
+/// `ValidationException`.
+fn lift(table_name: &str, error: crate::state::RequestError) -> UpdateTimeToLiveError {
+    match error {
+        crate::state::RequestError::NotFound(_) => {
+            UpdateTimeToLiveErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!(
+                    "Requested resource not found: Table: {table_name} not found"
+                )),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
     }
 }

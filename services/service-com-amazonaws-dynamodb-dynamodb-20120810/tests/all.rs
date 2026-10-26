@@ -118,6 +118,9 @@ mod table_throughput_mode_and_warm_capacity;
 #[path = "all/tag_read_propagation.rs"]
 mod tag_read_propagation;
 
+#[path = "all/time_to_live.rs"]
+mod time_to_live;
+
 #[path = "all/validation_message_wording.rs"]
 mod validation_message_wording;
 

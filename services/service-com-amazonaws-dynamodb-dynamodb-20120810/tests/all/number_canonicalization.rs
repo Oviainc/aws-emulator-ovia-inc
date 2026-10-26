@@ -82,6 +82,10 @@ fn canonical_rows() -> Vec<(&'static str, String, String)> {
         ("a negative decimal with padding", "-012.3400", "-12.34"),
         ("a fraction that an exponent turns into an integer", "0.0025e4", "25"),
         ("an integer that an exponent turns into a fraction", "250e-4", "0.025"),
+        // The exponent's TEXT may carry padding like the mantissa's, up to this
+        // emulator's input-size limit for it, and normalises away the same way.
+        ("an exponent padded with leading zeros", "1e0009", "1000000000"),
+        ("a signed exponent padded with leading zeros", "1e-0002", "0.01"),
     ]
     .into_iter()
     .map(|(case, submitted, canonical)| (case, submitted.to_string(), canonical.to_string()))
@@ -165,6 +169,17 @@ fn refusal_rows() -> Vec<(&'static str, Value)> {
     rows.push((
         "an exponent one past the documented minimum",
         json!({"v": {"N": format!("1e{}", MIN_EXPONENT - 1)}}),
+    ));
+    // PAST the emulator's own input-size limit for the exponent's text: a run of
+    // leading zeros denotes the same exponent however long it is, so a text wider than
+    // the integer the exponent is read into is refused rather than retained.
+    rows.push((
+        "an exponent spelled with more text than its value can need",
+        json!({"v": {"N": format!("1e{}9", "0".repeat(32))}}),
+    ));
+    rows.push((
+        "a negative exponent spelled with more text than its value can need",
+        json!({"v": {"N": format!("1e-{}9", "0".repeat(512))}}),
     ));
     rows
 }

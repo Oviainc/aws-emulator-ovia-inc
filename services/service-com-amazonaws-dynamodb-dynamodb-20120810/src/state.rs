@@ -34,7 +34,8 @@ use crate::ops::types::{
     OnDemandThroughput,
     SourceTableFeatureDetails, StreamSpecification, Tag,
     TableClassSummary, TableDescription, TableThroughputModeSummary,
-    TableWarmThroughputDescription, VectorAttributeDefinition, VectorIndexDescription,
+    TableWarmThroughputDescription, TimeToLiveDescription, VectorAttributeDefinition,
+    VectorIndexDescription,
     VectorIndexInfo,
     WarmThroughput,
 };
@@ -292,6 +293,20 @@ const MAX_POINT: i32 = 126;
 /// and its message names this limit.
 const MAX_NUMBER_TEXT_DIGITS: usize =
     MAX_SIGNIFICANT_DIGITS + (MAX_POINT - MIN_POINT) as usize;
+
+/// The most CHARACTERS one `N` value's EXPONENT text may carry, sign included: the
+/// widest decimal spelling of the `i32` the exponent is read into.
+///
+/// The same input-size limit as [`MAX_NUMBER_TEXT_DIGITS`], for the same reason, applied
+/// to the other half of the lexeme: an exponent is read with `parse::<i32>`, which
+/// accepts any run of leading zeros, so a bound on the exponent's VALUE (the documented
+/// range, enforced below as an over- or underflow) bounds no amount of exponent TEXT. An
+/// exponent spelled wider than an `i32` denotes a magnitude far outside the documented
+/// range whatever the mantissa shifts it by, so refusing it costs a caller nothing it
+/// could not spell another way — and it keeps the text one value retains bounded, which
+/// is what the byte budgets measured against a number's accounted size
+/// ([`attribute_value_size`], which sizes a number from its significant digits) rely on.
+const MAX_EXPONENT_TEXT_CHARS: usize = 11;
 
 /// How often the figures a description reports as `ItemCount` and
 /// `TableSizeBytes`/`IndexSizeBytes` are recomputed from what is stored.
@@ -783,12 +798,20 @@ impl NumberKey {
             None => (false, text.strip_prefix('+').unwrap_or(text)),
         };
         let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
-            Some(at) => (
-                &unsigned[..at],
-                unsigned[at + 1..]
-                    .parse::<i32>()
-                    .map_err(|_| NumberFault::NotNumeric)?,
-            ),
+            Some(at) => {
+                let text = &unsigned[at + 1..];
+                // The exponent's TEXT is bounded before it is parsed, exactly as the
+                // mantissa's is below: `parse::<i32>` reads through any number of
+                // leading zeros, so nothing else bounds how much text one exponent can
+                // carry ([`MAX_EXPONENT_TEXT_CHARS`]).
+                if text.len() > MAX_EXPONENT_TEXT_CHARS {
+                    return Err(NumberFault::TextTooLong);
+                }
+                (
+                    &unsigned[..at],
+                    text.parse::<i32>().map_err(|_| NumberFault::NotNumeric)?,
+                )
+            }
             None => (unsigned, 0),
         };
         let (integral, fractional) = match mantissa.find('.') {
@@ -2210,6 +2233,205 @@ impl ContributorInsights {
 }
 
 // =============================================================================
+// TIME TO LIVE
+//
+// One setting per table: whether items expire, and the attribute whose epoch-seconds
+// value says when. `UpdateTimeToLive` writes it, `DescribeTimeToLive` reports it, and
+// the store's own sweep ([`Table::apply_due_expirations`]) removes the items whose
+// deletion the clock has already made due.
+// =============================================================================
+
+/// The four values `TimeToLiveStatus` declares
+/// ([`crate::ops::types::TIME_TO_LIVE_STATUS_VALUES`]), named one per meaning: turning
+/// a table's TTL on or off is asynchronous ("It can take up to one hour for the change
+/// to fully process" — the `UpdateTimeToLive` doc), so the setting is reported in a
+/// transient status until the clock has settled it.
+pub const TIME_TO_LIVE_ENABLING: &str = "ENABLING";
+pub const TIME_TO_LIVE_ENABLED: &str = "ENABLED";
+pub const TIME_TO_LIVE_DISABLING: &str = "DISABLING";
+pub const TIME_TO_LIVE_DISABLED: &str = "DISABLED";
+
+/// How long after an item has expired its deletion falls due, and the shortest span
+/// between two sweeps of one table.
+///
+/// DynamoDB states no fixed figure for this one: "DynamoDB deletes expired items on a
+/// best-effort basis ... DynamoDB typically deletes expired items within two days of
+/// expiration. The exact duration within which an item gets deleted after expiration is
+/// specific to the nature of the workload" (the `UpdateTimeToLive` doc), which is an
+/// upper bound on a best-effort sweep rather than a duration to keep. This emulator
+/// therefore CHOOSES 500 ms: non-zero, so an item that has just expired is still served
+/// to a reader ("Items that have expired and not been deleted will still show up in
+/// reads, queries, and scans" — the same doc), and short enough that a client that waits
+/// sees the deletion. It doubles as the sweep interval, so the walk one request can
+/// trigger over a table's items runs at most once per span however many requests arrive.
+pub const TTL_DELETION_DELAY: Duration = Duration::from_millis(500);
+
+/// How a call that turns TTL on while it is already on is refused: AWS's FIXED sentence
+/// for that case, which names neither the table nor the attribute.
+///
+/// This is the refusal for a call that asks for the setting the table ALREADY has — the
+/// same attribute, enabled again. A call naming another attribute is a different
+/// refusal, which reports the attribute in force
+/// ([`time_to_live_attribute_mismatch`]).
+pub const TIME_TO_LIVE_ALREADY_ENABLED_MESSAGE: &str = "TimeToLive is already enabled";
+
+/// The same for a call that turns TTL off while it is already off.
+pub const TIME_TO_LIVE_ALREADY_DISABLED_MESSAGE: &str = "TimeToLive is already disabled";
+
+/// How a specification that names an attribute OTHER than the one TTL is in force for is
+/// refused: AWS's sentence for that case, whose variable part is the attribute this
+/// table's items are currently expired by, read from the table's stored setting.
+///
+/// The TTL attribute of a table whose TTL is on is not something this API moves: a
+/// specification naming another attribute asks for a TTL over an attribute that is not
+/// the one in force, so it is refused and the stored one is reported back — whether the
+/// specification was enabling TTL or disabling it, because either way the attribute it
+/// names is not this table's.
+pub fn time_to_live_attribute_mismatch(attribute_in_force: &str) -> String {
+    format!(
+        "TimeToLive is active on a different AttributeName: current AttributeName is \
+         {attribute_in_force}"
+    )
+}
+
+/// How a call that arrives while the last TTL change is still processing is refused:
+/// "Any additional UpdateTimeToLive calls for the same table during this one hour
+/// duration result in a ValidationException" (the `UpdateTimeToLive` doc). The span this
+/// emulator processes a change over is [`STATUS_TRANSITION`], the one every other
+/// transient status here is reported for.
+pub const TIME_TO_LIVE_MODIFIED_TOO_OFTEN_MESSAGE: &str =
+    "Time to live has been modified multiple times within a fixed interval";
+
+/// One table's Time to Live setting: what the last accepted `UpdateTimeToLive` asked
+/// for, when it was accepted, and when this table's items were last swept.
+///
+/// Only the REQUEST is stored; the status is derived at every read, for the reason
+/// [`ContributorInsights`]'s is — the change is asynchronous, so the call leaves the
+/// setting `ENABLING` / `DISABLING` and the clock owes it the move to `ENABLED` /
+/// `DISABLED` one [`STATUS_TRANSITION`] later. A table no `UpdateTimeToLive` has named
+/// is `DISABLED` with no attribute at all: this API is the only way to turn TTL on, and
+/// `CreateTable` carries no TTL member.
+#[derive(Debug, Clone, Default)]
+pub struct TimeToLive {
+    /// Whether the last accepted specification turned TTL on.
+    enabled: bool,
+    /// The attribute that specification named — the one whose value items expire by
+    /// while TTL is on, and the one being withdrawn while it is going off. `None` until
+    /// a request has named one.
+    attribute_name: Option<String>,
+    /// When the clock owes the move out of the transient status.
+    settles_at: Option<SystemTime>,
+    /// When this table's items were last swept for expiries, or `None` while they never
+    /// have been.
+    swept_at: Option<SystemTime>,
+}
+
+impl TimeToLive {
+    /// Apply one `TimeToLiveSpecification`: the attribute it names comes into force (or
+    /// starts being withdrawn) and the transient span starts again.
+    pub fn apply(&mut self, enabled: bool, attribute_name: &str, now: SystemTime) {
+        self.enabled = enabled;
+        self.attribute_name = Some(attribute_name.to_string());
+        self.settles_at = Some(now + STATUS_TRANSITION);
+    }
+
+    /// Whether the clock has already settled the last change this setting was given.
+    pub fn settled(&self, now: SystemTime) -> bool {
+        self.settles_at.is_none_or(|due| now >= due)
+    }
+
+    /// The status at `now`: the transient one until the clock has made the move due,
+    /// then the settled one.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        match (self.enabled, self.settled(now)) {
+            (true, true) => TIME_TO_LIVE_ENABLED,
+            (true, false) => TIME_TO_LIVE_ENABLING,
+            (false, true) => TIME_TO_LIVE_DISABLED,
+            (false, false) => TIME_TO_LIVE_DISABLING,
+        }
+    }
+
+    /// The attribute this table's items are expired by RIGHT NOW: the one the settled
+    /// enable named, and `None` for a table whose TTL is off or still settling.
+    pub fn attribute_in_force(&self, now: SystemTime) -> Option<&str> {
+        match self.status(now) {
+            TIME_TO_LIVE_ENABLED => self.attribute_name.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Project this setting into the `TimeToLiveDescription` the TTL reader reports:
+    /// the status, and the attribute it is in force for.
+    ///
+    /// A setting that has settled OFF reports no attribute: nothing expires items on
+    /// that table, so there is no TTL attribute for it to name — which is also what a
+    /// table that has never had TTL reports.
+    pub fn describe(&self, now: SystemTime) -> TimeToLiveDescription {
+        let status = self.status(now);
+        TimeToLiveDescription {
+            time_to_live_status: Some(status.to_string()),
+            attribute_name: match status {
+                TIME_TO_LIVE_DISABLED => None,
+                _ => self.attribute_name.clone(),
+            },
+        }
+    }
+
+    /// The attribute a sweep that is DUE at `now` expires items by, or `None` when this
+    /// table has nothing to sweep yet.
+    ///
+    /// A sweep is due only while TTL is in force — a change that is still settling
+    /// expires nothing, because the attribute it names is not the one items are being
+    /// deleted by yet — and at most once per [`TTL_DELETION_DELAY`].
+    fn due_sweep_attribute(&self, now: SystemTime) -> Option<String> {
+        let in_force = self.status(now) == TIME_TO_LIVE_ENABLED;
+        let due = self
+            .swept_at
+            .is_none_or(|last| now >= last + TTL_DELETION_DELAY);
+        (in_force && due)
+            .then(|| self.attribute_name.clone())
+            .flatten()
+    }
+
+    /// Record that this table's items have just been swept.
+    fn mark_swept(&mut self, now: SystemTime) {
+        self.swept_at = Some(now);
+    }
+}
+
+/// The epoch-seconds instant an item's TTL attribute must not be LATER than for its
+/// deletion to be due at `now`: one [`TTL_DELETION_DELAY`] back, as an `N` value's text,
+/// so the comparison runs through the same number parser a stored `N` was canonicalized
+/// by ([`NumberKey`]).
+fn expiry_cutoff(now: SystemTime) -> Option<NumberKey> {
+    let delay = i128::try_from(TTL_DELETION_DELAY.as_millis()).unwrap_or(i128::MAX);
+    let millis = epoch_millis(now).saturating_sub(delay);
+    let sign = if millis < 0 { "-" } else { "" };
+    let magnitude = millis.unsigned_abs();
+    NumberKey::parse(&format!(
+        "{sign}{}.{:03}",
+        magnitude / 1_000,
+        magnitude % 1_000
+    ))
+}
+
+/// Whether one item's TTL attribute value has already made the item's deletion due.
+///
+/// "TTL compares the current time in epoch time format to the time stored in the TTL
+/// attribute of an item. If the epoch time value stored in the attribute is less than
+/// the current time, the item is marked as expired" (the `UpdateTimeToLive` doc): the
+/// value is a NUMBER of seconds since the epoch, so an attribute of any other type
+/// expires nothing — a string, a set or a boolean states no epoch time to compare.
+fn expiry_due(value: &AttributeValue, cutoff: &NumberKey) -> bool {
+    match value {
+        AttributeValue::N(text) => {
+            NumberKey::parse(text).is_some_and(|expires_at| expires_at <= *cutoff)
+        }
+        _ => false,
+    }
+}
+
+// =============================================================================
 // KINESIS DATA STREAM DESTINATIONS
 //
 // A table replicates its item changes to a Kinesis data stream through a
@@ -2673,6 +2895,9 @@ pub struct SourceTableSnapshot {
     pub vector_indexes: Vec<VectorIndexInfo>,
     /// The table's stream configuration, for a table that had a stream.
     pub stream_specification: Option<StreamSpecification>,
+    /// The table's Time to Live setting as it stood then, which is what
+    /// `SourceTableFeatureDetails$TimeToLiveDescription` reports for this backup.
+    pub time_to_live_description: TimeToLiveDescription,
 }
 
 impl Backup {
@@ -2695,7 +2920,7 @@ impl Backup {
             available_at: now + STATUS_TRANSITION,
             expires_at: None,
             restored_until: None,
-            source: table.backup_snapshot(),
+            source: table.backup_snapshot(now),
             items: table.items.clone(),
         }
     }
@@ -2801,6 +3026,7 @@ impl Backup {
                 vector_indexes: (!self.source.vector_indexes.is_empty())
                     .then(|| self.source.vector_indexes.clone()),
                 stream_description: self.source.stream_specification.clone(),
+                time_to_live_description: Some(self.source.time_to_live_description.clone()),
                 ..SourceTableFeatureDetails::default()
             }),
         }
@@ -3072,6 +3298,10 @@ pub struct Table {
     /// operations wrote and report it ([`ContributorInsights`]). Its indexes carry
     /// their own.
     pub contributor_insights: ContributorInsights,
+    /// This table's Time to Live setting, as `UpdateTimeToLive` wrote it and
+    /// `DescribeTimeToLive` reports it ([`TimeToLive`]) — and what
+    /// [`Table::apply_due_expirations`] expires this table's items by.
+    pub time_to_live: TimeToLive,
     /// The Kinesis data stream destinations this table replicates its item changes to,
     /// in the order they were registered ([`KinesisDestination`]).
     ///
@@ -3540,6 +3770,47 @@ impl Table {
             return;
         }
         self.meter_counters(now);
+    }
+
+    /// Remove every item of this table whose TTL deletion the clock has already made
+    /// due, returning the items removed so their tables' streams can carry the change.
+    ///
+    /// "If the epoch time value stored in the attribute is less than the current time,
+    /// the item is marked as expired and subsequently deleted" (the `UpdateTimeToLive`
+    /// doc): the deletion was owed at this instant whether or not anybody called, so a
+    /// reporting operation may finish it. Nothing here is a filter — an item that is
+    /// expired but whose deletion is not due yet is still STORED and still served,
+    /// because "items that have expired and not been deleted will still show up in
+    /// reads, queries, and scans" (the same doc).
+    ///
+    /// A table whose TTL is off, or whose last TTL change is still settling, has nothing
+    /// to sweep, and a table that was swept within the last [`TTL_DELETION_DELAY`] is
+    /// left alone, so the walk over this table's items runs at most once per span.
+    pub fn apply_due_expirations(&mut self, now: SystemTime) -> Vec<Item> {
+        let Some(attribute) = self.time_to_live.due_sweep_attribute(now) else {
+            return Vec::new();
+        };
+        let Some(cutoff) = expiry_cutoff(now) else {
+            return Vec::new();
+        };
+        self.time_to_live.mark_swept(now);
+        let due: Vec<ItemKey> = self
+            .items
+            .iter()
+            .filter(|(_, item)| {
+                item.get(&attribute)
+                    .is_some_and(|value| expiry_due(value, &cutoff))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut removed = Vec::with_capacity(due.len());
+        for key in due {
+            if let Some(item) = self.items.remove(&key) {
+                self.stored_bytes = self.stored_bytes.saturating_sub(item_size(&item));
+                removed.push(item);
+            }
+        }
+        removed
     }
 
     /// Meter this table's figures and every index's, at `now`, whatever the schedule.
@@ -4086,7 +4357,7 @@ impl Table {
     /// committed up to its own time marker (the `CreateBackup` doc), so what it reports
     /// is what the table held then — and the table itself may be changed or gone by the
     /// time the backup is read.
-    pub fn backup_snapshot(&self) -> SourceTableSnapshot {
+    pub fn backup_snapshot(&self, now: SystemTime) -> SourceTableSnapshot {
         SourceTableSnapshot {
             key_schema: self.key_schema.clone(),
             attribute_definitions: self.attribute_definitions.clone(),
@@ -4136,6 +4407,9 @@ impl Table {
                 stream_enabled: stream.enabled,
                 stream_view_type: stream.enabled.then(|| stream.view_type.clone()),
             }),
+            // The TTL setting in force at this instant, projected exactly as the TTL
+            // reader projects it, so the backup records what the table reported then.
+            time_to_live_description: self.time_to_live.describe(now),
         }
     }
 }
@@ -4273,11 +4547,11 @@ pub struct ComAmazonawsDynamodbDynamodb20120810State {
 
 impl ComAmazonawsDynamodbDynamodb20120810State {
     /// Materialise the changes the clock has already made due: a table whose
-    /// `DeleteTable` span has elapsed is gone, a table whose metering interval has
-    /// elapsed reports freshly counted `ItemCount`/`TableSizeBytes` figures, a tag
-    /// write whose propagation span has elapsed becomes visible to the tag reader, and a
-    /// `ClientRequestToken` whose idempotency window has elapsed no longer stands for
-    /// the transaction it named.
+    /// `DeleteTable` span has elapsed is gone, an item whose TTL expiry has fallen due
+    /// is deleted, a table whose metering interval has elapsed reports freshly counted
+    /// `ItemCount`/`TableSizeBytes` figures, a tag write whose propagation span has
+    /// elapsed becomes visible to the tag reader, and a `ClientRequestToken` whose
+    /// idempotency window has elapsed no longer stands for the transaction it named.
     ///
     /// These are the only writes a reporting operation makes — each finishes something
     /// that was owed at this instant whether or not anybody called.
@@ -4288,12 +4562,31 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
                 Ok(age) if age >= TRANSACTION_IDEMPOTENCY_WINDOW
             )
         });
+        // An expired item's deletion is an item-level modification like any other, so a
+        // stream-enabled table owes its stream one record per item swept. The records
+        // are queued once the walk over the tables is done, because the queue is the
+        // STORE's.
+        let mut expired: Vec<PendingStreamRecord> = Vec::new();
         for tables in self.regions.values_mut() {
             tables.retain(|_, table| !table.removal_due(now));
             for table in tables.values_mut() {
+                let stream_arn = table.enabled_stream_arn();
+                for item in table.apply_due_expirations(now) {
+                    if let Some(stream_arn) = stream_arn.clone() {
+                        expired.push(PendingStreamRecord {
+                            stream_arn,
+                            keys: table.stream_keys(&item),
+                            old_image: Some(item),
+                            new_image: None,
+                        });
+                    }
+                }
                 table.refresh_due_counters(now);
                 table.tags.apply_due_propagation(now);
             }
+        }
+        for change in expired {
+            self.queue_stream_record(Some(change));
         }
         self.regions.retain(|_, tables| !tables.is_empty());
     }

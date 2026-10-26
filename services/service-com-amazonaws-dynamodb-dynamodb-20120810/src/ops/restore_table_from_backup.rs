@@ -387,6 +387,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A new table has consumed none of the capacity it is provisioned for.
             write_budget: crate::state::CapacityBudget::new(now),
             contributor_insights: crate::state::ContributorInsights::default(),
+            // TTL is one of the settings the doc above has a caller set up again on the
+            // restored table, so its items do not expire until `UpdateTimeToLive` says
+            // they do.
+            time_to_live: crate::state::TimeToLive::default(),
             // A restore reproduces the source table's data, not its Kinesis streaming
             // destinations: the restored table replicates to no stream until the enable
             // command registers one on it.

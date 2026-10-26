@@ -479,6 +479,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // contributor insights member, so `UpdateContributorInsights` is the only
             // way to turn them on.
             contributor_insights: crate::state::ContributorInsights::default(),
+            // A new table's items do not expire: `CreateTable` carries no TTL member,
+            // so `UpdateTimeToLive` is the only way to turn Time to Live on.
+            time_to_live: crate::state::TimeToLive::default(),
             // A new table replicates to no Kinesis data stream: `CreateTable` carries no
             // Kinesis destination member, so the enable command is the only way to
             // register one.
