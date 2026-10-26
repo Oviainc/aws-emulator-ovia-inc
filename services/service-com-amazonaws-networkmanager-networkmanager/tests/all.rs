@@ -117,6 +117,8 @@ mod site_to_site_vpn_attachment_lifecycle;
 mod state_roundtrip;
 #[path = "all/transit_gateway_connect_peer_association_lifecycle.rs"]
 mod transit_gateway_connect_peer_association_lifecycle;
+#[path = "all/transit_gateway_connect_peer_association_quota.rs"]
+mod transit_gateway_connect_peer_association_quota;
 #[path = "all/transit_gateway_peering.rs"]
 mod transit_gateway_peering;
 #[path = "all/transit_gateway_peering_create_bounds.rs"]

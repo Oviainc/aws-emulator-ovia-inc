@@ -24,6 +24,18 @@
 //!   is refused: the address is not the caller's to supply. India's `PAN` is such
 //!   a type, so a `PAN` entry is stored with its address filled in rather than
 //!   submitted.
+//! * a registration type the service ties to ONE country
+//!   (`crate::state::TYPE_JURISDICTIONS`) set for a registration held somewhere
+//!   else is refused with the `errorCode` the model publishes for that type
+//!   (`crate::state::TYPE_OUTSIDE_ITS_COUNTRY_CODES`): the country a
+//!   registration is held in is its `legalAddress.countryCode`, so an entry
+//!   naming another country names a customer that may not set the type.
+//! * a registration type the account's STORED registration blocks
+//!   (`crate::state::TYPES_BLOCKED_BY_A_STORED_TYPE`) is refused with the
+//!   `errorCode` the model publishes for that pair, and the stored record is
+//!   left as it was — see
+//!   [`crate::state::ComAmazonawsTaxsettingsTaxsettingsState::check_registration_type_against_stored`],
+//!   the one place both writers judge an entry against what the account holds.
 //! * `legalName` and `legalAddress` are optional on `TaxRegistrationEntry` and
 //!   `@required` on every shape that REPORTS a registration (`TaxRegistration`,
 //!   `TaxRegistrationWithJurisdiction`), so an entry that omits one is refused
@@ -57,9 +69,12 @@
 //!   [`crate::state::COUNTRY_RULES`] carries and
 //!   [`crate::state::check_country_requirements`] applies.
 //!
-//! Every one of these is decided by
-//! [`crate::state::check_tax_registration_entry`], the one place both this
-//! operation and `BatchPutTaxRegistration` judge an entry.
+//! Every one of these is decided in `state.rs` — the entry's own refusals by
+//! [`crate::state::check_tax_registration_entry`] and the one that depends on
+//! what the account already holds by
+//! [`crate::state::ComAmazonawsTaxsettingsTaxsettingsState::check_registration_type_against_stored`]
+//! — so this operation and `BatchPutTaxRegistration` judge one entry, and one
+//! account's state, the same way.
 //!
 //! The per-country rules are the sentences the operation's own model
 //! documentation states for `taxRegistrationEntry` — "Kenya You must specify the
@@ -279,10 +294,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `BatchPutTaxRegistration` cannot store one entry two different ways,
         // nor judge one account's state two different ways; both refusals are
         // this operation's modelled `ConflictException`.
-        let status = state
-            .lock()
+        let mut store = state.lock();
+
+        // What the account already holds can itself refuse the type the request
+        // sets, which is a fact about the stored record rather than about the
+        // entry, so it is judged here rather than in the entry checker — still
+        // in `state.rs`, so the batch writer judges it the same way.
+        store
+            .check_registration_type_against_stored(&account_id, entry)
+            .map_err(PutTaxRegistrationErrorModeled::ValidationException)?;
+
+        let status = store
             .store_registration(&account_id, entry, ::std::time::Instant::now())
             .map_err(PutTaxRegistrationErrorModeled::ConflictException)?;
+        drop(store);
 
         Ok(PutTaxRegistrationOutput {
             status: Some(status),

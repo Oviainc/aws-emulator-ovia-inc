@@ -37,6 +37,8 @@ mod charge_amounts;
 mod error_bodies;
 #[path = "all/idempotency_token_conflicts.rs"]
 mod idempotency_token_conflicts;
+#[path = "all/inactive_agreement_refusals.rs"]
+mod inactive_agreement_refusals;
 #[path = "all/invoice_adjustments.rs"]
 mod invoice_adjustments;
 #[path = "all/payment_request_cancellation.rs"]

@@ -17,9 +17,9 @@
 //! replication-set-scoped resource is refused with the modelled `ValidationException`
 //! (HTTP 400) BEFORE the resource is looked up — so an un-onboarded account is never told
 //! instead that the resource it named does not exist. The gate is the service-wide one,
-//! [`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set_for`],
-//! the ARN-shaped phrasing the crate reserves for an operation whose whole subject is one
-//! resource ARN, so every data-plane operation applies the same precondition in the same
+//! [`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`],
+//! which reports the ACCOUNT whose registry entry is missing and names no part of the
+//! request, so every data-plane operation applies the same precondition in the same
 //! order and words it the same way as its peers.
 //!
 //! ## Shape of an operation
@@ -183,13 +183,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
 
         // The account gate comes FIRST: it is evaluated before `RotationId` is resolved, so
-        // a non-onboarded account is refused identically whether or not its rotation exists.
-        // This operation's whole subject is one resource ARN, so the refusal is the
-        // ARN-shaped one the crate reserves for that case (the same form
-        // `DescribeEngagement` answers for its `EngagementId`): with no replication set the
-        // account has no home region for the rotation, so the ARN resolves to nothing.
+        // a non-onboarded account is refused identically whether or not its rotation exists,
+        // and with the account-level refusal every gated operation of this service answers
+        // it with — what is missing is the account's own registry entry rather than anything
+        // the request named.
         state
-            .require_active_replication_set_for(&input.rotation_id)
+            .require_active_replication_set()
             .map_err(account_precondition_failed)?;
 
         let Some(rotation) = state.rotations.get(&input.rotation_id) else {

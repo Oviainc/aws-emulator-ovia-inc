@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddRegion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddRegion`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: enables the IAM Identity Center instance its `InstanceArn` names in ONE
+//! more Region, in the same records `DescribeInstance` and `ListInstances` report. This is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddRegion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The Region the request names is appended to the instance in the `ADDING` status and
+//! becomes `ACTIVE` when the clock makes its extension workflow due
+//! (`crate::state::REGION_ACTIVATION_SPAN`) — the sequence this operation documents: "This
+//! operation initiates an asynchronous workflow to replicate the IAM Identity Center
+//! instance to the target Region. The Region status is set to ADDING at first and changes
+//! to ACTIVE when the workflow completes." — so a caller that reads the instance straight
+//! after the add observes the `ADDING` the model's `RegionStatus` enum declares; nothing
+//! sleeps for it. A repeat of the add while that workflow is still in flight is
+//! idempotent: it answers `ADDING` again and cannot push the activation out.
+//!
+//! What the add cannot serve is refused rather than ignored:
+//!
+//! * an `InstanceArn` this account holds no instance for is the modelled
+//!   `AccessDeniedException` — the only not-found channel this operation's model declares
+//!   (it carries no `ResourceNotFoundException`), and the one `DescribeInstance` answers
+//!   for the same ARN;
+//! * a Region the instance is ALREADY enabled in, and a Region of it with another add or
+//!   remove Region workflow in progress, are the modelled `ConflictException`;
+//! * an add past the emulator's per-instance Region ceiling
+//!   (`crate::state::MAX_REGIONS_PER_INSTANCE`) is the modelled
+//!   `ServiceQuotaExceededException`.
 //!
 //! ## Shape of an operation
 //!
@@ -131,6 +147,31 @@ impl From<AddRegionErrorModeled> for AddRegionError {
     }
 }
 
+/// The modelled refusal for an `InstanceArn` this account holds no instance for.
+///
+/// This operation's model declares no `ResourceNotFoundException`, so a missing instance
+/// is reported on the channel it does declare — the `AccessDeniedException` (HTTP 403)
+/// `DescribeInstance`/`DeleteInstance` answer for the same ARN, under the same message, so
+/// one ARN that resolves to nothing reads the same whichever of them a client calls.
+/// `Reason` is left absent: every value the model's `AccessDeniedExceptionReason` enum
+/// carries reports a KMS key fault, and this refusal inspects no key.
+fn instance_not_found(instance_arn: &str) -> AddRegionError {
+    AddRegionErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: Some(crate::state::instance_not_found_message(instance_arn)),
+        reason: None,
+    })
+    .into()
+}
+
+/// The modelled refusal for an add that conflicts with the instance's current Regions —
+/// one it is already enabled in, or a Region extension or removal workflow in progress.
+fn conflict(message: impl Into<String>) -> AddRegionError {
+    AddRegionErrorModeled::ConflictException(ConflictException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
 /// The `AddRegion` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -167,18 +208,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddRegion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddRegionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddRegion"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AddRegionErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the SSO Admin state store is unavailable".to_string()),
+            })
+        })?;
+        // The Region this call was MADE in, which the request carries only on its SigV4
+        // credential scope. It is not a precondition of this operation — unlike
+        // `RemoveRegion`, `AddRegion` documents no Region the request must come from — but
+        // it is the Region an account that holds no instance yet gets its ambient one
+        // enabled in, so it is what `on_request` is given.
+        let called_from = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        // A WRITE, so it first materialises what the clock already owes: an instance whose
+        // deletion instant has passed is gone before this call looks for it, a Region whose
+        // removal workflow has run out is no longer one of the instance's, and one whose
+        // extension workflow has run out is already `ACTIVE`.
+        store.on_request(&called_from, now);
+
+        let instance = store
+            .instance_mut(&input.instance_arn)
+            .ok_or_else(|| instance_not_found(&input.instance_arn))?;
+
+        // A Region the instance already holds a record for is not one this add can
+        // replicate the instance to.
+        if let Some(region) = instance.region(&input.region_name) {
+            // Except when that record is this very add's own workflow, still in flight: a
+            // repeat answers the `ADDING` it answered the first time, and leaves the
+            // activation instant the first call fixed where it is.
+            if region.addition_in_flight(now) {
+                return Ok(AddRegionOutput {
+                    status: Some(region.status.clone()),
+                });
+            }
+            // A target carrying some OTHER workflow — a removal, or an enablement that
+            // rides on the instance's own activation — is refused as the workflow it is,
+            // by the scan below; it is not "already enabled".
+            if !region.workflow_in_progress() {
+                return Err(conflict(format!(
+                    "Instance {} is already enabled in Region {}",
+                    input.instance_arn, input.region_name
+                )));
+            }
+        }
+
+        // One Region workflow at a time on an instance: `RemoveRegion` states the rule for
+        // the pair — "no other add or remove Region workflows can be in progress" — and a
+        // Region of this instance still `ADDING` or `REMOVING` is such a workflow.
+        if let Some(busy) = instance
+            .regions
+            .iter()
+            .find(|region| region.workflow_in_progress())
+        {
+            return Err(conflict(format!(
+                "An add or remove Region workflow is already in progress on instance {}: \
+                 Region {} is {}",
+                input.instance_arn, busy.region_name, busy.status
+            )));
+        }
+
+        // The record enters `ADDING` and becomes `ACTIVE` when the clock makes its
+        // extension workflow due. The append is refused past the emulator's per-instance
+        // ceiling, which a caller sees as the modelled quota failure.
+        instance
+            .add_region(crate::state::Region::adding(&input.region_name, now))
+            .map_err(|message| {
+                AddRegionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(message),
+                    },
+                )
+            })?;
+        // Reported from the record this call just stored, which is what every later read
+        // of the instance answers from too.
+        Ok(AddRegionOutput {
+            status: instance
+                .region(&input.region_name)
+                .map(|region| region.status.clone()),
+        })
     }
 }

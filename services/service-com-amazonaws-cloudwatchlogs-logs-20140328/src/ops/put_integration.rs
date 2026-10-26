@@ -227,8 +227,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(invalid(message));
             }
             if !crate::state::is_kms_key_arn(kms_key_arn) {
-                return Err(invalid(format!(
-                    "kmsKeyArn must name a KMS key, got '{kms_key_arn}'"
+                return Err(invalid(crate::state::not_a_kms_key_message(
+                    "kmsKeyArn",
+                    kms_key_arn,
                 )));
             }
         }

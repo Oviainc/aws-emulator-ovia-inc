@@ -53,6 +53,8 @@ mod resource_tagging;
 // module name to match the file name, so the two names stay as they are.)
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/revision_conflict_message.rs"]
+mod revision_conflict_message;
 #[path = "all/service_error_rules.rs"]
 mod service_error_rules;
 #[path = "all/state_roundtrip.rs"]

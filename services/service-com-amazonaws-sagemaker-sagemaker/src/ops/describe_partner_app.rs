@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePartnerApp
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePartnerApp`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePartnerApp::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the partner app the `Arn` names from `crate::state`, after
+//! materialising the `Creating` -> `Available` transition the clock already owed, and
+//! refuses an ARN this account holds no app for with the modelled `ResourceNotFound`.
 //!
 //! ## Shape of an operation
 //!
@@ -197,18 +191,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePartnerApp` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePartnerAppErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePartnerApp"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(app) = store.partner_app_by_arn_mut(&input.arn) else {
+            // The app is this call's subject, so an ARN this account holds no app for is
+            // the modelled not-found.
+            return Err(DescribePartnerAppErrorModeled::ResourceNotFound(
+                ResourceNotFound {
+                    message: Some(crate::state::partner_app_does_not_exist(&input.arn)),
+                },
+            )
+            .into());
+        };
+        // The only write this reporting call makes: the `Creating` -> `Available` move the
+        // clock already owed. It was due at the app's stored instant whether or not anybody
+        // described it, so this read changes nothing a later caller sees.
+        let settled = app.settle_status(now);
+        let reported = app.clone();
+        drop(store);
+        if settled {
+            // The transition is a state change, so it leaves the same record a create does
+            // rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, &reported.arn, ctx);
+        }
+
+        Ok(DescribePartnerAppOutput {
+            arn: Some(reported.arn),
+            name: Some(reported.name),
+            r#type: Some(reported.app_type),
+            status: Some(reported.status),
+            creation_time: Some(crate::state::timestamp(reported.creation_time)),
+            last_modified_time: Some(crate::state::timestamp(reported.last_modified_time)),
+            base_url: Some(reported.base_url),
+            execution_role_arn: Some(reported.settings.execution_role_arn),
+            tier: Some(reported.settings.tier),
+            auth_type: Some(reported.settings.auth_type),
+            kms_key_id: reported.settings.kms_key_id,
+            maintenance_config: reported.settings.maintenance_config,
+            application_config: reported.settings.application_config,
+            enable_iam_session_based_identity: reported
+                .settings
+                .enable_iam_session_based_identity,
+            enable_auto_minor_version_upgrade: reported
+                .settings
+                .enable_auto_minor_version_upgrade,
+            // "the Identity Center instance and the Identity Center application that
+            // SageMaker creates for the app" (the member's model doc): the instance is the
+            // one the create named, and an app that federates through IAM named none at
+            // all. No Identity Center application is created here, so none is reported.
+            idc_config: reported.settings.idc_config.map(|config| IdcConfigOutput {
+                instance_arn: config.instance_arn,
+                application_arn: None,
+            }),
+            // "This is an error field object that contains the error code and the reason
+            // for an operation failure": nothing here fails an app, so no app carries one.
+            error: None,
+            // This emulator provisions no partner application image, so it holds no version
+            // of one to report, no end-of-life date for a version it does not hold, and no
+            // upgrade catalog — and "a null value indicates no upgrades are available"
+            // (`AvailableUpgrade`'s model doc), which is the truth for every app here,
+            // whatever `IncludeAvailableUpgrade` asks for.
+            version: None,
+            current_version_eol_date: None,
+            available_upgrade: None,
+        })
     }
 }

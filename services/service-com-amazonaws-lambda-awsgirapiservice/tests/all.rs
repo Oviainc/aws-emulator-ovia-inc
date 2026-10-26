@@ -71,6 +71,8 @@ mod function_scaling_config;
 mod function_url_config;
 #[path = "all/function_url_deletion.rs"]
 mod function_url_deletion;
+#[path = "all/function_url_listing.rs"]
+mod function_url_listing;
 #[path = "all/function_url_update.rs"]
 mod function_url_update;
 #[path = "all/function_version_listing.rs"]

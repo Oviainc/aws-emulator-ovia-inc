@@ -35,6 +35,8 @@ mod group_listing;
 mod human_readable_summaries;
 #[path = "all/identity_policy_enforcement.rs"]
 mod identity_policy_enforcement;
+#[path = "all/instance_profile_listing.rs"]
+mod instance_profile_listing;
 #[path = "all/instance_profile_role_binding.rs"]
 mod instance_profile_role_binding;
 #[path = "all/instance_profile_role_removal.rs"]
@@ -57,6 +59,8 @@ mod managed_policies;
 mod open_id_connect_client_ids;
 #[path = "all/open_id_connect_providers.rs"]
 mod open_id_connect_providers;
+#[path = "all/policies_granting_service_access.rs"]
+mod policies_granting_service_access;
 #[path = "all/policy_listing.rs"]
 mod policy_listing;
 #[path = "all/policy_simulation.rs"]
@@ -69,6 +73,8 @@ mod policy_tags;
 mod policy_version_listing;
 #[path = "all/principal_policy_context_keys.rs"]
 mod principal_policy_context_keys;
+#[path = "all/range_refusal_wording.rs"]
+mod range_refusal_wording;
 #[path = "all/role_attached_policies.rs"]
 mod role_attached_policies;
 #[path = "all/role_deletion.rs"]

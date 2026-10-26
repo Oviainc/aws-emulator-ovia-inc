@@ -55,6 +55,7 @@ fn url_requests(url: &str) -> Vec<(&'static str, Value)> {
                    "Entries": [{"Id": "one", "ReceiptHandle": "not-a-handle"}]}),
         ),
         ("DeleteQueue", json!({"QueueUrl": url})),
+        ("PurgeQueue", json!({"QueueUrl": url})),
         ("ListQueueTags", json!({"QueueUrl": url})),
         ("TagQueue", json!({"QueueUrl": url, "Tags": {"team": "platform"}})),
         ("UntagQueue", json!({"QueueUrl": url, "TagKeys": ["team"]})),

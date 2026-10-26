@@ -57,13 +57,15 @@ pub const ASSOCIATION_STATUS_ASSOCIATED: &str = "associated";
 pub const CLIENT_VPN_ENDPOINT_STATUS_PENDING_ASSOCIATE: &str = "pending-associate";
 
 /// Refuse a request that named a Client VPN endpoint id this account holds no endpoint for:
-/// HTTP 400 [`INVALID_CLIENT_VPN_ENDPOINT_ID_NOT_FOUND`], through the one writer of that
-/// refusal ([`id_not_found`]).
+/// HTTP 400 [`INVALID_CLIENT_VPN_ENDPOINT_ID_NOT_FOUND`], worded as the Client VPN surface
+/// words it — `Endpoint <id> does not exist`, naming the id the request sent. That is not
+/// the `The <kind> ID '<id>' does not exist` wording [`id_not_found`] writes for the
+/// resources whose refusal reads that way, so this one is built here rather than through it.
 pub fn invalid_client_vpn_endpoint_id_not_found<E>(id: &str) -> Scaffolded<E> {
-    id_not_found(
+    Scaffolded::service_error(
         INVALID_CLIENT_VPN_ENDPOINT_ID_NOT_FOUND,
-        "Client VPN endpoint ID",
-        id,
+        400,
+        format!("Endpoint {id} does not exist"),
     )
 }
 

@@ -158,21 +158,20 @@ async fn a_submission_naming_a_job_template_is_not_refused_for_those_members() {
     let template = text(created.ok(case), "/id", case);
 
     // A template carries the three values, so a request naming one is not subject to the
-    // rule. This emulator does not apply a template's `jobTemplateData` to a run yet, so
-    // such a submission is refused for THAT reason — never for members a template supplies.
+    // rule: the submission is accepted and the run is built from the template.
     let answer = emr
         .start_job(
             &cluster,
             json!({"clientToken": "tok-templated-run", "jobTemplateId": template}),
         )
         .await;
-    if answer.status != 200 {
-        let reported = text(&answer.body, "/message", case);
-        for member in REQUIRED {
-            assert!(
-                !reported.contains(&format!("missing: {member}")),
-                "case {case:?}: a template supplies {member}, so the refusal must not call it missing, got {reported:?}"
-            );
-        }
+    let run = text(answer.ok(case), "/id", case);
+    let described = emr.describe_job(&cluster, &run).await;
+    let job_run = field(described.ok(case), "/jobRun", case);
+    for member in REQUIRED {
+        assert!(
+            job_run.get(member).is_some(),
+            "case {case:?}: the template supplies {member}, so the run must carry it, got {job_run}"
+        );
     }
 }

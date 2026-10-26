@@ -14,9 +14,11 @@
 //! replication-set-scoped resource ARN is refused with the modelled `ValidationException`
 //! (HTTP 400) BEFORE that ARN is resolved — an un-onboarded account is never told instead
 //! that the resource it named does not exist. The gate is the service-wide one,
-//! [`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set_for`],
-//! the ARN-shaped phrasing the crate reserves for an operation whose whole subject is one
-//! resource ARN (the form `GetRotation` and `DescribeEngagement` answer with).
+//! [`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`],
+//! and it reports the ACCOUNT: the precondition is a fact about the account, decided before
+//! any member of the request is read, so the refusal names no part of the request. The
+//! wording built from a supplied ARN belongs to the separate ARN-RESOLUTION failure — an ARN
+//! that names no resource of this service — which only an onboarded account can reach.
 //!
 //! ## Shape of an operation
 //!
@@ -184,12 +186,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
 
         // The account gate comes FIRST: it is evaluated before `ContactId` is resolved, so
-        // a non-onboarded account is refused identically whether or not its contact exists.
-        // This operation's whole subject is one resource ARN, so the refusal is the
-        // ARN-shaped one the crate reserves for that case: with no replication set the
-        // account has no home region for the contact, so the ARN resolves to nothing.
+        // a non-onboarded account is refused identically whether or not its contact exists —
+        // and with the account-level refusal every gated operation of this service answers
+        // it with, since what is missing is the account's own registry entry rather than
+        // anything the request named.
         state
-            .require_active_replication_set_for(&input.contact_id)
+            .require_active_replication_set()
             .map_err(account_precondition_failed)?;
 
         let Some(contact) = state.contacts.get(&input.contact_id) else {

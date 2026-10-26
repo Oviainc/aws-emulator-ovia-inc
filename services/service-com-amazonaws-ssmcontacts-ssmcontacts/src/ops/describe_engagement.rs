@@ -10,11 +10,11 @@
 //!
 //! 1. The ACCOUNT-level Incident Manager precondition: while the account has no ACTIVE
 //!    replication set the call is refused with the modelled `ValidationException`
-//!    (HTTP 400), BEFORE the engagement is looked up. This operation's whole subject is one
-//!    resource ARN, and without a replication set the account has no home region to resolve
-//!    it in, so the refusal names THE ARN THE REQUEST SUPPLIED
-//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set_for`])
-//!    rather than the account.
+//!    (HTTP 400), BEFORE the engagement is looked up. The precondition is a fact about the
+//!    ACCOUNT — it has no entry in Incident Manager's registry — so the refusal reports the
+//!    account
+//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`])
+//!    rather than any member of the request.
 //! 2. The resource lookup: an `EngagementId` the store does not hold is the modelled
 //!    `ResourceNotFoundException` (HTTP 404).
 //!
@@ -198,10 +198,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The account gate comes FIRST, before `EngagementId` is resolved, so a
         // non-onboarded account is refused identically whether or not its engagement
-        // exists — and the refusal names the ARN the request supplied, which is what cannot
-        // be resolved without a replication set.
+        // exists — and about its own missing registry entry rather than about anything the
+        // request named.
         state
-            .require_active_replication_set_for(&input.engagement_id)
+            .require_active_replication_set()
             .map_err(account_precondition_failed)?;
 
         let Some(engagement) = state.engagements.get(&input.engagement_id) else {

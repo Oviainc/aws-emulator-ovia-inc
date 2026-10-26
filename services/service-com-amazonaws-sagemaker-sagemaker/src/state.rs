@@ -867,13 +867,14 @@ pub const TAGGED_RESOURCE_ENTITY: &str = "Resource";
 /// resources is refused with [`does_not_exist`], which is the refusal for an ARN this
 /// resolution holds no TAG SET for:
 ///
-/// * `hub_contents` and `partner_apps` — AWS does tag these, but the
+/// * `hub_contents` — AWS does tag these, but the
 ///   only writer that could carry a `Tags` list into the record is still a scaffold stub
 ///   here (`import_hub_content.rs` /
-///   `create_hub_content_reference.rs`, `create_partner_app.rs`), so the record carries
+///   `create_hub_content_reference.rs`), so the record carries
 ///   no `tags` field yet. (A test may seed one; the refusal is then approximate for that
 ///   seeded record.) Contrast `hubs`, whose `CreateHub` IS implemented and stores
-///   `Tags`, and which is therefore in the list.
+///   `Tags`, and which is therefore in the list — and `partner_apps`, whose
+///   `CreatePartnerApp` stores the `Tags` it carried and which is in the list too.
 /// * `lineage_groups` — materialised by [`ComAmazonawsSagemakerSagemakerState::ensure_lineage_group`]
 ///   rather than created by a request, and SageMaker models no `Tags` anywhere on a
 ///   lineage group.
@@ -956,6 +957,7 @@ tag_accessors!(
     models,
     notebook_instance_lifecycle_configs,
     notebook_instances,
+    partner_apps,
     pipelines,
     processing_jobs,
     training_jobs,
@@ -2673,6 +2675,15 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     /// Keyed by the partner app's `app-...` id. See [`PartnerApp`], at the end of this
     /// module with the rest of the partner-AI-app slice.
     pub partner_apps: BTreeMap<String, PartnerApp>,
+    /// The `PartnerAppType`s this account holds a partner-application subscription for.
+    /// See [`ComAmazonawsSagemakerSagemakerState::subscribed_to_partner_app`], which is
+    /// what `CreatePartnerApp` admits a type by. EMPTY for an account nothing has
+    /// subscribed for: subscribing is a purchase in AWS Marketplace, which no operation
+    /// SageMaker models performs, so nothing a client sends over the wire adds to this set
+    /// — an in-process caller (a test, or a future AWS Marketplace integration of this
+    /// emulator) is what grants one, exactly as an AWS account that has subscribed to
+    /// nothing cannot create a partner app at all.
+    pub partner_app_subscriptions: BTreeSet<String>,
     /// Keyed by `ImageName`. See [`Image`], at the end of this module with the rest of
     /// the custom-image slice.
     pub images: BTreeMap<String, Image>,
@@ -4875,12 +4886,93 @@ pub const PARTNER_APP_STATUS_AVAILABLE: &str = "Available";
 /// [`MAX_PAGE_SIZE`] still caps the page above it, as it does for every listing here.
 pub const PARTNER_APP_DEFAULT_PAGE_SIZE: i32 = 10;
 
-/// A SageMaker Partner AI App, as `ListPartnerApps` summarises it.
+/// See [`MODEL_QUOTA`]. Bounds the partner-app store, and is what `CreatePartnerApp`
+/// answers `ResourceLimitExceeded` past.
+pub const PARTNER_APP_QUOTA: usize = 1_000;
+
+/// How long after `CreatePartnerApp` the clock owes the `Creating` -> `Available`
+/// transition of `PartnerAppStatus`.
+///
+/// Same contract as [`ENDPOINT_IN_SERVICE_AFTER`]: a caller that lists or describes the
+/// app straight after creating it still observes `Creating` (and the state refusals that
+/// go with it), one that waits observes `Available`. Real SageMaker takes minutes to
+/// provision a partner application; the span is compressed, never zero, and the due
+/// instant is stored rather than slept on.
+pub const PARTNER_APP_AVAILABLE_AFTER: Duration = ENDPOINT_IN_SERVICE_AFTER;
+
+/// Where the partner app `app_id` is served in `region`: the host SageMaker gives one
+/// partner AI app, which `DescribePartnerApp` reports as `BaseUrl` and
+/// `CreatePartnerAppPresignedUrl` builds its URL on. The app's own id is what makes it
+/// unique, so the host carries it.
+pub fn partner_app_base_url(region: &str, app_id: &str) -> String {
+    format!("https://{app_id}.{region}.partner-app.sagemaker.aws")
+}
+
+/// A fresh partner-app id: `app-` and the twelve upper-case characters the modelled
+/// `PartnerAppArn` pattern admits after it (`partner-app\/app-[A-Z0-9]{12}`).
+///
+/// The caller never supplies it — a partner app is addressed by its ARN, so the id is the
+/// server's to generate, and it is derived from nothing in the request. Same scheme as
+/// every other id in this crate ([`mint_short_id`]), upper-cased to the alphabet this
+/// pattern admits.
+pub fn mint_partner_app_id() -> String {
+    format!("app-{}", mint_short_id().to_ascii_uppercase())
+}
+
+/// How the partner-app operations state an app this account holds none of, for the ARN
+/// the request sent — the only identifier a caller can name one by.
+///
+/// Stated once here so the reader (`DescribePartnerApp`) and the URL mint
+/// (`CreatePartnerAppPresignedUrl`) cannot word the same fact differently.
+pub fn partner_app_does_not_exist(arn: &str) -> String {
+    format!("Partner app {arn} does not exist.")
+}
+
+/// How `CreatePartnerApp` refuses a `Type` this account holds no partner-application
+/// subscription for: the type asked for, and what the caller has to do about it.
+///
+/// A partner AI app runs a third party's application, which is licensed to the account
+/// through AWS Marketplace rather than through this API — so a type the account has not
+/// subscribed to cannot be provisioned, and the refusal names the subscription that is
+/// missing. See [`ComAmazonawsSagemakerSagemakerState::subscribed_to_partner_app`].
+pub fn partner_app_not_subscribed(app_type: &str) -> String {
+    format!(
+        "This account does not have an active AWS Marketplace subscription for the \
+         SageMaker Partner AI App type {app_type}. Subscribe to the partner application \
+         in AWS Marketplace before creating the app."
+    )
+}
+
+/// The configuration one partner AI app carries: everything `CreatePartnerApp` is given
+/// about HOW the app runs, as opposed to the identity SageMaker mints for it.
+///
+/// Kept as one record so `DescribePartnerApp` reports exactly what the create stored, and
+/// so `UpdatePartnerApp` — which takes the same members again — replaces the
+/// configuration without touching the app's identity, status or grants.
+#[derive(Debug, Clone, Default)]
+pub struct PartnerAppSettings {
+    /// `ExecutionRoleArn` — the IAM role the partner application uses.
+    pub execution_role_arn: String,
+    /// `Tier` — the instance type and size of the cluster attached to the app.
+    pub tier: String,
+    /// `AuthType` — the authorization type users access the app with.
+    pub auth_type: String,
+    /// `KmsKeyId`, when the request named a customer managed key.
+    pub kms_key_id: Option<String>,
+    pub maintenance_config: Option<crate::ops::types::PartnerAppMaintenanceConfig>,
+    pub application_config: Option<crate::ops::types::PartnerAppConfig>,
+    /// `IdcConfig` — the Identity Center instance an `IDC` app federates with.
+    pub idc_config: Option<crate::ops::types::IdcConfigInput>,
+    pub enable_iam_session_based_identity: Option<bool>,
+    pub enable_auto_minor_version_upgrade: Option<bool>,
+}
+
+/// A SageMaker Partner AI App, as `ListPartnerApps` summarises it and
+/// `DescribePartnerApp` reports it.
 ///
 /// Keyed in state by [`PartnerApp::app_id`] (the ARN's `app-...` resource id), which AWS
-/// mints and every later call addresses the app by. `CreatePartnerApp` is still a
-/// scaffold stub, so nothing in this emulator fills the store yet; `ListPartnerApps`
-/// pages whatever it holds, and the creating, updating and deleting handlers extend
+/// mints and every later call addresses the app by. `CreatePartnerApp` fills the store and
+/// `ListPartnerApps` pages whatever it holds; the updating and deleting handlers extend
 /// [`ComAmazonawsSagemakerSagemakerState::partner_apps`] rather than adding a second map.
 ///
 /// `available_at` is the instant the clock owes the `Creating` -> `Available` transition;
@@ -4899,6 +4991,13 @@ pub struct PartnerApp {
     /// Where the app itself is served; the presigned URL
     /// `CreatePartnerAppPresignedUrl` answers is this plus the grant it minted.
     pub base_url: String,
+    /// How the app runs, as the create was given it. See [`PartnerAppSettings`].
+    pub settings: PartnerAppSettings,
+    /// The `ClientToken` the create that minted this app presented, if any, so a retried
+    /// create answers the app it already made instead of a second one.
+    pub client_token: Option<String>,
+    /// The `Tags` the create carried, which the tag operations read and write.
+    pub tags: Vec<Tag>,
     /// Every presigned-URL grant minted for this app that has not expired, oldest
     /// first. See [`PresignedUrlGrant`].
     pub grants: Vec<PresignedUrlGrant>,
@@ -6165,6 +6264,43 @@ impl ComAmazonawsSagemakerSagemakerState {
         self.partner_apps
             .values_mut()
             .find(|app| app.arn == value)
+    }
+
+    /// Whether this account holds a partner-application subscription for `app_type`, which
+    /// is what `CreatePartnerApp` admits a `Type` by.
+    ///
+    /// A partner AI app runs a third party's licensed application: the account subscribes
+    /// to it in AWS Marketplace, which is a purchase outside SageMaker's API surface — no
+    /// operation this service models adds to this set. So an account that has subscribed to
+    /// nothing holds none, and every type is refused ([`partner_app_not_subscribed`]) until
+    /// a subscription for it is held.
+    pub fn subscribed_to_partner_app(&self, app_type: &str) -> bool {
+        self.partner_app_subscriptions.contains(app_type)
+    }
+
+    /// Whether another partner app fits, i.e. the store is below [`PARTNER_APP_QUOTA`].
+    pub fn partner_apps_below_quota(&self) -> bool {
+        self.partner_apps.len() < PARTNER_APP_QUOTA
+    }
+
+    /// The partner app this account holds under `name`, the one identity a caller chooses
+    /// for an app (its id and ARN are SageMaker's to mint).
+    ///
+    /// ACCOUNT-WIDE rather than per Region, which is the scope
+    /// [`Self::partner_apps`] has: the store is keyed by the app id alone and
+    /// `ListPartnerApps` pages all of it, so a name is unique across everything a caller
+    /// of this emulator can see. Narrowing both to the Region of the app's ARN is one
+    /// change covering the listing as well, not a property of the create alone.
+    pub fn partner_app_named(&self, name: &str) -> Option<&PartnerApp> {
+        self.partner_apps.values().find(|app| app.name == name)
+    }
+
+    /// The partner app a create presenting `token` already minted, so the retry of that
+    /// create answers the app it made rather than a second one.
+    pub fn partner_app_for_client_token(&self, token: &str) -> Option<&PartnerApp> {
+        self.partner_apps
+            .values()
+            .find(|app| app.client_token.as_deref() == Some(token))
     }
 
     /// Whether another trial fits, i.e. the store is below [`TRIAL_QUOTA`].

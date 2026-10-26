@@ -1864,7 +1864,9 @@ async fn every_state_change_is_recorded() {
 
 /// Cancelling writes the agreement's new status, and every later report reads
 /// it: the describe, the search view summary, and a second cancel, which the
-/// agreement's own state now refuses.
+/// agreement's own state now refuses. The refusal class is spanned over every
+/// operation that needs an active agreement in
+/// `tests/all/inactive_agreement_refusals.rs`.
 #[tokio::test]
 async fn cancelling_persists_the_new_status() {
     let router = emulator();
@@ -1921,14 +1923,27 @@ async fn cancelling_persists_the_new_status() {
 
     let again = cancel(&router, &agreement_id).await;
     assert_eq!(
-        again.status, 409,
-        "cancelling an agreement that is not ACTIVE must conflict, got {} with {:?}",
+        again.status, 400,
+        "cancelling an agreement that is not ACTIVE is an input fault on the member that \
+         named it, got {} with {:?}",
         again.status, again.body
     );
     assert_eq!(
         again.error_code(),
-        "ConflictException",
-        "expected ConflictException, got {:?}",
+        "ValidationException",
+        "expected ValidationException, got {:?}",
+        again.body
+    );
+    assert_eq!(
+        again.reason(),
+        "INACTIVE_AGREEMENT",
+        "expected the INACTIVE_AGREEMENT reason, got {:?}",
+        again.body
+    );
+    assert_eq!(
+        again.str_at("/fields/0/name"),
+        "agreementId",
+        "the refusal must name the member at fault, got {:?}",
         again.body
     );
 }

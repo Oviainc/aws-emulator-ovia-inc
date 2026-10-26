@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     FirewallConfig, FirewallDomainList, FirewallDomainListMetadata, InvalidRequestException,
-    IpAddressResponse, IpAddressUpdate, LimitExceededException, OutpostResolver,
+    IpAddressResponse, IpAddressUpdate, LimitExceededException, OutpostResolver, ResolverConfig,
     ResolverDnssecConfig, ResolverEndpoint, ResolverRule, ResolverRuleAssociation,
     ResourceExistsException, ResourceInUseException, ResourceNotFoundException, Tag, TargetAddress,
     ValidationException,
@@ -1620,6 +1620,139 @@ impl ResolverDnssecConfigRecord {
     }
 }
 
+/// `AutodefinedReverseFlag` values, the model's whole enum
+/// (`smithy_query(query="shape",shape="AutodefinedReverseFlag")`, re-exported as
+/// [`crate::ops::types::AUTODEFINED_REVERSE_FLAG_VALUES`]): the setting a
+/// request asks a VPC's Resolver configuration to take for the autodefined
+/// rules for reverse DNS lookups.
+pub const AUTODEFINED_REVERSE_FLAG_ENABLE: &str = "ENABLE";
+pub const AUTODEFINED_REVERSE_FLAG_DISABLE: &str = "DISABLE";
+pub const AUTODEFINED_REVERSE_FLAG_USE_LOCAL_RESOURCE_SETTING: &str = "USE_LOCAL_RESOURCE_SETTING";
+
+/// `ResolverAutodefinedReverseStatus` values a VPC's Resolver configuration
+/// reports, the model's whole enum
+/// (`smithy_query(query="shape",shape="ResolverAutodefinedReverseStatus")`,
+/// re-exported as
+/// [`crate::ops::types::RESOLVER_AUTODEFINED_REVERSE_STATUS_VALUES`]).
+///
+/// `ResolverConfig$AutodefinedReverse`'s doc pairs each settled value with the
+/// transient one that precedes it: "ENABLING: Autodefined rules for reverse DNS
+/// lookups are being enabled but are not complete", "ENABLED: Autodefined rules
+/// for reverse DNS lookups are enabled", "DISABLING: Autodefined rules for
+/// reverse DNS lookups are being disabled but are not complete", "DISABLED:
+/// Autodefined rules for reverse DNS lookups are disabled".
+pub const AUTODEFINED_REVERSE_ENABLING: &str = "ENABLING";
+pub const AUTODEFINED_REVERSE_ENABLED: &str = "ENABLED";
+pub const AUTODEFINED_REVERSE_DISABLING: &str = "DISABLING";
+pub const AUTODEFINED_REVERSE_DISABLED: &str = "DISABLED";
+pub const AUTODEFINED_REVERSE_UPDATING_TO_USE_LOCAL_RESOURCE_SETTING: &str =
+    "UPDATING_TO_USE_LOCAL_RESOURCE_SETTING";
+pub const AUTODEFINED_REVERSE_USE_LOCAL_RESOURCE_SETTING: &str = "USE_LOCAL_RESOURCE_SETTING";
+
+/// `LimitExceededException$ResourceType` for a VPC's Resolver behavior
+/// configuration: the modelled shape name of the resource, as for
+/// [`RESOURCE_TYPE_RESOLVER_ENDPOINT`].
+pub const RESOURCE_TYPE_RESOLVER_CONFIG: &str = "ResolverConfig";
+
+/// The most VPC Resolver configurations this store holds records for, for the
+/// same reason as [`MAX_STORED_FIREWALL_CONFIGS`]: `UpdateResolverConfig`
+/// admits any `ResourceId`, so without a bound a caller looping updates over
+/// fresh VPC ids would grow one emulator process without limit. An update that
+/// would need a record past this count is refused and writes nothing; one for a
+/// VPC the store already holds a record for allocates nothing and stays
+/// allowed, and so does a read of any VPC, which stores nothing at all.
+pub const MAX_STORED_RESOLVER_CONFIGS: usize = 1_000;
+
+/// The pair of `ResolverAutodefinedReverseStatus` values one requested
+/// `AutodefinedReverseFlag` moves a VPC's Resolver configuration through: the
+/// transient status it reports while the change is in flight, and the settled
+/// status it reports once the clock owes the move.
+///
+/// `AutodefinedReverseFlag`'s doc — "It can take some time for the status change
+/// to be completed" — is why the transient status exists, and
+/// `ResolverConfig$AutodefinedReverse`'s doc is what pairs each settled value
+/// with it. `USE_LOCAL_RESOURCE_SETTING` takes the status enum's own
+/// `UPDATING_TO_USE_LOCAL_RESOURCE_SETTING` as its in-flight value. `None` for a
+/// value the model's `AutodefinedReverseFlag` enum does not declare: a handler
+/// refuses that rather than treating it as one of these.
+pub fn autodefined_reverse_transition(flag: &str) -> Option<(&'static str, &'static str)> {
+    match flag {
+        AUTODEFINED_REVERSE_FLAG_ENABLE => {
+            Some((AUTODEFINED_REVERSE_ENABLING, AUTODEFINED_REVERSE_ENABLED))
+        }
+        AUTODEFINED_REVERSE_FLAG_DISABLE => {
+            Some((AUTODEFINED_REVERSE_DISABLING, AUTODEFINED_REVERSE_DISABLED))
+        }
+        AUTODEFINED_REVERSE_FLAG_USE_LOCAL_RESOURCE_SETTING => Some((
+            AUTODEFINED_REVERSE_UPDATING_TO_USE_LOCAL_RESOURCE_SETTING,
+            AUTODEFINED_REVERSE_USE_LOCAL_RESOURCE_SETTING,
+        )),
+        _ => None,
+    }
+}
+
+/// The Resolver behavior configuration of ONE VPC, as stored.
+///
+/// A VPC's Resolver configuration is a singleton the service maintains itself —
+/// there is no operation that creates or deletes one — so a record exists only
+/// for a VPC whose configuration was moved off its default; every other VPC
+/// reports the default one
+/// [`ComAmazonawsRoute53resolverRoute53resolverState::resolver_config`]
+/// derives. `Id` and `OwnerId` are therefore the same whether the record exists
+/// or not, so a VPC's configuration does not change identity when it is
+/// updated — the same shape as [`FirewallConfigRecord`].
+#[derive(Debug, Clone)]
+pub struct ResolverConfigRecord {
+    /// Creation order, for the list operation's pages (the same role as
+    /// [`FirewallConfigRecord::seq`]).
+    ///
+    /// `0` on the default configuration
+    /// [`ComAmazonawsRoute53resolverRoute53resolverState::resolver_config`]
+    /// derives for a VPC the store holds no record for: the id sequence starts
+    /// at 1, so a stored record never carries it.
+    pub seq: u64,
+    /// The `Id` of this configuration, [`resolver_config_id`] of its VPC.
+    pub id: String,
+    /// `ResourceId`: "The ID of the Amazon Virtual Private Cloud VPC or a Route
+    /// 53 Profile that you're configuring Resolver for."
+    pub resource_id: String,
+    /// `OwnerId`: "The owner account ID of the Amazon Virtual Private Cloud
+    /// VPC."
+    pub owner_id: String,
+    /// The `AutodefinedReverse` status reported while the requested change is
+    /// in flight.
+    pub status: String,
+    /// The `AutodefinedReverse` status reported once the move the clock owes
+    /// falls due.
+    pub settled_status: String,
+    /// When that move falls due.
+    pub settled_at: Instant,
+}
+
+impl ResolverConfigRecord {
+    /// This configuration's `AutodefinedReverse` as of `now`: the transient
+    /// status until the move the clock owes falls due, the settled one after
+    /// it. Computed, so a read never has to write to settle one.
+    pub fn autodefined_reverse_at(&self, now: Instant) -> &str {
+        if now < self.settled_at {
+            &self.status
+        } else {
+            &self.settled_status
+        }
+    }
+
+    /// Project the record onto the modelled `ResolverConfig` shape the Resolver
+    /// configuration operations report.
+    pub fn to_resolver_config(&self, now: Instant) -> ResolverConfig {
+        ResolverConfig {
+            id: Some(self.id.clone()),
+            resource_id: Some(self.resource_id.clone()),
+            owner_id: Some(self.owner_id.clone()),
+            autodefined_reverse: Some(self.autodefined_reverse_at(now).to_string()),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-route53resolver-route53resolver. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsRoute53resolverRoute53resolverState {
@@ -1658,6 +1791,15 @@ pub struct ComAmazonawsRoute53resolverRoute53resolverState {
     /// a VPC has at most one, and that id is also what
     /// `GetResolverDnssecConfig` resolves.
     pub resolver_dnssec_configs: HashMap<String, ResolverDnssecConfigRecord>,
+    /// The Resolver behavior configuration of every VPC whose configuration was
+    /// moved off its default, keyed by that VPC's id
+    /// (`ResolverConfig$ResourceId`).
+    ///
+    /// A Resolver configuration is a per-VPC singleton the service maintains
+    /// itself, so this map is an override table and not an inventory: a VPC it
+    /// holds no entry for still HAS a configuration, the default one
+    /// [`Self::resolver_config`] derives.
+    pub resolver_configs: HashMap<String, ResolverConfigRecord>,
     /// The DNS Firewall configuration of every VPC whose configuration was
     /// moved off its default, keyed by that VPC's id (`FirewallConfig$ResourceId`).
     ///
@@ -1806,6 +1948,36 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
         self.firewall_configs.len() < MAX_STORED_FIREWALL_CONFIGS
     }
 
+    /// The Resolver behavior configuration of the VPC `resource_id`, which every
+    /// VPC has: the stored record when one was written for it, and otherwise the
+    /// default configuration that VPC reports — identical identity
+    /// ([`resolver_config_id`] of the VPC, owned by this account) with
+    /// `AutodefinedReverse` at its documented default, settled.
+    ///
+    /// A pure read: a VPC with no record is NOT given one here, so reporting a
+    /// configuration never changes what a later caller sees.
+    pub fn resolver_config(&self, resource_id: &str) -> ResolverConfigRecord {
+        self.resolver_configs
+            .get(resource_id)
+            .cloned()
+            .unwrap_or_else(|| ResolverConfigRecord {
+                seq: 0,
+                id: resolver_config_id(resource_id),
+                resource_id: resource_id.to_string(),
+                owner_id: ::engine::emulator_account_id().to_string(),
+                status: AUTODEFINED_REVERSE_ENABLED.to_string(),
+                settled_status: AUTODEFINED_REVERSE_ENABLED.to_string(),
+                settled_at: Instant::now(),
+            })
+    }
+
+    /// Whether one more VPC's Resolver configuration may be stored, i.e. the
+    /// store is still below [`MAX_STORED_RESOLVER_CONFIGS`]. Asked only for a
+    /// VPC [`Self::resolver_configs`] holds no record for yet.
+    pub fn can_store_another_resolver_config(&self) -> bool {
+        self.resolver_configs.len() < MAX_STORED_RESOLVER_CONFIGS
+    }
+
     /// Every stored firewall domain list in creation order — the order
     /// `ListFirewallDomainLists`' pages and its cursor are defined over, for the
     /// same reason as [`Self::endpoints_in_creation_order`]: a page is cut at an
@@ -1918,6 +2090,22 @@ pub fn firewall_config_id(resource_id: &str) -> String {
     hasher.update(b"route53resolver/firewall-config/v1");
     feed_field(&mut hasher, resource_id.as_bytes());
     format!("rslvr-fc-{}", hex::encode(&hasher.finalize()[..8]))
+}
+
+/// The `Id` of a VPC's Resolver behavior configuration. AWS names one
+/// `rslvr-rc-<hex>`; every result fits `ResourceId` (length 1..64).
+///
+/// Derived from the VPC id rather than taken from the id sequence, for the same
+/// reason as [`firewall_config_id`]: no operation creates a Resolver
+/// configuration, so one exists for a VPC whether or not anything has ever
+/// written to it, and its id has to be a function of the VPC it belongs to. The
+/// same VPC therefore reports the same `Id` from every call, before and after an
+/// update.
+pub fn resolver_config_id(resource_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"route53resolver/resolver-config/v1");
+    feed_field(&mut hasher, resource_id.as_bytes());
+    format!("rslvr-rc-{}", hex::encode(&hasher.finalize()[..8]))
 }
 
 /// The `HostVPCId` of an endpoint placed in `subnet_ids`.

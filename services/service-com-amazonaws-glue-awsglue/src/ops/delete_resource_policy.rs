@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Detaches the policy of ONE Glue resource: the attachment a `PutResourcePolicy` made
+//! for the resource this request addresses, or the Data Catalog's own when the request
+//! names no `ResourceArn`. A resource carrying no policy is a miss, so a second delete of
+//! the same policy is refused rather than reported as a delete. A `PolicyHashCondition`
+//! that is not the attached policy's hash is refused with the modelled condition failure
+//! and leaves the attachment in place.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +141,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResourcePolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteResourcePolicyErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // The resource whose policy is detached: the ARN the request named, else this
+        // account's Data Catalog — resolved exactly as the read and the write resolve it.
+        let region = crate::state::request_region(ctx.parts());
+        let resource_arn =
+            match crate::state::resolve_policy_resource_arn(input.resource_arn.as_ref(), &region) {
+                Ok(resource_arn) => resource_arn,
+                Err(message) => {
+                    return Err(DeleteResourcePolicyErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(message),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into());
+                }
+            };
+
+        let mut store = state.lock();
+        // The MISS comes first, before the condition: the delete addresses a policy, and a
+        // resource carrying none has no policy to delete and none to compare a hash
+        // against, which is the `EntityNotFoundException` a read of the same resource
+        // earns. The put is the other way round because it addresses the ATTACHMENT it is
+        // about to make: there a hash stated for a resource with no policy is a condition
+        // that cannot hold ("Policy not exists or policy hash mismatch"), not a missing
+        // entity. Neither precedence is recorded; each follows the operation's own subject.
+        let Some(attached_hash) = store
+            .resource_policy(&resource_arn)
+            .map(|attached| attached.policy_hash.clone())
+        else {
+            return Err(DeleteResourcePolicyErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::POLICY_NOT_FOUND.to_string()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // "The hash value returned when this policy was set": the delete proceeds only
+        // against the policy the caller last saw, so a hash that is not the attached
+        // policy's fails the condition and the attachment stays.
+        if let Some(hash_condition) = input.policy_hash_condition.as_deref() {
+            if attached_hash != hash_condition {
+                return Err(
+                    DeleteResourcePolicyErrorModeled::ConditionCheckFailureException(
+                        ConditionCheckFailureException {
+                            message: Some(
+                                crate::state::messages::POLICY_CONDITION_FAILED.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        store.remove_resource_policy(&resource_arn);
+        ::tracing::info!(
+            operation = "DeleteResourcePolicy",
+            resource_arn = %resource_arn,
+            "detached a resource policy"
+        );
+
+        Ok(DeleteResourcePolicyOutput {})
     }
 }

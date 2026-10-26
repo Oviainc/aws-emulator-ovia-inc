@@ -73,6 +73,8 @@ mod instance_delete;
 mod instance_describe;
 #[path = "all/instance_encryption_default.rs"]
 mod instance_encryption_default;
+#[path = "all/instance_region_addition.rs"]
+mod instance_region_addition;
 #[path = "all/instance_region_removal.rs"]
 mod instance_region_removal;
 #[path = "all/instance_region_status.rs"]

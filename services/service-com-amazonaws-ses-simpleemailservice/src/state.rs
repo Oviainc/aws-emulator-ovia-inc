@@ -2,21 +2,28 @@
 
 //! Engine state for the com-amazonaws-ses-simpleemailservice service.
 //!
-//! One store per emulator: the identity list SES keys every send against, the
-//! send log the sending quota is derived from, the account's sending limits, and
-//! the configuration sets a send may name.
+//! One store per emulator: the identity list SES keys every send against (with
+//! the sending-authorization policies each identity carries), the send log the
+//! sending quota is derived from, the account's sending limits, and the
+//! configuration sets a send may name.
 //!
 //! Nothing here is a counter that a reader bumps: `SentLast24Hours` is COMPUTED
 //! from the send log (see [`ComAmazonawsSesSimpleemailserviceState::sent_last_24_hours`]),
 //! so it falls again as messages age out of the window instead of drifting.
 //!
-//! Both caller-driven stores are BOUNDED, because every request reaching this
+//! Every caller-driven store is BOUNDED, because every request reaching this
 //! emulator can grow one of them: the identity list at [`MAX_IDENTITIES`]
-//! entries, and the send log at the account's own 24-hour quota, with the
-//! window's expiry applied on append
-//! ([`ComAmazonawsSesSimpleemailserviceState::log_sent_message`]) and
+//! entries, each identity's sending-authorization policies at
+//! [`MAX_IDENTITY_POLICIES`] documents of [`MAX_POLICY_BYTES`], and the send log
+//! at the account's own 24-hour quota, with the window's expiry applied on
+//! append ([`ComAmazonawsSesSimpleemailserviceState::log_sent_message`]) and
 //! [`MAX_SENT_LOG_ENTRIES`] as the backstop. The text one log entry keeps is
-//! capped at [`MAX_LOGGED_TEXT`].
+//! capped at [`MAX_LOGGED_TEXT`]. The template store is bounded the same way, at
+//! [`MAX_TEMPLATES`].
+//!
+//! A listing this store serves a page at a time hands the caller an OPAQUE,
+//! self-verifying cursor ([`encode_page_token`]), so a token this service never
+//! issued is refused instead of being read as some arbitrary position.
 
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -55,6 +62,31 @@ pub const MAX_IDENTITIES: usize = 10_000;
 /// append, so this is the backstop that still bounds the store if the stored
 /// quota is raised later.
 pub const MAX_SENT_LOG_ENTRIES: usize = 1_000;
+
+/// The email templates one account may hold, and so the ceiling on the template
+/// store: SES documents a limit of 10,000 email templates per account, and a
+/// creation past it is refused rather than letting caller input grow this store
+/// without end.
+pub const MAX_TEMPLATES: usize = 10_000;
+
+/// The bytes one sending-authorization policy document may carry.
+///
+/// `PutIdentityPolicyRequest$Policy` states the ceiling: "The text of the policy
+/// in JSON format. The policy cannot exceed 4 KB." The model carries only the
+/// member's lower bound (`length 1..`), so the documented ceiling is the
+/// handler's to enforce — and it is also what bounds one entry of the policy
+/// store.
+pub const MAX_POLICY_BYTES: usize = 4 * 1024;
+
+/// The sending-authorization policies ONE identity may hold at once, and so the
+/// ceiling on an identity's policy map.
+///
+/// `GetIdentityPoliciesRequest$PolicyNames` is documented as "a list of the names
+/// of policies to be retrieved. You can retrieve a maximum of 20 policies at a
+/// time", so 20 policies is the whole set a caller can read back in one call —
+/// the documented size of an identity's policy collection. A put past it is
+/// refused rather than letting caller input grow this store without end.
+pub const MAX_IDENTITY_POLICIES: usize = 20;
 
 /// The characters of a message's subject and body the log keeps.
 ///
@@ -140,6 +172,20 @@ pub struct Identity {
     pub verification_token: Option<String>,
     /// The Easy DKIM tokens, set by `VerifyDomainDkim` (still a stub, so empty).
     pub dkim_tokens: Vec<String>,
+    /// The sending-authorization policies attached to this identity, keyed by
+    /// policy name.
+    ///
+    /// Held ON the identity record, because a policy exists only for an identity
+    /// the account owns: nothing can attach one to an identity that is not in
+    /// the list, and removing the identity removes its policies with it. A
+    /// `BTreeMap` so `ListIdentityPolicies` answers in one stable
+    /// (lexicographic) order, and bounded at [`MAX_IDENTITY_POLICIES`] entries
+    /// of [`MAX_POLICY_BYTES`] each.
+    ///
+    /// The document is kept VERBATIM as the caller submitted it, so
+    /// `GetIdentityPolicies` reports back the text that was stored rather than a
+    /// re-rendering of it.
+    pub policies: BTreeMap<String, String>,
     /// When the identity was added to the list.
     pub verified_at: SystemTime,
 }
@@ -188,6 +234,26 @@ impl Default for AccountSettings {
     }
 }
 
+/// One email template in the account's template store.
+///
+/// The members are the model's own `Template` shape: a name, and the subject,
+/// text and HTML parts a send renders. `created_at` is the instant the template
+/// was recorded, which `ListTemplates` reports as
+/// `TemplateMetadata$CreatedTimestamp`.
+#[derive(Debug, Clone)]
+pub struct EmailTemplate {
+    /// The template's name, which is its key in the store.
+    pub name: String,
+    /// `Template$SubjectPart` — "The subject line of the email."
+    pub subject_part: Option<String>,
+    /// `Template$TextPart` — the body shown to clients that display no HTML.
+    pub text_part: Option<String>,
+    /// `Template$HtmlPart` — "The HTML body of the email."
+    pub html_part: Option<String>,
+    /// When the template was recorded.
+    pub created_at: SystemTime,
+}
+
 /// A configuration set a send may name.
 #[derive(Debug, Clone, Default)]
 pub struct ConfigurationSet {
@@ -213,6 +279,10 @@ pub struct ComAmazonawsSesSimpleemailserviceState {
     pub account: AccountSettings,
     /// The configuration sets, keyed by name.
     pub configuration_sets: BTreeMap<String, ConfigurationSet>,
+    /// The email templates, keyed by name. A `BTreeMap` so every listing is in
+    /// one stable (lexicographic) order, which is what makes `ListTemplates`'
+    /// pagination resumable. Bounded at [`MAX_TEMPLATES`].
+    pub templates: BTreeMap<String, EmailTemplate>,
     /// How many opaque ids this store has minted, which is what makes the next
     /// one UNIQUE rather than merely unlikely to repeat: every id digests this
     /// counter, and the counter is never reused. Written only by
@@ -266,9 +336,26 @@ impl ComAmazonawsSesSimpleemailserviceState {
                     verification_status: VerificationStatus::Success,
                     verification_token,
                     dkim_tokens: Vec::new(),
+                    policies: BTreeMap::new(),
                     verified_at: SystemTime::now(),
                 }),
         )
+    }
+
+    /// Record `template` under its own name, replacing any template already
+    /// stored under that name, and hand back the stored record.
+    ///
+    /// `None` when the store already holds [`MAX_TEMPLATES`] templates and this
+    /// is a new one: the caller refuses the request rather than growing the store
+    /// past the account's limit. Replacing a template already in the store always
+    /// succeeds, since it adds nothing.
+    pub fn put_template(&mut self, template: EmailTemplate) -> Option<&EmailTemplate> {
+        let name = template.name.clone();
+        if !self.templates.contains_key(&name) && self.templates.len() >= MAX_TEMPLATES {
+            return None;
+        }
+        self.templates.insert(name.clone(), template);
+        self.templates.get(&name)
     }
 
     /// Append an accepted message to the send log, bounding it as it grows.
@@ -312,6 +399,29 @@ impl ComAmazonawsSesSimpleemailserviceState {
             return false;
         };
         domain_suffixes(domain).any(|suffix| self.is_verified(suffix))
+    }
+
+    /// The sending-authorization policies attached to `identity`, or `None` when
+    /// this account holds no such identity.
+    ///
+    /// `None` is what the policy operations refuse on: they are "for the identity
+    /// owner only", so an identity this account has not verified is not an
+    /// identity with no policies.
+    pub fn identity_policies(&self, identity: &str) -> Option<&BTreeMap<String, String>> {
+        self.identities
+            .get(identity_key(identity))
+            .map(|stored| &stored.policies)
+    }
+
+    /// [`Self::identity_policies`] for a writer: the same map, keyed the same
+    /// way, so a policy is put on and read back from one record.
+    pub fn identity_policies_mut(
+        &mut self,
+        identity: &str,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        self.identities
+            .get_mut(identity_key(identity))
+            .map(|stored| &mut stored.policies)
     }
 
     /// Whether `name` is in the identity list with a successful verification.
@@ -402,6 +512,58 @@ impl ComAmazonawsSesSimpleemailserviceState {
     }
 }
 
+/// The listing name stamped into a `ListTemplates` page token, so a cursor cut
+/// from the template list cannot resume another listing of this service.
+pub const LISTING_TEMPLATES: &str = "ListTemplates";
+
+/// The bytes every page token of this service digests before the listing and the
+/// key, so a token of this service is not a token of any other.
+const PAGE_TOKEN_DOMAIN: &[u8] = b"com.amazonaws.ses#page-token\0";
+
+/// The leading bytes of the digest a page token carries as its integrity tag.
+/// Eight bytes is enough that a value the caller made up does not carry a
+/// matching tag, while keeping the token short.
+const PAGE_TOKEN_TAG_LEN: usize = 8;
+
+/// The integrity tag of `key` for `listing`: the leading [`PAGE_TOKEN_TAG_LEN`]
+/// bytes of SHA-256 over this service's domain separator, the listing, and the
+/// key. Hashed with the `sha2` crate rather than a hand-written digest.
+fn page_token_tag(listing: &str, key: &str) -> Vec<u8> {
+    let mut digest = Sha256::new();
+    digest.update(PAGE_TOKEN_DOMAIN);
+    digest.update(listing.as_bytes());
+    digest.update(b"\0");
+    digest.update(key.as_bytes());
+    digest.finalize()[..PAGE_TOKEN_TAG_LEN].to_vec()
+}
+
+/// A page token naming the `key` the NEXT page of `listing` starts at: the
+/// integrity tag followed by the key, hex-encoded.
+///
+/// Opaque — a caller cannot read a position out of it and hands it back verbatim
+/// — and self-verifying, so a token this listing never issued is refused by
+/// [`decode_page_token`] instead of being read as an arbitrary position in it.
+pub fn encode_page_token(listing: &str, key: &str) -> String {
+    let mut bytes = page_token_tag(listing, key);
+    bytes.extend_from_slice(key.as_bytes());
+    ::hex::encode(bytes)
+}
+
+/// The key a token of `listing` resumes at, or `None` when `token` is not one
+/// this service issued for that listing: not hex, too short to carry a tag, not
+/// UTF-8, carrying no key, or carrying a tag that does not match the listing and
+/// position it claims. The caller refuses such a token rather than restarting
+/// the listing at some other position.
+pub fn decode_page_token(listing: &str, token: &str) -> Option<String> {
+    let bytes = ::hex::decode(token).ok()?;
+    if bytes.len() <= PAGE_TOKEN_TAG_LEN {
+        return None;
+    }
+    let (tag, key) = bytes.split_at(PAGE_TOKEN_TAG_LEN);
+    let key = String::from_utf8(key.to_vec()).ok()?;
+    (page_token_tag(listing, &key) == tag).then_some(key)
+}
+
 /// The addr-spec of a `Source`/recipient value, which may arrive either bare
 /// (`user@example.com`) or with a display name (`"Me" <user@example.com>`).
 ///
@@ -414,6 +576,38 @@ pub fn addr_spec(value: &str) -> &str {
         _ => trimmed,
     }
 }
+
+/// The key an identity is stored under, for a caller value that may name the
+/// identity either way the policy operations document.
+///
+/// Their `Identity` member states both forms: "You can specify an identity by
+/// using its name or by using its Amazon Resource Name (ARN). Examples:
+/// user@example.com, example.com,
+/// arn:aws:ses:us-east-1:123456789012:identity/example.com." So an ARN of this
+/// service naming an `identity` resource is read down to the identity it names,
+/// and anything else is the identity itself; either way the value is keyed by
+/// its addr-spec, the way the writers key it ([`addr_spec`]).
+///
+/// The ARN is read through the ONE caller-supplied-ARN parse
+/// (`service_common::arn`) rather than by splitting the value here, so this
+/// service cannot disagree with another about what an ARN is.
+pub fn identity_key(value: &str) -> &str {
+    let trimmed = value.trim();
+    if let Some(named) = ::service_common::arn::is_resource_arn_of(trimmed, SES_ARN_VENDOR)
+        .then(|| ::service_common::arn::resource_id_of_type(trimmed, IDENTITY_RESOURCE_TYPE))
+        .flatten()
+    {
+        return addr_spec(named);
+    }
+    addr_spec(trimmed)
+}
+
+/// The vendor field of this service's own ARNs, which is its signing name.
+const SES_ARN_VENDOR: &str = "ses";
+
+/// The resource type an SES identity ARN addresses
+/// (`arn:aws:ses:<region>:<account>:identity/<name>`).
+const IDENTITY_RESOURCE_TYPE: &str = "identity";
 
 /// The domain itself and every parent domain of it, longest first
 /// (`mail.corp.example.com` -> `mail.corp.example.com`, `corp.example.com`,

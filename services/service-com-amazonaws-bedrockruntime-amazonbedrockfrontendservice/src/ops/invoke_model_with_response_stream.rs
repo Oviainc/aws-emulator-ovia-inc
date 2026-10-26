@@ -196,15 +196,18 @@ impl<Eng: Send + Sync + 'static> InvokeModelWithResponseStream<Eng> {
         let turn = crate::state::invoke_turn(&model, family, body);
         let first_byte_latency_ms = crate::state::latency_ms(started.elapsed());
 
-        state
-            .lock()
-            .log_invocation(crate::state::InvocationLogEntry {
-                model_id: model.model_id.clone(),
-                kind: crate::state::InvokeKind::SyncStream,
-                input_tokens: turn.input_tokens,
-                output_tokens: turn.output_tokens,
-                at_millis: crate::state::now_millis(),
-            });
+        let logged = crate::state::InvocationLogEntry {
+            model_id: model.model_id.clone(),
+            kind: crate::state::InvokeKind::SyncStream,
+            input_tokens: turn.input_tokens,
+            output_tokens: turn.output_tokens,
+            at_millis: crate::state::now_millis(),
+        };
+        state.lock().log_invocation(logged.clone());
+        // The token volume this call reports in the family's own metrics event is
+        // also its contribution to the `AWS/Bedrock` series dimensioned on the
+        // invoked model, published with no state guard of this service held.
+        crate::state::invocation_metrics::publish_token_usage(&*self.engine, &logged);
 
         // One `chunk` event per streaming event of the model's own protocol, in
         // the order the family emits them.

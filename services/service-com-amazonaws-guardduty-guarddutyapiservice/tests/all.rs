@@ -35,6 +35,8 @@ mod custom_detection_rule_org_configuration_listing;
 mod custom_detection_rule_org_configuration_update;
 #[path = "all/custom_detection_rules.rs"]
 mod custom_detection_rules;
+#[path = "all/detector_configuration_timestamp.rs"]
+mod detector_configuration_timestamp;
 #[path = "all/detector_data_sources_projection.rs"]
 mod detector_data_sources_projection;
 #[path = "all/detector_lifecycle.rs"]

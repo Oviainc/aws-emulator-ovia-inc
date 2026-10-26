@@ -37,6 +37,12 @@
 //! carrying that same token hands the identical messages and receipt handles back
 //! instead of a second, different batch.
 //!
+//! `PurgeQueue` empties that plane through [`Queue::purge`]: the messages, the receipt
+//! handles naming them, the remembered receive attempts that named them and the
+//! deduplication tokens that would suppress a resend all go, and the instant of the
+//! purge is remembered, so a further purge inside [`PURGE_QUEUE_INTERVAL`] of it is
+//! refused ([`Queue::purge_in_progress`]).
+//!
 //! # Message movement tasks
 //!
 //! `StartMessageMoveTask` takes the messages a dead-letter queue can hand out and puts
@@ -167,6 +173,14 @@ pub const RECEIVE_REQUEST_ATTEMPT_INTERVAL: Duration = Duration::from_secs(300);
 /// you can create another with the same name." — which is the model's documentation of
 /// that error shape with its second "queue" dropped, as the recorded refusal words it.
 pub const QUEUE_DELETED_RECENTLY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long an accepted `PurgeQueue` keeps the next one on the same queue refused:
+/// "the specified queue previously received a PurgeQueue request within the last 60
+/// seconds (the time it can take to delete the messages in the queue)"
+/// (`PurgeQueueInProgress`), while "the message deletion process takes up to 60 seconds"
+/// (`PurgeQueue`). The interval is part of the fixed text of that refusal too, through
+/// [`purge_queue_in_progress_message`].
+pub const PURGE_QUEUE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The longest `MessageGroupId` / `MessageDeduplicationId` a message may carry: "The
 /// length of MessageGroupId is 128 characters" and "The maximum length of
@@ -788,6 +802,10 @@ pub struct Queue {
     /// When an attribute of this queue last changed; equals `created_at` until a
     /// `SetQueueAttributes` changes something.
     pub last_modified_at: SystemTime,
+    /// When this queue last had a `PurgeQueue` accepted, if it ever has: a further
+    /// purge inside [`PURGE_QUEUE_INTERVAL`] of that instant is what
+    /// `PurgeQueueInProgress` reports.
+    pub purged_at: Option<SystemTime>,
 }
 
 impl Queue {
@@ -1075,6 +1093,35 @@ impl Queue {
     pub fn record_receipt_handle(&mut self, receipt_handle: String, message_id: &str) {
         self.handles.retain(|_, id| id != message_id);
         self.handles.insert(receipt_handle, message_id.to_string());
+    }
+
+    /// Discard everything this queue holds, and remember that it was purged at `at`.
+    ///
+    /// `PurgeQueue` "deletes available messages in a queue (including in-flight
+    /// messages)", so no message survives whatever its visibility, and every receipt
+    /// handle an earlier receive minted names a message that is gone — as does every
+    /// batch a `ReceiveRequestAttemptId` remembers, so neither can be replayed against
+    /// messages the purge discarded. The deduplication tokens go with them: a token's
+    /// only effect is suppressing a resend of a message this queue holds, and "you
+    /// can't retrieve any messages deleted from a queue", so a resend after a purge is a
+    /// message the queue never accepted and is delivered rather than suppressed.
+    ///
+    /// The queue's configuration — its attributes, its tags and the sequence counter
+    /// whose numbers "continue to increase" — is untouched: a purge empties a queue, it
+    /// does not re-create it.
+    pub fn purge(&mut self, at: SystemTime) {
+        self.messages.clear();
+        self.handles.clear();
+        self.receive_attempts.clear();
+        self.deduplication.clear();
+        self.purged_at = Some(at);
+    }
+
+    /// Whether a `PurgeQueue` on this queue is refused at `now` because the purge it
+    /// accepted inside [`PURGE_QUEUE_INTERVAL`] is still deleting.
+    pub fn purge_in_progress(&self, now: SystemTime) -> bool {
+        self.purged_at
+            .is_some_and(|at| !lapsed(at, PURGE_QUEUE_INTERVAL, now))
     }
 
     /// Drop a message and every receipt handle that referred to it.
@@ -1846,6 +1893,17 @@ pub fn queue_does_not_exist() -> QueueDoesNotExist {
     QueueDoesNotExist {
         message: Some(QUEUE_DOES_NOT_EXIST_MESSAGE.to_string()),
     }
+}
+
+/// What Amazon SQS answers a `PurgeQueue` on the queue called `name` with while the one
+/// before it is still deleting: the interval is part of the sentence, so the caller is
+/// told how long the deletion can take, and the queue the request named is the only
+/// value filled in.
+pub fn purge_queue_in_progress_message(name: &str) -> String {
+    format!(
+        "Only one PurgeQueue operation on {name} is allowed every {} seconds.",
+        PURGE_QUEUE_INTERVAL.as_secs(),
+    )
 }
 
 /// The modelled refusal for a receipt handle this queue did not mint, or whose message

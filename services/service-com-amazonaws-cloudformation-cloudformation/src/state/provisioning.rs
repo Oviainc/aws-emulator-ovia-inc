@@ -308,9 +308,15 @@ impl StackProvenance {
 /// service's own refusal ([`Self::reason`]) — neither of which the STACK's own events can
 /// say, since they describe the operation as a whole.
 ///
+/// WHEN each of those happened is not recorded here. The calls below run in-process, one
+/// after another, so the wall clock while they return says nothing about the walk: the
+/// instant a resource was scheduled and the instant it finished follow from the dependency
+/// graph and from the signals a wait condition waited for, which is
+/// [`super::timeline`]'s to compute.
+///
 /// Collected here rather than written straight to the store because the calls that make a
 /// resource exist run with the store UNLOCKED: the operation that drove them records them
-/// on the stack ([`super::StoredStack::record_resource_events`]) when it takes the lock
+/// on the stack ([`super::StoredStack::schedule_resource_events`]) when it takes the lock
 /// again.
 #[derive(Debug, Clone)]
 pub struct ResourceTransition {
@@ -332,9 +338,6 @@ pub struct ResourceTransition {
     /// resource" — the properties document the template declares for it, which is what the
     /// deployment asked the owning service for.
     pub resource_properties: Option<String>,
-    /// When the transition happened, which is the event's `Timestamp` ("Time the status was
-    /// updated").
-    pub at: SystemTime,
 }
 
 impl ResourceTransition {
@@ -349,7 +352,6 @@ impl ResourceTransition {
             status: status.to_string(),
             reason: None,
             resource_properties: resource.properties_blob(),
-            at: SystemTime::now(),
         }
     }
 
@@ -388,7 +390,6 @@ impl ResourceTransition {
             status: status.to_string(),
             reason,
             resource_properties: resource.properties_blob(),
-            at: SystemTime::now(),
         }
     }
 

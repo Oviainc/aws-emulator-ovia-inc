@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProfileNotifications
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProfileNotifications`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProfileNotifications::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports one notification per association of a profile with a workload
+//! whose pinned `ProfileVersion` is not the version that profile is now at — the
+//! `PROFILE_ANSWERS_UPDATED` notification `UpgradeProfileVersion` clears — narrowed to one
+//! workload by `WorkloadId` and paged by `MaxResults` / `NextToken`. A reporting
+//! operation: it writes nothing. The operation models no `ResourceNotFoundException`, so a
+//! `WorkloadId` no stored workload answers to selects nothing and gets an empty page,
+//! while a `NextToken` this service did not issue is `ValidationException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +146,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProfileNotifications` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProfileNotificationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListProfileNotificationsErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool profile store is unavailable".to_string(),
+            })
+        })?;
+
+        // `MaxResults` is modelled `@range(min: 1, max: 50)`; a request that omits it asks
+        // for a full page, so the modelled maximum is the default.
+        let page_size = crate::state::page_size(input.max_results);
+
+        // An opaque token this service did not issue is a bad request, not an empty page.
+        // Classified `CANNOT_PARSE` like every other cursor in this service: a caller
+        // cannot correct a token it did not compose, only start the pagination again — and
+        // the finding still names the member whose value could not be decoded.
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_profile_notification_next_token(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(ListProfileNotificationsErrorModeled::ValidationException(
+                        crate::state::cannot_parse_exception(
+                            crate::state::NEXT_TOKEN_MEMBER,
+                            crate::state::INVALID_NEXT_TOKEN_MESSAGE,
+                        ),
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let store = state.lock();
+
+        // The workloads the request asks about: the one `WorkloadId` names, resolved
+        // through the key [`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::workloads`]
+        // is keyed by, or every workload of the account when the request names none. The
+        // operation models no `ResourceNotFoundException`, so a `WorkloadId` that resolves
+        // nothing selects nothing and the answer is an empty page rather than a refusal.
+        let selected: Vec<&crate::state::WorkloadRecord> = match input.workload_id.as_deref() {
+            Some(workload_id) => store.workloads.get(workload_id).into_iter().collect(),
+            None => store.workloads.values().collect(),
+        };
+
+        // A profile notification is OUTSTANDING work on one association of one profile with
+        // one workload: `ProfileNotificationSummary` reports the version that association
+        // is pinned at beside the version the profile itself is at (`CurrentProfileVersion`
+        // / `LatestProfileVersion`), so an association whose two versions AGREE is reviewed
+        // against the profile as it stands and has nothing to report. A profile's version
+        // is the service's own counter over its revisions and only ever moves forward, so a
+        // pinned version differing from the profile's is one the profile has moved past —
+        // `PROFILE_ANSWERS_UPDATED` — and `UpgradeProfileVersion` is what clears it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProfileNotifications"))
+        // Each notification is carried beside the pair that NAMES its association, which is
+        // what the enumeration is ordered and the pages are cut on.
+        let mut outstanding: Vec<((&str, &str), ProfileNotificationSummary)> = selected
+            .into_iter()
+            .flat_map(|workload| {
+                workload.profiles.iter().filter_map(|associated| {
+                    let profile = store.profiles.get(&associated.profile_arn)?;
+                    (profile.profile_version != associated.profile_version).then(|| {
+                        (
+                            (workload.workload_id.as_str(), profile.profile_arn.as_str()),
+                            ProfileNotificationSummary {
+                                current_profile_version: Some(associated.profile_version.clone()),
+                                latest_profile_version: Some(profile.profile_version.clone()),
+                                r#type: Some(
+                                    crate::state::PROFILE_NOTIFICATION_ANSWERS_UPDATED.to_string(),
+                                ),
+                                profile_arn: Some(profile.profile_arn.clone()),
+                                profile_name: Some(profile.profile_name.clone()),
+                                workload_id: Some(workload.workload_id.clone()),
+                                workload_name: Some(workload.workload_name.clone()),
+                            },
+                        )
+                    })
+                })
+            })
+            .collect();
+
+        // The model publishes no order for `ProfileNotificationSummaries`, so this is the
+        // emulator's own: the pair that names the association, whose two halves are each
+        // fixed for the life of the resource they name — where `WorkloadName` is a member
+        // `UpdateWorkload` can move and `ProfileName` one `UpdateProfile` can — so the
+        // order is total and stable across requests.
+        outstanding.sort_by_key(|(key, _)| *key);
+
+        // The cursor is start-EXCLUSIVE: the page resumes just past the association already
+        // served, so every notification is enumerated at most once across the pages.
+        let resume_after = cursor
+            .as_ref()
+            .map(|(workload_id, profile_arn)| (workload_id.as_str(), profile_arn.as_str()));
+        let matching: Vec<((&str, &str), ProfileNotificationSummary)> = outstanding
+            .into_iter()
+            .filter(|(key, _)| resume_after.is_none_or(|served| *key > served))
+            .collect();
+
+        let page_length = matching.len().min(page_size);
+        // A cursor is issued only when the selection did NOT fit in this page, so the last
+        // page omits `NextToken` and a caller following it terminates.
+        let next_token = match matching[..page_length].last() {
+            Some(((workload_id, profile_arn), _)) if matching.len() > page_length => Some(
+                crate::state::encode_profile_notification_next_token(workload_id, profile_arn),
+            ),
+            _ => None,
+        };
+
+        Ok(ListProfileNotificationsOutput {
+            notification_summaries: Some(
+                matching
+                    .into_iter()
+                    .take(page_length)
+                    .map(|(_, summary)| summary)
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

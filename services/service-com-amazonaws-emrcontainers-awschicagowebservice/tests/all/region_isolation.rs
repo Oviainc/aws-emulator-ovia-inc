@@ -625,9 +625,8 @@ async fn one_client_token_mints_one_resource_in_each_region() {
 ///
 /// The rows are the two references this service's creates carry:
 /// `CreateVirtualCluster$securityConfigurationId` and `StartJobRun$jobTemplateId`. A job
-/// template that DOES resolve is refused with `ValidationException` instead, because
-/// applying a template to a run is not implemented in this slice — a different refusal
-/// from "there is no such template here", which is what the row asserts.
+/// template that DOES resolve starts the run it describes, which is what makes the
+/// refusal of the other region's template about the region and not about the reference.
 #[tokio::test]
 async fn a_reference_to_another_regions_resource_is_not_found() {
     for (home, other) in REGION_PAIRS {
@@ -650,7 +649,7 @@ async fn a_reference_to_another_regions_resource_is_not_found() {
         create_cluster(&emr, home, own).await.ok(&label);
 
         // `jobTemplateId`: the template of the other region does not exist at this
-        // endpoint; this region's own one does, and is refused for another reason.
+        // endpoint; this region's own one does, and supplies the run's values.
         let label = format!("jobTemplateId of {other} used in {home}");
         let mut foreign = job_body("job-foreign-template");
         foreign["jobTemplateId"] = json!(there.template);
@@ -673,7 +672,7 @@ async fn a_reference_to_another_regions_resource_is_not_found() {
             Some(own),
         )
         .await
-        .refused(&label, 400, "ValidationException");
+        .ok(&label);
     }
 }
 
