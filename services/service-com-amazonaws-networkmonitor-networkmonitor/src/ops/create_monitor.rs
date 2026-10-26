@@ -18,6 +18,11 @@
 //! materialises the transitions the clock has already made due
 //! ([`crate::state::ComAmazonawsNetworkmonitorNetworkmonitorState::settle_monitor`]).
 //!
+//! The tags the request assigns — the monitor's `tags` and each probe's
+//! `probeTags` — are a caller's own, so a key in the namespace AWS reserves for
+//! its tags ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) is refused with the
+//! modelled 400 `ValidationException` and creates nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -233,6 +238,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(validation)?;
         let monitor_tags: ::std::collections::BTreeMap<String, String> =
             input.tags.unwrap_or_default().into_iter().collect();
+        // AWS owns the tag keys of its own namespace, so a request naming one
+        // creates nothing — the same rule `TagResource` applies, over every tag
+        // map this request carries: the monitor's own and each probe's.
+        crate::state::check_tag_keys(
+            &crate::state::member_path("tags"),
+            monitor_tags.keys().map(String::as_str),
+        )
+        .map_err(validation)?;
         // Each requested probe carries its OWN tags (`probeTags`); the
         // request-level `tags` are the monitor's.
         let specs: Vec<crate::state::ProbeSpec> = input
@@ -248,6 +261,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 tags: probe.probe_tags.unwrap_or_default().into_iter().collect(),
             })
             .collect();
+        // The same rule over each probe's own tag map, named where the caller
+        // sent it (`probes.1.member.probeTags`).
+        for (position, spec) in specs.iter().enumerate() {
+            crate::state::check_tag_keys(
+                &crate::state::probe_member_path(
+                    &crate::state::element_path("probes", position + 1),
+                    "probeTags",
+                ),
+                spec.tags.keys().map(String::as_str),
+            )
+            .map_err(validation)?;
+        }
 
         let mut store = state.lock();
         store.prune_client_tokens(now);

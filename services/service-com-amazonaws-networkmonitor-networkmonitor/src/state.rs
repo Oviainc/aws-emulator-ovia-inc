@@ -253,6 +253,20 @@ pub const CLIENT_TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// the bound, since `TagResource` models no quota error.
 pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 
+/// The tag-key prefix AWS keeps for the tags it applies itself.
+///
+/// AWS's tagging rules reserve this namespace across every service: a tag whose
+/// key carries it belongs to AWS, and a caller can neither create one nor change
+/// or remove one. The comparison is case-insensitive, because the rule is stated
+/// over the prefix in any mixture of cases.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// What a tag key a CALLER names has to satisfy, as a refusal's clause states
+/// the requirement: it is outside the namespace AWS reserves for its own tags
+/// ([`RESERVED_TAG_KEY_PREFIX`]). The model types a tag key as a plain length-
+/// bounded string, so the reservation is the service's to apply.
+const TAG_KEY_REQUIREMENT: &str = "Member must not begin with the reserved prefix aws:";
+
 /// The AWS service namespace a probe's `sourceArn` must name.
 ///
 /// The model documents `ProbeInput$sourceArn` as "The ARN of the subnet", and a
@@ -497,6 +511,18 @@ pub fn element_path(member: &str, position: usize) -> String {
     path::join(&[path::member(member), path::element(position)])
 }
 
+/// The dotted path of ONE ENTRY of the map member sitting at `map_path` — the
+/// map's own path followed by the entry's key, which is how the framework's walk
+/// names a map entry whose value is what failed (`tags.team`).
+///
+/// `map_path` is a PATH rather than a member name, so a map nested inside a
+/// request (`probes.1.member.probeTags`) is named exactly where the caller sent
+/// it. The key is a value the caller chose, so it is echoed as sent and never
+/// re-cased the way a model name is.
+pub fn entry_path(map_path: &str, key: &str) -> String {
+    path::join(&[map_path.to_string(), key.to_string()])
+}
+
 /// AWS's constraint-violation message for ONE rule this service's own code
 /// applies, rendered by the framework's own clause builder.
 ///
@@ -574,6 +600,52 @@ pub fn unknown_page_token_refusal(member: &str, operation: &str, submitted: &str
         Some(submitted),
         &format!("Member must be a {member} returned by a previous {operation} call"),
     )
+}
+
+/// Whether `key` names a tag AWS owns: one whose key carries
+/// [`RESERVED_TAG_KEY_PREFIX`], in any mixture of cases.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.to_ascii_lowercase().starts_with(RESERVED_TAG_KEY_PREFIX)
+}
+
+/// Refuse ONE tag key a caller may not name, wherever the request carried it.
+///
+/// `key_path` is the dotted path the key sat at in the REQUEST — an entry of a
+/// tag map ([`entry_path`]) or an element of a key list ([`element_path`]) — so
+/// a refusal names the member the caller sent. `Err` carries the clause for
+/// [`TAG_KEY_REQUIREMENT`], built like every other refusal this service authors.
+pub fn check_tag_key(key_path: &str, key: &str) -> Result<(), String> {
+    if is_reserved_tag_key(key) {
+        return Err(stated_requirement(
+            key_path,
+            Some(key),
+            TAG_KEY_REQUIREMENT,
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a tag MAP that names a key a caller may not name, for every operation
+/// that assigns tags (`CreateMonitor`'s `tags` and each probe's `probeTags`,
+/// `CreateProbe`'s `tags` and `probe.tags`, `TagResource`'s `tags`).
+///
+/// `map_path` is where that map sat in the request. The keys are judged in key
+/// ORDER, not in the order a hash map happens to yield them, so one request is
+/// always refused for the same key.
+pub fn check_tag_keys<'a>(
+    map_path: &str,
+    keys: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    let mut reserved: Vec<&str> = keys.into_iter().filter(|key| is_reserved_tag_key(key)).collect();
+    reserved.sort_unstable();
+    match reserved.first() {
+        Some(key) => Err(stated_requirement(
+            &entry_path(map_path, key),
+            Some(key),
+            TAG_KEY_REQUIREMENT,
+        )),
+        None => Ok(()),
+    }
 }
 
 /// What the service states when an `aggregationPeriod` is outside the documented
@@ -737,7 +809,7 @@ pub fn check_probes_per_subnet<'a>(
 /// The dotted path of one member of the probe sitting at `probe_path`, which is
 /// empty for an operation that binds a probe's members at the top level of its
 /// own input (`UpdateProbe`).
-fn probe_member_path(probe_path: &str, member: &str) -> String {
+pub fn probe_member_path(probe_path: &str, member: &str) -> String {
     if probe_path.is_empty() {
         return member_path(member);
     }

@@ -9,6 +9,11 @@
 //! ([`crate::state::check_probes_per_subnet`]), so a request past that bound is
 //! refused and mints nothing.
 //!
+//! The tags the request assigns the probe (`tags` and `probe.tags`) are a
+//! caller's own, so a key in the namespace AWS reserves for its tags
+//! ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) is refused with the modelled 400
+//! `ValidationException` and mints nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -229,9 +234,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both `tags` and `probe.tags` are documented as the pairs assigned to
         // the probe, so the probe gets their union; the one nested in `probe`
         // is the more specific, so it wins a key both name.
-        let mut tags: ::std::collections::BTreeMap<String, String> =
+        //
+        // AWS owns the tag keys of its own namespace, so a request naming one
+        // mints nothing. Each half is judged where the caller sent it, before
+        // the union hides which one carried the key.
+        let requested_tags: ::std::collections::BTreeMap<String, String> =
             input.tags.unwrap_or_default().into_iter().collect();
-        tags.extend(input.probe.tags.unwrap_or_default());
+        crate::state::check_tag_keys(
+            &crate::state::member_path("tags"),
+            requested_tags.keys().map(String::as_str),
+        )
+        .map_err(validation)?;
+        let probe_tags: ::std::collections::BTreeMap<String, String> =
+            input.probe.tags.unwrap_or_default().into_iter().collect();
+        crate::state::check_tag_keys(
+            &crate::state::probe_member_path(&crate::state::member_path("probe"), "tags"),
+            probe_tags.keys().map(String::as_str),
+        )
+        .map_err(validation)?;
+        let mut tags = requested_tags;
+        tags.extend(probe_tags);
         let spec = crate::state::ProbeSpec {
             source_arn: input.probe.source_arn,
             destination: input.probe.destination,

@@ -31,6 +31,8 @@ mod probe_teardown;
 mod probes_per_subnet_limit;
 #[path = "all/region_isolation.rs"]
 mod region_isolation;
+#[path = "all/reserved_tag_keys.rs"]
+mod reserved_tag_keys;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

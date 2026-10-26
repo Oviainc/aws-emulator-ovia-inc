@@ -16,6 +16,11 @@
 //! no-content status ([`crate::state::TAG_MUTATION_SUCCESS_STATUS`]) rather than
 //! the model's defaulted 200.
 //!
+//! The same reservation `TagResource` applies holds here: a key in AWS's own
+//! namespace ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) is not a caller's to
+//! remove, so a request naming one is refused with the modelled 400
+//! `ValidationException` ([`crate::state::check_tag_key`]) and removes nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -114,6 +119,14 @@ impl From<UntagResourceErrorModeled> for UntagResourceError {
     }
 }
 
+/// This service's `ValidationException` (HTTP 400), carrying `message`.
+fn validation(message: String) -> UntagResourceError {
+    UntagResourceErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The `UntagResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -159,6 +172,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // runs, so reaching here means the input satisfies each of them. An
         // EMPTY `tagKeys` is inside the modelled `@length(min: 0)`, so it is a
         // request that removes nothing rather than a bad request.
+        //
+        // Which keys a caller may name is a property of the REQUEST alone, so it
+        // is judged before anything is resolved or written: the keys AWS
+        // reserves for its own tags are not a caller's to remove, whatever ARN
+        // the request carried. The clause names the element the caller sent, so
+        // the FIRST reserved key in request order is the one stated.
+        for (position, key) in input.tag_keys.iter().enumerate() {
+            crate::state::check_tag_key(
+                &crate::state::element_path("tagKeys", position + 1),
+                key,
+            )
+            .map_err(validation)?;
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UntagResourceErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the networkmonitor monitor store is unavailable".to_string()),

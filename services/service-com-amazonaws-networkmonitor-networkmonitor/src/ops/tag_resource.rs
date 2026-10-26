@@ -10,6 +10,12 @@
 //! an ARN no stored resource answers to is
 //! refused with the modelled 404 `ResourceNotFoundException`.
 //!
+//! A key AWS reserves for its own tags
+//! ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) is not a key a caller may assign,
+//! so a request naming one is refused with the modelled 400
+//! `ValidationException` ([`crate::state::check_tag_keys`]) and stores none of
+//! the pairs it carried.
+//!
 //! The write reports nothing back, so a success is answered with the no-content
 //! status ([`crate::state::TAG_MUTATION_SUCCESS_STATUS`]) rather than the
 //! model's defaulted 200.
@@ -173,6 +179,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `resourceArn`'s length bound and `^arn:.*$` pattern, and every tag
         // key's and value's own length bounds, are refused by the framework
         // BEFORE this handler runs.
+        //
+        // Which keys a caller may name is a property of the REQUEST alone, so it
+        // is judged before anything is resolved or written: a request naming a
+        // key of AWS's own namespace assigns nothing, whatever ARN it carried.
+        crate::state::check_tag_keys(
+            &crate::state::member_path("tags"),
+            input.tags.keys().map(String::as_str),
+        )
+        .map_err(validation)?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             TagResourceErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the networkmonitor monitor store is unavailable".to_string()),
