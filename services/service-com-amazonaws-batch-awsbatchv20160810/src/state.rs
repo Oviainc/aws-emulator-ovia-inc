@@ -545,6 +545,32 @@ pub const MIN_LIST_CONSUMABLE_RESOURCES_RESULTS: i32 = 1;
 /// returns up to 100 results and a `nextToken` value if applicable."
 pub const MAX_LIST_CONSUMABLE_RESOURCES_RESULTS: i32 = 100;
 
+/// The fewest results `ListJobsByConsumableResource$maxResults` accepts, from the member's
+/// doc: "This value can be between 1 and 100." The model types it as a plain `Integer`, so
+/// the bound is applied in the handler.
+pub const MIN_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS: i32 = 1;
+/// The most results `ListJobsByConsumableResource$maxResults` accepts; see
+/// [`MIN_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS`]. Also the page size of a request that
+/// names none, from the same doc: "If this parameter isn't used, then
+/// `ListJobsByConsumableResource` returns up to 100 results and a `nextToken` value if
+/// applicable."
+pub const MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS: i32 = 100;
+
+/// The most `ListJobsByConsumableResource$filters` entries this emulator applies to one
+/// request, and the most values any one of them may carry.
+///
+/// EMULATOR-CHOSEN ceilings, not AWS quotas (the model constrains the list's length
+/// nowhere and the member's doc states no limit): every entry costs one selection pass
+/// over the jobs selected so far, and every value in it costs one comparison per job, so
+/// these two are what bound the work — entries x values x stored jobs — one request can
+/// ask this handler for. The operation documents two filter names, so a request past
+/// either ceiling is answering nothing a caller could mean; it is refused with the
+/// modelled `ClientException` before any pass runs, rather than silently trimmed, which
+/// would answer a narrowing the caller did not get.
+pub const MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_FILTERS: usize = 10;
+/// See [`MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_FILTERS`].
+pub const MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_FILTER_VALUES: usize = 100;
+
 /// The fewest results `ListQuotaShares$maxResults` accepts, from the member's doc: "This
 /// value can be between 1 and 100." The model types it as a plain `Integer`, so the bound
 /// is applied in the handler.

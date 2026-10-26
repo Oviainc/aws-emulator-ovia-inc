@@ -41,6 +41,8 @@ mod job_queue_updates;
 mod job_rests_in_runnable;
 #[path = "all/job_state_change_events.rs"]
 mod job_state_change_events;
+#[path = "all/jobs_by_consumable_resource.rs"]
+mod jobs_by_consumable_resource;
 #[path = "all/quota_share_listing.rs"]
 mod quota_share_listing;
 #[path = "all/quota_share_updates.rs"]

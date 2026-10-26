@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListJobsByConsumableResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListJobsByConsumableResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListJobsByConsumableResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the jobs that REQUIRE one consumable resource: the jobs whose stored
+//! `consumableResourceProperties` name the resource the request names (by name or by
+//! ARN), each summary read from the persisted job and from the requirement that selected
+//! it. A listing is a REPORTING call — it selects, orders and pages what is stored and
+//! changes nothing a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -96,6 +93,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The filter name that selects by `JobStatus`, from the `filters` member's own doc: "The
+/// filter names and values can be: name: JOB_STATUS values: SUBMITTED | PENDING |
+/// RUNNABLE | STARTING | RUNNING | SUCCEEDED | FAILED".
+const FILTER_JOB_STATUS: &str = "JOB_STATUS";
+
+/// The filter name that selects by job name, from the same doc: "name: JOB_NAME The values
+/// are case-insensitive matches for the job name. If a filter value ends with an asterisk
+/// (*), it matches any job name that begins with the string before the '*'."
+const FILTER_JOB_NAME: &str = "JOB_NAME";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -127,6 +134,43 @@ impl From<ListJobsByConsumableResourceErrorModeled> for ListJobsByConsumableReso
     fn from(modeled: ListJobsByConsumableResourceErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// How much of the consumable resource stored under `name` the job `job` requires, or
+/// `None` for a job that requires none of it (and so is not listed at all).
+///
+/// A requirement names its resource the way every `consumableResource` member documents
+/// it — "The name or ARN of the consumable resource" — so each reference is put through
+/// this service's own resolver (`consumable_resource_name`) and compared by the NAME it
+/// resolves to, which is what makes the two forms select the same jobs. A job that names
+/// one resource in several requirements requires their sum.
+fn required_quantity(
+    state: &crate::state::ComAmazonawsBatchAwsbatchv20160810State,
+    job: &crate::state::Job,
+    name: &str,
+) -> Option<i64> {
+    let mut required: Option<i64> = None;
+    let requirements = job
+        .consumable_resource_properties
+        .as_ref()
+        .and_then(|properties| properties.consumable_resource_list.as_deref())
+        .unwrap_or_default();
+    for requirement in requirements {
+        let Some(reference) = requirement.consumable_resource.as_deref() else {
+            continue;
+        };
+        if state.consumable_resource_name(reference).as_deref() != Some(name) {
+            continue;
+        }
+        // `ConsumableResourceRequirement$quantity`: "The quantity of the consumable
+        // resource that is needed." A requirement that names none needs nothing of it.
+        required = Some(
+            required
+                .unwrap_or(0)
+                .saturating_add(requirement.quantity.unwrap_or_default()),
+        );
+    }
+    required
 }
 
 /// The `ListJobsByConsumableResource` operation.
@@ -165,18 +209,188 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListJobsByConsumableResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListJobsByConsumableResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListJobsByConsumableResource"))
+        use crate::state as batch;
+
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(ListJobsByConsumableResourceErrorModeled::ServerException(
+                batch::unreachable_state(),
+            )
+            .into());
+        };
+
+        // `maxResults`: "This value can be between 1 and 100." A plain `Integer` in the
+        // model, so the published bound is applied here.
+        if let Some(requested) = input.max_results.filter(|requested| {
+            !(batch::MIN_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS
+                ..=batch::MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS)
+                .contains(requested)
+        }) {
+            return Err(ListJobsByConsumableResourceErrorModeled::ClientException(
+                batch::client_exception(format!(
+                    "maxResults {requested} must be between {} and {}",
+                    batch::MIN_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS,
+                    batch::MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS
+                )),
+            )
+            .into());
+        }
+
+        // Every `filters` dimension a caller fills is bounded BEFORE anything is selected:
+        // each entry costs one selection pass over the jobs selected so far, and each of
+        // its values one comparison per job, so the entry count and the per-entry value
+        // count are what cap the work one request can ask of this handler
+        // (`batch::MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_FILTERS`). Past either ceiling the
+        // request is refused with the modelled `ClientException` rather than trimmed,
+        // which would answer a narrowing the caller did not ask for.
+        let filters = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > batch::MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_FILTERS {
+            return Err(ListJobsByConsumableResourceErrorModeled::ClientException(
+                batch::client_exception(format!(
+                    "filters names {} filters; at most {} can be used in one request.",
+                    filters.len(),
+                    batch::MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_FILTERS
+                )),
+            )
+            .into());
+        }
+        if let Some(oversized) = filters.iter().find(|filter| {
+            filter.values.as_ref().is_some_and(|values| {
+                values.len() > batch::MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_FILTER_VALUES
+            })
+        }) {
+            return Err(ListJobsByConsumableResourceErrorModeled::ClientException(
+                batch::client_exception(format!(
+                    "filter {} names {} values; at most {} can be used in one filter.",
+                    oversized.name.as_deref().unwrap_or_default(),
+                    oversized.values.as_ref().map_or(0, Vec::len),
+                    batch::MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_FILTER_VALUES
+                )),
+            )
+            .into());
+        }
+
+        let region = batch::request_region(ctx);
+        let now = batch::now_millis();
+        // The store's lock lives in THIS block and no longer, so nothing holds it while
+        // the transitions it materialised are published below (that call reaches another
+        // service in-process).
+        let mut jobs: Vec<(batch::Job, i64)> = {
+            let mut state = state.lock();
+            // A read: this only materialises what the clock already owed at `now`, so a
+            // later caller sees exactly what this caller saw.
+            state.materialize_due(now);
+
+            // The resource this operation lists the jobs OF. The result set is defined
+            // against it, so a reference this service holds no resource for is the
+            // resolver's own refusal — the one every operation taking a required
+            // `consumableResource` answers — and not an empty page.
+            let Some(resource) = state.consumable_resource(&input.consumable_resource) else {
+                return Err(ListJobsByConsumableResourceErrorModeled::ClientException(
+                    batch::does_not_exist_exception(&batch::resolved_arn(
+                        &input.consumable_resource,
+                        |name| batch::consumable_resource_arn(&region, name),
+                    )),
+                )
+                .into());
+            };
+            let name = resource.name.clone();
+            let selected: Vec<(batch::Job, i64)> = state
+                .jobs
+                .values()
+                .filter_map(|job| {
+                    required_quantity(&state, job, &name).map(|quantity| (job.clone(), quantity))
+                })
+                .collect();
+            selected
+        };
+        batch::publish_job_state_changes(ctx, &*self.engine, &region).await;
+
+        // "If used, only those jobs requiring the specified consumable resource
+        // (consumableResource) and that match the value of the filters are listed": each
+        // entry narrows the listing further, and a job matches an entry when any of that
+        // entry's values matches it.
+        for filter in input.filters.unwrap_or_default() {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let values = filter.values.clone().unwrap_or_default();
+            match name {
+                FILTER_JOB_STATUS => {
+                    jobs.retain(|(job, _)| values.contains(&job.status));
+                }
+                FILTER_JOB_NAME => {
+                    jobs.retain(|(job, _)| {
+                        values
+                            .iter()
+                            .any(|value| batch::matches_name_filter(&job.job_name, value))
+                    });
+                }
+                other => {
+                    return Err(ListJobsByConsumableResourceErrorModeled::ClientException(
+                        batch::client_exception(format!("Unknown filter name {other}")),
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // The most recently created job first, the way this service's other job listings
+        // report; the id breaks a tie, so two jobs created in the same millisecond still
+        // page in one stable order.
+        jobs.sort_by(|(left, _), (right, _)| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then(left.job_id.cmp(&right.job_id))
+        });
+
+        // "If this parameter isn't used, then ListJobsByConsumableResource returns up to
+        // 100 results and a nextToken value if applicable": the page is bounded even when
+        // the request names no size.
+        let page_size = input
+            .max_results
+            .unwrap_or(batch::MAX_LIST_JOBS_BY_CONSUMABLE_RESOURCE_RESULTS);
+        let (page, next_token) =
+            batch::paginate(jobs, Some(page_size), input.next_token.as_deref()).map_err(
+                |message| {
+                    ListJobsByConsumableResourceError::from(
+                        ListJobsByConsumableResourceErrorModeled::ClientException(
+                            batch::client_exception(message),
+                        ),
+                    )
+                },
+            )?;
+
+        let jobs = page
+            .into_iter()
+            .map(|(job, quantity)| ListJobsByConsumableResourceSummary {
+                job_arn: job.job_arn,
+                job_queue_arn: job.job_queue_arn,
+                job_name: job.job_name,
+                job_definition_arn: Some(job.job_definition_arn),
+                share_identifier: job.share_identifier,
+                job_status: job.status,
+                // `quantity` and `createdAt` are the only two members of this summary whose
+                // doc sentence is the CONSUMABLE RESOURCE's own ("the total amount of the
+                // consumable resource that is available", "when the consumable resource was
+                // created"), while the shape itself is per (job, resource) pair: "Current
+                // information about a consumable resource required by a job". So each is
+                // reported about the pairing the row is: how much of the listed resource
+                // THIS job requires, and when THIS job was created. A resource's own totals
+                // are what `DescribeConsumableResource` and `ListConsumableResources`
+                // report, identically for every job, and a row repeating them would say
+                // nothing about the job it is a row for.
+                quantity,
+                status_reason: job.status_reason,
+                // `startedAt`: "when the job transitioned from the STARTING state to the
+                // RUNNING state". Nothing here places a job on compute capacity, so a job
+                // that never started reports none rather than an invented instant.
+                started_at: job.started_at,
+                created_at: job.created_at,
+                consumable_resource_properties: job
+                    .consumable_resource_properties
+                    .unwrap_or_default(),
+            })
+            .collect();
+
+        Ok(ListJobsByConsumableResourceOutput { jobs, next_token })
     }
 }
