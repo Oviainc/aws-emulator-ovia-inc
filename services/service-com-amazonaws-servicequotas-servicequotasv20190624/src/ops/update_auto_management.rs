@@ -15,8 +15,15 @@
 //! account that never started it, or that has stopped it, is refused with
 //! `NoSuchResourceException`.
 //!
-//! An `ExclusionList` is stored as given — each service's codes in the order the
-//! caller named them — the way `StartAutoManagement` stores it.
+//! An exclusion names the quota it excludes by `(ServiceCode, QuotaCode)`, so an
+//! `ExclusionList` this call names is RESOLVED against this service's catalog before
+//! anything is written — a key naming no service, or a code that service publishes no
+//! quota under, names a resource that does not exist and is refused with the modelled
+//! `NoSuchResourceException`, leaving the running configuration exactly as it was. It
+//! is the rule `StartAutoManagement` applies to the same member, and what resolves is
+//! stored in the order the caller named it. The configuration this call changes is
+//! looked up FIRST, so an account with nothing running is told that rather than being
+//! told about the names in a call it has no configuration to apply.
 //!
 //! Only SOME of the modes the `OptInType` enum declares are available yet: the
 //! member's own documentation (below) names the available subset, so an update naming
@@ -146,6 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut quotas_state = state.lock();
+
         // Only a RUNNING configuration can be updated: `None` is an account that never
         // opted in, and a `DISABLED` record is one that opted out again.
         let running = quotas_state
@@ -167,14 +175,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // The configuration this call changes exists, so now the names the call
+        // carries are resolved — the whole exclusion list before any of it is written,
+        // so a refused update changes nothing at all.
+        let names_exclusions = input.exclusion_list.is_some();
+        let exclusion_list = quotas_state
+            .resolved_exclusion_list(input.exclusion_list)
+            .map_err(|refusal| {
+                UpdateAutoManagementErrorModeled::NoSuchResourceException(NoSuchResourceException {
+                    message: Some(refusal.message()),
+                })
+            })?;
+
         if let Some(opt_in_type) = input.opt_in_type {
             config.opt_in_type = opt_in_type;
         }
         if let Some(notification_arn) = input.notification_arn {
             config.notification_arn = Some(notification_arn);
         }
-        if input.exclusion_list.is_some() {
-            config.exclusion_list = crate::state::stored_exclusion_list(input.exclusion_list);
+        if names_exclusions {
+            config.exclusion_list = exclusion_list;
         }
         quotas_state.set_auto_management(config);
 

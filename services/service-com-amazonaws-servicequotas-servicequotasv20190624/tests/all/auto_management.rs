@@ -19,8 +19,10 @@
 //!
 //! * starting records the WHOLE configuration the call carries and sets
 //!   `OptInStatus = ENABLED`;
-//! * an exclusion list is stored as given — each service's codes in the order the
-//!   caller named them;
+//! * an exclusion list that RESOLVES against the quota catalog is stored as given —
+//!   each service's codes in the order the caller named them — and every entry is
+//!   reported with both its `QuotaCode` and its `QuotaName`; the refusal of one that
+//!   does not resolve is `auto_management_exclusions.rs`'s rule;
 //! * updating overwrites only the members the update call names, and an exclusion list
 //!   it does name replaces the stored one outright;
 //! * an `OptInType` the service does not offer yet is refused by BOTH writers of the
@@ -157,6 +159,26 @@ fn expected_codes(exclusions: &[(&str, &[&str])]) -> Option<BTreeMap<String, Vec
     )
 }
 
+/// Assert that every entry of a reported exclusion list carries BOTH members a
+/// `QuotaInfo` pairs: the excluded `QuotaCode` and the `QuotaName` the catalog holds
+/// for it. Every stored exclusion names a quota the catalog holds — a write refuses one
+/// that does not — so a half-populated entry is a defect.
+fn assert_every_entry_is_named(case: &str, body: &Value) {
+    let Some(reported) = body.get("ExclusionList").and_then(Value::as_object) else {
+        return;
+    };
+    for (service_code, entries) in reported {
+        for entry in entries.as_array().map(Vec::as_slice).unwrap_or_default() {
+            let member = |name: &str| entry.get(name).and_then(Value::as_str);
+            assert!(
+                member("QuotaCode").is_some() && member("QuotaName").is_some(),
+                "case {case}: every excluded quota of {service_code} must be reported with \
+                 both its QuotaCode and its QuotaName, got {entry:?}"
+            );
+        }
+    }
+}
+
 /// Read the configuration back, which must succeed: the read reports
 /// `OptInStatus: DISABLED` rather than failing even when nothing was ever started.
 async fn configuration(client: &Client, case: &str) -> Value {
@@ -196,8 +218,8 @@ struct StartCase {
 ///
 /// The rows differ along everything the rule generalises over: a notification ARN
 /// present or absent, and an exclusion list absent, naming one service or several,
-/// carrying one quota code or several, carrying the same code twice, carrying a code the
-/// catalog does not know, and naming a service with no quota codes at all. The opt-in
+/// carrying one quota code or several, carrying the same code twice, and naming a
+/// service with no quota codes at all. The opt-in
 /// type is spanned by
 /// [`every_available_opt_in_type_is_accepted_and_reads_back`], since only the
 /// types the service offers can be recorded at all.
@@ -230,12 +252,6 @@ async fn starting_records_the_whole_configuration_and_the_read_reports_it() {
                 ("ec2", &["L-1216C47A", "L-0263D0A3", "L-1216C47A"]),
                 ("dynamodb", &["L-F98FE922"]),
             ],
-        },
-        StartCase {
-            case: "a quota code the catalog does not know",
-            opt_in_type: "NotifyOnly",
-            notification: None,
-            exclusions: &[("lambda", &["L-00000000"])],
         },
         StartCase {
             case: "a service excluded with no quota codes of its own",
@@ -292,6 +308,7 @@ async fn starting_records_the_whole_configuration_and_the_read_reports_it() {
             expected_codes(exclusions),
             "case {case}: the exclusion list must be reported as named, got {read}"
         );
+        assert_every_entry_is_named(case, &read);
     }
 }
 
@@ -425,6 +442,7 @@ async fn updating_overwrites_only_the_members_it_names() {
             "case {case}: updating with {request} must leave the exclusion list it does \
              not name alone, got {read}"
         );
+        assert_every_entry_is_named(case, &read);
     }
 }
 

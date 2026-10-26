@@ -188,9 +188,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         ListRequestedServiceQuotaChangeHistoryErrorModeled::NoSuchResourceException(
                             NoSuchResourceException {
-                                message: Some(format!(
-                                    "no service quotas are available for ServiceCode \
-                                     '{service_code}'"
+                                message: Some(crate::state::no_such_service_message(
+                                    service_code,
                                 )),
                             },
                         )

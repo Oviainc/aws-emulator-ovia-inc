@@ -118,9 +118,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetAWSDefaultServiceQuotaErrorModeled::NoSuchResourceException(
                     NoSuchResourceException {
-                        message: Some(format!(
-                            "no quota with ServiceCode '{}' and QuotaCode '{}' exists",
-                            input.service_code, input.quota_code
+                        message: Some(crate::state::no_such_quota_message(
+                            &input.service_code,
+                            &input.quota_code,
                         )),
                     },
                 )

@@ -16,11 +16,14 @@
 //! stopped, replaces the record and leaves it `ENABLED` rather than refusing or
 //! merging. `UpdateAutoManagement` is the partial writer, and it is the only one.
 //!
-//! The exclusion list is stored as given — each service's codes in the order the
-//! caller named them — and its entries are NOT checked against the quota catalog,
-//! because that catalog is a subset of AWS's, so refusing an entry it does not know
-//! would refuse a service AWS does know. An excluded quota code the catalog does know
-//! gains its `QuotaName` when the configuration is read back.
+//! An exclusion names the quota it excludes by `(ServiceCode, QuotaCode)`, so the
+//! exclusion list is RESOLVED against this service's catalog before any of it is
+//! recorded: a key naming no service, or a code that service publishes no quota under,
+//! names a resource that does not exist and is refused with the modelled
+//! `NoSuchResourceException` — see [`crate::state::ComAmazonawsServicequotasServicequotasv20190624State::resolved_exclusion_list`],
+//! the rule `UpdateAutoManagement` applies to the same member. What resolves is stored
+//! in the order the caller named it, and each code is paired with its catalog
+//! `QuotaName` when the configuration is read back.
 //!
 //! Every modelled input constraint — `OptInLevel`'s and `OptInType`'s value sets, the
 //! `NotificationArn` length and pattern, the exclusion list's key and member
@@ -154,15 +157,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        state
-            .lock()
-            .set_auto_management(crate::state::AutoManagementConfig {
-                opt_in_level: input.opt_in_level,
-                opt_in_type: input.opt_in_type,
-                opt_in_status: crate::state::OPT_IN_STATUS_ENABLED.to_string(),
-                notification_arn: input.notification_arn,
-                exclusion_list: crate::state::stored_exclusion_list(input.exclusion_list),
-            });
+        let mut quotas_state = state.lock();
+
+        // The whole exclusion list is resolved against the catalog BEFORE anything is
+        // written, so a configuration can only ever name quotas this service
+        // publishes — and a refused start records none of the call, not even the part
+        // of it that resolved.
+        let exclusion_list = quotas_state
+            .resolved_exclusion_list(input.exclusion_list)
+            .map_err(|refusal| {
+                StartAutoManagementErrorModeled::NoSuchResourceException(NoSuchResourceException {
+                    message: Some(refusal.message()),
+                })
+            })?;
+
+        quotas_state.set_auto_management(crate::state::AutoManagementConfig {
+            opt_in_level: input.opt_in_level,
+            opt_in_type: input.opt_in_type,
+            opt_in_status: crate::state::OPT_IN_STATUS_ENABLED.to_string(),
+            notification_arn: input.notification_arn,
+            exclusion_list,
+        });
 
         Ok(StartAutoManagementOutput {})
     }

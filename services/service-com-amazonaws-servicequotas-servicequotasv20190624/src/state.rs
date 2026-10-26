@@ -522,9 +522,13 @@ pub struct AutoManagementConfig {
     pub opt_in_status: String,
     /// `NotificationArn` — the User Notifications ARN, when one was given.
     pub notification_arn: Option<String>,
-    /// `ExclusionList`: `ExcludedService` -> the excluded `QuotaCode`s. Stored as the
-    /// codes the caller named; `GetAutoManagementConfiguration` reports them as
-    /// `QuotaInfo` entries, pairing each code with the catalog's `QuotaName`.
+    /// `ExclusionList`: `ExcludedService` -> the excluded `QuotaCode`s, every one of
+    /// them a quota this service publishes — a write RESOLVES the list it carries
+    /// against the catalog (see
+    /// [`ComAmazonawsServicequotasServicequotasv20190624State::resolved_exclusion_list`])
+    /// and refuses an entry no quota answers to. Stored in the codes' requested order;
+    /// `GetAutoManagementConfiguration` reports them as `QuotaInfo` entries, pairing
+    /// each code with the catalog's `QuotaName`.
     pub exclusion_list: BTreeMap<String, Vec<String>>,
 }
 
@@ -649,6 +653,43 @@ pub struct TagCeilingExceeded {
     pub would_hold: usize,
 }
 
+/// Why an `ExclusionList` a write carries names something this service publishes no
+/// quota for.
+///
+/// Both arms are the model's `NoSuchResourceException` ("The specified resource does
+/// not exist"): an exclusion names the quota it excludes by `(ServiceCode,
+/// QuotaCode)`, so a pair no quota answers to names a resource that does not exist.
+/// The arm decides which of the two facts the refusal states.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExclusionRefusal {
+    /// The list is keyed by a `ServiceCode` the service catalog does not hold.
+    UnknownService {
+        /// The `ExcludedService` key that named no service.
+        service_code: String,
+    },
+    /// A service the catalog holds, with a `QuotaCode` it publishes no quota under.
+    UnknownQuota {
+        /// The service the unresolvable code was named under.
+        service_code: String,
+        /// The code no quota of that service answers to.
+        quota_code: String,
+    },
+}
+
+impl ExclusionRefusal {
+    /// How the refusal is worded: the same wording every other read of a service or a
+    /// quota that does not exist answers with, so one fact has one message.
+    pub fn message(&self) -> String {
+        match self {
+            Self::UnknownService { service_code } => no_such_service_message(service_code),
+            Self::UnknownQuota {
+                service_code,
+                quota_code,
+            } => no_such_quota_message(service_code, quota_code),
+        }
+    }
+}
+
 /// Why no support case was opened for a quota increase request.
 ///
 /// The three cases are three different refusals in the model, and the handler maps
@@ -766,9 +807,9 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
     /// every excluded `QuotaCode`, in stored order, paired with the `QuotaName` the
     /// quota catalog holds for it.
     ///
-    /// A code the catalog does not know is still reported, with no `QuotaName`: the
-    /// exclusion is the caller's own, so dropping it would under-report the
-    /// configuration. Empty when the account has no configuration stored.
+    /// Every stored entry resolves, because a write refuses one that does not (see
+    /// [`Self::resolved_exclusion_list`]), so each reported entry carries both the
+    /// code and the name. Empty when the account has no configuration stored.
     pub fn auto_management_exclusion_view(&self) -> HashMap<String, Vec<QuotaInfo>> {
         let Some(config) = self.auto_management.as_ref() else {
             return HashMap::new();
@@ -789,6 +830,55 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
                 (service_code.clone(), quotas)
             })
             .collect()
+    }
+
+    /// The `ExclusionList` a write carries, RESOLVED against this service's catalog
+    /// and in the form [`AutoManagementConfig::exclusion_list`] stores: keyed in
+    /// service-code order, each service's codes kept exactly as the caller named them,
+    /// and empty when the request named no exclusion list at all.
+    ///
+    /// An exclusion names the quota it excludes by `(ServiceCode, QuotaCode)`, so
+    /// every entry has to answer to a quota this service publishes: a key the service
+    /// catalog does not hold, or a code that service publishes no quota under, names a
+    /// resource that does not exist and is refused ([`ExclusionRefusal`]) instead of
+    /// recorded. A service named with no codes of its own excludes that service's
+    /// quotas, so it resolves on the key alone.
+    ///
+    /// The entries are checked in service-code order, so a request carrying more than
+    /// one unresolvable entry is always refused for the same one. The catalog is
+    /// indexed ONCE per call, and only for a call that names an exclusion at all, so a
+    /// list naming many codes does not multiply the work each one costs and a call
+    /// naming none pays nothing.
+    pub fn resolved_exclusion_list(
+        &self,
+        exclusion_list: Option<HashMap<String, Vec<String>>>,
+    ) -> Result<BTreeMap<String, Vec<String>>, ExclusionRefusal> {
+        let requested: BTreeMap<String, Vec<String>> =
+            exclusion_list.unwrap_or_default().into_iter().collect();
+        if requested.is_empty() {
+            return Ok(requested);
+        }
+        let published: BTreeSet<(&str, &str)> = self
+            .default_quotas
+            .iter()
+            .map(|quota| (quota.service_code.as_str(), quota.quota_code.as_str()))
+            .collect();
+        for (service_code, quota_codes) in &requested {
+            if !self.knows_service(service_code) {
+                return Err(ExclusionRefusal::UnknownService {
+                    service_code: service_code.clone(),
+                });
+            }
+            for quota_code in quota_codes {
+                if !published.contains(&(service_code.as_str(), quota_code.as_str())) {
+                    return Err(ExclusionRefusal::UnknownQuota {
+                        service_code: service_code.clone(),
+                        quota_code: quota_code.clone(),
+                    });
+                }
+            }
+        }
+        Ok(requested)
     }
 
     /// Whether the catalog knows `service_code`. Codes are matched exactly: AWS's
@@ -1582,16 +1672,6 @@ fn contexts_in_force(context: Option<&str>) -> Vec<Option<&str>> {
     }
 }
 
-/// An `ExclusionList` as it arrives on the wire (service code -> quota codes), in the
-/// form [`AutoManagementConfig::exclusion_list`] stores: keyed in service-code order,
-/// with each service's codes kept exactly as the caller named them, and empty when the
-/// request named no exclusion list at all.
-pub fn stored_exclusion_list(
-    exclusion_list: Option<HashMap<String, Vec<String>>>,
-) -> BTreeMap<String, Vec<String>> {
-    exclusion_list.unwrap_or_default().into_iter().collect()
-}
-
 /// A wall-clock instant as the modelled `Timestamp` the wire carries.
 pub fn epoch_timestamp(time: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = time
@@ -1677,6 +1757,26 @@ pub fn malformed_resource_arn_message(resource_arn: &str) -> String {
         "ResourceARN '{resource_arn}' is not an applied quota ARN of the form \
          arn:<partition>:{ARN_NAMESPACE}:<region>:<account>:<ServiceCode>/<QuotaCode>"
     )
+}
+
+/// How this service states that `service_code` names no service it publishes quotas
+/// for, for the modelled `NoSuchResourceException`.
+///
+/// ONE wording for the fact, wherever a request names a service the catalog does not
+/// hold: the listings that take a `ServiceCode`, and an Automatic Management exclusion
+/// keyed by one.
+pub fn no_such_service_message(service_code: &str) -> String {
+    format!("no service quotas are available for ServiceCode '{service_code}'")
+}
+
+/// How this service states that no quota answers to a `(ServiceCode, QuotaCode)` pair,
+/// for the modelled `NoSuchResourceException`.
+///
+/// ONE wording for the fact, wherever a request names a pair the catalog does not
+/// hold: the reads and the writes of one quota, and an Automatic Management exclusion
+/// naming one.
+pub fn no_such_quota_message(service_code: &str, quota_code: &str) -> String {
+    format!("no quota with ServiceCode '{service_code}' and QuotaCode '{quota_code}' exists")
 }
 
 /// How a tagging operation states that `resource_arn` names no applied quota of this
