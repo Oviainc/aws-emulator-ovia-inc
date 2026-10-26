@@ -77,6 +77,8 @@ mod response_members;
 mod rule_evaluation_order;
 #[path = "all/rule_group_capacity_refusal.rs"]
 mod rule_group_capacity_refusal;
+#[path = "all/rule_group_deletion.rs"]
+mod rule_group_deletion;
 #[path = "all/rule_group_lifecycle.rs"]
 mod rule_group_lifecycle;
 #[path = "all/rule_group_updates.rs"]
