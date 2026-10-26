@@ -51,6 +51,8 @@ mod destination_policies;
 mod destination_removal;
 #[path = "all/destinations.rs"]
 mod destinations;
+#[path = "all/event_cursor_envelope.rs"]
+mod event_cursor_envelope;
 #[path = "all/export_tasks.rs"]
 mod export_tasks;
 #[path = "all/field_indexes.rs"]
