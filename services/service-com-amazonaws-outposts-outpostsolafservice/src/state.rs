@@ -4812,6 +4812,31 @@ fn push_once(values: &mut Vec<String>, value: &str) {
     }
 }
 
+/// Whether a record's value for ONE filtered member is accepted by the `*Filter`
+/// the caller sent for that member.
+///
+/// Every list in this API states the same selection rule — "if you specify multiple
+/// filters, the results include only the resources that match all of the specified
+/// filters. For a filter where you can specify multiple values, the results include
+/// items that match any of the values that you specify for the filter" — so a filter
+/// is a LIST of ACCEPTED VALUES for the member it names: a record matches it when its
+/// value for that member is one of them, a filter the caller did not send (or sent
+/// empty) narrows nothing, and a record that recorded no value at all for a filtered
+/// member matches none of the accepted values, so the filter narrows it out. A
+/// handler combines one call per filter member with `&&`, which is what makes several
+/// filters narrow rather than widen.
+///
+/// Shared by the five list operations that take filters so they cannot drift apart on
+/// that rule.
+pub fn filter_accepts(filter: Option<&[String]>, value: Option<&str>) -> bool {
+    match filter {
+        Some(accepted) if !accepted.is_empty() => {
+            value.is_some_and(|value| accepted.iter().any(|candidate| candidate.as_str() == value))
+        }
+        _ => true,
+    }
+}
+
 /// Cut one page out of an already-filtered sequence of records, and issue the token
 /// that resumes after it.
 ///

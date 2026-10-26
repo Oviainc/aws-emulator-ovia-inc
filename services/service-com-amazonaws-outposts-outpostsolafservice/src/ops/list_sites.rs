@@ -192,22 +192,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 ///
 /// Each filter is a LIST of accepted values for the `Site` member it names, so a
 /// site matches when its value is one of them; an absent (or empty) filter matches
-/// everything, so several filters together narrow rather than widen.
+/// everything, so several filters together narrow rather than widen. The rule itself
+/// is [`crate::state::filter_accepts`], which every list of this service selects
+/// with; this function only says which member each of this list's filters selects on.
 fn matches_filters(site: &Site, input: &ListSitesInput) -> bool {
-    let matches = |filter: Option<&Vec<String>>, value: Option<&String>| match filter {
-        Some(accepted) if !accepted.is_empty() => {
-            value.is_some_and(|value| accepted.contains(value))
-        }
-        _ => true,
-    };
-    matches(
-        input.operating_address_country_code_filter.as_ref(),
-        site.operating_address_country_code.as_ref(),
-    ) && matches(
-        input.operating_address_state_or_region_filter.as_ref(),
-        site.operating_address_state_or_region.as_ref(),
-    ) && matches(
-        input.operating_address_city_filter.as_ref(),
-        site.operating_address_city.as_ref(),
+    use crate::state::filter_accepts;
+    filter_accepts(
+        input.operating_address_country_code_filter.as_deref(),
+        site.operating_address_country_code.as_deref(),
+    ) && filter_accepts(
+        input.operating_address_state_or_region_filter.as_deref(),
+        site.operating_address_state_or_region.as_deref(),
+    ) && filter_accepts(
+        input.operating_address_city_filter.as_deref(),
+        site.operating_address_city.as_deref(),
     )
 }

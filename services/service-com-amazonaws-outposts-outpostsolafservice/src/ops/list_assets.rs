@@ -244,7 +244,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// narrow rather than widen, while an absent (or empty) filter matches everything. An
 /// asset whose value for a filtered member was never recorded matches no value, so it
 /// is narrowed out, exactly as `ListOutposts` narrows out an Outpost with no value for
-/// a filtered member.
+/// a filtered member — that selection rule is [`crate::state::filter_accepts`], the
+/// one every list of this service selects with, so this function only says which
+/// member each of this list's filters selects on.
 ///
 /// The members the model binds the three filters to: `AssetTypeFilter` selects on the
 /// asset's own `AssetType`, while `HostIdFilter` ("the host ID of a Dedicated Host")
@@ -252,20 +254,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// compute asset's `HostId` and `State` — the only members of this output those two
 /// values appear in — so an asset with no compute attributes matches neither.
 fn matches_filters(asset: &AssetInfo, input: &ListAssetsInput) -> bool {
-    let matches = |filter: Option<&Vec<String>>, value: Option<&String>| match filter {
-        Some(accepted) if !accepted.is_empty() => {
-            value.is_some_and(|value| accepted.contains(value))
-        }
-        _ => true,
-    };
+    use crate::state::filter_accepts;
     let compute = asset.compute_attributes.as_ref();
-    matches(input.asset_type_filter.as_ref(), asset.asset_type.as_ref())
-        && matches(
-            input.host_id_filter.as_ref(),
-            compute.and_then(|compute| compute.host_id.as_ref()),
-        )
-        && matches(
-            input.status_filter.as_ref(),
-            compute.and_then(|compute| compute.state.as_ref()),
-        )
+    filter_accepts(
+        input.asset_type_filter.as_deref(),
+        asset.asset_type.as_deref(),
+    ) && filter_accepts(
+        input.host_id_filter.as_deref(),
+        compute.and_then(|compute| compute.host_id.as_deref()),
+    ) && filter_accepts(
+        input.status_filter.as_deref(),
+        compute.and_then(|compute| compute.state.as_deref()),
+    )
 }

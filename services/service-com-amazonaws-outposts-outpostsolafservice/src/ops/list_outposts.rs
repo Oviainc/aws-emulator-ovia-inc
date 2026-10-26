@@ -197,22 +197,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 ///
 /// Each filter is a LIST of accepted values for the member it names, so an Outpost
 /// matches when its value is one of them; an absent (or empty) filter matches
-/// everything, so several filters together narrow rather than widen.
+/// everything, so several filters together narrow rather than widen. The rule itself
+/// is [`crate::state::filter_accepts`], which every list of this service selects
+/// with; this function only says which member each of this list's filters selects on.
 fn matches_filters(outpost: &Outpost, input: &ListOutpostsInput) -> bool {
-    let matches = |filter: Option<&Vec<String>>, value: Option<&String>| match filter {
-        Some(accepted) if !accepted.is_empty() => {
-            value.is_some_and(|value| accepted.contains(value))
-        }
-        _ => true,
-    };
-    matches(
-        input.life_cycle_status_filter.as_ref(),
-        outpost.life_cycle_status.as_ref(),
-    ) && matches(
-        input.availability_zone_filter.as_ref(),
-        outpost.availability_zone.as_ref(),
-    ) && matches(
-        input.availability_zone_id_filter.as_ref(),
-        outpost.availability_zone_id.as_ref(),
+    use crate::state::filter_accepts;
+    filter_accepts(
+        input.life_cycle_status_filter.as_deref(),
+        outpost.life_cycle_status.as_deref(),
+    ) && filter_accepts(
+        input.availability_zone_filter.as_deref(),
+        outpost.availability_zone.as_deref(),
+    ) && filter_accepts(
+        input.availability_zone_id_filter.as_deref(),
+        outpost.availability_zone_id.as_deref(),
     )
 }

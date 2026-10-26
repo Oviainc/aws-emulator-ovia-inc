@@ -246,7 +246,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// their own filters — while an absent (or empty) filter matches everything. An instance
 /// whose value for a filtered member was never recorded matches no value, so it is
 /// narrowed out, exactly as those lists narrow out a record with no value for a filtered
-/// member.
+/// member. That one rule is [`crate::state::filter_accepts`], which every list of this
+/// service selects with, so this function only says which member each of this list's
+/// filters selects on.
 ///
 /// The members the model binds the four filters to: `AssetIdFilter` selects on the
 /// instance's `AssetId` (the asset it runs on), `InstanceTypeFilter` on its
@@ -254,23 +256,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `AwsServiceFilter` on the `AwsServiceName` of the Amazon Web Services service that
 /// owns it — the one member of this output each filtered value appears in.
 fn matches_filters(instance: &AssetInstance, input: &ListAssetInstancesInput) -> bool {
-    let matches = |filter: Option<&Vec<String>>, value: Option<&String>| match filter {
-        Some(accepted) if !accepted.is_empty() => {
-            value.is_some_and(|value| accepted.contains(value))
-        }
-        _ => true,
-    };
-    matches(input.asset_id_filter.as_ref(), instance.asset_id.as_ref())
-        && matches(
-            input.instance_type_filter.as_ref(),
-            instance.instance_type.as_ref(),
-        )
-        && matches(
-            input.account_id_filter.as_ref(),
-            instance.account_id.as_ref(),
-        )
-        && matches(
-            input.aws_service_filter.as_ref(),
-            instance.aws_service_name.as_ref(),
-        )
+    use crate::state::filter_accepts;
+    filter_accepts(
+        input.asset_id_filter.as_deref(),
+        instance.asset_id.as_deref(),
+    ) && filter_accepts(
+        input.instance_type_filter.as_deref(),
+        instance.instance_type.as_deref(),
+    ) && filter_accepts(
+        input.account_id_filter.as_deref(),
+        instance.account_id.as_deref(),
+    ) && filter_accepts(
+        input.aws_service_filter.as_deref(),
+        instance.aws_service_name.as_deref(),
+    )
 }

@@ -231,7 +231,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// values, the results include items that match any of the values that you specify
 /// for the filter": several filters together narrow rather than widen, an absent (or
 /// empty) filter narrows nothing, and a filter that is a LIST of values accepts a
-/// task whose value is any one of them.
+/// task whose value is any one of them — which for the list filter is
+/// [`crate::state::filter_accepts`], the rule every list of this service selects
+/// with.
 ///
 /// A filter is a filter and not an identifier the request is addressed to: it
 /// narrows the list the caller is reported, so one naming an Outpost that holds no
@@ -243,10 +245,9 @@ fn matches_filters(
     status_filter: Option<&[String]>,
 ) -> bool {
     let outpost_matches = outpost_filter.is_none_or(|outpost_id| task.outpost_id == outpost_id);
-    let status_matches = match status_filter {
-        Some(accepted) if !accepted.is_empty() => accepted.contains(&task.status),
-        _ => true,
-    };
+    // The status filter is a list of accepted values, so it selects by the rule every
+    // list of this service selects its own list filters by.
+    let status_matches = crate::state::filter_accepts(status_filter, Some(task.status.as_str()));
     outpost_matches && status_matches
 }
 
