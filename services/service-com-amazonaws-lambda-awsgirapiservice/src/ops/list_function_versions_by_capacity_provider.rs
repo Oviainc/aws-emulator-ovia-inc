@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFunctionVersionsByCapacityProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFunctionVersionsByCapacityProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFunctionVersionsByCapacityProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `ListFunctionVersionsByCapacityProvider` "Returns a list of function versions that are
+//! configured to use a specific capacity provider", so what it reports is read out of the
+//! function records this service's store holds: every PUBLISHED version whose
+//! configuration names the addressed provider's ARN — publishing froze the configuration
+//! the version was taken from, so the reference is the version's own — each reported as
+//! the ARN of that version and the `State` of the function it belongs to. The unpublished
+//! configuration is the draft the next publish freezes rather than a version that runs on
+//! the provider, so it is not one of the entries.
+//!
+//! The relationship is read through the ONE place that knows it,
+//! [`crate::state::ComAmazonawsLambdaAwsgirapiserviceState::capacity_provider_users`], which
+//! `DeleteCapacityProvider` also asks before refusing a provider still in use — so the
+//! two surfaces cannot disagree about which versions use a provider.
+//!
+//! A `CapacityProviderName` naming no provider is refused `ResourceNotFoundException`
+//! with the provider-not-found sentence, whose variable part is the value the request
+//! named — the capacity-provider operations addressed AT a provider report the ARN they
+//! resolved it to instead (`crate::state::resolve_capacity_provider`), which is how AWS
+//! words each of the two.
+//!
+//! It writes nothing of its own: the only changes it applies are the ones the clock
+//! already made due (a `Pending` function or provider whose activation is owed becomes
+//! `Active`), through
+//! [`crate::state::ComAmazonawsLambdaAwsgirapiserviceState::materialize_all`].
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +172,193 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFunctionVersionsByCapacityProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFunctionVersionsByCapacityProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFunctionVersionsByCapacityProvider"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListFunctionVersionsByCapacityProviderErrorModeled::ServiceException(
+                    ServiceException {
+                        r#type: None,
+                        message: Some("Lambda state is not reachable on this engine".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `MaxItems` is modelled `MaxFiftyListItems`, `@range(min: 1, max: 50)`, so the
+        // boundary validator has already refused anything outside it; this handler
+        // enforces the same floor itself rather than letting a page size of zero reach
+        // the pagination arithmetic below.
+        if let Some(requested) = input.max_items.filter(|requested| *requested < 1) {
+            return Err(invalid_parameter(format!(
+                "1 validation error detected: Value '{requested}' at 'maxItems' failed to \
+                 satisfy constraint: Member must have value greater than or equal to 1"
+            )));
+        }
+        let page_size = input
+            .max_items
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(MAX_FUNCTION_VERSIONS_PER_PAGE)
+            .clamp(1, MAX_FUNCTION_VERSIONS_PER_PAGE);
+
+        // The marker is the ARN of the last version the previous page reported, so the
+        // next page starts at the first version ordered after it and no version is ever
+        // reported twice. It names a place in that order rather than an entry that must
+        // still be there, so a version removed between two pages does not strand the
+        // walk.
+        let start_after = match input.marker.as_deref() {
+            Some(marker) => Some(marker_order(marker).ok_or_else(|| {
+                invalid_parameter(format!(
+                    "1 validation error detected: Value '{marker}' at 'marker' failed to \
+                     satisfy constraint: Member must be the function version ARN of a \
+                     previous page's last entry"
+                ))
+            })?),
+            None => None,
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+        // A function or a provider whose activation the clock has already made due is
+        // `Active`, and that is as true reported in this listing as read one at a time.
+        // Nothing else is written here.
+        store.materialize_all(now);
+
+        // The provider is addressed the way every capacity-provider operation addresses
+        // it: by its name, or by the ARN that names the same record. Its ARN comes out of
+        // that record, so the answered `CapacityProviderArn` is the stored one rather
+        // than the text the request spelled it with.
+        let provider_arn = crate::state::resolve_capacity_provider(
+            &mut store,
+            &input.capacity_provider_name,
+            &region,
+            now,
+        )
+        .map(|record| record.arn.clone())
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
+            // A well-formed value that names no provider is refused as not found, with
+            // the value the request named as the sentence's variable part (see
+            // [`provider_not_found_message`]).
+            crate::state::ResolveFailure::NotFound(_) => {
+                ListFunctionVersionsByCapacityProviderErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(provider_not_found_message(&input.capacity_provider_name)),
+                    },
+                )
+                .into()
+            }
+        })?;
+
+        // What this operation reports are the function VERSIONS on the provider: a
+        // published version, whose configuration was frozen when it was published and
+        // which therefore runs on the provider named in it. The unpublished
+        // configuration is the draft the next publish freezes rather than a version that
+        // runs, so it is not one of the entries here — while it still counts as a USE of
+        // the provider, which is the question `DeleteCapacityProvider` asks the same
+        // reader.
+        let entries: Vec<_> = store
+            .capacity_provider_users(&provider_arn)
+            .into_iter()
+            .filter(|entry| entry.version != crate::state::VERSION_LATEST)
+            .collect();
+        let start = match start_after {
+            Some(after) => entries
+                .iter()
+                .position(|entry| {
+                    entry_order(&entry.function_name, &entry.version)
+                        .is_some_and(|order| order > after)
+                })
+                .unwrap_or(entries.len()),
+            None => 0,
+        };
+        let page = match entries.get(start..) {
+            Some(remaining) => &remaining[..page_size.min(remaining.len())],
+            None => &[][..],
+        };
+        let truncated = start + page.len() < entries.len();
+
+        Ok(ListFunctionVersionsByCapacityProviderOutput {
+            capacity_provider_arn: provider_arn,
+            function_versions: page
+                .iter()
+                .map(|entry| FunctionVersionsByCapacityProviderListItem {
+                    function_arn: entry.function_arn.clone(),
+                    state: entry.state.clone(),
+                })
+                .collect(),
+            // "The pagination token that's included if more results are available" — so
+            // it is absent on the last page, and it is the ARN of the last version THIS
+            // page reported, which is what the next page continues after.
+            next_marker: page
+                .last()
+                .filter(|_| truncated)
+                .map(|entry| entry.function_arn.clone()),
+        })
     }
+}
+
+/// The most function versions one page reports: the model caps `MaxItems` at 50
+/// (`MaxFiftyListItems`, `@range(min: 1, max: 50)`) and the answered
+/// `FunctionVersionsByCapacityProviderList` at `@length(min: 0, max: 50)`, so 50 is both
+/// the page size a caller that names no `MaxItems` gets and the ceiling on the one who
+/// does.
+const MAX_FUNCTION_VERSIONS_PER_PAGE: usize = 50;
+
+/// Where one listed version sits in the order this operation reports versions in: by the
+/// name of the function it belongs to, and within one function the unpublished
+/// configuration first and the published versions after it in ascending numeric order.
+///
+/// `None` for a label the model's `Version` pattern (`^(\$LATEST|[0-9]+)$`) does not
+/// admit at all.
+fn entry_order(function_name: &str, version: &str) -> Option<(String, u64)> {
+    let order = if version == crate::state::VERSION_LATEST {
+        // Version numbers start at 1, so the unpublished configuration takes the one
+        // rank below the first published version.
+        0
+    } else {
+        version.parse::<u64>().ok()?
+    };
+    Some((function_name.to_string(), order))
+}
+
+/// Where a `Marker` sits in that order.
+///
+/// The marker a page answers is the ARN of its last entry, which carries the function
+/// name and the version label the order is built from, so it is read back through the one
+/// shared `FunctionName` reader rather than by indexing untrusted text. `None` for a
+/// value that names no function version at all.
+fn marker_order(marker: &str) -> Option<(String, u64)> {
+    let reference = crate::state::parse_function_reference(marker)?;
+    let version = reference
+        .qualifier
+        .unwrap_or_else(|| crate::state::VERSION_LATEST.to_string());
+    entry_order(&reference.name, &version)
+}
+
+/// The refusal a `CapacityProviderName` that names no provider gets.
+///
+/// The sentence is the service's own for a capacity provider that does not exist, and its
+/// variable part is the value the request named — either documented
+/// `CapacityProviderName` form, as it was given. The operations addressed AT a provider
+/// (`GetCapacityProvider`, `UpdateCapacityProvider`, `DeleteCapacityProvider`) report the
+/// ARN they resolved that value to instead, which is why the sentence is built here
+/// rather than taken from `crate::state::resolve_capacity_provider`.
+fn provider_not_found_message(capacity_provider_name: &str) -> String {
+    format!(
+        "Capacity provider not found: {capacity_provider_name}. Check that the ARN is \
+         correct and the capacity provider exists in this Region."
+    )
+}
+
+/// The modelled 400 this operation refuses a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> ListFunctionVersionsByCapacityProviderError {
+    ListFunctionVersionsByCapacityProviderErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
 }

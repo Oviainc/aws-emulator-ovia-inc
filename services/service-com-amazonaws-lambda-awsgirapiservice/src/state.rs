@@ -1961,6 +1961,21 @@ impl FunctionRecord {
         }
     }
 
+    /// How this function's `version` is reported as a user of the capacity provider its
+    /// configuration names: the ARN of that version, the function and version it
+    /// belongs to, and the lifecycle `State` of the function the version is part of
+    /// (which is a property of the function rather than of one version, see
+    /// [`FunctionRecord::state`]).
+    #[must_use]
+    pub fn capacity_provider_version(&self, version: &str) -> CapacityProviderVersion {
+        CapacityProviderVersion {
+            function_arn: self.versioned_arn(version),
+            function_name: self.config.name.clone(),
+            version: version.to_string(),
+            state: self.state.clone(),
+        }
+    }
+
     /// The version label `qualifier` names, or `None` when this function has no such
     /// version or alias.
     ///
@@ -3456,6 +3471,26 @@ pub struct ListedFunction {
     pub configuration: CreateFunctionOutput,
 }
 
+/// One function version that is configured to run on a capacity provider.
+///
+/// Both surfaces that ask which versions use a provider read the same entries:
+/// `DeleteCapacityProvider` refuses a provider that any version still uses, and
+/// `ListFunctionVersionsByCapacityProvider` reports those versions — so the relationship
+/// is read in ONE place, [`ComAmazonawsLambdaAwsgirapiserviceState::capacity_provider_users`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapacityProviderVersion {
+    /// The ARN of the version: the unqualified function ARN for [`VERSION_LATEST`], and
+    /// the `:<version>`-suffixed one for a published version.
+    pub function_arn: String,
+    /// The name of the function the version belongs to — the first component of the
+    /// order these entries are reported in.
+    pub function_name: String,
+    /// The version label: [`VERSION_LATEST`] or a published version number.
+    pub version: String,
+    /// The model's `State` of the function this version belongs to.
+    pub state: String,
+}
+
 impl ComAmazonawsLambdaAwsgirapiserviceState {
     /// Bring every function, every capacity provider and every event source mapping up
     /// to whatever the clock has already made due; see [`FunctionRecord::materialize`],
@@ -3485,8 +3520,8 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
         }
     }
 
-    /// The ARNs of every function version configured to run on the capacity provider
-    /// `provider_arn` names, in a stable order.
+    /// Every function version configured to run on the capacity provider `provider_arn`
+    /// names, in a stable order.
     ///
     /// A function names the provider it runs on through
     /// `FunctionConfiguration$CapacityProviderConfig`, whose one
@@ -3494,16 +3529,22 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
     /// published version froze the configuration it was published from — so both the
     /// `$LATEST` configuration and every published version's count as a user of the
     /// provider.
+    ///
+    /// The order is by function name, `$LATEST` before the published versions of the
+    /// same function and those in ascending numeric order, which is the order the store's
+    /// maps already yield: it is the order
+    /// `ListFunctionVersionsByCapacityProvider` pages through, so it has to be stable
+    /// across calls rather than depend on when a version was configured.
     #[must_use]
-    pub fn capacity_provider_users(&self, provider_arn: &str) -> Vec<String> {
+    pub fn capacity_provider_users(&self, provider_arn: &str) -> Vec<CapacityProviderVersion> {
         let mut users = Vec::new();
         for function in self.functions.values() {
             if configured_capacity_provider(&function.config) == Some(provider_arn) {
-                users.push(function.versioned_arn(VERSION_LATEST));
+                users.push(function.capacity_provider_version(VERSION_LATEST));
             }
             for version in function.versions.values() {
                 if configured_capacity_provider(&version.config) == Some(provider_arn) {
-                    users.push(function.versioned_arn(&version.version.to_string()));
+                    users.push(function.capacity_provider_version(&version.version.to_string()));
                 }
             }
         }

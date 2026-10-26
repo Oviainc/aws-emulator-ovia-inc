@@ -85,6 +85,8 @@ mod function_url_listing;
 mod function_url_update;
 #[path = "all/function_version_listing.rs"]
 mod function_version_listing;
+#[path = "all/function_versions_by_capacity_provider.rs"]
+mod function_versions_by_capacity_provider;
 #[path = "all/layer_listing.rs"]
 mod layer_listing;
 #[path = "all/layer_version_by_arn.rs"]

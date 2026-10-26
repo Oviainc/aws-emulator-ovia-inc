@@ -213,9 +213,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         r#type: None,
                         message: Some(format!(
                             "The capacity provider {} cannot be deleted while it is in use \
-                             by {} function version(s), including {user}",
+                             by {} function version(s), including {}",
                             record.arn,
-                            users.len()
+                            users.len(),
+                            user.function_arn
                         )),
                     },
                 )
