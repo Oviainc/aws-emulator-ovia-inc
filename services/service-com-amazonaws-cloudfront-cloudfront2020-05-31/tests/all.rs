@@ -113,6 +113,8 @@ mod managed_origin_request_policy_reference;
 mod managed_policy_catalogs;
 #[path = "all/monitoring_subscription.rs"]
 mod monitoring_subscription;
+#[path = "all/origin_access_control_config_read.rs"]
+mod origin_access_control_config_read;
 #[path = "all/origin_access_control_delete.rs"]
 mod origin_access_control_delete;
 #[path = "all/origin_access_control_lifecycle.rs"]
