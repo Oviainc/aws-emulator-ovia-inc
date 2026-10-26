@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes attributes STORED against the resources of one cluster — "deletes one or more
+//! custom attributes from an Amazon ECS resource" — and reports the ones it removed. A
+//! MUTATION: each entry names a resource of the cluster by `targetId` and an attribute of
+//! it by `name`, and that attribute is dropped from what the resource carries, so a later
+//! `ListAttributes` or `DescribeContainerInstances` no longer reports it.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +83,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The refusal every unusable `attributes` entry of this operation carries: "The
+/// specified parameter isn't valid" is the condition each of them meets, so the error is
+/// built in one place and only the sentence differs.
+fn invalid_parameter(message: String) -> DeleteAttributesError {
+    DeleteAttributesErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,18 +166,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteAttributesErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx);
+        // "If you do not specify a cluster, the default cluster is assumed."
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+
+        // "You can specify up to 10 attributes for each request."
+        if input.attributes.len() > crate::state::MAX_ATTRIBUTES_PER_REQUEST {
+            return Err(invalid_parameter(crate::state::at_most_items_message(
+                "attributes",
+                crate::state::MAX_ATTRIBUTES_PER_REQUEST,
+            )));
+        }
+
+        let mut guard = state.lock();
+        guard.advance_clock(::std::time::SystemTime::now());
+
+        if !guard.has_active_cluster(&cluster_name) {
+            return Err(DeleteAttributesErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Every entry's target is resolved BEFORE anything is removed, so a request that
+        // names one resource this cluster does not hold deletes nothing at all.
+        let mut targeted: Vec<(String, String)> = Vec::with_capacity(input.attributes.len());
+        for attribute in &input.attributes {
+            // "For custom attributes, specify the attribute name and target ID": an entry
+            // with no target names no resource to delete the attribute from.
+            let target_id = attribute
+                .target_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|target_id| !target_id.is_empty())
+                .ok_or_else(|| {
+                    invalid_parameter(
+                        crate::state::ATTRIBUTE_TARGET_ID_REQUIRED_MESSAGE.to_string(),
+                    )
+                })?;
+            // `Attribute$targetType`: "This parameter is required if you use the short
+            // form ID for a resource instead of the full ARN."
+            if !target_id.starts_with("arn:") && attribute.target_type.is_none() {
+                return Err(invalid_parameter(
+                    crate::state::ATTRIBUTE_TARGET_TYPE_REQUIRED_MESSAGE.to_string(),
+                ));
+            }
+            // `TargetType` models ONE value, `container-instance`, and the schema refuses
+            // any other before this handler runs, so the resources an entry can name are
+            // the container instances REGISTERED into this cluster. A deregistered one is
+            // not among them — "Deregistering a container instance removes the instance
+            // from a cluster" — which is the same set `ListAttributes` reports.
+            let resolved = guard
+                .resolve_container_instance(&region, &cluster_name, target_id)
+                .filter(|instance| instance.is_registered())
+                .map(|instance| instance.arn.clone());
+            let Some(arn) = resolved else {
+                return Err(DeleteAttributesErrorModeled::TargetNotFoundException(
+                    TargetNotFoundException {
+                        message: Some(crate::state::TARGET_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            };
+            targeted.push((arn, attribute.name.clone()));
+        }
+
+        // An attribute is identified by the resource it is on and its NAME — `PutAttributes`
+        // describes writing one that is already there as "its value is replaced with the
+        // specified value" — so an entry's `value` selects nothing: "For custom attributes,
+        // specify the attribute name and target ID, but don't specify the value."
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAttributes"))
+        // "A list of attribute objects that were successfully deleted from your resource":
+        // what is reported is what this call REMOVED, read off the stored attribute, so an
+        // entry naming a name the resource does not carry leaves the store as it is and is
+        // reported as deleting nothing.
+        let mut deleted: Vec<Attribute> = Vec::with_capacity(targeted.len());
+        for (arn, name) in targeted {
+            let instance = guard
+                .container_instances
+                .get_mut(&arn)
+                .expect("the ARN was just resolved out of the map under this lock");
+            let Some(index) = instance
+                .attributes
+                .iter()
+                .position(|stored| stored.name == name)
+            else {
+                continue;
+            };
+            let removed = instance.attributes.remove(index);
+            // `ContainerInstance$version`: "Every time a container instance experiences a
+            // change ... the version counter is incremented."
+            instance.version += 1;
+            deleted.push(Attribute {
+                name: removed.name,
+                value: removed.value,
+                // The deleted attribute is reported against the full ARN of the resource
+                // it was on, which is the form `Attribute$targetType` is not required
+                // beside.
+                target_type: None,
+                target_id: Some(arn),
+            });
+        }
+
+        Ok(DeleteAttributesOutput {
+            attributes: Some(deleted),
+        })
     }
 }
+
