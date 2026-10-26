@@ -865,10 +865,14 @@ impl EmailIdentityRecord {
             // owns that, and nothing here requests one.
             next_signing_key_length: None,
             current_signing_key_length: self.dkim.signing_key_length.clone(),
-            // SES generated the Easy DKIM key pair when it created the identity;
-            // with BYODKIM the caller owns the key, so SES generated none.
+            // SES generated the Easy DKIM key pair when it configured DKIM for the
+            // identity, which is exactly when it published a token set of its own;
+            // with BYODKIM the caller owns the key, so SES generated none, and an
+            // identity with no DKIM configuration has no key pair either. Whether
+            // signing is currently switched on does not come into it: turning
+            // signing off generates and destroys no key.
             last_key_generation_timestamp: (self.dkim.origin == DkimOrigin::AwsSes
-                && self.dkim.signing_enabled)
+                && !self.dkim.tokens.is_empty())
                 .then(|| ::aws_smithy_types::DateTime::from(self.created_at)),
         }
     }

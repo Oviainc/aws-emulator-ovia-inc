@@ -27,6 +27,8 @@ mod contact_lists;
 mod email_identity_certificates;
 #[path = "all/email_identity_configuration_set_association.rs"]
 mod email_identity_configuration_set_association;
+#[path = "all/email_identity_dkim_attributes.rs"]
+mod email_identity_dkim_attributes;
 #[path = "all/email_identity_feedback_attributes.rs"]
 mod email_identity_feedback_attributes;
 #[path = "all/email_identity_lifecycle.rs"]

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutEmailIdentityDkimAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutEmailIdentityDkimAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutEmailIdentityDkimAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +130,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutEmailIdentityDkimAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutEmailIdentityDkimAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Request metadata is not needed: the identity is keyed by name within the
+        // one emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to write to. That is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutEmailIdentityDkimAttributes without the shared emulator state",
+            ));
+        };
+
+        let mut store = state.lock();
+        // A read of the table reports settled statuses; do the same here so this
+        // write lands on the same record a read would have reported.
+        store.settle(::std::time::SystemTime::now());
+
+        let Some(record) = store
+            .identities
+            .get_mut(&crate::state::identity_key(&input.email_identity))
+        else {
+            return Err(PutEmailIdentityDkimAttributesErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Email identity {} does not exist.",
+                        input.email_identity
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "Sets the DKIM signing configuration for the identity": the request carries
+        // the whole setting, so the stored flag becomes exactly the value supplied —
+        // writing the same value again changes nothing — and every later read reports
+        // it as `DkimAttributes$SigningEnabled`. The member is modelled with a default
+        // of `false`, so a request that omits it turns signing off.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutEmailIdentityDkimAttributes"))
+        // Nothing else on the identity's DKIM configuration is this call's to move:
+        // the authentication status is what SES finds in the domain's DNS, and the
+        // tokens, the origin and the key length belong to the key pair in use, which
+        // `PutEmailIdentityDkimSigningAttributes` configures. Toggling signing
+        // publishes and revokes nothing, so it leaves all of them as they stand.
+        record.dkim.signing_enabled = input.signing_enabled;
+
+        Ok(PutEmailIdentityDkimAttributesOutput {})
     }
 }
