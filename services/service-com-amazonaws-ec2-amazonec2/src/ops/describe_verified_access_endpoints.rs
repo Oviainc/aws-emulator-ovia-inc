@@ -274,10 +274,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the Verified Access group" and "The ID of the Verified Access instance". Both
             // are read off the stored endpoint, which took its instance from its group, so
             // the two can never select inconsistently. An unknown GROUP id is refused above;
-            // an instance id narrows without being resolved, because nothing in this emulator
-            // stores Verified Access instances yet (`CreateVerifiedAccessInstance` is a
-            // scaffold stub with its own open issue), so there is no instance store to resolve
-            // it against — narrowing on it is all this operation can honestly do.
+            // an instance id narrows the report without being resolved, because an endpoint
+            // takes its instance from its group — so an id that names no endpoint's instance
+            // selects nothing rather than being an error.
             if input
                 .verified_access_group_id
                 .as_deref()
