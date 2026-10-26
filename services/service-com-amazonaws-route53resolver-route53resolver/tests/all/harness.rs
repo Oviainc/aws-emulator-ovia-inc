@@ -24,7 +24,13 @@ pub const ACCOUNT: &str = "000000000000";
 
 /// A fresh emulator: one shared engine, this one service mounted on it.
 pub fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    emulator_on(Arc::new(engine::InMemoryEngine::new()))
+}
+
+/// The same emulator, mounted on an engine the caller keeps a handle to — for a
+/// suite that must observe the store itself and not only the wire (whether a
+/// call wrote a record at all, say).
+pub fn emulator_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.register_service(EmulatedService::new(engine));
     router

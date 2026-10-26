@@ -31,6 +31,8 @@ mod outpost_resolvers;
 mod resolver_configs;
 #[path = "all/resolver_dnssec_config_listing.rs"]
 mod resolver_dnssec_config_listing;
+#[path = "all/resolver_dnssec_config_reads.rs"]
+mod resolver_dnssec_config_reads;
 #[path = "all/resolver_dnssec_configs.rs"]
 mod resolver_dnssec_configs;
 #[path = "all/resolver_endpoint_ip_address_association.rs"]
