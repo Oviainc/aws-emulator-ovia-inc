@@ -9,12 +9,12 @@
 //!
 //! The rules under test:
 //!
-//! 1. An operation that can only run under the IAM role a hypervisor's PROPERTY MAPPINGS
-//!    name is refused with the modelled `AccessDeniedException` (HTTP 403, `ErrorCode`
-//!    `MappingsNotConfigured`) whenever no mappings are set for the ARN it was asked for
-//!    — before any resource-existence lookup, so an ARN naming no hypervisor at all is
-//!    refused exactly like a hypervisor carrying no mappings, and never as a missing
-//!    resource. That is the RECORDED behaviour of this operation, pinned by the unit
+//! 1. A metadata sync is conditioned on NOTHING but the hypervisor the ARN resolves to:
+//!    every record this store holds is synced, whatever property mappings it carries, and
+//!    only an ARN this store holds no hypervisor under is refused — with the modelled
+//!    `AccessDeniedException` (HTTP 403, `ErrorCode` `MappingsNotConfigured`), the answer
+//!    that reveals nothing about whether the resource exists. That refusal is the RECORDED
+//!    behaviour of this operation, pinned by the unit
 //!    `backup-gateway.start-metadata-sync-state-transition`
 //!    (`issues/things-that-now-work/20261023T110543Z-backup-gateway-startvirtualmachinesmetadatasync-stub.md`,
 //!    whose check asserts that answer for a nonexistent `HypervisorArn`), and not a rule
@@ -24,9 +24,10 @@
 //!    clock — `CREATED`, then `RUNNING`, then `SUCCEEDED` dated at the instant it fell
 //!    due — so no call has to poll for the transition and no read moves it.
 //!
-//! The tables below span those classes: ARNs differing in resource type, partition, id
-//! and length (including each published bound of `ServerArn`), mapping sets differing in
-//! count and in the role they are set with, and every point of the sync's span.
+//! The tables below span those classes: hypervisors differing in the mappings they carry
+//! (none, several, an empty list, mappings since cleared) and in the role those mappings
+//! name, ARNs differing in resource type, partition, id and length (including each
+//! published bound of `ServerArn`), and every point of the sync's span.
 //!
 //! Where a case needs the clock to have moved on, the stored instant the sync started at
 //! is moved BACK instead of sleeping ([`rewind_sync`]): nothing but the clock carries a
@@ -38,7 +39,9 @@
 //! seed them straight into the `property_mappings` field it writes, so a sync is asserted
 //! against a known store whatever that handler does. The workflow a client walks with wire
 //! calls only — import, create and associate a gateway, put the mappings, start the sync —
-//! is covered end-to-end by the sibling `metadata_sync_over_the_wire` suite.
+//! is covered end-to-end by the sibling `metadata_sync_over_the_wire` suite, and the
+//! sibling `metadata_sync_is_not_gated_on_property_mappings` suite walks the shorter path
+//! a client needs for a sync alone.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -404,43 +407,21 @@ async fn a_real_wait_alone_carries_the_sync_to_succeeded() {
     );
 }
 
-/// With no property mappings set for the ARN, the sync is refused with the modelled
-/// `AccessDeniedException` — HTTP 403, `ErrorCode` `MappingsNotConfigured` — whatever the
-/// ARN names: a hypervisor carrying no mappings, one whose mappings were cleared, a
-/// gateway, or an ARN this store holds no record for at all, in any partition and at each
-/// published bound of `ServerArn`.
+/// A sync is refused with the modelled `AccessDeniedException` — HTTP 403, `ErrorCode`
+/// `MappingsNotConfigured` — exactly for an ARN this store holds NO hypervisor under: a
+/// never-imported hypervisor ARN in any partition, each published bound of `ServerArn`,
+/// and an ARN that really names another resource of this service. Nothing is written for
+/// any of them.
 #[tokio::test]
-async fn a_sync_is_refused_when_no_mappings_are_configured() {
+async fn a_sync_is_refused_for_every_arn_no_hypervisor_is_stored_under() {
     let engine = build_engine();
     let router = build_router(&engine);
 
-    // Resources that really exist, so a refusal below is about the mappings and not about
-    // an empty store.
+    // A gateway that really exists, so its refusal is about the hypervisor the sync
+    // resolves and not about an empty store.
     let live_gateway = create(&router, "gw-live").await;
-    let no_mappings = import(&router, "hv-nomap", "198.51.100.30").await;
-    let cleared = import(&router, "hv-cleared", "198.51.100.31").await;
-    set_mappings(
-        &engine,
-        &cleared,
-        Some(StoredPropertyMappings {
-            iam_role_arn: format!(
-                "arn:aws:iam::{}:role/temporary",
-                engine::EMULATOR_ACCOUNT_ID
-            ),
-            vmware_to_aws_tag_mappings: vec![mapping("c", "t", "k", "v")],
-        }),
-    );
-    set_mappings(&engine, &cleared, None);
 
     let rows: Vec<(&str, String)> = vec![
-        (
-            "a hypervisor this store holds, carrying no mappings",
-            no_mappings.clone(),
-        ),
-        (
-            "a hypervisor whose mappings were set and then cleared",
-            cleared.clone(),
-        ),
         (
             "a hypervisor ARN that was never imported",
             hypervisor_arn_in("aws", "hv-ffffffffffffff01"),
@@ -480,79 +461,158 @@ async fn a_sync_is_refused_when_no_mappings_are_configured() {
                 Some("AccessDeniedException"),
                 Some(MAPPINGS_NOT_CONFIGURED)
             ),
-            "case {case:?}: a sync with no mappings configured must be refused with 403 \
-             AccessDeniedException, got {} {:?}",
+            "case {case:?}: a sync for an ARN no hypervisor is stored under must be \
+             refused with 403 AccessDeniedException, got {} {:?}",
             reply.status,
             reply.body
         );
     }
 
-    // A refused sync wrote nothing: the records this store does hold still report no sync.
-    for (case, arn) in [
-        ("a hypervisor carrying no mappings", &no_mappings),
-        ("a hypervisor whose mappings were cleared", &cleared),
-    ] {
-        assert_eq!(
-            sync_started(&engine, arn),
-            None,
-            "case {case:?}: a refused sync must not have been persisted"
-        );
-        let reply = get_hypervisor(&router, arn).await;
-        assert_eq!(
-            (
-                reply.status,
-                reply.str_at("/Hypervisor/LatestMetadataSyncStatus"),
-                reported_success_time(&reply)
-            ),
-            (200, None, None),
-            "case {case:?}: a refused sync must leave the record reporting none, got {} {:?}",
-            reply.status,
-            reply.body
-        );
-    }
+    // The refusals wrote nothing: no sync materialised an inventory anywhere.
+    let listed = call(&router, "ListVirtualMachines", &json!({})).await;
+    let machines = listed
+        .body
+        .get("VirtualMachines")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        listed.status == 200 && machines.is_empty(),
+        "a refused sync must materialise no inventory, got {} {:?}",
+        listed.status,
+        listed.body
+    );
 }
 
-/// The permission gate fires BEFORE any resource-existence lookup: a well-formed ARN this
-/// store holds no hypervisor under is refused exactly like a hypervisor that exists and
-/// carries no mappings — and not with the missing-hypervisor refusal every operation that
-/// does resolve the resource first answers with.
+/// The hypervisor's property mappings are not a precondition of a sync: a record this
+/// store holds is synced whatever mappings it carries — none, several, an empty list, or
+/// mappings since cleared — and each sync is persisted and carried along by the clock,
+/// where an ARN this store holds no hypervisor under is refused instead.
 #[tokio::test]
-async fn the_refusal_does_not_reveal_whether_the_arn_names_a_hypervisor() {
+async fn a_hypervisor_syncs_whatever_mappings_it_carries() {
     let engine = build_engine();
     let router = build_router(&engine);
 
-    let existing = import(&router, "hv-existing", "198.51.100.40").await;
-    let ghost = hypervisor_arn_in("aws", "hv-ffffffffffffff04");
+    let bare = import(&router, "hv-bare", "198.51.100.40").await;
+    let mapped = import(&router, "hv-mapped", "198.51.100.41").await;
+    set_mappings(
+        &engine,
+        &mapped,
+        Some(StoredPropertyMappings {
+            iam_role_arn: format!("arn:aws:iam::{}:role/mapped", engine::EMULATOR_ACCOUNT_ID),
+            vmware_to_aws_tag_mappings: vec![
+                mapping("department", "finance", "Department", "Finance"),
+                mapping("tier", "gold", "Tier", "Gold"),
+            ],
+        }),
+    );
+    let empty_mappings = import(&router, "hv-empty-mappings", "198.51.100.42").await;
+    set_mappings(
+        &engine,
+        &empty_mappings,
+        Some(StoredPropertyMappings {
+            iam_role_arn: format!("arn:aws-cn:iam::{}:role/empty", engine::EMULATOR_ACCOUNT_ID),
+            vmware_to_aws_tag_mappings: vec![],
+        }),
+    );
+    let cleared = import(&router, "hv-cleared", "198.51.100.43").await;
+    set_mappings(
+        &engine,
+        &cleared,
+        Some(StoredPropertyMappings {
+            iam_role_arn: format!(
+                "arn:aws:iam::{}:role/temporary",
+                engine::EMULATOR_ACCOUNT_ID
+            ),
+            vmware_to_aws_tag_mappings: vec![mapping("c", "t", "k", "v")],
+        }),
+    );
+    set_mappings(&engine, &cleared, None);
 
-    let for_existing = start_sync(&router, &existing).await;
+    let rows: Vec<(&str, &String)> = vec![
+        ("a hypervisor carrying no mappings at all", &bare),
+        ("a hypervisor carrying two mappings", &mapped),
+        (
+            "a hypervisor carrying an empty mapping list",
+            &empty_mappings,
+        ),
+        (
+            "a hypervisor whose mappings were set and then cleared",
+            &cleared,
+        ),
+    ];
+
+    for (case, arn) in &rows {
+        let reply = start_sync(&router, arn).await;
+        assert_eq!(
+            (reply.status, reply.str_at("/HypervisorArn")),
+            (200, Some(arn.as_str())),
+            "case {case:?}: the sync must answer 200 with the record's own ARN, got {} {:?}",
+            reply.status,
+            reply.body
+        );
+        assert!(
+            sync_started(&engine, arn).is_some(),
+            "case {case:?}: the start must persist the instant the sync was requested"
+        );
+
+        // The sync is in flight and nothing has succeeded yet. WHICH point of its span a
+        // read lands in is the clock's answer, so both are accepted here; the table above
+        // pins each point exactly by moving the stored instant.
+        let in_flight = get_hypervisor(&router, arn).await;
+        let reported = (
+            in_flight.status,
+            in_flight.str_at("/Hypervisor/LatestMetadataSyncStatus"),
+            reported_success_time(&in_flight),
+        );
+        assert!(
+            reported == (200, Some(SYNC_METADATA_CREATED), None)
+                || reported == (200, Some(SYNC_METADATA_RUNNING), None),
+            "case {case:?}: a sync just started must read back as CREATED or RUNNING with \
+             no successful sync yet, got {reported:?} in {:?}",
+            in_flight.body
+        );
+
+        // ... and once it falls due it has SUCCEEDED, on the clock alone.
+        rewind_sync(&engine, arn, METADATA_SYNC_SUCCEEDS_AFTER);
+        let succeeded = get_hypervisor(&router, arn).await;
+        assert_eq!(
+            (
+                succeeded.status,
+                succeeded.str_at("/Hypervisor/LatestMetadataSyncStatus"),
+                succeeded.str_at("/Hypervisor/LatestMetadataSyncStatusMessage"),
+            ),
+            (
+                200,
+                Some(SYNC_METADATA_SUCCEEDED),
+                Some(METADATA_SYNC_SUCCEEDED_MESSAGE)
+            ),
+            "case {case:?}: a sync past its due instant must read back as SUCCEEDED, got \
+             {} {:?}",
+            succeeded.status,
+            succeeded.body
+        );
+    }
+
+    // An ARN this store holds no hypervisor under is what the sync refuses, and an
+    // operation that reports the resource answers the same ARN as a missing hypervisor.
+    let ghost = hypervisor_arn_in("aws", "hv-ffffffffffffff04");
     let for_ghost = start_sync(&router, &ghost).await;
     assert_eq!(
         (
             for_ghost.status,
-            for_ghost.code.clone(),
-            for_ghost.str_at("/ErrorCode").map(str::to_string),
-            for_ghost.str_at("/Message").map(str::to_string),
+            for_ghost.code.as_deref(),
+            for_ghost.str_at("/ErrorCode")
         ),
         (
-            for_existing.status,
-            for_existing.code.clone(),
-            for_existing.str_at("/ErrorCode").map(str::to_string),
-            for_existing.str_at("/Message").map(str::to_string),
+            403,
+            Some("AccessDeniedException"),
+            Some(MAPPINGS_NOT_CONFIGURED)
         ),
-        "an ARN naming no hypervisor must be refused exactly like one carrying no \
-         mappings, got {:?} for the ghost and {:?} for the existing record",
-        for_ghost.body,
-        for_existing.body
+        "an ARN naming no hypervisor must be refused 403 AccessDeniedException, got {} {:?}",
+        for_ghost.status,
+        for_ghost.body
     );
-    assert_eq!(
-        for_ghost.status, 403,
-        "the gate must answer 403, got {} {:?}",
-        for_ghost.status, for_ghost.body
-    );
-
-    // An operation that DOES resolve the hypervisor first answers the same ghost ARN the
-    // other way, so the 403 above is the gate's order and not this service refusing every
-    // unknown ARN alike.
     let read = get_hypervisor(&router, &ghost).await;
     assert_eq!(
         (read.status, read.str_at("/ErrorCode")),

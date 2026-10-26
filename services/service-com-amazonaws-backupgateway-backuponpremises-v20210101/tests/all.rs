@@ -43,6 +43,8 @@ mod hypervisor_update;
 mod maintenance_start_time;
 #[path = "all/metadata_sync.rs"]
 mod metadata_sync;
+#[path = "all/metadata_sync_is_not_gated_on_property_mappings.rs"]
+mod metadata_sync_is_not_gated_on_property_mappings;
 #[path = "all/metadata_sync_over_the_wire.rs"]
 mod metadata_sync_over_the_wire;
 #[path = "all/negative_paths.rs"]

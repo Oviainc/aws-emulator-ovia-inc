@@ -9,18 +9,25 @@
 //! machines the hypervisor reports
 //! ([`crate::state::ComAmazonawsBackupgatewayBackuponpremisesV20210101State::start_metadata_sync`]),
 //! dated at the instant the sync falls due, so from that instant `ListVirtualMachines` and
-//! `GetVirtualMachine` report them. A sync runs
-//! under the IAM role the hypervisor's PROPERTY MAPPINGS name, so a request for an ARN no
-//! mappings are set for is refused with the modelled `AccessDeniedException` (HTTP 403)
-//! before any resource lookup — that gate answers alike whether or not the ARN names a
-//! hypervisor this store holds, which is the order the recorded unit
-//! `backup-gateway.start-metadata-sync-state-transition` pins (see
-//! [`crate::state::MAPPINGS_NOT_CONFIGURED`]). A client sets those mappings through
-//! `PutHypervisorPropertyMappings` on a hypervisor a gateway is associated with, so the
-//! whole workflow is reachable with wire calls alone —
-//! `tests/all/metadata_sync_over_the_wire.rs` walks it and
-//! `tests/all/virtual_machine_inventory_sync.rs` walks it through to the listing. This is
-//! the ONLY file to touch for this operation.
+//! `GetVirtualMachine` report them. This is the ONLY file to touch for this operation.
+//!
+//! The sync is conditioned on NOTHING but the hypervisor the ARN resolves to: the model
+//! documents the operation as sending a request to sync the metadata of the specified
+//! virtual machines and states no precondition, and a hypervisor's PROPERTY MAPPINGS — the
+//! VMware-to-Amazon tag mappings `PutHypervisorPropertyMappings` sets — are an optional
+//! tagging feature of that record, not something the sync waits for. So a hypervisor this
+//! store holds is synced whether it carries mappings or none, which is what makes
+//! `ImportHypervisorConfiguration` → `StartVirtualMachinesMetadataSync` →
+//! `ListVirtualMachines` reachable for a client that only has the API
+//! (`tests/all/metadata_sync_is_not_gated_on_property_mappings.rs`,
+//! `tests/all/virtual_machine_inventory_sync.rs`).
+//!
+//! An ARN this store holds NO hypervisor under is refused with the modelled
+//! `AccessDeniedException` (HTTP 403), the answer that reveals nothing about whether the
+//! resource exists, which is what the recorded unit
+//! `backup-gateway.start-metadata-sync-state-transition` pins for a nonexistent
+//! `HypervisorArn` — see [`crate::state::MAPPINGS_NOT_CONFIGURED`] for the recorded
+//! `ErrorCode` and the record it is quoted from.
 //!
 //! ## Shape of an operation
 //!
@@ -77,9 +84,12 @@
 //! ## Errors
 //!
 //! * `AccessDeniedException` (HTTP 403) — The operation cannot proceed because you have
-//!   insufficient permissions.
+//!   insufficient permissions. The refusal for a `HypervisorArn` this service holds no
+//!   hypervisor under, with `ErrorCode` [`crate::state::MAPPINGS_NOT_CONFIGURED`].
 //! * `ResourceNotFoundException` (HTTP 404) — A resource that is required for the action
-//!   wasn't found.
+//!   wasn't found. The only resource this operation resolves is the hypervisor, and an ARN
+//!   naming none takes the recorded permissions refusal above instead, so this shape is
+//!   not answered here.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -171,42 +181,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // One guard spans the gate and the write, so the record the gate passed is the
-        // record the sync is started on.
+        // One guard spans the lookup and the write, so the record the sync is started on
+        // is the record the store holds.
         let mut store = state.lock();
 
         // `HypervisorArn`'s length and pattern are refused by the boundary validator
         // before `handle` runs, so reaching here means the ARN is well formed.
         //
-        // The PERMISSION gate comes first. A metadata sync reads the virtual machines of
-        // the hypervisor and writes their tags under the IAM role the hypervisor's
-        // property mappings name, so with no mappings set there is no role the caller
-        // permitted the service to act with: the modelled `AccessDeniedException`, "the
-        // operation cannot proceed because you have insufficient permissions". That
-        // question is about the MAPPINGS, not about the hypervisor, so it is answered the
-        // same way for an ARN this store holds no hypervisor under — which is why a
-        // never-imported ARN is refused here, and not as a missing resource. That order is
-        // RECORDED and not a choice: the unit named in the module docs asserts this shape
-        // and `ErrorCode` for a `HypervisorArn` naming no hypervisor, so resolving the
-        // record first would answer that request the wrong way.
-        if !store.property_mappings_configured(&input.hypervisor_arn) {
-            return Err(
-                StartVirtualMachinesMetadataSyncErrorModeled::AccessDeniedException(
-                    AccessDeniedException {
-                        error_code: crate::state::MAPPINGS_NOT_CONFIGURED.to_string(),
-                        message: Some(crate::state::MAPPINGS_NOT_CONFIGURED_MESSAGE.to_string()),
-                    },
-                )
-                .into(),
-            );
-        }
-
-        // Past the gate the mappings exist, and they are a member of the hypervisor
-        // record — so the record exists too, and with one guard spanning both this
-        // refusal cannot be reached. It is written all the same, through the same
-        // `crate::state::MissingResource` choice of status and `ErrorCode` every other
-        // operation of this service refuses a missing hypervisor with, so a sync asked
-        // for a record the store does not hold can only ever answer that one way.
+        // The ONE question this operation asks is which hypervisor the ARN resolves to.
+        // Nothing else conditions the sync: the hypervisor's property mappings are the
+        // optional VMware-to-Amazon tag mappings of that record, so a hypervisor carrying
+        // none is synced like any other.
         //
         // The one write: the sync's own instant, and the inventory it discovers on the
         // hypervisor — the machines `ListVirtualMachines` and `GetVirtualMachine` report
@@ -216,17 +201,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ::std::time::SystemTime::now(),
         );
         let Some(started) = started else {
-            let missing = crate::state::MissingResource::Hypervisor;
-            let error = StartVirtualMachinesMetadataSyncErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    error_code: missing.error_code().map(str::to_string),
-                    message: Some(missing.message(&input.hypervisor_arn)),
-                },
+            // Nothing was written: this store holds no hypervisor under the ARN, so there
+            // is no record whose virtual machines could be synced. The answer is the
+            // modelled `AccessDeniedException` — "the operation cannot proceed because you
+            // have insufficient permissions" — which says nothing about whether the
+            // resource exists, and that is RECORDED and not a choice: the unit named in
+            // the module docs asserts this shape and `ErrorCode` for a `HypervisorArn`
+            // naming no hypervisor (see [`crate::state::MAPPINGS_NOT_CONFIGURED`]).
+            return Err(
+                StartVirtualMachinesMetadataSyncErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        error_code: crate::state::MAPPINGS_NOT_CONFIGURED.to_string(),
+                        message: Some(crate::state::MAPPINGS_NOT_CONFIGURED_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
             );
-            return Err(match missing.status_override() {
-                Some(status) => crate::scaffolded::Scaffolded::modeled_with_status(error, status),
-                None => error.into(),
-            });
         };
 
         // The ARN comes back off the record the store now holds, not off the request.

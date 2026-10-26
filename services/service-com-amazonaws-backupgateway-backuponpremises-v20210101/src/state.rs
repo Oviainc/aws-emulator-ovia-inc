@@ -230,24 +230,26 @@ pub const MAPPINGS_NOT_FOUND: &str = "MappingsNotFound";
 /// requirement is the error shape and the `ErrorCode`, and this wording is an example.
 pub const MAPPINGS_NOT_FOUND_MESSAGE: &str = "The mappings are not found.";
 
-/// `AccessDeniedException$ErrorCode` for an operation that can only run under the IAM
-/// role a hypervisor's property mappings name, asked for an ARN no mappings are set for.
+/// `AccessDeniedException$ErrorCode` for a metadata sync asked for a `HypervisorArn` this
+/// store holds no hypervisor under.
 ///
 /// `AccessDeniedException$ErrorCode` is REQUIRED and documented as "A description of why
 /// you have insufficient permissions"
-/// (`smithy_query(query="shape",shape="AccessDeniedException")`). A metadata sync reads
-/// and writes the virtual machines' tags under [`StoredPropertyMappings::iam_role_arn`],
-/// so with no mappings SET there is no role the service was permitted to act with — a
-/// PERMISSION answer (HTTP 403), which is why it does not depend on whether the ARN names
-/// a hypervisor this store holds.
+/// (`smithy_query(query="shape",shape="AccessDeniedException")`). A sync of a record the
+/// service does not hold is answered as a PERMISSION matter (HTTP 403) rather than as a
+/// missing resource, so the refusal says nothing about whether the ARN names anything.
 ///
 /// Both halves of that — the shape and this `ErrorCode`, answered for an ARN naming no
 /// hypervisor at all — are what the recorded unit
 /// `backup-gateway.start-metadata-sync-state-transition` pins
 /// (`issues/things-that-now-work/20261023T110543Z-backup-gateway-startvirtualmachinesmetadatasync-stub.md`,
 /// whose check asserts an `AccessDeniedException` with this code for a nonexistent
-/// `HypervisorArn` and states that the gate fires before the resource-existence lookup),
-/// so neither the value nor the order it is answered in is this emulator's choice.
+/// `HypervisorArn`, before any resource-existence lookup), so neither the value nor the
+/// answer being a refusal of that kind is this emulator's choice. It says nothing about a
+/// hypervisor the store DOES hold: the sync of such a record is conditioned on nothing
+/// ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::start_metadata_sync`]), and
+/// property mappings in particular are an optional tagging feature of the record
+/// ([`StoredPropertyMappings`]) rather than a precondition of a sync.
 pub const MAPPINGS_NOT_CONFIGURED: &str = "MappingsNotConfigured";
 
 /// See [`MAPPINGS_NOT_CONFIGURED`]. The sentence the modelled shape itself states —
@@ -1461,18 +1463,6 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         Some(record.clone())
     }
 
-    /// Whether property mappings are SET for `arn`.
-    ///
-    /// `false` both for a hypervisor this store holds that carries none and for an ARN it
-    /// holds no hypervisor under: the question is whether the mappings — and so the IAM
-    /// role a metadata sync runs under — exist, which they do not in either case. The ONE
-    /// place that question is asked, so an operation gated on the mappings cannot gate on
-    /// something subtly different.
-    pub fn property_mappings_configured(&self, arn: &str) -> bool {
-        self.hypervisor(arn)
-            .is_some_and(|hypervisor| hypervisor.property_mappings.is_some())
-    }
-
     /// The gateway ASSOCIATED with the hypervisor `hypervisor_arn` names, if any.
     ///
     /// A gateway records the hypervisor it serves in [`StoredGateway::hypervisor_arn`], so
@@ -1512,7 +1502,10 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// the record as it is now STORED — read out of the map after the write, so what a
     /// caller gets is what the store holds.
     ///
-    /// `None` — nothing written — when this store holds no hypervisor under `arn`.
+    /// `None` — nothing written — when this store holds no hypervisor under `arn`. That is
+    /// the ONLY thing a sync is conditioned on: a record this store holds is synced
+    /// whether or not it carries property mappings, which are the optional VMware-to-Amazon
+    /// tag mappings of the record ([`StoredPropertyMappings`]) and not a precondition.
     ///
     /// What is persisted is the instant the sync was REQUESTED, the status and message
     /// that instant puts the record in, and the time of a sync that had already
