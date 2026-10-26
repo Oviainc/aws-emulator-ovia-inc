@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConditionalForwarder
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConditionalForwarder`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConditionalForwarder::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes the remote DNS server addresses of a conditional forwarder a directory already
+//! holds, so its DNS forwards the remote domain's lookups somewhere else. Implemented
+//! here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +143,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConditionalForwarder` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConditionalForwarderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConditionalForwarder"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The update carries the same pair of address lists the create does, and they say
+        // the same thing: where the directory's DNS forwards the remote domain's lookups.
+        // A forwarder has to name at least one remote DNS server, so a request carrying
+        // neither list would leave it pointing at nothing. Refused on the INPUT, before the
+        // directory is resolved and before the store LOCK is taken, so such a request is
+        // answered the same way whether or not the pair it names is stored. The addresses
+        // themselves are already shaped by the modelled `IpAddr` / `Ipv6Addr` patterns.
+        let dns_ip_addrs = input.dns_ip_addrs.unwrap_or_default();
+        let dns_ipv6_addrs = input.dns_ipv6_addrs.unwrap_or_default();
+        if dns_ip_addrs.is_empty() && dns_ipv6_addrs.is_empty() {
+            return Err(invalid_parameter(
+                "DnsIpAddrs or DnsIpv6Addrs must name at least one remote DNS server address"
+                    .to_string(),
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        // The forwarder hangs off the directory whose DNS forwards, so an id naming no
+        // stored directory is refused with the modelled "specified entity could not be
+        // found" and changes nothing.
+        let Some(directory) = store.directories.get_mut(&input.directory_id) else {
+            return Err(
+                UpdateConditionalForwarderErrorModeled::EntityDoesNotExistException(
+                    crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
+                )
+                .into(),
+            );
+        };
+
+        // Changing a forwarder changes the directory's own DNS, exactly as creating or
+        // dropping one does, so it needs a directory that is in service: one still being
+        // built by the transition its create owes is unavailable, which is the modelled
+        // refusal for exactly that.
+        if directory.stage != crate::state::STAGE_ACTIVE {
+            return Err(
+                UpdateConditionalForwarderErrorModeled::DirectoryUnavailableException(
+                    crate::state::refusal(format!(
+                        "Directory {id} is in stage {stage} and is not available for \
+                         conditional forwarder changes",
+                        id = directory.directory_id,
+                        stage = directory.stage
+                    )),
+                )
+                .into(),
+            );
+        }
+
+        // A forwarder is identified by the remote domain it points at, resolved the way a
+        // stored one is keyed, so this update reaches the forwarder a create of the same
+        // domain would have collided with — whatever case or trailing root dot either
+        // request spelled it with. A domain this directory forwards nowhere is the entity
+        // that does not exist rather than a create in disguise, so an update of a forwarder
+        // that was never created, or that a delete already removed, is refused and stores
+        // nothing.
+        let key = crate::state::Directory::conditional_forwarder_key(&input.remote_domain_name);
+        let Some(forwarder) = directory.conditional_forwarders.get_mut(&key) else {
+            return Err(
+                UpdateConditionalForwarderErrorModeled::EntityDoesNotExistException(
+                    crate::state::refusal(crate::state::no_such_conditional_forwarder(
+                        &input.remote_domain_name,
+                    )),
+                )
+                .into(),
+            );
+        };
+
+        // The request's address lists BECOME the forwarder's, in the order it listed them:
+        // the update takes the same complete pair of lists the create does, so what it
+        // names is where the remote domain's lookups go from now on and an address it
+        // leaves out is no longer forwarded to. Neither the remote domain this forwarder is
+        // keyed by nor its replication scope is something this operation changes: it moves
+        // the addresses only, so the describe keeps reporting the name the create spelled.
+        forwarder.dns_ip_addrs = dns_ip_addrs;
+        forwarder.dns_ipv6_addrs = dns_ipv6_addrs;
+
+        // The operation models no output members: `DescribeConditionalForwarders` is what
+        // reports the new addresses back.
+        Ok(UpdateConditionalForwarderOutput {})
     }
+}
+
+/// Refuse the request with the modelled `InvalidParameterException`, naming the members
+/// and the rule they broke so the caller can fix the request from the message alone.
+fn invalid_parameter(message: String) -> UpdateConditionalForwarderError {
+    UpdateConditionalForwarderErrorModeled::InvalidParameterException(crate::state::refusal(
+        message,
+    ))
+    .into()
 }

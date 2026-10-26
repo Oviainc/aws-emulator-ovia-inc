@@ -19,6 +19,8 @@ mod certificates;
 mod computers;
 #[path = "all/conditional_forwarder_deletion.rs"]
 mod conditional_forwarder_deletion;
+#[path = "all/conditional_forwarder_update.rs"]
+mod conditional_forwarder_update;
 #[path = "all/conditional_forwarders.rs"]
 mod conditional_forwarders;
 #[path = "all/directory_data_access.rs"]
