@@ -242,6 +242,9 @@ mod offering_description;
 #[path = "all/partner_input.rs"]
 mod partner_input;
 
+#[path = "all/post_delete_mutation_classification.rs"]
+mod post_delete_mutation_classification;
+
 #[path = "all/rejection_messages.rs"]
 mod rejection_messages;
 

@@ -15,7 +15,8 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_emr_elasticmapreduce::state::{
-    AUDIT_TARGET, MAX_SECURITY_CONFIGURATIONS, MAX_SECURITY_CONFIGURATION_BYTES,
+    AUDIT_TARGET, LIST_PAGE_SIZE as PAGE_SIZE, MAX_SECURITY_CONFIGURATIONS,
+    MAX_SECURITY_CONFIGURATION_BYTES,
 };
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
@@ -91,6 +92,49 @@ impl SecurityConfigurations {
         self.emr
             .call("DeleteSecurityConfiguration", json!({ "Name": name }))
             .await
+    }
+
+    async fn list(&self, body: Value) -> (u16, Value) {
+        self.emr.call("ListSecurityConfigurations", body).await
+    }
+
+    /// Every name the listing reports, following `Marker` to the last page.
+    async fn list_names(&self, case: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut marker: Option<String> = None;
+        loop {
+            let body = match marker {
+                Some(ref marker) => json!({ "Marker": marker }),
+                None => json!({}),
+            };
+            let (status, payload) = self.list(body).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: ListSecurityConfigurations must answer 200, got {status} \
+                 with {payload}"
+            );
+            let page = at(&payload, &["SecurityConfigurations"])
+                .as_array()
+                .cloned()
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: SecurityConfigurations must be a list, got {payload}")
+                });
+            for entry in &page {
+                let name = at(entry, &["Name"])
+                    .as_str()
+                    .unwrap_or_else(|| panic!("case {case:?}: every entry carries a Name"))
+                    .to_string();
+                assert!(
+                    !at(entry, &["CreationDateTime"]).is_null(),
+                    "case {case:?}: every entry carries its creation instant, got {entry}"
+                );
+                names.push(name);
+            }
+            match at(&payload, &["Marker"]).as_str() {
+                Some(next) => marker = Some(next.to_string()),
+                None => return names,
+            }
+        }
     }
 }
 
@@ -682,10 +726,12 @@ async fn illegal_encryption_semantics_are_refused_and_legal_ones_accepted() {
 }
 
 /// THE RULE: the name identifies a security configuration, so a create under a name the
-/// store already holds is refused — identical document or not — and the stored document
-/// and its creation instant are left exactly as they were.
+/// store already holds stores nothing: re-submitting the SAME document is the create the
+/// caller already made and succeeds, answering the stored configuration's own creation
+/// instant, while a DIFFERENT document under that name is refused — and either way the
+/// stored document and its creation instant are left exactly as they were.
 #[tokio::test]
-async fn a_second_create_under_a_taken_name_is_refused_and_changes_nothing() {
+async fn a_second_create_under_a_taken_name_stores_nothing() {
     let original = json!({
         "EncryptionConfiguration": {
             "EnableAtRestEncryption": true,
@@ -700,26 +746,47 @@ async fn a_second_create_under_a_taken_name_is_refused_and_changes_nothing() {
     let created = emr.create_ok("taken", &original).await;
     let created_at = creation_secs("the first create", &created);
 
-    // The documents a second create may carry: the same bytes, the same JSON with other
-    // formatting, a different configuration, and an illegal one.
-    for (label, document) in [
-        ("the identical document", original.clone()),
+    // The documents a second create may carry, and whether re-submitting it is the same
+    // create: the same bytes (yes), the same JSON with other formatting, a different
+    // configuration, and an illegal one (no).
+    for (label, document, idempotent) in [
+        ("the identical document", original.clone(), true),
         (
             "the same JSON, pretty-printed",
             serde_json::to_string_pretty(
                 &serde_json::from_str::<Value>(&original).expect("the document is JSON"),
             )
             .expect("the document re-serializes"),
+            false,
         ),
-        ("a different document", "{}".to_string()),
+        ("a different document", "{}".to_string(), false),
         (
             "an illegal document",
             json!({ "EncryptionConfiguration": { "EnableAtRestEncryption": true } }).to_string(),
+            false,
         ),
     ] {
         // Not a rename: the name is the same every time, which is the point.
         let (status, payload) = emr.create("taken", &document).await;
-        assert_refused(label, status, &payload, "InvalidRequestException");
+        if idempotent {
+            assert_eq!(
+                status, 200,
+                "case {label:?}: an identical re-create must succeed, got {status} with {payload}"
+            );
+            assert_eq!(
+                at(&payload, &["Name"]).as_str(),
+                Some("taken"),
+                "case {label:?}: expected the requested name back, got {payload}"
+            );
+            assert_eq!(
+                creation_secs(label, &payload),
+                created_at,
+                "case {label:?}: an identical re-create answers the stored creation instant, \
+                 got {payload}"
+            );
+        } else {
+            assert_refused(label, status, &payload, "InvalidRequestException");
+        }
 
         let described = emr.describe_ok("taken").await;
         assert_eq!(
@@ -747,6 +814,162 @@ async fn a_second_create_under_a_taken_name_is_refused_and_changes_nothing() {
         Some("{}"),
         "case {:?}: expected its own document, not the other one",
         "a free name"
+    );
+}
+
+/// THE RULE, under concurrency: identical creates of one name are the same create, so a
+/// racing provisioner loses no racer — every concurrent identical create succeeds and
+/// they all report the one stored configuration.
+#[tokio::test]
+async fn concurrent_identical_creates_all_succeed() {
+    // Rows differ in how many racers submit at once, and in the document they agree on.
+    for (case, racers, document) in [
+        ("two racers, the empty configuration", 2usize, "{}".to_string()),
+        (
+            "four racers, an encryption configuration with both flags off",
+            4,
+            json!({
+                "EncryptionConfiguration": {
+                    "EnableInTransitEncryption": false,
+                    "EnableAtRestEncryption": false,
+                }
+            })
+            .to_string(),
+        ),
+        (
+            "eight racers, a document with no encryption section",
+            8,
+            json!({ "Raced": true }).to_string(),
+        ),
+    ] {
+        let emr = Arc::new(SecurityConfigurations::new());
+        let name = format!("raced-{racers}");
+
+        // Every racer is spawned before any of them is awaited, so they are all in
+        // flight together and each decides against whatever the store holds when it runs.
+        let mut racing = Vec::with_capacity(racers);
+        for _ in 0..racers {
+            let emr = Arc::clone(&emr);
+            let name = name.clone();
+            let document = document.clone();
+            racing.push(tokio::spawn(
+                async move { emr.create(&name, &document).await },
+            ));
+        }
+        let mut answers = Vec::with_capacity(racers);
+        for racer in racing {
+            answers.push(racer.await.expect("the racer ran to completion"));
+        }
+
+        for (index, (status, payload)) in answers.iter().enumerate() {
+            assert_eq!(
+                *status, 200,
+                "case {case:?}: racer {index} must succeed, got {status} with {payload}"
+            );
+            assert_eq!(
+                at(payload, &["Name"]).as_str(),
+                Some(name.as_str()),
+                "case {case:?}: racer {index} must answer the requested name, got {payload}"
+            );
+        }
+        // One stored configuration, with one creation instant, which every racer saw.
+        let described = emr.describe_ok(&name).await;
+        assert_eq!(
+            at(&described, &["SecurityConfiguration"]).as_str(),
+            Some(document.as_str()),
+            "case {case:?}: the stored document must be the one every racer submitted, \
+             got {described}"
+        );
+        let stored_at = creation_secs(case, &described);
+        for (index, (_, payload)) in answers.iter().enumerate() {
+            assert_eq!(
+                creation_secs(case, payload),
+                stored_at,
+                "case {case:?}: racer {index} must report the stored creation instant, \
+                 got {payload}"
+            );
+        }
+        // One name, one entry: the racers created ONE configuration between them.
+        assert_eq!(
+            emr.list_names(case).await,
+            vec![name.clone()],
+            "case {case:?}: the listing must hold exactly one entry"
+        );
+    }
+}
+
+/// THE RULE: `ListSecurityConfigurations` reports the configurations the store holds —
+/// one entry per stored name, with its creation instant — paginated on `Marker`, and
+/// reading the listing changes nothing.
+///
+/// The rows differ along how many configurations are held, which is what the pagination
+/// generalises over: none, one, a page's worth and more than a page.
+#[tokio::test]
+async fn the_listing_reports_one_entry_per_stored_configuration() {
+    let emr = SecurityConfigurations::new();
+    let case = "an account holding nothing";
+    assert!(
+        emr.list_names(case).await.is_empty(),
+        "case {case:?}: an account with no configuration lists none"
+    );
+
+    // One past the page size, so the walk crosses a page boundary.
+    let held = PAGE_SIZE + 1;
+    let mut expected: Vec<String> = Vec::new();
+    for index in 0..held {
+        // Zero-padded, so the names sort the way the store keys them.
+        let name = format!("listed-{index:04}");
+        emr.create_ok(&name, &json!({ "Index": index }).to_string())
+            .await;
+        expected.push(name);
+
+        let case = format!("{} configuration(s) held", index + 1);
+        let listed = emr.list_names(&case).await;
+        assert_eq!(
+            listed, expected,
+            "case {case:?}: the listing must report every stored name once"
+        );
+    }
+
+    // A page is no longer than the page size, and the marker names the first entry of
+    // the next page.
+    let (status, first) = emr.list(json!({})).await;
+    assert_eq!(status, 200, "the first page must answer 200, got {first}");
+    let page = at(&first, &["SecurityConfigurations"])
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        page.len(),
+        PAGE_SIZE,
+        "a full page carries the page size, got {} entries",
+        page.len()
+    );
+    assert_eq!(
+        at(&first, &["Marker"]).as_str(),
+        Some(expected[PAGE_SIZE].as_str()),
+        "the marker must name the first entry of the next page, got {first}"
+    );
+
+    // A marker naming nothing the listing holds is refused rather than read as a resume
+    // point.
+    for marker in ["listed-9999", "", "LISTED-0000"] {
+        let (status, payload) = emr.list(json!({ "Marker": marker })).await;
+        assert_refused(
+            &format!("a marker naming {marker:?}"),
+            status,
+            &payload,
+            "InvalidRequestException",
+        );
+    }
+
+    // A deleted configuration leaves the listing, and nothing else moves.
+    emr.delete(&expected[0]).await;
+    let after = emr.list_names("after a delete").await;
+    assert_eq!(
+        after,
+        expected[1..],
+        "a deleted configuration leaves the listing"
     );
 }
 
@@ -1142,8 +1365,14 @@ async fn state_changing_calls_emit_one_audit_record_each() {
             "security-configuration-created",
         ),
         (
-            "a create under a taken name",
+            "a create re-submitting the stored document",
             Call::Create("audited", secret_document.clone()),
+            "audited",
+            "security-configuration-unchanged",
+        ),
+        (
+            "a create under a taken name, with a different document",
+            Call::Create("audited", json!({ "Raced": false }).to_string()),
             "audited",
             "conflict",
         ),

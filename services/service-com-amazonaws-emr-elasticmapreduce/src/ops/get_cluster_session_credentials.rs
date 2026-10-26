@@ -2,16 +2,18 @@
 
 //! @op GetClusterSessionCredentials
 //! Resolves the cluster and then refuses, with the modelled `InvalidRequestException`,
-//! to issue credentials for an endpoint nothing serves.
+//! to issue credentials for a cluster whose security configuration enables no runtime
+//! role.
 //!
 //! What this operation returns is "temporary, HTTP basic credentials … used by a
 //! cluster with fine-grained access control activated", for connecting "to cluster
 //! endpoints that support username and password authentication" (its own model
-//! documentation). This emulator launches no cluster instances and serves no such
-//! endpoint, so there is no endpoint for a username and password to authenticate
-//! against: minting a pair here would be a credential for a service nothing runs.
-//! Both refusals are the one client error this operation models — a cluster id no
-//! cluster carries, and a cluster with no username/password endpoint — and they are
+//! documentation). A cluster gets that activation from the runtime roles or IAM
+//! Identity Center integration its SECURITY CONFIGURATION enables, and this emulator
+//! enables neither on any cluster, so there is no runtime role for a username and
+//! password to be issued against: minting a pair here would be a credential for a
+//! service nothing runs. Both refusals are the one client error this operation models —
+//! a cluster id no cluster carries, and a cluster with no runtime role — and they are
 //! told apart by their message, never by a 501.
 //!
 //! ## Shape of an operation
@@ -166,34 +168,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The cluster is resolved first, so an id no cluster carries is refused as the
-        // client error it is rather than as a missing capability.
-        let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
+        // client error it is rather than as a missing capability. This operation words
+        // that refusal without naming the id.
+        if store.cluster_mut(&input.cluster_id, now).is_none() {
             return Err(
                 GetClusterSessionCredentialsErrorModeled::InvalidRequestException(
                     InvalidRequestException {
                         error_code: None,
-                        message: Some(format!(
-                            "Cluster id '{}' is not valid or does not exist.",
-                            input.cluster_id
-                        )),
+                        message: Some(crate::state::unknown_cluster_without_id_message()),
                     },
                 )
                 .into(),
             );
-        };
+        }
 
-        // The cluster exists, and it runs no instance and publishes no cluster
-        // endpoint that takes a username and password, so there is nothing for HTTP
-        // basic credentials to authenticate against. See this module's documentation.
+        // The cluster exists. Session credentials are for "a cluster with fine-grained
+        // access control activated", which a cluster gets from the runtime roles or IAM
+        // Identity Center integration its SECURITY CONFIGURATION enables; a cluster
+        // whose security configuration enables neither has no runtime role to issue
+        // credentials for, and that is what the refusal names.
         Err(
             GetClusterSessionCredentialsErrorModeled::InvalidRequestException(
                 InvalidRequestException {
                     error_code: None,
-                    message: Some(format!(
-                        "Cluster '{}' has no endpoint with fine-grained access control \
-                         activated, so no session credentials can be issued for it.",
-                        cluster.id
-                    )),
+                    message: Some(crate::state::runtime_roles_not_enabled_message()),
                 },
             )
             .into(),

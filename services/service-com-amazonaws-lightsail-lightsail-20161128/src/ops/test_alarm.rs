@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TestAlarm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TestAlarm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Puts ONE stored alarm into the `AlarmState` the request asks to test, and
+//! answers the operation-log entry the write appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TestAlarm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Testing an alarm is what drives it into a state nothing else can: this
+//! emulator receives no measurement of any metric an alarm watches, so an alarm
+//! stays in the state `PutAlarm` left it in until a test moves it (see
+//! [`crate::state::ALARM_STATE_INSUFFICIENT_DATA`]). The banner the console
+//! displays and the notification a configured trigger sends are both about that
+//! state, and the state is what a later `GetAlarms` reports.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +170,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TestAlarm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TestAlarmErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TestAlarm"))
+        // An alarm is addressed by name and the state to test comes from the
+        // request, so nothing this operation reads or writes comes from the
+        // request metadata `ctx` carries — not even the region, which is the
+        // stored alarm's own.
+        let _ = ctx;
+
+        // `alarmName` and `state` are modelled `@required` members, the name's
+        // pattern is a modelled constraint and `state` targets the modelled
+        // `AlarmState` enum (`ALARM`, `INSUFFICIENT_DATA`, `OK`), so the
+        // centralized walk refused everything outside them before this body ran:
+        // every state this handler can store is one the model admits, and there
+        // is no further rule a request can break.
+        let name = input.alarm_name;
+        let tested_state = input.state;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            let alarm = store.alarm_mut(&name).ok_or_else(|| not_found(&name))?;
+            // The test puts the alarm into the state the caller named, which is
+            // the state the console's banner and any notification the alarm's
+            // own triggers send are about. Nothing else on the record changes: a
+            // test is not a re-configuration, so the metric, the thresholds, the
+            // contact protocols and the alarm's identity are left exactly as
+            // `PutAlarm` stored them.
+            //
+            // A notification goes out only when the alarm has the tested state
+            // among its `notificationTriggers`, has notifications enabled, and
+            // the Region holds a contact method for one of its
+            // `contactProtocols` — and it is delivered to an email address or a
+            // phone number, so nothing this emulator can reach. The state the
+            // test set is the whole of what a caller can observe afterwards, and
+            // it is observable through `GetAlarms`.
+            alarm.state = tested_state.clone();
+            let location = alarm.location.clone();
+            // The alarm is in the tested state as this call returns, so the work
+            // this operation describes is already done and the entry is
+            // terminal.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_TEST_ALARM,
+                crate::state::RESOURCE_TYPE_ALARM,
+                &name,
+                &location,
+                None,
+            );
+            Ok(TestAlarmOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// No alarm of that name is stored, so there is nothing to test: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the
+/// requested name. The same rejection `DeleteAlarm` answers for the same missing
+/// record.
+fn not_found(name: &str) -> TestAlarmError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(crate::state::RESOURCE_TYPE_ALARM, name)
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> TestAlarmError {
+    TestAlarmErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail alarm store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

@@ -147,7 +147,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // MediaPackage is regional: a listing reports only the endpoints of the Region
+        // its own request is served in.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListOriginEndpointsErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -169,8 +171,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = crate::state::page_size(input.max_results);
 
         // The channelId filter applies BEFORE paging, so a page is `MaxResults`
-        // matching endpoints and the token points at the next matching one.
-        let matching = state.origin_endpoints.values().filter(|record| {
+        // matching endpoints and the token points at the next matching one. One Region's
+        // endpoints are a contiguous id-ordered range of the store, so an endpoint of
+        // another Region is not reported here at all.
+        let matching = state.origin_endpoints_in(&region).filter(|record| {
             input
                 .channel_id
                 .as_deref()
@@ -183,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         let origin_endpoints = keys
             .iter()
-            .filter_map(|key| state.origin_endpoints.get(*key))
+            .filter_map(|key| state.origin_endpoint(&region, key))
             .map(crate::state::OriginEndpointRecord::to_origin_endpoint)
             .collect();
 

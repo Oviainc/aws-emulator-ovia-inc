@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DissociatePackages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DissociatePackages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DissociatePackages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes each package the call names OFF the domain it names: the one
+//! [`crate::state::PackageAssociation`] the domain holds for that package goes into
+//! its removal status, which the clock then completes by taking the record off the
+//! domain, and the call answers with the stored records through the same
+//! `DomainPackageDetails` projection every other operation reports an association
+//! with.
+//!
+//! The whole call is decided before anything is written, so a request that cannot be
+//! served leaves the domain's associations exactly as they were. Each package is
+//! judged by the store's one `plan_package_dissociation`, shared with the operation
+//! that unlinks a single package, so the two cannot serve or refuse the same request
+//! differently.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +84,13 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::collections::BTreeSet;
+use std::time::SystemTime;
+
+use crate::state::{
+    domain_does_not_exist, internal_failure, package_named_twice, AssociationRefusal, Package,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -154,18 +165,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DissociatePackages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DissociatePackagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+
+        // Whatever the clock already owed the records this call reads is materialised
+        // first, so the call decides on the state of the store at `now`: an
+        // association whose move has landed is no longer in flight, and one whose
+        // removal has fallen due is no longer on the domain at all.
+        store.settle_packages(now);
+        // A name that names no domain is refused by the lookup this settling precedes.
+        let _ = store.settled_mut(&input.domain_name, now);
+
+        // The domain the call names is resolved whatever else the request carries, so
+        // a name that names no domain is refused even by a call that goes on to name
+        // no package at all: the domain is what the call acts on. It is the SAME
+        // refusal the per-package decision below makes for an unresolvable domain, so
+        // a batch that names one is refused identically however many packages it
+        // carries.
+        if !store.domains.contains_key(&input.domain_name) {
+            return Err(DissociatePackagesErrorModeled::ValidationException(
+                domain_does_not_exist(&input.domain_name),
+            )
+            .into());
+        }
+
+        // Each entry is read, checked and decided in ONE pass, and NOTHING is written
+        // until every package the call names can be dissociated, so a refused request
+        // leaves the domain's associations as they were.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DissociatePackages"))
+        // `PackageList` carries no length constraint, so how many entries it holds is
+        // the caller's — which is why the pass refuses at the first entry it cannot
+        // serve rather than walking the whole list first, and why nothing here is
+        // sized by that length. Every entry the pass admits names a DISTINCT
+        // association the domain holds, so the work and the records kept are bounded
+        // by the store: a request naming more than that is refused by the entry that
+        // repeats a package or names a link the domain does not have.
+        //
+        // A domain holds ONE association per package, so the same package cannot be
+        // named twice by one call: that request asks for two removals of one link.
+        // Each entry is then decided by the one shared decision this service makes
+        // about unlinking a package from a domain, so this call and the one that
+        // unlinks a single package cannot refuse the same request differently.
+        let mut requested: BTreeSet<&str> = BTreeSet::new();
+        let mut planned: Vec<Package> = Vec::new();
+        for package_id in &input.package_list {
+            if !requested.insert(package_id.as_str()) {
+                return Err(DissociatePackagesErrorModeled::ValidationException(
+                    package_named_twice("PackageList", package_id),
+                )
+                .into());
+            }
+            planned.push(
+                store
+                    .plan_package_dissociation(&input.domain_name, package_id)
+                    .map_err(refuse)?,
+            );
+        }
+
+        let mut reported = Vec::with_capacity(planned.len());
+        for package in &planned {
+            // The plan above resolved the domain and the link under the SAME lock this
+            // write holds, so there is no request that reaches this arm: a store that
+            // no longer holds them is an internal failure rather than anything the
+            // caller can fix.
+            let details = store
+                .remove_package_association(&input.domain_name, package, now)
+                .ok_or_else(|| {
+                    DissociatePackagesErrorModeled::InternalException(internal_failure(
+                        "the domain's package associations",
+                    ))
+                })?;
+            reported.push(details);
+        }
+
+        Ok(DissociatePackagesOutput {
+            domain_package_details_list: Some(reported),
+        })
     }
+}
+
+/// The shared refusal, as THIS operation's error channel names it.
+fn refuse(refusal: AssociationRefusal) -> DissociatePackagesError {
+    match refusal {
+        AssociationRefusal::NotFound(payload) => {
+            DissociatePackagesErrorModeled::ResourceNotFoundException(payload)
+        }
+        AssociationRefusal::Conflict(payload) => {
+            DissociatePackagesErrorModeled::ConflictException(payload)
+        }
+        AssociationRefusal::Validation(payload) => {
+            DissociatePackagesErrorModeled::ValidationException(payload)
+        }
+    }
+    .into()
 }

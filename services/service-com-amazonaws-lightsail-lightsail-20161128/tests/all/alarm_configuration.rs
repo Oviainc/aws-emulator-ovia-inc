@@ -62,14 +62,14 @@ const INSTANCE_BUNDLE: &str = "micro_3_0";
 /// emulator — `CreateLoadBalancer` is still a scaffold with its own issue — so a
 /// load balancer metric is exercised through the refusals instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Monitored {
+pub(crate) enum Monitored {
     Instance,
     RelationalDatabase,
 }
 
 impl Monitored {
     /// The modelled `ResourceType` value a resource of this kind reports.
-    fn resource_type(self) -> &'static str {
+    pub(crate) fn resource_type(self) -> &'static str {
         match self {
             Self::Instance => "Instance",
             Self::RelationalDatabase => "RelationalDatabase",
@@ -79,7 +79,10 @@ impl Monitored {
 
 /// Create the monitored resource `name` of `kind` in `zone`, answering the ARN
 /// its own read reports.
-async fn monitored_resource(
+///
+/// `pub(crate)` so a sibling suite in this test target puts an alarm on a
+/// resource created the same way rather than standing up a second fixture.
+pub(crate) async fn monitored_resource(
     emulator: &Emulator,
     kind: Monitored,
     name: &str,
@@ -138,7 +141,9 @@ async fn monitored_resource(
 }
 
 /// The alarms `GetAlarms` reports for `filters`, walking every page.
-async fn alarms(emulator: &Emulator, filters: Value) -> (Vec<Value>, Vec<usize>) {
+///
+/// `pub(crate)` so a sibling suite reads the stored alarms the same way.
+pub(crate) async fn alarms(emulator: &Emulator, filters: Value) -> (Vec<Value>, Vec<usize>) {
     let mut found = Vec::new();
     let mut page_sizes = Vec::new();
     let mut token: Option<String> = None;
@@ -170,7 +175,9 @@ async fn alarms(emulator: &Emulator, filters: Value) -> (Vec<Value>, Vec<usize>)
 }
 
 /// The one alarm `name` names, or a panic naming `case`.
-async fn alarm(emulator: &Emulator, name: &str, case: &str) -> Value {
+///
+/// `pub(crate)` so a sibling suite reads one stored alarm the same way.
+pub(crate) async fn alarm(emulator: &Emulator, name: &str, case: &str) -> Value {
     let (found, _) = alarms(emulator, json!({"alarmName": name})).await;
     assert_eq!(
         found.len(),
@@ -181,7 +188,9 @@ async fn alarm(emulator: &Emulator, name: &str, case: &str) -> Value {
 }
 
 /// Every alarm name in `found`, in the order they were reported.
-fn names(found: &[Value]) -> Vec<String> {
+///
+/// `pub(crate)` so a sibling suite names the reported alarms the same way.
+pub(crate) fn names(found: &[Value]) -> Vec<String> {
     found
         .iter()
         .map(|alarm| alarm["name"].as_str().unwrap_or_default().to_string())

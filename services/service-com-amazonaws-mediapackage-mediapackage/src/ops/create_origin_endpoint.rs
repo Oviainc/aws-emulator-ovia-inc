@@ -282,18 +282,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut state = state.lock();
 
+        // MediaPackage is regional: this endpoint belongs to the Region this request is
+        // served in, and every id it names resolves only among that Region's records.
+        let region = crate::state::request_region(ctx.parts());
+
         // An OriginEndpoint packages ONE Channel: a ChannelId naming no stored channel
-        // has nothing to package, so the endpoint is not created. This is a value in the
-        // REQUEST the caller has to fix — not a resource the request addressed — so it is
-        // `UnprocessableEntityException` (422) keyed by the member, which is a different
-        // answer from "the endpoint you asked about is gone" (404).
-        if !state.channels.contains_key(&input.channel_id) {
+        // OF THIS REGION has nothing to package — a channel of the same id in another
+        // Region is another Region's channel — so the endpoint is not created. This is a
+        // value in the REQUEST the caller has to fix — not a resource the request
+        // addressed — so it is `UnprocessableEntityException` (422) keyed by the member,
+        // which is a different answer from "the endpoint you asked about is gone" (404).
+        if !state.has_channel(&region, &input.channel_id) {
             return Err(crate::state::member_not_found("channelId").into());
         }
 
-        // The ID must be unique: a second create on an id already in use is refused,
-        // never an overwrite.
-        if state.origin_endpoints.contains_key(&input.id) {
+        // "The ID must be unique within the region": a second create on an id already in
+        // use in this Region is refused, never an overwrite.
+        if state.has_origin_endpoint(&region, &input.id) {
             return Err(crate::state::resource_already_exists(
                 crate::state::ORIGIN_ENDPOINT_KIND,
                 &input.id,
@@ -302,7 +307,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The store lives for the life of the process and only a create adds to it, so
-        // it is capped by entry count; past the cap the resource limit is reported.
+        // it is capped by entry count — across every Region, because the memory the
+        // process holds is the sum of them; past the cap the resource limit is reported.
         if state.origin_endpoints.len() >= crate::state::MAX_ORIGIN_ENDPOINTS {
             return Err(crate::state::resource_limit_reached(
                 crate::state::ORIGIN_ENDPOINT_KIND,
@@ -328,12 +334,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Err(supplied) => return Err(crate::state::packaging_refusal(&supplied).into()),
         };
 
-        let region = crate::state::request_region(ctx.parts());
         let manifest_name = input
             .manifest_name
             .clone()
             .unwrap_or_else(|| crate::state::DEFAULT_MANIFEST_NAME.to_string());
         let mut record = crate::state::OriginEndpointRecord {
+            region: region.clone(),
             arn: crate::state::origin_endpoint_arn(&region, &input.id),
             channel_id: input.channel_id.clone(),
             description: input.description.clone(),
@@ -377,11 +383,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `insert` + the read back below: the record returned is always the STORED one,
         // and the id is free (refused as a duplicate above), so nothing is replaced.
         let id = input.id.clone();
-        state.origin_endpoints.insert(id.clone(), record);
+        state.insert_origin_endpoint(record);
         let stored = state
-            .origin_endpoints
-            .get(&id)
-            .expect("the record just inserted under this id");
+            .origin_endpoint(&region, &id)
+            .expect("the record just inserted under this region and id");
 
         // Rendered from the STORED record, so the create response and every later
         // DescribeOriginEndpoint/ListOriginEndpoints are the same bytes.

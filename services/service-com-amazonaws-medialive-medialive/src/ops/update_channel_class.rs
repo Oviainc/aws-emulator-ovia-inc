@@ -30,8 +30,8 @@
 //! channel into the modelled `UPDATING` state and owes the `IDLE` it started
 //! from, so a caller polling straight afterwards sees that transient state.
 //!
-//! The id is resolved through the LIVE channel lookup
-//! (`state::live_channel_mut`), so a channel whose delete this service has
+//! The id is resolved through the shared channel-mutation guard
+//! (`state::mutable_channel`), so a channel whose delete this service has
 //! accepted — readable in `DELETING` and then in the terminal `DELETED` — names
 //! nothing a caller may still change; this operation models `NotFoundException`
 //! (404), which is what both a dead id and one no channel ever had are answered
@@ -219,18 +219,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // change. This operation models `NotFoundException`, so that is the
         // answer to both; the message tells them apart, the status and the code
         // do not.
-        //
-        // Whether the store holds a record under this id at all is read BEFORE
-        // the live lookup borrows it, so the id is resolved exactly once.
-        let recorded = state.channels.contains_key(&input.channel_id);
-        let Some(channel) = state.live_channel_mut(&input.channel_id) else {
-            let message = if recorded {
-                crate::state::already_deleted_message(&format!("Channel {}", input.channel_id))
-            } else {
-                crate::state::not_found_message("Channel", &input.channel_id)
-            };
-            return Err(not_found(&message));
-        };
+        let channel = state
+            .mutable_channel(&input.channel_id)
+            .map_err(|dead| not_found(&dead.message))?;
 
         // A channel that has not stopped is encoding through exactly the
         // pipelines this call would re-provision, so the change waits until it

@@ -7,6 +7,12 @@
 //! the value an earlier call persisted. The mutation is read-your-write visible: the
 //! response and the next `GetQueue` project the same stored record.
 //!
+//! A reserved queue's concurrency is not an independent member: it is the slot count its
+//! reservation plan reserves, so a call that stores a new plan without stating
+//! `ConcurrentJobs` stores that plan's count as the queue's concurrency too — the rule
+//! `CreateQueue` applies to a plan it stores, shared through
+//! [`crate::state::concurrent_jobs_for`].
+//!
 //! Two members are not free to take any value the wire accepts: a reservation plan's slot
 //! count is one-way (it may be raised or restated, never lowered), and a concurrency the
 //! request states is an allocation out of the Region's pool. Each is refused before the
@@ -318,9 +324,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(description) = input.description {
             record.description = crate::state::optional_free_text(Some(description));
         }
-        if let Some(concurrent_jobs) = input.concurrent_jobs {
-            record.concurrent_jobs = concurrent_jobs;
-        }
+        // "For reserved queues, update your reservation plan instead in order to increase
+        // your yearly commitment": a reserved queue's concurrency IS the slot count its
+        // plan reserves, so a plan this call stores sets the concurrency beside it rather
+        // than leaving the previous plan's count behind. One rule, in one place, shared
+        // with `CreateQueue` — a request that states `ConcurrentJobs` still stores the
+        // value it entered, and one that states neither keeps what is stored.
+        record.concurrent_jobs = crate::state::concurrent_jobs_for(
+            input.concurrent_jobs,
+            input.reservation_plan_settings.as_ref(),
+            record.concurrent_jobs,
+        );
         if let Some(maximum_concurrent_feeds) = input.maximum_concurrent_feeds {
             record.maximum_concurrent_feeds = maximum_concurrent_feeds;
         }
