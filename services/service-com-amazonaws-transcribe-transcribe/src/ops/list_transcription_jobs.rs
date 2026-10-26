@@ -177,21 +177,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A page cursor: the creation sequence of the last job of the previous page,
-        // read through this service's own token codec
-        // (`state::resume_after_sequence`), so every listing pages the same way and
-        // refuses a cursor this service never handed out in the same words.
-        let resume_below = crate::state::resume_after_sequence(
-            input.next_token.as_deref(),
-            Self::NAME,
-            |message| -> Self::Error {
-                ListTranscriptionJobsErrorModeled::BadRequestException(BadRequestException {
-                    message: Some(message),
-                })
-                .into()
-            },
-        )?;
-
         // "If you do not specify a value, a default of 5 is used" (model doc for
         // `ListTranscriptionJobsRequest$MaxResults`).
         let page_size = crate::state::page_size(
@@ -202,6 +187,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+
+        // A page cursor: the creation sequence of the last job of the previous page,
+        // read through this service's own token codec
+        // (`state::resume_after_sequence`), so every listing pages the same way and
+        // refuses a cursor this service never handed out in the same words. What this
+        // store has minted is what makes that decidable.
+        let resume_below = crate::state::resume_after_sequence(
+            input.next_token.as_deref(),
+            Self::NAME,
+            store.minted_sequences(),
+            |message| -> Self::Error {
+                ListTranscriptionJobsErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+                .into()
+            },
+        )?;
+
         // Reporting only: the sole write is each job's clock-owed status transition.
         // A regional endpoint lists only the jobs started through it.
         let records = store.jobs_newest_first(&region, now);

@@ -1275,6 +1275,18 @@ impl ComAmazonawsTranscribeTranscribeState {
         self.next_sequence
     }
 
+    /// The highest creation sequence this store has minted — 0 before the first record
+    /// of any family was created.
+    ///
+    /// Every sequence page cursor this service hands out carries the sequence of a
+    /// record on the page it was handed out with ([`page_cursor`]), so a cursor naming
+    /// a sequence past this one is a token no listing of this store could have written
+    /// ([`parse_page_cursor`]). The counter only ever grows, so deleting a record
+    /// cannot invalidate a cursor already handed out.
+    pub fn minted_sequences(&self) -> u64 {
+        self.next_sequence
+    }
+
     /// Materialise every clock-owed status transition of the jobs `region` holds, then
     /// those jobs newest first — the order `ListTranscriptionJobs` documents ("Jobs are
     /// ordered by creation date, with the newest job first").
@@ -2246,6 +2258,12 @@ pub fn content_bytes(terms: &[String]) -> usize {
     terms.iter().map(String::len).sum()
 }
 
+/// What separates the two halves of a sequence page cursor, which — like the prefix of
+/// the name-keyed cursor ([`NAME_CURSOR_PREFIX`]) — is part of what tells a token this
+/// service handed out from one it never wrote. No name this service keys a record by
+/// can hold it: every such name is modelled `pattern "^[0-9a-zA-Z._-]+$"`.
+const SEQUENCE_CURSOR_SEPARATOR: char = '|';
+
 /// The `NextToken` a listing hands out to resume after the record with this creation
 /// sequence and name.
 ///
@@ -2255,20 +2273,32 @@ pub fn content_bytes(terms: &[String]) -> usize {
 /// deleted between pages does not stop the next page from resuming strictly past it.
 /// Single-homed so every listing of this service pages the same way.
 pub fn page_cursor(sequence: u64, name: &str) -> String {
-    format!("{sequence}|{name}")
+    format!("{sequence}{SEQUENCE_CURSOR_SEPARATOR}{name}")
 }
 
 /// The creation sequence a `NextToken` resumes after, or `None` for a token this
 /// service never handed out — which a listing refuses rather than silently restarting
 /// from the top.
 ///
-/// Creation sequences start at 1, so a cursor of 0 is one this service never wrote.
-pub fn parse_page_cursor(token: &str) -> Option<u64> {
-    token
-        .split('|')
-        .next()
-        .and_then(|sequence| sequence.parse::<u64>().ok())
-        .filter(|sequence| *sequence > 0)
+/// A token this service wrote carries the WHOLE of what [`page_cursor`] hands out: a
+/// creation sequence, the separator, and the non-empty name the cursor was minted with
+/// (every name this service keys a record by is modelled `@length(min: 1, ..)`), so a
+/// bare number carrying neither separator nor name is not one of this service's
+/// cursors. Creation sequences are minted from 1 upwards by
+/// [`ComAmazonawsTranscribeTranscribeState::next_sequence`], so a cursor is only one
+/// this service could have handed out when its sequence has actually been minted:
+/// `minted_through` is the highest sequence this store has minted (0 before the first
+/// record), and a sequence of 0, or one past it, belongs to no record any page of this
+/// store ever reported.
+pub fn parse_page_cursor(token: &str, minted_through: u64) -> Option<u64> {
+    let (sequence, name) = token.split_once(SEQUENCE_CURSOR_SEPARATOR)?;
+    if name.is_empty() {
+        return None;
+    }
+    sequence
+        .parse::<u64>()
+        .ok()
+        .filter(|sequence| (1..=minted_through).contains(sequence))
 }
 
 /// The prefix a name-keyed page cursor carries, which is what tells a token this
@@ -2318,17 +2348,22 @@ pub fn invalid_next_token_message(operation: &str) -> String {
 /// request carried no token — or `operation`'s own refusal for a token this service
 /// never handed out.
 ///
-/// Generic over the error channel because each listing models its own: `refuse` is
-/// what lifts the single-homed refusal text ([`invalid_next_token_message`]) into it,
-/// so no handler spells that text or the token format itself.
+/// `minted_through` is what the store has actually minted
+/// ([`ComAmazonawsTranscribeTranscribeState::minted_sequences`]), which is what makes
+/// "a cursor this service handed out" decidable rather than assumed; see
+/// [`parse_page_cursor`]. Generic over the error channel because each listing models
+/// its own: `refuse` is what lifts the single-homed refusal text
+/// ([`invalid_next_token_message`]) into it, so no handler spells that text or the
+/// token format itself.
 pub fn resume_after_sequence<E>(
     token: Option<&str>,
     operation: &str,
+    minted_through: u64,
     refuse: impl FnOnce(String) -> E,
 ) -> Result<Option<u64>, E> {
     match token {
         None => Ok(None),
-        Some(token) => match parse_page_cursor(token) {
+        Some(token) => match parse_page_cursor(token, minted_through) {
             Some(sequence) => Ok(Some(sequence)),
             None => Err(refuse(invalid_next_token_message(operation))),
         },

@@ -32,7 +32,7 @@ use crate::transcription_jobs::{Reply, Transcribe};
 
 /// The total order a listing takes its page in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Order {
+pub(crate) enum Order {
     /// "Jobs are ordered by creation date, with the newest job first" — the order
     /// every sequence-paged listing of this service documents.
     NewestFirst,
@@ -43,9 +43,13 @@ enum Order {
 
 /// One listing of this service: the operation, the create that establishes a record
 /// it reports, and how to read the page it answers with.
-struct Listing {
+///
+/// `pub(crate)`, like [`listings`] and [`CREATED_IN_ORDER`]: `crate::list_cursor_rule`
+/// drives the SAME listings through the same creates rather than writing a second copy
+/// of this table.
+pub(crate) struct Listing {
     /// The list operation — also the name its refusal of an alien cursor must name.
-    operation: &'static str,
+    pub(crate) operation: &'static str,
     /// The create that establishes one record this listing reports, as
     /// `crate::tagging_resource_families::families` spells it.
     create: &'static str,
@@ -56,7 +60,7 @@ struct Listing {
     /// The request member this listing's case-insensitive substring search is spelled
     /// with, or `None` for the one listing that publishes no such filter.
     name_contains_member: Option<&'static str>,
-    order: Order,
+    pub(crate) order: Order,
 }
 
 /// Every listing this service serves, each reached through the same paging rule.
@@ -66,7 +70,7 @@ struct Listing {
 /// ListTranscriptionJobs,ListMedicalTranscriptionJobs,ListMedicalScribeJobs,\
 /// ListCallAnalyticsJobs,ListVocabularies,ListMedicalVocabularies,\
 /// ListVocabularyFilters,ListLanguageModels,ListCallAnalyticsCategories")`).
-fn listings() -> Vec<Listing> {
+pub(crate) fn listings() -> Vec<Listing> {
     vec![
         Listing {
             operation: "ListTranscriptionJobs",
@@ -151,7 +155,7 @@ fn listings() -> Vec<Listing> {
 /// listing cannot be confused with a name-ordered one and a case-insensitive search
 /// has something to fold: `ET` is a substring of exactly two of them, and of neither
 /// the first nor the last of either order.
-const CREATED_IN_ORDER: &[&str] = &[
+pub(crate) const CREATED_IN_ORDER: &[&str] = &[
     "Zeta-1", "alpha-2", "Mid-3", "beta-4", "Gamma-5", "delta-6",
 ];
 
@@ -173,7 +177,7 @@ impl Listing {
     }
 
     /// Establish one record per name in [`CREATED_IN_ORDER`], in that order.
-    async fn create_the_records(&self, transcribe: &Transcribe) {
+    pub(crate) async fn create_the_records(&self, transcribe: &Transcribe) {
         for name in CREATED_IN_ORDER {
             let case = format!("{} creates {name}", self.create);
             transcribe
@@ -184,7 +188,7 @@ impl Listing {
     }
 
     /// Every created name in the order this listing reports them.
-    fn expected_order(&self) -> Vec<String> {
+    pub(crate) fn expected_order(&self) -> Vec<String> {
         let mut names: Vec<String> = CREATED_IN_ORDER.iter().map(|n| n.to_string()).collect();
         match self.order {
             // The reverse of the creation order.
@@ -222,12 +226,12 @@ impl Listing {
     }
 
     /// One call of this listing.
-    async fn list(&self, transcribe: &Transcribe, request: Value) -> Reply {
+    pub(crate) async fn list(&self, transcribe: &Transcribe, request: Value) -> Reply {
         transcribe.call(self.operation, request).await
     }
 
     /// One page: the names on it and the cursor it handed out, if any.
-    async fn page(
+    pub(crate) async fn page(
         &self,
         transcribe: &Transcribe,
         request: Value,

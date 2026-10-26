@@ -178,21 +178,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A page cursor: the creation sequence of the last model of the previous page,
-        // read through this service's own token codec
-        // (`state::resume_after_sequence`), so every listing pages the same way and
-        // refuses a cursor this service never handed out in the same words.
-        let resume_below = crate::state::resume_after_sequence(
-            input.next_token.as_deref(),
-            Self::NAME,
-            |message| -> Self::Error {
-                ListLanguageModelsErrorModeled::BadRequestException(BadRequestException {
-                    message: Some(message),
-                })
-                .into()
-            },
-        )?;
-
         let page_size = crate::state::page_size(
             input.max_results,
             crate::state::DEFAULT_MODEL_LIST_MAX_RESULTS,
@@ -201,6 +186,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+
+        // A page cursor: the creation sequence of the last model of the previous page,
+        // read through this service's own token codec
+        // (`state::resume_after_sequence`), so every listing pages the same way and
+        // refuses a cursor this service never handed out in the same words. What this
+        // store has minted is what makes that decidable.
+        let resume_below = crate::state::resume_after_sequence(
+            input.next_token.as_deref(),
+            Self::NAME,
+            store.minted_sequences(),
+            |message| -> Self::Error {
+                ListLanguageModelsErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+                .into()
+            },
+        )?;
+
         // Reporting only: the sole write is each model's clock-owed transition, which
         // was due at its stored instant whether or not anybody called. A regional
         // endpoint lists only the models created through it.

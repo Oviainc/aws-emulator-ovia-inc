@@ -47,6 +47,8 @@ mod job_concurrency_quota;
 mod language_model_listing;
 #[path = "all/language_models.rs"]
 mod language_models;
+#[path = "all/list_cursor_rule.rs"]
+mod list_cursor_rule;
 #[path = "all/list_paging_rule.rs"]
 mod list_paging_rule;
 #[path = "all/medical_scribe_job_listing.rs"]
