@@ -29,11 +29,11 @@ use service_com_amazonaws_billingconductor_awsbillingconductor::{
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
-/// The maximum number of resources one percentage custom line item holds in this
-/// emulator: a CHOSEN bound, informed by `CustomLineItemAssociationsList`'s
-/// `@length(max: 5)` on the `ChargeDetails.Percentage.AssociatedValues` a create can
-/// express (`smithy_query(query="shape",shape="CustomLineItemAssociationsList")`).
-const MAX_ASSOCIATED_RESOURCES: usize = 5;
+/// How many resources ONE `BatchAssociateResourcesToCustomLineItem` request may name:
+/// the `ResourceArns` `@length` maximum
+/// (`smithy_query(query="shape",shape="CustomLineItemBatchAssociationsList")`: len
+/// 1..30). It bounds the request, not the membership the item accumulates.
+pub(crate) const MAX_RESOURCES_PER_REQUEST: usize = 30;
 
 /// An AWS-managed pricing plan every billing group here computes with: the
 /// `PricingPlanFullArn` pattern enumerates it, so no plan has to be created first
@@ -41,7 +41,11 @@ const MAX_ASSOCIATED_RESOURCES: usize = 5;
 const MANAGED_PRICING_PLAN: &str = "arn:aws:billingconductor::aws:pricingplan/BasicPricingPlan";
 
 /// A live emulator holding only this service.
-struct Emulator {
+///
+/// `pub(crate)` so the sibling suites about the same surface drive it rather than
+/// standing up a second harness of their own (see
+/// `tests/all/custom_line_item_associations_accumulate.rs`).
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
@@ -55,7 +59,7 @@ impl Emulator {
     /// the world in which the associations these tests are about are reachable at all.
     /// The denial every other caller gets is asserted in
     /// `tests/all/payer_account_gate.rs`, over the default store.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         engine
             .state::<BillingConductorState>()
@@ -70,7 +74,7 @@ impl Emulator {
     /// parsed body. The method matters: the batch association routes are `PUT`
     /// (`smithy_query(query="operation",operation=
     /// "BatchAssociateResourcesToCustomLineItem")`).
-    async fn send(&self, method: &str, path: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn send(&self, method: &str, path: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method(method)
             .uri(format!(
@@ -99,7 +103,7 @@ impl Emulator {
     }
 
     /// Create a billing group and return its ARN.
-    async fn billing_group(&self, name: &str) -> String {
+    pub(crate) async fn billing_group(&self, name: &str) -> String {
         let (status, body) = self
             .send(
                 "POST",
@@ -119,7 +123,12 @@ impl Emulator {
     }
 
     /// Create a custom line item with the given charge details and return its ARN.
-    async fn custom_line_item(&self, group_arn: &str, name: &str, charge: Value) -> String {
+    pub(crate) async fn custom_line_item(
+        &self,
+        group_arn: &str,
+        name: &str,
+        charge: Value,
+    ) -> String {
         let (status, body) = self
             .send(
                 "POST",
@@ -140,7 +149,7 @@ impl Emulator {
     }
 
     /// A percentage custom line item: the only kind resources can be associated to.
-    async fn percentage_item(&self, group_arn: &str, name: &str) -> String {
+    pub(crate) async fn percentage_item(&self, group_arn: &str, name: &str) -> String {
         self.custom_line_item(
             group_arn,
             name,
@@ -161,7 +170,12 @@ impl Emulator {
 
     /// `BatchAssociateResourcesToCustomLineItem` with the resources named exactly as
     /// the caller spells them, and an optional `BillingPeriodRange`.
-    async fn associate(&self, target: &str, resources: &[String], range: Option<Value>) -> (u16, Value) {
+    pub(crate) async fn associate(
+        &self,
+        target: &str,
+        resources: &[String],
+        range: Option<Value>,
+    ) -> (u16, Value) {
         let mut body = json!({ "TargetArn": target, "ResourceArns": resources });
         if let Some(range) = range {
             body["BillingPeriodRange"] = range;
@@ -190,7 +204,11 @@ impl Emulator {
     }
 
     /// The `(Arn, Relationship)` pairs a read reports, in the order it reports them.
-    async fn association_pairs(&self, target: &str, extra: Value) -> Vec<(String, String)> {
+    pub(crate) async fn association_pairs(
+        &self,
+        target: &str,
+        extra: Value,
+    ) -> Vec<(String, String)> {
         let (status, body) = self.associated(target, extra).await;
         assert_eq!(
             status, 200,
@@ -232,7 +250,7 @@ fn elements(body: &Value) -> Vec<(String, String)> {
 }
 
 /// The ARNs of one of the batch response's two lists, in response order.
-fn reported(body: &Value, member: &str) -> Vec<String> {
+pub(crate) fn reported(body: &Value, member: &str) -> Vec<String> {
     body.get(member)
         .and_then(Value::as_array)
         .unwrap_or(&Vec::new())
@@ -243,7 +261,7 @@ fn reported(body: &Value, member: &str) -> Vec<String> {
 }
 
 /// The `(Arn, Error.Reason)` pairs of `FailedAssociatedResources`.
-fn failures(body: &Value) -> Vec<(String, String)> {
+pub(crate) fn failures(body: &Value) -> Vec<(String, String)> {
     body.get("FailedAssociatedResources")
         .and_then(Value::as_array)
         .unwrap_or(&Vec::new())
@@ -495,83 +513,65 @@ async fn a_resource_that_cannot_be_associated_fails_as_its_own_element() {
     }
 }
 
-/// The modelled bound on how many resources one percentage custom line item holds:
-/// every resource up to it is associated, and the one past it fails with
-/// `SERVICE_LIMIT_EXCEEDED` instead of displacing a stored association.
+/// EVERY in-scope resource one request names is associated, however many of them the
+/// request carries: the size of the request is bounded by `ResourceArns` alone, and
+/// no resource of a request within that bound is refused as a limit.
 #[tokio::test]
-async fn an_association_past_the_modelled_maximum_is_refused_for_that_resource() {
-    let emulator = Emulator::new();
-    let home = emulator.billing_group("home").await;
-    let target = emulator.percentage_item(&home, "target").await;
+async fn every_in_scope_resource_of_one_request_is_associated() {
+    // The number of resources in ONE request. `ResourceArns` is
+    // @length(min: 1, max: 30)
+    // (`smithy_query(query="shape",shape="CustomLineItemBatchAssociationsList")`), so
+    // the rows run from the published minimum, through the `AssociatedValues` maximum
+    // a create can express (five) and one past it, to the published maximum.
+    for size in [1usize, 2, 5, 6, MAX_RESOURCES_PER_REQUEST] {
+        let case = format!("{size} resources in one request");
+        let emulator = Emulator::new();
+        let home = emulator.billing_group("home").await;
+        let target = emulator.percentage_item(&home, "target").await;
 
-    // One more resource than the item can hold, every one of them in scope of the
-    // billing group the item applies to: that group, and custom line items of it.
-    let mut resources: Vec<String> = vec![home.clone()];
-    for index in 1..=MAX_ASSOCIATED_RESOURCES {
-        resources.push(
-            emulator
-                .percentage_item(&home, &format!("item{index}"))
-                .await,
-        );
-    }
+        // Every resource in scope of the billing group the target applies to: that
+        // group, and custom line items of that same group.
+        let mut resources: Vec<String> = vec![home.clone()];
+        while resources.len() < size {
+            resources.push(
+                emulator
+                    .percentage_item(&home, &format!("item{}", resources.len()))
+                    .await,
+            );
+        }
 
-    // One resource at a time: every one up to the bound succeeds, the one past it
-    // does not.
-    for (index, resource) in resources.iter().enumerate() {
-        let case = format!("resource {} of {}", index + 1, resources.len());
-        let (status, body) = emulator
-            .associate(&target, std::slice::from_ref(resource), None)
-            .await;
+        let (status, body) = emulator.associate(&target, &resources, None).await;
         assert_eq!(
             status, 200,
             "case {case}: expected HTTP 200, got {status} with {body}"
         );
-        if index < MAX_ASSOCIATED_RESOURCES {
-            assert_eq!(
-                reported(&body, "SuccessfullyAssociatedResources"),
-                vec![resource.clone()],
-                "case {case}: expected the association to be made, got {body}"
-            );
-        } else {
-            assert_eq!(
-                failures(&body),
-                vec![(resource.clone(), "SERVICE_LIMIT_EXCEEDED".to_string())],
-                "case {case}: expected the resource past the bound of \
-                 {MAX_ASSOCIATED_RESOURCES} to fail, got {body}"
-            );
-        }
-    }
-    let reported_back = emulator.association_pairs(&target, json!({})).await;
-    assert_eq!(
-        reported_back.len(),
-        MAX_ASSOCIATED_RESOURCES,
-        "case the bound: expected exactly {MAX_ASSOCIATED_RESOURCES} associations to be \
-         stored, got {reported_back:?}"
-    );
+        assert_eq!(
+            reported(&body, "SuccessfullyAssociatedResources"),
+            resources,
+            "case {case}: expected every resource associated, got {body}"
+        );
+        assert_eq!(
+            failures(&body),
+            Vec::new(),
+            "case {case}: expected no failed resource, got {body}"
+        );
 
-    // A batch that would cross the bound in ONE request behaves the same way: the
-    // item is full, so every resource of the batch fails rather than evicting one.
-    let fresh = emulator.percentage_item(&home, "fresh").await;
-    let (status, body) = emulator.associate(&fresh, &resources, None).await;
-    assert_eq!(
-        status, 200,
-        "case one batch past the bound: expected HTTP 200, got {status} with {body}"
-    );
-    assert_eq!(
-        reported(&body, "SuccessfullyAssociatedResources").len(),
-        MAX_ASSOCIATED_RESOURCES,
-        "case one batch past the bound: expected the first {MAX_ASSOCIATED_RESOURCES} \
-         resources associated, got {body}"
-    );
-    assert_eq!(
-        failures(&body),
-        vec![(
-            resources[MAX_ASSOCIATED_RESOURCES].clone(),
-            "SERVICE_LIMIT_EXCEEDED".to_string()
-        )],
-        "case one batch past the bound: expected only the resource past the bound to fail, \
-         got {body}"
-    );
+        // What was persisted is what a read reports back.
+        let mut reported_back: Vec<String> = emulator
+            .association_pairs(&target, json!({ "MaxResults": 100 }))
+            .await
+            .into_iter()
+            .map(|(arn, _)| arn)
+            .collect();
+        reported_back.sort();
+        let mut expected = resources.clone();
+        expected.sort();
+        assert_eq!(
+            reported_back, expected,
+            "case {case}: expected the read to report every association, got \
+             {reported_back:?}"
+        );
+    }
 }
 
 /// A fault of the REQUEST is the call's own modelled error, not a per-resource one:

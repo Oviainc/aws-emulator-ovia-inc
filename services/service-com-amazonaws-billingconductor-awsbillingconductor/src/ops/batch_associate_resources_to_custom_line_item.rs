@@ -351,8 +351,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
                 continue;
             }
-            // One more association than the model can represent for this item is a
-            // limit the request cannot get around.
+            // The resources one item can hold at all: the membership's own capacity
+            // bound ([`crate::state::MAX_RESOURCES_PER_CUSTOM_LINE_ITEM`]), which is
+            // how many in-scope resources there are to name. It is NOT the length of
+            // any input list: `ResourceArns` bounds the resources of ONE request
+            // (1..30) and the create's `AssociatedValues` those of one create, while
+            // associations ACCUMULATE across calls — so every resource this request
+            // names is associated, and nothing short of a full store refuses one.
             if target.associated_resources.len() >= crate::state::MAX_RESOURCES_PER_CUSTOM_LINE_ITEM
             {
                 failures.push(failed(

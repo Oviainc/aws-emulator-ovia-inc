@@ -2033,8 +2033,9 @@ const TRANSFER_DIRECTIONS: &[&str] = &["inbound", "outbound"];
 ///   as a period that never held that group.
 /// * `custom_line_items` holds one entry per custom line item, at most
 ///   [`MAX_CUSTOM_LINE_ITEMS`], and each item at most
-///   [`MAX_RESOURCES_PER_CUSTOM_LINE_ITEM`] associated resources — the maximum the
-///   model itself can represent. A create past the cap is REFUSED with
+///   [`MAX_RESOURCES_PER_CUSTOM_LINE_ITEM`] associated resources — as many as there
+///   are resources in scope of its billing group to name. A create past the cap is
+///   REFUSED with
 ///   `ServiceLimitExceededException`, and an association past it fails THAT resource
 ///   with the modelled `SERVICE_LIMIT_EXCEEDED` reason; a deleted billing group takes
 ///   its items, and their associations, with it. One association, and one item itself,
@@ -2097,7 +2098,8 @@ pub struct ComAmazonawsBillingconductorAwsbillingconductorState {
     /// which reads back as a period that never held that group.
     pub deleted_billing_groups: VecDeque<DeletedBillingGroupRecord>,
     /// Custom line items by full ARN, at most [`MAX_CUSTOM_LINE_ITEMS`]; each one
-    /// holds at most [`MAX_RESOURCES_PER_CUSTOM_LINE_ITEM`] associated resources.
+    /// holds at most [`MAX_RESOURCES_PER_CUSTOM_LINE_ITEM`] associated resources —
+    /// one per resource in scope of its billing group.
     /// A custom line item applies to a billing group, so
     /// [`remove_billing_group`](ComAmazonawsBillingconductorAwsbillingconductorState::remove_billing_group)
     /// reclaims the ones that named a deleted group.
@@ -3355,17 +3357,23 @@ pub const MAX_CUSTOM_LINE_ITEMS: usize = 1000;
 
 /// How many resources one percentage custom line item may hold.
 ///
-/// A CHOSEN bound, informed by the model rather than read off it:
-/// `CustomLineItemAssociationsList` — the `ChargeDetails.Percentage.AssociatedValues`
-/// a custom line item is CREATED with — carries `@length(max: 5)`, so five is the
-/// most the create's own shape can express, and holding a stored item within what
-/// the create can express keeps it representable. (The documented AWS quota for
-/// resources per percentage custom line item is not in the model;
-/// `BatchAssociateResourcesToCustomLineItem`'s `ResourceArns` admits 1..30 per
-/// request, which bounds a request rather than the membership it accumulates.) An
-/// association past the bound fails THAT resource with the modelled
-/// `SERVICE_LIMIT_EXCEEDED` reason rather than displacing a stored association.
-pub const MAX_RESOURCES_PER_CUSTOM_LINE_ITEM: usize = 5;
+/// The membership's OWN capacity bound, not a per-request length: an association names
+/// a resource that EXISTS and is in scope of the item's own billing group — that group
+/// itself, or another custom line item of that same group
+/// ([`ComAmazonawsBillingconductorAwsbillingconductorState::out_of_scope_association`])
+/// — and one resource is held at most once, so an item can accumulate no more
+/// associations than there are such resources to name: the one group plus the other
+/// stored items, at most [`MAX_CUSTOM_LINE_ITEMS`] of them. Associations ACCUMULATE
+/// across calls, so no `@length` maximum of an input list bounds them: the
+/// `ChargeDetails.Percentage.AssociatedValues` of a create expresses the associations
+/// of ONE create and `BatchAssociateResourcesToCustomLineItem`'s `ResourceArns` the
+/// resources of ONE request (1..30), which is why a membership bound tighter than 30
+/// would fail resources the association operation's own contract admits. The bound is
+/// still enforced where associations are made — an association past it fails THAT
+/// resource with the modelled `SERVICE_LIMIT_EXCEEDED` reason rather than displacing a
+/// stored association — so the store stays bounded however the resolution of an ARN to
+/// a resource changes.
+pub const MAX_RESOURCES_PER_CUSTOM_LINE_ITEM: usize = MAX_CUSTOM_LINE_ITEMS;
 
 /// How many SEPARATE stretches of billing periods one resource may be in effect over:
 /// a resource association ([`ResourceAssociationRecord::spans`]) or a custom line item
