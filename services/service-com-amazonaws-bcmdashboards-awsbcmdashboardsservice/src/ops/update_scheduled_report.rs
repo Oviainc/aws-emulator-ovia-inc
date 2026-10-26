@@ -1,15 +1,47 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateScheduledReport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateScheduledReport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateScheduledReport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the stored scheduled report in place, PARTIALLY: "Only the parameters
+//! included in the request are updated; all other properties remain unchanged"
+//! (`smithy_query(query="doc",shape="UpdateScheduledReport")`). So every optional member
+//! the request carries REPLACES the stored one and every member it omits leaves the
+//! stored value alone — `name`, `description`, `dashboardArn`,
+//! `scheduledReportExecutionRoleArn`, `scheduleConfig` (whose `state` is resolved through
+//! [`crate::state::resolve_schedule_config`], the same resolution the create path uses, so
+//! a config submitted without a state is stored `ENABLED` rather than stateless),
+//! `widgetIds` and `widgetDateRangeOverride`. `updatedAt` is set to the moment of the
+//! call; `createdAt`, the tags, the execution history and the health the last refresh
+//! established are properties this request does not include, so they are left untouched
+//! (health is established by a refresh, which is `ExecuteScheduledReport`).
+//!
+//! The two `clear…` flags are the only way to UNSET an optional member — "Set to true to
+//! clear existing widgetIds" / "… widgetDateRangeOverride" — since an omitted member
+//! means "unchanged". A request that both clears a member and supplies a new value for it
+//! cannot hold together, so it is refused with the modelled `ValidationException` (400)
+//! and changes nothing.
+//!
+//! The refusals that come before the write:
+//!
+//! * an `arn` no stored scheduled report answers to is refused with the service's
+//!   not-found answer — HTTP 400 with the error code `ResourceNotFoundException` and a
+//!   `resourceId` member carrying the requested ARN, as
+//!   [`crate::scaffolded::Scaffolded::resource_not_found`] renders it (the model's
+//!   `@httpError` for that shape is 404, which is not what the recorded service answers);
+//! * a `dashboardArn` no stored dashboard answers to is refused the same way, naming that
+//!   ARN: a report can only be scheduled on a dashboard that exists, and this operation
+//!   DOES declare the not-found error the model documents for "the specified resource
+//!   (dashboard, policy, or widget)" — which is why the refusal here is a not-found while
+//!   `CreateScheduledReport`, whose model declares no `ResourceNotFoundException`, words
+//!   that same rule as its `ValidationException`.
+//!
+//! A `widgetIds` entry that names no widget of the dashboard is NOT refused: the
+//! configuration is stored and that mismatch surfaces as the report's health
+//! (`WIDGET_ID_NOT_FOUND`) at its next refresh, exactly as it does for a report created
+//! that way.
+//!
+//! Being state-changing, it emits the audit record [`crate::state::record_state_change`]
+//! writes on the success and on each refusal above.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +210,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateScheduledReport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateScheduledReportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateScheduledReport"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateScheduledReportErrorModeled::InternalServerException(InternalServerException {
+                message: "the dashboard store is unavailable".to_string(),
+            })
+        })?;
+        let mut state = state.lock();
+
+        let arn = input.arn;
+
+        // Resolve the resource this call addresses FIRST: an ARN no report is stored
+        // under is refused before any other member is looked at, and nothing is written
+        // on that path.
+        if !state.scheduled_reports.contains_key(&arn) {
+            crate::state::record_state_change(
+                ctx,
+                Self::NAME,
+                &arn,
+                crate::scaffolded::RESOURCE_NOT_FOUND_CODE,
+            );
+            return Err(crate::scaffolded::Scaffolded::resource_not_found(
+                &arn,
+                // The request-derived template this operation words its refusal with, the
+                // same one every other operation on a scheduled report uses.
+                format!("Scheduled report not found: {arn}"),
+            ));
+        }
+
+        // Clearing a member and supplying a new value for that same member are
+        // contradictory instructions, a combination the model cannot express — so it is
+        // refused here, with the members named, and the stored record is left as it was.
+        for (member, flag, clear, replaced) in [
+            (
+                "widgetIds",
+                "clearWidgetIds",
+                input.clear_widget_ids,
+                input.widget_ids.is_some(),
+            ),
+            (
+                "widgetDateRangeOverride",
+                "clearWidgetDateRangeOverride",
+                input.clear_widget_date_range_override,
+                input.widget_date_range_override.is_some(),
+            ),
+        ] {
+            if clear && replaced {
+                crate::state::record_state_change(ctx, Self::NAME, &arn, "ValidationException");
+                return Err(UpdateScheduledReportErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "{flag}: cannot be true in a request that also specifies {member}"
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A scheduled report reports on a dashboard, so a request that re-points it has
+        // to name one this account stores. Checked before the record is borrowed, so a
+        // request naming a missing dashboard changes nothing at all — not even the
+        // members it got right.
+        if let Some(dashboard_arn) = input.dashboard_arn.as_deref() {
+            if !state.dashboards.contains_key(dashboard_arn) {
+                crate::state::record_state_change(
+                    ctx,
+                    Self::NAME,
+                    &arn,
+                    crate::scaffolded::RESOURCE_NOT_FOUND_CODE,
+                );
+                return Err(crate::scaffolded::Scaffolded::resource_not_found(
+                    dashboard_arn,
+                    format!("Dashboard not found: {dashboard_arn}"),
+                ));
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let Some(report) = state.scheduled_reports.get_mut(&arn) else {
+            // Unreachable: the key was present a moment ago under this same lock.
+            return Err(crate::scaffolded::Scaffolded::resource_not_found(
+                &arn,
+                format!("Scheduled report not found: {arn}"),
+            ));
+        };
+
+        // Present replaces, absent leaves alone — the partial update this operation
+        // documents. `description` has no `clear` flag of its own, so an absent one keeps
+        // the stored description rather than dropping it.
+        if let Some(name) = input.name {
+            report.name = name;
+        }
+        if let Some(description) = input.description {
+            report.description = Some(description);
+        }
+        if let Some(dashboard_arn) = input.dashboard_arn {
+            report.dashboard_arn = dashboard_arn;
+        }
+        if let Some(role_arn) = input.scheduled_report_execution_role_arn {
+            report.execution_role_arn = role_arn;
+        }
+        if let Some(schedule_config) = input.schedule_config {
+            // Resolved at write time, like every other write of a schedule, so every
+            // reader sees a state that was decided once rather than guessing one.
+            report.schedule_config = crate::state::resolve_schedule_config(schedule_config);
+        }
+        if let Some(widget_ids) = input.widget_ids {
+            report.widget_ids = Some(widget_ids);
+        } else if input.clear_widget_ids {
+            // Back to absent, which is "all widgets in the dashboard are included" —
+            // distinct on the wire from the empty list a request may also send.
+            report.widget_ids = None;
+        }
+        if let Some(range) = input.widget_date_range_override {
+            report.widget_date_range_override = Some(range);
+        } else if input.clear_widget_date_range_override {
+            report.widget_date_range_override = None;
+        }
+        report.updated_at = now;
+        let changed = report.arn.clone();
+
+        // The record this call changed state, for the audit stream.
+        crate::state::record_state_change(ctx, Self::NAME, &changed, "SUCCESS");
+
+        Ok(UpdateScheduledReportOutput { arn: changed })
     }
 }

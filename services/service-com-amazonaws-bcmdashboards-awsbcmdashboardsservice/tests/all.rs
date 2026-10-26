@@ -57,3 +57,5 @@ mod tag_resource;
 mod untag_resource;
 #[path = "all/update_dashboard_partial_update.rs"]
 mod update_dashboard_partial_update;
+#[path = "all/update_scheduled_report.rs"]
+mod update_scheduled_report;

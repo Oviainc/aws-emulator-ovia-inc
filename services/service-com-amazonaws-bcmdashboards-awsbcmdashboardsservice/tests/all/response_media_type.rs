@@ -17,8 +17,9 @@
 //!
 //! The rows span the layers that can produce a response, because the rule is about all of
 //! them and not about one operation: a handler's success, a handler's modelled exception,
-//! a handler's own refusal, the boundary validator's refusal, the scaffold's 501, the
-//! routing failure rendered before any operation runs, and the transport failure rendered
+//! a handler's own refusal, the boundary validator's refusal, the routing failure
+//! rendered before any operation runs (which is where this service's only 501 comes from,
+//! now that every operation it models is implemented), and the transport failure rendered
 //! before the request is even routed.
 
 use std::sync::Arc;
@@ -110,8 +111,8 @@ struct Case {
 }
 
 /// Every response of a routed request announces the service's media type: a success, a
-/// modelled exception, a handler refusal, a boundary refusal and the scaffold's 501 all
-/// come from different layers and all carry the same header.
+/// modelled exception, a handler refusal and a boundary refusal all come from different
+/// layers and all carry the same header.
 #[tokio::test]
 async fn every_routed_response_announces_the_services_media_type() {
     let router = router();
@@ -195,15 +196,18 @@ async fn every_routed_response_announces_the_services_media_type() {
             status: 200,
         },
         Case {
-            // `UpdateScheduledReport` still carries the scaffold marker in
-            // `src/ops/update_scheduled_report.rs`, so it is this suite's 501 row.
-            label: "the scaffold's 501: an operation nobody has implemented yet",
+            // No row here answers 501: every operation this service models is
+            // implemented, so the scaffold channel is unreachable from a routed request.
+            // The 501 a client can still see — an `X-Amz-Target` naming no modelled
+            // operation — is rendered before routing and is covered by
+            // `a_response_rendered_before_routing_announces_the_services_media_type`.
+            label: "a handler's not-found answer on an update that writes nothing",
             operation: "UpdateScheduledReport",
             body: json!({
                 "arn": "arn:aws:bcm-dashboards::123456789012:scheduled-report/never-created",
                 "name": "Renamed Report"
             }),
-            status: 501,
+            status: 400,
         },
         // Last: it removes the fixture every row above reads.
         Case {
