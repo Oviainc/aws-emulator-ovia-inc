@@ -13,13 +13,18 @@
 //! omits keeps its current value and is not something the request says, so it is not
 //! constrained. See `crate::state::notification_rule_violation`.
 //!
-//! The configuration lives inside a Slack workspace registered to the account, so an
-//! update whose `teamId` is not in the registry
-//! (`state::slack_workspace_configurations`, written by
-//! `RegisterSlackWorkspaceForOrganization`) is refused with the modelled
-//! `ConflictException` (409), the condition `ConflictException`'s own documentation
-//! names first for an add, an update OR a delete; the `ResourceNotFoundException` (404)
-//! is for a registered workspace in which this channel is not configured.
+//! This operation acts on the configuration its `(teamId, channelId)` pair names, so
+//! whether that configuration EXISTS is the first thing settled against the account's
+//! state: a pair this account holds nothing for is the modelled
+//! `ResourceNotFoundException` (404), whatever else the account is or is not missing.
+//! The account-level precondition `ConflictException` documents ("Add, update, or
+//! delete a Slack channel configuration before you add a Slack workspace to your
+//! Amazon Web Services account") cannot add an answer here: a stored configuration
+//! always lives in a workspace this account has registered —
+//! `CreateSlackChannelConfiguration` admits no other, and
+//! `DeleteSlackWorkspaceConfiguration` takes a workspace's configurations with it — so
+//! the registry is consulted where that conflict is the applicable answer, on the
+//! create path.
 //!
 //! ## Shape of an operation
 //!
@@ -234,25 +239,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        // The precondition `ConflictException` documents first: "Add, update, or delete
-        // a Slack channel configuration before you add a Slack workspace to your Amazon
-        // Web Services account." A channel configuration lives inside a workspace
-        // registered to this account, so a `teamId` absent from the registry has no
-        // workspace holding a channel configuration to update — a different answer from
-        // a registered workspace in which this channel is simply not configured, which
-        // is the 404 below. Consulted BEFORE the configuration is looked up, so the
-        // conflict is reported rather than hidden behind the miss.
-        if let Some(message) = store.unregistered_workspace_conflict(&input.team_id) {
-            return Err(
-                UpdateSlackChannelConfigurationErrorModeled::ConflictException(
-                    ConflictException {
-                        message: Some(message),
-                    },
-                )
-                .into(),
-            );
-        }
-
+        // The resource this update names is looked up FIRST, so an absent configuration
+        // is reported as absent rather than behind an account-level precondition: a
+        // pair this account holds nothing for is the modelled
+        // `ResourceNotFoundException`, which is what an update-or-create caller branches
+        // on.
         let key = (input.team_id.clone(), input.channel_id.clone());
         let Some(stored) = store.slack_channel_configurations.get(&key) else {
             return Err(

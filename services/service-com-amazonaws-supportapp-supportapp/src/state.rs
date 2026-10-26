@@ -156,30 +156,31 @@ pub struct ComAmazonawsSupportappSupportappState {
     /// `RegisterSlackWorkspaceForOrganization`, removed by
     /// `DeleteSlackWorkspaceConfiguration` and bounded by
     /// [`MAX_SLACK_WORKSPACE_CONFIGURATIONS`]. It is the account's workspace registry:
-    /// a Slack channel configuration lives INSIDE a registered workspace, so every
-    /// operation that adds, updates or deletes a channel configuration refuses one
-    /// whose `teamId` is absent here (see
+    /// a Slack channel configuration lives INSIDE a registered workspace, so a create
+    /// whose `teamId` is absent here has nothing to configure a channel in (see
     /// [`ComAmazonawsSupportappSupportappState::unregistered_workspace_conflict`]) and
     /// deleting a workspace takes that workspace's channel configurations with it.
     pub slack_workspace_configurations: BTreeMap<String, SlackWorkspaceConfig>,
 }
 
 impl ComAmazonawsSupportappSupportappState {
-    /// Why a request that adds, updates or deletes a Slack channel configuration in the
-    /// workspace `team_id` names must be refused with the modelled `ConflictException`,
-    /// or `None` when that workspace is registered to this account.
+    /// Why a request that ADDS a Slack channel configuration to the workspace `team_id`
+    /// names must be refused with the modelled `ConflictException`, or `None` when that
+    /// workspace is registered to this account.
     ///
     /// `ConflictException`'s documentation names this condition first — "Add, update, or
     /// delete a Slack channel configuration before you add a Slack workspace to your
-    /// Amazon Web Services account" — so it holds for EVERY operation that writes a
-    /// channel configuration, not just the one that creates it. A channel configuration
-    /// lives inside a registered workspace, so a `teamId` absent from
-    /// [`Self::slack_workspace_configurations`] has no workspace to hold a channel
-    /// configuration at all: that is a different answer from a registered workspace in
-    /// which the named channel happens not to be configured, which is the
-    /// `ResourceNotFoundException` of the configuration itself. Each writing operation
-    /// therefore consults this BEFORE looking the configuration up, and they all read
-    /// the one registry through here so the three cannot drift apart.
+    /// Amazon Web Services account" — and the create path is where it is the applicable
+    /// answer: a `teamId` absent from [`Self::slack_workspace_configurations`] has no
+    /// workspace for a new channel configuration to live in, and the configuration the
+    /// request names cannot already exist for the account to report as found.
+    ///
+    /// An operation that acts on an EXISTING configuration settles that configuration's
+    /// existence first instead, and answers the miss with
+    /// [`slack_channel_configuration_not_found`]: a stored configuration always lives in
+    /// a registered workspace — nothing else can be created, and
+    /// `DeleteSlackWorkspaceConfiguration` takes a workspace's configurations with it —
+    /// so this registry has no answer to add once the lookup has missed.
     pub fn unregistered_workspace_conflict(&self, team_id: &str) -> Option<String> {
         (!self.slack_workspace_configurations.contains_key(team_id))
             .then(|| workspace_not_registered_message(team_id))

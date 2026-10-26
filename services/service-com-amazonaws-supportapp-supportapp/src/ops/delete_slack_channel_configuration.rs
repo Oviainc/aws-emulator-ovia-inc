@@ -6,12 +6,20 @@
 //! has no members, so the removal is the operation's only effect: a later
 //! `ListSlackChannelConfigurations` no longer reports it and a later
 //! `UpdateSlackChannelConfiguration` of it answers `ResourceNotFoundException`. Nothing
-//! is stored for a pair that was never configured, so deleting one is that same 404 —
-//! but only inside a Slack workspace this account has registered: a delete whose
-//! `teamId` is not in the registry (`state::slack_workspace_configurations`, written by
-//! `RegisterSlackWorkspaceForOrganization`) is refused with the modelled
-//! `ConflictException` (409), the condition `ConflictException`'s own documentation
-//! names first for an add, an update OR a delete.
+//! is stored for a pair that was never configured, so deleting one is that same 404.
+//!
+//! This operation acts on the configuration its `(teamId, channelId)` pair names, so
+//! whether that configuration EXISTS is the first thing settled against the account's
+//! state: a pair this account holds nothing for is the modelled
+//! `ResourceNotFoundException` (404), whatever else the account is or is not missing.
+//! The account-level precondition `ConflictException` documents ("Add, update, or
+//! delete a Slack channel configuration before you add a Slack workspace to your
+//! Amazon Web Services account") cannot add an answer here: a stored configuration
+//! always lives in a workspace this account has registered —
+//! `CreateSlackChannelConfiguration` admits no other, and
+//! `DeleteSlackWorkspaceConfiguration` takes a workspace's configurations with it — so
+//! the registry is consulted where that conflict is the applicable answer, on the
+//! create path, and a configuration that is simply absent is reported as absent.
 //!
 //! ## Shape of an operation
 //!
@@ -167,25 +175,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
-        // The precondition `ConflictException` documents first: "Add, update, or delete
-        // a Slack channel configuration before you add a Slack workspace to your Amazon
-        // Web Services account." A channel configuration lives inside a workspace
-        // registered to this account, so a `teamId` absent from the registry has no
-        // workspace to delete a channel configuration from — a different answer from a
-        // registered workspace in which this channel is simply not configured, which is
-        // the 404 below. Consulted BEFORE the configuration is looked up, so the
-        // conflict is reported rather than hidden behind the miss.
-        if let Some(message) = store.unregistered_workspace_conflict(&input.team_id) {
-            return Err(
-                DeleteSlackChannelConfigurationErrorModeled::ConflictException(
-                    ConflictException {
-                        message: Some(message),
-                    },
-                )
-                .into(),
-            );
-        }
-
+        // The resource this delete names is looked up FIRST, so an absent configuration
+        // is reported as absent rather than behind an account-level precondition: a
+        // pair this account holds nothing for is the modelled
+        // `ResourceNotFoundException`, which is also what a repeated delete answers.
         let key = (input.team_id.clone(), input.channel_id.clone());
         if store.slack_channel_configurations.remove(&key).is_none() {
             return Err(
