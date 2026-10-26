@@ -27,11 +27,11 @@
 //! calls run against an ORGANIZATION instance because the permission-set surface is
 //! withdrawn on an account instance (asserted here too).
 //!
-//! The attachments themselves are seeded through the store, on the SAME record field the
-//! attach operation writes: `AttachManagedPolicyToPermissionSet` is still a scaffold
-//! (`issues/things-that-do-not-work/20261024T063249Z-sso-admin-attachmanagedpolicytopermissionset-stub.md`),
-//! so until it is implemented no request can make an attachment. Everything this file then
-//! asserts goes over the wire.
+//! The attachments themselves are seeded through the store, on the SAME record field
+//! `AttachManagedPolicyToPermissionSet` writes, so this suite's subject stays the
+//! ENUMERATION: the exact set and the stored ORDER of the attachments are set without going
+//! through the attach path, whose own round trip `managed_policies.rs` pins over the wire.
+//! Everything this file then asserts goes over the wire.
 
 use std::sync::Arc;
 

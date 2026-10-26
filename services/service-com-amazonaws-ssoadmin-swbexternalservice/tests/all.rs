@@ -109,6 +109,8 @@ mod list_instances_pagination;
 mod managed_policies;
 #[path = "all/managed_policies_in_permission_set.rs"]
 mod managed_policies_in_permission_set;
+#[path = "all/managed_policy_attach_independence.rs"]
+mod managed_policy_attach_independence;
 #[path = "all/permission_set_provisioning.rs"]
 mod permission_set_provisioning;
 #[path = "all/permission_set_provisioning_status_list.rs"]
