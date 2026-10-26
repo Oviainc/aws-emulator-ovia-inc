@@ -71,5 +71,7 @@ mod region_scoping;
 mod signing_name_path_claim;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_key_refusal.rs"]
+mod tag_key_refusal;
 #[path = "all/tag_key_rules.rs"]
 mod tag_key_rules;
