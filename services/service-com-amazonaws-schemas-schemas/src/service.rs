@@ -42,10 +42,15 @@
 //!
 //! ## How a response with no body is framed
 //!
-//! Several operations here answer with no body at all: every delete returns `Unit` at
-//! HTTP 204 (`smithy_query(query="digest")` — `DeleteSchema`, `DeleteSchemaVersion`,
-//! `DeleteRegistry`, `DeleteResourcePolicy`, `DeleteDiscoverer`), as do `TagResource`
-//! and `UntagResource`. A response with no body still has a LENGTH, and AWS states it:
+//! Several operations here answer with no body at all: every operation whose output is
+//! `Unit` (`smithy_query(query="digest")` — `DeleteSchema`, `DeleteSchemaVersion`,
+//! `DeleteRegistry`, `DeleteResourcePolicy`, `DeleteDiscoverer`, `TagResource` and
+//! `UntagResource`). Which STATUS each of them answers is that operation's own fact,
+//! carried on its `Operation::SUCCESS_STATUS` and not inferred from the empty body —
+//! the resource removals answer 204, while the policy endpoint answers 200 for every
+//! method it serves, the policy removal included.
+//!
+//! A response with no body still has a LENGTH, and AWS states it:
 //! these answers carry `content-length: 0`. The protocol's serializer leaves the header
 //! off, which leaves the length to the transport to frame — so a client that requires a
 //! framing header on an empty response sees a differently framed reply than AWS sends.
@@ -56,10 +61,12 @@
 //!
 //! That framing is what this service answers, and it is what the in-process front door
 //! delivers (the inter-service callback path and the SDK connector both serve the
-//! router's response unchanged). An answer served over HTTP/1.1 reaches the client
-//! without it: the HTTP writer the vendored transport uses removes `content-length`
-//! from a `204`, which RFC 7230 §3.3.2 forbids there, and that is below anything this
-//! crate decides. `tests/all/empty_response_framing.rs` pins both halves.
+//! router's response unchanged). On an answer served over HTTP/1.1 it survives for
+//! every status that may carry a body — the empty 200 the policy removal answers keeps
+//! it — but not on a `204`: the HTTP writer the vendored transport uses removes
+//! `content-length` there, which RFC 7230 §3.3.2 forbids, and that is below anything
+//! this crate decides. `tests/all/empty_response_framing.rs` and
+//! `tests/all/empty_result_statuses.rs` pin both halves.
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
