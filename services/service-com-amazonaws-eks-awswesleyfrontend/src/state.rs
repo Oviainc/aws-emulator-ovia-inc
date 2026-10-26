@@ -1338,7 +1338,12 @@ impl IdentityProviderConfigRecord {
 /// AWS Batch, the AI operations and DevOps agents and Application Recovery
 /// Controller's region switch), and the policies for the cluster capabilities EKS
 /// manages (event forwarding, the Kube Resource Orchestrator, EKS Pod Identity
-/// and secret admin/reader access). The catalogue is what a caller discovers
+/// and secret admin/reader access), service-account impersonation, and the
+/// policies Amazon EKS publishes for the Amazon Web Services services that
+/// orchestrate workloads ON a cluster — Amazon EMR on EKS (its virtual-cluster
+/// controller and its job runs) and Amazon SageMaker HyperPod (its cluster and
+/// controller access plus its inference, space and space-template components).
+/// The catalogue is what a caller discovers
 /// through `ListAccessPolicies` INSTEAD of hardcoding ARNs, so a policy missing
 /// here is a policy no caller can associate.
 ///
@@ -1396,8 +1401,23 @@ pub const ACCESS_POLICY_NAMES: &[&str] = &[
     "AmazonEKSPodIdentityPolicy",
     "AmazonEKSSecretAdminPolicy",
     "AmazonEKSSecretReaderPolicy",
+    // The policy Amazon EKS publishes for impersonating a Kubernetes service
+    // account from an IAM principal.
+    "AmazonEKSServiceAccountImpersonationPolicy",
     // `view`.
     "AmazonEKSViewPolicy",
+    // Amazon EMR on EKS: the access a virtual cluster's controller is granted on
+    // the cluster, and the access an EMR job run is granted in its namespace.
+    "AmazonEMRClusterPolicy",
+    "AmazonEMRJobPolicy",
+    // Amazon SageMaker HyperPod, whose orchestration runs on an EKS cluster: the
+    // cluster- and controller-scoped access its control plane is granted, plus the
+    // access the inference, space and space-template components are granted.
+    "AmazonSagemakerHyperpodClusterPolicy",
+    "AmazonSagemakerHyperpodControllerPolicy",
+    "AmazonSagemakerHyperpodInferencePolicy",
+    "AmazonSagemakerHyperpodSpacePolicy",
+    "AmazonSagemakerHyperpodSpaceTemplatePolicy",
 ];
 
 /// The prefix every access-policy ARN carries.
@@ -5427,6 +5447,28 @@ macro_rules! callback_client {
     }};
 }
 
+/// The endpoint the in-process callback reaches `service` in `region` at, or
+/// `None` when `region` is not a Region LABEL.
+///
+/// The Region a request is signed for is CALLER-SUPPLIED text, and here it ends
+/// up in an endpoint URL's authority rather than in a response, so it is read as
+/// a Region label (`service_common::arn::region_label`, the one place this tree
+/// states that grammar) instead of being interpolated as given: a value carrying
+/// a host or path delimiter would name an authority the caller chose rather than
+/// the peer service this emulator asks. `None` means there is no peer endpoint to
+/// ask, which the two callers below answer the way they answer any unreachable
+/// peer — by grounding no refusal in it.
+fn peer_endpoint(service: &str, region: &str) -> Option<String> {
+    let Some(region) = ::service_common::arn::region_label(region) else {
+        ::tracing::warn!(
+            peer = %service,
+            "the request names no Region label, so {service} cannot be asked"
+        );
+        return None;
+    };
+    Some(format!("https://{service}.{region}.amazonaws.com"))
+}
+
 /// The refusal a role whose trust policy does not admit `principal` earns, or
 /// `None` when IAM holds the role and its trust policy lets `principal` assume
 /// it — and also when this emulator has no IAM to ask, because a refusal has to
@@ -5447,12 +5489,7 @@ pub async fn service_principal_trust_violation(
     // Not an in-account role at all: `pass_role_refusal` is what reports that,
     // and it has already run by the time a handler asks this.
     let role_name = iam_role_name(role_arn)?;
-    let answer = callback_client!(
-        aws_sdk_iam,
-        ctx,
-        format!("https://iam.{region}.amazonaws.com"),
-        region
-    )
+    let answer = callback_client!(aws_sdk_iam, ctx, peer_endpoint("iam", region)?, region)
     .get_role()
     .role_name(role_name)
     .send()
@@ -5559,16 +5596,16 @@ pub async fn resolve_subnets(
     if subnet_ids.is_empty() {
         return ResolvedSubnets::default();
     }
-    let answer = callback_client!(
-        aws_sdk_ec2,
-        ctx,
-        format!("https://ec2.{region}.amazonaws.com"),
-        region
-    )
-    .describe_subnets()
-    .set_subnet_ids(Some(subnet_ids.to_vec()))
-    .send()
-    .await;
+    // No Region label, so no endpoint to ask EC2 at: the same answer an
+    // unreachable EC2 gets, which grounds no refusal and names no VPC.
+    let Some(endpoint) = peer_endpoint("ec2", region) else {
+        return ResolvedSubnets::default();
+    };
+    let answer = callback_client!(aws_sdk_ec2, ctx, endpoint, region)
+        .describe_subnets()
+        .set_subnet_ids(Some(subnet_ids.to_vec()))
+        .send()
+        .await;
     // Every requested id resolved: EC2 reports the subnets rather than refusing.
     // A subnet belongs to exactly one VPC, so the VPC a cluster is created in is
     // the one every subnet it names agrees on; a list that spans two names no
@@ -5704,12 +5741,7 @@ pub async fn mint_cluster_security_group(
     resource_id: &str,
     vpc_id: &str,
 ) -> Option<String> {
-    let ec2 = callback_client!(
-        aws_sdk_ec2,
-        ctx,
-        format!("https://ec2.{region}.amazonaws.com"),
-        region
-    );
+    let ec2 = callback_client!(aws_sdk_ec2, ctx, peer_endpoint("ec2", region)?, region);
     let group_name = cluster_security_group_name(cluster_name, resource_id);
     let created = ec2
         .create_security_group()
@@ -5779,16 +5811,16 @@ pub async fn release_cluster_security_group(
     region: &str,
     group_id: &str,
 ) {
-    let released = callback_client!(
-        aws_sdk_ec2,
-        ctx,
-        format!("https://ec2.{region}.amazonaws.com"),
-        region
-    )
-    .delete_security_group()
-    .group_id(group_id)
-    .send()
-    .await;
+    // No Region label, so no endpoint to reach EC2 at: the same silence an
+    // unreachable EC2 leaves, which a deleted cluster is not refused over.
+    let Some(endpoint) = peer_endpoint("ec2", region) else {
+        return;
+    };
+    let released = callback_client!(aws_sdk_ec2, ctx, endpoint, region)
+        .delete_security_group()
+        .group_id(group_id)
+        .send()
+        .await;
     if let Err(error) = released {
         ::tracing::warn!(
             %group_id,

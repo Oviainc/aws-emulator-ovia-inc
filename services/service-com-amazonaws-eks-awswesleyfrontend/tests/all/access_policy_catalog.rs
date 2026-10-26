@@ -29,7 +29,9 @@ use crate::wire::{call, emulator, Answer};
 /// namespace-scoped, `AmazonEKS<Capability>Policy`, and cluster-scoped,
 /// `AmazonEKS<Capability>ClusterPolicy`), and the policies for the cluster
 /// capabilities EKS manages (events, the Kube Resource Orchestrator, Pod Identity
-/// and secret admin/reader access).
+/// and secret admin/reader access), service-account impersonation, and the
+/// policies published for the Amazon Web Services services that orchestrate
+/// workloads on a cluster (Amazon EMR on EKS and Amazon SageMaker HyperPod).
 const EXPECTED_POLICIES: &[&str] = &[
     "AIDevOpsAgentAccessPolicy",
     "AWSBatchClusterPolicy",
@@ -58,7 +60,15 @@ const EXPECTED_POLICIES: &[&str] = &[
     "AmazonEKSPodIdentityPolicy",
     "AmazonEKSSecretAdminPolicy",
     "AmazonEKSSecretReaderPolicy",
+    "AmazonEKSServiceAccountImpersonationPolicy",
     "AmazonEKSViewPolicy",
+    "AmazonEMRClusterPolicy",
+    "AmazonEMRJobPolicy",
+    "AmazonSagemakerHyperpodClusterPolicy",
+    "AmazonSagemakerHyperpodControllerPolicy",
+    "AmazonSagemakerHyperpodInferencePolicy",
+    "AmazonSagemakerHyperpodSpacePolicy",
+    "AmazonSagemakerHyperpodSpaceTemplatePolicy",
 ];
 
 /// The ARN prefix an access policy carries: partition `aws`, service `eks`, EMPTY

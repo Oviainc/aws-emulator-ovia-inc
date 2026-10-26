@@ -174,6 +174,25 @@ pub fn parse_of<'a>(value: &'a str, expected: &str) -> Option<Arn<'a>> {
 /// so a longer label is not a Region any AWS endpoint has.
 const MAX_REGION_LENGTH: usize = 20;
 
+/// `value` when it is a well-formed AWS Region LABEL, and `None` otherwise.
+///
+/// For a service that has to put a caller-supplied Region into an endpoint URL's
+/// AUTHORITY, which is the one place a Region is not just data: a value carrying `/`,
+/// `@`, `:`, `?` or `#` would re-point or truncate that authority, so it is reported as
+/// no Region at all and the caller falls back to refusing nothing rather than reaching a
+/// host the caller chose. The grammar is the one every model's ARN pattern states for the
+/// field — non-empty, at most [`MAX_REGION_LENGTH`] characters, composed only of
+/// `[a-z0-9-]` — so this is also what [`region_of`] holds an ARN's Region field to.
+#[must_use]
+pub fn region_label(value: &str) -> Option<&str> {
+    let well_formed = !value.is_empty()
+        && value.len() <= MAX_REGION_LENGTH
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    well_formed.then_some(value)
+}
+
 /// The REGION of `value` when it is a well-formed resource ARN of `expected_vendor` AND
 /// that field is a Region LABEL rather than arbitrary text.
 ///
@@ -191,13 +210,7 @@ const MAX_REGION_LENGTH: usize = 20;
 /// Region field is empty, and a Region field outside the grammar.
 #[must_use]
 pub fn region_of<'value>(value: &'value str, expected_vendor: &str) -> Option<&'value str> {
-    let region = parse_of(value, expected_vendor)?.region;
-    let well_formed = !region.is_empty()
-        && region.len() <= MAX_REGION_LENGTH
-        && region
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
-    well_formed.then_some(region)
+    region_label(parse_of(value, expected_vendor)?.region)
 }
 
 /// What an input member a model DOCUMENTS as an ARN of a particular AWS resource has to
@@ -381,9 +394,9 @@ fn names_identity(resource: &str, resource_type: &str, segments: usize) -> bool 
 #[cfg(test)]
 mod tests {
     use super::{
-        is_iam_principal_arn, is_resource_arn_of, parse, parse_of, region_of, resource_id_of_type,
-        resource_type, vendor, Requirement, ACM_CERTIFICATE, IAM_ROLE, S3_OBJECT,
-        SECRETS_MANAGER_SECRET,
+        is_iam_principal_arn, is_resource_arn_of, parse, parse_of, region_label, region_of,
+        resource_id_of_type, resource_type, vendor, Requirement, ACM_CERTIFICATE, IAM_ROLE,
+        S3_OBJECT, SECRETS_MANAGER_SECRET,
     };
 
     /// The vendor field is read from the third position, whatever the resource
@@ -632,6 +645,40 @@ mod tests {
 
         for (case, value, expected_vendor, expected) in rows {
             let read = region_of(value, expected_vendor);
+            assert_eq!(
+                read, *expected,
+                "case {case:?}: expected region {expected:?}, got {read:?}"
+            );
+        }
+    }
+
+    /// The same grammar read from a BARE Region, which is what a service that was
+    /// handed the Region directly (a request's signing scope) puts in an endpoint
+    /// URL's authority.
+    #[test]
+    fn a_bare_region_is_a_label_only_inside_the_published_grammar() {
+        // (case, value, the Region the read must report)
+        let rows: &[(&str, &str, Option<&str>)] = &[
+            ("a commercial Region", "us-west-2", Some("us-west-2")),
+            ("a Region of another partition", "cn-northwest-1", Some("cn-northwest-1")),
+            ("a GovCloud Region", "us-gov-east-1", Some("us-gov-east-1")),
+            ("a single character", "a", Some("a")),
+            ("exactly at the published bound", "us-east-1-us-east-1x", Some("us-east-1-us-east-1x")),
+            ("one character past the published bound", "us-east-1-us-east-1xy", None),
+            ("a host label appended after a dot", "us-east-1.evil.example.com", None),
+            ("a path separator", "us-east-1/evil.example.com", None),
+            ("userinfo", "us-east-1@evil.example.com", None),
+            ("a port", "us-east-1:8443", None),
+            ("a fragment", "us-east-1#x", None),
+            ("a query", "us-east-1?x=1", None),
+            ("upper case", "US-EAST-1", None),
+            ("an underscore", "us_east_1", None),
+            ("whitespace", "us-east-1 ", None),
+            ("the empty string", "", None),
+        ];
+
+        for (case, value, expected) in rows {
+            let read = region_label(value);
             assert_eq!(
                 read, *expected,
                 "case {case:?}: expected region {expected:?}, got {read:?}"

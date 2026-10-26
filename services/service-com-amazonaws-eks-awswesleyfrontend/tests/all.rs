@@ -27,6 +27,8 @@ mod addon_versions;
 mod cancel_update;
 #[path = "all/capability_lifecycle.rs"]
 mod capability_lifecycle;
+#[path = "all/catalog_discovery.rs"]
+mod catalog_discovery;
 #[path = "all/certificate_authority.rs"]
 mod certificate_authority;
 #[path = "all/certificate_authority_activation.rs"]
