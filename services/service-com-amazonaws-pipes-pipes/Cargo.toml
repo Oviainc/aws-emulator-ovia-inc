@@ -24,7 +24,10 @@ tracing = { workspace = true }
 # Hex codec for the opaque `NextToken` ListPipes issues and reads back.
 hex = { workspace = true }
 # `arn`: the ONE parse of a resource ARN, shared with every other service — a pipe's
-# Source, Enrichment and Target are read through it rather than split here.
+# Source, Enrichment and Target are read through it rather than split here. Also
+# `front_door::binds_to_body` and `validation::refusing_violations_with_echoes`: where a
+# refused member travels (body vs URI), and the violations of one request with each value
+# echo restored to the bytes the caller submitted.
 service-common = { path = "../common" }
 # The AWS SDK clients the data plane (`state::data_plane`) reaches the other services of
 # THIS emulator through, over the in-process callback (`OperationContext::callback`): the

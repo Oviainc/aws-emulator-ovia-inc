@@ -6,8 +6,9 @@
 //! carries is `NotFoundException` (404) carrying the tagging layer's constant sentence, and
 //! a key outside `TagKey`'s published bound is the `BadRequestException` (400) that layer
 //! answers a broken tag rule with — raised by the boundary validator, which walks a list's
-//! elements, and worded in `crate::service`. This is the ONLY file to touch for this
-//! operation.
+//! elements, and worded in `crate::service`. An ARN that is not a pipe ARN at all is that
+//! same `BadRequestException`, because no pipe can ever carry it. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,6 +150,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut state = store.lock();
         state.settle_due_transitions();
+
+        // See `TagResource`: an ARN of another service is the layer's
+        // `BadRequestException` (400), not the 404 for an ARN of this vendor that resolves
+        // to no pipe.
+        if let Some(message) = crate::state::foreign_resource_arn(&input.resource_arn) {
+            return Err(UntagResourceError::bad_request(message));
+        }
 
         let pipe = state.pipe_by_arn_mut(&input.resource_arn).ok_or_else(|| {
             UntagResourceErrorModeled::NotFoundException(crate::state::resource_not_found())

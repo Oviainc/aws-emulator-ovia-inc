@@ -13,6 +13,7 @@
 //! * an absent pipe is reported by ONE sentence per addressing form — the name-addressed
 //!   control-plane operations name the pipe the request asked for, the ARN-addressed
 //!   tagging operations state the constant resource-agnostic sentence;
+//! * a name this account already holds is reported by ONE sentence naming it;
 //! * an `UpdatePipe` that lands while a move is already in flight is reported by ONE
 //!   sentence naming the pipe, whichever move that is, leaking none of the pipe's states.
 //!
@@ -421,6 +422,85 @@ async fn an_absent_pipe_is_reported_by_one_sentence_per_addressing_form() {
                 );
             }
         }
+    }
+}
+
+/// RULE: `CreatePipe` for a name this account already holds is refused with
+/// `ConflictException` (409) reporting ONE sentence naming the pipe the request asked for —
+/// built from the request, so the same sentence whatever else the request carried — with
+/// `resourceId` and `resourceType` naming the pipe, as the model requires of all three
+/// members, and the stored pipe left exactly as it was.
+///
+/// The rows differ along the form of the taken name (plain, the longest `PipeName` allows,
+/// one carrying the other characters its pattern admits) and along what the second request
+/// carries beside it (the identical body, a different description, a different target).
+#[tokio::test]
+async fn a_taken_name_is_reported_by_one_sentence_naming_the_pipe() {
+    let long_name = "t".repeat(64);
+    for name in ["taken", &long_name, "taken.with-other_chars"] {
+        let router = router();
+        let first = create_body(
+            "arn:aws:sqs:us-west-2:000000000000:orders",
+            TARGET,
+            json!({"Description": "the stored one"}),
+        );
+        let created = create(&router, name, first.clone()).await;
+        assert_eq!(
+            created.status, 200,
+            "case {name:?}: the fixture pipe must be created, got {created:?}"
+        );
+
+        let rows: Vec<(&str, Value)> = vec![
+            ("identical", first.clone()),
+            (
+                "a different description",
+                create_body(
+                    "arn:aws:sqs:us-west-2:000000000000:orders",
+                    TARGET,
+                    json!({"Description": "another one"}),
+                ),
+            ),
+            (
+                "a different target",
+                create_body(
+                    "arn:aws:sqs:us-west-2:000000000000:orders",
+                    "arn:aws:sqs:us-west-2:000000000000:results",
+                    json!({}),
+                ),
+            ),
+        ];
+
+        for (case, body) in rows {
+            let refused = create(&router, name, body).await;
+            assert_eq!(
+                (refused.status, refused.error_code.as_str()),
+                (409, "ConflictException"),
+                "case {name:?} / {case}: expected 409 ConflictException, got {refused:?}"
+            );
+            assert_eq!(
+                message(&refused),
+                format!("Pipe {name} already exists."),
+                "case {name:?} / {case}: expected the one taken-name sentence, got {refused:?}"
+            );
+            assert_eq!(
+                (
+                    refused.string("resourceId"),
+                    refused.string("resourceType")
+                ),
+                (name.to_string(), "pipe".to_string()),
+                "case {name:?} / {case}: the conflict must name the resource it is about, \
+                 got {refused:?}"
+            );
+        }
+
+        // None of the refused calls overwrote the stored pipe.
+        let described = describe(&router, name).await;
+        assert_eq!(
+            described.string("Description"),
+            "the stored one",
+            "case {name:?}: a refused CreatePipe must leave the stored pipe as it was, \
+             got {described:?}"
+        );
     }
 }
 

@@ -323,6 +323,14 @@ async fn describe_pipe_reports_every_member_create_pipe_stored() {
             "case {name:?}: DescribePipe must find the pipe just created, got {described:?}"
         );
         for (member, expected) in body.as_object().expect("the case body is an object") {
+            // An explicit empty-string `Description` is stored exactly as an omitted one,
+            // so the pipe reports no `Description` at all for it; the rule has its own
+            // table in `tests/all/pipe_description.rs`.
+            let expected = if member == "Description" && expected.as_str() == Some("") {
+                &Value::Null
+            } else {
+                expected
+            };
             assert_eq!(
                 described.member(member),
                 expected,

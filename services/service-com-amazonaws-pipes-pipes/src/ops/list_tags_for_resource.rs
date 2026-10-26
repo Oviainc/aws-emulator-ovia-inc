@@ -3,8 +3,9 @@
 //! @op ListTagsForResource
 //! IMPLEMENTED: reports the tags persisted on the pipe the request's `resourceArn` names.
 //! An ARN no stored pipe carries is `NotFoundException` (404) carrying the tagging layer's
-//! constant sentence. A pipe with no tags reports an EMPTY `tags` map rather than no
-//! member, so a caller can read it without first asking whether it is there. This is the
+//! constant sentence, and an ARN that is not a pipe ARN at all is that layer's
+//! `BadRequestException` (400). A pipe with no tags reports an EMPTY `tags` map rather than
+//! no member, so a caller can read it without first asking whether it is there. This is the
 //! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -151,6 +152,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The ONE write a reporting operation may make: materialise the state moves the
         // clock has ALREADY made due — owed at this instant even if nobody had called.
         state.settle_due_transitions();
+
+        // See `TagResource`: an ARN of another service is the layer's
+        // `BadRequestException` (400), not the 404 for an ARN of this vendor that resolves
+        // to no pipe.
+        if let Some(message) = crate::state::foreign_resource_arn(&input.resource_arn) {
+            return Err(ListTagsForResourceError::bad_request(message));
+        }
 
         let pipe = state.pipe_by_arn(&input.resource_arn).ok_or_else(|| {
             ListTagsForResourceErrorModeled::NotFoundException(crate::state::resource_not_found())

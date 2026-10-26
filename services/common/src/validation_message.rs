@@ -30,6 +30,14 @@
 //! about a member's length. [`property_count_refusal`] states that one, for a service
 //! whose recordings show it, and is asked before the envelope.
 //!
+//! [`too_many_properties`], [`pattern_mismatch`] and [`string_too_long`] are the SENTENCES
+//! that layer states for the three constraint classes it reports on a member it read from
+//! the request BODY. A service whose front door words those findings itself — because it
+//! has to tell a body member from one bound to the URI, which the refusal seam cannot —
+//! builds them from here, so the sentences do not drift per crate. [`expected_vendor`] is
+//! the one sentence here that is not a schema finding: how the resource-tagging layer
+//! refuses an ARN of another vendor, which it decides before any lookup.
+//!
 //! The other difference this module owns is the VALUE half of a clause: a COLLECTION
 //! (list or map) whose `@length` was broken is stated with no value at all —
 //! `Value at '<member path>' failed to satisfy constraint: …` — where a scalar states the
@@ -65,7 +73,12 @@ fn collection_size(stored: &str, suffix: &str) -> Option<usize> {
 
 /// How many entries the framework's rendering of a MAP member states, when `stored` is
 /// one. `None` for a list's rendering and for a caller's own string.
-fn map_entry_count(stored: &str) -> Option<usize> {
+///
+/// `pub` because a service whose front door words its OWN schema finding (rather than
+/// delegating the whole refusal to [`property_count_refusal`]) needs the same reading of
+/// the same rendering: two services cannot disagree about how many entries one map held.
+#[must_use]
+pub fn map_entry_count(stored: &str) -> Option<usize> {
     collection_size(stored, " entries")
 }
 
@@ -97,6 +110,47 @@ fn collection_length_clause(violation: &Violation) -> Option<String> {
 #[must_use]
 pub fn too_many_properties(found: usize, max: i64) -> String {
     format!("object has too many properties (found {found} but schema requires at most {max})")
+}
+
+/// The finding that layer states for a string outside the regular expression its schema
+/// declares: the expression as the MODEL writes it (anchors included — this is the schema's
+/// own expression, not the per-member clause's rendering that [`unanchored`] owns) and the
+/// string the caller submitted.
+///
+/// `services/service-com-amazonaws-account-account/src/service.rs` and
+/// `services/service-com-amazonaws-oam-oamservice/src/service.rs` still carry their own
+/// inlined copies of this sentence, written before this module had it; they are to be
+/// migrated onto this one rather than copied again.
+#[must_use]
+pub fn pattern_mismatch(pattern: &str, value: &str) -> String {
+    format!("ECMA 262 regex \"{pattern}\" does not match input string \"{value}\"")
+}
+
+/// The finding that layer states for a string longer than the schema's maximum: the string
+/// the caller submitted, its length, and that maximum.
+///
+/// `length` is the length the CONSTRAINT counted (`@length` counts characters), passed in
+/// rather than measured here, so the number the finding states is the one that was checked.
+/// The same two services as [`pattern_mismatch`] carry their own copies of this sentence.
+#[must_use]
+pub fn string_too_long(value: &str, length: usize, max: i64) -> String {
+    format!("string \"{value}\" is too long (length: {length}, maximum allowed: {max})")
+}
+
+/// The sentence the resource-tagging layer in front of a service refuses a caller-supplied
+/// `resourceArn` of ANOTHER vendor with: it names the vendor it expected — the serving
+/// service's own ARN namespace — and nothing of the ARN it was handed.
+///
+/// Not a schema finding like the three above: the layer refuses the ARN before it looks any
+/// resource up (an ARN of another vendor can name none of this service's resources however
+/// the account changes), so it states what it expected rather than what the value failed.
+/// `services/service-com-amazonaws-emrserverless-awstoledowebservice/src/service.rs` and
+/// `services/service-com-amazonaws-marketplacedeployment-awsmpdeploymentparametersservice/src/state.rs`
+/// still carry their own inlined copies of this sentence; they are to be migrated onto this
+/// one rather than copied again.
+#[must_use]
+pub fn expected_vendor(vendor: &str) -> String {
+    format!("Invalid input resource arn: expected vendor {vendor}")
 }
 
 /// [`too_many_properties`] for one violation, or `None` when the violation is not a MAP
@@ -222,7 +276,10 @@ pub fn aws_validation_refusal_with(
 
 #[cfg(test)]
 mod tests {
-    use super::{aws_validation_refusal, aws_validation_refusal_with, property_count_refusal};
+    use super::{
+        aws_validation_refusal, aws_validation_refusal_with, pattern_mismatch,
+        property_count_refusal, string_too_long,
+    };
     use crate::validation::unanchored_grouping_alternation;
     use aws_smithy_schema_server::{Violation, ViolationKind};
     use smithy_server_runtime::Refusal;
@@ -574,6 +631,63 @@ mod tests {
                 .is_none(),
             "expected the chosen rendering not to change which refusals are stated"
         );
+    }
+
+    /// RULE: the two string findings state the value the caller submitted as it was
+    /// submitted — the expression and the string for a pattern, the string and both
+    /// lengths for a maximum — with nothing of the member or the envelope around them.
+    ///
+    /// The rows differ along what the sentences generalise over: the form of the
+    /// expression, and the value's length, charset and content (including one carrying the
+    /// quotes and braces the sentence itself uses).
+    #[test]
+    fn the_string_findings_state_the_submitted_value_and_the_schemas_own_bound() {
+        // (case, the expression, the value, the finding expected)
+        let patterns: [(&str, &str, &str, &str); 3] = [
+            (
+                "an anchored expression",
+                r"^[\.\-_A-Za-z0-9]+$",
+                "bad@name",
+                r#"ECMA 262 regex "^[\.\-_A-Za-z0-9]+$" does not match input string "bad@name""#,
+            ),
+            (
+                "an alternation",
+                r"^smk://host:[0-9]{1,5}|arn:.+$",
+                "https://host/queue",
+                r#"ECMA 262 regex "^smk://host:[0-9]{1,5}|arn:.+$" does not match input string "https://host/queue""#,
+            ),
+            (
+                "a value carrying the sentence's own punctuation",
+                r"^[a-z]+$",
+                r#"{"a": "b"}"#,
+                r#"ECMA 262 regex "^[a-z]+$" does not match input string "{"a": "b"}""#,
+            ),
+        ];
+        for (case, pattern, value, expected) in patterns {
+            let actual = pattern_mismatch(pattern, value);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+
+        // (case, the value, the length the constraint counted, the maximum)
+        let lengths: [(&str, &str, usize, i64); 3] = [
+            ("one character past the maximum", "xxx", 3, 2),
+            // `@length` counts CHARACTERS, so the length is the one that was checked and
+            // not the byte count of the value.
+            ("a unicode value", "ééé", 3, 2),
+            ("a maximum of zero", "x", 1, 0),
+        ];
+        for (case, value, length, max) in lengths {
+            let expected =
+                format!(r#"string "{value}" is too long (length: {length}, maximum allowed: {max})"#);
+            let actual = string_too_long(value, length, max);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
     }
 
     /// RULE: a MAP member over its `@length` maximum is stated as the schema layer's

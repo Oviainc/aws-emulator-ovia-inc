@@ -4,8 +4,11 @@
 //! IMPLEMENTED: applies the members the request carries to the pipe record persisted in
 //! [`crate::state`], leaves every member it omits unchanged, and answers from the record
 //! it just wrote. An unknown name is `NotFoundException` (404); a pipe already
-//! mid-transition is `ConflictException` (409). This is the ONLY file to touch for this
-//! operation.
+//! mid-transition is `ConflictException` (409); `SourceParameters` the pipe's source
+//! cannot have, and a configuration the resources it names cannot hold (a batch size past
+//! what the target takes per delivery, a FIFO queue target with no message group id, a
+//! filter that is not an event pattern), are `ValidationException` (400). This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -254,9 +257,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )?),
         };
 
+        // The rules that span the pipe's source, target and filters, checked against the
+        // configuration this update would LEAVE the pipe in — the members it carries over
+        // the ones the pipe already holds — so an update cannot move a pipe into a
+        // configuration `CreatePipe` would have refused.
+        let target = input.target.as_deref().unwrap_or(&pipe.target);
+        let target_parameters = input
+            .target_parameters
+            .as_ref()
+            .or(pipe.target_parameters.as_ref());
+        let effective_source_parameters = source_parameters
+            .as_ref()
+            .or(pipe.source_parameters.as_ref());
+        if let Some(violation) = crate::state::cross_resource_violation(
+            effective_source_parameters,
+            target,
+            target_parameters,
+        ) {
+            return Err(UpdatePipeErrorModeled::ValidationException(violation).into());
+        }
+
         // Only the members the request carries move; the rest stay as stored.
         if let Some(description) = input.description.clone() {
-            pipe.description = Some(description);
+            // `PipeDescription` admits the empty string, which is how a caller CLEARS the
+            // description: stored and reported exactly as an absent one.
+            pipe.description = crate::state::stored_description(Some(description));
         }
         if let Some(target) = input.target.clone() {
             pipe.target = target;

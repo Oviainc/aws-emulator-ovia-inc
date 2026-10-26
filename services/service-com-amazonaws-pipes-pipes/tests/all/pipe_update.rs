@@ -105,10 +105,12 @@ async fn update_pipe_changes_only_the_members_the_request_carries() {
             name: "empty-description".to_string(),
             create: create_body(SOURCE_SQS, TARGET_A, json!({"Description": "before"})),
             // `PipeDescription` is `@length(min: 0)`, so the empty string is a value a
-            // description can hold rather than a way of removing it.
+            // request may carry — and it is how a caller CLEARS the description: it is
+            // stored exactly as an omitted one, so the pipe then reports no `Description`
+            // at all. `tests/all/pipe_description.rs` pins that rule over a table.
             update: json!({"RoleArn": ROLE_A, "Description": ""}),
-            expected: json!({"Description": ""}),
-            absent: vec![],
+            expected: json!({}),
+            absent: vec!["Description"],
         },
         Case {
             name: "role-arn-only".to_string(),

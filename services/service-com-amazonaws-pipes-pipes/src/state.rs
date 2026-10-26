@@ -13,8 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    NotFoundException, Pipe, PipeEnrichmentParameters, PipeLogConfiguration, PipeSourceParameters,
-    PipeTargetParameters, ValidationException, ValidationExceptionField,
+    FilterCriteria, NotFoundException, Pipe, PipeEnrichmentParameters, PipeLogConfiguration,
+    PipeSourceParameters, PipeTargetParameters, ValidationException, ValidationExceptionField,
 };
 
 /// The `PipeState` members this slice reports. Source: the `PipeState` enum of
@@ -350,6 +350,249 @@ pub fn resource_not_found() -> NotFoundException {
     }
 }
 
+/// The `Description` to STORE for the one a request carried.
+///
+/// `PipeDescription` is `@length(min: 0)`, so the empty string is a value a request may
+/// carry — but a pipe holds a description or holds none, and the empty string is how a
+/// caller says "none": recorded behaviour is that `Description=""` is stored exactly as an
+/// omitted `Description` is, so a later read reports the member for neither. The same
+/// normalization the other "empty string clears it" members of this service get
+/// (`Enrichment`, `KmsKeyIdentifier`), which is why it is stated once here rather than in
+/// each write.
+pub fn stored_description(requested: Option<String>) -> Option<String> {
+    requested.filter(|text| !text.is_empty())
+}
+
+/// This service's own ARN namespace: `arn:<partition>:pipes:…`.
+pub const PIPES_SERVICE: &str = "pipes";
+
+/// The sentence the tagging layer refuses a `resourceArn` belonging to ANOTHER service
+/// with, or `None` when the ARN names this service's own vendor.
+///
+/// The generic resource-tagging layer resolves the ARN's vendor before it looks for a
+/// resource: an ARN of another service — and text that is not a resource ARN at all — can
+/// never name a pipe, however this account's pipes change, so it is a BAD REQUEST rather
+/// than a missing resource. An ARN of THIS vendor that resolves to no pipe (a resource that
+/// is not a pipe, a pipe this account does not hold) is the 404 those operations model.
+///
+/// Which ARNs are of this vendor is `service_common::arn`'s reading, the one parse of an
+/// ARN's fields in this tree, and the sentence is that layer's own
+/// (`service_common::validation_message::expected_vendor`), which names the vendor it
+/// expected and echoes no part of the ARN it was handed — as [`RESOURCE_NOT_FOUND_MESSAGE`]
+/// echoes none either.
+pub fn foreign_resource_arn(arn: &str) -> Option<String> {
+    (!::service_common::arn::is_resource_arn_of(arn, PIPES_SERVICE))
+        .then(|| ::service_common::validation_message::expected_vendor(PIPES_SERVICE))
+}
+
+/// The largest batch a pipe may read for a target, by the target's ARN service namespace.
+///
+/// A pipe's batch size is bounded by what the TARGET takes in ONE delivery, not by the
+/// source: each entry is the maximum number of entries that target service's own batch API
+/// accepts per call — Amazon SQS `SendMessageBatch` and EventBridge `PutEvents` 10 entries,
+/// Kinesis Data Streams `PutRecords` 500 records, CloudWatch Logs `PutLogEvents` 10,000
+/// events.
+///
+/// A target whose delivery is ONE call per batch (Lambda, Step Functions, ECS, Batch,
+/// SageMaker, an API destination, Timestream, Redshift Data) is deliberately absent: it has
+/// no per-call entry limit to cap the batch at, so only the source's own modelled `@range`
+/// bounds it.
+const TARGET_BATCH_SIZE_CAPS: &[(&str, i32)] = &[
+    ("events", 10),
+    ("kinesis", 500),
+    ("logs", 10_000),
+    (PIPES_SERVICE_SQS, 10),
+];
+
+/// The ARN service namespace of Amazon SQS, named once: it is both a batch cap above and
+/// the service whose FIFO queues need a message group id.
+const PIPES_SERVICE_SQS: &str = "sqs";
+
+/// The suffix the name of an Amazon SQS FIFO queue carries — a queue whose name does not
+/// end in it is a standard queue. Source: Amazon SQS requires the name of a FIFO queue to
+/// end with `.fifo`.
+const FIFO_QUEUE_SUFFIX: &str = ".fifo";
+
+/// The vendor the resource `target` names and the largest batch it accepts per delivery, or
+/// `None` when that target has no per-call entry limit ([`TARGET_BATCH_SIZE_CAPS`]) and when
+/// `target` is not a resource ARN at all.
+///
+/// The vendor travels WITH the cap because the refusal states both, and the one that proved
+/// the cap is the one the sentence has to name.
+pub fn target_batch_size_cap(target: &str) -> Option<(&str, i32)> {
+    let vendor = ::service_common::arn::vendor(target)?;
+    TARGET_BATCH_SIZE_CAPS
+        .iter()
+        .find(|(namespace, _)| *namespace == vendor)
+        .map(|(_, cap)| (vendor, *cap))
+}
+
+/// The batch size a pipe's source parameters configure, whichever source type they are
+/// for: every `PipeSource*Parameters` shape that can batch carries the same `BatchSize`
+/// member, and a pipe reads from exactly one source.
+pub fn configured_batch_size(parameters: &PipeSourceParameters) -> Option<i32> {
+    let from_each = [
+        parameters.sqs_queue_parameters.as_ref().and_then(|p| p.batch_size),
+        parameters.kinesis_stream_parameters.as_ref().and_then(|p| p.batch_size),
+        parameters.dynamo_db_stream_parameters.as_ref().and_then(|p| p.batch_size),
+        parameters.active_mq_broker_parameters.as_ref().and_then(|p| p.batch_size),
+        parameters.rabbit_mq_broker_parameters.as_ref().and_then(|p| p.batch_size),
+        parameters
+            .managed_streaming_kafka_parameters
+            .as_ref()
+            .and_then(|p| p.batch_size),
+        parameters
+            .self_managed_kafka_parameters
+            .as_ref()
+            .and_then(|p| p.batch_size),
+    ];
+    from_each.into_iter().flatten().next()
+}
+
+/// The field a `FilterCriteria` this service cannot accept is refused as, or `None` when
+/// every pattern it carries is one.
+///
+/// A pipe's filter patterns are EventBridge EVENT PATTERNS: each is a JSON object matched
+/// against the event, so text that is not a JSON object is not a pattern at all. The model
+/// types `Filter.Pattern` as a plain string, which no boundary constraint can express, so
+/// the write that stores one parses it. An absent or empty pattern carries no event pattern
+/// and is left alone — `FilterCriteria` with an empty `Filters` array is how a caller
+/// REMOVES filtering.
+fn filter_criteria_field(criteria: &FilterCriteria) -> Option<ValidationExceptionField> {
+    let patterns = criteria.filters.iter().flat_map(|filters| filters.iter());
+    for filter in patterns {
+        let pattern = match filter.pattern.as_deref() {
+            None | Some("") => continue,
+            Some(pattern) => pattern,
+        };
+        if let Some(reason) = event_pattern_reason(pattern) {
+            return Some(validation_field(
+                PATTERN_FIELD,
+                format!("Invalid Event Pattern. Reason: {reason}."),
+            ));
+        }
+    }
+    None
+}
+
+/// Why `pattern` is not an event pattern, as the parser that read it reports it — or
+/// `None` when it is one.
+///
+/// The reason is the PARSER's own diagnostic, read through
+/// [`::service_common::json_parse_fault`] — the one place this tree states where a
+/// submitted JSON document stopped parsing and what was expected there — so two services
+/// handed the same text cannot disagree about it. Two readings are this service's own:
+///
+/// * a text that PARSES but is not an object is not a filter, which is the one fault with
+///   no parse failure to report ([`NOT_AN_OBJECT_REASON`]);
+/// * the parser this service hands a pattern to reads the filter's MEMBERS, so its first
+///   expectation is a member name. Where the text does not open the filter object, the
+///   parse never begins and stops on its very first character — so that parse is the one
+///   RUN (the text read as the object's body, the opening brace the pattern never had
+///   prepended), rather than a guess about which fault the text carries: the character and
+///   the expectation still come from the parse itself.
+fn event_pattern_reason(pattern: &str) -> Option<String> {
+    let error = match ::serde_json::from_str::<::serde_json::Value>(pattern) {
+        Ok(::serde_json::Value::Object(_)) => return None,
+        Ok(_) => return Some(NOT_AN_OBJECT_REASON.to_string()),
+        Err(error) => error,
+    };
+    if !pattern.trim_start().starts_with(FILTER_OBJECT_OPENING) {
+        let body = format!("{FILTER_OBJECT_OPENING}{pattern}");
+        if let Err(body_error) = ::serde_json::from_str::<::serde_json::Value>(&body) {
+            return Some(::service_common::json_parse_fault::unexpected_input(
+                &body,
+                &body_error,
+            ));
+        }
+    }
+    Some(::service_common::json_parse_fault::unexpected_input(
+        pattern, &error,
+    ))
+}
+
+/// The character a filter object opens with, which an event pattern has to.
+const FILTER_OBJECT_OPENING: char = '{';
+
+/// The member a refused event pattern is reported at: the one that carried it.
+const PATTERN_FIELD: &str = "Pattern";
+
+/// What this service reports for a pattern that parses but is not an object — the one
+/// fault with no parse failure behind it, so no parser states it.
+const NOT_AN_OBJECT_REASON: &str = "Filter is not an object";
+
+/// The field a batch size the target cannot take is reported at, and the one a FIFO target
+/// with no message group id is: the member that would have had to carry something else.
+const BATCH_SIZE_FIELD: &str = "BatchSize";
+const MESSAGE_GROUP_ID_FIELD: &str = "MessageGroupId";
+
+/// The `ValidationException` a pipe configuration is refused with when it breaks a rule
+/// about the RESOURCES the pipe names rather than about the shape of the request, or `None`
+/// when it breaks none.
+///
+/// These are the rules no modelled constraint can express, because each spans two members:
+/// the batch size the source reads is bounded by what the TARGET accepts per delivery
+/// ([`target_batch_size_cap`]), a FIFO queue target needs the message group id its sends
+/// are ordered by, and a filter pattern has to be an event pattern
+/// ([`filter_criteria_field`]). Checked by both writes that can configure a pipe, against
+/// the configuration the pipe would END UP with, so neither a create nor an update can
+/// leave a pipe AWS would never have accepted.
+pub fn cross_resource_violation(
+    source_parameters: Option<&PipeSourceParameters>,
+    target: &str,
+    target_parameters: Option<&PipeTargetParameters>,
+) -> Option<ValidationException> {
+    let field = cross_resource_field(source_parameters, target, target_parameters)?;
+    Some(validation_error(vec![field]))
+}
+
+/// The one field [`cross_resource_violation`] reports, in the order the rules are stated.
+fn cross_resource_field(
+    source_parameters: Option<&PipeSourceParameters>,
+    target: &str,
+    target_parameters: Option<&PipeTargetParameters>,
+) -> Option<ValidationExceptionField> {
+    if let Some(criteria) = source_parameters.and_then(|p| p.filter_criteria.as_ref()) {
+        if let Some(field) = filter_criteria_field(criteria) {
+            return Some(field);
+        }
+    }
+
+    if let (Some(batch_size), Some((target_type, cap))) = (
+        source_parameters.and_then(configured_batch_size),
+        target_batch_size_cap(target),
+    ) {
+        if batch_size > cap {
+            return Some(validation_field(
+                BATCH_SIZE_FIELD,
+                format!(
+                    "The configured batch size {batch_size} is greater than the max \
+                     supported batch size {cap} for target {target_type}."
+                ),
+            ));
+        }
+    }
+
+    // A FIFO queue orders its messages by message group, and `SendMessage` to one requires
+    // the group to send in — which for a pipe is the target parameter, there being no event
+    // member to read it from. A FIFO queue is one whose NAME carries the suffix, which is
+    // the resource field of its ARN (`service_common::arn` reads both fields).
+    let fifo_target = ::service_common::arn::parse_of(target, PIPES_SERVICE_SQS)
+        .is_some_and(|queue| queue.resource.ends_with(FIFO_QUEUE_SUFFIX));
+    let message_group_id = target_parameters
+        .and_then(|p| p.sqs_queue_parameters.as_ref())
+        .and_then(|p| p.message_group_id.as_deref())
+        .filter(|id| !id.is_empty());
+    if fifo_target && message_group_id.is_none() {
+        return Some(validation_field(
+            MESSAGE_GROUP_ID_FIELD,
+            "MessageGroupId is required for a FIFO queue target.",
+        ));
+    }
+
+    None
+}
+
 /// The region an ARN carries when the request names none.
 const DEFAULT_REGION: &str = "us-east-1";
 
@@ -442,9 +685,9 @@ impl PipeRecord {
     /// The source type this pipe reads from, as the token this service names a source by.
     ///
     /// It is resolved from the pipe's `Source`, which is fixed when the pipe is created
-    /// (no update shape carries a `Source`): the service namespace of its ARN
-    /// (`arn:<partition>:<service>:…`), lowercased, or [`SELF_MANAGED_KAFKA`] for the one
-    /// non-ARN form `ArnOrUrl` admits.
+    /// (no update shape carries a `Source`): the vendor of its ARN as
+    /// `service_common::arn` reads one — the one parse of an ARN's fields in this tree —
+    /// or [`SELF_MANAGED_KAFKA`] for the one non-ARN form `ArnOrUrl` admits.
     pub fn source_type(&self) -> String {
         if self
             .source
@@ -453,11 +696,9 @@ impl PipeRecord {
         {
             return SELF_MANAGED_KAFKA.to_string();
         }
-        self.source
-            .split(':')
-            .nth(2)
+        ::service_common::arn::vendor(&self.source)
             .unwrap_or_default()
-            .to_ascii_lowercase()
+            .to_string()
     }
 
     /// This record as the `Pipe` summary `ListPipes` returns.

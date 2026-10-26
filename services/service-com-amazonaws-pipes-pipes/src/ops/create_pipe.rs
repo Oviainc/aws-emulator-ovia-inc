@@ -3,9 +3,12 @@
 //! @op CreatePipe
 //! IMPLEMENTED: persists the whole pipe record in [`crate::state`], mints its ARN, and
 //! answers from the record it just stored. A name that already exists is refused with
-//! `ConflictException` (409); a `Tags` entry breaking a published tag rule is refused with
-//! the `BadRequestException` (400) the tagging layer answers a broken tag rule with, so a
-//! pipe cannot be created carrying a tag `TagResource` would refuse. A pipe the caller
+//! `ConflictException` (409); a configuration the resources the pipe names cannot hold —
+//! a batch size past what the target takes per delivery, a FIFO queue target with no
+//! message group id, a filter that is not an event pattern — is refused with the modelled
+//! `ValidationException` (400); a `Tags` entry breaking a published tag rule is refused
+//! with the `BadRequestException` (400) the tagging layer answers a broken tag rule with,
+//! so a pipe cannot be created carrying a tag `TagResource` would refuse. A pipe the caller
 //! asked to RUN also gets its data-plane poller ([`crate::state::data_plane`]), which is
 //! what makes the pipe move records with no further client action. This is the ONLY file
 //! to touch for this operation.
@@ -217,6 +220,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // The rules that span the pipe's SOURCE, TARGET and filters — what the resources
+        // the pipe names can actually hold, which no per-member constraint can express.
+        // Stated once in `crate::state` and enforced by `UpdatePipe` too, so a pipe cannot
+        // be created in a configuration an update could not have reached either.
+        if let Some(violation) = crate::state::cross_resource_violation(
+            input.source_parameters.as_ref(),
+            &input.target,
+            input.target_parameters.as_ref(),
+        ) {
+            return Err(CreatePipeErrorModeled::ValidationException(violation).into());
+        }
+
         // The tag rules a write that installs tags enforces for itself: `TagKey`'s and
         // `TagValue`'s `@length` bounds (the boundary validator walks a map's entry count
         // and its values' shapes but not its KEYS), the documented tag character set and
@@ -254,7 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if let Some(existing) = state.pipes.get(&input.name) {
             return Err(CreatePipeErrorModeled::ConflictException(ConflictException {
-                message: format!("Pipe named {} already exists.", existing.name),
+                message: format!("Pipe {} already exists.", existing.name),
                 resource_id: existing.name.clone(),
                 resource_type: crate::state::PIPE_RESOURCE_TYPE.to_string(),
             })
@@ -289,7 +304,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::PipeRecord {
             arn: crate::state::pipe_arn(&region, &input.name),
             name: input.name.clone(),
-            description: input.description.clone(),
+            description: crate::state::stored_description(input.description.clone()),
             current_state: crate::state::pipe_state::CREATING.to_string(),
             // The move the clock owes: `CREATING` -> the state the caller asked for.
             pending: Some(crate::state::pending_transition(&desired_state)),

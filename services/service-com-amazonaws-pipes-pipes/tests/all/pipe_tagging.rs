@@ -414,10 +414,11 @@ async fn untag_resource_removes_only_the_keys_it_names() {
     }
 }
 
-/// RULE: a tagging call addresses the pipe whose ARN is its `resourceArn`; when this
-/// account holds no such pipe — it was never created, it has been deleted, or the ARN
-/// names another region or another service's resource — every one of the three operations
-/// answers 404 `NotFoundException`.
+/// RULE: a tagging call addresses the pipe whose ARN is its `resourceArn`; when that ARN is
+/// of this vendor but this account holds no such pipe — it was never created, it has been
+/// deleted, or the ARN names another region or another account — every one of the three
+/// operations answers 404 `NotFoundException`. (An ARN of ANOTHER vendor is a different
+/// refusal, 400 `BadRequestException`, pinned in `tests/all/tagging_refusals.rs`.)
 #[tokio::test]
 async fn tagging_an_arn_no_pipe_carries_is_not_found() {
     let router = router();
@@ -454,13 +455,6 @@ async fn tagging_an_arn_no_pipe_carries_is_not_found() {
             ),
         ),
         ("another-account", other_account),
-        (
-            "another-service-resource",
-            format!(
-                "arn:aws:sqs:{REGION}:{}:orders",
-                engine::EMULATOR_ACCOUNT_ID
-            ),
-        ),
     ];
 
     for (case, resource_arn) in rows {

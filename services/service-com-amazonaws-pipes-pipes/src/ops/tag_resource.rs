@@ -8,8 +8,9 @@
 //! the tagging layer's constant sentence; a tag breaking a published tag rule — the
 //! `TagKey`/`TagValue` length bounds, the documented tag character set, or the prefix AWS
 //! reserves for its own tags — is `BadRequestException` (400), the code that layer answers
-//! with; and a merge that would push the pipe past 50 tags is the modelled
-//! `ValidationException` (400). This is the ONLY file to touch for this operation.
+//! with, as is an ARN that is not a pipe ARN at all; and a merge that would push the pipe
+//! past 50 tags is the modelled `ValidationException` (400). This is the ONLY file to touch
+//! for this operation.
 //!
 //! The tag-content rules live in [`crate::state::tag_violation`], so the create path that
 //! also installs tags refuses exactly what this one refuses.
@@ -162,6 +163,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut state = store.lock();
         state.settle_due_transitions();
+
+        // An ARN of ANOTHER service can name no pipe however this account's pipes change,
+        // so the tagging layer refuses it with its own `BadRequestException` (400) rather
+        // than with the 404 it answers an ARN of this vendor that resolves to no pipe.
+        if let Some(message) = crate::state::foreign_resource_arn(&input.resource_arn) {
+            return Err(TagResourceError::bad_request(message));
+        }
 
         // Every tag in a deterministic order, so a request carrying several illegal ones
         // is always refused with the same message.

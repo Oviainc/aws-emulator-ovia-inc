@@ -16,7 +16,8 @@
 //!   code, `BadRequestException`, which no operation of this model declares — including
 //!   a key named for REMOVAL that is outside `TagKey`'s `@length(1, 128)` bound, where
 //!   the refusal states the member `UntagResource`'s request validation names and both
-//!   published bounds.
+//!   published bounds — and refuses an ARN of ANOTHER vendor with the same code, because no
+//!   pipe of this service can ever carry it.
 //!
 //! What a tag may CONTAIN has its own suite in `tests/all/tag_key_rules.rs`; the merge
 //! semantics live in `tests/all/pipe_tagging.rs`. Every assertion goes through
@@ -36,6 +37,10 @@ use crate::pipe_tagging::{
 /// with. Recorded behaviour: a constant, not built from the request.
 const RESOURCE_NOT_FOUND: &str = "Resource was not found";
 
+/// The sentence those operations report an ARN of another vendor with. The vendor it names
+/// is this service's own ARN namespace.
+const NOT_A_PIPE_ARN: &str = "Invalid input resource arn: expected vendor pipes";
+
 /// The code the tagging layer refuses a broken tag rule with.
 const TAG_RULE_CODE: &str = "BadRequestException";
 
@@ -47,13 +52,14 @@ const MIN_TAG_KEY_LEN: usize = 1;
 /// The most BYTES of a refused value a validation sentence echoes before eliding it.
 const MAX_ECHOED_BYTES: usize = 256;
 
-/// RULE: whichever of the three ARN-addressed tagging operations is called, an ARN this
-/// account holds no pipe for is 404 `NotFoundException` carrying the one constant
-/// sentence — nothing of the ARN interpolated into it.
+/// RULE: whichever of the three ARN-addressed tagging operations is called, an ARN of THIS
+/// vendor that this account holds no pipe for is 404 `NotFoundException` carrying the one
+/// constant sentence — nothing of the ARN interpolated into it.
 ///
-/// The rows span the ways an ARN resolves to no pipe: never created, created and then
-/// deleted, another region, another account, another service's resource, and an
-/// identifier carrying no `pipe/` part at all.
+/// The rows span the ways such an ARN resolves to no pipe: never created, created and then
+/// deleted, another region, another account, a `pipes` resource that is not a pipe at all,
+/// and one whose pipe name is empty. (An ARN of ANOTHER vendor is a different refusal — see
+/// `an_arn_of_another_vendor_is_refused_as_a_bad_request`.)
 #[tokio::test]
 async fn an_unresolvable_resource_arn_is_reported_by_one_constant_sentence() {
     let router = router();
@@ -99,12 +105,16 @@ async fn an_unresolvable_resource_arn_is_reported_by_one_constant_sentence() {
             format!("arn:aws:pipes:{REGION}:210987654321:pipe/{live}"),
         ),
         (
-            "another-service-resource",
-            format!("arn:aws:sqs:{REGION}:{account}:orders"),
+            "a-pipes-resource-that-is-not-a-pipe",
+            format!("arn:aws:pipes:{REGION}:{account}:{live}"),
         ),
         (
-            "no-pipe-part-at-all",
-            format!("arn:aws:pipes:{REGION}:{account}:{live}"),
+            "a-resource-type-that-only-looks-like-a-pipe",
+            format!("arn:aws:pipes:{REGION}:{account}:pipeline/{live}"),
+        ),
+        (
+            "an-empty-pipe-name",
+            format!("arn:aws:pipes:{REGION}:{account}:pipe/"),
         ),
     ];
 
@@ -129,10 +139,13 @@ async fn an_unresolvable_resource_arn_is_reported_by_one_constant_sentence() {
                 "case {case:?} / {operation}: expected the one constant sentence, \
                  got {reply:?}"
             );
+            // The constant sentence resolves nothing and echoes nothing: neither the pipe
+            // the ARN names nor any other part of it reaches the caller.
             assert!(
-                !reply.message().contains(name_in_arn)
-                    && !reply.message().contains("arn:")
-                    && !reply.message().contains(REGION),
+                !reply.message().contains("arn:")
+                    && !reply.message().contains(account)
+                    && !reply.message().contains(REGION)
+                    && (name_in_arn.is_empty() || !reply.message().contains(name_in_arn)),
                 "case {case:?} / {operation}: the sentence must echo no part of the ARN it \
                  was given, got {reply:?}"
             );
@@ -153,6 +166,74 @@ async fn an_unresolvable_resource_arn_is_reported_by_one_constant_sentence() {
         described.status, 404,
         "the deleted pipe must stay deleted, got {described:?}"
     );
+}
+
+/// RULE: an ARN of ANOTHER vendor can name no pipe of this service however this account's
+/// pipes change, so the tagging layer refuses it as a bad request: 400 `BadRequestException`
+/// with the one sentence naming the vendor the layer expected, echoing no part of the ARN it
+/// was handed, on all three operations and leaving every stored tag alone.
+///
+/// The rows span the ways an ARN names another vendor: another service's own resource, one
+/// whose resource part looks exactly like a pipe's, and one whose vendor is close to this
+/// service's name.
+#[tokio::test]
+async fn an_arn_of_another_vendor_is_refused_as_a_bad_request() {
+    let router = router();
+    let live = "arnnotapipelive";
+    let stored = json!({"env": "prod"});
+    let created = create(&router, live, create_body(Some(&stored))).await;
+    assert_eq!(
+        created.status, 200,
+        "the live pipe must be created, got {created:?}"
+    );
+
+    let account = engine::EMULATOR_ACCOUNT_ID;
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "another-service-resource",
+            format!("arn:aws:sqs:{REGION}:{account}:orders"),
+        ),
+        (
+            "another-service-with-a-pipe-resource",
+            format!("arn:aws:sqs:{REGION}:{account}:pipe/{live}"),
+        ),
+        (
+            "a-vendor-close-to-this-one",
+            format!("arn:aws:pipe:{REGION}:{account}:pipe/{live}"),
+        ),
+    ];
+
+    for (case, resource_arn) in rows {
+        for (operation, reply) in [
+            ("ListTagsForResource", list_tags(&router, &resource_arn).await),
+            (
+                "TagResource",
+                tag(&router, &resource_arn, &json!({"env": "prod"})).await,
+            ),
+            ("UntagResource", untag(&router, &resource_arn, &["env"]).await),
+        ] {
+            assert_eq!(
+                (reply.status, reply.error_code.as_str()),
+                (400, TAG_RULE_CODE),
+                "case {case:?} / {operation}: expected 400 {TAG_RULE_CODE}, got {reply:?}"
+            );
+            assert_eq!(
+                reply.message(),
+                NOT_A_PIPE_ARN,
+                "case {case:?} / {operation}: expected the one fixed sentence, got {reply:?}"
+            );
+            assert!(
+                !reply.message().contains(account)
+                    && !reply.message().contains(REGION)
+                    && !reply.message().contains(live),
+                "case {case:?} / {operation}: the sentence must echo no part of the ARN it \
+                 was given, got {reply:?}"
+            );
+        }
+    }
+
+    // None of the refused calls touched the pipe those ARNs came close to naming.
+    assert_tags_agree(&router, "live-pipe-after-the-400s", live, &tag_map(&stored)).await;
 }
 
 /// RULE: the same pipe answered through its NAME keeps the name-interpolated sentence —

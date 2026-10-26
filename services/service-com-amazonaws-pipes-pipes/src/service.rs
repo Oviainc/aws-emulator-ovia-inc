@@ -20,12 +20,13 @@
 //!   request's resolved route key against this service's signing name. Edit it
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
-//! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//! - `override_operation` — EDITED HERE: the key and the handler stay the generated
+//!   table's, but each modelled operation is served through [`FrontDoor`], which is where
+//!   a refusal of the request BODY against the modelled input is worded — see "How a
+//!   refused pipes request is worded".
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. EDITED HERE for the refusals the resource-tagging layer owns;
+//!   see the inline note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -39,9 +40,48 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! # How a refused pipes request is worded
+//!
+//! Three layers answer a refused pipes request, and they do not answer alike.
+//!
+//! The FRONT DOOR validates the request's JSON BODY against the operation's modelled
+//! input before the service sees it, and reports a value outside a modelled constraint as
+//! the clause its body-schema validator states for that constraint class, in brackets:
+//! `[ECMA 262 regex "<pattern>" does not match input string "<value>"]` for a `@pattern`,
+//! `[string "<value>" is too long (length: <n>, maximum allowed: <max>)]` for a `@length`
+//! maximum on a string, `[object has too many properties (found <n> but schema requires at
+//! most <max>)]` for one on a map. The clause quotes the value the CALLER submitted, which
+//! is why the wording happens in [`FrontDoor`], per operation, where the request can be
+//! re-read: the `override_refusal` seam is handed the violations alone, and the framework's
+//! own violation carries an elided rendering of a long value.
+//!
+//! A value the request carries OUTSIDE that body — a `@httpLabel` in the URI, a
+//! `@httpQuery` parameter — is in no body schema, so the front door has no clause for it
+//! and names the member alone (`[tagKeys]`) when the value is EMPTY where the model
+//! requires at least one character or element: an empty query value never becomes a
+//! parameter at all. Everything else about such a member is the SERVICE's own refusal, with
+//! one exception the service validates itself: the pipe NAME, whose `@pattern` is reported
+//! as this service's own `ValidationErrorFields` document naming the member as the control
+//! plane spells it ([`PIPE_NAME_FIELD`]) — the same document `crate::state` builds for the
+//! refusals its handlers state.
+//!
+//! The resource-tagging layer in FRONT of the three ARN-addressed tagging operations owns
+//! what a TAG may contain, and refuses a tag whose content breaks a published tag rule with
+//! its own code — [`TAG_RULE_REFUSAL_CODE`], which no operation of this model declares,
+//! because the layer is not the service. `crate::state::tag_refusal` states the same
+//! sentences for the rules the handlers enforce themselves, so one tag rule is worded one
+//! way whichever layer catches it.
 
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use service_common::front_door::binds_to_body;
+use service_common::validation::{refusing_violations_with_echoes, SubmittedEcho};
+use service_common::validation_message::{
+    map_entry_count, pattern_mismatch, string_too_long, too_many_properties,
+};
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation,
+    http, BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable, Refusal,
+    Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
 
@@ -50,6 +90,20 @@ use std::sync::Arc;
 /// service — so a refusal worded with it cannot come from the modelled error enums; see
 /// `crate::scaffolded::Scaffolded::BadRequest` for the handler-side channel.
 const TAG_RULE_REFUSAL_CODE: &str = "BadRequestException";
+
+/// The code and status every refusal [`FrontDoor`] words carries: the modelled
+/// `ValidationException` (`com.amazonaws.pipes#ValidationException`, `@httpError(400)`),
+/// which is the code the framework's own refusal channel names too — only the BODY differs.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+const VALIDATION_EXCEPTION_STATUS: u16 = 400;
+
+/// The violation path of the pipe NAME: `Name` is a `@httpLabel` on every operation that
+/// addresses one pipe, and the walk spells a member's path in lowerCamel.
+const PIPE_NAME_PATH: &str = "name";
+
+/// The member a refused pipe NAME is reported at. The wire member is `Name`; the control
+/// plane's own validation reports it as the recorded refusal names it.
+const PIPE_NAME_FIELD: &str = "PipeName";
 
 /// The input members a TAG's own content arrives on, and the name request validation
 /// reports a refused tag at for each.
@@ -108,6 +162,28 @@ fn tag_content_clause(violation: &Violation) -> Option<String> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The same modelled operations the generated table holds, each wrapped in
+    /// [`FrontDoor`] so a request the front door refuses is worded the way that layer
+    /// words one. Keyed by the routing key the protocol resolves — the key the generated
+    /// table uses — and built from the SAME shared engine, so a wrapped operation reads
+    /// and writes the one store.
+    front_door: OperationRoutingTable,
+}
+
+/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
+/// [`FrontDoor`] and keyed by its operation shape name — the routing key
+/// `ServerHttpProtocol::routing_key` resolves and the generated table is keyed by.
+macro_rules! wrap_operations {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                stringify!($operation),
+                ::std::boxed::Box::new(FrontDoor::new(
+                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                )) as ::std::boxed::Box<dyn ErasedOperation>,
+            );
+        )+
+    };
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -115,9 +191,235 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let mut front_door = OperationRoutingTable::new();
+        // EVERY modelled operation, so the front door's rule is applied by ONE code path
+        // rather than per operation: an operation that binds nothing to the body
+        // (`DescribePipe`, whose only member is its URI label) simply never has a body
+        // violation to word, which the wrapper reads off its own input schema.
+        wrap_operations!(
+            front_door,
+            engine,
+            create_pipe::CreatePipe,
+            delete_pipe::DeletePipe,
+            describe_pipe::DescribePipe,
+            list_pipes::ListPipes,
+            list_tags_for_resource::ListTagsForResource,
+            start_pipe::StartPipe,
+            stop_pipe::StopPipe,
+            tag_resource::TagResource,
+            untag_resource::UntagResource,
+            update_pipe::UpdatePipe,
+        );
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            front_door,
         }
+    }
+}
+
+/// One modelled operation, served behind this service's front door (see "How a refused
+/// pipes request is worded").
+///
+/// Nothing here re-implements a check: the violations come from the framework's own
+/// machinery (the protocol's deserializer and `constraints::validate` over the built
+/// input) through `service_common::validation`, which also restores each value echo to the
+/// bytes the caller submitted, and the status and the error code are the modelled ones.
+/// Only the SENTENCE is this layer's. A request it has no wording for is handed to the
+/// generated [`ErasedOperation::run`], which owns deserialize -> validate -> handle ->
+/// serialize, telemetry and every modelled error — including the refusals the handlers and
+/// the tagging layer state.
+///
+/// The wrapper exists because the clause needs the REQUEST: it quotes the submitted value,
+/// and it has to tell a BODY member from one bound to the URI or the query string, which
+/// is read off this operation's own input schema. The `override_refusal` seam is handed the
+/// violations alone, so neither is reachable there. The cost is DELIBERATE: a valid
+/// request's body is read twice, once here and once in the operation's own sequence,
+/// because the framework hands no already-built input to an operation.
+///
+/// `service_common::front_door::FrontDoor` is the same plumbing for the services whose
+/// front door answers one FIXED sentence (`BadRequestException` / "Invalid request body"),
+/// and this service cannot use it as it stands: the refusal here is the modelled
+/// `ValidationException` whose body is BUILT from the violations. Giving that shared
+/// wrapper a wording hook, and moving this service and the other copies onto it, is a
+/// change to a module several services already depend on and is not this issue's to make —
+/// which is why the clause builders this wrapper calls are in `service_common`
+/// (`validation`, `validation_message`, `front_door::binds_to_body`) even though the
+/// wrapper itself is here: the RULES are shared, only the plumbing is repeated.
+struct FrontDoor<O> {
+    operation: O,
+}
+
+impl<O> FrontDoor<O> {
+    /// Wrap one operation, already constructed from the shared engine.
+    fn new(operation: O) -> Self {
+        Self { operation }
+    }
+}
+
+impl<O> ErasedOperation for FrontDoor<O>
+where
+    O: Operation + ErasedOperation,
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // The protocol is read, used and dropped inside this one block:
+            // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the await
+            // below would make this future non-`Send`.
+            let refused = {
+                let protocol = svc.definition().protocol();
+                let violations = refusing_violations_with_echoes::<O>(protocol, req);
+                front_door_refusal(O::INPUT_SCHEMA, &violations).map(|exception| {
+                    protocol
+                        .serialize_error(
+                            &exception,
+                            &crate::ops::types::SCHEMA_VALIDATION_EXCEPTION,
+                            VALIDATION_EXCEPTION,
+                            VALIDATION_EXCEPTION_STATUS,
+                        )
+                        .unwrap_or_else(|error| svc.definition().framework_error_response(error))
+                })
+            };
+            if let Some(response) = refused {
+                return response;
+            }
+            self.operation.run(svc, req, ctx).await
+        })
+    }
+
+    /// The wrapped operation's modelled auth schemes: wrapping an operation must not
+    /// change which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
+    }
+}
+
+/// The `ValidationException` the front door answers one refused request with, or `None`
+/// when it has no wording for it and the layers behind it answer instead.
+///
+/// The pipe NAME comes FIRST: it is read from the request URI before a body is parsed at
+/// all, and the control plane validates it itself, so a request that gets its name wrong is
+/// refused by that document whatever else it carries. Otherwise every violation has to be
+/// one this layer states a clause for — a request carrying one it does not is left whole to
+/// the framework's own wording rather than reported half in one voice and half in another.
+fn front_door_refusal(
+    input_schema: &::aws_smithy_schema::Schema,
+    refused: &[(Violation, SubmittedEcho)],
+) -> Option<crate::ops::types::ValidationException> {
+    if let Some(field) = refused
+        .iter()
+        .find_map(|(violation, _)| pipe_name_field(violation))
+    {
+        return Some(crate::state::validation_error(vec![field]));
+    }
+    // A value that arrived EMPTY where the model requires at least one character or element
+    // never became a parameter at all, so the front door reports that member and nothing
+    // else about it: whatever ELSE the empty value fails (its pattern, say) is moot beside
+    // the value not being there.
+    let empty_members: Vec<&str> = refused
+        .iter()
+        .filter(|(violation, _)| {
+            matches!(violation.kind, ViolationKind::MinLength(_))
+                && !binds_to_body(input_schema, &violation.path)
+        })
+        .map(|(violation, _)| member_of(violation))
+        .collect();
+
+    let mut clauses: Vec<String> = Vec::new();
+    for (violation, echo) in refused {
+        let moot = empty_members.contains(&member_of(violation))
+            && !matches!(violation.kind, ViolationKind::MinLength(_));
+        if moot {
+            continue;
+        }
+        let clause = clause(input_schema, violation, echo)?;
+        if !clauses.contains(&clause) {
+            clauses.push(clause);
+        }
+    }
+    if clauses.is_empty() {
+        return None;
+    }
+    Some(crate::ops::types::ValidationException {
+        // The clauses of one refusal, as the schema validator lists them. No `fieldList`:
+        // the member-by-member list is what the SERVICE's own validation reports (see
+        // `crate::state::validation_error`), and this refusal is not the service's.
+        message: Some(format!("[{}]", clauses.join(", "))),
+        field_list: None,
+    })
+}
+
+/// The field a refused pipe NAME is reported as, or `None` when the violation is not the
+/// name's modelled `@pattern`.
+///
+/// The sentence states the rule and the expression the MODEL declares for `PipeName`, both
+/// taken from the violation rather than written out, so it follows the model. A name
+/// outside the length bound is a different rule with no recorded sentence of its own, so it
+/// keeps the framework's wording, which states the bound it broke.
+fn pipe_name_field(violation: &Violation) -> Option<crate::ops::types::ValidationExceptionField> {
+    let ViolationKind::Pattern(pattern) = &violation.kind else {
+        return None;
+    };
+    (violation.path == PIPE_NAME_PATH).then(|| {
+        crate::state::validation_field(
+            PIPE_NAME_FIELD,
+            format!(
+                "Invalid pattern for pipe name. Pipe name should match pattern {pattern}."
+            ),
+        )
+    })
+}
+
+/// The clause the front door states for one violation, or `None` when it states none.
+///
+/// A member carried OUTSIDE the request body is in no body schema: the front door reads it
+/// from the URI or the query string, where a value that is EMPTY where the model requires
+/// at least one character or element never arrives as a parameter at all, and the refusal
+/// names the member alone. Every other rule about such a member belongs to the service.
+///
+/// A BODY member is reported by the clause the body-schema validator states for the class
+/// of constraint it broke, quoting the value the caller submitted — every one of those
+/// sentences through `service_common::validation_message`, which is their home for the
+/// whole tree. Only a TOP-LEVEL member is worded: one nested inside a structure, a map
+/// entry or a list element is reported by the layer that owns that member — a tag's content
+/// is the tagging layer's ([`tag_content_clause`]) — so its clause is not this layer's to
+/// state. A class that layer has no recorded sentence for (a `@length` MINIMUM on a body
+/// string, a `@range`, an enum, an absent `@required` member) keeps the framework's own
+/// wording rather than being given one here.
+fn clause(
+    input_schema: &::aws_smithy_schema::Schema,
+    violation: &Violation,
+    echo: &SubmittedEcho,
+) -> Option<String> {
+    if !binds_to_body(input_schema, &violation.path) {
+        return matches!(violation.kind, ViolationKind::MinLength(_))
+            .then(|| member_of(violation).to_string());
+    }
+    if violation.path.contains('.') {
+        return None;
+    }
+    match (echo, &violation.kind) {
+        (SubmittedEcho::Rendered(value), ViolationKind::Pattern(pattern)) => {
+            Some(pattern_mismatch(pattern, value))
+        }
+        (SubmittedEcho::Rendered(value), ViolationKind::MaxLength(max)) => {
+            // `@length` counts CHARACTERS, which is what the constraint walk counted.
+            Some(string_too_long(value, value.chars().count(), *max))
+        }
+        // A value with no text rendering whose `@length` is the ENTRY COUNT of a map: the
+        // body schema states that bound as the object's property count, which
+        // `service_common::validation_message` already states once for the whole tree
+        // (together with the `<n> entries` rendering the count is read from). Every map a
+        // request of this service carries at the top level of its body is a `TagMap`.
+        (SubmittedEcho::Unrendered, ViolationKind::MaxLength(max)) => {
+            let found = map_entry_count(violation.value.as_deref()?)?;
+            Some(too_many_properties(found, *max))
+        }
+        _ => None,
     }
 }
 
@@ -143,26 +445,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // NOT a re-route: the key is the one the generated table's own protocol resolves,
+        // and the operation it names is the one served — wrapped in [`FrontDoor`] so a
+        // request the front door refuses is worded the way that layer words one. A key the
+        // model does not name resolves to `None` here exactly as it does in the generated
+        // table, so the router's routing-error path is unchanged.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.front_door.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // Two layers answer a refused pipes request, and they do not answer alike.
-        //
-        // The resource-tagging layer in FRONT of this service owns the three
-        // ARN-addressed tagging operations, and it refuses a tag whose content breaks a
-        // published tag rule with its own code — `BadRequestException`, which no
-        // operation of this model declares, because the layer is not the service. The
-        // rule the tag broke is one the model DOES declare (`TagKey`'s and `TagValue`'s
-        // `@length`), so the boundary validator is what finds it, and this is where that
-        // refusal is worded. `crate::state::tag_refusal` states the same sentences for
-        // the rules the handlers enforce themselves, so one tag rule is worded one way
-        // whichever layer catches it.
+        // [`FrontDoor`] answers every refusal this service has its own wording for before
+        // the framework's walk reaches here, so this seam is left with the one layer whose
+        // refusal is keyed on the violation ALONE: the resource-tagging layer in front of
+        // the three ARN-addressed tagging operations, which refuses a tag whose CONTENT
+        // breaks a published tag rule with its own code — `BadRequestException`, which no
+        // operation of this model declares, because the layer is not the service. The rule
+        // the tag broke is one the model DOES declare (`TagKey`'s and `TagValue`'s
+        // `@length`), so the boundary validator is what finds it.
+        // `crate::state::tag_refusal` states the same sentences for the rules the handlers
+        // enforce themselves, so one tag rule is worded one way whichever layer catches it.
         //
         // Everything else is the SERVICE's own refusal, and this service models
         // `ValidationException` for it — which is the code the default already names —
