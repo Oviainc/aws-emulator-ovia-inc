@@ -70,9 +70,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::ops::types::{
     Connection, ConnectionAuthResponseParameters, DeadLetterConfig, DescribeApiDestinationOutput,
     DescribeArchiveOutput, DescribeConnectionOutput, DescribeEndpointOutput, DescribeReplayOutput,
-    EndpointEventBus, LogConfig, PartnerEventSourceAccount, Replay as ReplaySummary,
-    ReplayDestination, ReplicationConfig, RoutingConfig, Rule as RuleSummary, Tag, Target,
-    INCLUDE_DETAIL_VALUES, LEVEL_VALUES, RULE_STATE_VALUES,
+    Endpoint as EndpointSummary, EndpointEventBus, LogConfig, PartnerEventSourceAccount,
+    Replay as ReplaySummary, ReplayDestination, ReplicationConfig, RoutingConfig,
+    Rule as RuleSummary, Tag, Target, UpdateEndpointOutput, INCLUDE_DETAIL_VALUES, LEVEL_VALUES,
+    RULE_STATE_VALUES,
 };
 
 /// The event bus a request lands on when it names none.
@@ -1699,13 +1700,24 @@ pub const ENDPOINT_STATE_CREATING: &str = "CREATING";
 /// The `EndpointState` of a global endpoint that is serving.
 pub const ENDPOINT_STATE_ACTIVE: &str = "ACTIVE";
 
-/// How long after the create a global endpoint's [`ENDPOINT_STATE_ACTIVE`] state
+/// The `EndpointState` a global endpoint carries while a write to it is being
+/// applied.
+///
+/// `EndpointState` holds `UPDATING` beside `ACTIVE`, and
+/// `UpdateEndpoint$State` is "the state of the endpoint you updated in this
+/// request": the configuration a write names has to reach the Regions the
+/// endpoint spans before the endpoint is serving it, so the write answers this
+/// non-terminal state and a later read reports the endpoint serving again.
+pub const ENDPOINT_STATE_UPDATING: &str = "UPDATING";
+
+/// How long after a write a global endpoint's [`ENDPOINT_STATE_ACTIVE`] state
 /// becomes due.
 ///
 /// AWS publishes no duration for it, so this is the emulator's OWN span, chosen
 /// inside the window the project fixes for a clock-owed transition, and it is
 /// stored as a DUE INSTANT rather than waited for: a caller reading straight
-/// after the create still observes [`ENDPOINT_STATE_CREATING`].
+/// after the write still observes [`ENDPOINT_STATE_CREATING`] or
+/// [`ENDPOINT_STATE_UPDATING`].
 pub const ENDPOINT_TRANSITION: Duration = Duration::from_millis(400);
 
 /// Largest number of global endpoints this store holds.
@@ -1777,14 +1789,31 @@ pub fn endpoint_url(endpoint_id: &str) -> String {
     format!("https://{endpoint_id}.{ENDPOINT_URL_DOMAIN}")
 }
 
-/// What any reader reports for a name that names no global endpoint: the missing
-/// ENDPOINT by name, built from the request, in the same words every reader of
-/// this service's resources uses — `no_such_archive`, [`no_such_replay`],
-/// [`no_such_event_bus`], [`no_such_event_source`] and [`no_such_rule`] all name
-/// the resource kind and then the identifier the caller passed, so a caller
-/// reads one form across this API.
-pub fn no_such_endpoint(name: &str) -> String {
-    format!("Endpoint {name} does not exist.")
+/// What any operation addressing a name that names no global endpoint reports:
+/// the missing ENDPOINT by name AND the Region it was looked for in, both built
+/// from the request ([`endpoint_region`] resolves the Region).
+///
+/// Like `no_such_archive`, [`no_such_replay`], [`no_such_event_bus`],
+/// [`no_such_event_source`] and [`no_such_rule`], it names the resource kind and
+/// then the identifier the caller passed; unlike them it also names the Region,
+/// because a global endpoint is homed in ONE Region and the same name can be
+/// absent here and present there — so the refusal says WHERE it looked.
+pub fn no_such_endpoint(name: &str, region: &str) -> String {
+    format!("Endpoint {name} does not exist in region {region}.")
+}
+
+/// The Region a global-endpoint request is about: the `HomeRegion` it named, or
+/// the Region the request itself was addressed to when it named none.
+///
+/// A global endpoint is homed in ONE Region — "the primary Region of the
+/// endpoint you want to get information about" (`DescribeEndpoint$HomeRegion`) —
+/// so the Region searched is the one the caller named, and otherwise the one the
+/// call was signed for ([`request_region`]). It is the Region
+/// [`no_such_endpoint`] reports, so the refusal names the Region actually
+/// searched. An operation whose input carries no `HomeRegion` member passes
+/// `None`.
+pub fn endpoint_region(home_region: Option<&str>, parts: &::http::request::Parts) -> String {
+    home_region.map_or_else(|| request_region(parts), str::to_string)
 }
 
 /// The Region field of an ARN, or `None` when the text carries none.
@@ -1904,6 +1933,44 @@ impl EndpointRecord {
     /// the stored subdomain so the URL and the `EndpointId` cannot disagree.
     pub fn url(&self) -> String {
         endpoint_url(&self.endpoint_id)
+    }
+
+    /// Every member a listing reports for this endpoint
+    /// ([`crate::ops::types::Endpoint`]), read back from the same stored record
+    /// the single-endpoint read reports, so a listing and a read cannot
+    /// disagree.
+    pub fn to_summary(&self) -> EndpointSummary {
+        EndpointSummary {
+            name: Some(self.name.clone()),
+            description: self.description.clone(),
+            arn: Some(self.arn.clone()),
+            routing_config: Some(self.routing_config.clone()),
+            replication_config: Some(self.replication_config()),
+            event_buses: Some(self.event_buses.clone()),
+            role_arn: self.role_arn.clone(),
+            endpoint_id: Some(self.endpoint_id.clone()),
+            endpoint_url: Some(self.url()),
+            state: Some(self.state.clone()),
+            state_reason: self.state_reason.clone(),
+            creation_time: Some(to_wire_timestamp(self.created)),
+            last_modified_time: Some(to_wire_timestamp(self.last_modified)),
+        }
+    }
+
+    /// Every member `UpdateEndpoint` reports, read back from the stored record,
+    /// so the write's answer and a later read cannot disagree.
+    pub fn to_update_output(&self) -> UpdateEndpointOutput {
+        UpdateEndpointOutput {
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            routing_config: Some(self.routing_config.clone()),
+            replication_config: Some(self.replication_config()),
+            event_buses: Some(self.event_buses.clone()),
+            role_arn: self.role_arn.clone(),
+            endpoint_id: Some(self.endpoint_id.clone()),
+            endpoint_url: Some(self.url()),
+            state: Some(self.state.clone()),
+        }
     }
 
     /// Every member `DescribeEndpoint` reports, read back from the stored
@@ -2331,14 +2398,21 @@ impl ComAmazonawsEventbridgeAwseventsState {
             .filter(|record| home_region.is_none_or(|region| record.home_region == region))
     }
 
+    /// The global endpoint `name` names, mutably, for a WRITING operation.
+    /// Creates nothing: an endpoint comes into existence through
+    /// `CreateEndpoint`, never through a write to one that does not exist.
+    pub fn endpoint_mut(&mut self, name: &str) -> Option<&mut EndpointRecord> {
+        self.endpoints.get_mut(name)
+    }
+
     /// Materialise every global-endpoint transition the clock has ALREADY made
     /// due at `now`, and answer how many were applied.
     ///
     /// The change is owed by the clock alone: an endpoint answered
-    /// [`ENDPOINT_STATE_CREATING`] reaches [`ENDPOINT_STATE_ACTIVE`]
-    /// [`ENDPOINT_TRANSITION`] after the create, and was owed at the same
-    /// instant even if nobody had called — which is why a reporting operation
-    /// may finish it.
+    /// [`ENDPOINT_STATE_CREATING`] or [`ENDPOINT_STATE_UPDATING`] reaches
+    /// [`ENDPOINT_STATE_ACTIVE`] [`ENDPOINT_TRANSITION`] after the write that
+    /// left it there, and was owed at the same instant even if nobody had
+    /// called — which is why a reporting operation may finish it.
     pub fn settle_endpoints(&mut self, now: SystemTime) -> usize {
         let mut settled = 0usize;
         for endpoint in self.endpoints.values_mut() {
@@ -3086,22 +3160,14 @@ const ENVELOPE_LEVELS: usize = 1;
 /// could be matched against; the caller replays nothing for it rather than
 /// inventing an envelope. Reading the text DESCENDS into it, so the published
 /// [`MAX_DETAIL_DEPTH`] is charged here for the reason [`parse_detail`] gives,
-/// allowing for the levels the envelope itself adds.
+/// allowing for the levels the envelope itself adds, and the stack that depth
+/// needs is provided the same way ([`parse_json_document`]).
 pub fn replayed_envelope(archived: &str, replay_name: &str) -> Option<::serde_json::Value> {
-    if json_nesting_depth(archived) > MAX_DETAIL_DEPTH + ENVELOPE_LEVELS {
+    let depth = json_nesting_depth(archived);
+    if depth > MAX_DETAIL_DEPTH + ENVELOPE_LEVELS {
         return None;
     }
-    let mut reader = ::serde_json::Deserializer::from_str(archived);
-    // Past the charge above, the parser's own default would refuse an envelope
-    // this service archived, so the published bound replaces it.
-    reader.disable_recursion_limit();
-    let mut documents = reader.into_iter::<::serde_json::Value>();
-    let Some(Ok(mut envelope)) = documents.next() else {
-        return None;
-    };
-    if documents.next().is_some() {
-        return None;
-    }
+    let mut envelope = parse_json_document(archived, depth)?;
     envelope.as_object_mut()?.insert(
         REPLAY_NAME_FIELD.to_string(),
         ::serde_json::Value::String(replay_name.to_string()),
@@ -3581,6 +3647,70 @@ pub fn validate_detail(detail: &str) -> Result<(), DetailRefusal> {
     Ok(())
 }
 
+/// How deeply a JSON document may nest before its parse tree is built on a
+/// stack of this module's own sizing.
+///
+/// Building a [`::serde_json::Value`] DESCENDS one frame per container level, and
+/// a frame of that parse costs on the order of two kilobytes, so a document near
+/// [`MAX_DETAIL_DEPTH`] needs more stack than a thread serving a request is
+/// guaranteed to have. Up to this depth — where every realistic document sits —
+/// the tree is built in place; past it the build moves to a thread whose stack is
+/// sized for the published bound ([`DEEP_PARSE_STACK_BYTES`]). So how deeply a
+/// document nests decides HOW the tree is built and never whether the process
+/// survives building it.
+const IN_PLACE_PARSE_DEPTH: usize = 64;
+
+/// The stack a deep parse ([`parse_json_document`]) is given: a generous charge
+/// per level of [`MAX_DETAIL_DEPTH`], so the deepest document this service
+/// publishes is read with room to spare.
+const DEEP_PARSE_STACK_BYTES: usize = 8 * 1024 * MAX_DETAIL_DEPTH;
+
+/// The name the deep parse's thread carries, so a stack trace taken during one
+/// says which work it belongs to.
+const DEEP_PARSE_THREAD_NAME: &str = "eventbridge-json-parse";
+
+/// `text` read as EXACTLY one JSON document, with the parser's own depth default
+/// lifted — whatever stack this runs on is the stack the parse descends into, so
+/// every caller comes through [`parse_json_document`], which provides one.
+///
+/// `None` for text that is not one JSON document: a second document, or trailing
+/// bytes that are not whitespace, is not one.
+fn read_one_json_document(text: &str) -> Option<::serde_json::Value> {
+    let mut reader = ::serde_json::Deserializer::from_str(text);
+    reader.disable_recursion_limit();
+    let mut documents = reader.into_iter::<::serde_json::Value>();
+    let Some(Ok(value)) = documents.next() else {
+        return None;
+    };
+    documents.next().is_none().then_some(value)
+}
+
+/// One JSON document of `depth` levels ([`json_nesting_depth`]) as a parse tree,
+/// read on a stack sized for that depth.
+///
+/// The ONE place this service builds a tree out of text a caller supplied. A
+/// document no deeper than [`IN_PLACE_PARSE_DEPTH`] is read in place; a deeper
+/// one is read on a scoped thread whose stack is sized for the published bound,
+/// which is joined before this returns, so nothing is left running behind the
+/// request. A scoped thread rather than a blocking-pool task: the SIZED stack is
+/// the whole point, and a pool task takes the runtime's size, which no caller
+/// here can set. A parse that panics, or a thread this process cannot start,
+/// answers `None` — the same answer unreadable text gets.
+fn parse_json_document(text: &str, depth: usize) -> Option<::serde_json::Value> {
+    if depth <= IN_PLACE_PARSE_DEPTH {
+        return read_one_json_document(text);
+    }
+    ::std::thread::scope(|scope| {
+        ::std::thread::Builder::new()
+            .name(DEEP_PARSE_THREAD_NAME.to_string())
+            .stack_size(DEEP_PARSE_STACK_BYTES)
+            .spawn_scoped(scope, || read_one_json_document(text))
+            .ok()?
+            .join()
+            .ok()?
+    })
+}
+
 /// One entry's `Detail` as the parse tree a rule's `EventPattern` is matched
 /// against, or `None` when it is not a publishable document at all.
 ///
@@ -3590,25 +3720,16 @@ pub fn validate_detail(detail: &str) -> Result<(), DetailRefusal> {
 /// [`validate_detail`] uses and before the parser is handed anything: the bound
 /// on the recursion is a property of this function rather than of the order its
 /// callers happen to check things in, so no caller can reach the parser with a
-/// document past it. A document AT that bound costs on the order of two
-/// megabytes of stack, which is well inside the stack the emulator gives the
-/// threads it serves requests on.
+/// document past it. The stack that depth needs is PROVIDED rather than assumed
+/// ([`parse_json_document`]), so a document at the bound is read on a stack sized
+/// for it instead of on whatever the request arrived on.
 pub fn parse_detail(detail: &str) -> Option<::serde_json::Value> {
-    if json_nesting_depth(detail) > MAX_DETAIL_DEPTH {
+    let depth = json_nesting_depth(detail);
+    if depth > MAX_DETAIL_DEPTH {
         return None;
     }
-    let mut reader = ::serde_json::Deserializer::from_str(detail);
-    // Past the charge above, the parser's own default would refuse a document
-    // this operation publishes, so the published bound replaces it.
-    reader.disable_recursion_limit();
-    let mut documents = reader.into_iter::<::serde_json::Value>();
-    let Some(Ok(value)) = documents.next() else {
-        return None;
-    };
-    if documents.next().is_some() || !value.is_object() {
-        return None;
-    }
-    Some(value)
+    let value = parse_json_document(detail, depth)?;
+    value.is_object().then_some(value)
 }
 
 /// One clause of a `ValidationException` message: the value that was rejected,
