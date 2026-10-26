@@ -101,3 +101,5 @@ mod user_pool_domain;
 mod user_pool_mfa_config;
 #[path = "all/verification_code_pipeline.rs"]
 mod verification_code_pipeline;
+#[path = "all/web_authn_registration.rs"]
+mod web_authn_registration;
