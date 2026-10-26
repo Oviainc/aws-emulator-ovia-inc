@@ -85,13 +85,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The largest page `ListTagsForResource` returns, and the page size a caller that names
-/// no `maxResults` gets: the maximum of the modelled `maxResults` range (`1..1000`).
-///
-/// A resource holds at most [`crate::state::MAX_TAGS_PER_RESOURCE`] tags, so an unlimited
-/// page is always one page — and never longer than the modelled `TagList` maximum of 60.
-pub const MAX_PAGE_SIZE: i32 = 1000;
-
 /// Encode the resume point of a page as the opaque `nextToken` the caller hands back.
 ///
 /// The token names the LAST tag key on the page just returned, qualified by the resource
@@ -192,12 +185,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // `maxResults` is modelled `1..1000`, so the boundary validator has already
-        // refused a page size outside that range; an absent one means "no limit the caller
-        // asked for", which is every tag the resource holds.
-        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
-            .unwrap_or(MAX_PAGE_SIZE as usize);
-
         let resume_after = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(
@@ -229,22 +216,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // One page, plus one lookahead entry: the token is present exactly when a tag
-        // follows the last one on this page, so the final page carries none.
-        let mut scanned: Vec<(&String, &String)> = match resume_after.as_deref() {
-            Some(after) => tags
-                .range::<str, _>((
-                    ::std::ops::Bound::Excluded(after),
-                    ::std::ops::Bound::Unbounded,
-                ))
-                .take(page_size + 1)
-                .collect(),
-            None => tags.iter().take(page_size + 1).collect(),
+        // Where this page starts: after the tag key the token names, or at the first key
+        // the resource holds when the caller named none. A resource holds at most
+        // [`crate::state::MAX_TAGS_PER_RESOURCE`] tags, so a caller that names no page
+        // size always gets the whole tag set in one page.
+        let start = match resume_after.as_deref() {
+            Some(after) => ::std::ops::Bound::Excluded(after),
+            None => ::std::ops::Bound::Unbounded,
         };
-        let truncated = scanned.len() > page_size;
-        scanned.truncate(page_size);
+        // The page, and whether a tag follows its last entry: the shared window in
+        // `crate::state`, so the token this listing encodes is the only part that is its
+        // own.
+        let (page, truncated) = crate::state::page_window(
+            tags.range::<str, _>((start, ::std::ops::Bound::Unbounded)),
+            input.max_results,
+        );
         let next_token = match truncated {
-            true => scanned
+            true => page
                 .last()
                 .map(|(key, _)| encode_page_token(&input.resource_arn, key)),
             false => None,
@@ -254,8 +242,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token,
             // The modelled `TagList` is `len 1..60`, so an empty list is not a value this
             // member can carry: a resource holding no tags reports the member as absent.
-            tags: (!scanned.is_empty()).then(|| {
-                scanned
+            tags: (!page.is_empty()).then(|| {
+                page
                     .into_iter()
                     .map(|(key, value)| Tag {
                         key: key.clone(),

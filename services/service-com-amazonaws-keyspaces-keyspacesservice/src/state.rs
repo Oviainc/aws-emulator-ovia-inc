@@ -14,7 +14,8 @@
 //! iteration order is total and stable, which a hash map's is not.
 //!
 //! This module also holds what more than one operation needs — ARN construction,
-//! the request's region, the modelled defaults, the [service-managed
+//! the request's region, the modelled defaults, the [page window][page_window] every
+//! `@paginated` listing reports through, the [service-managed
 //! catalog][SERVICE_MANAGED_KEYSPACES] every Region already holds (derived per request by
 //! [`keyspace`][ComAmazonawsKeyspacesKeyspacesserviceState::keyspace]),
 //! and [`settle`][ComAmazonawsKeyspacesKeyspacesserviceState::settle],
@@ -386,6 +387,38 @@ pub fn is_in_flight_status(status: &str) -> bool {
         // Spelled with the table constant because only a table is ever in it; the
         // comparison is still against the status STRING, as the two above are.
         || status == TABLE_STATUS_RESTORING
+}
+
+/// The largest page a `@paginated` listing of this service returns, and the page size a
+/// caller that names no `maxResults` gets: the maximum of the modelled `maxResults` range
+/// (`1..1000`), which every `@paginated` operation of this service shares.
+pub const MAX_PAGE_SIZE: i32 = 1000;
+
+/// One page of a listing, and whether a further item follows it — the page window every
+/// `@paginated` operation of this service reports through.
+///
+/// `items` is the listing's own iteration order, already positioned at the start of the
+/// page the caller asked to resume at: every level of the store is a [`BTreeMap`], so that
+/// order is total and stable and a page boundary is resumable. `max_results` is the page
+/// size the caller named; `maxResults` is modelled `1..1000`, so the boundary validator has
+/// already refused one outside that range, and an absent one means "no limit the caller
+/// asked for", which is [`MAX_PAGE_SIZE`].
+///
+/// Takes ONE item more than the page fits, so the returned flag is true exactly when an
+/// item follows the last one on the page — which is when the listing owes the caller a
+/// `nextToken`, leaving the final page without one. The resume point is the last item of
+/// the returned page; what a token for it looks like is each listing's own, so the
+/// encoding stays with the operation.
+pub fn page_window<Item>(
+    items: impl Iterator<Item = Item>,
+    max_results: Option<i32>,
+) -> (Vec<Item>, bool) {
+    let page_size =
+        usize::try_from(max_results.unwrap_or(MAX_PAGE_SIZE)).unwrap_or(MAX_PAGE_SIZE as usize);
+    let mut page: Vec<Item> = items.take(page_size.saturating_add(1)).collect();
+    let truncated = page.len() > page_size;
+    page.truncate(page_size);
+    (page, truncated)
 }
 
 /// The most keyspaces this emulator holds in one Amazon Web Services Region, and — with

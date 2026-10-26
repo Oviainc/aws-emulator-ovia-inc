@@ -80,10 +80,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The largest page `ListKeyspaces` returns, and the page size a caller that names no
-/// `maxResults` gets: the maximum of the modelled `maxResults` range (`1..1000`).
-const MAX_PAGE_SIZE: i32 = 1000;
-
 /// Encode the resume point of a page as the opaque `nextToken` the caller hands back.
 ///
 /// The token names the LAST keyspace on the page just returned, hex-encoded so a caller
@@ -196,12 +192,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let region = crate::state::request_region(ctx);
 
-        // `maxResults` is modelled `1..1000`, so the boundary validator has already
-        // refused a page size outside that range; an absent one means "no limit the
-        // caller asked for", which is the whole account up to the modelled maximum.
-        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
-            .unwrap_or(MAX_PAGE_SIZE as usize);
-
         let resume_after = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(decode_page_token(token).ok_or_else(|| {
@@ -223,32 +213,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service-managed catalog it holds before any call. A keyspace created in another
         // Region is not one of them — "keyspace names must be unique within each Region",
         // so a keyspace belongs to the Region it was created in.
-        //
-        // One page, plus one lookahead item: the token is present exactly when a keyspace
-        // follows the last one on this page, so the final page carries none.
         let visible = store.keyspaces(&region);
-        let mut scanned: Vec<&crate::state::Keyspace> = visible
-            .iter()
-            .map(|keyspace| keyspace.as_ref())
-            .filter(|keyspace| {
-                resume_after
-                    .as_deref()
-                    .is_none_or(|after| keyspace.name.as_str() > after)
-            })
-            .take(page_size + 1)
-            .collect();
-        let truncated = scanned.len() > page_size;
-        scanned.truncate(page_size);
+        // The page, and whether a keyspace follows its last item: the shared window in
+        // `crate::state`, so the token this listing encodes is the only part that is its
+        // own.
+        let (page, truncated) = crate::state::page_window(
+            visible
+                .iter()
+                .map(|keyspace| keyspace.as_ref())
+                .filter(|keyspace| {
+                    resume_after
+                        .as_deref()
+                        .is_none_or(|after| keyspace.name.as_str() > after)
+                }),
+            input.max_results,
+        );
         let next_token = match truncated {
-            true => scanned
-                .last()
-                .map(|keyspace| encode_page_token(&keyspace.name)),
+            true => page.last().map(|keyspace| encode_page_token(&keyspace.name)),
             false => None,
         };
 
         Ok(ListKeyspacesOutput {
             next_token,
-            keyspaces: scanned
+            keyspaces: page
                 .into_iter()
                 .map(|keyspace| KeyspaceSummary {
                     keyspace_name: keyspace.name.clone(),

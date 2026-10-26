@@ -41,6 +41,8 @@ mod list_keyspaces;
 mod list_types;
 #[path = "all/multi_region_table_replicas.rs"]
 mod multi_region_table_replicas;
+#[path = "all/pagination_window.rs"]
+mod pagination_window;
 #[path = "all/regional_partitioning.rs"]
 mod regional_partitioning;
 #[path = "all/replication_region_catalog.rs"]

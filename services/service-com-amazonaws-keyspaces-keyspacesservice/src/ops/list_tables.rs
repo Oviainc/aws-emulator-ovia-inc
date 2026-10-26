@@ -84,10 +84,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The largest page `ListTables` returns, and the page size a caller that names no
-/// `maxResults` gets: the maximum of the modelled `maxResults` range (`1..1000`).
-const MAX_PAGE_SIZE: i32 = 1000;
-
 /// Encode the resume point of a page as the opaque `nextToken` the caller hands back.
 ///
 /// The token names the LAST table on the page just returned, qualified by its keyspace,
@@ -189,12 +185,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let region = crate::state::request_region(ctx);
 
-        // `maxResults` is modelled `1..1000`, so the boundary validator has already
-        // refused a page size outside that range; an absent one means "no limit the
-        // caller asked for", which is the whole keyspace up to the modelled maximum.
-        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
-            .unwrap_or(MAX_PAGE_SIZE as usize);
-
         let resume_after = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(decode_page_token(token, &input.keyspace_name).ok_or_else(
@@ -223,24 +213,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // One page, plus one lookahead item: the token is present exactly when a table
-        // follows the last one on this page, so the final page carries none.
-        let mut scanned: Vec<&crate::state::Table> = match resume_after.as_deref() {
-            Some(after) => keyspace
-                .tables
-                .range::<str, _>((
-                    ::std::ops::Bound::Excluded(after),
-                    ::std::ops::Bound::Unbounded,
-                ))
-                .map(|(_, table)| table)
-                .take(page_size + 1)
-                .collect(),
-            None => keyspace.tables.values().take(page_size + 1).collect(),
+        // Where this page starts: after the table the token names, or at the first table
+        // the keyspace holds when the caller named none.
+        let start = match resume_after.as_deref() {
+            Some(after) => ::std::ops::Bound::Excluded(after),
+            None => ::std::ops::Bound::Unbounded,
         };
-        let truncated = scanned.len() > page_size;
-        scanned.truncate(page_size);
+        // The page, and whether a table follows its last item: the shared window in
+        // `crate::state`, so the token this listing encodes is the only part that is its
+        // own.
+        let (page, truncated) = crate::state::page_window(
+            keyspace
+                .tables
+                .range::<str, _>((start, ::std::ops::Bound::Unbounded))
+                .map(|(_, table)| table),
+            input.max_results,
+        );
         let next_token = match truncated {
-            true => scanned
+            true => page
                 .last()
                 .map(|table| encode_page_token(&table.keyspace_name, &table.table_name)),
             false => None,
@@ -249,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(ListTablesOutput {
             next_token,
             tables: Some(
-                scanned
+                page
                     .into_iter()
                     .map(|table| TableSummary {
                         keyspace_name: table.keyspace_name.clone(),
