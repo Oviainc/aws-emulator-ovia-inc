@@ -188,10 +188,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        // The ONE write a read may make: finish every workflow teardown the clock
-        // already made due, so a workflow past its `DELETING` span is a lookup miss
-        // here too.
-        store.reap_deleted_workflows(SystemTime::now());
+        // The writes a read may make, each a change the clock already owed: finish
+        // every workflow teardown due and fire every automated run due, so a workflow
+        // past its `DELETING` span is a lookup miss here too.
+        store.advance_clock(SystemTime::now());
 
         // `TaggableResourceArn` admits exactly one resource kind — a workflow
         // (`^arn:aws…:airflow-serverless:<region>:<account>:workflow/<name>-<10>$`) — so the

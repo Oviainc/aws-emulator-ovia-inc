@@ -227,9 +227,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The ONE write a read may make: finish every workflow teardown the clock
-        // already made due, so a workflow still in its `DELETING` span is reported
-        // and one past it is gone — exactly what the store would hold unpolled.
-        store.reap_deleted_workflows(SystemTime::now());
+        // already made due, and fire every automated run it already owed, so a
+        // workflow still in its `DELETING` span is reported and one past it is gone —
+        // exactly what the store would hold unpolled.
+        store.advance_clock(SystemTime::now());
 
         // A reference that resolves to nothing is a lookup miss, and the entity THIS
         // operation resolves is the workflow itself. A workflow of ANOTHER region is

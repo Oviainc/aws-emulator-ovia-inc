@@ -7,8 +7,9 @@
 //! workflow this endpoint does not hold contributes no run, so the page it answers is
 //! empty: the operation's modelled error set declares no not-found error, and an
 //! operation answers only the errors it declares. The only writes are the changes the
-//! clock already owed — the teardown of a workflow past its `DELETING` span and each
-//! run's own status schedule — so a read never changes what a later caller sees. The
+//! clock already owed — the teardown of a workflow past its `DELETING` span, the
+//! automated run of a workflow whose trigger has fired, and each run's own status
+//! schedule — so a read never changes what a later caller sees. The
 //! `NextToken` this operation returns for THIS workflow's run history is the only one it
 //! accepts back; anything else — a cursor of another list, of another workflow's runs, or
 //! one this service never issued — is refused as a `ValidationException`.
@@ -208,10 +209,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = SystemTime::now();
         let mut store = state.lock();
 
-        // The first write a read may make: every workflow teardown whose removal the
-        // clock has already made due, so a run of a workflow past its `DELETING` span is
-        // gone with it — the same step every handler that touches `workflows` takes.
-        store.reap_deleted_workflows(now);
+        // The first writes a read may make, each a change the clock already owed:
+        // every workflow teardown whose removal has fallen due, so a run of a workflow
+        // past its `DELETING` span is gone with it, and every automated run whose
+        // firing has, so a workflow the service triggers reports the runs its trigger
+        // produced — the same step every handler that touches `workflows` takes.
+        store.advance_clock(now);
 
         // The cursor is the POSITION IN CREATION ORDER of the last item on the previous
         // page (`crate::state::WorkflowRun::listing_key`), not the identifier that run

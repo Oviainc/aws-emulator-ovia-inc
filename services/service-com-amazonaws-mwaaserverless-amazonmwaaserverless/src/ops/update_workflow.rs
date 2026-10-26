@@ -5,7 +5,10 @@
 //! request supplies, makes it the only latest (scheduled) version of the workflow, and
 //! persists all of it in this service's store (`crate::state`). Every value in the
 //! response is read back out of that record, so `GetWorkflow` reports exactly what was
-//! stored, and every earlier version still answers with the configuration it froze. A
+//! stored, and every earlier version still answers with the configuration it froze. The
+//! automated trigger in force is the new version's, so an update into or out of the
+//! trigger mode that asks the service to execute the workflow starts or stops the runs it
+//! produces on its own. A
 //! workflow whose `DeleteWorkflow` teardown has started (`WorkflowStatus` `DELETING`)
 //! is refused with the modelled `ConflictException`.
 //!
@@ -220,8 +223,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // Finish every workflow teardown the clock already made due, so a workflow
-        // past its `DELETING` span is a lookup miss here too.
-        store.reap_deleted_workflows(now);
+        // past its `DELETING` span is a lookup miss here too, and materialise every
+        // automated run already owed before this update re-points the trigger.
+        store.advance_clock(now);
 
         // A reference that resolves to nothing is a lookup miss, and the entity THIS
         // operation resolves is the workflow itself. A workflow of ANOTHER region is
@@ -319,6 +323,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         workflow.revision_id = revision_id;
         workflow.modified_at = now;
         workflow.code_snapshotted_at = now;
+        // "Disables scheduling on all previous versions": the trigger in force is the
+        // one the new version asks for, so an update into automated execution starts
+        // producing runs of its own and an update out of it stops.
+        workflow.configure_trigger(now);
 
         // Answer from the stored record, so the response can only ever be what was
         // persisted.

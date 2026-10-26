@@ -18,7 +18,10 @@
 //! `workflows` is capped at [`MAX_WORKFLOWS`], a workflow's `runs` at
 //! [`MAX_RUNS_PER_WORKFLOW`] and its `versions` at [`MAX_VERSIONS_PER_WORKFLOW`] (a
 //! create, a run start or an update past the ceiling is refused with the modelled
-//! `ServiceQuotaExceededException`, so the workflows x runs and workflows x versions
+//! `ServiceQuotaExceededException`, and a workflow already holding that many runs
+//! records no further automated one
+//! ([`ComAmazonawsMwaaserverlessAmazonmwaaserverlessState::fire_due_scheduled_runs`]),
+//! so the workflows x runs and workflows x versions
 //! products are finite and so is the caller-supplied data each record holds); `workflow_names` holds exactly one
 //! key per stored workflow, released when the delete's teardown removes the record
 //! ([`ComAmazonawsMwaaserverlessAmazonmwaaserverlessState::reap_deleted_workflows`]);
@@ -148,6 +151,31 @@ pub const RUN_STOPPED_AFTER: Duration = Duration::from_millis(400);
 
 /// `RunType` for a run a caller started explicitly.
 pub const RUN_TYPE_ON_DEMAND: &str = "ON_DEMAND";
+
+/// `RunType` for a run the workflow's own trigger started, with no caller asking for
+/// it — the other of the two values the model declares
+/// (`smithy_query(query="shape", shape="RunType")`: `ON_DEMAND | SCHEDULED`).
+pub const RUN_TYPE_SCHEDULED: &str = "SCHEDULED";
+
+/// The `TriggerMode` that asks the service to execute the workflow itself.
+///
+/// `TriggerMode` is modelled as a free string (`GenericString`, length 1..255), and
+/// the two kinds of execution this service distinguishes are the `RunType` values a
+/// run reports, so this is the mode under which the service produces
+/// [`RUN_TYPE_SCHEDULED`] runs. Every other value — and no value at all — leaves the
+/// workflow to be started by a caller.
+pub const TRIGGER_MODE_SCHEDULED: &str = "SCHEDULED";
+
+/// How long after a workflow's automated trigger is configured its FIRST firing falls
+/// due, and the period between firings after that.
+///
+/// The cadence is the emulator's own choice, not a fidelity claim about any cron
+/// expression: the firing instants a real schedule would have come from the workflow's
+/// definition body, which this emulator never fetches from Amazon S3. It is
+/// deliberately non-zero, so a caller that lists a freshly created workflow's runs
+/// still sees the empty history its create left behind, and short, so a caller that
+/// waits sees the automated runs the trigger owes.
+pub const SCHEDULED_RUN_EVERY: Duration = Duration::from_millis(500);
 
 /// How many workflows this emulator will hold for the account.
 ///
@@ -476,6 +504,12 @@ pub struct Workflow {
     /// touched. Stored, never slept on, and materialised by
     /// [`ComAmazonawsMwaaserverlessAmazonmwaaserverlessState::reap_deleted_workflows`].
     pub deletion_due_at: Option<SystemTime>,
+    /// The instant the clock owes this workflow's NEXT automated run, for a workflow
+    /// whose active version asks the service to execute it
+    /// ([`Workflow::is_scheduled`]), and `None` for one only a caller starts or whose
+    /// teardown has removed its triggers. Stored, never slept on, and materialised by
+    /// [`ComAmazonawsMwaaserverlessAmazonmwaaserverlessState::fire_due_scheduled_runs`].
+    pub next_scheduled_run_at: Option<SystemTime>,
 }
 
 impl Workflow {
@@ -499,10 +533,33 @@ impl Workflow {
         self.deletion_due_at.is_some()
     }
 
+    /// Whether the version this workflow currently runs asks the SERVICE to execute
+    /// it ([`TRIGGER_MODE_SCHEDULED`]), rather than waiting for a caller to start it.
+    pub fn is_scheduled(&self) -> bool {
+        self.current_snapshot()
+            .and_then(|snapshot| snapshot.trigger_mode.as_deref())
+            .is_some_and(|mode| mode == TRIGGER_MODE_SCHEDULED)
+    }
+
+    /// Point this workflow's automated trigger at the configuration its ACTIVE version
+    /// froze: a version asking for automated execution owes its first firing
+    /// [`SCHEDULED_RUN_EVERY`] from `now`, and one that does not clears the trigger.
+    ///
+    /// Called wherever the active version changes, because "only one version of a
+    /// workflow can have an active schedule at any given time"
+    /// (`smithy_query(query="shape", shape="GetWorkflowResponse")`,
+    /// `ScheduleConfiguration`): the trigger in force is always the latest version's,
+    /// so a workflow re-pointed at a configuration that no longer asks for automated
+    /// execution stops producing runs of its own.
+    pub fn configure_trigger(&mut self, now: SystemTime) {
+        self.next_scheduled_run_at = self.is_scheduled().then(|| now + SCHEDULED_RUN_EVERY);
+    }
+
     /// Start the teardown `DeleteWorkflow` describes: the workflow moves to
     /// [`WORKFLOW_STATUS_DELETING`], every execution of it that has not finished is
-    /// stopped ([`Self::stop_runs`]) because the cleanup the operation performs
-    /// includes "stopping any running executions", and its removal falls due
+    /// stopped ([`Self::stop_runs`]) and its automated trigger stops firing, because
+    /// the cleanup the operation performs includes "stopping any running executions,
+    /// removing scheduled triggers", and its removal falls due
     /// [`WORKFLOW_DELETED_AFTER`] later. Nothing is DROPPED here — the versions,
     /// runs, name and tokens go with the record when the removal lands, so a read
     /// during the teardown still reports the workflow and the runs it stopped.
@@ -517,6 +574,9 @@ impl Workflow {
         self.status = WORKFLOW_STATUS_DELETING.to_string();
         self.modified_at = now;
         self.deletion_due_at = Some(now + WORKFLOW_DELETED_AFTER);
+        // "removing scheduled triggers": the workflow's own trigger fires no more, so
+        // the teardown is not racing new automated runs into a record on its way out.
+        self.next_scheduled_run_at = None;
         // The workflow is going, so no execution of it may keep progressing: each
         // unfinished run enters the documented shutdown instead.
         self.stop_runs(None, now);
@@ -724,6 +784,113 @@ impl ComAmazonawsMwaaserverlessAmazonmwaaserverlessState {
         !due.is_empty()
     }
 
+    /// Materialise every automated run this store's triggers already owed, and report
+    /// how many runs that created.
+    ///
+    /// A workflow whose active version asks the service to execute it carries the
+    /// instant its trigger next fires ([`Workflow::next_scheduled_run_at`]). A firing
+    /// at or before `now` was owed at THAT instant whether or not anybody called, so
+    /// the run it produces is recorded with the due instant as its creation and start
+    /// and the trigger moves on to its next firing: this is the one write a reporting
+    /// operation may make, and it is what makes two reads after the same firing answer
+    /// identically. The run then walks the same lifecycle a caller-started one does
+    /// ([`WorkflowRun::settle`]), and reports [`RUN_TYPE_SCHEDULED`] because the
+    /// workflow's own trigger started it rather than a caller.
+    ///
+    /// A workflow already holding [`MAX_RUNS_PER_WORKFLOW`] runs records no further
+    /// one: its trigger skips to the next firing after `now`, so a schedule left
+    /// running cannot grow this store without bound.
+    pub fn fire_due_scheduled_runs(&mut self, now: SystemTime) -> usize {
+        let due: Vec<String> = self
+            .workflows
+            .values()
+            .filter(|workflow| workflow.next_scheduled_run_at.is_some_and(|at| now >= at))
+            .map(|workflow| workflow.arn.clone())
+            .collect();
+        let mut fired = 0;
+        for arn in due {
+            // Every firing the clock owes, oldest first, so a trigger left behind
+            // reports one run per firing rather than one run for the whole gap.
+            while let Some((due_at, version, at_capacity)) = self.next_owed_firing(&arn, now) {
+                if at_capacity {
+                    let skipped = firing_after(due_at, now, SCHEDULED_RUN_EVERY);
+                    if let Some(workflow) = self.workflows.get_mut(&arn) {
+                        workflow.next_scheduled_run_at = Some(skipped);
+                    }
+                    break;
+                }
+
+                let nonce = self.next_nonce(due_at);
+                let sequence = self.mint_seq;
+                let run_id = mint_run_id(&arn, &nonce);
+                let run = WorkflowRun {
+                    run_id: run_id.clone(),
+                    workflow_arn: arn.clone(),
+                    workflow_version: version,
+                    // Nobody asked for this run: the workflow's own trigger did.
+                    run_type: RUN_TYPE_SCHEDULED.to_string(),
+                    status: RUN_STATUS_STARTING.to_string(),
+                    // A trigger carries no caller parameters to override with.
+                    override_parameters: BTreeMap::new(),
+                    // Dated from the DUE instant, never from `now`, so the run a
+                    // reader reports is the one the firing would have produced
+                    // unpolled.
+                    created_at: due_at,
+                    started_on: due_at,
+                    completed_on: None,
+                    modified_at: due_at,
+                    duration: None,
+                    error_message: None,
+                    // Nothing executes a workflow definition here
+                    // ([`NO_AIRFLOW_ENGINE`]), so this run holds no task instance
+                    // either.
+                    task_instances: BTreeMap::new(),
+                    next_status_at: due_at + RUN_ADMITTED_AFTER,
+                    sequence,
+                };
+
+                let Some(workflow) = self.workflows.get_mut(&arn) else {
+                    break;
+                };
+                workflow.runs.insert(run_id, run);
+                workflow.next_scheduled_run_at = Some(due_at + SCHEDULED_RUN_EVERY);
+                fired += 1;
+            }
+        }
+        fired
+    }
+
+    /// The next firing of `arn`'s trigger that `now` has already made due: the instant
+    /// it fell due, the version in force at that instant — the one its run executes —
+    /// and whether the workflow already holds every run this store keeps for it.
+    ///
+    /// `None` when the trigger owes nothing: the workflow is gone, it has no trigger,
+    /// its next firing is still ahead, or it holds no version to run.
+    fn next_owed_firing(&self, arn: &str, now: SystemTime) -> Option<(SystemTime, String, bool)> {
+        let workflow = self.workflows.get(arn)?;
+        let due_at = workflow.next_scheduled_run_at.filter(|at| now >= *at)?;
+        let version = workflow.version(None)?.version.clone();
+        Some((
+            due_at,
+            version,
+            workflow.runs.len() >= MAX_RUNS_PER_WORKFLOW,
+        ))
+    }
+
+    /// Apply EVERY change the clock already owed this store — the workflow teardowns
+    /// whose removal has fallen due ([`Self::reap_deleted_workflows`]) and the
+    /// automated runs whose firing has ([`Self::fire_due_scheduled_runs`]) — and report
+    /// whether anything changed.
+    ///
+    /// Every handler that touches [`Self::workflows`] calls this FIRST, so what it
+    /// answers is what the store would hold unpolled: a workflow never outlives its
+    /// teardown, and a trigger never fails to fire, just because the next request
+    /// happened to be a different operation.
+    pub fn advance_clock(&mut self, now: SystemTime) -> bool {
+        let reaped = self.reap_deleted_workflows(now);
+        self.fire_due_scheduled_runs(now) > 0 || reaped
+    }
+
     /// The workflow `arn` names AS SEEN FROM `region`'s endpoint: the stored record
     /// when it lives in that region, and `None` otherwise.
     ///
@@ -772,6 +939,20 @@ impl ComAmazonawsMwaaserverlessAmazonmwaaserverlessState {
         self.workflow_names
             .insert((region.to_string(), name.to_string()), arn.to_string());
     }
+}
+
+/// The first firing of a trigger of period `every` that falls strictly after `now`,
+/// counted from the firing at `from`.
+///
+/// Computed rather than stepped, so a trigger whose store is full skips the whole gap
+/// in one step instead of walking a firing at a time.
+fn firing_after(from: SystemTime, now: SystemTime, every: Duration) -> SystemTime {
+    let behind = now.duration_since(from).unwrap_or_default();
+    let period = every.as_nanos().max(1);
+    let skipped = u32::try_from(behind.as_nanos() / period + 1).unwrap_or(u32::MAX);
+    from.checked_add(every.saturating_mul(skipped))
+        // A gap no instant can represent: the trigger owes nothing further.
+        .unwrap_or(now)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

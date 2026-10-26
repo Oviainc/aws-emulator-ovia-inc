@@ -3,7 +3,9 @@
 //! @op CreateWorkflow
 //! IMPLEMENTED: mints a workflow plus its first immutable version and persists both in
 //! this service's store (`crate::state`). Every value in the response is read back out
-//! of that record, so `GetWorkflow`/`ListWorkflows` report exactly what was stored.
+//! of that record, so `GetWorkflow`/`ListWorkflows` report exactly what was stored. A
+//! workflow whose `TriggerMode` asks the service to execute it also gets its automated
+//! trigger configured, so the service runs it without any caller starting a run.
 //!
 //! ## Shape of an operation
 //!
@@ -268,8 +270,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Finish every workflow teardown the clock already made due, so a name held
         // by a workflow whose `DELETING` span has elapsed is free for this create and
-        // one still tearing down still holds it.
-        store.reap_deleted_workflows(now);
+        // one still tearing down still holds it; every automated run already owed is
+        // materialised in the same step.
+        store.advance_clock(now);
 
         // A repeated @idempotencyToken replays its first answer rather than minting a
         // second workflow; the same token with a different request is a conflict. The
@@ -368,7 +371,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             trigger_mode: input.trigger_mode.clone(),
         };
 
-        let workflow = crate::state::Workflow {
+        let mut workflow = crate::state::Workflow {
             arn: arn.clone(),
             // The endpoint this workflow was created through, so every later lookup
             // and listing resolves it only there.
@@ -399,7 +402,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing is deleting a workflow this call just created, so the clock
             // owes it no removal.
             deletion_due_at: None,
+            // Set from the version's trigger mode just below, so the trigger a
+            // created workflow carries is the one its configuration asks for.
+            next_scheduled_run_at: None,
         };
+
+        // "Amazon Managed Workflows for Apache Airflow Serverless automatically creates
+        // the first version of the workflow and sets up the necessary execution
+        // environment": a workflow whose configuration asks the service to execute it
+        // gets its trigger configured here, so its first automated run falls due
+        // without anybody calling `StartWorkflowRun`.
+        workflow.configure_trigger(now);
 
         store.claim_workflow_name(&region, &input.name, &arn);
         store.workflows.insert(arn.clone(), workflow);
