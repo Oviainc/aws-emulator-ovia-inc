@@ -14,6 +14,13 @@
 //! with the modelled `InvalidParameterValueException` rather than stored as a mapping of
 //! a source nothing could poll.
 //!
+//! A mapping on a QUEUE is also held to the queue's own configuration: a queue hands a
+//! message to one consumer for the length of its `VisibilityTimeout` and makes it visible
+//! again once that lapses, so a queue whose timeout is below the invoked function's
+//! `Timeout` would re-deliver a message the function is still working on. That pair is
+//! refused with the same modelled 400 (see [`crate::state::queue_visibility_refusal`]),
+//! which is why the queue's timeout is read out of its own store here.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -480,9 +487,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let function_name = function.config.name.clone();
         let function_arn = function.versioned_arn(&version);
+        // The `Timeout` of the version this mapping invokes: "The amount of time in
+        // seconds that Lambda allows a function to run before stopping it." The resolution
+        // above refuses a version this store holds no configuration for, so a version with
+        // no timeout to compare is a failure of the store rather than of the request.
+        let Some(function_timeout) = function.config_of(&version).map(|config| config.timeout)
+        else {
+            return Err(CreateEventSourceMappingErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some(format!(
+                        "Lambda resolved {function_arn} without a configuration to read its \
+                         timeout from"
+                    )),
+                },
+            )
+            .into());
+        };
         // `$LATEST` is the function itself rather than one version or alias of it, so a
         // reference to it is an unqualified reference.
         let function_qualifier = (version != crate::state::VERSION_LATEST).then(|| version.clone());
+
+        // An Amazon SQS queue hands a message to one consumer for the length of its
+        // visibility timeout, so the timeout of the queue this mapping would poll is what
+        // the function's own is compared against. It is read from the QUEUE's own store,
+        // because it is the queue's configuration rather than anything the request states.
+        let queue_visibility_timeout = event_source_arn
+            .as_deref()
+            .filter(|_| vendor == Some(crate::state::EVENT_SOURCE_VENDOR_QUEUE))
+            .and_then(|arn| crate::state::queue_visibility_timeout_seconds(&*self.engine, arn));
+
+        // The queue would make a message visible to a second poller while this function is
+        // still working on it, so the mapping that would do it is refused here rather than
+        // leaving the duplicate delivery to surface later.
+        if let Some(message) = queue_visibility_timeout.and_then(|visibility_timeout| {
+            crate::state::queue_visibility_refusal(visibility_timeout, function_timeout)
+        }) {
+            return Err(invalid_parameter(message));
+        }
 
         // "The resource already exists, or another operation is in progress": one event
         // source is polled for one function by at most one mapping, so a second create of

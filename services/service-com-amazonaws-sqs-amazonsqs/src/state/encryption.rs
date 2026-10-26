@@ -336,6 +336,22 @@ pub fn authorize_master_key<Eng: Send + Sync + 'static>(
         let mut store = kms.lock();
         let resolved = match store.resolve(region, master_key_id) {
             kms_store::KeyRef::Found(key) => Some(KeySnapshot::of(key)),
+            // An identifier whose account segment names no account is one KMS refuses
+            // for want of permission BEFORE it looks any key up, so the queue's key
+            // cannot be used for this call at all — and the refusal names the principal,
+            // the action and the identifier the queue carries, as every other
+            // authorization failure here does.
+            kms_store::KeyRef::UnauthorizedAccount => {
+                return Err(KeyRefusal::AccessDenied(relayed(
+                    &format!(
+                        "User: {} is not authorized to perform: {action} on resource: \
+                         {master_key_id} because no resource-based policy allows the \
+                         {action} action",
+                        kms_store::caller_identity_arn()
+                    ),
+                    "AccessDeniedException",
+                )))
+            }
             // An identifier KMS cannot parse names no key either, and this service
             // models no "invalid ARN" refusal, so it is reported as not found — the
             // reading KMS's own `Encrypt`/`Decrypt` take of such an identifier.

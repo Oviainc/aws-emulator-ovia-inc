@@ -12,6 +12,12 @@
 //! one, the version or alias) it names, which has to resolve to a function this emulator
 //! holds.
 //!
+//! A re-target states a new pair of event source and function, so the pair is held to the
+//! same rule the create of a mapping is: a QUEUE whose `VisibilityTimeout` is below the
+//! newly named function's `Timeout` would make a message visible to a second poller while
+//! the function is still working on it, and that pair is refused with the modelled
+//! `InvalidParameterValueException` (see [`crate::state::queue_visibility_refusal`]).
+//!
 //! The operation answers 202 Accepted, so the change is NOT in effect when the call
 //! returns: the mapping moves into `Updating` — one of the states
 //! `EventSourceMappingConfiguration$State` enumerates — and the move to the state its
@@ -394,10 +400,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The QUEUE this mapping polls, which no update changes: a `FunctionName` picks a
+        // new function for the SAME source, so it is the source the new function's timeout
+        // is checked against below. Only a queue carries a visibility timeout, so only a
+        // queue source is read here.
+        let queue_source = store
+            .event_source_mappings
+            .get(&input.uuid)
+            .and_then(|record| record.event_source_arn.clone())
+            .filter(|arn| {
+                crate::state::event_source_vendor(arn)
+                    == Some(crate::state::EVENT_SOURCE_VENDOR_QUEUE)
+            });
+
         // A `FunctionName` re-targets the mapping, so it has to resolve to a function
         // this store holds — in any of its documented forms, qualified or not.
-        let retarget = match input.function_name.as_deref() {
-            None => None,
+        let (retarget, retarget_timeout) = match input.function_name.as_deref() {
+            None => (None, None),
             Some(function_name) => {
                 let (function, version) =
                     crate::state::resolve_function(&mut store, function_name, None, &region, now)
@@ -407,15 +426,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             }
                             crate::state::ResolveFailure::NotFound(message) => not_found(message),
                         })?;
-                Some((
-                    function.config.name.clone(),
-                    function.versioned_arn(&version),
-                    // `$LATEST` is the function itself rather than one version or alias
-                    // of it, so a reference to it is an unqualified reference.
-                    (version != crate::state::VERSION_LATEST).then_some(version),
-                ))
+                // "The amount of time in seconds that Lambda allows a function to run
+                // before stopping it", for the version this mapping would invoke. The
+                // resolution above refuses a version this store holds no configuration
+                // for, so a version with no timeout to compare is a failure of the store
+                // rather than of the request.
+                let function_arn = function.versioned_arn(&version);
+                let Some(timeout) = function.config_of(&version).map(|config| config.timeout)
+                else {
+                    return Err(service_error(&format!(
+                        "Lambda resolved {function_arn} without a configuration to read its \
+                         timeout from"
+                    )));
+                };
+                (
+                    Some((
+                        function.config.name.clone(),
+                        function_arn,
+                        // `$LATEST` is the function itself rather than one version or
+                        // alias of it, so a reference to it is an unqualified reference.
+                        (version != crate::state::VERSION_LATEST).then_some(version),
+                    )),
+                    Some(timeout),
+                )
             }
         };
+
+        // Re-targeting states a new pair of queue and function, so the pair is held to the
+        // same rule a create is: a queue whose visibility timeout is below the function's
+        // own would make a message visible to a second poller mid-invocation.
+        if let Some(message) = queue_source
+            .as_deref()
+            .zip(retarget_timeout)
+            .and_then(|(queue, function_timeout)| {
+                crate::state::queue_visibility_timeout_seconds(&*self.engine, queue).and_then(
+                    |visibility_timeout| {
+                        crate::state::queue_visibility_refusal(visibility_timeout, function_timeout)
+                    },
+                )
+            })
+        {
+            return Err(invalid_parameter(message));
+        }
 
         let Some(record) = store.event_source_mappings.get_mut(&input.uuid) else {
             return Err(service_error(
@@ -552,7 +604,8 @@ fn event_source_mapping_configuration(
     }
 }
 
-/// The modelled 400 for a `FunctionName` that is not one of the documented name forms.
+/// The modelled 400 for a `FunctionName` that is not one of the documented name forms, and
+/// for a re-target whose queue would re-deliver a message mid-invocation.
 fn invalid_parameter(message: String) -> UpdateEventSourceMappingError {
     UpdateEventSourceMappingErrorModeled::InvalidParameterValueException(
         InvalidParameterValueException {

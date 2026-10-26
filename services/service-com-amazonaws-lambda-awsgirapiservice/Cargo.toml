@@ -23,6 +23,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# An event source mapping on a queue is accepted against the QUEUE's own configuration,
+# which lives in the Amazon SQS emulator's queue store: it is reached through the shared
+# engine, which needs the owning service's state TYPE.
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # CodeSha256 is the SHA-256 of the stored deployment package...
 sha2 = { workspace = true }
 # ...reported base64-encoded, as the model's CodeSha256 member describes it.

@@ -35,3 +35,15 @@ Cause 2 — Expected: the failing invocation is denied, retried and the message 
 ## Steps to Reproduce
 Cause 1: create a queue with VisibilityTimeout=2, a function with Timeout=5, then CreateEventSourceMapping(EventSourceArn=queue, FunctionName=fn).
 Cause 2: wire an SQS queue with a redrive policy to a function, revoke the function role's downstream permission, send a message and poll the DLQ.
+
+## Resolution
+Cause 1 is FIXED: CreateEventSourceMapping, and an UpdateEventSourceMapping that re-targets
+a mapping, now compare the polled queue's VisibilityTimeout with the invoked function's
+Timeout and refuse the pair with InvalidParameterValueException (400). Covered by
+`services/service-com-amazonaws-lambda-awsgirapiservice/tests/all/event_source_mapping_queue_visibility.rs`.
+
+Cause 2 is still OUTSTANDING and blocked: the event-source-mapping poller, the invocation,
+its authorization failure and the DLQ redrive all need the function's deployment package to
+actually run, and this emulator has no in-process runtime for one (`Invoke` says so and
+answers 501). It is not implemented here rather than answered with an invocation, an error
+or a DLQ delivery that nothing produced.

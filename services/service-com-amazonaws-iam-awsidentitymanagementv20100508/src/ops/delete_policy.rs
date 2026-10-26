@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +169,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePolicy"))
+        // `ctx` carries request metadata only; a delete addressed by ARN depends on
+        // none of it — IAM is global, so not even the region comes from the request.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeletePolicyErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A value that is not a managed-policy ARN at all is an invalid input
+        // parameter, which is a different refusal from an ARN the account does not
+        // hold: `arnType` constrains only the length, so the form is checked here,
+        // through the one definition of the ARN grammar this crate holds — the same
+        // one `GetPolicy` reads a `PolicyArn` with.
+        let Some(parsed) = crate::state::parse_policy_arn(&input.policy_arn) else {
+            return Err(DeletePolicyErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!("ARN {} is not valid.", input.policy_arn)),
+                },
+            )
+            .into());
+        };
+
+        // This operation deletes a managed policy of the ACCOUNT: an ARN in AWS's own
+        // managed-policy namespace names a policy AWS owns and an account cannot
+        // remove, so such an ARN is an out-of-range value for this parameter rather
+        // than a missing entity — the same rule, and the same refusal, `TagPolicy`
+        // applies to a change of an AWS-owned policy. The refusal does not depend on
+        // whether this emulator's catalog carries that entry, because no entry of it
+        // could be deleted either.
+        if crate::state::is_aws_managed_policy_arn(&input.policy_arn) {
+            return Err(DeletePolicyErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Policy {} is an AWS managed policy, which cannot be deleted.",
+                        input.policy_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // The delete is addressed exactly as a read of the same ARN is, so it reaches
+        // the one record `GetPolicy` reports; an ARN the account holds no policy under
+        // "referenced a resource entity that does not exist", which IAM reports for a
+        // delete as the policy not having been found.
+        let Some(held) = store.policy_by_arn(&input.policy_arn) else {
+            return Err(DeletePolicyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(crate::state::policy_not_found(&input.policy_arn)),
+                },
+            )
+            .into());
+        };
+
+        // "You must delete all the policy's versions" first, and this call then deletes
+        // only "the policy's default version" with the policy: a policy still carrying
+        // a version other than its default has a subordinate entity, so the delete is
+        // refused rather than dropping those versions behind the caller's back.
+        let default_version_id = held.policy.default_version_id.clone();
+        let non_default_versions = held
+            .versions
+            .keys()
+            .filter(|version_id| Some(version_id.as_str()) != default_version_id.as_deref())
+            .count();
+        if non_default_versions > 0 {
+            return Err(DeletePolicyErrorModeled::DeleteConflictException(
+                DeleteConflictException {
+                    message: Some(
+                        "Cannot delete a policy with non-default versions. Delete the \
+                         non-default versions first."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "Before you can delete a managed policy, you must first detach the policy
+        // from all users, groups, and roles that it is attached to" — an entity still
+        // relating to the policy is an attached subordinate entity, whether it holds
+        // the policy as a permissions policy or uses it to set its permissions
+        // boundary, so the delete is refused rather than leaving that entity pointing
+        // at a policy the account no longer holds. Both relations are counted through
+        // the shared measures every reader of a policy reports them with, so this
+        // refusal and `Policy$AttachmentCount` can never disagree.
+        let attachments = store.policy_attachment_count(&input.policy_arn);
+        let boundary_uses = store.permissions_boundary_usage_count(&input.policy_arn);
+        if attachments > 0 || boundary_uses > 0 {
+            return Err(DeletePolicyErrorModeled::DeleteConflictException(
+                DeleteConflictException {
+                    message: Some("Cannot delete a policy attached to entities.".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The policy, its tags and its default version are one stored record, so
+        // removing it releases all of them: the name is free for a later create, and
+        // every read addressed by that ARN reports no entity afterwards.
+        store
+            .policies
+            .remove(&crate::state::name_key(&parsed.policy_name));
+        Ok(DeletePolicyOutput)
     }
 }

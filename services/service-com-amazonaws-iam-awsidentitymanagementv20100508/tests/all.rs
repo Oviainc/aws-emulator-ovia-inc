@@ -71,6 +71,8 @@ mod open_id_connect_provider_listing;
 mod open_id_connect_providers;
 #[path = "all/policies_granting_service_access.rs"]
 mod policies_granting_service_access;
+#[path = "all/policy_deletion.rs"]
+mod policy_deletion;
 #[path = "all/policy_listing.rs"]
 mod policy_listing;
 #[path = "all/policy_simulation.rs"]
