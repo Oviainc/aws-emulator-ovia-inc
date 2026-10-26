@@ -13,7 +13,11 @@
 //! * an activation naming a set the account does not hold is refused with the
 //!   modelled `RuleSetDoesNotExist` and changes nothing;
 //! * an activation naming NO set leaves none active, and leaves every stored set
-//!   in place.
+//!   in place;
+//! * reading the active set REPORTS: it answers the same thing however often it
+//!   is called, writes no active pointer and no set of its own, and a pointer at
+//!   a set the account no longer holds reads as no active set without being
+//!   rewritten.
 
 use crate::harness::{call, element, elements, emulator_over, field};
 use service_com_amazonaws_ses_simpleemailservice::ops::types::ReceiptRule;
@@ -109,6 +113,12 @@ fn seed_rule_set(engine: &engine::InMemoryEngine, name: &str, rules: Vec<Receipt
 /// The `<Name>` the active-set reader reports, if it reports a set at all.
 fn active_name(body: &str) -> Option<String> {
     element(body, "Metadata").and_then(|metadata| element(&metadata, "Name"))
+}
+
+/// The result element of an awsQuery response, which is the whole answer apart
+/// from the envelope's per-call request id.
+fn result(body: &str) -> Option<String> {
+    element(body, "DescribeActiveReceiptRuleSetResult")
 }
 
 /// A fresh account has no active receipt rule set: the reader answers 200 and
@@ -404,5 +414,194 @@ async fn activating_no_rule_set_leaves_none_active() {
                 "case {stored:?} after disabling: expected 200, got {status} with {body}"
             );
         }
+    }
+}
+
+/// Reading the active set is a REPORT: however often it is called it answers the
+/// same thing, and it writes nothing a later caller could see — no active
+/// pointer of its own on an account that has none, and no rule set.
+#[tokio::test]
+async fn reading_the_active_set_changes_nothing_a_later_caller_sees() {
+    // The rows span the states the reader can be called in: nothing stored at
+    // all, sets stored with none active, a set active, and that set active again
+    // after email receiving was disabled.
+    let (router, engine) = emulator_with_engine();
+    let store = engine.state::<ComAmazonawsSesSimpleemailserviceState>();
+    let stages: [(&str, Option<&str>); 4] = [
+        ("empty account", None),
+        ("sets stored, none active", None),
+        ("one set active", Some("stage-set")),
+        ("disabled again", None),
+    ];
+    for (stage, expected_active) in stages {
+        match stage {
+            "sets stored, none active" => {
+                for name in ["stage-set", "other-stage-set"] {
+                    let (status, body) = create_rule_set(&router, name).await;
+                    assert_eq!(
+                        status, 200,
+                        "case {stage:?}: expected 200 creating {name:?}, got {status} \
+                         with {body}"
+                    );
+                }
+            }
+            "one set active" => {
+                let (status, body) = set_active(&router, "stage-set").await;
+                assert_eq!(
+                    status, 200,
+                    "case {stage:?}: expected 200 from SetActiveReceiptRuleSet, got {status} \
+                     with {body}"
+                );
+            }
+            "disabled again" => {
+                let (status, body) = set_active_none(&router).await;
+                assert_eq!(
+                    status, 200,
+                    "case {stage:?}: expected 200 disabling email receiving, got {status} \
+                     with {body}"
+                );
+            }
+            _ => {}
+        }
+
+        let sets_before = store.lock().receipt_rule_sets.clone();
+        let (status, first) = describe_active(&router).await;
+        assert_eq!(
+            status, 200,
+            "case {stage:?}: expected 200 from the first read, got {status} with {first}"
+        );
+        assert_eq!(
+            active_name(&first).as_deref(),
+            expected_active,
+            "case {stage:?}: the reader must report the account's active set, got {first}"
+        );
+
+        // Three more reads, all answering exactly what the first did.
+        for attempt in 2..=4 {
+            let (status, again) = describe_active(&router).await;
+            assert_eq!(
+                status, 200,
+                "case {stage:?} read {attempt}: expected 200, got {status} with {again}"
+            );
+            assert_eq!(
+                result(&again),
+                result(&first),
+                "case {stage:?} read {attempt}: a read must answer the same thing every \
+                 time, got {again}"
+            );
+        }
+
+        // And the store is as the reads found it: no pointer written where there
+        // was none, no pointer cleared where there was one, and no set added.
+        assert_eq!(
+            store.lock().active_receipt_rule_set.as_deref(),
+            expected_active,
+            "case {stage:?}: reading must not write the account's active pointer"
+        );
+        let sets_after = store.lock().receipt_rule_sets.clone();
+        assert_eq!(
+            sets_after.keys().collect::<Vec<_>>(),
+            sets_before.keys().collect::<Vec<_>>(),
+            "case {stage:?}: reading must not add or remove a rule set"
+        );
+    }
+}
+
+/// An active pointer at a set the account no longer holds reads as NO active
+/// set — and the pointer is not rewritten to say so, so the set coming back
+/// makes it the active one again, rules and all.
+#[tokio::test]
+async fn an_active_pointer_at_a_set_that_is_gone_reports_no_active_set() {
+    let (router, engine) = emulator_with_engine();
+    let store = engine.state::<ComAmazonawsSesSimpleemailserviceState>();
+    // The rows differ in what the account holds around the vanished set, so the
+    // answer is about the pointer and not about an empty account.
+    let rows: [(&str, &[&str]); 3] = [
+        ("nothing else stored", &[]),
+        ("one other set stored", &["other-set"]),
+        ("several other sets stored", &["0-other", "zz-other"]),
+    ];
+    for (case, others) in rows {
+        let (status, body) = create_rule_set(&router, "vanishing-set").await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 creating the set, got {status} with {body}"
+        );
+        seed_rule_set(
+            &engine,
+            "vanishing-set",
+            vec![seeded_rule("inbound", &["sales@example.com"], true)],
+        );
+        for other in others {
+            let (status, body) = create_rule_set(&router, other).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected 200 creating {other:?}, got {status} with {body}"
+            );
+        }
+        let (status, body) = set_active(&router, "vanishing-set").await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 activating the set, got {status} with {body}"
+        );
+
+        // The set leaves the store while the pointer still names it.
+        let vanished = store
+            .lock()
+            .receipt_rule_sets
+            .remove("vanishing-set")
+            .expect("the activated set was stored");
+
+        let (status, body) = describe_active(&router).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from DescribeActiveReceiptRuleSet, got {status} \
+             with {body}"
+        );
+        assert_eq!(
+            element(&body, "Metadata"),
+            None,
+            "case {case:?}: a pointer at a set the account does not hold reports no \
+             Metadata, got {body}"
+        );
+        assert_eq!(
+            element(&body, "Rules"),
+            None,
+            "case {case:?}: a pointer at a set the account does not hold reports no Rules, \
+             got {body}"
+        );
+        assert_eq!(
+            store.lock().active_receipt_rule_set.as_deref(),
+            Some("vanishing-set"),
+            "case {case:?}: the read must not rewrite the account's active pointer"
+        );
+
+        // The pointer still names the set, so the set coming back is active
+        // again — with its own rules.
+        store
+            .lock()
+            .receipt_rule_sets
+            .insert("vanishing-set".to_string(), vanished);
+        let (status, body) = describe_active(&router).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 once the set is stored again, got {status} \
+             with {body}"
+        );
+        assert_eq!(
+            active_name(&body).as_deref(),
+            Some("vanishing-set"),
+            "case {case:?}: the pointer resolves to the set again, got {body}"
+        );
+        assert_eq!(
+            elements(&element(&body, "Rules").unwrap_or_default(), "Name").len(),
+            1,
+            "case {case:?}: the set's own rule is reported again, got {body}"
+        );
+
+        // Leave the account as the next row expects to find it.
+        let mut state = store.lock();
+        state.active_receipt_rule_set = None;
+        state.receipt_rule_sets.clear();
     }
 }
