@@ -254,6 +254,30 @@ pub fn jobs_in_flight<R: JobLifecycle>(
     in_flight
 }
 
+/// How many of `region`'s `jobs` are only WAITING to be processed at `now`: the records
+/// in [`STATUS_QUEUED`], counted after every clock-owed transition has been
+/// materialised, so a job the clock has already taken out of the queue is not counted
+/// as waiting.
+///
+/// A queued job is in flight ([`jobs_in_flight`]) without occupying one of the slots a
+/// family's concurrency ceiling bounds, so for the one family whose start documents a
+/// queue it is this count, not that ceiling, that caps how many records one caller can
+/// hold unfinished at once (see [`MAX_QUEUED_CALL_ANALYTICS_JOBS`]).
+pub fn jobs_waiting_in_queue<R: JobLifecycle>(
+    jobs: &mut RegionalStore<R>,
+    region: &str,
+    now: SystemTime,
+) -> usize {
+    let mut waiting = 0;
+    for record in jobs.values_in_mut(region) {
+        record.materialise_due_transitions(now);
+        if record.job_status() == STATUS_QUEUED {
+            waiting += 1;
+        }
+    }
+    waiting
+}
+
 /// The most job records of one family this emulator KEEPS for one Region.
 ///
 /// Not a quota and not a refusal: a start is never refused for it. It is the bound on
@@ -438,6 +462,23 @@ pub const MAX_CONCURRENT_CALL_ANALYTICS_JOBS: usize = MAX_CONCURRENT_TRANSCRIPTI
 /// The family [`concurrency_limit_message`] names in a Call Analytics start's refusal.
 pub const FAMILY_CALL_ANALYTICS_JOBS: &str = "Call Analytics jobs";
 
+/// The most Call Analytics jobs this emulator keeps WAITING in the queue a start enters
+/// past the ceiling above, for one Region.
+///
+/// Not a published quota: the queue this family's start documents is described without
+/// a depth ("your job will automatically be added to a queue to be processed once your
+/// concurrent job count is below the limit"). It is the bound on this process's memory,
+/// and it is needed because a queued job is NOT terminal: the ceiling above does not
+/// count it against a running slot and [`evict_oldest_finished_jobs`] cannot drop it,
+/// so without this cap one caller could hold unboundedly many unfinished records at
+/// once. A CHOSEN figure, the family's own ceiling, so the queue is never deeper than
+/// the number of jobs it feeds and a Region holds at most twice that ceiling in
+/// unfinished records; a start made while that many are already waiting is refused the
+/// `LimitExceededException` the ceiling itself answers, in the same words
+/// ([`concurrency_limit_message`]), whose documented remedy — waiting for a running job
+/// to finish — is exactly what empties the queue.
+pub const MAX_QUEUED_CALL_ANALYTICS_JOBS: usize = MAX_CONCURRENT_CALL_ANALYTICS_JOBS;
+
 /// `VocabularyState` values, from the model's enum
 /// (`smithy_query(query="shape", shape="VocabularyState")`).
 pub const VOCABULARY_STATE_PENDING: &str = "PENDING";
@@ -480,7 +521,9 @@ pub const MEDICAL_LANGUAGE_CODE: &str = "en-US";
 /// `MAX_REGIONS` buckets, and so at most `MAX_REGIONS` times its own per-Region
 /// ceiling ([`MAX_VOCABULARIES`], [`MAX_LANGUAGE_MODELS`],
 /// [`MAX_CALL_ANALYTICS_CATEGORIES`], [`MAX_RETAINED_JOB_RECORDS`] plus that family's
-/// concurrency quota) in total. AWS operates on the order of 36 commercial Regions, so
+/// concurrency quota, and for the family whose start queues the overflow the depth of
+/// that queue too, [`MAX_QUEUED_CALL_ANALYTICS_JOBS`]) in total. AWS operates on the
+/// order of 36 commercial Regions, so
 /// this figure is this emulator's own and comfortably above the real surface; a create
 /// or start past it answers the same modelled `LimitExceededException` AWS answers when
 /// a create would exceed an allowance ([`region_capacity_message`]).
@@ -3294,14 +3337,20 @@ pub fn identified_languages(language_options: Option<&[String]>) -> Vec<Language
 /// lifecycle facts the service itself owns (status, timestamps and the location its
 /// transcript would be written to).
 ///
-/// `StartCallAnalyticsJob` has no deferred-execution member
-/// (`smithy_query(query="operation", operation="StartCallAnalyticsJob")`) — the queue
-/// it documents is entered only when an account "exceeds your Concurrent Job Limit",
-/// which no member of the request opts into — so a job this emulator accepts is
-/// processing from the moment it is started and has exactly one clock-owed
-/// transition, `IN_PROGRESS` -> `COMPLETED`, like the Medical Scribe family
-/// ([`MedicalScribeJobRecord`]); a start made while that concurrent limit is already
-/// reached is refused instead ([`MAX_CONCURRENT_CALL_ANALYTICS_JOBS`]).
+/// This family has job QUEUEING, and the operation names the request member that opts
+/// into it: "Job queuing is available for Call Analytics jobs. If you pass a
+/// DataAccessRoleArn in your request and you exceed your Concurrent Job Limit, your job
+/// will automatically be added to a queue to be processed once your concurrent job
+/// count is below the limit"
+/// (`smithy_query(query="doc", shape="StartCallAnalyticsJob")`). So a start that passes
+/// that member while the family's concurrency ceiling is already reached
+/// ([`MAX_CONCURRENT_CALL_ANALYTICS_JOBS`]) is ACCEPTED in [`STATUS_QUEUED`] with no
+/// start time and has two clock-owed transitions, `QUEUED` -> `IN_PROGRESS` ->
+/// `COMPLETED`, exactly as a deferred batch transcription job does
+/// ([`TranscriptionJobRecord`]); a start at that ceiling that passes no role has opted
+/// into nothing and is refused, as is one that would make the queue deeper than this
+/// emulator keeps it ([`MAX_QUEUED_CALL_ANALYTICS_JOBS`]), and every accepted job below
+/// the ceiling is processing from the moment it is started.
 ///
 /// WHAT IT EMULATES is the job RECORD (see the module header): no call is
 /// transcribed, no sentiment or call characteristic is derived and no category is
@@ -3314,9 +3363,10 @@ pub struct CallAnalyticsJobRecord {
     /// Creation order, newest = largest. Also the cursor `ListCallAnalyticsJobs`
     /// pages with.
     pub sequence: u64,
-    /// `CallAnalyticsJobStatus`: [`STATUS_IN_PROGRESS`] until the clock owes it
-    /// [`STATUS_COMPLETED`]. The enum's other two values are modelled but unreached —
-    /// nothing queues such a job and nothing this emulator does can fail one.
+    /// `CallAnalyticsJobStatus`: [`STATUS_QUEUED`] while the job waits for a
+    /// concurrency slot, then [`STATUS_IN_PROGRESS`] until the clock owes it
+    /// [`STATUS_COMPLETED`]. [`STATUS_FAILED`] is modelled but unreached — nothing
+    /// this emulator does can fail a job it accepted.
     pub status: String,
     pub media: Media,
     /// `OutputLocation`, the one output member this operation takes; `None` when the
@@ -3356,18 +3406,23 @@ pub struct CallAnalyticsJobRecord {
     /// are: nothing it does can fail a job it accepted.
     pub failure_reason: Option<String>,
     pub creation_time: SystemTime,
+    /// When the job began processing; `None` while it is still `QUEUED`.
     pub start_time: Option<SystemTime>,
     pub completion_time: Option<SystemTime>,
+    /// When `QUEUED` -> `IN_PROGRESS` falls due; `None` for a job that started
+    /// processing immediately.
+    pub queued_until: Option<SystemTime>,
     /// When `IN_PROGRESS` -> `COMPLETED` falls due.
     pub completion_due: SystemTime,
     pub tags: Vec<Tag>,
 }
 
 impl CallAnalyticsJobRecord {
-    /// Materialise the status transition the CLOCK already owes this job: it was due
-    /// at the stored instant whether or not anybody called. A reporting operation
-    /// (`Get`, `List`) runs this before projecting the record, and that is the only
-    /// write it performs.
+    /// Materialise every status transition the CLOCK already owes this job — leaving
+    /// the queue it was accepted into, and finishing — each of which was due at its
+    /// stored instant whether or not anybody called. A reporting operation (`Get`,
+    /// `List`) runs this before projecting the record, and that is the only write it
+    /// performs.
     ///
     /// Completing a job records what the service determined while it processed the
     /// call — the language it identified, the format and sample rate of the audio it
@@ -3376,6 +3431,15 @@ impl CallAnalyticsJobRecord {
     /// values is a function of the stored record, so a job reports the same ones at
     /// every later read.
     pub fn advance_clock(&mut self, now: SystemTime) {
+        if self.status == STATUS_QUEUED {
+            match self.queued_until {
+                Some(due) if now >= due => {
+                    self.status = STATUS_IN_PROGRESS.to_string();
+                    self.start_time = Some(due);
+                }
+                _ => return,
+            }
+        }
         if self.status != STATUS_IN_PROGRESS || now < self.completion_due {
             return;
         }

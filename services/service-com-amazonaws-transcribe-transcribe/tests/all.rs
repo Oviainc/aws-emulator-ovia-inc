@@ -23,6 +23,8 @@ mod call_analytics_category_update_rule_validation;
 mod call_analytics_category_updates;
 #[path = "all/call_analytics_job_delete.rs"]
 mod call_analytics_job_delete;
+#[path = "all/call_analytics_job_queueing.rs"]
+mod call_analytics_job_queueing;
 #[path = "all/call_analytics_job_results.rs"]
 mod call_analytics_job_results;
 #[path = "all/call_analytics_job_start_limits.rs"]

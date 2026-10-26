@@ -2,9 +2,9 @@
 
 //! @op GetCallAnalyticsJob
 //! Answers the stored Call Analytics job of the requested name, after the status
-//! transition the clock already owed it, or the service's not-found refusal when this
-//! account started no such job. Reporting only: the sole write is that transition,
-//! which was due at its stored instant whether or not anybody called (see
+//! transitions the clock already owed it, or the service's not-found refusal when this
+//! account started no such job. Reporting only: the sole writes are those transitions,
+//! each due at its stored instant whether or not anybody called (see
 //! [`crate::state::CallAnalyticsJobRecord::advance_clock`]).
 //!
 //! ## Shape of an operation

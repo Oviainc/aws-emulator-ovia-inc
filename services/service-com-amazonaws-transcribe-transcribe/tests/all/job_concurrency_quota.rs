@@ -54,7 +54,11 @@ const ROLE_ARN: &str = "arn:aws:iam::111122223333:role/TranscribeAccess";
 /// quota differ in their input and not only in their name: the URI scheme varies, and
 /// each format is one of the modelled `MediaFormat` values
 /// (`smithy_query(query="shape", shape="MediaFormat")`).
-const MEDIA: &[(&str, &str)] = &[
+///
+/// `pub(crate)`, like [`call_analytics_request`] below: the Call Analytics queueing
+/// suite (`crate::call_analytics_job_queueing`) fills that family's ceiling with the
+/// very same jobs rather than inventing a second set.
+pub(crate) const MEDIA: &[(&str, &str)] = &[
     ("s3://example-media/audio.wav", "wav"),
     ("s3://example-media/meeting.mp3", "mp3"),
     ("https://example.invalid/media/clip.mp4", "mp4"),
@@ -116,8 +120,10 @@ fn medical_transcription_request(name: &str, index: usize) -> Value {
     })
 }
 
-/// A Call Analytics start, the family's minimal request plus the varying media.
-fn call_analytics_request(name: &str, index: usize) -> Value {
+/// A Call Analytics start, the family's minimal request plus the varying media. It
+/// carries NO `DataAccessRoleArn`, so it opts into no queue: see
+/// `crate::call_analytics_job_queueing` for the member that does.
+pub(crate) fn call_analytics_request(name: &str, index: usize) -> Value {
     let (uri, format) = MEDIA[index % MEDIA.len()];
     json!({
         "CallAnalyticsJobName": name,

@@ -3,10 +3,15 @@
 //! @op StartCallAnalyticsJob
 //! Records one Call Analytics job and answers the record it just stored, which
 //! `GetCallAnalyticsJob` reads back and `ListCallAnalyticsJobs` pages over. A job is
-//! `IN_PROGRESS` from the moment it is started — the queue this operation documents
-//! is entered only when an account exceeds its Concurrent Job Limit, a concurrency
-//! ceiling this emulator does not model — and the clock owes it `COMPLETED` a
-//! [`crate::state::JOB_TRANSITION_DELAY`] later.
+//! `IN_PROGRESS` from the moment it is started, unless the account's concurrent job
+//! limit ([`crate::state::MAX_CONCURRENT_CALL_ANALYTICS_JOBS`]) is already reached and
+//! the request passed a `DataAccessRoleArn`, the member this operation documents as
+//! opting into job queueing: such a job is accepted `QUEUED` with no `StartTime` and
+//! begins processing when the clock says it did. A start at that limit that passed no
+//! role has opted into nothing, and one that would make the queue deeper than this
+//! emulator keeps it ([`crate::state::MAX_QUEUED_CALL_ANALYTICS_JOBS`]), are refused
+//! with the modelled `LimitExceededException`. The clock owes a processing job
+//! `COMPLETED` a [`crate::state::JOB_TRANSITION_DELAY`] later.
 //!
 //! NOTHING IS ANALYSED: no call is transcribed, no call characteristic, sentiment or
 //! summary is derived and no category is matched, so the `Transcript` URI a completed
@@ -366,9 +371,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::state::MAX_CONCURRENT_CALL_ANALYTICS_JOBS`, and a job that has
         // reached a terminal status has released its slot (see
         // [`crate::state::jobs_in_flight`]).
-        if crate::state::jobs_in_flight(&mut store.call_analytics_jobs, &region, now)
-            >= crate::state::MAX_CONCURRENT_CALL_ANALYTICS_JOBS
-        {
+        //
+        // Reaching it is not by itself a refusal for this family: "Job queuing is
+        // available for Call Analytics jobs. If you pass a DataAccessRoleArn in your
+        // request and you exceed your Concurrent Job Limit, your job will automatically
+        // be added to a queue to be processed once your concurrent job count is below
+        // the limit" (this operation's own documentation). So at the ceiling a start
+        // that passed a `DataAccessRoleArn` is accepted into the documented queue
+        // instead (see [`crate::state::CallAnalyticsJobRecord::advance_clock`]) — while
+        // that queue has room for it, since a waiting job holds no running slot and so
+        // is bounded by its own depth rather than by the ceiling (see
+        // [`crate::state::MAX_QUEUED_CALL_ANALYTICS_JOBS`]). A start that opted into
+        // nothing, and one that would make the queue deeper than this emulator keeps,
+        // are refused in the ceiling's own words.
+        let at_the_ceiling =
+            crate::state::jobs_in_flight(&mut store.call_analytics_jobs, &region, now)
+                >= crate::state::MAX_CONCURRENT_CALL_ANALYTICS_JOBS;
+        let enters_the_queue = at_the_ceiling
+            && input.data_access_role_arn.is_some()
+            && crate::state::jobs_waiting_in_queue(&mut store.call_analytics_jobs, &region, now)
+                < crate::state::MAX_QUEUED_CALL_ANALYTICS_JOBS;
+        if at_the_ceiling && !enters_the_queue {
             return Err(StartCallAnalyticsJobErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(crate::state::concurrency_limit_message(
@@ -379,11 +402,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // Only the ceiling puts a job in the queue: below it there is nothing to wait
+        // for, so a start that named a role is processing like any other.
+        let queued = enters_the_queue;
 
         // The Region comes from the request's own (unauthenticated) credential scope, so
-        // the concurrency quota above and the retention bound below bound this family's
-        // store only together with a cap on how many Regions it keeps job records for
-        // (see [`crate::state::MAX_REGIONS`]).
+        // the concurrency quota above, the queue depth beside it and the retention bound
+        // below bound this family's store only together with a cap on how many Regions
+        // it keeps job records for (see [`crate::state::MAX_REGIONS`]).
         if store.call_analytics_jobs.region_bucket_exhausted(&region) {
             return Err(StartCallAnalyticsJobErrorModeled::LimitExceededException(
                 LimitExceededException {
@@ -397,10 +423,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let sequence = store.next_sequence();
+        // A job accepted into the documented queue is not processing yet: it has no
+        // start time, and the clock owes it `QUEUED` -> `IN_PROGRESS` before the
+        // completion every job gets — the same two spans a deferred batch
+        // transcription job waits out.
+        let (status, start_time, queued_until, completion_due) = if queued {
+            let starts_at = now + crate::state::JOB_TRANSITION_DELAY;
+            (
+                crate::state::STATUS_QUEUED.to_string(),
+                None,
+                Some(starts_at),
+                starts_at + crate::state::JOB_TRANSITION_DELAY,
+            )
+        } else {
+            (
+                crate::state::STATUS_IN_PROGRESS.to_string(),
+                Some(now),
+                None,
+                now + crate::state::JOB_TRANSITION_DELAY,
+            )
+        };
         let record = crate::state::CallAnalyticsJobRecord {
             name: input.call_analytics_job_name.clone(),
             sequence,
-            status: crate::state::STATUS_IN_PROGRESS.to_string(),
+            status,
             media: input.media,
             output_location: input.output_location,
             output_encryption_kms_key_id: input.output_encryption_kms_key_id,
@@ -417,9 +463,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             transcript: None,
             failure_reason: None,
             creation_time: now,
-            start_time: Some(now),
+            start_time,
             completion_time: None,
-            completion_due: now + crate::state::JOB_TRANSITION_DELAY,
+            queued_until,
+            completion_due,
             tags: input.tags.unwrap_or_default(),
         };
 
