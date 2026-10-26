@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAccessLogSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAccessLogSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAccessLogSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: clears the access log settings the named stage of the named api carries,
+//! leaving the rest of the stage as it was; 404 `NotFoundException` when no api carries
+//! that id or that api holds no such stage.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +156,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAccessLogSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAccessLogSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAccessLogSettings"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteAccessLogSettings",
+            ));
+        };
+        let mut store = state.lock();
+
+        // The settings are a member of the stage this request addresses, so both the api
+        // and its stage have to exist before there is anything to delete from. Each
+        // missing resource is reported the way every reader and writer of it reports one.
+        let Some(api) = store.apis.get_mut(&input.api_id) else {
+            return Err(DeleteAccessLogSettingsErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::invalid_api_identifier_message(&input.api_id)),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+        let Some(stage) = api.stages.get_mut(&input.stage_name) else {
+            return Err(DeleteAccessLogSettingsErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::invalid_identifier_message(
+                        crate::state::STAGE_RESOURCE,
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+
+        // Clearing the member IS the delete — "To disable access logging for a Stage,
+        // delete its AccessLogSettings" — and it is idempotent: a stage that carries no
+        // settings is already in the state this call asks for, so the second call answers
+        // 204 exactly like the first. Nothing else on the stage is touched, so a later
+        // GetStage reports the same stage minus its access log settings.
+        if stage.access_log_settings.take().is_some() {
+            // The stage record was rewritten, so it was "last updated" at this instant
+            // (`Stage$LastUpdatedDate`: "The timestamp when the stage was last updated");
+            // its `CreatedDate` does not move. A call that cleared nothing rewrote
+            // nothing, so it leaves the instant where it was.
+            stage.last_updated_date = ::std::time::SystemTime::now();
+        }
+
+        Ok(DeleteAccessLogSettingsOutput)
     }
 }
