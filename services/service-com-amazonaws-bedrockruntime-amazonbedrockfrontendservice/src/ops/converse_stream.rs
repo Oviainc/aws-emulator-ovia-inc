@@ -17,6 +17,11 @@
 //! one delta per block — nothing here splits it into fabricated increments, and
 //! nothing is echoed back from the request.
 //!
+//! A turn a mandatory `toolConfig.toolChoice` obliged to request a tool carries
+//! no text: its block opens with a `contentBlockStart` naming the minted
+//! `toolUseId` and the tool, its input arrives in that block's
+//! `contentBlockDelta`, and `messageStop` reports `tool_use`.
+//!
 //! This operation is hand-authored rather than generated: its output is a
 //! `@streaming` union, which the op-stub generator declines
 //! (`src/ops/SKIPPED_STUBS.md`) and whose generated `ErasedOperation` shim refuses
@@ -152,7 +157,19 @@ impl<Eng: Send + Sync + 'static> ConverseStream<Eng> {
                 model.model_id
             )));
         }
-        crate::state::validate_conversation(input.messages.as_ref()).map_err(validation)?;
+        let messages = crate::state::validate_conversation(input.messages.as_ref())
+            .map_err(validation)?;
+        // Every tool result in the conversation has to address a tool request the
+        // conversation carries, by the id that request was issued under — the
+        // rule `Converse` applies too.
+        crate::state::validate_tool_results(messages).map_err(validation)?;
+
+        // The `toolChoice` stage: a mandatory choice obliges the turn to request
+        // a tool, under an id minted here.
+        let tool_use = state
+            .lock()
+            .forced_tool_use(input.tool_config.as_ref(), crate::state::now_millis())
+            .map_err(validation)?;
 
         let turn = crate::state::converse_turn(
             &model,
@@ -163,6 +180,7 @@ impl<Eng: Send + Sync + 'static> ConverseStream<Eng> {
                 .inference_config
                 .as_ref()
                 .and_then(|config| config.max_tokens),
+            tool_use,
         );
 
         let logged = crate::state::InvocationLogEntry {
@@ -178,9 +196,9 @@ impl<Eng: Send + Sync + 'static> ConverseStream<Eng> {
         // model, published with no state guard of this service held.
         crate::state::invocation_metrics::publish_token_usage(&*self.engine, &logged);
 
-        // The assistant message this turn is, as one text content block — the same
-        // message `Converse` answers with, so the two surfaces cannot drift.
-        let blocks = [turn.text.clone()];
+        // The assistant message this turn is, block by block — the same message
+        // `Converse` answers with, so the two surfaces cannot drift.
+        let blocks = turn.content();
         let mut frames = Vec::new();
         self.frame(
             protocol,
@@ -191,14 +209,41 @@ impl<Eng: Send + Sync + 'static> ConverseStream<Eng> {
             },
             &MessageStartEvent::SCHEMA,
         )?;
-        for (index, text) in blocks.iter().enumerate() {
+        for (index, block) in blocks.iter().enumerate() {
             let content_block_index = i32::try_from(index).unwrap_or(i32::MAX);
+            // A tool request opens its block with the id and the name, and its
+            // input arrives in the block's deltas — the only place a streaming
+            // client reads it.
+            let delta = match block {
+                ContentBlock::toolUse(tool_use) => {
+                    self.frame(
+                        protocol,
+                        &mut frames,
+                        "contentBlockStart",
+                        &ContentBlockStartEvent {
+                            start: ContentBlockStart::toolUse(ToolUseBlockStart {
+                                tool_use_id: tool_use.tool_use_id.clone(),
+                                name: tool_use.name.clone(),
+                                r#type: tool_use.r#type.clone(),
+                            }),
+                            content_block_index,
+                        },
+                        &ContentBlockStartEvent::SCHEMA,
+                    )?;
+                    ContentBlockDelta::toolUse(ToolUseBlockDelta {
+                        input: crate::state::document_to_json(&tool_use.input).to_string(),
+                    })
+                }
+                ContentBlock::Text(text) => ContentBlockDelta::Text(text.clone()),
+                // `ConverseTurn::content` answers with those two kinds only.
+                _ => continue,
+            };
             self.frame(
                 protocol,
                 &mut frames,
                 "contentBlockDelta",
                 &ContentBlockDeltaEvent {
-                    delta: ContentBlockDelta::Text(text.clone()),
+                    delta,
                     content_block_index,
                 },
                 &ContentBlockDeltaEvent::SCHEMA,
