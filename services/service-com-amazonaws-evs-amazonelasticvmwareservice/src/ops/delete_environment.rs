@@ -8,7 +8,10 @@
 //! ([`crate::state::ec2_resources::release_vlan_subnets`]), and ends the Elastic IP
 //! associations its VLANs were holding on the account's own `Address` records
 //! ([`crate::state::ec2_resources::release_elastic_ips`]): an environment that is gone
-//! consumes none of the account's Elastic IP addresses, which stay allocated to it. The
+//! consumes none of the account's Elastic IP addresses, which stay allocated to it. Those
+//! associations leave the VLAN records with them — a VLAN whose subnet this deletion
+//! releases carries no association in either store — and no further one can be made:
+//! `AssociateEipToVlan` refuses an environment whose deletion has been accepted. The
 //! environment's own sub-resources go away with it on the same clock
 //! ([`crate::state::StoredEnvironment::start_dependent_deletions`]): its connectors are
 //! `DELETING` and then `DELETED`, and its entitlements stop tracking usage at once. The
@@ -246,6 +249,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // subnets": they go away with the environment.
                 vlan.vlan_state = crate::state::STATE_DELETING.to_string();
                 vlan.modified_at_ms = environment.modified_at_ms;
+                // And with the subnet goes every Elastic IP association it carried: an
+                // association is one "with the elastic network interface in the VLAN
+                // subnet" (`EipAssociation` doc), so a VLAN whose subnet this deletion
+                // releases carries none — in this service's own record as much as on the
+                // account's `Address` records, which the release below clears. Taken out
+                // of the record here so no reader is told the VLAN holds an address that
+                // nothing is associated with any more.
+                for association in vlan.eip_associations.drain(..) {
+                    if let (Some(allocation_id), Some(association_id)) =
+                        (association.allocation_id, association.association_id)
+                    {
+                        released_eips.push((allocation_id, association_id));
+                    }
+                }
             }
             let deletion = crate::state::PendingTransition::starting_now(
                 crate::state::STATE_DELETED,
@@ -261,17 +278,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .vlans
                 .iter()
                 .map(|vlan| vlan.subnet_id.clone())
-                .collect();
-            released_eips = environment
-                .vlans
-                .iter()
-                .flat_map(|vlan| vlan.eip_associations.iter())
-                .filter_map(|association| {
-                    Some((
-                        association.allocation_id.clone()?,
-                        association.association_id.clone()?,
-                    ))
-                })
                 .collect();
         }
 

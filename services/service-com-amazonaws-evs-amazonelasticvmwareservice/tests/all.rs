@@ -40,6 +40,8 @@ mod depot_url;
 mod eip_allocation_existence;
 #[path = "all/eip_ec2_propagation.rs"]
 mod eip_ec2_propagation;
+#[path = "all/eip_release_on_environment_deletion.rs"]
+mod eip_release_on_environment_deletion;
 #[path = "all/entitlement_connector.rs"]
 mod entitlement_connector;
 #[path = "all/entitlements.rs"]

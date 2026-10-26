@@ -59,23 +59,26 @@ const VLAN_MEMBERS: [&str; 10] = [
 
 /// One network an environment is deployed into: the Region it is addressed in, the zone
 /// its subnets sit in, and the first two octets of its address space.
+///
+/// Shared with the sibling suite that asserts what becomes of an association when the
+/// environment holding it is deleted (`eip_release_on_environment_deletion.rs`).
 #[derive(Debug, Clone, Copy)]
-struct Network {
-    region: &'static str,
-    zone: &'static str,
-    base: &'static str,
+pub(crate) struct Network {
+    pub(crate) region: &'static str,
+    pub(crate) zone: &'static str,
+    pub(crate) base: &'static str,
 }
 
 /// An environment under test: the network it was deployed into and the id it was given.
 #[derive(Debug, Clone)]
-struct Environment {
-    network: Network,
-    environment_id: String,
+pub(crate) struct Environment {
+    pub(crate) network: Network,
+    pub(crate) environment_id: String,
 }
 
 /// Create `network`'s VPC and service access subnet through Amazon EC2 itself, then the
 /// Amazon EVS environment deployed into it with a PUBLIC HCX VLAN, and answer it.
-async fn create_environment(
+pub(crate) async fn create_environment(
     router: &MultiServiceRouter,
     network: Network,
     name: &str,
@@ -159,7 +162,10 @@ async fn create_environment(
 
 /// Allocate one Elastic IP address through Amazon EC2 itself, and answer
 /// `(allocationId, publicIp)`.
-async fn allocate_address(router: &MultiServiceRouter, region: &str) -> (String, String) {
+pub(crate) async fn allocate_address(
+    router: &MultiServiceRouter,
+    region: &str,
+) -> (String, String) {
     let (status, xml) = call_ec2(router, region, "AllocateAddress", &[("Domain", "vpc")]).await;
     assert_eq!(
         status, 200,
@@ -176,7 +182,7 @@ async fn allocate_address(router: &MultiServiceRouter, region: &str) -> (String,
 ///
 /// The account must still hold the allocation — an Elastic IP association is never a
 /// release, so every caller here expects it to be found.
-async fn ec2_address(
+pub(crate) async fn ec2_address(
     router: &MultiServiceRouter,
     region: &str,
     allocation_id: &str,
@@ -230,7 +236,7 @@ async fn ec2_allocations_by_association(
 
 /// Associate `allocation_id` with `environment`'s HCX VLAN and answer the status, the
 /// body, and the association the VLAN reports for that allocation.
-async fn associate(
+pub(crate) async fn associate(
     router: &MultiServiceRouter,
     environment: &Environment,
     allocation_id: &str,
@@ -250,7 +256,10 @@ async fn associate(
 
 /// The `eipAssociations` of `environment`'s HCX VLAN, read back through
 /// `ListEnvironmentVlans`.
-async fn vlan_associations(router: &MultiServiceRouter, environment: &Environment) -> Vec<Value> {
+pub(crate) async fn vlan_associations(
+    router: &MultiServiceRouter,
+    environment: &Environment,
+) -> Vec<Value> {
     let (status, body) = call_in_region(
         router,
         environment.network.region,
@@ -272,7 +281,7 @@ async fn vlan_associations(router: &MultiServiceRouter, environment: &Environmen
 }
 
 /// The association the response's VLAN carries for `allocation_id`.
-fn reported_association(body: &Value, allocation_id: &str, case: &str) -> Value {
+pub(crate) fn reported_association(body: &Value, allocation_id: &str, case: &str) -> Value {
     body["vlan"]["eipAssociations"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: no eipAssociations in {body}"))

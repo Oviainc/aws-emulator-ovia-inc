@@ -26,6 +26,15 @@
 //!    with the modelled `ValidationException` and nothing is recorded — the same reading
 //!    `CreateEnvironment` takes of the `vpcId` and `serviceAccessSubnetId` it is given,
 //!    which also name EC2 resources the account has to hold already.
+//! 7. That environment's deletion has NOT been accepted: an association is one "with the
+//!    elastic network interface in the VLAN subnet" (`EipAssociation` doc) and
+//!    "environment deletion also deletes the associated Amazon EVS VLAN subnets"
+//!    (`DeleteEnvironment` doc), so an environment that is `DELETING` has no VLAN subnet
+//!    left to associate an address into and is REFUSED with the modelled
+//!    `ValidationException` — one that has reached `DELETED` is not found at all (1).
+//!    Nothing is written to either store for the refusal, so the allocation stays an
+//!    unassociated address of the account rather than one consumed by a VLAN nobody can
+//!    disassociate it from afterwards.
 //!
 //! The association is a change to the caller's Amazon EC2 resource, not only to this
 //! service's records: `allocationId` is "the Elastic IP address allocation ID" of the
@@ -234,6 +243,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::environment_not_found(&input.environment_id),
                 )
             })?;
+
+        // An association is "An Elastic IP address association with the elastic network
+        // interface in the VLAN subnet" (`EipAssociation` doc), and "environment deletion
+        // also deletes the associated Amazon EVS VLAN subnets" (`DeleteEnvironment` doc):
+        // an environment whose deletion has been ACCEPTED has no VLAN subnet left to
+        // associate an address into — its subnets are released the moment the deletion is
+        // accepted, and so are the addresses they were using — so the request is refused
+        // and the account's Elastic IP address is left unconsumed rather than bound to a
+        // subnet that is going away. An environment that has already reached DELETED is
+        // not found at all (above); this is the same rule for the one that is on its way
+        // there, reported with the client error that fits a resource the service does hold
+        // in a state the operation cannot be carried out in — the reading
+        // `CreateEnvironmentHost` takes of an environment that is not deployed.
+        if environment.state == crate::state::STATE_DELETING {
+            return Err(AssociateEipToVlanErrorModeled::ValidationException(
+                crate::state::field_validation_error(
+                    "environmentId",
+                    &format!(
+                        "names an environment whose state is {}; its VLAN subnets are deleted \
+                         with it, so no Elastic IP address can be associated with them",
+                        environment.state
+                    ),
+                ),
+            )
+            .into());
+        }
 
         // "hcx is the only accepted VLAN name at this time" (`vlanName` doc): every
         // other VLAN of the environment, and every name that is no VLAN at all, is
