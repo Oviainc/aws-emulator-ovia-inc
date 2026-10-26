@@ -71,11 +71,13 @@
 //! deployment's non-terminal `status` is owed its move to `Active`.
 //!
 //! And it holds the Automated Reasoning policies `ops/create_automated_reasoning_policy.rs`
-//! mints and `ops/get_automated_reasoning_policy.rs` reads back, each with the draft
-//! definition it was created with and the hash of that definition, so the hash the create
-//! answered is the hash the read reports — and, beside that draft, every numbered version
+//! mints, `ops/update_automated_reasoning_policy.rs` rewrites and
+//! `ops/get_automated_reasoning_policy.rs` reads back, each with the draft definition it
+//! was last written with and the hash of that definition, so the hash the write answered
+//! is the hash the read reports — and, beside that draft, every numbered version
 //! `ops/create_automated_reasoning_policy_version.rs` cuts from it, which the same read
-//! reports when the ARN it is given carries that version's number.
+//! reports when the ARN it is given carries that version's number, unchanged by any later
+//! write to the draft.
 //!
 //! And it holds the build workflows of those policies —
 //! `ops/start_automated_reasoning_policy_build_workflow.rs` starts them,

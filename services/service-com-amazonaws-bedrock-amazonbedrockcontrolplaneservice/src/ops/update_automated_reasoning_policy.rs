@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAutomatedReasoningPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAutomatedReasoningPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAutomatedReasoningPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the policy's DRAFT: the definition the request carries replaces the one the
+//! draft held, the draft's `definitionHash` becomes the hash of that new definition, and
+//! the optional members the request also carries (`name`, `description`) replace the
+//! draft's. The operation is bound to HTTP `PATCH`
+//! (`smithy_query(query="operation",operation="UpdateAutomatedReasoningPolicy")`), so an
+//! optional member the request omits leaves the policy's own value in place.
+//!
+//! Every numbered version `CreateAutomatedReasoningPolicyVersion` cut is an immutable
+//! snapshot, so this write touches none of them: `GetAutomatedReasoningPolicy` keeps
+//! reporting each version's frozen definition and hash, and only the unversioned ARN
+//! reports what this call wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +175,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAutomatedReasoningPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAutomatedReasoningPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAutomatedReasoningPolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(server_error());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        // `policyArn` "must be the ARN of a draft policy", so the `:<version>` suffix
+        // `AutomatedReasoningPolicyArn` also admits names a snapshot this operation cannot
+        // write: a version is frozen at the instant it was cut.
+        let (base_arn, version) =
+            crate::state::automated_reasoning_policy_arn_parts(&input.policy_arn);
+        if version.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "policyArn {} names a version of an Automated Reasoning policy; a version \
+                 cannot be updated, so policyArn must be the ARN of the policy's draft and \
+                 carry no version",
+                input.policy_arn
+            )));
+        }
+        let base_arn = base_arn.to_string();
+
+        let mut store = state.lock();
+
+        // The region the policy was minted in, which is what its name index is keyed by —
+        // taken from the stored policy rather than from this request, so a name moves
+        // within the index the create wrote it to.
+        let Some(region) = store
+            .automated_reasoning_policy(&base_arn)
+            .map(|policy| policy.region.clone())
+        else {
+            return Err(
+                UpdateAutomatedReasoningPolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "no automated reasoning policy {base_arn} exists in this account"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A name identifies a policy within the account and region, so it may move to this
+        // policy only while no other one holds it.
+        if let Some(name) = input.name.as_ref() {
+            if store
+                .automated_reasoning_policy_names
+                .get(&(region.clone(), name.clone()))
+                .is_some_and(|owner| *owner != base_arn)
+            {
+                return Err(
+                    UpdateAutomatedReasoningPolicyErrorModeled::ConflictException(
+                        ConflictException {
+                            message: Some(format!(
+                                "an automated reasoning policy named {name} already exists in \
+                                 this account in {region}"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let Some(policy) = store.automated_reasoning_policy_mut(&base_arn) else {
+            return Err(server_error());
+        };
+
+        let previous_name = policy.name.clone();
+        // The definition is REPLACED, and the hash follows it: the hash is a function of
+        // the definition alone, which is what makes it the concurrency token its member
+        // documents — a version cut against the hash read before this write now conflicts.
+        policy.definition = Some(input.policy_definition);
+        policy.definition_hash = crate::state::policy_definition_hash(policy.definition.as_ref());
+        if let Some(name) = input.name {
+            policy.name = name;
+        }
+        if let Some(description) = input.description {
+            policy.description = Some(description);
+        }
+        policy.updated_at = now;
+
+        // Read the response back out of the STORED record, so what the caller is told is
+        // exactly what a later GetAutomatedReasoningPolicy will find.
+        let output = updated(policy);
+        let name = policy.name.clone();
+
+        if name != previous_name {
+            store
+                .automated_reasoning_policy_names
+                .remove(&(region.clone(), previous_name));
+            store
+                .automated_reasoning_policy_names
+                .insert((region, name), base_arn);
+        }
+
+        Ok(output)
     }
 }
+
+/// What this operation answers for the policy it just wrote.
+fn updated(
+    record: &crate::state::AutomatedReasoningPolicyRecord,
+) -> UpdateAutomatedReasoningPolicyOutput {
+    UpdateAutomatedReasoningPolicyOutput {
+        // The policy's own (unversioned) ARN: this write is to the draft that ARN names.
+        policy_arn: record.arn.clone(),
+        name: record.name.clone(),
+        definition_hash: record.definition_hash.clone(),
+        updated_at: crate::state::date_time(record.updated_at),
+    }
+}
+
+/// The modelled 500 this operation answers when the engine carries no store for this
+/// service — never a fresh engine, which would drop the write on return.
+fn server_error() -> UpdateAutomatedReasoningPolicyError {
+    UpdateAutomatedReasoningPolicyErrorModeled::InternalServerException(InternalServerException {
+        message: Some(
+            "automated reasoning policy state is not available on this engine".to_string(),
+        ),
+    })
+    .into()
+}
+

@@ -20,7 +20,15 @@ pub struct UpdateAutomatedReasoningPolicyInput {
     pub description: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#UpdateAutomatedReasoningPolicyResponse")]
+/// `UpdateAutomatedReasoningPolicyResponse`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `updatedAt` carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation", operation="UpdateAutomatedReasoningPolicy")`), which
+/// the derive does not put on a member schema — see `types/date_time_wire.rs` for that
+/// whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct UpdateAutomatedReasoningPolicyOutput {
     pub policy_arn: String,
@@ -28,4 +36,23 @@ pub struct UpdateAutomatedReasoningPolicyOutput {
     pub definition_hash: String,
     pub updated_at: ::aws_smithy_types::DateTime,
 }
+
+bedrock_schema_and_codec!(
+    UpdateAutomatedReasoningPolicyOutput,
+    UPDATE_AUTOMATED_REASONING_POLICY_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrock#UpdateAutomatedReasoningPolicyResponse",
+    "com.amazonaws.bedrock",
+    "UpdateAutomatedReasoningPolicyResponse",
+    (M_POLICY_ARN, policy_arn, "policyArn", 0, req, string),
+    (M_NAME, name, "name", 1, req, string),
+    (
+        M_DEFINITION_HASH,
+        definition_hash,
+        "definitionHash",
+        2,
+        req,
+        string
+    ),
+    (M_UPDATED_AT, updated_at, "updatedAt", 3, req, date_time),
+);
 
