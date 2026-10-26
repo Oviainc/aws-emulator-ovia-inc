@@ -336,6 +336,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // An app client configured for machine-to-machine authorization carries
+        // ONE authentication flow: `ALLOW_CLIENT_TOKEN_AUTH` "is mutually
+        // exclusive with user authentication flows" (`GetClientToken` in this
+        // service's model). The rule lives in `state.rs` so this path and the
+        // update path enforce the same one, and it is asked beside the other
+        // parameter rule above — before any resource is looked up, the way the
+        // framework's own constraint checks run before this handler at all.
+        if let Some(message) = input
+            .explicit_auth_flows
+            .as_deref()
+            .and_then(crate::state::exclusive_auth_flow_violation)
+        {
+            return Err(invalid_parameter(message.to_string()));
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
         let pool = guard
