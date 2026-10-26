@@ -11,11 +11,12 @@
 //! agree on one implementation instead of carrying copies that can drift.
 //!
 //! The serverless cache is ElastiCache's other cache resource:
-//! `CreateServerlessCache` mints one, `DescribeServerlessCaches` reports it and
-//! `DeleteServerlessCache` takes it away. Its record and its projection into the
-//! modelled `ServerlessCache` shape live here too, so `ModifyServerlessCache`
-//! and the serverless snapshot operations — still scaffolded 501s, each with its
-//! own gap issue — write the same copy the reader reads instead of introducing a
+//! `CreateServerlessCache` mints one, `ModifyServerlessCache` changes it,
+//! `DescribeServerlessCaches` reports it and `DeleteServerlessCache` takes it
+//! away. Its record and its projection into the modelled `ServerlessCache`
+//! shape live here too, so those handlers — and the serverless snapshot
+//! operations, still scaffolded 501s with their own gap issue — write the same
+//! copy the reader reads instead of introducing a
 //! second one. A deleted cache does not vanish at the call: it answers
 //! `DELETING` and the clock owes its removal
 //! ([`ServerlessCacheRecord::pending_deletion`]), the same way a created one is
@@ -109,10 +110,11 @@
 //! operation belongs to one of those resources, the comment beside it says so.
 //!
 //! The serverless cache is another customer-created resource this store holds:
-//! `CreateServerlessCache` mints one, `DescribeServerlessCaches` reports it and
-//! `DeleteServerlessCache` removes it. `ModifyServerlessCache` and the
-//! serverless snapshot operations are still scaffolded 501s with their own gap
-//! issues, and they read and write the SAME record rather than a copy beside it.
+//! `CreateServerlessCache` mints one, `ModifyServerlessCache` changes it,
+//! `DescribeServerlessCaches` reports it and `DeleteServerlessCache` removes it.
+//! The serverless snapshot operations are still scaffolded 501s with their own
+//! gap issues, and every one of them reads and writes the SAME record rather
+//! than a copy beside it.
 //!
 //! A replication group is the other resource this state holds:
 //! `CreateReplicationGroup` mints one together with the member cache clusters it
@@ -139,7 +141,8 @@ use crate::ops::types::{
     Authentication, AuthenticationMode, AvailabilityZone, CacheCluster, CacheEngineVersion,
     CacheNode, CacheNodeTypeSpecificParameter, CacheNodeTypeSpecificValue, CacheParameterGroup,
     CacheNodeUpdateStatus, CacheParameterGroupStatus, CacheSubnetGroup, CacheUsageLimits,
-    ConfigureShard, CreateUserGroupOutput, CreateUserOutput, DestinationDetails, Endpoint, Event,
+    ConfigureShard, CreateUserGroupOutput, CreateUserOutput, DataStorage, DestinationDetails,
+    ECPUPerSecond, Endpoint, Event,
     GlobalNodeGroup, GlobalReplicationGroup, GlobalReplicationGroupInfo,
     GlobalReplicationGroupMember, LogDeliveryConfiguration, LogDeliveryConfigurationRequest,
     NodeGroup, NodeGroupConfiguration, NodeGroupMember, NodeGroupMemberUpdateStatus,
@@ -5238,10 +5241,12 @@ impl CacheEngineVersionRecord {
 /// `ServerlessCache$Status`'s values this slice writes and reads: "The current
 /// status of the serverless cache. The allowed values are CREATING, AVAILABLE,
 /// DELETING, CREATE-FAILED and MODIFYING." The member is a plain `String`
-/// rather than an enum, so these are the spellings. `MODIFYING` belongs to
-/// `ModifyServerlessCache`, which is still a scaffolded 501, so it is spelled
-/// where that lands rather than here.
+/// rather than an enum, so these are the spellings.
 pub const SERVERLESS_STATUS_CREATING: &str = "CREATING";
+/// See [`SERVERLESS_STATUS_CREATING`]. What a cache answers while ElastiCache
+/// works a `ModifyServerlessCache` through
+/// ([`ServerlessCacheRecord::begin_modification`]).
+pub const SERVERLESS_STATUS_MODIFYING: &str = "MODIFYING";
 /// See [`SERVERLESS_STATUS_CREATING`].
 pub const SERVERLESS_STATUS_AVAILABLE: &str = "AVAILABLE";
 /// See [`SERVERLESS_STATUS_CREATING`]. What a cache answers between the
@@ -5249,9 +5254,9 @@ pub const SERVERLESS_STATUS_AVAILABLE: &str = "AVAILABLE";
 /// owes it ([`ServerlessCacheRecord::pending_deletion`]).
 pub const SERVERLESS_STATUS_DELETING: &str = "DELETING";
 
-/// How long a serverless cache stays `CREATING` before the clock owes it
-/// `AVAILABLE`, and how long one stays `DELETING` before the clock owes its
-/// removal — the same span a cache cluster's transitions take; see
+/// How long a serverless cache stays `CREATING` (or `MODIFYING`) before the
+/// clock owes it `AVAILABLE`, and how long one stays `DELETING` before the clock
+/// owes its removal — the same span a cache cluster's transitions take; see
 /// [`CLUSTER_TRANSITION`] for why it is a chosen, non-zero span.
 pub const SERVERLESS_CACHE_TRANSITION: Duration = CLUSTER_TRANSITION;
 
@@ -5280,6 +5285,13 @@ pub const DATA_STORAGE_MAX_GB: i32 = 5000;
 /// The `CacheUsageLimits` bound value that removes a limit rather than setting
 /// one; see [`DATA_STORAGE_MIN_GB`].
 pub const USAGE_LIMIT_REMOVED: i32 = 0;
+
+/// What a request naming a `UserGroupId` for a Memcached serverless cache is
+/// refused with: a user group is "available for Valkey and Redis OSS only"
+/// (`CreateServerlessCache$UserGroupId`), so the combination is incompatible
+/// rather than a missing group. One sentence for every handler that raises it.
+pub const USER_GROUP_ENGINE_UNSUPPORTED: &str =
+    "UserGroupId is only valid for a serverless cache running valkey or redis, not for memcached.";
 
 /// The longest `Description` a serverless cache may carry, as
 /// `CreateServerlessCache$Description` documents it: "The maximum length is 255
@@ -5434,6 +5446,108 @@ pub fn is_daily_snapshot_time(value: &str) -> bool {
         && matches!(minutes.parse::<u32>(), Ok(m) if m < 60)
 }
 
+/// Why a serverless cache cannot carry the `Description` a request named, or
+/// the description it carries for that value.
+///
+/// The member carries no modelled `@length`, so the documented bound
+/// ([`MAX_SERVERLESS_DESCRIPTION_LENGTH`]) is enforced here and a longer value
+/// is refused rather than stored truncated; a blank one is the empty
+/// description the API reports as [`DEFAULT_SERVERLESS_DESCRIPTION`]. One
+/// implementation, so a created and a modified cache describe the same values.
+pub fn serverless_description(requested: &str) -> Result<String, String> {
+    let length = requested.chars().count();
+    if length > MAX_SERVERLESS_DESCRIPTION_LENGTH {
+        return Err(format!(
+            "Invalid value for Description: the maximum length is \
+             {MAX_SERVERLESS_DESCRIPTION_LENGTH} characters, got {length}."
+        ));
+    }
+    if requested.trim().is_empty() {
+        return Ok(DEFAULT_SERVERLESS_DESCRIPTION.to_string());
+    }
+    Ok(requested.to_string())
+}
+
+/// Why a serverless cache cannot carry the `SnapshotRetentionLimit` a request
+/// named, or `None` when it may.
+///
+/// "The maximum value allowed is 35 days" ([`MAX_SNAPSHOT_RETENTION_LIMIT`]),
+/// and a negative retention retains nothing: a limit outside that range is
+/// refused rather than clamped.
+pub fn snapshot_retention_limit_refusal(limit: i32) -> Option<String> {
+    (!(0..=MAX_SNAPSHOT_RETENTION_LIMIT).contains(&limit)).then(|| {
+        format!(
+            "Invalid value {limit} for SnapshotRetentionLimit: must be at least 0 and no more \
+             than {MAX_SNAPSHOT_RETENTION_LIMIT} days."
+        )
+    })
+}
+
+/// Why a serverless cache cannot carry the `DailySnapshotTime` a request named,
+/// or `None` when it may; see [`is_daily_snapshot_time`].
+pub fn daily_snapshot_time_refusal(requested: &str) -> Option<String> {
+    (!is_daily_snapshot_time(requested)).then(|| {
+        format!(
+            "Invalid value {requested} for DailySnapshotTime: must be a daily time in the format \
+             HH:MM (UTC)."
+        )
+    })
+}
+
+/// Why a serverless cache running `engine` cannot carry the
+/// `MajorEngineVersion` a request named, or `None` when it may; see
+/// [`is_version_label`].
+pub fn major_engine_version_refusal(engine: &str, requested: &str) -> Option<String> {
+    (!is_version_label(requested)).then(|| {
+        format!(
+            "Invalid value {requested} for MajorEngineVersion: must be a version such as {}.",
+            default_major_engine_version(engine)
+        )
+    })
+}
+
+/// The `CacheUsageLimits` a cache carries after a request that named
+/// `requested`, over the `stored` limits it carries now.
+///
+/// A limit is a BOUND rather than a document: each bound the request names
+/// replaces the stored one, and a bound it does not name keeps the value the
+/// cache is running — which is why the API publishes [`USAGE_LIMIT_REMOVED`] as
+/// the way to remove a bound rather than treating an omitted member as a
+/// removal. The result is what [`validate_cache_usage_limits`] is checked
+/// against, so a request that lifts one bound past the other's stored value is
+/// refused on the limits the cache would END UP with.
+pub fn merge_cache_usage_limits(
+    stored: Option<&CacheUsageLimits>,
+    requested: &CacheUsageLimits,
+) -> CacheUsageLimits {
+    let stored_storage = stored.and_then(|limits| limits.data_storage.as_ref());
+    let stored_ecpu = stored.and_then(|limits| limits.ecpu_per_second.as_ref());
+    CacheUsageLimits {
+        data_storage: match (requested.data_storage.as_ref(), stored_storage) {
+            (Some(wanted), stored) => Some(DataStorage {
+                minimum: wanted.minimum.or_else(|| stored.and_then(|s| s.minimum)),
+                maximum: wanted.maximum.or_else(|| stored.and_then(|s| s.maximum)),
+                // `DataStorage$Unit` is required and has one value (`GB`), so a
+                // named member always carries it; an empty one keeps the unit
+                // the cache is measured in.
+                unit: if wanted.unit.is_empty() {
+                    stored.map(|s| s.unit.clone()).unwrap_or_default()
+                } else {
+                    wanted.unit.clone()
+                },
+            }),
+            (None, stored) => stored.cloned(),
+        },
+        ecpu_per_second: match (requested.ecpu_per_second.as_ref(), stored_ecpu) {
+            (Some(wanted), stored) => Some(ECPUPerSecond {
+                minimum: wanted.minimum.or_else(|| stored.and_then(|s| s.minimum)),
+                maximum: wanted.maximum.or_else(|| stored.and_then(|s| s.maximum)),
+            }),
+            (None, stored) => stored.cloned(),
+        },
+    }
+}
+
 /// One `CacheUsageLimits` member as [`validate_cache_usage_limits`] checks it:
 /// its name, its `Minimum`, its `Maximum`, and the upper bound its values must
 /// be within (`None` where the API publishes none).
@@ -5580,6 +5694,21 @@ impl ServerlessCacheRecord {
         self.status = pending.status.clone();
         self.pending_status = None;
         Some(settled)
+    }
+
+    /// Put this cache into `MODIFYING` and record the `AVAILABLE` the clock now
+    /// owes it, [`SERVERLESS_CACHE_TRANSITION`] from `now`.
+    ///
+    /// Scaling a cache's capacity, and moving it onto another engine or engine
+    /// version, is work ElastiCache carries out after the call answers, so the
+    /// cache is `MODIFYING` from here and a caller reading it straight after
+    /// still sees that status and the state errors that go with it.
+    pub fn begin_modification(&mut self, now: SystemTime) {
+        self.status = SERVERLESS_STATUS_MODIFYING.to_string();
+        self.pending_status = Some(PendingTransition {
+            due: now + SERVERLESS_CACHE_TRANSITION,
+            status: SERVERLESS_STATUS_AVAILABLE.to_string(),
+        });
     }
 
     /// Put this cache into `DELETING` and record the removal the clock now owes

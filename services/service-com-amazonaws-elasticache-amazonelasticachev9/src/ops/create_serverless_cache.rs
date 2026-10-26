@@ -232,64 +232,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `MajorEngineVersion` is "the version of the cache engine that will be
         // used to create the serverless cache"; omitted, the cache is created on
-        // the engine's current major line.
+        // the engine's current major line. The same version rule a
+        // `ModifyServerlessCache` applies, so one implementation decides it
+        // (`crate::state::major_engine_version_refusal`).
         let major_engine_version = match input.major_engine_version {
             Some(requested) => {
-                if !crate::state::is_version_label(&requested) {
-                    return Err(invalid_value(format!(
-                        "Invalid value {requested} for MajorEngineVersion: must be a version such \
-                         as {}.",
-                        crate::state::default_major_engine_version(&engine)
-                    )));
+                if let Some(message) =
+                    crate::state::major_engine_version_refusal(&engine, &requested)
+                {
+                    return Err(invalid_value(message));
                 }
                 requested
             }
             None => crate::state::default_major_engine_version(&engine),
         };
 
-        // "The maximum length is 255 characters": `Description` carries no
-        // modelled `@length`, so the documented bound is enforced here rather
-        // than at the boundary, and a longer one is refused rather than stored
-        // truncated.
-        if let Some(description) = input.description.as_deref() {
-            if description.chars().count() > crate::state::MAX_SERVERLESS_DESCRIPTION_LENGTH {
-                return Err(invalid_value(format!(
-                    "Invalid value for Description: the maximum length is {} characters, got {}.",
-                    crate::state::MAX_SERVERLESS_DESCRIPTION_LENGTH,
-                    description.chars().count()
-                )));
-            }
-        }
-        // "The default is NULL, i.e. if no description is provided then an empty
-        // string will be returned", which the API reports as a single space; see
-        // `crate::state::DEFAULT_SERVERLESS_DESCRIPTION`.
-        let description = match input.description {
-            Some(description) if !description.trim().is_empty() => description,
-            _ => crate::state::DEFAULT_SERVERLESS_DESCRIPTION.to_string(),
+        // "The maximum length is 255 characters", and "the default is NULL,
+        // i.e. if no description is provided then an empty string will be
+        // returned", which the API reports as a single space: both are the one
+        // description rule (`crate::state::serverless_description`, which a
+        // `ModifyServerlessCache` applies too).
+        let description = match input.description.as_deref() {
+            Some(requested) => match crate::state::serverless_description(requested) {
+                Ok(description) => description,
+                Err(message) => return Err(invalid_value(message)),
+            },
+            None => crate::state::DEFAULT_SERVERLESS_DESCRIPTION.to_string(),
         };
 
         // "The number of days for which ElastiCache retains automatic snapshots
         // before deleting them … The maximum value allowed is 35 days." A limit
         // outside that range is refused rather than clamped.
-        if let Some(limit) = input.snapshot_retention_limit {
-            if !(0..=crate::state::MAX_SNAPSHOT_RETENTION_LIMIT).contains(&limit) {
-                return Err(invalid_value(format!(
-                    "Invalid value {limit} for SnapshotRetentionLimit: must be at least 0 and no \
-                     more than {} days.",
-                    crate::state::MAX_SNAPSHOT_RETENTION_LIMIT
-                )));
-            }
+        if let Some(message) = input
+            .snapshot_retention_limit
+            .and_then(crate::state::snapshot_retention_limit_refusal)
+        {
+            return Err(invalid_value(message));
         }
 
         // `DailySnapshotTime` is a wall-clock `HH:MM` in UTC; a value that is
         // not one names no time to snapshot at.
-        if let Some(time) = input.daily_snapshot_time.as_deref() {
-            if !crate::state::is_daily_snapshot_time(time) {
-                return Err(invalid_value(format!(
-                    "Invalid value {time} for DailySnapshotTime: must be a daily time in the \
-                     format HH:MM (UTC)."
-                )));
-            }
+        if let Some(message) = input
+            .daily_snapshot_time
+            .as_deref()
+            .and_then(crate::state::daily_snapshot_time_refusal)
+        {
+            return Err(invalid_value(message));
         }
 
         if let Some(limits) = input.cache_usage_limits.as_ref() {
@@ -353,9 +341,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 CreateServerlessCacheErrorModeled::InvalidParameterCombinationException(
                     InvalidParameterCombinationException {
                         message: Some(
-                            "UserGroupId is only valid for a serverless cache running valkey \
-                             or redis, not for memcached."
-                                .to_string(),
+                            crate::state::USER_GROUP_ENGINE_UNSUPPORTED.to_string(),
                         ),
                     },
                 )

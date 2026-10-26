@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyServerlessCache
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyServerlessCache`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyServerlessCache::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reads and writes this service's state and no
+//! longer answers 501, so it carries no `SCAFFOLDED, NOT IMPLEMENTED:` marker line
+//! (that line is the machine-readable census of the operations that are still stubs,
+//! `grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`). This is still the ONLY
+//! file to touch for `ModifyServerlessCache`.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +178,325 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyServerlessCache` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyServerlessCacheErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyServerlessCache"))
+        // A mutation: "This API modifies the attributes of a serverless cache."
+        // Every member the request names is either applied to the ONE stored
+        // record or the request is refused with a modelled error, so a 200 never
+        // reports a configuration the store does not hold, and a refused modify
+        // leaves the live cache exactly as it was.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // Same identity rule as `CreateServerlessCache`: `ServerlessCacheName`
+        // "is stored as a lowercase string", so the cache this request resolves
+        // is the one stored under the lowercased name.
+        let name = input.serverless_cache_name.to_ascii_lowercase();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A user group whose change has fallen due is `active` now, so the
+        // status read for one this request attaches is the settled one.
+        store.settle_user_groups(now);
+
+        // A cache whose removal the clock has already carried through is gone,
+        // and one that has become `AVAILABLE` since its last transition is
+        // available now: the record read below is the one this instant owes.
+        let Some(cache) = store.settled_serverless_cache_mut(&name, now) else {
+            return Err(
+                ModifyServerlessCacheErrorModeled::ServerlessCacheNotFoundFault(
+                    ServerlessCacheNotFoundFault {
+                        message: Some(format!(
+                            "Serverless cache with name {} not found.",
+                            input.serverless_cache_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The values this change is computed against: every member the request
+        // leaves out keeps the one the cache is running.
+        let status = cache.status.clone();
+        let stored_engine = cache.engine.clone();
+        let stored_major_engine_version = cache.major_engine_version.clone();
+        let stored_limits = cache.cache_usage_limits.clone();
+        let stored_user_group = cache.user_group_id.clone();
+
+        // "Modifies the engine listed in a serverless cache request. The options
+        // are valkey, memcached or redis" — the same set a cache is created
+        // for, so one implementation decides it
+        // (`crate::state::normalize_engine`).
+        let engine = match input.engine.as_deref() {
+            Some(requested) => match crate::state::normalize_engine(requested) {
+                Ok(engine) => engine,
+                Err(message) => return Err(invalid_value(message)),
+            },
+            None => stored_engine.clone(),
+        };
+
+        // A requested `MajorEngineVersion` is checked against the engine the
+        // cache will be running AFTER this call, the same rule the create
+        // applies.
+        let major_engine_version = match input.major_engine_version.as_deref() {
+            Some(requested) => {
+                if let Some(message) =
+                    crate::state::major_engine_version_refusal(&engine, requested)
+                {
+                    return Err(invalid_value(message));
+                }
+                requested.to_string()
+            }
+            None => stored_major_engine_version.clone(),
+        };
+
+        // "Default = NULL, i.e. the existing description is not
+        // removed/modified": only a named description changes the stored one,
+        // and it is held to the same length rule the create enforces.
+        let description = match input.description.as_deref() {
+            Some(requested) => match crate::state::serverless_description(requested) {
+                Ok(description) => Some(description),
+                Err(message) => return Err(invalid_value(message)),
+            },
+            None => None,
+        };
+
+        // "Default = NULL, i.e. the existing snapshot-retention-limit will not
+        // be removed or modified. The maximum value allowed is 35 days."
+        if let Some(message) = input
+            .snapshot_retention_limit
+            .and_then(crate::state::snapshot_retention_limit_refusal)
+        {
+            return Err(invalid_value(message));
+        }
+
+        // "The default is NULL, i.e. the existing snapshot time configured for
+        // the cluster is not removed"; a named one is the same `HH:MM` UTC
+        // wall-clock the create takes.
+        if let Some(message) = input
+            .daily_snapshot_time
+            .as_deref()
+            .and_then(crate::state::daily_snapshot_time_refusal)
+        {
+            return Err(invalid_value(message));
+        }
+
+        // "Modify the cache usage limit for the serverless cache": each bound
+        // the request names replaces the stored one and the rest keep the values
+        // the cache is running (`crate::state::merge_cache_usage_limits`), and
+        // the limits the cache would END UP with have to satisfy the same rule
+        // the create enforces — a contradictory envelope is refused with the
+        // modelled 400 BEFORE anything is written, so a live cache never ends up
+        // with a floor above its ceiling.
+        let cache_usage_limits = match input.cache_usage_limits.as_ref() {
+            Some(requested) => {
+                let merged =
+                    crate::state::merge_cache_usage_limits(stored_limits.as_ref(), requested);
+                if let Err(message) = crate::state::validate_cache_usage_limits(&merged) {
+                    return Err(invalid_value(message));
+                }
+                Some(merged)
+            }
+            None => None,
+        };
+
+        // `RemoveUserGroup` takes the group away and `UserGroupId` attaches one:
+        // a request that names both asks for opposite ends of the same
+        // association.
+        let removing_user_group = input.remove_user_group.unwrap_or(false);
+        if removing_user_group && input.user_group_id.is_some() {
+            return Err(invalid_combination(
+                "RemoveUserGroup and UserGroupId cannot both be named: one removes the serverless \
+                 cache's user group and the other attaches one.",
+            ));
+        }
+        // The group the cache is attached to after this call: none when the
+        // request removes it, the named one when it names one, else the one it
+        // already carries.
+        let user_group_id = if removing_user_group {
+            None
+        } else if let Some(id) = input.user_group_id.clone() {
+            Some(id)
+        } else {
+            stored_user_group.clone()
+        };
+        // A user group is "available for Valkey and Redis OSS only", read
+        // against the engine the cache ends up running: moving a cache that
+        // carries a group onto Memcached is the incompatible combination too,
+        // not only naming one in the same request.
+        if user_group_id.is_some() && engine == "memcached" {
+            return Err(invalid_combination(
+                crate::state::USER_GROUP_ENGINE_UNSUPPORTED,
+            ));
+        }
+
+        // A cache has to be provisioned before it can be reconfigured: one still
+        // `CREATING` or on its way out is refused with the modelled state fault.
+        // One already `MODIFYING` is not — a change arriving while the previous
+        // one is still being worked through supersedes it, which is the shape of
+        // every converge loop that reapplies its desired configuration.
+        if status != crate::state::SERVERLESS_STATUS_AVAILABLE
+            && status != crate::state::SERVERLESS_STATUS_MODIFYING
+        {
+            return Err(
+                ModifyServerlessCacheErrorModeled::InvalidServerlessCacheStateFault(
+                    InvalidServerlessCacheStateFault {
+                        message: Some(format!(
+                            "Serverless cache {name} is in {status} state, not {}.",
+                            crate::state::SERVERLESS_STATUS_AVAILABLE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A group this request attaches has to be one this account created, and
+        // has to be usable: a group still `creating` cannot carry the cache's
+        // access control yet. Resolved against the one stored map of groups.
+        if let Some(id) = input.user_group_id.as_deref() {
+            let Some(group) = store.user_groups.get(id) else {
+                return Err(ModifyServerlessCacheErrorModeled::UserGroupNotFoundFault(
+                    UserGroupNotFoundFault {
+                        message: Some(format!("User group {id} not found.")),
+                    },
+                )
+                .into());
+            };
+            if let Some(message) = crate::state::user_group_state_refusal(group) {
+                return Err(
+                    ModifyServerlessCacheErrorModeled::InvalidUserGroupStateFault(
+                        InvalidUserGroupStateFault {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Nothing below refuses anything, so from here the change is applied to
+        // the stored record.
+        let Some(cache) = store.serverless_caches.get_mut(&name) else {
+            return Err(
+                ModifyServerlessCacheErrorModeled::ServerlessCacheNotFoundFault(
+                    ServerlessCacheNotFoundFault {
+                        message: Some(format!(
+                            "Serverless cache with name {} not found.",
+                            input.serverless_cache_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let engine_changed = engine != cache.engine;
+        let version_changed = major_engine_version != cache.major_engine_version;
+        cache.engine = engine;
+        cache.major_engine_version = major_engine_version;
+        if engine_changed || version_changed {
+            // `FullEngineVersion` is "the name and version number of the engine
+            // the serverless cache is compatible with", so it is derived from
+            // the pair the cache now runs rather than left reporting the old
+            // one.
+            cache.full_engine_version = crate::state::serverless_full_engine_version(
+                &cache.engine,
+                &cache.major_engine_version,
+            );
+        }
+        if engine_changed {
+            // The endpoint's port is the engine's default port, which is the
+            // invariant the create establishes (`crate::state::default_port`):
+            // a cache moved onto another engine is reached on that engine's
+            // port. The endpoint ADDRESS is minted once and stays, so a client
+            // keeps resolving the same name.
+            cache.endpoint_port = crate::state::default_port(&cache.engine);
+        }
+        if let Some(description) = description {
+            cache.description = description;
+        }
+        let limits_changed = cache_usage_limits.is_some();
+        if let Some(limits) = cache_usage_limits {
+            cache.cache_usage_limits = Some(limits);
+        }
+        // "Populating this list means the current VPC security groups will be
+        // removed": a named list replaces the stored one.
+        if let Some(security_group_ids) = input.security_group_ids {
+            cache.security_group_ids = security_group_ids;
+        }
+        if let Some(limit) = input.snapshot_retention_limit {
+            cache.snapshot_retention_limit = Some(limit);
+        }
+        if let Some(time) = input.daily_snapshot_time {
+            cache.daily_snapshot_time = Some(time);
+        }
+        cache.user_group_id = user_group_id.clone();
+
+        // Scaling the cache's capacity, and moving it onto another engine or
+        // engine version, is provisioning work ElastiCache carries out after the
+        // call: the cache answers `MODIFYING` and the clock owes it `AVAILABLE`.
+        // The other members are settings the service stores at the call, so they
+        // are visible at once and leave the cache usable — a caller that reads
+        // one back is not then refused by the next state-gated call on it.
+        if limits_changed || engine_changed || version_changed {
+            cache.begin_modification(now);
+        }
+        let serverless_cache = cache.to_modeled();
+
+        // A user group reports the caches it serves (`UserGroup$ServerlessCaches`),
+        // so the two records are kept in step: the group this call detached loses
+        // the cache and the one it attached gains it.
+        if stored_user_group != user_group_id {
+            if let Some(id) = stored_user_group {
+                if let Some(group) = store.user_groups.get_mut(&id) {
+                    group.serverless_cache_names.retain(|served| served != &name);
+                }
+            }
+            if let Some(id) = user_group_id {
+                if let Some(group) = store.user_groups.get_mut(&id) {
+                    if !group.serverless_cache_names.contains(&name) {
+                        group.serverless_cache_names.push(name.clone());
+                    }
+                }
+            }
+        }
+        // Modifying a serverless cache is one of the events this service
+        // records; see `crate::state::EventRecord`.
+        store.record_event(
+            crate::state::SOURCE_TYPE_SERVERLESS_CACHE,
+            &name,
+            "Serverless cache modified",
+            now,
+        );
+
+        Ok(ModifyServerlessCacheOutput {
+            serverless_cache: Some(serverless_cache),
+        })
     }
+}
+
+/// The modelled refusal for a parameter value this operation cannot accept:
+/// `InvalidParameterValueException` ("The value for a parameter is invalid"),
+/// HTTP 400.
+fn invalid_value(message: impl Into<String>) -> ModifyServerlessCacheError {
+    ModifyServerlessCacheErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message.into()),
+        },
+    )
+    .into()
+}
+
+/// The modelled refusal for two members of this request that cannot be named
+/// together: `InvalidParameterCombinationException` ("Two or more incompatible
+/// parameters were specified"), HTTP 400.
+fn invalid_combination(message: impl Into<String>) -> ModifyServerlessCacheError {
+    ModifyServerlessCacheErrorModeled::InvalidParameterCombinationException(
+        InvalidParameterCombinationException {
+            message: Some(message.into()),
+        },
+    )
+    .into()
 }
