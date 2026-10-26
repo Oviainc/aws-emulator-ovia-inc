@@ -85,6 +85,9 @@ pub const LIST_ROLE_TAGS: &str = "iam:ListRoleTags";
 /// `iam:ListPolicyTags`.
 pub const LIST_POLICY_TAGS: &str = "iam:ListPolicyTags";
 
+/// `iam:UntagPolicy`.
+pub const UNTAG_POLICY: &str = "iam:UntagPolicy";
+
 /// The decision value for a request the policies in force permit — one of the three
 /// `PolicyEvaluationDecisionType` declares
 /// (`smithy_query(query="shape",shape="PolicyEvaluationDecisionType")`).
