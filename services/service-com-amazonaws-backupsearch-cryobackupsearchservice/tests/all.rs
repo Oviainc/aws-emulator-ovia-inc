@@ -29,6 +29,8 @@ mod export_refusal_classes;
 mod job_identifier_syntax;
 #[path = "all/owed_status_due_instants.rs"]
 mod owed_status_due_instants;
+#[path = "all/page_token_under_a_changing_filter.rs"]
+mod page_token_under_a_changing_filter;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/search_job_item_results.rs"]

@@ -1642,7 +1642,15 @@ pub fn encode_next_token(context: &str, offset: usize) -> String {
     format!("{offset}@{context}")
 }
 
-/// Where a `NextToken` resumes, as an offset into the sequence `context` names.
+/// Where a `NextToken` resumes, as an offset into the sequence `context` names — the
+/// sequence of records this store HOLDS for that listing, in the order the listing
+/// reports them, before any of the request's filters narrow it ([`page_matching`]).
+///
+/// `len` is the length of that held sequence and never of a filtered view of it. A held
+/// sequence of this service is only ever appended to, while which of its records a filter
+/// keeps can change after a token was issued, because a record's own status moves on with
+/// no caller involved; so an offset this service handed out stays inside the sequence it
+/// indexes for as long as the store holds those records.
 ///
 /// `Err` is the caller's problem: a token this service did not issue, one issued for a
 /// different sequence, or one that points past the end of what it is paging over.
@@ -1671,8 +1679,30 @@ pub fn decode_next_token(
     Ok(offset)
 }
 
-/// One page of `items` starting at `offset`, with the token that resumes after it. The
-/// token carries `context`, the sequence it indexes.
+/// One page of `items` starting at `offset`, with the token that resumes after it — the
+/// whole sequence, which is what a listing carrying no filter pages. The paging rule
+/// itself is [`page_matching`]'s.
+pub fn page<T: Clone>(
+    items: &[T],
+    offset: usize,
+    max_results: usize,
+    context: &str,
+) -> (Vec<T>, Option<String>) {
+    page_matching(items, offset, max_results, context, |_| true)
+}
+
+/// One page of the entries of `items` that `admits` keeps, starting at `offset`, with the
+/// token that resumes after it. The token carries `context`, the sequence it indexes.
+///
+/// `offset` is a position in `items` — the sequence the store HOLDS — and not in the
+/// shorter subsequence a request's filter leaves of it, and the token this returns
+/// resumes after the last entry the page examined rather than after the last one it
+/// carried. That is what keeps every token this service issues resumable: a filter's
+/// membership can change between two calls of one paginating walk, since a record's
+/// status advances on its own, so a position in the filtered subsequence can fall outside
+/// it by the time the next page is asked for, while a position in the held sequence
+/// cannot. A filter that now keeps fewer entries simply answers a shorter page — down to
+/// an empty last one — instead of turning a token the service issued into a refusal.
 ///
 /// A page carries a `NextToken` whenever it is FULL — it holds as many entries as the
 /// requested page size — because a full page is all this call was asked for and says
@@ -1680,14 +1710,21 @@ pub fn decode_next_token(
 /// none, which is how a paginating client knows to stop: it follows the token until a
 /// page comes back short, and the page a token at the very end of the sequence resumes
 /// is the empty one.
-pub fn page<T: Clone>(
+pub fn page_matching<T: Clone>(
     items: &[T],
     offset: usize,
     max_results: usize,
     context: &str,
+    admits: impl Fn(&T) -> bool,
 ) -> (Vec<T>, Option<String>) {
-    let end = offset.saturating_add(max_results).min(items.len());
-    let page = items[offset.min(items.len())..end].to_vec();
+    let mut page = Vec::new();
+    let mut end = offset.min(items.len());
+    while end < items.len() && page.len() < max_results {
+        if admits(&items[end]) {
+            page.push(items[end].clone());
+        }
+        end += 1;
+    }
     let next = (page.len() == max_results).then(|| encode_next_token(context, end));
     (page, next)
 }

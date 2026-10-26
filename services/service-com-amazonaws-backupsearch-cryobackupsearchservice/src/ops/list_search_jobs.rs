@@ -159,14 +159,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // while nobody was looking is listed as COMPLETED.
         state.settle(SystemTime::now());
 
+        // Every held job, newest-created first: the sequence the page token indexes. The
+        // `ByStatus` filter is applied to the PAGE below rather than to this sequence,
+        // because a job's status moves on its own and a position in the jobs-in-one-status
+        // subsequence would stop naming a place in it (see `crate::state::page_matching`).
         let summaries: Vec<SearchJobSummary> = state
             .jobs_newest_first()
-            .filter(|job| {
-                input
-                    .by_status
-                    .as_deref()
-                    .is_none_or(|wanted| job.status == wanted)
-            })
             .map(|job| SearchJobSummary {
                 search_job_identifier: Some(job.identifier.clone()),
                 search_job_arn: Some(job.arn.clone()),
@@ -186,11 +184,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             summaries.len(),
         )
         .map_err(crate::scaffolded::Scaffolded::validation)?;
-        let (search_jobs, next_token) = crate::state::page(
+        let (search_jobs, next_token) = crate::state::page_matching(
             &summaries,
             offset,
             crate::state::page_size(input.max_results),
             &context,
+            |summary| {
+                input
+                    .by_status
+                    .as_deref()
+                    .is_none_or(|wanted| summary.status.as_deref() == Some(wanted))
+            },
         );
 
         Ok(ListSearchJobsOutput {

@@ -179,28 +179,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both members are filters: an export job is listed when it matches every
         // filter the request carried. Neither one is looked up as a resource, so
         // neither can turn a listing into a not-found.
-        let summaries: Vec<ExportJobSummary> = state
+        //
+        // The sequence the page token indexes is every held export job, newest-created
+        // first, with the search job it exports carried alongside its summary (the
+        // summary itself reports that job by ARN). The filters narrow the PAGE and not
+        // this sequence, because an export job's status moves on its own and a position
+        // in a filtered subsequence would stop naming a place in it (see
+        // `crate::state::page_matching`).
+        let listed: Vec<(ExportJobSummary, String)> = state
             .export_jobs_newest_first()
-            .filter(|export| {
-                input
-                    .status
-                    .as_deref()
-                    .is_none_or(|wanted| export.status == wanted)
-            })
-            .filter(|export| {
-                input
-                    .search_job_identifier
-                    .as_deref()
-                    .is_none_or(|wanted| export.search_job_identifier == wanted)
-            })
-            .map(|export| ExportJobSummary {
-                export_job_identifier: export.identifier.clone(),
-                export_job_arn: Some(export.arn.clone()),
-                status: Some(export.status.clone()),
-                creation_time: Some(export.creation_time),
-                completion_time: export.completion_time,
-                status_message: export.status_message.clone(),
-                search_job_arn: Some(export.search_job_arn.clone()),
+            .map(|export| {
+                (
+                    ExportJobSummary {
+                        export_job_identifier: export.identifier.clone(),
+                        export_job_arn: Some(export.arn.clone()),
+                        status: Some(export.status.clone()),
+                        creation_time: Some(export.creation_time),
+                        completion_time: export.completion_time,
+                        status_message: export.status_message.clone(),
+                        search_job_arn: Some(export.search_job_arn.clone()),
+                    },
+                    export.search_job_identifier.clone(),
+                )
             })
             .collect();
 
@@ -208,18 +208,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.status.as_deref(),
             input.search_job_identifier.as_deref(),
         );
-        let offset = crate::state::decode_next_token(
-            input.next_token.as_deref(),
-            &context,
-            summaries.len(),
-        )
-        .map_err(crate::scaffolded::Scaffolded::validation)?;
-        let (export_jobs, next_token) = crate::state::page(
-            &summaries,
+        let offset =
+            crate::state::decode_next_token(input.next_token.as_deref(), &context, listed.len())
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        let (page, next_token) = crate::state::page_matching(
+            &listed,
             offset,
             crate::state::page_size(input.max_results),
             &context,
+            |(summary, search_job_identifier)| {
+                input
+                    .status
+                    .as_deref()
+                    .is_none_or(|wanted| summary.status.as_deref() == Some(wanted))
+                    && input
+                        .search_job_identifier
+                        .as_deref()
+                        .is_none_or(|wanted| search_job_identifier == wanted)
+            },
         );
+        let export_jobs = page.into_iter().map(|(summary, _)| summary).collect();
 
         Ok(ListSearchResultExportJobsOutput {
             export_jobs,
