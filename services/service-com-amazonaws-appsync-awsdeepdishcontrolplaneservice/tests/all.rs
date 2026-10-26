@@ -31,6 +31,8 @@ mod data_source_update;
 mod data_sources;
 #[path = "all/delete_api_cache.rs"]
 mod delete_api_cache;
+#[path = "all/disassociation_reference_refusals.rs"]
+mod disassociation_reference_refusals;
 #[path = "all/environment_variables.rs"]
 mod environment_variables;
 #[path = "all/error_contract.rs"]

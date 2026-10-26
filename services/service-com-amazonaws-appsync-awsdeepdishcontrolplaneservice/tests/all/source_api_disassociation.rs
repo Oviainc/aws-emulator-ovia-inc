@@ -19,7 +19,9 @@
 //!    answers the same status and leaves the same one association;
 //! 4. an identifier that cannot name an API is a 400 `BadRequestException`, one that
 //!    names no API this account holds a 404 `NotFoundException`, and an `associationId`
-//!    that names no association OF the Merged API addressed a 404.
+//!    of the shape the service issues that names no association OF the Merged API
+//!    addressed a 404 (how a reference the service could NOT have issued is refused is
+//!    the `disassociation_reference_refusals` suite's rule).
 //!
 //! The harness (`router`, `call`, `create_api`, `create_pair`, `get_path`) is the one
 //! the association suites already carry, so this suite drives the same router the

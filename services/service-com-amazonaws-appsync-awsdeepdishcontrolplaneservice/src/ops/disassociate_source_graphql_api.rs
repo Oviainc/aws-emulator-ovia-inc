@@ -195,7 +195,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// This operation's modelled error for a refusal the shared association rule states.
 ///
 /// Each variant keeps the status the model gives its shape, and carries the rule's own
-/// text: a not-found names no identifier, so which side was missing is not reported.
+/// text: a malformed request names the value that was refused, while a not-found names
+/// no identifier, so which side was missing is not reported.
 fn refuse(refusal: crate::state::AssociationRefusal) -> DisassociateSourceGraphqlApiError {
     match refusal {
         crate::state::AssociationRefusal::BadRequest(message) => {
