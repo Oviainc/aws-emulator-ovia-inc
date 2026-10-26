@@ -2,12 +2,26 @@
 
 //! @op DescribeEndpoints
 //!
-//! IMPLEMENTED: endpoint discovery, answered with the address this request actually
-//! reached this server on, so a client that re-targets itself at the discovered endpoint
-//! keeps talking to the server it already reached. An address a client is handed here is
-//! one it can dial again, which is why the answer carries no host beyond the endpoint this
-//! request arrived on: a name that resolves somewhere else would send the client off this
-//! server with the next call it makes.
+//! IMPLEMENTED: endpoint discovery, answered with the endpoint of the REGION THE REQUEST
+//! ADDRESSES — "the regional endpoint information" (the doc below) — as this emulator
+//! serves it. An address handed out here is what a client reads to learn which regional
+//! endpoint to address, and what it validates a discovered endpoint by, so it names both
+//! halves of that endpoint's identity in the labels AWS puts them in: the service, as its
+//! endpoint prefix, then the region the caller called. Neither is a property of the socket
+//! the request happened to arrive on, so both are derived from the region the request
+//! addresses rather than from the host or port it reached.
+//!
+//! The address ends in the loopback name and the port this process serves, so what is
+//! advertised stays an endpoint OF THIS EMULATOR: a client that re-targets itself at a
+//! discovered endpoint keeps talking to this server, instead of being sent — with the
+//! developer's credentials — to the real regional endpoint those labels would otherwise
+//! name. The emulator's own routing resolves a service and a region from exactly these
+//! labels ([`crate::state::request_region`]), so the advertised address also places a
+//! request the same way the one it was discovered through did.
+//!
+//! The endpoint VARIANT a request arrives on (a FIPS or dual-stack host) is deliberately not
+//! carried into the answer: this process serves ONE endpoint, and it is neither of those, so
+//! reporting a variant would describe an endpoint nothing here answers on.
 //!
 //! ## Shape of an operation
 //!
@@ -60,45 +74,33 @@ use super::types::*;
 /// How long a client may cache a discovered endpoint, in minutes (`Endpoint`'s
 /// `CachePeriodInMinutes`: "Endpoint cache time to live (TTL) value.").
 ///
-/// CHOSEN, not documented: this emulator's address does not move while it runs, so a
-/// 24-hour TTL keeps endpoint discovery to one call per client without ever handing out
-/// an address that goes stale.
+/// CHOSEN, not documented: a region's service endpoint is a fixed name rather than
+/// something this service moves, so a 24-hour TTL keeps endpoint discovery to one call per
+/// client without ever handing out an address that goes stale.
 const ENDPOINT_CACHE_PERIOD_MINUTES: i64 = 24 * 60;
 
-/// The address this request reached the emulator on — host and, when present, port, with
-/// no scheme, which is the form the modelled `Address` carries.
-///
-/// The `Host` header is what the client actually dialled, so it is read first; an HTTP/2
-/// request carries the same value as the URI authority instead. Each candidate has to BE
-/// a host with an optional port ([`host_and_port`]) — the value is the caller's own, and a
-/// value that is not an endpoint address is not reported as one. With no usable candidate
-/// (a bare origin-form request, or a `Host` that is not an address), fall back to loopback
-/// on the port the emulator serves, which is the only other address that reaches this
-/// process.
-fn serving_address(parts: &::http::request::Parts) -> String {
-    [
-        parts
-            .headers
-            .get(::http::header::HOST)
-            .and_then(|value| value.to_str().ok()),
-        parts.uri.authority().map(::http::uri::Authority::as_str),
-    ]
-    .into_iter()
-    .flatten()
-    .find_map(host_and_port)
-    .unwrap_or_else(|| format!("127.0.0.1:{}", ::emulator_server::data_port_from_env()))
-}
+/// The first label of every endpoint host this service is served on: its `aws.api#service`
+/// `endpointPrefix`, which is also the SigV4 signing name a request addresses it by
+/// (`smithy_query(query="service_info")` on this crate's model — `endpointPrefix:
+/// "dynamodb"`).
+const ENDPOINT_PREFIX: &str = "dynamodb";
 
-/// `candidate` as a host with an optional port, or `None` when it is not one.
+/// The last label of every address reported here: the name reserved for the loopback
+/// interface, so the whole address resolves to THIS machine and to no other host.
+const LOOPBACK_ENDPOINT_NAME: &str = "localhost";
+
+/// The endpoint of `region` as this emulator serves it, in the form the modelled `Address`
+/// carries (a host and a port, no scheme and no path): the service's endpoint prefix, then
+/// the region, then the loopback name and the port this process listens on.
 ///
-/// The whole trimmed value has to parse as a URI authority, so a candidate carrying a
-/// scheme, a path or any character an authority cannot hold names no address. Userinfo
-/// (`user@host`) parses as an authority but is a credential rather than part of an
-/// endpoint address, so it is refused too.
-fn host_and_port(candidate: &str) -> Option<String> {
-    let trimmed = candidate.trim();
-    let authority = ::http::uri::Authority::try_from(trimmed).ok()?;
-    (authority.as_str() == trimmed && !trimmed.contains('@')).then(|| trimmed.to_string())
+/// The leading labels are the endpoint identity a discovery answer conveys, laid out as an
+/// AWS regional endpoint host lays them out; the trailing ones keep the address on this
+/// machine, which is the only place this service is actually served.
+fn regional_endpoint_address(region: &str) -> String {
+    format!(
+        "{ENDPOINT_PREFIX}.{region}.{LOOPBACK_ENDPOINT_NAME}:{}",
+        ::emulator_server::data_port_from_env()
+    )
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -169,15 +171,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // `DescribeEndpointsRequest` has no members, and the answer is a property of the
-        // endpoint this request arrived on — not of the store — so no state is read or
+        // region this request addresses — not of the store — so no state is read or
         // written here.
         let _ = (&input, &self.engine);
-        // The endpoint the caller is serving this request from is the one endpoint there
-        // is to discover, so exactly one is reported, and a client that re-targets itself
-        // at it dials the server it already reached.
+        // The region the request is signed for is the region it addresses (the same
+        // resolution every other operation here places a request in), and that region has
+        // exactly one service endpoint to discover, so exactly one is reported.
+        let region = crate::state::request_region(ctx.parts());
         Ok(DescribeEndpointsOutput {
             endpoints: vec![Endpoint {
-                address: serving_address(ctx.parts()),
+                address: regional_endpoint_address(&region),
                 cache_period_in_minutes: ENDPOINT_CACHE_PERIOD_MINUTES,
             }],
         })
