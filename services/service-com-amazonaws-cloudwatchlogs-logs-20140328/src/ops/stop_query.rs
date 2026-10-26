@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: stops the CloudWatch Logs Insights query `queryId` names, so the query
+//! `DescribeQueries` reports is `Cancelled` and owes the clock no completion. This is the
+//! ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`StopQuery::handle`] with real behaviour and
@@ -119,6 +119,15 @@ pub struct StopQuery<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// Refuse the request with the error this operation models for a parameter that is
+/// "specified incorrectly".
+fn invalid_parameter(message: String) -> StopQueryError {
+    StopQueryErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+    })
+    .into()
+}
+
 impl<Eng> StopQuery<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -145,18 +154,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopQuery"))
+        // `ctx` carries only request metadata; the query to stop is named by `queryId` and by
+        // nothing about the request.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StopQueryError::from(StopQueryErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let mut store = state.lock();
+
+        // A query advances on the CLOCK — a scheduled one starts running and a running one
+        // completes at the instants its start armed — so the status this stop is judged
+        // against is the one that was already due at this instant, materialised before the
+        // decision rather than moved on because a stop happened to look.
+        store.materialize_due_query_transitions(crate::state::now_ms());
+
+        // "The ID number of the query to stop. To find this ID number, use DescribeQueries":
+        // an id this account holds no query under names no query to stop, which is the missing
+        // resource this operation models.
+        let Some(query) = store.queries.get_mut(&input.query_id) else {
+            return Err(StopQueryErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message("query")),
+                },
+            )
+            .into());
+        };
+
+        // "Stops a CloudWatch Logs Insights query that is in progress. If the query has
+        // already ended, the operation returns an error indicating that the specified query is
+        // not running." A query in any terminal status has ended, so it is refused as the
+        // incorrectly specified parameter it is and the outcome it reached is left untouched;
+        // only a query still in progress — scheduled or running — is stopped.
+        if !query.is_active() {
+            return Err(invalid_parameter(crate::state::query_not_running_message(
+                &input.query_id,
+            )));
+        }
+
+        query.cancel();
+
+        Ok(StopQueryOutput {
+            // "This is true if the query was stopped by the StopQuery operation": this call is
+            // what stopped it, and a call that stops nothing answers one of the modelled
+            // errors above instead of reporting a stop it did not perform.
+            success: true,
+        })
     }
 }

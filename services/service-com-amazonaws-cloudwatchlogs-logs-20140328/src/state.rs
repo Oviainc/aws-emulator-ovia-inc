@@ -1546,6 +1546,16 @@ impl QueryRecord {
         self.status == QUERY_STATUS_SCHEDULED || self.status == QUERY_STATUS_RUNNING
     }
 
+    /// Stop this query: it reaches [`QUERY_STATUS_CANCELLED`] and owes the clock no further
+    /// transition, so the completion it was armed for is DISCARDED rather than materialised
+    /// later over the cancellation. Only a query that [`Self::is_active`] has an execution
+    /// left to stop.
+    pub fn cancel(&mut self) {
+        self.status = QUERY_STATUS_CANCELLED.to_string();
+        self.running_due_ms = None;
+        self.complete_due_ms = None;
+    }
+
     /// Materialise the status changes the clock owes this query: a scheduled query whose
     /// start instant has passed is `Running`, and a running one whose completion instant has
     /// passed is `Complete` — each decided AT that instant and not at the time something
@@ -3211,6 +3221,16 @@ pub fn resolve_lookup_table_source(
 /// service a query store to resolve an id against.
 pub fn query_not_found_message(query_id: &str) -> String {
     format!("Query with id [{query_id}] is not a completed or cancelled query.")
+}
+
+/// The refusal `StopQuery` answers for a query that has already ended: it "stops a CloudWatch
+/// Logs Insights query that is in progress", and "if the query has already ended, the
+/// operation returns an error indicating that the specified query is not running". The
+/// message is built from the request, in the same `Query with id [..]` form every refusal of
+/// this service that names a query by its id takes, so a caller stopping queries in a loop
+/// can attribute the refusal to one id.
+pub fn query_not_running_message(query_id: &str) -> String {
+    format!("Query with id [{query_id}] is not running.")
 }
 
 /// What a lookup table's CSV body describes: the column names of its header row and how
