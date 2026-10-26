@@ -231,7 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             return Err(ListPolicyVersionsErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
-                    message: Some(format!("Policy {} does not exist.", input.policy_arn)),
+                    message: Some(crate::state::policy_not_found(&input.policy_arn)),
                 },
             )
             .into());

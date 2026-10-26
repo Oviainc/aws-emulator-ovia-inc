@@ -2673,6 +2673,17 @@ pub fn uncarried_aws_managed_policy(arn: &str, what: &str) -> crate::scaffolded:
     }
 }
 
+/// The message IAM refuses an operation addressed by `PolicyArn` with when the
+/// account holds no managed policy under that ARN — the `NoSuchEntityException`
+/// message, whose fixed text is `Policy ` and ` was not found.` around the ARN the
+/// request supplied.
+///
+/// ONE wording, shared by every operation taking a `PolicyArn`, so a read, a tag call
+/// and a delete cannot describe the same missing policy three different ways.
+pub fn policy_not_found(arn: &str) -> String {
+    format!("Policy {arn} was not found.")
+}
+
 /// Encode a state map key as the opaque pagination `Marker` a client echoes back.
 ///
 /// The codec is `aws_smithy_types::base64` — already in this crate's dependency
