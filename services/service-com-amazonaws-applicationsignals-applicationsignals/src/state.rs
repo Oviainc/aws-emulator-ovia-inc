@@ -559,6 +559,23 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsApplicationsignalsApplicationsignalsState>)
 }
 
+/// Whether an account id a request supplies names an account OTHER than the one this store
+/// holds — the single place every account-scoped read of this service decides that.
+///
+/// This store is one account's and one Region's (see the store doc): every ARN it mints
+/// carries `engine::emulator_account_id()`, so a request that names any other account names
+/// one this emulator holds no records for, and the selection it asks for is empty. An ABSENT
+/// account id names no account at all and therefore selects this store's own records, which
+/// is why the answer for `None` is `false`.
+///
+/// Every reader that takes an account id — a list's own `AwsAccountId`, an SLO list's
+/// `SloOwnerAwsAccountId`, the account an audited entity names, and the account field of a
+/// `ResourceArn` (always present, so `Some`) — reads it through here, so the reads that must
+/// agree about which account a request names cannot drift apart.
+pub fn names_other_account(account: Option<&str>) -> bool {
+    account.is_some_and(|account| account != ::engine::emulator_account_id())
+}
+
 /// The SLO name an `Id` denotes. The modelled `ServiceLevelObjectiveId` pattern is an
 /// alternation of the bare `ServiceLevelObjectiveName` and the full
 /// `ServiceLevelObjectiveArn`, so both forms name one record and every operation that
@@ -592,7 +609,7 @@ pub fn slo_name_in_arn(arn: &str) -> Option<&str> {
 /// (`arn:aws:s3:::slo/x`) names no resource here. The VENDOR field must be this service's
 /// namespace (`SIGNING_NAME`, which the modelled `ServiceLevelObjectiveArn` pattern spells)
 /// — which is what `service_common::arn::parse_of` narrows a parse to — and the account
-/// field must be the account this store holds (`engine::emulator_account_id()`). A
+/// field must be the account this store holds ([`names_other_account`]). A
 /// `ServiceLevelObjectiveId` needs neither check: its modelled pattern already fixes the
 /// namespace before a handler runs.
 ///
@@ -601,7 +618,7 @@ pub fn slo_name_in_arn(arn: &str) -> Option<&str> {
 /// rendering of the writer's SigV4 scope rather than part of an SLO's identity.
 pub fn tagged_slo_name_in_arn(resource_arn: &str) -> Option<&str> {
     let arn = ::service_common::arn::parse_of(resource_arn, SIGNING_NAME)?;
-    if arn.account != ::engine::emulator_account_id() {
+    if names_other_account(Some(arn.account)) {
         return None;
     }
     slo_name_in_arn(resource_arn)
@@ -2742,14 +2759,11 @@ fn audit_target_kind(target: &AuditTargetEntity) -> &'static str {
 /// `None` for an entity that names NO attribute at all, since an empty map would match every
 /// stored identity rather than one, and `None` for an entity in another account: the member
 /// is "the Amazon Web Services account ID where the service is located. Provide this value
-/// only for cross-account access", and this store holds one account's records (see the store
-/// doc), so another account's entity is one it holds nothing for.
+/// only for cross-account access", and this store holds one account's records, so another
+/// account's entity is one it holds nothing for ([`names_other_account`], the one reader of
+/// that rule).
 fn audited_entity_attributes(entity: &ServiceEntity) -> Option<HashMap<String, String>> {
-    if entity
-        .aws_account_id
-        .as_deref()
-        .is_some_and(|account| account != ::engine::emulator_account_id())
-    {
+    if names_other_account(entity.aws_account_id.as_deref()) {
         return None;
     }
     let mut attributes = HashMap::new();

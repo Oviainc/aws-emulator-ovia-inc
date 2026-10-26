@@ -199,14 +199,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
-        // This emulator holds exactly one account's SLOs, so a request that asks for
-        // another account's selects nothing. For the same reason `IncludeLinkedAccounts` is
-        // not consulted: there is no second account whose SLOs it could add, so the flag
-        // selects nothing extra and the answer is the same either way.
-        let other_account = input
-            .slo_owner_aws_account_id
-            .as_deref()
-            .is_some_and(|account| account != ::engine::emulator_account_id());
+        // A request that asks for another account's SLOs selects nothing
+        // (`crate::state::names_other_account`, the one reader of that rule). For the same
+        // reason `IncludeLinkedAccounts` is not consulted: there is no second account whose
+        // SLOs it could add, so the flag selects nothing extra and the answer is the same
+        // either way.
+        let other_account =
+            crate::state::names_other_account(input.slo_owner_aws_account_id.as_deref());
 
         let store = state.lock();
         let (slo_summaries, next_token) = if other_account {

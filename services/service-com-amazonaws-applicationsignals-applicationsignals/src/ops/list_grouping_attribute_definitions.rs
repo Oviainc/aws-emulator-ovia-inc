@@ -172,15 +172,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // This emulator holds exactly one account's grouping configuration, so a request
-        // that asks for another account's selects nothing. For the same reason
-        // `IncludeLinkedAccounts` is not consulted: there is no source account whose
+        // A request that asks for another account's grouping configuration selects nothing
+        // (`crate::state::names_other_account`, the one reader of that rule). For the same
+        // reason `IncludeLinkedAccounts` is not consulted: there is no source account whose
         // definitions it could add, so the flag selects nothing extra and the answer is the
         // same either way.
-        let other_account = input
-            .aws_account_id
-            .as_deref()
-            .is_some_and(|account| account != ::engine::emulator_account_id());
+        let other_account = crate::state::names_other_account(input.aws_account_id.as_deref());
         if other_account {
             return Ok(ListGroupingAttributeDefinitionsOutput {
                 grouping_attribute_definitions: Vec::new(),
