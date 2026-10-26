@@ -13,11 +13,13 @@
 //! them: what an id names depends on the group's target type, and an `ip` group's address
 //! or an `instance` group's instance is matched against the account's network, which EC2
 //! owns ([`crate::state::network`]). An address that is no address of the group's address
-//! type, one no subnet of its VPC holds and no zone was named for, and a publicly routable
-//! one are refused `ValidationError`; an instance EC2 does not hold, or holds in another
-//! VPC, is the modelled `InvalidTargetException`. A registration in a subnet of the
-//! group's VPC takes that subnet's Availability Zone, which is what `DescribeTargetHealth`
-//! then reports for it.
+//! type, one of no range an `ip` target may come from, one the group's VPC holds outside
+//! every subnet of it, and one outside the VPC that no zone was named for are refused
+//! `ValidationError` — which of those classes a registration earns is decided by where
+//! the address falls, never by what the request left out; an instance EC2 does not hold,
+//! or holds in another VPC, is the modelled `InvalidTargetException`. A registration in a
+//! subnet of the group's VPC takes that subnet's Availability Zone, which is what
+//! `DescribeTargetHealth` then reports for it.
 //!
 //! ## Shape of an operation
 //!
@@ -357,7 +359,6 @@ async fn resolve_targets(
                 let zone = crate::state::network::resolve_ip_target(
                     address,
                     target.availability_zone.as_deref(),
-                    vpc_id,
                     &cidrs,
                     &subnets,
                 )

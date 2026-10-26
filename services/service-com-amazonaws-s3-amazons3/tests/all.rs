@@ -21,6 +21,8 @@ mod bucket_accelerate_configuration;
 mod bucket_acl;
 #[path = "all/bucket_analytics_configuration.rs"]
 mod bucket_analytics_configuration;
+#[path = "all/bucket_analytics_configuration_listing.rs"]
+mod bucket_analytics_configuration_listing;
 #[path = "all/bucket_cors.rs"]
 mod bucket_cors;
 #[path = "all/bucket_deletion_emptiness.rs"]

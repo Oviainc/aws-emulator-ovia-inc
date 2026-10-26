@@ -3,8 +3,9 @@
 //! Engine state for the com-amazonaws-sesv2-simpleemailservice-v2 service.
 //!
 //! Everything the implemented operations answer with is computed from the records
-//! below: the email-identity table, the contact-list table, the outbound-message log,
-//! the per-account send counters and the account-level attributes. Nothing here is
+//! below: the email-identity table, the contact-list table, the suppression-list
+//! table, the outbound-message log, the per-account send counters and the
+//! account-level attributes. Nothing here is
 //! per-request scratch — the whole struct lives in the one shared engine (see
 //! [`service_state`]).
 
@@ -191,6 +192,11 @@ pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
     /// exactly, so it is keyed exactly as supplied. Ordered, so
     /// `ListConfigurationSets` enumerates and pages deterministically.
     pub configuration_sets: BTreeMap<String, ConfigurationSetRecord>,
+    /// Addresses on a suppression list, keyed by [`suppression_key`]: the list the
+    /// entry belongs to (a tenant's, or the account's) and the address within it, so
+    /// a tenant's list and the account-level list are separate. Ordered, so
+    /// `ListSuppressedDestinations` enumerates and pages deterministically.
+    pub suppressed_destinations: BTreeMap<String, SuppressedDestinationRecord>,
     /// The outbound-message log, oldest first: one entry per accepted `SendEmail`.
     pub sent_messages: Vec<SentMessage>,
     /// Per-account send counters, bumped by `SendEmail`.
@@ -929,6 +935,86 @@ pub fn configuration_set_name_invalid(configuration_set_name: &str) -> String {
 /// sees the same sentence whichever call first tells it the set is not there.
 pub fn configuration_set_not_found(configuration_set_name: &str) -> String {
     format!("Configuration set {configuration_set_name} does not exist.")
+}
+
+/// One address on a suppression list.
+///
+/// SES keeps a suppression list per account and, when a tenant configures one, per
+/// tenant; an entry carries the reason the address was suppressed, when the entry
+/// was last updated, and optionally what caused it.
+#[derive(Debug, Clone)]
+pub struct SuppressedDestinationRecord {
+    /// `SuppressedDestination$EmailAddress`, as the request that added the entry
+    /// spelled it: the local part belongs to the receiving mailbox, so a response
+    /// reports it unchanged.
+    pub email_address: String,
+    /// `SuppressedDestination$Reason`: the `SuppressionListReason` the address was
+    /// suppressed for.
+    pub reason: String,
+    /// `SuppressedDestination$LastUpdateTime`: when the entry was last written.
+    pub last_update_time: SystemTime,
+    /// `SuppressedDestinationAttributes$MessageId`: the message that caused the
+    /// suppression, when one did.
+    pub message_id: Option<String>,
+    /// `SuppressedDestinationAttributes$FeedbackId`: the identifier generated when
+    /// the address was added, when the entry carries one.
+    pub feedback_id: Option<String>,
+    /// The tenant whose suppression list holds this entry; `None` for the
+    /// account-level list. `SuppressedDestination$TenantName` "is present only when
+    /// the suppressed destination is on a tenant's suppression list".
+    pub tenant_name: Option<String>,
+}
+
+impl SuppressedDestinationRecord {
+    /// The modelled `SuppressedDestination` view of this record.
+    ///
+    /// One projection shared by every operation that reports a suppressed address,
+    /// so a write and the read after it cannot disagree.
+    pub fn detail(&self) -> crate::ops::types::SuppressedDestination {
+        crate::ops::types::SuppressedDestination {
+            email_address: self.email_address.clone(),
+            reason: self.reason.clone(),
+            last_update_time: ::aws_smithy_types::DateTime::from(self.last_update_time),
+            // "An optional value that can contain additional information about the
+            // reasons that the address was added": an entry that knows neither the
+            // message nor the feedback id reports no attributes at all, rather than
+            // an object whose members are all absent.
+            attributes: (self.message_id.is_some() || self.feedback_id.is_some()).then(|| {
+                crate::ops::types::SuppressedDestinationAttributes {
+                    message_id: self.message_id.clone(),
+                    feedback_id: self.feedback_id.clone(),
+                }
+            }),
+            tenant_name: self.tenant_name.clone(),
+        }
+    }
+}
+
+/// The key a suppression-list entry is stored under: the list it belongs to — a
+/// tenant's, or the account's when `tenant_name` is `None` — and the address within
+/// it.
+///
+/// The address part is its [`identity_key`], so a lookup matches the domain without
+/// regard to case while keeping the local part exactly as supplied. The two parts
+/// are joined by a character neither a `TenantName` ("alphanumeric characters,
+/// including letters, numbers, hyphens (-) and underscores (_) only") nor an
+/// addr-spec can contain, so one list's entries can never collide with another's.
+pub fn suppression_key(tenant_name: Option<&str>, email_address: &str) -> String {
+    format!(
+        "{}\u{1f}{}",
+        tenant_name.unwrap_or_default(),
+        identity_key(email_address)
+    )
+}
+
+/// How this service words `NotFoundException` for an address that is not on the
+/// suppression list being read.
+///
+/// One wording for every operation that looks an address up on a suppression list,
+/// so a client sees the same sentence whichever call first tells it the address is
+/// not suppressed.
+pub fn suppressed_destination_not_found(email_address: &str) -> String {
+    format!("Email address {email_address} does not exist on your suppression list.")
 }
 
 /// One accepted outbound message.
