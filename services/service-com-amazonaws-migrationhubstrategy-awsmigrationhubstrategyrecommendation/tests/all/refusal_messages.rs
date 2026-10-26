@@ -112,10 +112,11 @@ fn get(what: &'static str, uri: String) -> Case {
 ///
 /// Every row's constraint is declared on the member's TARGET shape, which is what the
 /// generated schema carries, and is a `@length`, `@range` or `@required` — the three the
-/// scaffold's boundary validator enforces. (`name` and `s3key` target the unconstrained
-/// `String` and carry their own `@length`/`@pattern` on the member, and `@pattern` is not
-/// enforced at all; both are gaps in the generated schema rather than in how this service
-/// WORDS a refusal, so no row rests on either.)
+/// scaffold's boundary validator enforces. (`name` and `s3key` carry their own
+/// `@length`/`@pattern` on the MEMBER, over an unconstrained `String`, and `@pattern` is
+/// not in the generated schema at all; the handler decides those, and
+/// `tests/all/start_call_member_constraints.rs` is where they are pinned, so no row here
+/// rests on them.)
 fn refused_cases() -> Vec<Case> {
     let mut long_bucket = valid_import();
     long_bucket["S3Bucket"] = json!(bucket_of_length(70));

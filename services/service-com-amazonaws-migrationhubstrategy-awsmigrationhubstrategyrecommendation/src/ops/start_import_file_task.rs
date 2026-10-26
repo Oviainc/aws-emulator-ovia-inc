@@ -167,6 +167,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
 
+        // The members the model constrains ON THE MEMBER — `name`'s `@length(1,50)` and
+        // `@pattern [a-zA-Z0-9_-]+`, `s3key`'s `@pattern .*\S.*`, and the bucket members'
+        // `@pattern [0-9a-z]+[0-9a-z\.\-]*[0-9a-z]+` — are the handler's to decide: the
+        // generated boundary validator enforces only `@length`/`@range`/`@required` from a
+        // member's TARGET shape. They run before the task is minted, so a request the model
+        // does not admit creates nothing.
+        crate::state::check_import_name(&input.name)
+            .map_err(StartImportFileTaskErrorModeled::ValidationException)?;
+        crate::state::check_s3_key(&input.s3key)
+            .map_err(StartImportFileTaskErrorModeled::ValidationException)?;
+        crate::state::check_bucket_name(Some(input.s3_bucket.as_str()))
+            .map_err(StartImportFileTaskErrorModeled::ValidationException)?;
+        crate::state::check_bucket_name(input.s3bucket_for_report_data.as_deref())
+            .map_err(StartImportFileTaskErrorModeled::ValidationException)?;
+
         // The same documented prefix rule as `StartAssessment`, on this operation's own
         // bucket members: `S3Bucket` is where the import file is read from and
         // `s3bucketForReportData` where the import results would be uploaded. Both are
@@ -269,6 +284,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             let id = store.mint_import_file_task_id(&region);
+            // What the clock already owes the imports this Region ran is materialised
+            // first, so this ingestion resolves against the portfolio as it stands: a
+            // component of this file naming a server an EARLIER import declared finds that
+            // server (`import_file::server_ids_named`) instead of the half-finished state
+            // of an import whose completion nobody has read yet.
+            if let Some(portfolio) = store.region_mut(&region) {
+                portfolio.settle_imports(now);
+            }
             // The resources the file declared become the records this import brings in,
             // each under an id minted here, in this Region's portfolio. They enter the
             // inventory the read path reports when the clock owes the task its terminal

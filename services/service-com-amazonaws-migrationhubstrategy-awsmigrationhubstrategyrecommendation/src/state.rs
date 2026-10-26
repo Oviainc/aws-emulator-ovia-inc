@@ -1044,6 +1044,14 @@ pub struct ServerRecord {
     /// this server's key in [`RegionState::servers`],
     /// which is what gives a list a stable total order to sort and paginate over.
     pub id: String,
+    /// The resource id the import file DECLARED for this server, which is what the
+    /// entries of an import file refer to a server by ([`import_file`]).
+    ///
+    /// Not a member of `ServerDetail`, and not the id the service reports: it is the
+    /// account's own name for the machine, so an application component declaring that it
+    /// runs on that server resolves to this record whichever import brought the server
+    /// in. `None` for a server whose entry declared only a name.
+    pub external_id: Option<String>,
     /// `ServerDetail$name`.
     pub name: Option<String>,
     /// `ServerDetail$serverType`.
@@ -2231,6 +2239,86 @@ pub fn check_bucket_usable(value: Option<&str>) -> Result<(), ValidationExceptio
         }),
         _ => Ok(()),
     }
+}
+
+/// The bounds `StartImportFileTaskRequest$name` declares: `@length(min: 1, max: 50)`
+/// (`smithy_query(query="operation", operation="StartImportFileTask")`).
+pub const IMPORT_NAME_LENGTH: ::std::ops::RangeInclusive<usize> = 1..=50;
+
+/// Whether `character` is one `StartImportFileTaskRequest$name`'s `@pattern`
+/// (`[a-zA-Z0-9_-]+`) admits: an ASCII letter or digit, an underscore or a hyphen — so no
+/// space and no other punctuation.
+fn import_name_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_' || character == '-'
+}
+
+/// Refuse an import name the model does not admit.
+///
+/// `StartImportFileTaskRequest$name` carries its `@length(1,50)` and its `@pattern`
+/// ([`import_name_character`]) ON THE MEMBER, over an unconstrained `String` target, and
+/// the generated boundary validator enforces only what a member's TARGET shape declares
+/// (and no `@pattern` at all) — so this constraint is the handler's to decide. Refused
+/// with the service's one modelled-constraint sentence ([`invalid_request_body`]), which
+/// is what `EmulatedService::override_refusal` gives every constraint the validator does
+/// refuse, so one logical failure reads the same whichever side decided it.
+pub fn check_import_name(name: &str) -> Result<(), ValidationException> {
+    let counted = name.chars().count();
+    if !IMPORT_NAME_LENGTH.contains(&counted) || !name.chars().all(import_name_character) {
+        return Err(invalid_request_body());
+    }
+    Ok(())
+}
+
+/// The longest `s3key` the model admits: `@length(max: 1024)` on
+/// `StartImportFileTaskRequest$s3key`.
+pub const MAX_S3_KEY_CHARACTERS: usize = 1024;
+
+/// Refuse an S3 key the model does not admit.
+///
+/// `s3key`'s `@pattern` is `.*\S.*` — the value has to carry a non-whitespace character,
+/// so a blank key names no object — within its `@length(0,1024)`. Both sit on the member
+/// over an unconstrained `String`, so neither reaches the boundary validator.
+pub fn check_s3_key(key: &str) -> Result<(), ValidationException> {
+    if key.chars().count() > MAX_S3_KEY_CHARACTERS
+        || !key.chars().any(|character| !character.is_whitespace())
+    {
+        return Err(invalid_request_body());
+    }
+    Ok(())
+}
+
+/// The longest bucket name the model admits: `@length(max: 63)` on `importS3Bucket` and on
+/// the other bucket members, which is also S3's own bound on a bucket name.
+pub const MAX_BUCKET_NAME_CHARACTERS: usize = 63;
+
+/// Refuse a bucket name the model does not admit.
+///
+/// Every bucket member of this service carries the `@pattern`
+/// `[0-9a-z]+[0-9a-z\.\-]*[0-9a-z]+`: a name of at least two characters made of LOWER-CASE
+/// letters, digits, dots and hyphens that both starts and ends with a letter or a digit.
+/// The pattern is the half of those members' constraints the boundary validator does not
+/// enforce (it does refuse a name past [`MAX_BUCKET_NAME_CHARACTERS`], which the target
+/// shape declares, and that bound is restated here so one function decides the whole
+/// modelled rule).
+///
+/// `Ok` for an absent member: an optional bucket that was not named carries no value to
+/// hold to the pattern. This is the MODELLED rule alone — whether the service may use the
+/// bucket it names is [`check_bucket_usable`], a different refusal, so this one runs first.
+pub fn check_bucket_name(value: Option<&str>) -> Result<(), ValidationException> {
+    let Some(bucket) = value else {
+        return Ok(());
+    };
+    let edge = |character: char| character.is_ascii_lowercase() || character.is_ascii_digit();
+    let inner = |character: char| edge(character) || character == '.' || character == '-';
+    let counted = bucket.chars().count();
+    if !(2..=MAX_BUCKET_NAME_CHARACTERS).contains(&counted)
+        || !bucket.chars().all(inner)
+        || !bucket.chars().next().is_some_and(edge)
+        || !bucket.chars().next_back().is_some_and(edge)
+    {
+        return Err(invalid_request_body());
+    }
+    Ok(())
 }
 
 /// `StartAssessment`'s refusal in an account that has registered no data collector, word

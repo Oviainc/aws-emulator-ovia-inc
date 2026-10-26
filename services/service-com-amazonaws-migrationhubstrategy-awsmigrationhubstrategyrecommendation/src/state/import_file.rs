@@ -23,14 +23,14 @@
 //! `numberOfRecordsFailed` and materialises nothing, which is why the two counts a
 //! completed task reports always add up to the entries its file declared.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ::serde_json::Value;
 
 use super::analysis;
 use super::{
     ApplicationComponentRecord, ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState,
-    ServerRecord, COLLECTION_TO_BE_SCHEDULED, IMPORT_FAILED, IMPORT_PARTIAL_SUCCESS, IMPORT_SUCCESS,
+    RegionState, ServerRecord, COLLECTION_TO_BE_SCHEDULED, IMPORT_FAILED, IMPORT_SUCCESS,
 };
 use crate::ops::types::Group;
 
@@ -84,9 +84,10 @@ pub struct DeclaredResource {
     pub cpu_architecture: Option<String>,
     /// The file system type it declares — `SystemInfo$fileSystemType`.
     pub file_system_type: Option<String>,
-    /// The server this process or database runs on, named by that server's own entry (its
-    /// file id or its name). Absent on a server entry.
-    pub server_reference: Option<String>,
+    /// The servers this process or database runs on, named by each server's own entry (its
+    /// resource id or its name) wherever an import declared it. Empty on a server entry,
+    /// and on a component entry that names none.
+    pub server_references: Vec<String>,
     /// The application type of a process or database — `ApplicationComponentDetail$appType`.
     pub app_type: Option<String>,
 }
@@ -125,6 +126,9 @@ impl DeclaredResource {
         ServerRecord {
             id,
             name: self.name.clone(),
+            // The id the file declared for the machine, kept so a LATER import's components
+            // can name the server by it ([`server_ids_named`]).
+            external_id: self.external_id.clone(),
             os_type: self.os_type_value(),
             os_version: self.os_version.clone(),
             file_system_type: self.file_system_type.clone(),
@@ -259,20 +263,20 @@ impl Ingestion {
 
     /// The terminal `ImportFileTaskStatus` the task that ran this ingestion reaches.
     ///
-    /// `ImportFileTaskStatus` declares one value per outcome an import can have, so the
-    /// status is that outcome and not a fixed success: an import that read nothing it was
-    /// asked to read, or that failed every record its file declared, FAILED
-    /// ([`IMPORT_FAILED`]); one that brought in some records and failed others is a
-    /// PARTIAL success; one that brought in every record its file declared — including a
-    /// file that declared none, which asked nothing of it — succeeded.
+    /// The status reports whether the import BROUGHT THE PORTFOLIO ANYTHING, and the two
+    /// record counts report how its file's entries fared: an import whose file declared
+    /// records it could bring in and records it could not still SUCCEEDED
+    /// ([`IMPORT_SUCCESS`]) with `numberOfRecordsFailed` naming the rest, which is the
+    /// recorded behaviour of an import of such a file, and so does one whose file asked
+    /// nothing of it by declaring no resource at all. An import that read none of the
+    /// file it was asked to read, or that could bring in no record of it, FAILED
+    /// ([`IMPORT_FAILED`]) — nothing of what the caller asked for is in the portfolio.
     pub fn terminal_status(&self) -> &'static str {
         if self.unreadable.is_some() {
             return IMPORT_FAILED;
         }
-        if self.outcomes.iter().all(RecordOutcome::imported) {
+        if self.outcomes.is_empty() || self.outcomes.iter().any(RecordOutcome::imported) {
             IMPORT_SUCCESS
-        } else if self.outcomes.iter().any(RecordOutcome::imported) {
-            IMPORT_PARTIAL_SUCCESS
         } else {
             IMPORT_FAILED
         }
@@ -302,6 +306,41 @@ fn member<'a>(object: &'a ::serde_json::Map<String, Value>, names: &[&str]) -> O
     })
 }
 
+/// EVERY value the first of `names` the entry holds names: one per entry for a member
+/// holding a list, and the single value for one holding a string.
+///
+/// The format carries the servers an application component runs on as a LIST
+/// (`AssociatedServerIds`), because a component can run on more than one — which is what
+/// `ApplicationComponentDetail$moreServerAssociationExists` ("set to true if the
+/// application component is running on multiple servers") reports — so the reader takes
+/// every entry of it rather than the first. A document that names the one server directly
+/// (`AssociatedServerId`) names exactly that one. Matched the same way [`member`] matches:
+/// without regard to case, in preference order, and a blank value names nothing.
+fn member_values(object: &::serde_json::Map<String, Value>, names: &[&str]) -> Vec<String> {
+    let named = |value: &Value| -> Vec<String> {
+        let listed = match value {
+            Value::Array(entries) => entries.iter().filter_map(Value::as_str).collect(),
+            other => other.as_str().into_iter().collect::<Vec<&str>>(),
+        };
+        listed
+            .into_iter()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    names
+        .iter()
+        .find_map(|name| {
+            object
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| named(value))
+                .filter(|values| !values.is_empty())
+        })
+        .unwrap_or_default()
+}
+
 /// The resources the import document `body` declares, or `None` when it is not an import
 /// document at all (not JSON, or carrying no list of resources).
 ///
@@ -329,8 +368,23 @@ pub fn declared_resources(body: &str) -> Option<Vec<DeclaredResource>> {
                         .map(str::to_string),
                     cpu_architecture: member(entry, &["CPUArchitecture"]).map(str::to_string),
                     file_system_type: member(entry, &["FileSystemType"]).map(str::to_string),
-                    server_reference: member(entry, &["AssociatedServerId"]).map(str::to_string),
-                    app_type: member(entry, &["AppType"]).map(str::to_string),
+                    // The servers a process or a database runs on, named by each server's
+                    // resource id or name. The format carries them as a list, so a
+                    // component can declare more than one ([`member_values`]) — bounded
+                    // here by [`MAX_ASSOCIATED_SERVERS_PER_RECORD`], since the list is
+                    // the caller's.
+                    server_references: {
+                        let mut named = member_values(
+                            entry,
+                            &["AssociatedServerIds", "AssociatedServerId"],
+                        );
+                        named.truncate(MAX_ASSOCIATED_SERVERS_PER_RECORD);
+                        named
+                    },
+                    // And the application the component runs — reported as
+                    // `ApplicationComponentDetail$appType` — under the names the format
+                    // carries it by.
+                    app_type: member(entry, &["AppType", "ApplicationType"]).map(str::to_string),
                 },
             })
             .collect(),
@@ -344,6 +398,15 @@ fn resources_list(object: &::serde_json::Map<String, Value>) -> Option<&Vec<Valu
         .find(|(key, _)| key.eq_ignore_ascii_case("Resources"))
         .and_then(|(_, value)| value.as_array())
 }
+
+/// How many servers ONE component entry may name.
+///
+/// The list is the caller's (it comes out of an import document a caller wrote), and every
+/// name in it is resolved against the servers this file and this Region's portfolio hold,
+/// so without a bound one entry could make the ingestion cost the product of two
+/// caller-chosen sizes. It is far above any component of a real portfolio — a process runs
+/// on a handful of machines, not on dozens — so no workflow this service serves meets it.
+pub const MAX_ASSOCIATED_SERVERS_PER_RECORD: usize = 64;
 
 /// How many bytes of one import file this service reads.
 ///
@@ -368,12 +431,17 @@ pub const MAX_IMPORT_RECORDS: usize = 10_000;
 ///
 /// The id comes from the store's own counter, so a record of one Region never shares an id
 /// with a record of another and two imports of the same file are two sets of records. A
-/// process or a database is associated with the server its entry names (by that server's
-/// file id or name) WITHIN the same import file, wherever in the file that server is
-/// declared: the servers are taken first and the components resolved against them, so the
-/// association is the one the document declares and not an artefact of the order it lists
-/// its entries in. An entry naming a server the file does not declare is imported with no
-/// association rather than with one guessed from another import.
+/// process or a database is associated with the servers its entry names, by the resource id
+/// or the name each of those servers was DECLARED under, wherever it was declared: in this
+/// same file, whatever order it lists its entries in, or by an import that already brought
+/// the server into this Region's portfolio (the resource id an import file declares for a
+/// machine is the account's own name for it, so it names the same server across the imports
+/// that declare it). An entry naming servers NOTHING has declared names no server of this
+/// account, so it is counted as a record the import could not bring in.
+///
+/// Every reference is resolved through [`ServerIndex`], built ONCE for the whole import, so
+/// an import's cost stays linear in the entries its file declares and in the inventory it
+/// resolves against rather than the product of the two.
 ///
 /// The outcomes come back in the order the file declared its entries, whichever pass
 /// decided each one.
@@ -387,8 +455,10 @@ pub fn ingest(
     // One outcome per entry of the file, keyed by the entry's position in it, so the two
     // passes below fill one list in the file's own order.
     let mut outcomes: BTreeMap<usize, RecordOutcome> = BTreeMap::new();
-    // The servers of THIS file, by the names its other entries can refer to them with.
-    let mut servers_by_reference: Vec<(String, String)> = Vec::new();
+    // Where every reference of this import is resolved: the servers of THIS file, by the
+    // references its other entries can name them with, and then the ones the portfolio
+    // already held.
+    let mut index = ServerIndex::default();
 
     // The entries this import cannot bring in at all, and the servers, which the
     // components are resolved against.
@@ -409,11 +479,15 @@ pub fn ingest(
             .into_iter()
             .flatten()
         {
-            servers_by_reference.push((reference.to_string(), id.clone()));
+            index.declare(reference, &id);
         }
         outcomes.insert(position, resource.outcome(Some(id.clone()), None));
         ingestion.servers.push(resource.to_server(id, groups));
     }
+
+    // The references this file's components name and this file does not itself declare are
+    // the ONLY thing the Region's portfolio is searched for, and it is searched once.
+    index.index_portfolio(store.region(region), &references_named(declared));
 
     // Then the processes and databases running on them.
     for (position, resource) in declared.iter().enumerate() {
@@ -427,18 +501,34 @@ pub fn ingest(
                     outcomes.insert(position, resource.outcome(None, Some(too_many_records())));
                     continue;
                 }
+                // The servers the entry names, when it names any. A component runs ON a
+                // server (`ApplicationComponentDetail$associatedServerId` — "the ID of the
+                // server that the application component is running on", beside
+                // `moreServerAssociationExists` for a component running on several), so an
+                // entry whose named servers NOTHING has declared names no server of this
+                // account: there is nothing to attach the component to, and the record is
+                // counted as one the import could not bring in rather than materialised as
+                // a component running nowhere.
+                let server_ids = if resource.server_references.is_empty() {
+                    Vec::new()
+                } else {
+                    let resolved = index.ids_for(&resource.server_references);
+                    if resolved.is_empty() {
+                        outcomes.insert(
+                            position,
+                            resource.outcome(
+                                None,
+                                Some(
+                                    "the record names a server no import has declared"
+                                        .to_string(),
+                                ),
+                            ),
+                        );
+                        continue;
+                    }
+                    resolved
+                };
                 let id = store.mint_application_component_id(region);
-                let server_ids: Vec<String> = resource
-                    .server_reference
-                    .as_deref()
-                    .map(|named| {
-                        servers_by_reference
-                            .iter()
-                            .filter(|(reference, _)| reference == named)
-                            .map(|(_, server_id)| server_id.clone())
-                            .collect()
-                    })
-                    .unwrap_or_default();
                 outcomes.insert(position, resource.outcome(Some(id.clone()), None));
                 ingestion
                     .components
@@ -461,6 +551,115 @@ pub fn ingest(
 
     ingestion.outcomes = outcomes.into_values().collect();
     ingestion
+}
+
+/// Every reference this file's component entries name, deduplicated: the only references
+/// the Region's portfolio is searched for.
+///
+/// Deduplicating here is what keeps a document that repeats one name from costing anything
+/// per repetition, and the set is bounded by the file itself — at most
+/// [`MAX_ASSOCIATED_SERVERS_PER_RECORD`] names per entry, from a document bounded by
+/// [`MAX_IMPORT_FILE_BYTES`].
+fn references_named(declared: &[DeclaredResource]) -> BTreeSet<&str> {
+    declared
+        .iter()
+        .filter(|resource| {
+            matches!(
+                resource.kind().as_deref(),
+                Some(RESOURCE_TYPE_PROCESS | RESOURCE_TYPE_DATABASE)
+            )
+        })
+        .flat_map(|resource| resource.server_references.iter().map(String::as_str))
+        .collect()
+}
+
+/// Where an import resolves the servers a component entry names: one index of reference to
+/// server id, built ONCE for the whole import.
+///
+/// Resolving a reference is a single lookup, so an import costs one pass over the entries
+/// its file declares plus one pass over the inventory it resolves against — never the
+/// PRODUCT of the entries, the references each one names and the servers the account holds.
+/// Both passes are what build this index: the servers of the file being imported
+/// ([`Self::declare`], during the ingestion's first pass) and, for the references that file
+/// does not itself declare, the servers the Region's portfolio already held
+/// ([`Self::index_portfolio`]).
+///
+/// A reference resolves to the FILE's own servers where it declares any, because those are
+/// the ones the document being imported declares; only a reference nothing in it declares
+/// reaches back to what an earlier import brought in. Either way a server is named the same
+/// two ways — by the resource id it was declared under ([`ServerRecord::external_id`]) or by
+/// its name — so one spelling of a reference resolves wherever the server came from. Each
+/// reference holds at most [`MAX_ASSOCIATED_SERVERS_PER_RECORD`] ids, so a name many servers
+/// share cannot put an unbounded list of associations on a component record.
+#[derive(Debug, Default)]
+struct ServerIndex {
+    /// Reference to the ids of the servers THIS file declares under it.
+    declared_here: BTreeMap<String, Vec<String>>,
+    /// Reference to the ids of the servers the Region's portfolio already held under it,
+    /// for the references this file does not declare.
+    held_already: BTreeMap<String, Vec<String>>,
+}
+
+impl ServerIndex {
+    /// Record `id` as a server `reference` names, in `index`, up to the per-reference bound
+    /// and never twice.
+    fn record(index: &mut BTreeMap<String, Vec<String>>, reference: &str, id: &str) {
+        let ids = index.entry(reference.to_string()).or_default();
+        if ids.len() < MAX_ASSOCIATED_SERVERS_PER_RECORD && !ids.iter().any(|held| held == id) {
+            ids.push(id.to_string());
+        }
+    }
+
+    /// Note that the file being imported declares the server `id` under `reference`.
+    fn declare(&mut self, reference: &str, id: &str) {
+        Self::record(&mut self.declared_here, reference, id);
+    }
+
+    /// Index the servers `portfolio` already holds under the references `wanted`, in ONE
+    /// pass over it — and only for the references the file does not itself declare, which
+    /// take precedence.
+    fn index_portfolio(&mut self, portfolio: &RegionState, wanted: &BTreeSet<&str>) {
+        if wanted.is_empty() {
+            return;
+        }
+        for server in portfolio.servers.values() {
+            for reference in [server.external_id.as_deref(), server.name.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                if wanted.contains(reference) && !self.declared_here.contains_key(reference) {
+                    Self::record(&mut self.held_already, reference, &server.id);
+                }
+            }
+        }
+    }
+
+    /// The ids the reference `named` names, or an empty slice when nothing declared it.
+    fn ids_named(&self, named: &str) -> &[String] {
+        const NONE: &[String] = &[];
+        self.declared_here
+            .get(named)
+            .or_else(|| self.held_already.get(named))
+            .map_or(NONE, Vec::as_slice)
+    }
+
+    /// The ids the references `named` name between them, in the order they are named, each
+    /// id once and at most [`MAX_ASSOCIATED_SERVERS_PER_RECORD`] of them: the servers one
+    /// component entry runs on.
+    fn ids_for(&self, named: &[String]) -> Vec<String> {
+        let mut resolved: Vec<String> = Vec::new();
+        for reference in named {
+            for id in self.ids_named(reference) {
+                if resolved.len() >= MAX_ASSOCIATED_SERVERS_PER_RECORD {
+                    return resolved;
+                }
+                if !resolved.iter().any(|held| held == id) {
+                    resolved.push(id.clone());
+                }
+            }
+        }
+        resolved
+    }
 }
 
 /// Why `resource` cannot be brought in whatever its type, or `None` when it can.

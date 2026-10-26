@@ -1756,7 +1756,8 @@ pub const POLICY_LANGUAGE_VERSION: &str = "2012-10-17";
 /// The service-provided prefix is [`SERVICE_LINKED_ROLE_NAME_PREFIX`] followed by
 /// the service's own AWS-assigned label, and that label is NOT the first label of
 /// the principal and is not derivable from it: `ssm-sap.amazonaws.com` links
-/// `AWSServiceRoleForAWSSSMForSAP`, `ops.apigateway.amazonaws.com` links
+/// `AWSServiceRoleForAWSSSMForSAP`, `migrationhub-strategy.amazonaws.com` links
+/// `AWSServiceRoleForMigrationHubStrategy`, `ops.apigateway.amazonaws.com` links
 /// `AWSServiceRoleForAPIGateway`, `replication.cassandra.amazonaws.com` links
 /// `AWSServiceRoleForKeyspacesReplication`, and each Application Auto Scaling
 /// principal links a name suffixed with the resource type it scales. No part of the
@@ -1807,6 +1808,10 @@ pub const PUBLISHED_SERVICE_LINKED_ROLE_NAMES: &[(&str, &str)] = &[
         "codestar-notifications.amazonaws.com",
         "AWSServiceRoleForCodeStarNotifications",
     ),
+    // AWS Compute Optimizer: the hyphen of the principal's label is not in the role
+    // AWS names in "Using service-linked roles for AWS Compute Optimizer",
+    // AWSServiceRoleForComputeOptimizer.
+    ("compute-optimizer.amazonaws.com", "AWSServiceRoleForComputeOptimizer"),
     // [model] service-com-amazonaws-configservice-starlingdoveservice
     // `src/ops/put_service_linked_configuration_recorder.rs`: "creates a
     // service-linked role AWSServiceRoleForConfig in your account".
@@ -1852,6 +1857,25 @@ pub const PUBLISHED_SERVICE_LINKED_ROLE_NAMES: &[(&str, &str)] = &[
     ),
     ("lex.amazonaws.com", "AWSServiceRoleForLexBots"),
     ("macie.amazonaws.com", "AWSServiceRoleForAmazonMacie"),
+    // The AWS Migration Hub family. Each of these services is reached through a
+    // HYPHENATED endpoint label (`migrationhub-orchestrator`,
+    // `migrationhub-strategy` — the `cloudTrailEventSource` their own Smithy models
+    // in this repository carry), while the label AWS assigns the role is the
+    // service's NAME in mixed case with the hyphen gone, which no transformation of
+    // the principal produces: "Using service-linked roles for AWS Migration Hub
+    // Orchestrator" names AWSServiceRoleForMigrationHubOrchestrator and "Using
+    // service-linked roles for Strategy Recommendations" names
+    // AWSServiceRoleForMigrationHubStrategy — the role Strategy Recommendations
+    // requires in the account before it will run an import or an assessment, and so
+    // the name a client reads back as that prerequisite.
+    (
+        "migrationhub-orchestrator.amazonaws.com",
+        "AWSServiceRoleForMigrationHubOrchestrator",
+    ),
+    (
+        "migrationhub-strategy.amazonaws.com",
+        "AWSServiceRoleForMigrationHubStrategy",
+    ),
     (
         "opensearchservice.amazonaws.com",
         "AWSServiceRoleForAmazonOpenSearchService",
@@ -1877,6 +1901,10 @@ pub const PUBLISHED_SERVICE_LINKED_ROLE_NAMES: &[(&str, &str)] = &[
     // `AWSServiceRoleForBackupReports` as the role AWS Backup creates to run report
     // jobs, which is the name a client that provisions Backup reporting reads back.
     ("reports.backup.amazonaws.com", "AWSServiceRoleForBackupReports"),
+    // AWS Resource Explorer: the principal carries the service's API VERSION
+    // (`resource-explorer-2`), which the role AWS names in "Using service-linked
+    // roles for Resource Explorer" does not — AWSServiceRoleForResourceExplorer.
+    ("resource-explorer-2.amazonaws.com", "AWSServiceRoleForResourceExplorer"),
     ("securityhub.amazonaws.com", "AWSServiceRoleForSecurityHub"),
     // Amazon EC2 Spot and Spot Fleet: each role is assumed through the FEATURE's own
     // principal (`spot.amazonaws.com`, `spotfleet.amazonaws.com`), which is neither

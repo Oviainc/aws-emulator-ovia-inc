@@ -180,6 +180,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The report bucket is optional and is only held to the prefix. Both run BEFORE
         // anything is minted, so a refused request leaves no assessment behind.
         let analysis_bucket = input.s3bucket_for_analysis_data.as_deref();
+        // The bucket members' `@pattern` ([`crate::state::check_bucket_name`]) is the half
+        // of their modelled constraints the boundary validator does not enforce, and it is
+        // a rule of the MODEL rather than of this service, so it is decided before the
+        // service's own prefix rule below.
+        crate::state::check_bucket_name(analysis_bucket)
+            .map_err(StartAssessmentErrorModeled::ValidationException)?;
+        crate::state::check_bucket_name(input.s3bucket_for_report_data.as_deref())
+            .map_err(StartAssessmentErrorModeled::ValidationException)?;
         crate::state::require_bucket(
             "s3bucketForAnalysisData",
             "perform assessment",
