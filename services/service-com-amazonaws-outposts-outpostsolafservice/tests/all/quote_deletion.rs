@@ -76,11 +76,18 @@ enum Form {
 }
 
 impl Form {
-    /// `quote_id` written in this form.
-    fn of(self, quote_id: &str) -> String {
+    /// `quote_id` written in this form, for a quote of `region`.
+    ///
+    /// The ARN form carries the quote's own Region (and the account that holds it):
+    /// an ARN is an absolute identity, so the one that names a quote of `region` is
+    /// the one that Region's endpoint minted.
+    fn of(self, region: &str, quote_id: &str) -> String {
         match self {
             Self::BareId => quote_id.to_string(),
-            Self::Arn => format!("{QUOTE_ARN_PREFIX}{quote_id}"),
+            Self::Arn => format!(
+                "arn:aws:outposts:{region}:{}:quote/{quote_id}",
+                engine::emulator_account_id()
+            ),
         }
     }
 }
@@ -297,7 +304,7 @@ async fn deleting_a_quote_removes_it_whatever_its_status_and_identifier_form() {
             status.modelled()
         );
 
-        let identifier = form.of(&quote_id);
+        let identifier = form.of(HOME_REGION, &quote_id);
         let reply = delete_quote(&outposts, HOME_REGION, &identifier).await;
         assert_eq!(
             reply.status, 200,
@@ -313,7 +320,7 @@ async fn deleting_a_quote_removes_it_whatever_its_status_and_identifier_form() {
         // Gone to every later call: a read of either identifier form is not-found,
         // and a second delete is refused the same way.
         for form in [Form::BareId, Form::Arn] {
-            let gone = form.of(&quote_id);
+            let gone = form.of(HOME_REGION, &quote_id);
             let read = outposts
                 .call("GET", &format!("/quotes/{}", segment(&gone)), None)
                 .await;
@@ -579,7 +586,7 @@ async fn a_quote_is_only_deletable_through_the_region_it_was_created_in() {
             .await["Quote"]
             .clone();
         let quote_id = text(&created, "QuoteId");
-        let identifier = form.of(&quote_id);
+        let identifier = form.of(home, &quote_id);
 
         let refused = delete_quote(&outposts, other, &identifier).await;
         assert_eq!(
