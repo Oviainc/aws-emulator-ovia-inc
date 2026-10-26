@@ -1215,7 +1215,10 @@ async fn seed_rules(router: &MultiServiceRouter) -> (String, String, Vec<String>
 }
 
 /// The `Id`s of the rules one `ListResolverRules` response carries.
-fn listed_ids(body: &Value) -> Vec<String> {
+///
+/// `pub` because [`super::resolver_rule_listing_bounds`] reads the same pages
+/// and so needs the same projection.
+pub fn listed_ids(body: &Value) -> Vec<String> {
     body.get("ResolverRules")
         .and_then(Value::as_array)
         .map(|items| items.iter().map(|item| string_member(item, "Id")).collect())

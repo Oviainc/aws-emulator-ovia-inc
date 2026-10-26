@@ -49,6 +49,8 @@ mod resolver_rule_deletion;
 mod resolver_rule_disassociation;
 #[path = "all/resolver_rule_error_bodies.rs"]
 mod resolver_rule_error_bodies;
+#[path = "all/resolver_rule_listing_bounds.rs"]
+mod resolver_rule_listing_bounds;
 #[path = "all/resolver_rule_policies.rs"]
 mod resolver_rule_policies;
 #[path = "all/resolver_rule_updates.rs"]
