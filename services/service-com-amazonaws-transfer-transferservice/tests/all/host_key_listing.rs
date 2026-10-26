@@ -284,17 +284,22 @@ async fn the_listing_reports_every_stored_host_key_of_the_server() {
     let emulator = Emulator::new();
     let server_id = emulator.create_server(json!({})).await;
 
-    // Before any import the server holds no host key: `HostKeys` is present and empty
-    // rather than absent, and no token is handed out.
+    // Before any import the server holds exactly ONE host key: its own, the key it
+    // serves with (`crate::server_host_key_resource` is that rule's suite). No token is
+    // handed out for a single page.
     let before = list_host_keys(&emulator, json!({"ServerId": &server_id})).await;
-    assert!(
-        host_keys_of("before any import", &before).is_empty(),
-        "case \"before any import\": expected no host keys, got {before}"
+    let own_keys = host_keys_of("before any import", &before);
+    assert_eq!(
+        own_keys.len(),
+        1,
+        "case \"before any import\": expected the server's own host key alone, got {before}"
     );
     assert!(
         member_of(&before, "NextToken").is_null(),
         "case \"before any import\": expected no NextToken on a single page, got {before}"
     );
+    // Every count below is against what the server already held.
+    let own = own_keys.len();
 
     // (case, extra members of the import, the Description expected back, the
     // StorageType expected back)
@@ -339,8 +344,9 @@ async fn the_listing_reports_every_stored_host_key_of_the_server() {
         let keys = walk_host_keys(&emulator, &server_id, None).await;
         assert_eq!(
             keys.len(),
-            expected_ids.len(),
-            "case {case:?}: expected {} stored keys listed, got {keys:?}",
+            own + expected_ids.len(),
+            "case {case:?}: expected the server's own key and the {} imported ones listed, \
+             got {keys:?}",
             expected_ids.len()
         );
         let entry = listed(case, &keys, &host_key_id);
@@ -416,10 +422,12 @@ async fn the_listing_follows_the_store_per_server() {
         ),
     ] {
         let keys = walk_host_keys(&emulator, server_id, None).await;
+        // Each server also holds the key it serves with, beside the imported ones.
         assert_eq!(
             keys.len(),
-            expected.len(),
-            "case {case:?}: expected {} listed keys, got {keys:?}",
+            expected.len() + 1,
+            "case {case:?}: expected the server's own key and the {} imported ones, got \
+             {keys:?}",
             expected.len()
         );
         for (host_key_id, fingerprint) in expected {
@@ -457,8 +465,9 @@ async fn the_listing_follows_the_store_per_server() {
     let after_delete = walk_host_keys(&emulator, &first, None).await;
     assert_eq!(
         after_delete.len(),
-        1,
-        "case \"after deleting one key\": expected the other key alone, got {after_delete:?}"
+        2,
+        "case \"after deleting one key\": expected the other imported key and the server's \
+         own alone, got {after_delete:?}"
     );
     listed("after deleting one key", &after_delete, &on_first);
 
@@ -492,9 +501,9 @@ async fn the_listing_follows_the_store_per_server() {
     let survivor = walk_host_keys(&emulator, &second, None).await;
     assert_eq!(
         survivor.len(),
-        1,
-        "case \"after deleting another server\": expected the second server's key intact, \
-         got {survivor:?}"
+        2,
+        "case \"after deleting another server\": expected the second server's imported key \
+         and its own intact, got {survivor:?}"
     );
 }
 
@@ -506,7 +515,9 @@ async fn the_listing_follows_the_store_per_server() {
 async fn a_next_token_this_service_never_issued_is_refused() {
     let emulator = Emulator::new();
     let server_id = emulator.create_server(json!({})).await;
-    for index in 0..2 {
+    // One import beside the key the server itself serves with, so the server holds TWO
+    // keys and a page size of one has exactly one further page.
+    for index in 0..1 {
         let (material, _) = generated_host_key();
         let case = format!("key {index}");
         import_host_key(

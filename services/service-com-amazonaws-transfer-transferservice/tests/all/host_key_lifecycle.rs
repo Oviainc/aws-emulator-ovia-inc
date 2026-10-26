@@ -814,7 +814,15 @@ async fn a_server_holds_at_most_the_bounded_number_of_host_keys() {
     let emulator = Emulator::new();
     let server_id = emulator.create_server(json!({})).await;
 
-    let keys: Vec<(String, String)> = (0..=BOUND).map(|_| generated_host_key()).collect();
+    // The server already holds the key it serves with, which is one of its host keys and
+    // so counts against the bound (`crate::server_host_key_resource`): the room left for
+    // imports is read from the store rather than assumed.
+    let held = crate::host_key_listing::walk_host_keys(&emulator, &server_id, None)
+        .await
+        .len();
+    let importable = BOUND - held;
+
+    let keys: Vec<(String, String)> = (0..=importable).map(|_| generated_host_key()).collect();
     let mut stored: Vec<String> = Vec::new();
 
     for (index, (material, _)) in keys.iter().enumerate() {
@@ -824,8 +832,8 @@ async fn a_server_holds_at_most_the_bounded_number_of_host_keys() {
                 json!({"ServerId": &server_id, "HostKeyBody": material}),
             )
             .await;
-        let case = format!("key {} of a {BOUND}-key bound", index + 1);
-        if index < BOUND {
+        let case = format!("key {} of a {BOUND}-key bound", index + 1 + held);
+        if index < importable {
             assert_eq!(
                 answer.status, 200,
                 "case {case:?}: expected the import to be accepted, got {} with body {}",

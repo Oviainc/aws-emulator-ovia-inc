@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateWebApp
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateWebApp`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateWebApp::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies to a STORED web app the members the request names, leaving the ones it omits
+//! exactly as they stand: "assigns new properties to a web app. You can modify the
+//! access point, identity provider details, endpoint configuration, and the web app
+//! units", so `DescribeWebApp` and `ListWebApps` then report the updated record.
+//!
+//! The identity provider's `Role` is the one member `UpdateWebAppIdentityCenterConfig`
+//! carries: the Identity Center instance and the application registered in it belong to
+//! the web app from its create, so an update re-points the role and leaves them.
+//! Updating the VPC endpoint's `SubnetIds` keeps the `VpcEndpointId` the create minted
+//! — the same endpoint, in different subnets — and a web app with no VPC endpoint has
+//! none to update, which is a malformed request rather than a new endpoint.
+//!
+//! A web app applies ONE update at a time: a second update that arrives while the first
+//! is still being applied is refused with the modelled `ConflictException` (409), so two
+//! concurrent writers have exactly one winner and the losing caller is told to retry
+//! rather than silently overwriting the winner. The window is
+//! `crate::state::WEB_APP_UPDATE_SPAN`, stored as the instant it ends; nothing sleeps.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +172,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateWebApp` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateWebAppErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateWebApp"))
+        use crate::state as st;
+
+        // This operation reads no request metadata: it addresses a stored web app by id
+        // and answers that same id, so nothing here is derived from the Region.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            UpdateWebAppErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+        let now = ::std::time::Instant::now();
+
+        let mut guard = state.lock();
+        let Some(stored) = guard.web_apps.get_mut(&input.web_app_id) else {
+            return Err(st::not_found(
+                UpdateWebAppErrorModeled::ResourceNotFoundException(st::unknown_web_app(
+                    &input.web_app_id,
+                )),
+            ));
+        };
+
+        // One update at a time: while the web app is still applying the previous one
+        // there is no second roll-out to begin, so this request is refused rather than
+        // raced against it.
+        if stored.update_in_flight(now) {
+            return Err(
+                UpdateWebAppErrorModeled::ConflictException(st::web_app_update_conflict()).into(),
+            );
+        }
+
+        // A VPC endpoint can be re-configured; one that does not exist cannot be. The
+        // refusal is decided BEFORE anything is written, so a refused update changes
+        // nothing.
+        if let Some(UpdateWebAppEndpointDetails::Vpc(_)) = input.endpoint_details.as_ref() {
+            if !matches!(
+                stored.endpoint_details.as_ref(),
+                Some(DescribedWebAppEndpointDetails::Vpc(_))
+            ) {
+                return Err(UpdateWebAppErrorModeled::InvalidRequestException(
+                    st::web_app_has_no_vpc_endpoint(),
+                )
+                .into());
+            }
+        }
+
+        if let Some(access_endpoint) = input.access_endpoint {
+            stored.access_endpoint = access_endpoint;
+        }
+        if let Some(web_app_units) = input.web_app_units {
+            stored.web_app_units = Some(web_app_units);
+        }
+        // The one member an identity-provider update carries is the role; the instance
+        // and the application registered in it are the web app's own, from its create.
+        if let Some(UpdateWebAppIdentityProviderDetails::IdentityCenterConfig(requested)) =
+            input.identity_provider_details
+        {
+            if let Some(DescribedWebAppIdentityProviderDetails::IdentityCenterConfig(config)) =
+                stored.identity_provider_details.as_mut()
+            {
+                if let Some(role) = requested.role {
+                    config.role = Some(role);
+                }
+            }
+        }
+        // The endpoint keeps the id it was created with — it is the same endpoint — and
+        // takes the subnets the update names.
+        if let Some(UpdateWebAppEndpointDetails::Vpc(requested)) = input.endpoint_details {
+            if let Some(DescribedWebAppEndpointDetails::Vpc(vpc)) =
+                stored.endpoint_details.as_mut()
+            {
+                if let Some(subnet_ids) = requested.subnet_ids {
+                    vpc.subnet_ids = Some(subnet_ids);
+                }
+            }
+        }
+
+        // The roll-out this call begins, which the next one is judged against.
+        stored.begin_update(now);
+        let web_app_id = stored.web_app_id.clone();
+        drop(guard);
+
+        Ok(UpdateWebAppOutput { web_app_id })
     }
 }

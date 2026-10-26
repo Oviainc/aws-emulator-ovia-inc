@@ -2578,7 +2578,7 @@ fn gateway_label_char(c: char) -> bool {
 ///
 /// It is NOT the set [`crate::state::provisioning`] creates in the owning service: the two
 /// questions are independent — a type can have published return values this module knows
-/// and no owning service mounted here (`AWS::Transfer::Server`), or an owning service that
+/// and no owning service mounted here (`AWS::Transfer::Workflow`), or an owning service that
 /// creates it and no published return value beyond its name
 /// (`AWS::CodePipeline::Pipeline`, whose `Ref` is the pipeline name, which is the default
 /// this module already gives every type).
@@ -2633,7 +2633,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::SecretsManager::Secret",
     SSM_PARAMETER,
     STEP_FUNCTIONS_ACTIVITY,
-    "AWS::Transfer::Server",
+    TRANSFER_SERVER,
     "AWS::Transfer::Workflow",
 ];
 
@@ -2892,7 +2892,7 @@ fn return_values(
         // list-valued As2ServiceManagedEgressIpAddresses, which is not carried. The
         // template names no server — AWS::Transfer::Server has no name property — so the
         // id is the service-assigned `s-` + 17 hexadecimal form.
-        "AWS::Transfer::Server" => {
+        TRANSFER_SERVER => {
             let server_id = generated_service_id("s", name, TRANSFER_ID_HEX_DIGITS);
             let arn =
                 ::emulator_server::emulator_arn("transfer", region, &format!("server/{server_id}"));
@@ -3549,7 +3549,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         "AWS::DynamoDB::Table" => &["Arn"],
         "AWS::Lambda::Function" => &["Arn"],
         "AWS::Logs::LogGroup" => &["Arn"],
-        "AWS::Transfer::Server" => &["Arn", "ServerId"],
+        TRANSFER_SERVER => &["Arn", "ServerId"],
         "AWS::Transfer::Workflow" => &["Arn", "WorkflowId"],
         "AWS::IAM::Role" => &["Arn"],
         ECR_PUBLIC_REPOSITORY => &["Arn"],
@@ -3635,6 +3635,11 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 /// `rslvr-`-prefixed id for an endpoint, a rule and a rule association, none of its creates
 /// takes one, and each type's `Ref` returns that id — the `Name` such a type declares is
 /// only "a friendly name that lets you easily find [it] in the Resolver dashboard".
+///
+/// An AWS Transfer Family server is one more: `CreateServer` takes no identifier and
+/// answers the `ServerId` it assigned, and that type's `Ref` returns the server's ARN,
+/// which carries that id — so neither the id nor the ARN can be recomputed from the
+/// template.
 pub fn identity_is_service_assigned(resource_type: &str) -> bool {
     resource_type == FIS_EXPERIMENT_TEMPLATE
         || resource_type == WAF_REGIONAL_IP_SET
@@ -3648,6 +3653,7 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == ROUTE53RESOLVER_ENDPOINT
         || resource_type == ROUTE53RESOLVER_RULE
         || resource_type == ROUTE53RESOLVER_RULE_ASSOCIATION
+        || resource_type == TRANSFER_SERVER
 }
 
 /// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Data Firehose stream.
@@ -3693,6 +3699,15 @@ pub const S3VECTORS_BUCKET_SEGMENT: &str = "bucket/";
 /// `awsService.cloudFormationName: EMR`. "Ref returns the cluster ID", the `j-` job-flow id
 /// `RunJobFlow` mints, which is why [`identity_is_service_assigned`] names this type.
 pub const EMR_CLUSTER: &str = "AWS::EMR::Cluster";
+
+/// The type of an AWS Transfer Family server: that model carries
+/// `awsService.cloudFormationName: Transfer`. "Ref returns the Amazon Resource Name (ARN)
+/// of the server", and `Fn::GetAtt` reads `Arn` and `ServerId` — "the service-assigned ID
+/// of the server that is created". Transfer Family MINTS both (`CreateServer` takes no
+/// identifier and answers the `ServerId` it assigned), which is why
+/// [`identity_is_service_assigned`] names this type: the ARN a `Ref` resolves to is the one
+/// that service created the server under, not one these naming rules computed.
+pub const TRANSFER_SERVER: &str = "AWS::Transfer::Server";
 
 /// The types of the two kinds of Amazon MSK cluster a stack creates: the Amazon MSK model
 /// carries `awsService.cloudFormationName: MSK`, and the namespace publishes one type per
