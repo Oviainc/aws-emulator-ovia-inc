@@ -370,6 +370,13 @@ fn create_refusal(refusal: crate::state::CreateRefusal) -> CreateDistributionErr
                 message: Some(message),
             })
         }
+        crate::state::CreateRefusal::InvalidOriginAccessControl(message) => {
+            CreateDistributionErrorModeled::InvalidOriginAccessControl(
+                InvalidOriginAccessControl {
+                    message: Some(message),
+                },
+            )
+        }
     }
     .into()
 }

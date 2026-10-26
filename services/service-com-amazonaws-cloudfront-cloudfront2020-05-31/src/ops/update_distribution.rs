@@ -445,6 +445,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The same rule the create path applies: an origin reaches its bucket with the
+        // credentials of the origin access control it names, so an update cannot leave a
+        // distribution naming a control this account does not hold either.
+        if store
+            .unknown_origin_access_control(&input.distribution_config)
+            .is_some()
+        {
+            return Err(UpdateDistributionErrorModeled::InvalidOriginAccessControl(
+                crate::state::invalid_origin_access_control(),
+            )
+            .into());
+        }
+
         // A distribution's caller reference identifies it for its whole life, so an
         // update that renames it is not a modification CloudFront allows. The same one
         // fixed sentence every caller-reference refusal of this service carries, naming no

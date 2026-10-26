@@ -352,6 +352,13 @@ fn create_refusal(refusal: crate::state::CreateRefusal) -> CreateDistributionWit
                 },
             )
         }
+        crate::state::CreateRefusal::InvalidOriginAccessControl(message) => {
+            CreateDistributionWithTagsErrorModeled::InvalidOriginAccessControl(
+                InvalidOriginAccessControl {
+                    message: Some(message),
+                },
+            )
+        }
     }
     .into()
 }

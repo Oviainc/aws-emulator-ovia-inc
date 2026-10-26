@@ -4300,6 +4300,36 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         })
     }
 
+    /// The origin access control a configuration's origins name that this account does
+    /// NOT hold, or `None` when every control they name exists.
+    ///
+    /// An origin reaches its bucket WITH the credentials of the origin access control the
+    /// configuration names, so a configuration can only be stored while every control it
+    /// names exists: the reference is resolved against the stored controls on the way IN,
+    /// on every path that stores a `DistributionConfig`, and an id the store does not hold
+    /// — never created, or created and since deleted — is refused with the modelled
+    /// `InvalidOriginAccessControl` before anything is written. The check is the mirror of
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::distribution_using_origin_access_control`],
+    /// which is what keeps a control a stored origin names from being deleted, so the two
+    /// together are why no stored origin can name a control that is gone.
+    ///
+    /// `Origin$OriginAccessControlId` is the only place a configuration names a control,
+    /// and an empty id names none — [`resolve_distribution_config`] stores the empty string
+    /// for an origin that named no control — so an absent or empty member is not a
+    /// reference and resolves to nothing.
+    pub fn unknown_origin_access_control<'config>(
+        &self,
+        config: &'config DistributionConfig,
+    ) -> Option<&'config str> {
+        config
+            .origins
+            .items
+            .iter()
+            .filter_map(|origin| origin.origin_access_control_id.as_deref())
+            .filter(|id| !id.is_empty())
+            .find(|id| self.origin_access_control(id).is_none())
+    }
+
     /// The origin request policy `id` names, or `None` when the store holds none.
     ///
     /// The ACCOUNT's own policies only — what a mutation addresses, since nothing in this
@@ -4623,6 +4653,16 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         // before any distribution exists to carry the alias.
         if let Some(message) = alias_certificate_mismatch(&config) {
             return Err(CreateRefusal::InvalidViewerCertificate(message));
+        }
+
+        // An origin signs its requests to the bucket with the credentials of the origin
+        // access control it names, so a configuration can only be stored while every
+        // control it names exists: a reference to one this account does not hold is
+        // refused before any distribution is created from it.
+        if self.unknown_origin_access_control(&config).is_some() {
+            return Err(CreateRefusal::InvalidOriginAccessControl(
+                INVALID_ORIGIN_ACCESS_CONTROL_MESSAGE.to_string(),
+            ));
         }
 
         // A caller reference identifies ONE distribution for its whole life, and what it
@@ -5498,6 +5538,10 @@ pub enum CreateRefusal {
     /// `InvalidViewerCertificate` — the configuration's alternate domain names and its
     /// viewer certificate disagree (see [`alias_certificate_mismatch`]).
     InvalidViewerCertificate(String),
+    /// `InvalidOriginAccessControl` — an origin of the configuration names an origin
+    /// access control this account does not hold (see
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::unknown_origin_access_control`]).
+    InvalidOriginAccessControl(String),
 }
 
 /// What a create hands back: the new record's id and version token, and the
@@ -8371,6 +8415,29 @@ pub fn no_such_origin_access_control() -> NoSuchOriginAccessControl {
 /// shorter form.
 pub const NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE: &str =
     "The specified origin access control does not exist.";
+
+/// The modelled `InvalidOriginAccessControl` (HTTP 400) for a distribution configuration
+/// whose origin names an origin access control this account does not hold.
+///
+/// The sentence states the condition the configuration broke — the control it names is not
+/// one that can be resolved — which is a property of the store rather than of the request,
+/// so nothing from the request belongs in the text.
+pub fn invalid_origin_access_control() -> crate::ops::types::InvalidOriginAccessControl {
+    crate::ops::types::InvalidOriginAccessControl {
+        message: Some(INVALID_ORIGIN_ACCESS_CONTROL_MESSAGE.to_string()),
+    }
+}
+
+/// The message `InvalidOriginAccessControl` carries for an origin that names a control the
+/// store cannot resolve, on the wire.
+///
+/// The WIRE text — what the recorded service answers this code with, and what this
+/// emulator therefore serves. Like [`NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE`] it differs
+/// from the sentence the MODEL's documentation of the error shape uses for the same rule
+/// ("The origin access control is not valid."): that one documents the condition, this one
+/// is served. Do not "correct" this constant to the documentation sentence.
+pub const INVALID_ORIGIN_ACCESS_CONTROL_MESSAGE: &str =
+    "The specified origin access control does not exist or is not valid.";
 
 /// The sentence `OriginAccessControlAlreadyExists` carries, up to the control that
 /// already holds the submitted parameters, which it names at the end — the one piece of
