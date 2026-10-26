@@ -48,7 +48,12 @@
 //! * **Pagination.** Records are reported in store (insertion) order, so a page
 //!   boundary is stable. `nextToken` is opaque: a 128-bit fingerprint of the
 //!   SELECTION the token was issued over (the filter) followed by the offset to
-//!   resume at. `maxResults` is a per-call page-size hint and is deliberately NOT
+//!   resume at. The fingerprint names the selection and nothing else: the filters
+//!   are reduced to a set (so listing them in another order, or listing one of them
+//!   twice, resumes the same listing) and the fingerprinted encoding is
+//!   length-prefixed (so a `values` element carrying any character cannot make one
+//!   selection look like another). `maxResults` is a per-call page-size hint and is
+//!   deliberately NOT
 //!   part of the token's identity, so a caller may change it, or drop it, between
 //!   pages and still resume where the previous page stopped; a request that names
 //!   no `maxResults` is served at [`DEFAULT_PAGE_SIZE`], the largest page this
@@ -336,17 +341,41 @@ impl CompiledFilter {
     /// This filter's contribution to the query fingerprint. Values are sorted and
     /// de-duplicated because a filter tests set membership, so `[A, B]` and
     /// `[B, A, B]` are the same query.
+    ///
+    /// Every component is encoded through [`push_component`], so a value that
+    /// happens to contain a delimiter cannot be read as two components: the
+    /// encoding of a filter determines the filter.
     fn canonical(&self) -> String {
         let mut values: Vec<&str> = self.values.iter().map(String::as_str).collect();
         values.sort_unstable();
         values.dedup();
-        format!(
-            "{}:{}:{}",
-            self.key.as_str(),
-            self.match_option.as_str(),
-            values.join(",")
-        )
+        let mut canonical = String::new();
+        push_component(&mut canonical, self.key.as_str());
+        push_component(&mut canonical, self.match_option.as_str());
+        push_component(&mut canonical, &values.len().to_string());
+        for value in values {
+            push_component(&mut canonical, value);
+        }
+        canonical
     }
+}
+
+/// Append one component of a canonical encoding to `canonical`, length-prefixed
+/// as `<byte length>:<bytes>`.
+///
+/// The length prefix is what makes the encoding UNAMBIGUOUS, which is what a
+/// fingerprint of a selection needs: each component is read by the length that
+/// precedes it, never by scanning its bytes for a separator, so two encodings are
+/// equal only when their component lists are equal — whatever characters a
+/// component carries. The components fingerprinted here include `ActionFilter$values`
+/// elements, arbitrary caller-supplied strings (`FilterValue`, pattern `[\S\s]*`),
+/// so without the prefix one value carrying a separator would encode exactly like
+/// several components and two DIFFERENT selections would share a fingerprint,
+/// letting a token resume a listing whose records it never named.
+fn push_component(canonical: &mut String, component: &str) {
+    canonical.push_str(&component.len().to_string());
+    canonical.push(':');
+    canonical.push_str(component);
 }
 
 /// Validate the request's filters, refusing only what the model does not declare:
@@ -427,15 +456,28 @@ fn compile_filters(
 }
 
 /// The fingerprint of a listing's SELECTION: the filters (order-independent, since
-/// they are ANDed). A `nextToken` carries it so a token cannot resume a listing of a
-/// different selection, where the offset it names would land on an unrelated record.
+/// they are ANDed, and repetition-independent, since ANDing a filter with itself
+/// keeps the same records). A `nextToken` carries it so a token cannot resume a
+/// listing of a different selection, where the offset it names would land on an
+/// unrelated record.
+///
+/// Equal selections fingerprint equally and different ones do not: the filters are
+/// reduced to a SET (sorted, then de-duplicated) and every part of the encoding —
+/// each filter, and each component within it — is length-prefixed by
+/// [`push_component`], so no caller-supplied value can make one selection encode
+/// like another.
 ///
 /// `maxResults` is NOT part of it: a token names a position in the selection, and the
 /// page size is a per-call hint the caller may change or omit while paginating.
 fn query_fingerprint(filters: &[CompiledFilter]) -> String {
     let mut parts: Vec<String> = filters.iter().map(CompiledFilter::canonical).collect();
     parts.sort();
-    let canonical = format!("filters={}", parts.join("&"));
+    parts.dedup();
+    let mut canonical = String::from("filters=");
+    push_component(&mut canonical, &parts.len().to_string());
+    for part in &parts {
+        push_component(&mut canonical, part);
+    }
     let digest = hex::encode(sha2::Sha256::digest(canonical.as_bytes()));
     digest[..TOKEN_FINGERPRINT_LEN].to_string()
 }

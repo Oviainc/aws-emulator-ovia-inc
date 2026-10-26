@@ -45,7 +45,7 @@ fn seeded_at() -> SystemTime {
 }
 
 /// `POST /workspaces/{workspaceId}/logging`.
-async fn create_logging(
+pub(crate) async fn create_logging(
     amp: &Amp,
     region: &str,
     workspace_id: &str,
@@ -66,14 +66,14 @@ async fn create_logging(
 }
 
 /// `GET /workspaces/{workspaceId}/logging`.
-async fn describe_logging(amp: &Amp, region: &str, workspace_id: &str) -> Reply {
+pub(crate) async fn describe_logging(amp: &Amp, region: &str, workspace_id: &str) -> Reply {
     amp.call("GET", &format!("/workspaces/{workspace_id}/logging"), region, "")
         .await
 }
 
 /// `DELETE /workspaces/{workspaceId}/logging`, with the optional `clientToken` query
 /// member when one is given.
-async fn delete_logging(
+pub(crate) async fn delete_logging(
     amp: &Amp,
     region: &str,
     workspace_id: &str,

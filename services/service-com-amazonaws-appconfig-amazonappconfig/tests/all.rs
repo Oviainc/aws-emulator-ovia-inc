@@ -59,6 +59,8 @@ mod list_applications;
 mod list_configuration_profiles;
 #[path = "all/list_deployment_strategies.rs"]
 mod list_deployment_strategies;
+#[path = "all/list_deployments.rs"]
+mod list_deployments;
 #[path = "all/list_environments.rs"]
 mod list_environments;
 #[path = "all/list_experiment_run_events.rs"]

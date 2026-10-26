@@ -305,16 +305,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A cluster the clock still owes a transition, or one on its way out,
         // cannot take a new stream.
-        if !cluster.accepts_mutation() {
-            return Err(CreateStreamErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "cluster {} cannot take a stream while its status is {}",
-                    cluster.identifier, cluster.status
-                ),
-                resource_id: Some(cluster.identifier.clone()),
-                resource_type: Some("cluster".to_string()),
-            })
-            .into());
+        if let Some(conflict) = cluster.mutation_conflict("take a stream") {
+            return Err(CreateStreamErrorModeled::ConflictException(conflict).into());
         }
 
         // Each cluster's stream table is bounded for the same reason the cluster

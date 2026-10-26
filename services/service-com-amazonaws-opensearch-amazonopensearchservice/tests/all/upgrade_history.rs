@@ -13,7 +13,9 @@
 //! reported newest first, bounded to the last ten runs, in pages of at most
 //! `MaxResults` resumed by the token the previous page handed out. An upgrade moves
 //! the domain onto the version it names once the clock makes the run due; a check
-//! performs none; a target version the domain's current version cannot be upgraded to
+//! performs none — and so records no second run when it is repeated, which
+//! [`super::upgrade_eligibility_checks`] asserts; a target version the domain's
+//! current version cannot be upgraded to
 //! is refused, as is a second run started while one is still being performed, and a
 //! name the account holds no domain under has no history at all.
 //!
@@ -85,7 +87,12 @@ const SEQUENCE: [Run; 5] = [
 ];
 
 /// `UpgradeDomain`: `POST /2021-01-01/opensearch/upgradeDomain`.
-async fn upgrade(emulator: &Emulator, name: &str, target: &str, check_only: bool) -> Answer {
+pub(crate) async fn upgrade(
+    emulator: &Emulator,
+    name: &str,
+    target: &str,
+    check_only: bool,
+) -> Answer {
     emulator
         .call(
             "POST",
@@ -101,7 +108,7 @@ async fn upgrade(emulator: &Emulator, name: &str, target: &str, check_only: bool
 
 /// `GetUpgradeHistory`: `GET /2021-01-01/opensearch/upgradeDomain/{name}/history`,
 /// with `MaxResults` and `NextToken` as its `@httpQuery` members.
-async fn history(emulator: &Emulator, name: &str, query: &str) -> Answer {
+pub(crate) async fn history(emulator: &Emulator, name: &str, query: &str) -> Answer {
     let uri = if query.is_empty() {
         format!("{PREFIX}/opensearch/upgradeDomain/{name}/history")
     } else {
@@ -111,7 +118,7 @@ async fn history(emulator: &Emulator, name: &str, query: &str) -> Answer {
 }
 
 /// The `UpgradeHistories` of an accepted read.
-fn entries(answer: &Answer, case: &str) -> Vec<Value> {
+pub(crate) fn entries(answer: &Answer, case: &str) -> Vec<Value> {
     assert_eq!(
         answer.status, 200,
         "case {case}: expected HTTP 200, got {} with {:?}",
@@ -129,7 +136,7 @@ fn entries(answer: &Answer, case: &str) -> Vec<Value> {
 }
 
 /// The `UpgradeName` of every entry of a page, in the order the page reports them.
-fn names(page: &[Value]) -> Vec<String> {
+pub(crate) fn names(page: &[Value]) -> Vec<String> {
     page.iter()
         .map(|entry| entry["UpgradeName"].as_str().unwrap_or_default().to_owned())
         .collect()
@@ -138,7 +145,7 @@ fn names(page: &[Value]) -> Vec<String> {
 /// `UpgradeHistory$UpgradeName` for a run: "a string that describes the upgrade" —
 /// which versions it went between, and whether it performed the upgrade or only
 /// checked that it could.
-fn expected_name(source: &str, target: &str, check_only: bool) -> String {
+pub(crate) fn expected_name(source: &str, target: &str, check_only: bool) -> String {
     if check_only {
         format!("Upgrade eligibility check from {source} to {target}")
     } else {
@@ -175,7 +182,7 @@ fn steps(entry: &Value, case: &str) -> Vec<(String, String, f64)> {
 
 /// Create a domain on `engine_version` and let the provisioning span fall due, so the
 /// record is settled before anything upgrades it.
-async fn settled_domain(emulator: &Emulator, name: &str, engine_version: &str) {
+pub(crate) async fn settled_domain(emulator: &Emulator, name: &str, engine_version: &str) {
     let created = emulator
         .create(json!({ "DomainName": name, "EngineVersion": engine_version }))
         .await;

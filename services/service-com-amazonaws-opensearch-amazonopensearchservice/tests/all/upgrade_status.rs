@@ -38,7 +38,7 @@ use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFI
 const SEEDED_SPAN: Duration = Duration::from_secs(3600);
 
 /// `GetUpgradeStatus`: `GET /2021-01-01/opensearch/upgradeDomain/{DomainName}/status`.
-async fn status(emulator: &Emulator, name: &str) -> Answer {
+pub(crate) async fn status(emulator: &Emulator, name: &str) -> Answer {
     emulator
         .call(
             "GET",

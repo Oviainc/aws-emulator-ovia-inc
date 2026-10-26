@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateExpressGatewayService
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateExpressGatewayService`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateExpressGatewayService::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an EXPRESS service in a cluster and reports it. The stored record holds the
+//! service and the ONE configuration its first deployment rolls out — the operation's
+//! own doc: "Creates an Express service that simplifies deploying containerized web
+//! applications on Amazon ECS with managed Amazon Web Services infrastructure". Every
+//! member the request leaves out takes the value AWS documents as its default, so
+//! `DescribeExpressGatewayService` reads back exactly what this call stored. The service
+//! is ACTIVE with one active configuration: `ExpressGatewayServiceStatusCode` names no
+//! provisioning state, and nothing is being replaced yet.
 //!
 //! ## Shape of an operation
 //!
@@ -246,17 +245,208 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateExpressGatewayService` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateExpressGatewayServiceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateExpressGatewayService"))
+        // request metadata.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateExpressGatewayServiceErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // The configuration members this call shares with `UpdateExpressGatewayService`:
+        // both render ONE service revision out of them, so the defaults and the
+        // exclusivity rule come from the same place for both.
+        let requested = crate::state::ExpressGatewayConfigurationRequest {
+            execution_role_arn: input.execution_role_arn.clone(),
+            task_role_arn: input.task_role_arn.clone(),
+            task_definition_arn: input.task_definition_arn.clone(),
+            cpu: input.cpu.clone(),
+            memory: input.memory.clone(),
+            cpu_architecture: input.cpu_architecture.clone(),
+            network_configuration: input.network_configuration.clone(),
+            health_check_path: input.health_check_path.clone(),
+            primary_container: input.primary_container.clone(),
+            scaling_target: input.scaling_target.clone(),
+        };
+
+        // "If you provide a task definition ARN, you cannot also specify
+        // primaryContainer, executionRoleArn, taskRoleArn, cpu, memory, or
+        // cpuArchitecture."
+        if let Some(message) = requested.task_definition_conflict() {
+            return Err(
+                CreateExpressGatewayServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A revision runs EITHER the container this service renders a task definition for
+        // ("The primary container must specify at minimum a container image") or a task
+        // definition the caller manages; a request that names neither says nothing to run.
+        if input.primary_container.is_none() && input.task_definition_arn.is_none() {
+            return Err(
+                CreateExpressGatewayServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            "either primaryContainer or taskDefinitionArn must be specified"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The health check path must start with a forward slash and can include query
+        // parameters."
+        if let Some(path) = input
+            .health_check_path
+            .as_deref()
+            .filter(|path| !path.starts_with('/'))
+        {
+            return Err(
+                CreateExpressGatewayServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::express_health_check_path_message(path)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "This name must be unique within the specified cluster and can contain up to
+        // 255 letters (uppercase and lowercase), numbers, underscores, and hyphens."
+        if let Some(name) = input
+            .service_name
+            .as_deref()
+            .filter(|name| !crate::state::is_valid_name(name))
+        {
+            return Err(
+                CreateExpressGatewayServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::name_pattern_message("Service name", name)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A caller-supplied tag may not write into the namespace Amazon Web Services keeps
+        // for its own tags, whichever operation carries the `tags` list.
+        if let Some(message) =
+            crate::state::reserved_tag_prefix_violation(input.tags.as_deref().unwrap_or_default())
+        {
+            return Err(
+                CreateExpressGatewayServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "If you do not specify a cluster, the default cluster is assumed."
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        guard.advance_clock(now);
+
+        // The account holds the DEFAULT cluster without anybody creating it, whether the
+        // request names it or assumes it ("If you do not specify a cluster, the default
+        // cluster is assumed").
+        if cluster_name == crate::state::DEFAULT_CLUSTER_NAME {
+            guard.ensure_default_cluster(&region);
+        }
+
+        let Some(cluster) = guard.active_cluster(&cluster_name) else {
+            return Err(
+                CreateExpressGatewayServiceErrorModeled::ClusterNotFoundException(
+                    ClusterNotFoundException {
+                        message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let cluster_arn = cluster.arn.clone();
+
+        // "If you don't specify a service name, Amazon ECS generates a unique name for
+        // the service."
+        let name = match input.service_name.clone() {
+            Some(name) => name,
+            None => guard.next_express_gateway_service_name(),
+        };
+        let key = (cluster_name.clone(), name.clone());
+
+        // "This name must be unique within the specified cluster" — against every service
+        // the cluster holds, Express or not, since one name there names one service.
+        let taken = guard.express_gateway_services.contains_key(&key)
+            || guard
+                .services
+                .get(&key)
+                .is_some_and(crate::state::ServiceRecord::is_active);
+        if taken {
+            return Err(
+                CreateExpressGatewayServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::service_name_taken_message(
+                            &name,
+                            &cluster_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if guard.express_gateway_services.len() >= crate::state::MAX_SERVICES {
+            return Err(CreateExpressGatewayServiceErrorModeled::ClientException(
+                ClientException {
+                    message: Some(format!(
+                        "this emulator holds at most {} Express services; delete one \
+                         before creating another",
+                        crate::state::MAX_SERVICES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let created_at = crate::state::now();
+        // The deployment that rolls the first revision out, and the revision it rolls
+        // out, are minted with the service.
+        let current_deployment = guard.next_deployment_id();
+        let service_revision_arn = guard.next_service_revision_arn(&region, &cluster_name, &name);
+        let record = crate::state::ExpressGatewayServiceRecord {
+            arn: crate::state::service_arn(&region, &cluster_name, &name),
+            name: name.clone(),
+            cluster_name: cluster_name.clone(),
+            cluster_arn,
+            infrastructure_role_arn: input.infrastructure_role_arn.clone(),
+            status_code: crate::state::EXPRESS_GATEWAY_ACTIVE.to_string(),
+            configurations: vec![requested.resolve(None, service_revision_arn, created_at)],
+            current_deployment,
+            tags: input.tags.clone().unwrap_or_default(),
+            created_at,
+            updated_at: created_at,
+            // Nothing is being replaced, and nothing is draining.
+            rollout_due_at: None,
+            removal_due_at: None,
+        };
+        // Inserted and reported back through the store, so the response is the stored
+        // record rather than the request that produced it.
+        let stored = guard
+            .express_gateway_services
+            .entry(key)
+            .or_insert(record);
+        // `CreateExpressGatewayService` has no `include` member to narrow the response
+        // with, so the service it just created is reported with the tags it carries.
+        Ok(CreateExpressGatewayServiceOutput {
+            service: Some(stored.view(true)),
+        })
     }
 }

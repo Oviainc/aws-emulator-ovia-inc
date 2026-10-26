@@ -27,6 +27,13 @@
 //! (HTTP 412) otherwise — including when the registry holds no policy at all, which is
 //! no revision. A request without `RevisionId` states no precondition and overwrites.
 //!
+//! ## Who may attach one
+//!
+//! Attaching a policy is a WRITE to the registry, so the registries a caller may write
+//! to are the ones it owns: a service-owned registry's contents are AWS's, so this call
+//! is refused with `ForbiddenException` (HTTP 403) for one, exactly as every other write
+//! to a service-owned registry is.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -241,14 +248,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
 
         // A policy attaches to a registry, so there has to be one to attach it to.
-        let current_revision = state
-            .registries
-            .get(&registry_name)
-            .ok_or_else(|| {
-                PutResourcePolicyError::from(PutResourcePolicyErrorModeled::NotFoundException(
-                    crate::state::registry_not_found(&registry_name),
-                ))
-            })?
+        let held = state.registries.get(&registry_name).ok_or_else(|| {
+            PutResourcePolicyError::from(PutResourcePolicyErrorModeled::NotFoundException(
+                crate::state::registry_not_found(&registry_name),
+            ))
+        })?;
+
+        // A service-owned registry is AWS's, not the caller's, so what governs access
+        // to it is not a caller's to write — the same refusal every other write to one
+        // gets.
+        if held.scope.is_managed() {
+            return Err(PutResourcePolicyErrorModeled::ForbiddenException(
+                crate::state::managed_registry_is_read_only(&registry_name),
+            )
+            .into());
+        }
+
+        let current_revision = held
             .policy
             .as_ref()
             .map(|policy| policy.revision_id.clone());

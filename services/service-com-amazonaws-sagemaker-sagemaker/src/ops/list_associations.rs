@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: a pure READ over the lineage edges `AddAssociation` recorded in
+//! `crate::state`, narrowed by the request's filters, sorted and paged. This is the ONLY
+//! file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The SCAFFOLDED marker line this file used to carry is gone, because the stub census
+//! (the grep over those lines) must not count this operation as unwritten any more.
 //!
 //! ## Shape of an operation
 //!
@@ -147,6 +144,39 @@ impl<Eng> ListAssociations<Eng> {
     }
 }
 
+/// `MaxResults`' documented default for this operation ("The maximum number of
+/// associations to return in the response. The default value is 10."), applied when the
+/// caller sends none. An explicit `MaxResults` is still capped by
+/// [`crate::state::MAX_PAGE_SIZE`].
+///
+/// `SortBy`'s and `SortOrder`'s documented defaults are [`crate::state::DEFAULT_SORT_BY`]
+/// and [`crate::state::DEFAULT_SORT_ORDER`] ("The property used to sort results. The
+/// default value is CreationTime." / "The sort order. The default value is Descending."),
+/// shared with the service's other listings; the accepted value sets are the generated
+/// `*_VALUES` slices in `super::types`, so a refusal stays in step with the model rather
+/// than with a transcription of it.
+const DEFAULT_MAX_RESULTS: i32 = 10;
+
+/// The members of `SortAssociationsBy` other than the default, named once so the sort
+/// below selects its key by a constant rather than by a bare literal. The accepted SET is
+/// still the generated `SORT_ASSOCIATIONS_BY_VALUES`.
+const SORT_BY_SOURCE_ARN: &str = "SourceArn";
+/// See [`SORT_BY_SOURCE_ARN`].
+const SORT_BY_DESTINATION_ARN: &str = "DestinationArn";
+/// See [`SORT_BY_SOURCE_ARN`].
+const SORT_BY_SOURCE_TYPE: &str = "SourceType";
+/// See [`SORT_BY_SOURCE_ARN`].
+const SORT_BY_DESTINATION_TYPE: &str = "DestinationType";
+
+/// One association as this listing reports it: the stored edge plus what each of its ends
+/// resolves to right now, so the type and name members are computed ONCE per edge and the
+/// filters, the sort and the response all read the same values.
+struct ResolvedAssociation {
+    stored: crate::state::Association,
+    source: crate::state::LineageEntityEnd,
+    destination: crate::state::LineageEntityEnd,
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListAssociations<Eng>
 {
@@ -164,18 +194,197 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssociations"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `SortBy`, `SortOrder` and the `AssociationType` filter each select exactly one
+        // member of a modelled enum, which the boundary validator does not enforce, so
+        // anything else is refused here rather than silently ignored. The accepted sets
+        // are the generated `*_VALUES` slices, so each refusal stays in step with the
+        // model rather than with a transcription of it.
+        let sort_by = input
+            .sort_by
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_BY);
+        if !SORT_ASSOCIATIONS_BY_VALUES.contains(&sort_by) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortBy must be one of {}; got \"{sort_by}\".",
+                SORT_ASSOCIATIONS_BY_VALUES.join(", ")
+            )));
+        }
+        let sort_order = input
+            .sort_order
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_ORDER);
+        if !SORT_ORDER_VALUES.contains(&sort_order) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortOrder must be one of {}; got \"{sort_order}\".",
+                SORT_ORDER_VALUES.join(", ")
+            )));
+        }
+        let descending = sort_order == crate::state::ORDER_DESCENDING;
+        if let Some(association_type) = input.association_type.as_deref() {
+            if !ASSOCIATION_EDGE_TYPE_VALUES.contains(&association_type) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "AssociationType must be one of {}; got \"{association_type}\".",
+                    ASSOCIATION_EDGE_TYPE_VALUES.join(", ")
+                )));
+            }
+        }
+
+        let after = input.created_after.map(crate::state::timestamp_key);
+        let before = input.created_before.map(crate::state::timestamp_key);
+        // A lineage entity is a REGIONAL resource — its ARN names the Region it was
+        // created in — so a listing reports the edges between the entities of the Region
+        // this request signed for and never one whose ends name another.
+        let region = crate::state::request_region(ctx);
+
+        let store = state.lock();
+        let mut matching: Vec<ResolvedAssociation> = store
+            .associations
+            .values()
+            .filter(|association| association.in_region(&region))
+            // An end's type and name are properties of the ENTITY, not of the edge: the
+            // edge records the two ARNs and nothing else, so both are read back out of
+            // the entity each ARN names. An end whose entity is no longer stored resolves
+            // to neither, so those members stay absent rather than reporting a type or a
+            // name the account no longer holds.
+            .map(|association| ResolvedAssociation {
+                stored: association.clone(),
+                source: store
+                    .lineage_entity_end(&region, &association.source_arn)
+                    .unwrap_or_default(),
+                destination: store
+                    .lineage_entity_end(&region, &association.destination_arn)
+                    .unwrap_or_default(),
+            })
+            .filter(|resolved| {
+                // Every filter is documented as returning only the associations WITH the
+                // specified value, so each is an equality test on the member it names
+                // rather than a substring or prefix match, and an absent filter selects
+                // everything.
+                input
+                    .source_arn
+                    .as_deref()
+                    .is_none_or(|wanted| resolved.stored.source_arn == wanted)
+                    && input
+                        .destination_arn
+                        .as_deref()
+                        .is_none_or(|wanted| resolved.stored.destination_arn == wanted)
+                    && input
+                        .source_type
+                        .as_deref()
+                        .is_none_or(|wanted| resolved.source.entity_type.as_deref() == Some(wanted))
+                    && input.destination_type.as_deref().is_none_or(|wanted| {
+                        resolved.destination.entity_type.as_deref() == Some(wanted)
+                    })
+                    && input.association_type.as_deref().is_none_or(|wanted| {
+                        resolved.stored.association_type.as_deref() == Some(wanted)
+                    })
+            })
+            .filter(|resolved| {
+                // "created on or after" / "created on or before": both bounds are
+                // inclusive, so a timestamp copied straight out of a prior response's
+                // `CreationTime` still selects that association.
+                let created = crate::state::timestamp_key(crate::state::timestamp(
+                    resolved.stored.creation_time,
+                ));
+                after.is_none_or(|bound| created >= bound)
+                    && before.is_none_or(|bound| created <= bound)
+            })
+            .collect();
+
+        // `SortOrder` reverses whichever key `SortBy` names. The tie-break stays the
+        // `(SourceArn, DestinationArn)` pair ascending in both directions — that pair is
+        // an association's whole identity, and the one key every edge has a value for —
+        // so two edges sharing a sort key keep one order whichever way the page is sorted
+        // and a `NextToken` resolved against a freshly computed result set lands on the
+        // same boundary. An end that resolves to no type sorts before every type, the
+        // order `Option` gives.
+        matching.sort_by(|left, right| {
+            let by_key = match sort_by {
+                SORT_BY_SOURCE_ARN => left.stored.source_arn.cmp(&right.stored.source_arn),
+                SORT_BY_DESTINATION_ARN => left
+                    .stored
+                    .destination_arn
+                    .cmp(&right.stored.destination_arn),
+                SORT_BY_SOURCE_TYPE => left.source.entity_type.cmp(&right.source.entity_type),
+                SORT_BY_DESTINATION_TYPE => left
+                    .destination
+                    .entity_type
+                    .cmp(&right.destination.entity_type),
+                // `CreationTime`: this operation's documented default, and the one
+                // remaining member of the modelled enum.
+                _ => {
+                    crate::state::timestamp_key(crate::state::timestamp(left.stored.creation_time))
+                        .cmp(&crate::state::timestamp_key(crate::state::timestamp(
+                            right.stored.creation_time,
+                        )))
+                }
+            };
+            let by_key = if descending { by_key.reverse() } else { by_key };
+            by_key.then_with(|| left.stored.key().cmp(&right.stored.key()))
+        });
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = crate::state::decode_page_token(token)
+                    .and_then(|key| {
+                        matching
+                            .iter()
+                            .position(|resolved| resolved.stored.key() == key)
+                    })
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::validation(crate::state::STALE_PAGE_TOKEN)
+                    })?;
+                resumed_after + 1
+            }
+        };
+
+        // An absent `MaxResults` takes this operation's documented default of 10; an
+        // explicit one is capped by the service's own ceiling, so no single call can
+        // serialise the whole store. The token below is emitted whenever anything is
+        // left, so a paginating client walks the full result set exactly once either way.
+        let start = start.min(matching.len());
+        let page_size = input
+            .max_results
+            .map_or(DEFAULT_MAX_RESULTS, |max| {
+                max.clamp(1, crate::state::MAX_PAGE_SIZE)
+            })
+            .unsigned_abs() as usize;
+        let end = start.saturating_add(page_size).min(matching.len());
+        let page = &matching[start..end];
+
+        let next_token = match page.last() {
+            // A token only where a further page exists, so a paginating client stops.
+            Some(last) if end < matching.len() => {
+                Some(crate::state::encode_page_token(&last.stored.key()))
+            }
+            _ => None,
+        };
+
+        Ok(ListAssociationsOutput {
+            // The member is always present, the empty list included: a listing that
+            // selects nothing answers an empty list rather than omitting the member.
+            association_summaries: Some(
+                page.iter()
+                    .map(|resolved| AssociationSummary {
+                        source_arn: Some(resolved.stored.source_arn.clone()),
+                        destination_arn: Some(resolved.stored.destination_arn.clone()),
+                        source_type: resolved.source.entity_type.clone(),
+                        destination_type: resolved.destination.entity_type.clone(),
+                        // Replayed as stored, so an edge added without an
+                        // `AssociationType` reports none rather than a default.
+                        association_type: resolved.stored.association_type.clone(),
+                        source_name: resolved.source.name.clone(),
+                        destination_name: resolved.destination.name.clone(),
+                        creation_time: Some(crate::state::timestamp(resolved.stored.creation_time)),
+                        created_by: Some(resolved.stored.created_by.clone()),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

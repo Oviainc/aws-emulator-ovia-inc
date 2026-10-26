@@ -6,12 +6,6 @@
 //! far behind the tip of the shard the page is. This is the ONLY file to touch for this
 //! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRecords::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -314,7 +308,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `StreamId` is documented "Not Implemented. Reserved for future use", so no stream
         // carries one and a request naming only that member names no stream.
         let stream = store
-            .stream_by_arn(&region, &token.stream_arn)
+            .stream_by_arn(now, &region, &token.stream_arn)
             .filter(|stream| token.names(stream))
             .ok_or_else(|| not_found(crate::state::stream_not_found_message(&token.stream_arn)))?;
         // The iterator already names the stream, so a `StreamARN` beside it has to name the

@@ -35,3 +35,5 @@ mod tag_write_last_modified_stamp;
 mod tagging_frontend_errors;
 #[path = "all/update_investigation_group_identifier.rs"]
 mod update_investigation_group_identifier;
+#[path = "all/write_configuration_rejection_chain.rs"]
+mod write_configuration_rejection_chain;

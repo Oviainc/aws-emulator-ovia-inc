@@ -530,6 +530,28 @@ pub struct ResourcePolicyRecord {
     /// [`AppMonitorRecord::store_resource_policy`], so no two revisions of one monitor's
     /// policy can share a number.
     pub revision: u64,
+    /// Whether a revision id has been ASSIGNED to this policy by a caller, i.e. whether
+    /// some accepted write of it provided a `PolicyRevisionId`.
+    ///
+    /// `PutResourcePolicyRequest$PolicyRevisionId` makes that assignment STICKY: "When
+    /// you assign a policy revision ID, then later requests about that policy will be
+    /// rejected with an InvalidPolicyRevisionIdException error if they don't provide the
+    /// correct current revision ID" — so once this is true a put must carry the current
+    /// revision id, and one that carries none is refused rather than overwriting the
+    /// policy ([`AppMonitorRecord::policy_revision_refusal_on_current`]).
+    ///
+    /// It is the CALLER's assignment the member names, which is why this is tracked at
+    /// all rather than read off the mere existence of a revision: the service mints a
+    /// revision number for every write ([`Self::revision`]), and a caller that has never
+    /// provided one goes on replacing its policy with a put that provides none, each
+    /// write answering the next revision number.
+    ///
+    /// It is carried from revision to revision by
+    /// [`AppMonitorRecord::store_resource_policy`], because the assignment is about the
+    /// POLICY and not about the one write that made it; it goes away with the policy
+    /// itself, since a monitor that carries none has no current revision id for a
+    /// request to provide.
+    pub revision_assigned: bool,
 }
 
 impl ResourcePolicyRecord {
@@ -809,8 +831,18 @@ impl AppMonitorRecord {
             .map(ResourcePolicyRecord::revision_id)
     }
 
+    /// Whether a revision id has been ASSIGNED to the policy this monitor currently
+    /// carries — see [`ResourcePolicyRecord::revision_assigned`]. False while the monitor
+    /// carries no policy: there is then no current revision id for a request to provide.
+    pub fn policy_revision_assigned(&self) -> bool {
+        self.resource_policy
+            .as_ref()
+            .is_some_and(|policy| policy.revision_assigned)
+    }
+
     /// Store `document` as this monitor's resource policy, as the NEXT revision of it,
-    /// and report the record just written.
+    /// and report the record just written. `provided_revision_id` is the
+    /// `PolicyRevisionId` the accepted request carried, if any.
     ///
     /// The ONE writer of [`Self::resource_policy`] and of [`Self::policy_revisions`], so
     /// every accepted `PutResourcePolicy` advances the revision by exactly one: the first
@@ -818,28 +850,66 @@ impl AppMonitorRecord {
     /// and so on. The document is stored in its canonical form
     /// ([`canonical_policy_document`]): its content, with the caller's insignificant
     /// whitespace dropped.
-    pub fn store_resource_policy(&mut self, document: &str) -> &ResourcePolicyRecord {
+    ///
+    /// A write that provided a revision id ASSIGNS one to the policy, and the assignment
+    /// outlives that write: the new revision inherits it from the revision it replaces,
+    /// so a caller that once made a conditional write keeps the protection the member
+    /// documents for every later revision of the same policy.
+    pub fn store_resource_policy(
+        &mut self,
+        document: &str,
+        provided_revision_id: Option<&str>,
+    ) -> &ResourcePolicyRecord {
         self.policy_revisions = self.policy_revisions.saturating_add(1);
         let stored = ResourcePolicyRecord {
             document: canonical_policy_document(document),
             revision: self.policy_revisions,
+            revision_assigned: provided_revision_id.is_some() || self.policy_revision_assigned(),
         };
         self.resource_policy.insert(stored)
     }
 
-    /// Why a request carrying `provided` as its `PolicyRevisionId` cannot act on this
-    /// monitor's policy, or `None` when it can.
+    /// Why a request that must PROVIDE the correct current `PolicyRevisionId` cannot act
+    /// on this monitor's policy, or `None` when it can.
     ///
-    /// From the model (`PutResourcePolicyRequest$PolicyRevisionId`): "You can provide the
-    /// revision ID of your existing policy to make mutating requests against that policy
-    /// … later requests about that policy will be rejected with an
-    /// InvalidPolicyRevisionIdException error if they don't provide the correct current
-    /// revision ID." So a request that names a revision id is CONDITIONAL on it being
-    /// the current one — including when there is no policy at all, where no id can be the
-    /// current one — and a request that names none is unconditional. Shared by
-    /// `PutResourcePolicy` and `DeleteResourcePolicy`, which the model gives the same
-    /// member and the same error.
-    pub fn policy_revision_refusal(
+    /// The rule `PutResourcePolicyRequest$PolicyRevisionId` states: "You can provide the
+    /// revision ID of your existing policy to make mutating requests against that
+    /// policy. When you assign a policy revision ID, then later requests about that
+    /// policy will be rejected with an InvalidPolicyRevisionIdException error if they
+    /// don't provide the correct current revision ID." The refusal is conditioned on the
+    /// request not providing the CORRECT CURRENT id, so once a revision id has been
+    /// assigned ([`Self::policy_revision_assigned`]) a request that provides none is
+    /// refused exactly like one that provides a stale one: omitting the member is not a
+    /// way around the condition, which is what makes the read-revision-then-write loop
+    /// safe against a stale retry or a second writer.
+    ///
+    /// Until an id has been assigned a request may still name one, and is then
+    /// conditional on it being the current one — including when there is no policy at
+    /// all, where no id can be current.
+    pub fn policy_revision_refusal_on_current(
+        &self,
+        provided: Option<&str>,
+    ) -> Option<InvalidPolicyRevisionIdException> {
+        match provided {
+            Some(provided) => (self.policy_revision_id().as_deref() != Some(provided))
+                .then(|| policy_revision_mismatch(provided)),
+            None => self
+                .policy_revision_assigned()
+                .then(policy_revision_not_provided),
+        }
+    }
+
+    /// Why the `PolicyRevisionId` a request PROVIDES stops it acting on this monitor's
+    /// policy, or `None` when it does not.
+    ///
+    /// The weaker of the two conditional rules, and the one
+    /// `DeleteResourcePolicyRequest$PolicyRevisionId` states: "Provide a
+    /// PolicyRevisionId to ensure an atomic delete operation. If the revision ID that you
+    /// provide doesn't match the latest policy revision ID, the request will be rejected
+    /// …". The refusal is conditioned on the id the request PROVIDES, so a request that
+    /// provides none asks for no atomicity and is unconditional, whatever the policy's
+    /// history.
+    pub fn policy_revision_refusal_on_provided(
         &self,
         provided: Option<&str>,
     ) -> Option<InvalidPolicyRevisionIdException> {
@@ -2004,6 +2074,28 @@ pub fn policy_revision_mismatch(provided: &str) -> InvalidPolicyRevisionIdExcept
         ),
     }
 }
+
+/// `InvalidPolicyRevisionIdException` for a request that had to provide the stored
+/// policy's current `PolicyRevisionId` and provided none at all.
+///
+/// The same error class as [`policy_revision_mismatch`] — the request did not provide the
+/// correct current revision id — so it is the error's own documented sentence ("The policy
+/// revision ID that you provided … match the latest policy revision ID") with no id to
+/// name, because the request carried none. The model's sentence contracts the verb; the
+/// wording here keeps the "does not match" voice of the recorded sibling message above, so
+/// two refusals of one class do not read differently. No recording of this case is
+/// available, so the exact service wording for a request that carries no id is not
+/// verified against one.
+pub fn policy_revision_not_provided() -> InvalidPolicyRevisionIdException {
+    InvalidPolicyRevisionIdException {
+        message: POLICY_REVISION_NOT_PROVIDED_MESSAGE.to_string(),
+    }
+}
+
+/// The wording of [`policy_revision_not_provided`], which a caller of the conditional
+/// put sees when it omits `PolicyRevisionId` after one has been assigned.
+pub const POLICY_REVISION_NOT_PROVIDED_MESSAGE: &str =
+    "The policy revision ID that you provided does not match the latest policy revision ID.";
 
 /// `ConflictException` for a create whose `Name` a stored app monitor already holds.
 ///
