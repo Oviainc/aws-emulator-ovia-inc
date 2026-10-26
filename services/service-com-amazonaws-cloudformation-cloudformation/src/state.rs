@@ -69,7 +69,8 @@
 //! [`stack_sets::MAX_INSTANCES_PER_STACK_SET`] stack instances each (both oldest-first),
 //! [`handler_progress::MAX_HANDLER_INVOCATIONS`] resource-handler invocations with a
 //! progress record (oldest-first),
-//! and [`resource_scans::MAX_RESOURCE_SCANS`] recorded resource scans (oldest-first).
+//! and [`resource_scans::MAX_RESOURCE_SCANS`] recorded resource scans (oldest-first), each
+//! one carrying the resources this store already holds and so bounded by the ceilings above.
 //!
 //! Reading a stack's template body and evaluating what it declares is bounded by the
 //! [`template`] module's own caps (nodes, depth, the documented per-template quotas and
@@ -3146,6 +3147,77 @@ impl ComAmazonawsCloudformationCloudformationState {
             .count()
     }
 
+    /// The resource scan `resource_scan_id` addresses in the request's Region, if this store
+    /// holds it: a scan is addressed by its own ARN, and nothing outside that Region is
+    /// addressable.
+    pub fn resolve_resource_scan(
+        &self,
+        region: &str,
+        resource_scan_id: &str,
+    ) -> Option<&resource_scans::StoredResourceScan> {
+        self.resource_scans
+            .iter()
+            .find(|scan| scan.is_addressed_by(region, resource_scan_id))
+    }
+
+    /// The scan of one Region that is still running, if any: the set the modelled
+    /// `ResourceScanInProgressException` meters, since "only one can be run at a time for an
+    /// account in a Region".
+    ///
+    /// Read off the stored statuses, so it is accurate only once [`Self::settle`] has retired
+    /// the scans the clock already concluded; every caller settles first.
+    pub fn resource_scan_in_flight(
+        &self,
+        region: &str,
+    ) -> Option<&resource_scans::StoredResourceScan> {
+        self.resource_scans
+            .iter()
+            .find(|scan| scan.region == region && scan.is_in_flight())
+    }
+
+    /// The RUNNING scan of one Region a retry under `client_request_token` addresses: the
+    /// token is "a unique identifier for this StartResourceScan request", so a retry while the
+    /// scan it started is still running means that scan rather than a second one.
+    ///
+    /// Scoped to the scan still in flight: once it has concluded there is no request in flight
+    /// to be retrying, so the same token starts the next scan instead of answering an old
+    /// scan's id forever.
+    pub fn resource_scan_by_token(
+        &self,
+        region: &str,
+        client_request_token: &str,
+    ) -> Option<&resource_scans::StoredResourceScan> {
+        self.resource_scans.iter().find(|scan| {
+            scan.region == region
+                && scan.is_in_flight()
+                && scan.client_request_token.as_deref() == Some(client_request_token)
+        })
+    }
+
+    /// The resources of this account and Region a scan READS: every resource of every live
+    /// stack of that Region that still exists, in stack order and then in the order the
+    /// stack's template declared them, so a scan's rows are deterministic.
+    ///
+    /// A record a deployment left at `DELETE_COMPLETE` is left out: the stack goes on naming
+    /// what became of that resource, while nothing of it exists to be found by a scan — the
+    /// same set [`Self::current_resource_count`] counts as occupied.
+    pub fn scannable_resources(&self, region: &str) -> Vec<resource_scans::FoundResource> {
+        self.live_stacks(region)
+            .flat_map(|stack| {
+                stack
+                    .resources
+                    .iter()
+                    .filter(|deployed| deployed.status != resource_status::DELETE_COMPLETE)
+                    .map(|deployed| resource_scans::FoundResource {
+                        resource_type: deployed.resource.resource_type.clone(),
+                        physical_resource_id: deployed.resource.physical_resource_id.clone(),
+                        logical_resource_id: deployed.resource.logical_id.clone(),
+                        stack_id: stack.stack_id.clone(),
+                    })
+            })
+            .collect()
+    }
+
     /// Materialise every drift-detection STATUS whose due instant has passed.
     ///
     /// What the clock owes here is the detection operation's own status: AWS answers
@@ -4094,6 +4166,15 @@ pub fn new_generated_template_id(region: &str, generated_template_name: &str) ->
             new_identifier(generated_template_name)
         ),
     )
+}
+
+/// Mint a resource scan's id, which is its ARN: `ResourceScanId` is "the Amazon Resource Name
+/// (ARN) of the resource scan. The format is
+/// `arn:${Partition}:cloudformation:${Region}:${Account}:resourceScan/${Id}`" — the same
+/// 8-4-4-4-12 id every other identifier this service mints carries, in the ARN form
+/// [`resource_scans::resource_scan_arn`] builds.
+pub fn new_resource_scan_id(region: &str) -> String {
+    resource_scans::resource_scan_arn(region, &new_identifier("resource-scan"))
 }
 
 /// The message CloudFormation answers when a request names a change set that is not

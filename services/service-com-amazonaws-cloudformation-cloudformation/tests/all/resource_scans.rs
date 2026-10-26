@@ -15,12 +15,13 @@
 //! still running, start instants deliberately out of the order the records were written in,
 //! and two Regions — so a row's expected ids distinguish each selection from every other.
 //!
-//! The store's WRITER is `StartResourceScan`, which is still a scaffold stub with an issue
-//! of its own (`cloudformation|StartResourceScan|NotImplemented`), so the records below are
-//! seeded through the store's one writing entry point (`record_resource_scan`) — the same
-//! device `hook_result_invocations.rs` and `extension_registry.rs` use for records whose
-//! wire writer is not available. Every READ goes through the real request path (form-encoded
-//! body in, XML envelope out), so what is asserted is what a client sees.
+//! The store's WRITER is `StartResourceScan`, whose own suite drives it over the wire
+//! (`resource_scan_lifecycle.rs`); the records below are seeded through the store's one
+//! writing entry point (`record_resource_scan`) — the same device
+//! `hook_result_invocations.rs` and `extension_registry.rs` use — because the statuses and
+//! start instants these rows span are ones no bound's worth of wire calls could produce.
+//! Every READ goes through the real request path (form-encoded body in, XML envelope out),
+//! so what is asserted is what a client sees.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -82,6 +83,10 @@ fn finished(
         end_time: Some(at(ended)),
         percentage_completed: Some(percentage),
         pending: None,
+        client_request_token: None,
+        scan_filters: Vec::new(),
+        resources_read: 0,
+        resources: Vec::new(),
     }
 }
 
@@ -101,6 +106,10 @@ fn seeded_scans() -> Vec<StoredResourceScan> {
         end_time: None,
         percentage_completed: Some(PERCENTAGE_STARTED),
         pending: None,
+        client_request_token: None,
+        scan_filters: Vec::new(),
+        resources_read: 0,
+        resources: Vec::new(),
     };
 
     vec![
@@ -459,6 +468,10 @@ async fn a_scan_whose_outcome_is_not_due_yet_keeps_the_status_it_holds() {
                 percentage_completed: 10.0,
                 due_at: SystemTime::now() + Duration::from_secs(3_600),
             }),
+            client_request_token: None,
+            scan_filters: Vec::new(),
+            resources_read: 0,
+            resources: Vec::new(),
         });
     }
 
