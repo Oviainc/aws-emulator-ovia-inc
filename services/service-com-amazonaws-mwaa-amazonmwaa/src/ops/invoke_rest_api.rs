@@ -6,9 +6,10 @@
 //! names, over that environment's own Apache Airflow metadata
 //! ([`crate::state::AirflowMetadata`]), and reports what that API answered: the HTTP
 //! status in `RestApiStatusCode` and the JSON document in `RestApiResponse`. A name that
-//! resolves to nothing is refused with HTTP 404 by the environment-scoped data endpoint
-//! that fronts this operation (`@endpoint` host prefix `env.`), whose wording and payload
-//! shape live in [`crate::service::env_endpoint`].
+//! resolves to nothing is refused with HTTP 404 and this operation's modelled
+//! `ResourceNotFoundException`, worded by the environment-scoped data endpoint that fronts
+//! it (`@endpoint` host prefix `env.`):
+//! [`crate::state::ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE`].
 //!
 //! `Method`, `Path`, `QueryParameters` and `Body` are all acted on: the path selects the
 //! Apache Airflow resource, the method what is done to it, the query parameters page a
@@ -220,9 +221,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // This operation is served through the environment data endpoint's proxy
         // (`@endpoint` host prefix `env.`), so the refusal is that endpoint's: HTTP 404 with
         // the modeled `ResourceNotFoundException` code, and the endpoint's own fixed
-        // wording, which names no environment. `crate::service::env_endpoint` then carries
-        // it as the endpoint's document payload instead of as a serialized exception
-        // object.
+        // wording, which names no environment. It travels in the modelled exception the
+        // framework serializes, like every other refusal of this service, so an SDK's error
+        // parser reads both the code and the message out of it.
         let Some(environment) = store.environment_mut(&region, &input.name) else {
             return Err(InvokeRestApiErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

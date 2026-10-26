@@ -431,8 +431,8 @@ async fn a_name_addressed_operation_resolves_nothing_outside_the_environments_re
                 );
             }
 
-            // The proxied operation refuses the same lookup through the data endpoint's
-            // document payload (its body's root is a JSON string, not an exception object).
+            // The proxied operation refuses the same lookup with the same modelled
+            // exception, worded by the data endpoint's front door.
             let proxied = harness
                 .send(
                     caller,

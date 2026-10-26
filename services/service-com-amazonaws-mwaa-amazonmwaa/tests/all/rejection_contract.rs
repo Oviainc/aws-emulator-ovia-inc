@@ -14,9 +14,8 @@
 //!    environment data endpoint (`env.`) is refused by that front door, whose sentence is
 //!    fixed and names no environment. Rows vary the name (length, case, the `-`/`_`
 //!    characters `EnvironmentName`'s pattern allows) and the operation; the wording rule
-//!    itself has its own suite (`tests/all/env_endpoint_not_found_wording.rs`).
-//!    `InvokeRestApi` is NOT one of them: it carries its refusal as the data endpoint's own
-//!    document payload rather than as a serialized exception — that shape has its own suite
+//!    itself has its own suite (`tests/all/env_endpoint_not_found_wording.rs`), and the
+//!    envelope every refusal travels in has another
 //!    (`tests/all/env_endpoint_payload.rs`).
 //! 2. The `/tags/{ResourceArn}` operations refuse a well-formed ARN that resolves to no
 //!    environment with HTTP 404 and the WIRE error code the service publishes for them,
@@ -200,15 +199,11 @@ fn unknown_names() -> Vec<String> {
     ]
 }
 
-/// Every operation addressed by `Name` whose refusal is a serialized modelled exception, as
-/// `(label, method, uri template, body, host prefix)`. The template's `{}` takes the name,
-/// and the host prefix is the one the model's `@endpoint` trait declares for the operation —
-/// which is what decides the refusal's wording.
-///
-/// `InvokeRestApi` is absent deliberately: it is served through the environment data
-/// endpoint's proxy, whose not-found refusal is that endpoint's document payload rather
-/// than a serialized modelled exception, and is asserted in
-/// `tests/all/env_endpoint_payload.rs`.
+/// Every operation addressed by `Name`, as `(label, method, uri template, body, host
+/// prefix)`. The template's `{}` takes the name, and the host prefix is the one the model's
+/// `@endpoint` trait declares for the operation — which is what decides the refusal's
+/// wording. Each one's refusal is the serialized modelled exception, the proxied operation
+/// included.
 type NamedCall = (
     &'static str,
     &'static str,
@@ -236,6 +231,13 @@ fn name_addressed_calls() -> Vec<NamedCall> {
         ),
         ("CreateCliToken", "POST", "/clitoken/{}", None, "env."),
         ("CreateWebLoginToken", "POST", "/webtoken/{}", None, "env."),
+        (
+            "InvokeRestApi",
+            "POST",
+            "/restapi/{}",
+            Some(json!({"Path": "/dags", "Method": "GET"})),
+            "env.",
+        ),
     ]
 }
 

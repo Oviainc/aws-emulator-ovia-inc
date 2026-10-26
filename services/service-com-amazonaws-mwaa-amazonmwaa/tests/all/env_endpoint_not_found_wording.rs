@@ -79,13 +79,10 @@ impl Answer {
         })
     }
 
-    /// The sentence the refusal carries, wherever the endpoint puts it: the `message` of a
-    /// serialized exception object, or the root of the data endpoint's document payload.
+    /// The sentence the refusal carries: the `message` of the serialized modelled
+    /// exception, which is where every endpoint of this service puts it.
     fn refusal_message(&self) -> String {
         let body = self.json();
-        if let Some(bare) = body.as_str() {
-            return bare.to_string();
-        }
         body.get("message")
             .or_else(|| body.get("Message"))
             .and_then(Value::as_str)

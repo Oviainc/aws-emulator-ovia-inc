@@ -1109,10 +1109,9 @@ pub fn environment_not_found_message(name: &str) -> String {
 /// Airflow web server before any of this service's own code runs. A name that resolves to
 /// nothing is refused by that front door, so the sentence is the endpoint's own and is
 /// FIXED: it states the condition and names no environment, ahead of the request-derived
-/// builder above. `InvokeRestApi`, the one operation the model declares as a PROXY, carries
-/// it as the endpoint's document payload rather than as a serialized exception (see
-/// [`crate::service::env_endpoint`]); the token operations carry it in the `message` of
-/// their modelled `ResourceNotFoundException`.
+/// builder above. Every one of them carries it in the `message` of its modelled
+/// `ResourceNotFoundException`, which is the envelope an AWS SDK's error parser reads a
+/// code and a message out of.
 ///
 /// The text itself is only an example; what a client branches on is the 404 and the
 /// `x-amzn-errortype` code beside it. What is NOT an example is that the sentence is fixed:
