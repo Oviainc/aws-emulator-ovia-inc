@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExecuteAction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExecuteAction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExecuteAction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation takes one action on the target resource the request
+//! names — an asset or a computation model — and records it in the shared engine
+//! store (`crate::state`): the action `DescribeAction` reads back and `ListActions`
+//! summarises, plus the one execution of it `ListExecutions` reports. The target
+//! resource and the action definition it names must both exist, so a request naming
+//! one of them that is not there is a modelled refusal rather than an action taken
+//! on nothing. This is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +164,231 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExecuteAction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExecuteActionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExecuteAction"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| internal_failure("the IoT SiteWise store is unavailable".to_string()))?;
+        // Nothing this operation records or answers is scoped to the caller's
+        // region: it mints an id, stores the references the request itself
+        // carries, and reports no ARN.
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // The action is taken ON one resource, so the request has to name one:
+        // `targetResource` carries one optional member per kind, and a structure
+        // naming neither or both names no resource to act on.
+        let (target_type, target_id) =
+            crate::state::target_resource_reference(&input.target_resource)
+                .map_err(invalid_request)?;
+
+        // "A unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request": a token this service has already taken an
+        // action under replays THAT action's id and records nothing, so a retry
+        // the client cannot tell apart from a first attempt does not act twice.
+        if let Some(recorded) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.action_for_client_token(token))
+        {
+            return Ok(ExecuteActionOutput {
+                action_id: recorded.action_id.clone(),
+            });
+        }
+
+        // One match over `TargetResourceType` decides BOTH which store the id is
+        // resolved against and which actions that resource exposes, so the two
+        // cannot drift apart. It yields what the EXECUTION of the action reports
+        // about the resource it ran against: the type of the action it runs, and
+        // the version of that resource.
+        let (action_type, target_resource_version) = match target_type {
+            crate::state::TARGET_RESOURCE_TYPE_ASSET => {
+                if !store.assets.contains_key(target_id) {
+                    return Err(not_found(crate::state::not_found_message(
+                        crate::state::RESOURCE_ASSET,
+                        target_id,
+                    )));
+                }
+                // The actions an asset exposes are the ones its composite models
+                // publish ("The available actions for a composite model on this
+                // asset"), and this store materialises an action definition only
+                // where the model documents the catalog of action types a kind of
+                // resource publishes — which it does for a computation type and
+                // for no composite model type. An asset therefore publishes no
+                // action definition, so every `actionDefinitionId` names one it
+                // does not have: the same refusal an id naming no definition of a
+                // computation model draws.
+                return Err(not_found(crate::state::not_found_message(
+                    crate::state::RESOURCE_ACTION_DEFINITION,
+                    &input.action_definition_id,
+                )));
+            }
+            crate::state::TARGET_RESOURCE_TYPE_COMPUTATION_MODEL => {
+                let model = store.computation_models.get(target_id).ok_or_else(|| {
+                    not_found(crate::state::not_found_message(
+                        crate::state::RESOURCE_COMPUTATION_MODEL,
+                        target_id,
+                    ))
+                })?;
+                // A resource still settling a call it already accepted has an
+                // operation in flight on it, so a second one on that same
+                // resource at that same instant is the modelled conflict rather
+                // than an action taken on a resource that is not there yet — the
+                // rule `UpdateWorkspace` already states for a resource that is
+                // not settled. A retry once the owed transition has fallen due
+                // succeeds.
+                let state_now = model.state(now);
+                if state_now != crate::state::STATE_ACTIVE {
+                    return Err(conflicting_operation(
+                        format!(
+                            "The computation model {} is in the {state_now} state; an action \
+                             can be executed on it only in the {} state.",
+                            model.id,
+                            crate::state::STATE_ACTIVE
+                        ),
+                        model.id.clone(),
+                        model.arn.clone(),
+                    ));
+                }
+                // "The ID of the action definition": one of the actions this
+                // resource publishes, which its create materialised from the
+                // computation type its configuration names. An id naming none of
+                // them addresses no action to take.
+                let definition = model
+                    .action_definitions
+                    .iter()
+                    .find(|definition| {
+                        definition.action_definition_id == input.action_definition_id
+                    })
+                    .ok_or_else(|| {
+                        not_found(crate::state::not_found_message(
+                            crate::state::RESOURCE_ACTION_DEFINITION,
+                            &input.action_definition_id,
+                        ))
+                    })?;
+                (definition.action_type.clone(), model.version_label())
+            }
+            // Unreachable: the runtime refuses a value the enum does not declare
+            // before this handler runs. A value the model gains later names a
+            // resource this operation cannot resolve, which is the refusal below,
+            // worded for the kind the request asked for.
+            other => {
+                return Err(not_found(crate::state::not_found_message(
+                    other, target_id,
+                )))
+            }
+        };
+
+        // "The detailed resource this action resolves to" is a reference to one
+        // asset, so an id no asset of this store holds resolves to nothing — the
+        // refusal the listings scoped by that same reference give.
+        if let Some(resolve_to) = input.resolve_to.as_ref() {
+            if !store.assets.contains_key(&resolve_to.asset_id) {
+                return Err(not_found(crate::state::not_found_message(
+                    crate::state::RESOURCE_ASSET,
+                    &resolve_to.asset_id,
+                )));
+            }
+        }
+
+        // The store is bounded: an execute is the only thing that records an
+        // action and nothing evicts one, so past the cap the request exceeds what
+        // this emulator holds — the quota refusal this operation models.
+        if store.actions.len() >= crate::state::MAX_ACTIONS {
+            return Err(limit_exceeded(format!(
+                "This emulator holds at most {} actions.",
+                crate::state::MAX_ACTIONS
+            )));
+        }
+
+        let action_id = loop {
+            let candidate = crate::state::new_id();
+            if !store.actions.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        let execution_id = loop {
+            let candidate = crate::state::new_id();
+            if !store.executions.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+
+        store.actions.insert(
+            action_id.clone(),
+            crate::state::ActionRecord {
+                action_id: action_id.clone(),
+                action_definition_id: input.action_definition_id.clone(),
+                target_resource: input.target_resource.clone(),
+                action_payload: input.action_payload.clone(),
+                resolve_to: input.resolve_to.clone(),
+                execution_time: now,
+                client_token: input.client_token.clone(),
+            },
+        );
+
+        // Taking the action RUNS it: the one execution of this action is what a
+        // caller then polls, reporting the action's own type and the version of
+        // the resource it ran against. Its run is owed from here — the state it
+        // reports and the instant it ended are derived from when that run falls
+        // due rather than stored, and nothing is slept on.
+        store.executions.insert(
+            execution_id.clone(),
+            crate::state::ExecutionRecord {
+                execution_id,
+                action_type: Some(action_type),
+                target_resource: input.target_resource.clone(),
+                target_resource_version,
+                resolve_to: input.resolve_to.clone(),
+                execution_start_time: now,
+                settles_at: now + crate::state::ACTION_EXECUTION_DELAY,
+                // Nothing in this emulator fails to run an action, so every
+                // execution settles into the state a run that finished reports.
+                outcome: crate::state::EXECUTION_STATE_COMPLETED.to_string(),
+                // The modelled `executionEntityVersion` is "the execution entity
+                // version associated with the summary", and this store holds no
+                // entity beside the target resource whose version the execution
+                // already reports, so there is none to report.
+                execution_entity_version: None,
+            },
+        );
+
+        Ok(ExecuteActionOutput { action_id })
     }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> ExecuteActionError {
+    ExecuteActionErrorModeled::InvalidRequestException(InvalidRequestException { message }).into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> ExecuteActionError {
+    ExecuteActionErrorModeled::ResourceNotFoundException(ResourceNotFoundException { message })
+        .into()
+}
+
+/// HTTP 409 `ConflictingOperationException`: another operation on the same
+/// resource is still in flight, so this one collides with it and a retry can
+/// succeed. `resource_id`/`resource_arn` name THAT resource.
+fn conflicting_operation(
+    message: String,
+    resource_id: String,
+    resource_arn: String,
+) -> ExecuteActionError {
+    ExecuteActionErrorModeled::ConflictingOperationException(ConflictingOperationException {
+        message,
+        resource_id,
+        resource_arn,
+    })
+    .into()
+}
+
+/// HTTP 410 `LimitExceededException` carrying `message`.
+fn limit_exceeded(message: String) -> ExecuteActionError {
+    ExecuteActionErrorModeled::LimitExceededException(LimitExceededException { message }).into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> ExecuteActionError {
+    ExecuteActionErrorModeled::InternalFailureException(InternalFailureException { message }).into()
 }

@@ -11,12 +11,11 @@
 //! on; an identifier that names no stored resource is a modelled refusal rather
 //! than an empty page, and no listing changes what a later caller sees.
 //!
-//! `ExecuteAction` is the operation that records an execution and is still a
-//! scaffold stub (its own issue,
-//! `20261024T100803Z-iotsitewise-executeaction-stub.md`), so these suites record
-//! the executions directly in the shared store this handler reads — the same store
-//! a handler writes through, which is what `time_series` does for the alias
-//! binding its own stub writer would make.
+//! `ExecuteAction` is the operation that records an execution, and it records one
+//! only against a target resource that publishes the action it is asked to run,
+//! so these suites record their whole table directly in the shared store this
+//! handler reads — the same store a handler writes through, which is what
+//! `time_series` does for the alias binding its own stub writer would make.
 //!
 //! The wire harness (`router_with_engine`, `call`, `error_code`, …) is the one
 //! `asset_lifecycle` already defines, re-used rather than copied.

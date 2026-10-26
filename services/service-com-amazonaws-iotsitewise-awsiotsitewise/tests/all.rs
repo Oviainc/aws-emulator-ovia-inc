@@ -20,6 +20,14 @@
 #[path = "all/actions.rs"]
 mod actions;
 
+// `execute_action` is declared HERE, beside the `actions` suite it belongs with,
+// for the reason the note above gives and because the END of this file is where
+// every concurrent iotsitewise change appends a declaration of its own: two
+// appends there collided in a row with this one. Fold it into the list once the
+// churn settles.
+#[path = "all/execute_action.rs"]
+mod execute_action;
+
 // `reserved_tag_keys` is declared here too, at the head of the file, for the
 // reason the note above gives: the sorted list and the tail of the file are both
 // where every concurrent iotsitewise change puts a declaration of its own, and

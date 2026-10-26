@@ -95,7 +95,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    ActionDefinition, ActionSummary, AggregatedValue, Aggregates, Alarms,
+    ActionDefinition, ActionPayload, ActionSummary, AggregatedValue, Aggregates, Alarms,
     AssetCompositeModelPathSegment, AssetCompositeModelSummary, AssetHierarchy,
     AssetModelCompositeModel,
     AssetModelCompositeModelPathSegment, AssetModelCompositeModelSummary, AssetModelHierarchy,
@@ -2820,6 +2820,64 @@ pub const EXECUTION_STATE_COMPLETED: &str = "COMPLETED";
 /// [`EXECUTION_STATE_RUNNING`] for the source of the set.
 pub const EXECUTION_STATE_FAILED: &str = "FAILED";
 
+/// How long after the call that starts it an execution of an action takes to
+/// settle: until then it reports [`EXECUTION_STATE_RUNNING`], and its outcome
+/// from then on.
+///
+/// CHOSEN, not documented: AWS publishes no duration for an action's run, only
+/// that the call starting one is ACCEPTED (HTTP 202) and that an execution
+/// reports `RUNNING` while "the process" has not ended. The span is deliberately
+/// non-zero, so a caller that reads the execution straight after the call still
+/// observes the running state the real service reports.
+pub const ACTION_EXECUTION_DELAY: Duration = Duration::from_millis(500);
+
+/// The ceiling on how many actions this store holds.
+///
+/// Not a published AWS quota: the store is in memory, an execute is the only
+/// thing that adds an action and nothing evicts one, so this is where the
+/// emulator stops growing — the quota refusal `ExecuteAction` models
+/// (`LimitExceededException`, "You've reached the quota for a resource"). Each
+/// action starts exactly one execution, so this bounds the executions too.
+pub const MAX_ACTIONS: usize = 1_000;
+
+/// The members of the `TargetResource` shape, in the order it declares them.
+/// Source: `smithy_query(query="shape", shape="TargetResource")`.
+pub const TARGET_RESOURCE_MEMBERS: [&str; 2] = ["assetId", "computationModelId"];
+
+/// The `(TargetResourceType, ID)` pair `target_resource` names, or the refusal a
+/// structure naming no single resource draws.
+///
+/// `TargetResource` is a choice spelled as a structure of optional members —
+/// "The resource the action will be taken on. This can include asset-based
+/// resources and computation model resources" — so a request naming neither of
+/// them, or both, names no one resource to act on. The pair this returns is the
+/// same pair the listings scoped to a target resource take, so a resource is
+/// addressed identically whether the request states it as a structure or as a
+/// type and an id. The `Err` carries the refusal message, which the calling
+/// operation lifts into its own modelled client error.
+pub fn target_resource_reference(
+    target_resource: &TargetResource,
+) -> Result<(&'static str, &str), String> {
+    match (
+        target_resource.asset_id.as_deref(),
+        target_resource.computation_model_id.as_deref(),
+    ) {
+        (Some(asset_id), None) => Ok((TARGET_RESOURCE_TYPE_ASSET, asset_id)),
+        (None, Some(computation_model_id)) => Ok((
+            TARGET_RESOURCE_TYPE_COMPUTATION_MODEL,
+            computation_model_id,
+        )),
+        (asset_id, computation_model_id) => {
+            let named =
+                usize::from(asset_id.is_some()) + usize::from(computation_model_id.is_some());
+            Err(format!(
+                "targetResource must name exactly one of {}; this request named {named}.",
+                catalog_names(TARGET_RESOURCE_MEMBERS.into_iter())
+            ))
+        }
+    }
+}
+
 /// One execution of an action on a target resource: what `ListExecutions`
 /// summarises, keyed by its own `executionId` in
 /// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::executions`].
@@ -2939,11 +2997,18 @@ pub struct ActionRecord {
     pub action_definition_id: String,
     /// The resource the action was taken on: an asset or a computation model.
     pub target_resource: TargetResource,
+    /// The JSON payload the call that took this action supplied, which the read
+    /// form of a single action reports back.
+    pub action_payload: ActionPayload,
     /// The detailed resource this action resolves to, which only an action whose
     /// target resolves through a data binding carries.
     pub resolve_to: Option<ResolveTo>,
     /// When the action ran.
     pub execution_time: SystemTime,
+    /// The `clientToken` the call that took this action carried, if it carried
+    /// one, so a retry of that same call is recognised as the retry it is rather
+    /// than taking the action a second time.
+    pub client_token: Option<String>,
 }
 
 impl ActionRecord {
@@ -4448,6 +4513,20 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             .count()
     }
 
+    /// The action this store already recorded under `client_token`, if any.
+    ///
+    /// What makes `ExecuteAction` idempotent on its token, which the member
+    /// documents as "a unique case-sensitive identifier that you can provide to
+    /// ensure the idempotency of the request": a token an action was already
+    /// taken under names that action rather than a second one. An action is
+    /// addressed by its id alone, so the lookup is over every action this store
+    /// holds, as `ListActions` and `DescribeAction` are.
+    pub fn action_for_client_token(&self, client_token: &str) -> Option<&ActionRecord> {
+        self.actions
+            .values()
+            .find(|record| record.client_token.as_deref() == Some(client_token))
+    }
+
     /// The enrichment job of `workspace_name` that is doing the same work as
     /// `configuration` and has not reached a terminal status at `now`, if any.
     ///
@@ -5377,6 +5456,19 @@ pub const RESOURCE_ACCESS_POLICY: &str = "Access Policy";
 
 /// The resource kind those errors name for a computation model.
 pub const RESOURCE_COMPUTATION_MODEL: &str = "Computation Model";
+
+/// The resource kind those errors name for one action taken on a target
+/// resource — what `ExecuteAction` records and `DescribeAction` reads back.
+pub const RESOURCE_ACTION: &str = "Action";
+
+/// The resource kind those errors name for an action DEFINITION: one of the
+/// actions a target resource exposes, which an execute addresses by its
+/// `actionDefinitionId`.
+///
+/// A definition is not a top-level resource but one of the actions a resource
+/// publishes, so it is named as what it is rather than as the resource it
+/// belongs to.
+pub const RESOURCE_ACTION_DEFINITION: &str = "Action Definition";
 
 /// The message a not-found refusal carries: the resource kind, then the
 /// identifier the REQUEST supplied, echoed exactly as sent — whatever form that

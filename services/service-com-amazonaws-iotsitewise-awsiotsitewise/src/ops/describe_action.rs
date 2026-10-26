@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reports, from the shared engine store
+//! (`crate::state`), the ONE action its `actionId` names — the resource it was taken
+//! on, the definition it ran, the payload it carried, when it ran and what it
+//! resolves to — and writes nothing; an id no action is recorded under is a modelled
+//! refusal. This is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +154,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeActionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAction"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| internal_failure("the IoT SiteWise store is unavailable".to_string()))?;
+        // Nothing an action carries is scoped to the caller's region, so this read
+        // takes no value off the request itself beyond the id it addresses.
+        let _ = ctx;
+        let store = state.lock();
+
+        // An action is addressed by its own id, so an id no action is recorded
+        // under addresses nothing: the modelled not-found refusal, in the wording
+        // every other read of this service uses.
+        let record = store.actions.get(&input.action_id).ok_or_else(|| {
+            not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_ACTION,
+                &input.action_id,
+            ))
+        })?;
+
+        // Every member read off the stored record, so this read and the listing
+        // over the same action report one action rather than two views of it.
+        Ok(DescribeActionOutput {
+            action_id: record.action_id.clone(),
+            target_resource: record.target_resource.clone(),
+            action_definition_id: record.action_definition_id.clone(),
+            action_payload: record.action_payload.clone(),
+            execution_time: crate::state::to_date_time(record.execution_time),
+            resolve_to: record.resolve_to.clone(),
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> DescribeActionError {
+    DescribeActionErrorModeled::ResourceNotFoundException(ResourceNotFoundException { message })
+        .into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> DescribeActionError {
+    DescribeActionErrorModeled::InternalFailureException(InternalFailureException { message })
+        .into()
 }

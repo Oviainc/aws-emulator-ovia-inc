@@ -10,12 +10,13 @@
 //! resource is a modelled refusal rather than an empty page, and no listing
 //! changes what a later caller sees.
 //!
-//! `ExecuteAction` is the operation that records an action and is still a
-//! scaffold stub (its own issue,
-//! `20261024T100803Z-iotsitewise-executeaction-stub.md`), so these suites record
-//! the actions directly in the shared store this handler reads — the same store a
-//! handler writes through, which is what `executions` does for the executions its
-//! own stub writer would record.
+//! `ExecuteAction` is the operation that records an action, and it resolves the
+//! `actionDefinitionId` it is given against the actions the target resource
+//! publishes — which this store materialises for a computation model's
+//! computation type and for nothing else. These suites therefore record their
+//! whole table directly in the shared store this handler reads — the same store
+//! a handler writes through, which is what `executions` does for the executions
+//! it lists.
 //!
 //! The wire harness (`router_with_engine`, `call`, `error_code`, …) is the one
 //! `asset_lifecycle` already defines, and the computation-model create is
@@ -27,7 +28,9 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_iotsitewise_awsiotsitewise::ops::types::{ResolveTo, TargetResource};
+use service_com_amazonaws_iotsitewise_awsiotsitewise::ops::types::{
+    ActionPayload, ResolveTo, TargetResource,
+};
 use service_com_amazonaws_iotsitewise_awsiotsitewise::state::{service_state, ActionRecord};
 
 use crate::asset_lifecycle::{
@@ -268,10 +271,19 @@ async fn fixture() -> Fixture {
                     action_id: row.id.to_string(),
                     action_definition_id: row.definition.to_string(),
                     target_resource,
+                    // The payload the call that took the action supplied. Only the
+                    // read form of a single action reports it, so the rows this
+                    // suite lists carry one naming the row they belong to.
+                    action_payload: ActionPayload {
+                        string_value: format!("{{\"case\":\"{}\"}}", row.case),
+                    },
                     resolve_to: row.resolve_to.map(|resolved| ResolveTo {
                         asset_id: fixture.id_of(resolved).to_string(),
                     }),
                     execution_time: anchor - Duration::from_secs(row.ran_ago),
+                    // No idempotency token: these rows stand for actions already
+                    // recorded, not for calls this suite retries.
+                    client_token: None,
                 },
             );
         }
