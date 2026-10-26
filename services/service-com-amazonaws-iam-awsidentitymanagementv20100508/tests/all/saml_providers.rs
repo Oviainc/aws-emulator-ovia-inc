@@ -46,7 +46,7 @@ pub(crate) enum MetadataForm {
 }
 
 /// The namespace SAML 2.0 metadata descriptors are declared in.
-const METADATA_NAMESPACE: &str = "urn:oasis:names:tc:SAML:2.0:metadata";
+pub(crate) const METADATA_NAMESPACE: &str = "urn:oasis:names:tc:SAML:2.0:metadata";
 
 /// A base64 body long enough that the document passes `SAMLMetadataDocumentType`'s
 /// 1000-character minimum (`smithy_query(query="operation",
@@ -266,7 +266,7 @@ pub(crate) fn reported_instant(text: &str) -> DateTime {
 /// `privateKeyIdType` (which both `SAMLProviderUUID` and `SAMLPrivateKey$KeyId` target)
 /// is len 22..64 with pattern `^[A-Z0-9]+$` (`smithy_query(query="shape",
 /// shape="privateKeyIdType")`).
-fn assert_private_key_id_shape(case: &str, member: &str, value: &str) {
+pub(crate) fn assert_private_key_id_shape(case: &str, member: &str, value: &str) {
     assert!(
         (22..=64).contains(&value.len())
             && value
@@ -536,7 +536,7 @@ async fn a_second_create_for_a_held_name_is_refused_and_changes_nothing() {
 
 /// Filler that carries a bad document past `SAMLMetadataDocumentType`'s 1000-character
 /// minimum, so the handler is what refuses it rather than the boundary validator.
-fn filler() -> String {
+pub(crate) fn filler() -> String {
     "0123456789".repeat(120)
 }
 

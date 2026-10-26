@@ -322,6 +322,15 @@ pub const ANY_OPEN_ID_CONNECT_PROVIDER: &str = "*";
 /// growing without end.
 pub const MAX_SAML_PROVIDERS_PER_ACCOUNT: usize = 100;
 
+/// How many private keys ONE SAML provider may hold: `privateKeyList` — the shape
+/// `GetSAMLProvider$PrivateKeyList` reports the keys through — is modelled len 0..2
+/// (`smithy_query(query="shape", shape="privateKeyList")`), so a provider holding more
+/// could never be reported. It is also why "to rotate private keys, add your new private
+/// key and then remove the old key in a separate request" (`UpdateSAMLProvider`): with
+/// the second slot taken, the next upload is refused with `LimitExceededException`,
+/// whose documentation says "the error message describes the limit exceeded".
+pub const MAX_PRIVATE_KEYS_PER_SAML_PROVIDER: usize = 2;
+
 /// How many server certificates one account may hold. AWS's "IAM and STS quotas" page
 /// gives the quota "Server certificates stored in IAM per account: 20", and an upload
 /// past it is refused with `LimitExceededException`, whose documentation says "the error
@@ -842,9 +851,10 @@ pub struct SamlProviderRecord {
     /// chooses a value.
     pub assertion_encryption_mode: Option<String>,
     /// "The private key metadata for the SAML provider"
-    /// (`GetSAMLProvider$PrivateKeyList`), in the order the keys were uploaded. At most as
-    /// many as `privateKeyList` declares (len 0..2, `smithy_query(query="shape",
-    /// shape="privateKeyList")`), and empty when no call uploaded one.
+    /// (`GetSAMLProvider$PrivateKeyList`), in the order the keys were uploaded. At most
+    /// [`MAX_PRIVATE_KEYS_PER_SAML_PROVIDER`] of them, the maximum `privateKeyList`
+    /// declares (len 0..2, `smithy_query(query="shape", shape="privateKeyList")`), and
+    /// empty when no call uploaded one.
     pub private_keys: Vec<SAMLPrivateKey>,
     /// The provider's tags, sorted by tag key, because "the returned list of tags is
     /// sorted by tag key" (`GetSAMLProvider$Tags`). `None` when the provider carries

@@ -131,6 +131,8 @@ mod saml_provider_listing;
 mod saml_provider_tag_updates;
 #[path = "all/saml_provider_tags.rs"]
 mod saml_provider_tags;
+#[path = "all/saml_provider_updates.rs"]
+mod saml_provider_updates;
 #[path = "all/saml_providers.rs"]
 mod saml_providers;
 #[path = "all/server_certificates.rs"]
