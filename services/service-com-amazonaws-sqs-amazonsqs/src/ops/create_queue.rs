@@ -351,6 +351,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing has changed the queue yet, so it was last modified when it was
             // created.
             last_modified_at: now,
+            // A queue nobody has purged holds no purge instant, so the first
+            // `PurgeQueue` on it is accepted.
+            purged_at: None,
         };
         store.queues.insert(input.queue_name, queue);
 
