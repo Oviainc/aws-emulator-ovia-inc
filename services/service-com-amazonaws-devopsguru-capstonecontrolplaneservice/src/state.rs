@@ -2511,6 +2511,12 @@ pub const INSIGHT_RESOURCE_TYPE: &str = "INSIGHT";
 /// [`INSIGHT_RESOURCE_TYPE`] gives.
 pub const ANOMALY_RESOURCE_TYPE: &str = "ANOMALY";
 
+/// The `ResourceType` a channel-shaped `ResourceNotFoundException` reports — the kind
+/// of resource the refused `ResourceId` would have named, for the reason
+/// [`INSIGHT_RESOURCE_TYPE`] gives. This is what `RemoveNotificationChannel` reports
+/// for a `NotificationChannelId` that names no stored channel.
+pub const NOTIFICATION_CHANNEL_RESOURCE_TYPE: &str = "NOTIFICATION_CHANNEL";
+
 /// Before any `UpdateServiceIntegration`, every integration is opted out: a
 /// client that never enabled OpsCenter, log anomaly detection or customer-managed
 /// encryption has none of them.

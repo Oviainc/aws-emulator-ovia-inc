@@ -779,7 +779,7 @@ async fn repeating_a_read_reports_the_same_state() {
 /// exactly the config submitted; the SNS topic identifies the channel, so a second add
 /// of the same topic reports the id already registered for it instead of creating a
 /// second channel; `RemoveNotificationChannel` deletes it, after which the id names
-/// nothing and a repeat delete is a successful no-op.
+/// nothing and a repeat delete is refused with `ResourceNotFoundException` (404).
 ///
 /// The rows differ in the FORM of `Config.Filters` — absent, one list, the other list,
 /// both, and empty lists — which is what the round-trip generalises over.
@@ -861,12 +861,12 @@ async fn a_channel_round_trips_its_config_and_its_topic_is_unique() {
             "case {name:?}: expected the repeat to change nothing, got {listed_again}"
         );
 
-        // An unknown but well-formed id names no channel, so removing it is a no-op.
+        // An unknown but well-formed id names no channel, so removing it is refused.
         let unknown = "00000000-0000-4000-8000-000000000000";
         let missing = emulator.remove_notification_channel(unknown).await;
         assert_eq!(
-            missing.status, 200,
-            "case {name:?}: removing an unknown id must be a no-op 200, got {}",
+            missing.status, 404,
+            "case {name:?}: removing an unknown id must be refused with 404, got {}",
             missing.raw
         );
 
@@ -892,8 +892,8 @@ async fn a_channel_round_trips_its_config_and_its_topic_is_unique() {
 
         let again = emulator.remove_notification_channel(&id).await;
         assert_eq!(
-            again.status, 200,
-            "case {name:?}: a repeat remove must be a no-op 200, got {}",
+            again.status, 404,
+            "case {name:?}: a repeat remove must be refused with 404, got {}",
             again.raw
         );
     }

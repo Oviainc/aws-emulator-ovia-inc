@@ -45,6 +45,8 @@ mod monitored_resources;
 mod mutation_idempotency_and_tenancy;
 #[path = "all/notification_channel_conflict.rs"]
 mod notification_channel_conflict;
+#[path = "all/notification_channel_removal.rs"]
+mod notification_channel_removal;
 #[path = "all/organization_health.rs"]
 mod organization_health;
 #[path = "all/organization_insight_listing.rs"]

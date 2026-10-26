@@ -2,11 +2,12 @@
 
 //! End-to-end tests for the rules a MUTATION of this service's state follows:
 //!
-//! * a REMOVAL keyed by a caller-named target is IDEMPOTENT — removing a target already
-//!   absent states what the call asks for, so it succeeds and changes nothing (a
-//!   REGISTRATION keyed by a target already taken follows the same rule from the other
-//!   side — it succeeds reporting the resource already registered — and is pinned by
-//!   [`crate::notification_channel_conflict`]);
+//! * a REMOVAL addressed by a resource identifier acts on the resource that identifier
+//!   names, so an identifier naming no stored resource is REFUSED with the modelled
+//!   not-found error and changes nothing — pinned by
+//!   [`crate::notification_channel_removal`], while a REGISTRATION keyed by a target
+//!   already taken succeeds reporting the resource already registered, pinned by
+//!   [`crate::notification_channel_conflict`];
 //! * a write is REFUSED with the modelled client error, and persists nothing, when the
 //!   configuration it would leave stored is one the service cannot represent — a second
 //!   app-boundary key for an account that has exactly one, or customer-managed-key
@@ -90,82 +91,76 @@ pub(crate) fn minted_id(reply: &Reply) -> String {
         .to_string()
 }
 
-/// RULE: a removal keyed by its target is idempotent — `RemoveNotificationChannel`
-/// states that the id names no channel, which already holds for an id that names none,
-/// so such a call succeeds with the empty output and leaves the other channels alone.
+/// RULE: a removal addressed by a resource identifier acts on the resource that
+/// identifier names, so a `RemoveNotificationChannel` whose `Id` names no stored channel
+/// is refused rather than reported as a deletion, and the id a removal freed names a
+/// modelled-looking channel id that still belongs to nothing.
 ///
-/// The rows differ in what the id names (never minted, minted and removed, removed
-/// repeatedly), in how many removals are issued, and in whether another channel exists
-/// alongside; the issue's "remove the same id twice" is the second row.
+/// The rows differ in how many channels the store holds when the freed id is re-checked,
+/// so this pins the id-minting half of the rule; the refusal itself, over the set of
+/// inputs it generalises over, is pinned by [`crate::notification_channel_removal`].
 #[tokio::test]
-async fn removing_a_channel_is_idempotent() {
-    // (case name, mint the channel first?, how many removals, keep a second channel?)
-    let cases: [(&str, bool, usize, bool); 5] = [
-        ("an id that was never minted", false, 1, false),
-        ("a minted id removed twice", true, 2, false),
-        ("a minted id removed four times", true, 4, false),
-        ("an id never minted, removed three times", false, 3, false),
-        ("a minted id removed twice beside another channel", true, 2, true),
+async fn a_removal_frees_its_id_and_the_topic_gets_a_fresh_one() {
+    // (case name, how many channels stay alongside)
+    let cases: [(&str, usize); 3] = [
+        ("no other channel", 0),
+        ("one other channel", 1),
+        ("two other channels", 2),
     ];
 
-    for (name, mint, removals, keep_other) in cases {
+    for (name, bystanders) in cases {
         let emulator = Emulator::new();
 
-        let other_id = if keep_other {
+        let mut other_ids: Vec<String> = Vec::new();
+        for bystander in 0..bystanders {
             let reply = emulator
                 .add_notification_channel(channel_config(
-                    "arn:aws:sns:us-east-1:000000000000:guru-keep-me",
+                    &format!("arn:aws:sns:us-east-1:000000000000:guru-keep-me-{bystander}"),
                     &json!(null),
                 ))
                 .await;
             assert_eq!(
                 reply.status, 200,
-                "case {name:?}: the bystander add must succeed, got {}",
+                "case {name:?}: the bystander add {bystander} must succeed, got {}",
                 reply.raw
             );
-            Some(minted_id(&reply))
-        } else {
-            None
-        };
-
-        let id = if mint {
-            let reply = emulator
-                .add_notification_channel(channel_config(
-                    "arn:aws:sns:us-east-1:000000000000:guru-doomed",
-                    &json!(null),
-                ))
-                .await;
-            assert_eq!(
-                reply.status, 200,
-                "case {name:?}: the add must succeed, got {}",
-                reply.raw
-            );
-            minted_id(&reply)
-        } else {
-            // A well-formed `NotificationChannelId` this service never minted.
-            "00000000-0000-4000-8000-000000000000".to_string()
-        };
-
-        for attempt in 0..removals {
-            let reply = emulator.remove_notification_channel(&id).await;
-            assert_eq!(
-                reply.status, 200,
-                "case {name:?}: removal {attempt} must succeed, got status {} body {}",
-                reply.status, reply.raw
-            );
-            assert_eq!(
-                reply.body,
-                json!({}),
-                "case {name:?}: removal {attempt} must report the empty output, got {}",
-                reply.raw
-            );
+            other_ids.push(minted_id(&reply));
         }
 
-        let remaining = listed_channel_ids(&emulator).await;
-        let expected: Vec<String> = other_id.iter().cloned().collect();
+        let reply = emulator
+            .add_notification_channel(channel_config(
+                "arn:aws:sns:us-east-1:000000000000:guru-doomed",
+                &json!(null),
+            ))
+            .await;
         assert_eq!(
-            remaining, expected,
-            "case {name:?}: expected {expected:?} to remain, got {remaining:?}"
+            reply.status, 200,
+            "case {name:?}: the add must succeed, got {}",
+            reply.raw
+        );
+        let id = minted_id(&reply);
+
+        let removed = emulator.remove_notification_channel(&id).await;
+        assert_eq!(
+            removed.status, 200,
+            "case {name:?}: removing the live channel must succeed, got status {} body {}",
+            removed.status, removed.raw
+        );
+        assert_eq!(
+            removed.body,
+            json!({}),
+            "case {name:?}: a successful removal must report the empty output, got {}",
+            removed.raw
+        );
+
+        let remaining = listed_channel_ids(&emulator).await;
+        let mut expected = other_ids.clone();
+        expected.sort();
+        let mut actual = remaining.clone();
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "case {name:?}: expected {expected:?} to remain, got {actual:?}"
         );
 
         // Removal frees the topic: the same topic may be registered again, and gets a
@@ -186,12 +181,10 @@ async fn removing_a_channel_is_idempotent() {
             is_modeled_channel_id(&reused_id),
             "case {name:?}: expected a modelled id for the re-added topic, got {reused_id:?}"
         );
-        if mint {
-            assert_ne!(
-                reused_id, id,
-                "case {name:?}: a re-added topic must get a fresh id, got the removed {id:?}"
-            );
-        }
+        assert_ne!(
+            reused_id, id,
+            "case {name:?}: a re-added topic must get a fresh id, got the removed {id:?}"
+        );
     }
 }
 
