@@ -31,6 +31,8 @@ mod cluster_node_cancellation;
 mod cluster_node_creation_window;
 #[path = "all/cluster_node_job_members.rs"]
 mod cluster_node_job_members;
+#[path = "all/cluster_node_job_updates.rs"]
+mod cluster_node_job_updates;
 #[path = "all/cluster_node_updates.rs"]
 mod cluster_node_updates;
 #[path = "all/cluster_provisioning.rs"]
