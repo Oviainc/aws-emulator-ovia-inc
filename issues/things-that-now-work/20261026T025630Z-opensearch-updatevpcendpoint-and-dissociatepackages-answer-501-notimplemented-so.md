@@ -1,16 +1,37 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: opensearch.concurrency-update-vpc-endpoint-optimistic-lock opensearch.update-vpc-endpoint-concurrent-modification-conflict opensearch.concurrent-associate-dissociate-packages-race-consistency opensearch.e2e-package-association-enables-index-analyzer opensearch.e2e-package-association-search-flow
+Issue-Trace-Ids: opensearch.concurrency-update-vpc-endpoint-optimistic-lock opensearch.concurrent-associate-dissociate-packages-race-consistency
 Issue-Shape-Id: com.amazonaws.opensearch#AmazonOpenSearchService
 Issue-Key: opensearch.concurrency-update-vpc-endpoint-optimistic-lock|run#20|AssertionError|assert len(successes) == 1, f"expected exactly one winner, got outcomes={outcomes}"
-Issue-Key: opensearch.update-vpc-endpoint-concurrent-modification-conflict|run#20|AssertionError|assert len(oks) == 1, f"expected exactly one winner among concurrent updates, got {results}"
 Issue-Key: opensearch.concurrent-associate-dissociate-packages-race-consistency|run#22|AssertionError|assert code == "ConflictException", f"{name} racer failed with unexpected code {code}"
-Issue-Key: opensearch.e2e-package-association-enables-index-analyzer|_analyze#16|Timeout|time.sleep(delay_s)
-Issue-Key: opensearch.e2e-package-association-search-flow|_wait_domain_package_status#22|Timeout|time.sleep(interval_s)
 Issue-Commit: d5b444aa1a2c0b78901c8918371b89e5e61348ae
 
 # opensearch: UpdateVpcEndpoint and DissociatePackages answer 501 NotImplemented so in-flight-modification conflicts never serialize, and the package-association e2e flows never converge (3 causes)
+
+> _RESOLVED for causes 1 and 2; cause 3 was SPLIT OUT, still open._
+>
+> * Cause 1 (UpdateVpcEndpoint answers 501, so no writer wins and no writer is refused) is
+>   FIXED: the operation is implemented over the stored VPC-endpoint record and refuses a
+>   change that arrives while another has not landed with the modelled `ConflictException`
+>   (409). The check `opensearch.concurrency-update-vpc-endpoint-optimistic-lock`, which
+>   grades the "exactly one winner (200), exactly one loser (409)" pair, now PASSES.
+> * Cause 2 (DissociatePackages answers 501, so an associate/dissociate race cannot
+>   converge) is FIXED: the operation decides every entry through the one shared
+>   `plan_package_dissociation` the single-package operation uses, so the two directions
+>   cannot disagree. `opensearch.concurrent-associate-dissociate-packages-race-consistency`
+>   now PASSES.
+> * Cause 3 (the two package-association e2e flows never converge) is NOT fixed: what is
+>   left of it is the domain OpenSearch REST data plane, which no service answers on. It
+>   is refiled, with its two replay keys and the still-timing-out
+>   `opensearch.update-vpc-endpoint-concurrent-modification-conflict` readiness poll, as
+>   `issues/things-that-do-not-work/20261026T044500Z-opensearch-package-association-e2e-flows-need-the-domain-data-plane-and.md`,
+>   and the capability it needs is the one
+>   `issues/things-that-do-not-work/20261024T055421Z-opensearch-domain-data-plane-is-not-served-and.md`
+>   already owns. The trace ids and keys of those three checks have been moved to that
+>   report so neither file claims the other's state.
+>
+> The text below is the report as originally filed, unedited.
 
 > _Note: this issue was identified against the code base at commit `d5b444aa1a2c0b78901c8918371b89e5e61348ae`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 

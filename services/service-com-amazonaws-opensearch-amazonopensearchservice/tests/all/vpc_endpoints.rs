@@ -49,7 +49,11 @@ const DOMAIN_UNAVAILABLE: &str = "Either the domain doesn't exist, it doesn't su
                                   VPC endpoint for the domain.";
 
 /// `CreateVpcEndpoint`: `POST /2021-01-01/opensearch/vpcEndpoints`.
-async fn create_endpoint(emulator: &Emulator, body: Value) -> Answer {
+///
+/// `pub(crate)` because the sibling suites for `UpdateVpcEndpoint` and for the
+/// per-domain listing create endpoints through THIS wrapper rather than growing a
+/// second copy of it.
+pub(crate) async fn create_endpoint(emulator: &Emulator, body: Value) -> Answer {
     emulator
         .call(
             "POST",
@@ -60,7 +64,10 @@ async fn create_endpoint(emulator: &Emulator, body: Value) -> Answer {
 }
 
 /// `DescribeVpcEndpoints`: `POST /2021-01-01/opensearch/vpcEndpoints/describe`.
-async fn describe_endpoints(emulator: &Emulator, ids: &[&str]) -> Answer {
+///
+/// `pub(crate)` for the same reason as [`create_endpoint`]: it is this crate's one read
+/// of an endpoint by id.
+pub(crate) async fn describe_endpoints(emulator: &Emulator, ids: &[&str]) -> Answer {
     emulator
         .call(
             "POST",
@@ -93,7 +100,9 @@ async fn delete_endpoint(emulator: &Emulator, id: &str) -> Answer {
 
 /// A VPC-provisioned domain to create endpoints for, answering with its ARN — the
 /// value a create addresses the domain by.
-async fn vpc_domain(emulator: &Emulator, name: &str) -> String {
+///
+/// `pub(crate)` for the same reason as [`create_endpoint`].
+pub(crate) async fn vpc_domain(emulator: &Emulator, name: &str) -> String {
     let answer = emulator
         .create(json!({
             "DomainName": name,
@@ -141,7 +150,9 @@ async fn public_domain(emulator: &Emulator, name: &str) -> String {
 }
 
 /// The `VpcEndpoint` of an accepted create, with the case named on failure.
-fn minted(answer: &Answer, case: &str) -> Value {
+///
+/// `pub(crate)` for the same reason as [`create_endpoint`].
+pub(crate) fn minted(answer: &Answer, case: &str) -> Value {
     assert_eq!(
         answer.status, 200,
         "case {case}: expected 200, got {} with {:?}",
@@ -157,7 +168,9 @@ fn minted(answer: &Answer, case: &str) -> Value {
 }
 
 /// A required string member of a response object, with the case named on failure.
-fn member(object: &Value, name: &str, case: &str) -> String {
+///
+/// `pub(crate)` for the same reason as [`create_endpoint`].
+pub(crate) fn member(object: &Value, name: &str, case: &str) -> String {
     object[name]
         .as_str()
         .unwrap_or_else(|| panic!("case {case}: expected a string {name}, got {object:?}"))

@@ -601,6 +601,10 @@ pub const VPC_ENDPOINT_STATUS_CREATING: &str = "CREATING";
 /// through.
 pub const VPC_ENDPOINT_STATUS_ACTIVE: &str = "ACTIVE";
 
+/// `VpcEndpointStatus`'s `UPDATING` value: a change to the endpoint's subnets or
+/// security groups has been asked for and is being applied.
+pub const VPC_ENDPOINT_STATUS_UPDATING: &str = "UPDATING";
+
 /// `VpcEndpointStatus`'s `DELETING` value: the endpoint has been released and is
 /// being torn down.
 pub const VPC_ENDPOINT_STATUS_DELETING: &str = "DELETING";
@@ -629,6 +633,45 @@ pub const VPC_ENDPOINT_QUOTA: usize = 50;
 /// [`VPC_ENDPOINT_QUOTA`], so the set can span more than one page and a caller that
 /// ignores the token cannot mistake a first page for the whole set.
 pub const VPC_ENDPOINT_PAGE: usize = 10;
+
+/// ONE page of an endpoint listing: the summaries it carries and the token the next
+/// page resumes from, or `None` where `next_token` names no place in `ordered`.
+///
+/// BOTH operations that page endpoints go through this — the account's whole set and
+/// one domain's — so they cannot drift on what a page holds, where a token resumes
+/// from, or how a listing ends. `ordered` is the set in the order the caller reports
+/// it, which is the store's own key order, and is what makes a token a PLACE in the
+/// set rather than an offset a create or a release would have shifted.
+///
+/// `None` is left for the caller to word, which is the modelled `ValidationException`
+/// both listings refuse an unresolvable token with ([`invalid_next_token`]). The EMPTY token is the one a listing itself
+/// hands out at the end of a set, so it starts from the first page exactly as naming
+/// no token does. The token answered is likewise EMPTY at the end of the set, because
+/// both responses declare the member REQUIRED — which is also what a paginating client
+/// stops on.
+pub fn vpc_endpoint_page(
+    ordered: &[&VpcEndpointRecord],
+    next_token: Option<&str>,
+) -> Option<(Vec<VpcEndpointSummary>, String)> {
+    let start = match next_token.filter(|token| !token.is_empty()) {
+        None => 0,
+        Some(token) => ordered
+            .iter()
+            .position(|endpoint| endpoint.vpc_endpoint_id == token)?,
+    };
+    // ONE page, so the answer is bounded by the page size however large the set is.
+    let page = ordered
+        .iter()
+        .skip(start)
+        .take(VPC_ENDPOINT_PAGE)
+        .map(|endpoint| endpoint.to_summary())
+        .collect();
+    let resume = ordered
+        .get(start.saturating_add(VPC_ENDPOINT_PAGE))
+        .map(|endpoint| endpoint.vpc_endpoint_id.clone())
+        .unwrap_or_default();
+    Some((page, resume))
+}
 
 /// One service-managed VPC endpoint of this account, as this emulator persists it.
 #[derive(Debug, Clone)]
@@ -673,6 +716,47 @@ impl VpcEndpointRecord {
             return;
         };
         self.status = owed.status;
+    }
+
+    /// Whether a change to this endpoint has not landed yet, which is what makes a
+    /// second writer's call conflict with the one already in flight.
+    ///
+    /// Read AFTER [`Self::settle`], so a move that has merely fallen due does not read
+    /// as one still in flight. The same shape as [`PackageAssociation::in_flight`],
+    /// because it is the same question about a resource this control plane is still
+    /// changing.
+    pub fn in_flight(&self) -> bool {
+        self.owed.is_some()
+    }
+
+    /// Apply the subnets and security groups `options` names to this endpoint and
+    /// leave it in the status that change starts.
+    ///
+    /// `VpcOptions` is "the security groups and/or subnets to add, remove, or modify":
+    /// a member the request CARRIES replaces what the endpoint had, and a member it
+    /// leaves out names nothing to change, so it keeps the value the endpoint already
+    /// carries rather than being cleared.
+    ///
+    /// The change is not in place the instant the call returns: the endpoint is being
+    /// modified, and the clock owes it the status that modification leaves it in once
+    /// the span has passed — which is what a second writer arriving meanwhile sees
+    /// ([`Self::in_flight`]).
+    pub fn begin_update(&mut self, options: VPCOptions, now: SystemTime) {
+        if options.subnet_ids.is_some() {
+            self.vpc_options.subnet_ids = options.subnet_ids;
+        }
+        if options.security_group_ids.is_some() {
+            self.vpc_options.security_group_ids = options.security_group_ids;
+        }
+        if options.egress_enabled.is_some() {
+            self.vpc_options.egress_enabled = options.egress_enabled;
+        }
+        self.status = VPC_ENDPOINT_STATUS_UPDATING.to_string();
+        self.owed = Some(OwedStatus {
+            status: VPC_ENDPOINT_STATUS_ACTIVE.to_string(),
+            message: None,
+            due: now + PROVISIONING,
+        });
     }
 
     /// This record as `VpcEndpoint` — the shape `CreateVpcEndpoint` answers with and
@@ -744,6 +828,23 @@ pub const ENDPOINT_INACCESSIBLE: &str =
 pub fn vpc_endpoint_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(ENDPOINT_INACCESSIBLE.to_string()),
+    }
+}
+
+/// The `ConflictException` payload for a call that would change a service-managed VPC
+/// endpoint whose last change has not landed yet.
+///
+/// The service applies one change to an endpoint at a time, so a writer that arrives
+/// while another is still in flight is refused rather than overtaking it — the same
+/// rule [`concurrent_package_operation`] states for a domain's package associations.
+/// The endpoint is what the two callers are contending over, so the sentence names it
+/// and nothing else of the request.
+pub fn vpc_endpoint_being_modified(vpc_endpoint_id: &str) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "Operation not allowed. A concurrent operation is in progress for VPC endpoint \
+             {vpc_endpoint_id}."
+        )),
     }
 }
 

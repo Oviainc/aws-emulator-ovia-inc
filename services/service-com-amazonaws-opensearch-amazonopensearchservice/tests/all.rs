@@ -93,5 +93,9 @@ mod upgrade_status;
 mod version_catalog;
 #[path = "all/vpc_endpoint_access.rs"]
 mod vpc_endpoint_access;
+#[path = "all/vpc_endpoint_updates.rs"]
+mod vpc_endpoint_updates;
 #[path = "all/vpc_endpoints.rs"]
 mod vpc_endpoints;
+#[path = "all/vpc_endpoints_for_domain.rs"]
+mod vpc_endpoints_for_domain;

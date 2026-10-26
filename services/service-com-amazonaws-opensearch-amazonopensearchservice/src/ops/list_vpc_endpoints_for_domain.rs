@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListVpcEndpointsForDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListVpcEndpointsForDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListVpcEndpointsForDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the service-managed VPC endpoints of ONE domain: the same stored
+//! [`crate::state::VpcEndpointRecord`]s `ListVpcEndpoints` pages through, narrowed to the
+//! ones whose `DomainArn` is the ARN of the domain the request names, and reported
+//! through the same `VpcEndpointSummary` projection — so this listing and the
+//! account-wide one cannot describe the same endpoint differently.
+//!
+//! Both listings page that one set through the store's own
+//! [`crate::state::vpc_endpoint_page`], so they cannot drift on what a page holds, where
+//! a token resumes from, or how a listing ends.
+//!
+//! The set is selected by the ARN the named domain has, which is what an endpoint record
+//! carries. A name this account holds no domain under selects no endpoint, so the listing
+//! is EMPTY rather than refused: this operation reports endpoints, and nothing about the
+//! domain record decides which of them exist.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +87,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{domain_arn, invalid_next_token, request_region};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -92,13 +100,22 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-opensearch-amazonopense
 // here — hence the `ListVpcEndpointsForDomainError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.opensearch#ListVpcEndpointsForDomain")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.opensearch#ListVpcEndpointsForDomain",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum ListVpcEndpointsForDomainErrorModeled {
     BaseException(BaseException),
     DisabledOperationException(DisabledOperationException),
     InternalException(InternalException),
     ResourceNotFoundException(ResourceNotFoundException),
+    // Widened in through `extra_errors`, exactly as `ListVpcEndpoints` widens it: the
+    // SERVICE models `ValidationException` and this operation needs it for a `NextToken`
+    // that names no place in the set being paged, which its own `errors` list omits. One
+    // condition, one shape, one sentence across both endpoint listings. See
+    // `crate::state::invalid_next_token`.
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -152,18 +169,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListVpcEndpointsForDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListVpcEndpointsForDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListVpcEndpointsForDomain"))
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let region = request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // Reporting the set materialises only the status moves the clock already owed
+        // its records at `now` — each would have fallen due whether or not anybody
+        // called.
+        store.settle_vpc_endpoints(now);
+
+        // An endpoint names the domain it serves by ARN, so the set is selected by the
+        // ARN the named domain has: the stored domain's own, and for a name this account
+        // holds no domain under, the ARN that name WOULD have in the Region the request
+        // was signed for. A name that names no domain therefore selects nothing and the
+        // listing is EMPTY rather than refused — the recorded behaviour of this
+        // operation for a missing domain, and the reason it resolves no domain record:
+        // it reports endpoints, and nothing about the domain decides which exist.
+        let domain_arn = store
+            .domains
+            .get(&input.domain_name)
+            .map(|domain| domain.arn.clone())
+            .unwrap_or_else(|| domain_arn(&input.domain_name, &region));
+
+        // Order-stable, because the store is keyed by the endpoint's id: the same
+        // request reports the same order twice, which is what lets a token name a place
+        // in the set.
+        let of_domain: Vec<&crate::state::VpcEndpointRecord> = store
+            .vpc_endpoints
+            .values()
+            .filter(|endpoint| endpoint.domain_arn == domain_arn)
+            .collect();
+
+        // The ONE paging decision both endpoint listings go through, so the two cannot
+        // drift on what a page holds or where a token resumes from. A token naming no
+        // endpoint OF THIS DOMAIN names no place in its listing, which is a malformed
+        // request rather than an empty page — the same refusal, in the same words, the
+        // account-wide listing states for the same condition.
+        let (page, next_token) =
+            crate::state::vpc_endpoint_page(&of_domain, input.next_token.as_deref()).ok_or_else(
+                || {
+                    ListVpcEndpointsForDomainErrorModeled::ValidationException(
+                        invalid_next_token(),
+                    )
+                },
+            )?;
+
+        Ok(ListVpcEndpointsForDomainOutput {
+            vpc_endpoint_summary_list: page,
+            next_token,
+        })
     }
 }

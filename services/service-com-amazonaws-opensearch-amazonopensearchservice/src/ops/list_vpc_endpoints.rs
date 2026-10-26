@@ -73,7 +73,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{invalid_next_token, VPC_ENDPOINT_PAGE};
+use crate::state::invalid_next_token;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -167,47 +167,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Order-stable, because the store is keyed by the endpoint's id: the same
         // request reports the same order twice, which is what lets a token name a place
         // in the set.
-        //
-        // A token names the endpoint the next page starts at, so paging resumes from a
-        // place in the set rather than from an offset a create or a release would have
-        // shifted. A token naming no endpoint of the set — one this service never handed
-        // out, or one whose endpoint has since been released — names no such place,
-        // which is a malformed request rather than an empty page. The EMPTY token is the
-        // one this operation itself hands out at the end of a listing, so it starts from
-        // the first page exactly as naming no token does.
-        let start = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
-            None => 0,
-            Some(token) => store
-                .vpc_endpoints
-                .keys()
-                .position(|id| id == token)
-                .ok_or_else(|| {
-                    ListVpcEndpointsErrorModeled::ValidationException(invalid_next_token())
-                })?,
-        };
-        // ONE page, so the answer is bounded by the page size however large the stored
-        // set is.
-        let page: Vec<VpcEndpointSummary> = store
-            .vpc_endpoints
-            .values()
-            .skip(start)
-            .take(VPC_ENDPOINT_PAGE)
-            .map(crate::state::VpcEndpointRecord::to_summary)
-            .collect();
+        let ordered: Vec<&crate::state::VpcEndpointRecord> = store.vpc_endpoints.values().collect();
+
+        // The ONE paging decision both endpoint listings go through: a token naming no
+        // endpoint of the set — one this service never handed out, or one whose endpoint
+        // has since been released — names no such place, which is a malformed request
+        // rather than an empty page.
+        let (page, next_token) =
+            crate::state::vpc_endpoint_page(&ordered, input.next_token.as_deref()).ok_or_else(
+                || ListVpcEndpointsErrorModeled::ValidationException(invalid_next_token()),
+            )?;
 
         Ok(ListVpcEndpointsOutput {
             vpc_endpoint_summary_list: page,
-            // "When nextToken is returned, there are more results available": the token
-            // is the endpoint the next page starts at, and there is none once this page
-            // ended the set. The member is REQUIRED by the model, so the end of the
-            // listing is the empty token rather than no member — which is also what a
-            // paginating client stops on.
-            next_token: store
-                .vpc_endpoints
-                .keys()
-                .nth(start.saturating_add(VPC_ENDPOINT_PAGE))
-                .cloned()
-                .unwrap_or_default(),
+            next_token,
         })
     }
 }

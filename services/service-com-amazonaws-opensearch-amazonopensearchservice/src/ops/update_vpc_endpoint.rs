@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateVpcEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateVpcEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateVpcEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the subnets and security groups the call names to one service-managed VPC
+//! endpoint: the ONE [`crate::state::VpcEndpointRecord`] every endpoint operation reads
+//! and writes takes the requested `VpcOptions`, rests in its updating status, and is
+//! owed the status that change leaves it in by the clock — so the call answers with the
+//! endpoint it persisted, through the same `VpcEndpoint` projection a create and a
+//! describe report.
+//!
+//! The service applies one change to an endpoint at a time: a writer that arrives while
+//! another change to the SAME endpoint has not landed yet is refused with the modelled
+//! `ConflictException` rather than overtaking it, which is what makes two racing
+//! updates settle on exactly one winner's options instead of a merge of both. Once
+//! nothing is in flight the refused request succeeds unchanged.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +82,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::{vpc_endpoint_being_modified, vpc_endpoint_not_found};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -152,18 +158,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateVpcEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateVpcEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateVpcEndpoint"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Whatever the clock already owed the endpoints is materialised first, so this
+        // call decides on the state of the store at `now`: an endpoint whose last
+        // change has landed is no longer in flight and can take another one.
+        store.settle_vpc_endpoints(now);
+
+        // The endpoint is addressed by its own id, so an id the store holds none under
+        // is the modelled missing-resource refusal rather than a change applied to
+        // nothing — the same refusal the call that RELEASES one endpoint answers such an
+        // id with.
+        let endpoint = store
+            .vpc_endpoints
+            .get_mut(&input.vpc_endpoint_id)
+            .ok_or_else(|| {
+                UpdateVpcEndpointErrorModeled::ResourceNotFoundException(vpc_endpoint_not_found())
+            })?;
+
+        // One change at a time: a call that arrives while another change to this
+        // endpoint has not landed yet is refused, so of two writers exactly one applies
+        // and the endpoint settles with that one's options rather than with a merge of
+        // both. The condition is read AFTER the settling above, so an endpoint whose
+        // change has merely fallen due is idle again and this request is served.
+        if endpoint.in_flight() {
+            return Err(UpdateVpcEndpointErrorModeled::ConflictException(
+                vpc_endpoint_being_modified(&input.vpc_endpoint_id),
+            )
+            .into());
+        }
+
+        endpoint.begin_update(input.vpc_options, now);
+
+        // Answered from the STORED record, through the projection every read path
+        // reports an endpoint with: the slot the write went into IS the record.
+        Ok(UpdateVpcEndpointOutput {
+            vpc_endpoint: endpoint.to_endpoint(),
+        })
     }
 }
