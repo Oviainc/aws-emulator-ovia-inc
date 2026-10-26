@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/list_streams_discovery.rs"]
 mod list_streams_discovery;
+#[path = "all/not_found_messages.rs"]
+mod not_found_messages;
 #[path = "all/record_creation_time_whole_seconds.rs"]
 mod record_creation_time_whole_seconds;
 #[path = "all/record_retention_budget.rs"]

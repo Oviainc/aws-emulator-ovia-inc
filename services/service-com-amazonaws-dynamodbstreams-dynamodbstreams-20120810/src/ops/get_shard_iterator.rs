@@ -10,6 +10,11 @@
 //! asynchronous enable is still pending — which exposes no shards — has no shard to
 //! iterate and the request is `ResourceNotFoundException`.
 //!
+//! This operation's `ResourceNotFoundException` message is a FIXED sentence naming
+//! only the kind of resource that is absent; it never interpolates the ARN or shard
+//! id it was handed. Reporting on one named stream is `DescribeStream`'s job, and its
+//! message is the one that names the stream asked for.
+//!
 //! The two refusals a `SequenceNumber` can draw are different claims and are decided
 //! apart: a number the addressed shard's own range does not cover, or a position the
 //! request leaves out altogether, is a bad argument (`ValidationException`), while
@@ -110,6 +115,20 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The message this operation answers when the stream it was given is not one it can
+/// iterate: either no stream is registered under that ARN, or the asynchronous enable
+/// the registration started has not finished, so the stream serves no shard yet.
+///
+/// Request-INDEPENDENT, and deliberately not the text `DescribeStream` answers for an
+/// absent stream. Both refusals carry the one error code, so the message is all a
+/// consumer has to tell "this call cannot iterate that stream yet" from "no such
+/// stream", and this one echoes nothing it was handed.
+const STREAM_NOT_FOUND_MESSAGE: &str = "Requested resource not found: Stream does not exist";
+
+/// The message for a shard id the stream being served does not have — the same fixed
+/// form, naming the kind of resource that is absent rather than the id requested.
+const SHARD_NOT_FOUND_MESSAGE: &str = "Requested resource not found: Shard does not exist";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -196,27 +215,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.materialize_due_expiries(now);
 
         let next_position = {
-            let stream = guard.stream(&input.stream_arn).ok_or_else(|| {
-                GetShardIteratorErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Requested resource not found: Stream: {} not found",
-                            input.stream_arn
-                        )),
-                    },
-                )
-            })?;
-            // The shard must be one the stream SERVES at this instant: while the
-            // stream's asynchronous enable is still pending it exposes no shards
-            // at all, so there is nothing to place an iterator in and the shard is
-            // as absent as one of another stream.
+            // A stream this call can place a cursor in is one that SERVES shards at
+            // this instant: while the stream's asynchronous enable is still pending it
+            // exposes no shards at all, so there is nothing to iterate and the stream
+            // is as unknown to this call as an ARN nothing was ever registered under.
+            let stream = guard
+                .stream(&input.stream_arn)
+                .filter(|stream| !stream.shards_at(now).is_empty())
+                .ok_or_else(|| {
+                    GetShardIteratorErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(STREAM_NOT_FOUND_MESSAGE.to_string()),
+                        },
+                    )
+                })?;
+            // The shard must be one of those the stream serves.
             let shard = stream.shard_at(&input.shard_id, now).ok_or_else(|| {
                 GetShardIteratorErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Requested resource not found: Shard: {} not found in stream {}",
-                            input.shard_id, input.stream_arn
-                        )),
+                        message: Some(SHARD_NOT_FOUND_MESSAGE.to_string()),
                     },
                 )
             })?;

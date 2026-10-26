@@ -100,6 +100,19 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The message this operation answers when the stream the presented iterator stands
+/// in is no longer one this service serves.
+///
+/// A fixed sentence naming the kind of resource that is absent: this call is handed an
+/// opaque token and never an ARN, so the refusal has nothing of the request to report
+/// and does not disclose the stream the token resolved to. Naming the stream asked for
+/// is `DescribeStream`'s job.
+const STREAM_NOT_FOUND_MESSAGE: &str = "Requested resource not found: Stream does not exist";
+
+/// The message for an iterator whose shard the stream no longer has — the same fixed
+/// form, naming the kind of resource that is absent.
+const SHARD_NOT_FOUND_MESSAGE: &str = "Requested resource not found: Shard does not exist";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -227,18 +240,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (records, next_position, shard_drained) = {
             let stream = guard.stream(&cursor.stream_arn).ok_or_else(|| {
                 GetRecordsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!(
-                        "Requested resource not found: Stream: {} not found",
-                        cursor.stream_arn
-                    )),
+                    message: Some(STREAM_NOT_FOUND_MESSAGE.to_string()),
                 })
             })?;
             let shard = stream.shard(&cursor.shard_id).ok_or_else(|| {
                 GetRecordsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!(
-                        "Requested resource not found: Shard: {} not found in stream {}",
-                        cursor.shard_id, cursor.stream_arn
-                    )),
+                    message: Some(SHARD_NOT_FOUND_MESSAGE.to_string()),
                 })
             })?;
             // The record this iterator points at was trimmed after the iterator was
