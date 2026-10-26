@@ -142,8 +142,13 @@ fn create_body(name: &str, row: &Row) -> Value {
 
 /// The `Endpoints` map of a `DomainStatus`, as the keys it carries paired with their
 /// hosts — empty when the member is absent, which is what a public domain reports.
+///
+/// The pairs come back ordered by key, because `Endpoints` is a MAP: the document a
+/// client reads states which host each key is reached on and nothing about the order
+/// the members travel in, so two reads are compared by their entries rather than by
+/// the order one serialization happened to emit them in.
 fn endpoints(status: &Value, case: &str) -> Vec<(String, String)> {
-    match &status["Endpoints"] {
+    let mut entries: Vec<(String, String)> = match &status["Endpoints"] {
         Value::Null => Vec::new(),
         Value::Object(map) => map
             .iter()
@@ -155,7 +160,9 @@ fn endpoints(status: &Value, case: &str) -> Vec<(String, String)> {
             })
             .collect(),
         other => panic!("case {case:?}: expected an Endpoints map or none at all, got {other:?}"),
-    }
+    };
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    entries
 }
 
 /// One host's opaque per-domain id, with the tail the rule gives that host checked

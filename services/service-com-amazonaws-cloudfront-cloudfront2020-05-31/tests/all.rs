@@ -143,6 +143,8 @@ mod refusal_contract;
 mod response_headers_policy_config_read;
 #[path = "all/response_headers_policy_lifecycle.rs"]
 mod response_headers_policy_lifecycle;
+#[path = "all/response_headers_policy_refusal_message.rs"]
+mod response_headers_policy_refusal_message;
 #[path = "all/staging_config_promotion.rs"]
 mod staging_config_promotion;
 #[path = "all/state_roundtrip.rs"]

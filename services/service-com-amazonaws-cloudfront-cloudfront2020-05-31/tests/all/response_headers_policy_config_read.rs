@@ -40,7 +40,10 @@ use crate::response_headers_policy_lifecycle::{
 
 /// `GET /2020-05-31/response-headers-policy/{Id}/config` — the route the model binds this
 /// operation to.
-async fn get_policy_config(router: &MultiServiceRouter, id: &str) -> Answer {
+///
+/// `pub(crate)` so a sibling suite drives this reader's id resolution over the same wire
+/// path rather than growing a copy of this.
+pub(crate) async fn get_policy_config(router: &MultiServiceRouter, id: &str) -> Answer {
     call(
         router,
         "GET",
