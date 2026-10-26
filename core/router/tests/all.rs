@@ -189,6 +189,10 @@ mod elbv2_network_resolution;
 // appends its line.
 #[path = "all/elbv2_ip_target_refusal_classes.rs"]
 mod elbv2_ip_target_refusal_classes;
+// Declared beside its sibling suites, in this span of the sorted list rather than appended
+// at the tail of this file, for the reason the notes above give.
+#[path = "all/elbv2_subnet_and_elastic_ip_resolution.rs"]
+mod elbv2_subnet_and_elastic_ip_resolution;
 // Alphabetically between the `elbv2_` and `es_` suites, rather than appended at the end
 // of this file, which is where every new suite lands and therefore where two changes
 // collide.

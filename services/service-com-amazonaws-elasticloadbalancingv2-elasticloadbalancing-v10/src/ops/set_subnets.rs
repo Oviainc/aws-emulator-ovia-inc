@@ -217,27 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "You must specify either Subnets or SubnetMappings".to_string(),
             ));
         }
-        let requested_subnets: Vec<String> = subnets
-            .iter()
-            .cloned()
-            .chain(
-                subnet_mappings
-                    .iter()
-                    .filter_map(|mapping| mapping.subnet_id.clone()),
-            )
-            .collect();
-        // "You can specify only one subnet per Availability Zone": a request naming more
-        // subnets than a Region has zones names two of them in one zone whatever those
-        // subnets are, which is also what bounds the work one request can ask for on this
-        // path.
-        if requested_subnets.len() > crate::state::SUBNETS_PER_LOAD_BALANCER {
-            return Err(invalid_configuration(format!(
-                "You can specify only one subnet per Availability Zone, so at most {} \
-                 subnets, and this request names {}",
-                crate::state::SUBNETS_PER_LOAD_BALANCER,
-                requested_subnets.len()
-            )));
-        }
+        let requested_placements = subnets.len() + subnet_mappings.len();
 
         // What the load balancer is today, read under the lock and then released: the
         // subnets are resolved against EC2 next, and nothing is held across that call.
@@ -253,18 +233,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
-        // "[Application Load Balancers] You must specify subnets from at least two
-        // Availability Zones", and one subnet per zone means at least two subnets.
-        if family == crate::state::LoadBalancerFamily::Application
-            && requested_subnets.len() < SUBNETS_PER_APPLICATION_LOAD_BALANCER
-        {
-            return Err(invalid_configuration(format!(
-                "An application load balancer must be placed in at least \
-                 {SUBNETS_PER_APPLICATION_LOAD_BALANCER} subnets, in as many Availability \
-                 Zones, and this request names {}",
-                requested_subnets.len()
-            )));
+        // How many PLACEMENTS the request asks for — one per `Subnets` entry and one per
+        // `SubnetMappings` entry — judged before anything reads either list, because this
+        // is the bound that has to dominate every per-entry step below: the zone records
+        // this call persists on the load balancer and the addresses it resolves against
+        // EC2. Both the ceiling ("you can specify only one subnet per Availability Zone")
+        // and the Application family's floor are one reading in `crate::state`, the same
+        // one `CreateLoadBalancer` applies to the subnets a load balancer STARTS in.
+        if let Err(rule) = crate::state::check_placement_count(family, requested_placements) {
+            return Err(invalid_configuration(rule));
         }
+        // Each `SubnetMapping` member is documented for one family, and two of them for
+        // one scheme of it, so an address pinned on a load balancer that could never carry
+        // it is refused rather than stored.
+        for mapping in subnet_mappings {
+            if let Err(rule) = crate::state::check_subnet_mapping(family, &scheme, mapping) {
+                return Err(invalid_configuration(rule));
+            }
+        }
+        let requested_subnets: Vec<String> = subnets
+            .iter()
+            .cloned()
+            .chain(
+                subnet_mappings
+                    .iter()
+                    .filter_map(|mapping| mapping.subnet_id.clone()),
+            )
+            .collect();
 
         // The IP address type the load balancer will carry after this call: the one the
         // request names, else the one it already has. Judged by the same two rules
@@ -293,7 +288,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // say which Availability Zone each one is in — so they are resolved against EC2
         // before anything is written. The store is locked only once the answer is in.
         let resolved_subnets =
-            crate::state::network::subnets_by_id(ctx, &region, &requested_subnets).await;
+            match crate::state::network::resolve_subnets(ctx, &region, &requested_subnets).await {
+                // One the account does not hold is a placement EC2 itself refuses, so the
+                // modelled `SubnetNotFound` carries the code EC2 answered — the same
+                // reading `CreateLoadBalancer` applies to the subnets a load balancer
+                // STARTS in.
+                crate::state::network::SubnetLookup::Absent(code) => {
+                    return Err(SetSubnetsErrorModeled::SubnetNotFoundException(
+                        SubnetNotFoundException {
+                            message: Some(code),
+                        },
+                    )
+                    .into())
+                }
+                crate::state::network::SubnetLookup::Resolved(subnets) => Some(subnets),
+                crate::state::network::SubnetLookup::Unknown => None,
+            };
+        // An Elastic IP is EC2's resource too, and the allocation id is what names it.
+        let allocation_ids: Vec<String> = subnet_mappings
+            .iter()
+            .filter_map(|mapping| mapping.allocation_id.clone())
+            .collect();
+        if let Some(code) =
+            crate::state::network::absent_allocation_id(ctx, &region, &allocation_ids).await
+        {
+            return Err(
+                SetSubnetsErrorModeled::AllocationIdNotFoundException(
+                    AllocationIdNotFoundException {
+                        message: Some(code),
+                    },
+                )
+                .into(),
+            );
+        }
         let zones = crate::state::availability_zone_records(
             subnets,
             subnet_mappings,
@@ -330,11 +357,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// How many subnets an Application Load Balancer is placed in at least, from this
-/// operation's own documentation: "[Application Load Balancers] You must specify subnets
-/// from at least two Availability Zones" — one subnet per zone, so two subnets.
-const SUBNETS_PER_APPLICATION_LOAD_BALANCER: usize = 2;
 
 /// The `EnablePrefixForIpv6SourceNatEnum` value that turns source NAT prefixes on, from
 /// that enum's own values (`off`, `on`).

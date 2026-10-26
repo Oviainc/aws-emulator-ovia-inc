@@ -9,6 +9,16 @@
 //! balancer, and only a repeat with DIFFERENT settings is
 //! `DuplicateLoadBalancerNameException`.
 //!
+//! Nothing is minted for a request the model's own documentation says this operation
+//! cannot serve, so a refused create leaves the name free: a `Name` outside its documented
+//! form (`ValidationError`), a placement with fewer subnets than the family requires, an
+//! `IpAddressType` the family and scheme cannot carry or a `SubnetMapping` member
+//! documented for another family or scheme (`InvalidConfigurationRequest`), and a subnet
+//! or Elastic IP allocation EC2 — which owns both — holds none of (`SubnetNotFound`,
+//! `AllocationIdNotFound`). Each rule is read once, in `crate::state`, because
+//! `SetSubnets` and `SetIpAddressType` apply the same ones to a load balancer that
+//! already exists.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -226,6 +236,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now = std::time::SystemTime::now();
 
+        // The model's own rule for `Name`: "This name must be unique per region per
+        // account, can have a maximum of 32 characters, must contain only alphanumeric
+        // characters or hyphens, must not begin or end with a hyphen, and must not begin
+        // with 'internal-'." The Smithy shape carries no `@length` or `@pattern`, so the
+        // boundary validator passes every name and this handler is the only gate; the
+        // uniqueness half of that rule is the duplicate-name check further down, which
+        // needs the store.
+        crate::state::check_load_balancer_name(&input.name)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        // The modelled defaults: "the default is an Internet-facing load balancer"
+        // (`Scheme`), "the default is application" (`Type`), and `ipv4` for
+        // `IpAddressType`. Resolved before anything is judged, because every rule below is
+        // about the load balancer the request asks for rather than about what it spelled
+        // out.
+        let scheme = input
+            .scheme
+            .clone()
+            .unwrap_or_else(|| "internet-facing".to_string());
+        let lb_type = input
+            .r#type
+            .clone()
+            .unwrap_or_else(|| "application".to_string());
+        let family = crate::state::load_balancer_family(&lb_type);
+        let ip_address_type = input
+            .ip_address_type
+            .clone()
+            .unwrap_or_else(|| crate::state::IPV4_ADDRESS_TYPE.to_string());
+
         // The model: "You must specify either subnets or subnet mappings, but not
         // both." The model cannot express that pairing, so the handler refuses it
         // with the modelled "requested configuration is not valid" error rather than
@@ -243,6 +282,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // How many PLACEMENTS the request asks for: one per `Subnets` entry and one per
+        // `SubnetMappings` entry, counted before anything else reads either list, because
+        // this is the bound that has to dominate every per-entry step below — the zone
+        // records persisted on the load balancer and the addresses resolved against EC2.
+        // Both the ceiling ("you can specify only one subnet per Availability Zone") and
+        // the family's floor are one reading in `crate::state`, which `SetSubnets` applies
+        // to the subnets that REPLACE these, so one call cannot place a load balancer where
+        // the other would not.
+        if let Err(rule) =
+            crate::state::check_placement_count(family, subnets.len() + subnet_mappings.len())
+        {
+            return Err(invalid_configuration(&rule));
+        }
         // The subnets a load balancer is placed in are EC2's resources, and they are
         // what say which VPC and which Availability Zone it is in — so they are resolved
         // against EC2 before anything is written. Nothing is held across that call: the
@@ -256,21 +308,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .filter_map(|mapping| mapping.subnet_id.clone()),
             )
             .collect();
-        // "You can specify only one subnet per Availability Zone": a request naming more
-        // subnets than a Region has zones names two of them in one zone whatever those
-        // subnets are, so it is refused here — before the subnets are resolved and before
-        // a zone is named for any of them, which is also what bounds the work one request
-        // can ask for on this path ([`SUBNETS_PER_LOAD_BALANCER`]).
-        if requested_subnets.len() > crate::state::SUBNETS_PER_LOAD_BALANCER {
-            return Err(invalid_configuration(&format!(
-                "You can specify only one subnet per Availability Zone, so at most {} \
-                 subnets, and this request names {}",
-                crate::state::SUBNETS_PER_LOAD_BALANCER,
-                requested_subnets.len()
-            )));
+        // Each `SubnetMapping` member is documented for one family, and two of them for
+        // one scheme of it, so an address pinned on a load balancer that could never carry
+        // it is refused rather than stored.
+        for mapping in subnet_mappings {
+            if let Err(rule) = crate::state::check_subnet_mapping(family, &scheme, mapping) {
+                return Err(invalid_configuration(&rule));
+            }
         }
-        let resolved_subnets =
-            crate::state::network::subnets_by_id(ctx, &region, &requested_subnets).await;
+        // "Internal load balancers must use ipv4", and `dualstack-without-public-ipv4` is
+        // an Application Load Balancer's alone — the same two rules `SetIpAddressType` and
+        // `SetSubnets` apply, so a create cannot start a load balancer at a type they
+        // would refuse to set.
+        if let Err(rule) = crate::state::check_ip_address_type(family, &scheme, &ip_address_type) {
+            return Err(invalid_configuration(&rule));
+        }
+
+        let resolved_subnets = match crate::state::network::resolve_subnets(
+            ctx,
+            &region,
+            &requested_subnets,
+        )
+        .await
+        {
+            // The subnets are EC2's resources: one the account does not hold is a
+            // placement EC2 itself refuses, so the modelled `SubnetNotFound` carries the
+            // code EC2 answered rather than a sentence restating it.
+            crate::state::network::SubnetLookup::Absent(code) => {
+                return Err(CreateLoadBalancerErrorModeled::SubnetNotFoundException(
+                    SubnetNotFoundException {
+                        message: Some(code),
+                    },
+                )
+                .into())
+            }
+            crate::state::network::SubnetLookup::Resolved(subnets) => Some(subnets),
+            // Nothing is known about the subnets — there is no EC2 to ask — so nothing is
+            // refused on them and the zones are stood in for.
+            crate::state::network::SubnetLookup::Unknown => None,
+        };
+        // An Elastic IP is EC2's resource too, and the allocation id is what names it, so
+        // an address the account holds no allocation for is refused the same way.
+        let allocation_ids: Vec<String> = subnet_mappings
+            .iter()
+            .filter_map(|mapping| mapping.allocation_id.clone())
+            .collect();
+        if let Some(code) =
+            crate::state::network::absent_allocation_id(ctx, &region, &allocation_ids).await
+        {
+            return Err(
+                CreateLoadBalancerErrorModeled::AllocationIdNotFoundException(
+                    AllocationIdNotFoundException {
+                        message: Some(code),
+                    },
+                )
+                .into(),
+            );
+        }
         // "Every DescribeLoadBalancers entry carries the VpcId the load balancer's
         // subnets belong to": the VPC of the subnets it was created in, reported only
         // when the subnets agree on one — which is the only case AWS creates at all.
@@ -292,24 +386,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: String::new(),
             id: String::new(),
             name: input.name.clone(),
+            region: region.clone(),
             dns_name: String::new(),
             created_time: now,
-            // The modelled default for `Scheme`: "the default is an Internet-facing
-            // load balancer".
-            scheme: input
-                .scheme
-                .clone()
-                .unwrap_or_else(|| "internet-facing".to_string()),
+            scheme,
             // The VPC the load balancer's subnets belong to, as EC2 reports it; left
             // unreported when there is no EC2 to ask, rather than invented.
             vpc_id,
             state_code: "provisioning".to_string(),
             active_at: now + crate::state::SETTLE_AFTER,
-            // The modelled default for `Type`: "the default is application".
-            lb_type: input
-                .r#type
-                .clone()
-                .unwrap_or_else(|| "application".to_string()),
+            lb_type,
             availability_zones: crate::state::availability_zone_records(
                 subnets,
                 subnet_mappings,
@@ -317,11 +403,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 resolved_subnets.as_deref(),
             ),
             security_groups: input.security_groups.clone().unwrap_or_default(),
-            // The modelled default for `IpAddressType`.
-            ip_address_type: input
-                .ip_address_type
-                .clone()
-                .unwrap_or_else(|| "ipv4".to_string()),
+            ip_address_type,
             customer_owned_ipv4_pool: input.customer_owned_ipv4_pool.clone(),
             // Nothing has set either of these on a load balancer being created: the
             // members that carry them belong to `SetSecurityGroups` and `SetSubnets`,
@@ -359,7 +441,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateLoadBalancerErrorModeled::DuplicateLoadBalancerNameException(
                 DuplicateLoadBalancerNameException {
                     message: Some(format!(
-                        "A load balancer with the name '{}' already exists",
+                        "A load balancer with the same name '{}' exists, but with different \
+                         settings",
                         candidate.name
                     )),
                 },

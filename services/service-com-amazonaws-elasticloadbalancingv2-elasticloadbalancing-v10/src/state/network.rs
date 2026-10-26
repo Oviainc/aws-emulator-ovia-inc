@@ -140,31 +140,155 @@ fn subnet_facts(subnet: &::aws_sdk_ec2::types::Subnet) -> SubnetFacts {
     }
 }
 
-/// The subnets EC2 holds for the ids a request named, in the order EC2 answered, or
-/// `None` when EC2 could not be asked or refused the read (an id that names no subnet of
-/// the account refuses the WHOLE read, so nothing is known about any of them).
-pub async fn subnets_by_id(
+/// What EC2 says about the subnets a request named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubnetLookup {
+    /// EC2 reported the subnets, in the order it answered.
+    Resolved(Vec<SubnetFacts>),
+    /// EC2 reports that the account holds no subnet for one of the ids the request named,
+    /// carrying the error CODE it answered (`InvalidSubnetID.NotFound` for an id that
+    /// names no subnet, `InvalidSubnetID.Malformed` for a value that is not a subnet id at
+    /// all) — which is what a caller states when it refuses the request, because Elastic
+    /// Load Balancing reports the EC2 refusal it ran into rather than restating it.
+    Absent(String),
+    /// Nothing is known: there is no EC2 to ask, or it answered something else.
+    Unknown,
+}
+
+/// What EC2 says about the subnets `subnet_ids` names.
+///
+/// EC2 refuses a read naming an id the account holds no subnet for, so one bad id says
+/// nothing about the others — which is why the refusal is reported for the request as a
+/// whole. Any other failure is this emulator failing to ask rather than EC2 reporting a bad
+/// subnet, so it says nothing ([`SubnetLookup::Unknown`]), and a request naming no subnet
+/// at all resolves to no facts.
+pub async fn resolve_subnets(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     subnet_ids: &[String],
-) -> Option<Vec<SubnetFacts>> {
+) -> SubnetLookup {
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
     if subnet_ids.is_empty() {
-        return None;
+        return SubnetLookup::Unknown;
     }
     let answer = ec2(ctx, region)
         .describe_subnets()
         .set_subnet_ids(Some(subnet_ids.to_vec()))
         .send()
         .await;
-    match answer {
-        Ok(output) => Some(output.subnets().iter().map(subnet_facts).collect()),
-        Err(error) => {
-            ::tracing::debug!(
-                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                "the subnets a request named could not be resolved against EC2"
-            );
-            None
+    let error = match answer {
+        Ok(output) => {
+            let reported: Vec<SubnetFacts> = output.subnets().iter().map(subnet_facts).collect();
+            // A read that resolved but reports no subnet for an id the request named says
+            // the same thing the refusal below does.
+            if subnet_ids
+                .iter()
+                .any(|id| !reported.iter().any(|subnet| &subnet.subnet_id == id))
+            {
+                return SubnetLookup::Absent(SUBNET_ID_NOT_FOUND.to_string());
+            }
+            return SubnetLookup::Resolved(reported);
         }
+        Err(error) => error,
+    };
+    let code = error
+        .as_service_error()
+        .and_then(ProvideErrorMetadata::code)
+        .unwrap_or_default()
+        .to_string();
+    if code.starts_with(SUBNET_ID_REFUSAL_PREFIX) {
+        return SubnetLookup::Absent(code);
+    }
+    ::tracing::debug!(
+        error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+        "the subnets a request named could not be resolved against EC2"
+    );
+    SubnetLookup::Unknown
+}
+
+/// The prefix of every EC2 error code that says an id names no subnet of the account:
+/// `InvalidSubnetID.NotFound` for one no subnet carries, `InvalidSubnetID.Malformed` for a
+/// value that is not a subnet id at all. Both say the same thing about a placement.
+const SUBNET_ID_REFUSAL_PREFIX: &str = "InvalidSubnetID.";
+
+/// The EC2 code for an id the account holds no subnet for, which is what a read that
+/// resolved without reporting one of the ids ran into.
+const SUBNET_ID_NOT_FOUND: &str = "InvalidSubnetID.NotFound";
+
+/// The prefix of every EC2 error code that says a value names no Elastic IP allocation of
+/// the account: `InvalidAllocationID.NotFound` and `InvalidAllocationID.Malformed`.
+const ALLOCATION_ID_REFUSAL_PREFIX: &str = "InvalidAllocationID.";
+
+/// The EC2 code for an id the account holds no Elastic IP allocation for.
+const ALLOCATION_ID_NOT_FOUND: &str = "InvalidAllocationID.NotFound";
+
+/// The EC2 refusal the allocation ids a request pinned ran into, or `None` when EC2
+/// resolved every one of them — and also when there is no EC2 to ask, because a refusal has
+/// to be grounded in what EC2 reported rather than assumed from silence.
+///
+/// An Elastic IP address is EC2's resource, and its allocation id is what names it, so
+/// whether an address exists to pin on a load balancer's subnet is EC2's to say. The value
+/// is the error CODE EC2 answered, for the caller to state in its own refusal.
+pub async fn absent_allocation_id(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    allocation_ids: &[String],
+) -> Option<String> {
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+    if allocation_ids.is_empty() {
+        return None;
+    }
+    let answer = ec2(ctx, region)
+        .describe_addresses()
+        .set_allocation_ids(Some(allocation_ids.to_vec()))
+        .send()
+        .await;
+    let error = match answer {
+        Ok(output) => {
+            let reported: Vec<&str> = output
+                .addresses()
+                .iter()
+                .filter_map(::aws_sdk_ec2::types::Address::allocation_id)
+                .collect();
+            return allocation_ids
+                .iter()
+                .any(|id| !reported.contains(&id.as_str()))
+                .then(|| ALLOCATION_ID_NOT_FOUND.to_string());
+        }
+        Err(error) => error,
+    };
+    let code = error
+        .as_service_error()
+        .and_then(ProvideErrorMetadata::code)
+        .unwrap_or_default()
+        .to_string();
+    if code.starts_with(ALLOCATION_ID_REFUSAL_PREFIX) {
+        return Some(code);
+    }
+    ::tracing::debug!(
+        error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+        "the Elastic IP allocations a request named could not be resolved against EC2"
+    );
+    None
+}
+
+/// The subnets EC2 holds for the ids a request named, in the order EC2 answered, or
+/// `None` when EC2 could not be asked or refused the read (an id that names no subnet of
+/// the account refuses the WHOLE read, so nothing is known about any of them).
+///
+/// The reporting half of [`resolve_subnets`], for a caller that places nothing and so has
+/// no refusal to raise: an unresolved subnet leaves the members it would have filled
+/// unreported.
+pub async fn subnets_by_id(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    subnet_ids: &[String],
+) -> Option<Vec<SubnetFacts>> {
+    match resolve_subnets(ctx, region, subnet_ids).await {
+        SubnetLookup::Resolved(subnets) => Some(subnets),
+        SubnetLookup::Absent(_) | SubnetLookup::Unknown => None,
     }
 }
 

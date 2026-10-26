@@ -200,7 +200,22 @@ pub(crate) fn action(name: &str) -> Vec<(String, String)> {
 }
 
 /// Send one awsQuery request: `pairs` are the form fields, `Action` included.
+///
+/// Signed for [`REGION`], which is the Region every suite's ARNs and DNS names belong to.
+/// A suite that asserts what the service mints for ANOTHER Region sends the same request
+/// through [`call_in_region`], which is where the request is built: one builder for the
+/// crate, so no suite can drift on how an awsQuery request is addressed.
 pub(crate) async fn call(router: &MultiServiceRouter, pairs: &[(String, String)]) -> Reply {
+    call_in_region(router, REGION, pairs).await
+}
+
+/// Send one awsQuery request signed for `region`, which is the Region the service reads off
+/// the SigV4 credential scope.
+pub(crate) async fn call_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
+    pairs: &[(String, String)],
+) -> Reply {
     let body = pairs
         .iter()
         .map(|(key, value)| format!("{}={}", encode(key), encode(value)))
@@ -216,12 +231,12 @@ pub(crate) async fn call(router: &MultiServiceRouter, pairs: &[(String, String)]
     // both services mounted.
     let request = http::Request::builder()
         .method("POST")
-        .uri("https://elasticloadbalancingv2.us-west-2.amazonaws.com/")
+        .uri(format!("https://elasticloadbalancingv2.{region}.amazonaws.com/"))
         .header("content-type", "application/x-www-form-urlencoded")
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/elasticloadbalancingv2/aws4_request, SignedHeaders=host, Signature=0000"
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/elasticloadbalancingv2/aws4_request, SignedHeaders=host, Signature=0000"
             ),
         )
         .body(bytes::Bytes::from(body))
@@ -466,8 +481,12 @@ async fn the_provisioning_loop_is_persisted_and_read_back() {
     );
     let hosted_zone = first_text(lb, "CanonicalHostedZoneId");
     assert_eq!(
-        hosted_zone, None,
-        "case describe by arn: AWS's published hosted zone id is in neither the model nor the request, so it must be left unreported rather than invented, got {hosted_zone:?}"
+        hosted_zone.as_deref(),
+        // The hosted zone Elastic Load Balancing publishes for an Application Load
+        // Balancer of this Region; `all/load_balancer_input_rules.rs` walks the rest of
+        // that table.
+        Some("Z1H1FL5HABSF5"),
+        "case describe by arn: expected the hosted zone published for {REGION}, got {hosted_zone:?}"
     );
     let subnets: Vec<String> = members(lb, "AvailabilityZones")
         .iter()

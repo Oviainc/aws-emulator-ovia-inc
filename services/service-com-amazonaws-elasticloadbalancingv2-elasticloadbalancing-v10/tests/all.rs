@@ -23,6 +23,8 @@ mod listener_rules;
 mod listener_tls_certificates;
 #[path = "all/load_balancer_attributes.rs"]
 mod load_balancer_attributes;
+#[path = "all/load_balancer_input_rules.rs"]
+mod load_balancer_input_rules;
 #[path = "all/load_balancer_network_capacity_and_policy.rs"]
 mod load_balancer_network_capacity_and_policy;
 #[path = "all/provisioning_loop.rs"]

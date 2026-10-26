@@ -432,6 +432,20 @@ async fn discovers_what_the_owning_services_hold() {
         .await,
         "subnetId",
     );
+    // A second subnet of the same VPC, because the load balancer below is an Application
+    // Load Balancer: ELBv2 places one in at least two Availability Zones, and resolves the
+    // subnets a request names against EC2, which owns them.
+    let second_subnet = element(
+        "second subnet",
+        &ec2_ok(
+            "second subnet",
+            &router,
+            "CreateSubnet",
+            &[p("VpcId", &vpc), p("CidrBlock", "10.0.2.0/24")],
+        )
+        .await,
+        "subnetId",
+    );
     let group_name = "fms-discovered-group";
     let group = element(
         "security group",
@@ -532,7 +546,7 @@ async fn discovers_what_the_owning_services_hold() {
         &[
             p("Name", load_balancer_name),
             p("Subnets.member.1", &subnet),
-            p("Subnets.member.2", "subnet-11111111"),
+            p("Subnets.member.2", &second_subnet),
         ],
     )
     .await;

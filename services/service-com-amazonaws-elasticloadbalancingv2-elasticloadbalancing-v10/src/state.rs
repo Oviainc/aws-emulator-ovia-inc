@@ -207,6 +207,10 @@ pub struct LoadBalancerRecord {
     /// The 16-hex id that both the ARN and the DNS name carry.
     pub id: String,
     pub name: String,
+    /// The Region the load balancer was created in — the one its ARN and its DNS name
+    /// carry, and the one whose published hosted zone a read reports
+    /// ([`Self::canonical_hosted_zone_id`]).
+    pub region: String,
     pub dns_name: String,
     pub created_time: SystemTime,
     pub scheme: String,
@@ -260,12 +264,7 @@ impl LoadBalancerRecord {
         LoadBalancer {
             load_balancer_arn: Some(self.arn.clone()),
             dns_name: Some(self.dns_name.clone()),
-            // AWS reports the PUBLISHED Route 53 hosted zone id of the load
-            // balancer's region and type. That constant is in neither the model nor
-            // the request, and a derived stand-in would be a value of the right
-            // shape that resolves to nothing — so, as with `vpc_id`, the member is
-            // left unreported rather than invented.
-            canonical_hosted_zone_id: None,
+            canonical_hosted_zone_id: self.canonical_hosted_zone_id(),
             created_time: Some(::aws_smithy_types::DateTime::from(self.created_time)),
             load_balancer_name: Some(self.name.clone()),
             scheme: Some(self.scheme.clone()),
@@ -295,6 +294,13 @@ impl LoadBalancerRecord {
     /// and the IP address types and security groups it accepts.
     pub fn family(&self) -> LoadBalancerFamily {
         load_balancer_family(&self.lb_type)
+    }
+
+    /// The hosted zone a client aliases this load balancer's DNS name through
+    /// (`LoadBalancer$CanonicalHostedZoneId`): the one published for the Region the load
+    /// balancer is in and the family it belongs to — see [`canonical_hosted_zone_id`].
+    pub fn canonical_hosted_zone_id(&self) -> Option<String> {
+        canonical_hosted_zone_id(&self.region, self.family()).map(str::to_string)
     }
 
     /// The IPAM pools this load balancer draws from, as the modelled shape, or `None`
@@ -557,19 +563,59 @@ pub fn priority_in_use_message(priority: i32, listener_arn: &str) -> String {
 /// `Name` documentation: "can have a maximum of 32 characters".
 pub const LOAD_BALANCER_NAME_MAX_LENGTH: usize = 32;
 
-/// Whether `name` is a load balancer NAME this service can address, as the model's
-/// `CreateLoadBalancerInput$Name` documentation states the rule: "can have a maximum of
-/// 32 characters, must contain only alphanumeric characters or hyphens, must not begin
-/// or end with a hyphen".
+/// The prefix a load balancer name may not begin with, from `CreateLoadBalancerInput$Name`:
+/// "must not begin with \"internal-\"". It is the prefix the service itself puts on the DNS
+/// name of an internal load balancer, so a name carrying it could never be told apart from
+/// one the service generated.
+pub const RESERVED_LOAD_BALANCER_NAME_PREFIX: &str = "internal-";
+
+/// Whether `name` is a load balancer NAME this service can address — see
+/// [`check_load_balancer_name`], which is the one reading of that rule.
 ///
 /// Read by [`check_listener_arn`]: a load balancer name this service could never have
 /// minted is not a name any ARN of this service can carry.
 pub fn is_load_balancer_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.chars().count() <= LOAD_BALANCER_NAME_MAX_LENGTH
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-        && !name.starts_with('-')
-        && !name.ends_with('-')
+    check_load_balancer_name(name).is_ok()
+}
+
+/// Whether `name` is a load balancer name this service accepts and — when it is not — the
+/// clause it broke, so a refusal can name the value and the rule the caller has to satisfy.
+///
+/// Every clause is one of `CreateLoadBalancerInput$Name`'s own: "This name must be unique
+/// per region per account, can have a maximum of 32 characters, must contain only
+/// alphanumeric characters or hyphens, must not begin or end with a hyphen, and must not
+/// begin with \"internal-\"." Uniqueness is the only one that needs the store, so it is
+/// the create's own (a name already taken is `DuplicateLoadBalancerName`); the rest are
+/// read off the value alone, which is why they are stated here once for every operation
+/// that takes or parses a load balancer name.
+pub fn check_load_balancer_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Load balancer name cannot be empty".to_string());
+    }
+    if name.chars().count() > LOAD_BALANCER_NAME_MAX_LENGTH {
+        return Err(format!(
+            "Load balancer name '{name}' cannot be longer than '{LOAD_BALANCER_NAME_MAX_LENGTH}' \
+             characters"
+        ));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(format!(
+            "Load balancer name '{name}' can only contain characters that are alphanumeric \
+             characters or hyphens"
+        ));
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        return Err(format!(
+            "Load balancer name '{name}' cannot begin or end with a hyphen"
+        ));
+    }
+    if name.starts_with(RESERVED_LOAD_BALANCER_NAME_PREFIX) {
+        return Err(format!(
+            "Load balancer name '{name}' cannot begin with \
+             '{RESERVED_LOAD_BALANCER_NAME_PREFIX}'"
+        ));
+    }
+    Ok(())
 }
 
 /// The ARN segments [`load_balancer_type_code`] mints, which are the only load balancer
@@ -826,6 +872,157 @@ pub fn load_balancer_family(lb_type: &str) -> LoadBalancerFamily {
         "gateway" => LoadBalancerFamily::Gateway,
         // `application` is the modelled default for `Type`.
         _ => LoadBalancerFamily::Application,
+    }
+}
+
+/// One Region's published Route 53 hosted zones: the Region, the zone an Application Load
+/// Balancer of it is aliased through, and the zone a Network Load Balancer of it is
+/// aliased through.
+struct HostedZoneEntry {
+    region: &'static str,
+    application: &'static str,
+    network: &'static str,
+}
+
+/// The Route 53 hosted zone ids Elastic Load Balancing publishes per Region and load
+/// balancer family, which `LoadBalancer$CanonicalHostedZoneId` reports ("the ID of the
+/// Amazon Route 53 hosted zone associated with the load balancer").
+///
+/// These are the service's own published identifiers — the "Elastic Load Balancing
+/// endpoints and quotas" table of hosted zone ids, which a client needs to alias a record
+/// at the load balancer — not anything derived from a request or minted per run: the same
+/// Region and family always answer the same id, for every account and every load balancer.
+/// Application Load Balancers share their Region's zone with Classic load balancers, and
+/// Network Load Balancers have their own.
+///
+/// A Region this table does not carry reports no hosted zone rather than a made-up one: an
+/// id of the right shape that resolves to nothing would be worse than an absent member.
+///
+/// The `application` column is the SAME published column as the Classic endpoint's, which
+/// `services/service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7`'s
+/// `CLASSIC_ELB_HOSTED_ZONE_IDS` carries for its own model: the two tables must agree on
+/// every Region both cover, and they do. They cannot be ONE table in a shared crate
+/// without a dependency cycle — that crate already depends on this one, for the shared
+/// endpoint's API-version dispatch — so this is the cross-reference that keeps them in
+/// step, and a Region added to either belongs in both.
+const HOSTED_ZONES: &[HostedZoneEntry] = &[
+    HostedZoneEntry {
+        region: "af-south-1",
+        application: "Z268VQBMOI5EKX",
+        network: "Z203XCE67M25HM",
+    },
+    HostedZoneEntry {
+        region: "ap-east-1",
+        application: "Z3DQVH9N71FHZ0",
+        network: "Z12Y7K3UBGUAD1",
+    },
+    HostedZoneEntry {
+        region: "me-south-1",
+        application: "ZS929ML54UICD",
+        network: "Z3QSRYVP46NYYV",
+    },
+    HostedZoneEntry {
+        region: "us-east-1",
+        application: "Z35SXDOTRQ7X7K",
+        network: "Z26RNL4JYFTOTI",
+    },
+    HostedZoneEntry {
+        region: "us-east-2",
+        application: "Z3AADJGX6KTTL2",
+        network: "ZLMOA37VPKANP",
+    },
+    HostedZoneEntry {
+        region: "us-west-1",
+        application: "Z368ELLRRE2KJ0",
+        network: "Z24FKFUX50B4VV",
+    },
+    HostedZoneEntry {
+        region: "us-west-2",
+        application: "Z1H1FL5HABSF5",
+        network: "Z18D5FSROUN65G",
+    },
+    HostedZoneEntry {
+        region: "ca-central-1",
+        application: "ZQSVJUPU6J1EY",
+        network: "Z2EPGBW3API2WT",
+    },
+    HostedZoneEntry {
+        region: "eu-west-1",
+        application: "Z32O12XQLNTSW2",
+        network: "Z2IFOLAFXWLO4F",
+    },
+    HostedZoneEntry {
+        region: "eu-west-2",
+        application: "ZHURV8PSTC4K8",
+        network: "ZD4D7Y8KGAS4G",
+    },
+    HostedZoneEntry {
+        region: "eu-west-3",
+        application: "Z3Q77PNBQS71R4",
+        network: "Z1CMS0P5QUZ6D5",
+    },
+    HostedZoneEntry {
+        region: "eu-central-1",
+        application: "Z215JYRZR1TBD5",
+        network: "Z3F0SRJ5LGBH90",
+    },
+    HostedZoneEntry {
+        region: "eu-north-1",
+        application: "Z23TAZ6LKFMNIO",
+        network: "Z1UDT6IFJ4EJM",
+    },
+    HostedZoneEntry {
+        region: "eu-south-1",
+        application: "Z3ULH7SSC9OV64",
+        network: "Z23146JA1KNAFP",
+    },
+    HostedZoneEntry {
+        region: "ap-south-1",
+        application: "ZP97RAFLXTNZK",
+        network: "ZVDDRBQ08TROA",
+    },
+    HostedZoneEntry {
+        region: "ap-northeast-1",
+        application: "Z14GRHDCWA56QT",
+        network: "Z31USIVHYNEOWT",
+    },
+    HostedZoneEntry {
+        region: "ap-northeast-2",
+        application: "ZWKZPGTI48KDX",
+        network: "ZIBE1TIR4HY56",
+    },
+    HostedZoneEntry {
+        region: "ap-northeast-3",
+        application: "Z5LXEXXYQ4HTP",
+        network: "Z1GWIQ4HH19I5X",
+    },
+    HostedZoneEntry {
+        region: "ap-southeast-1",
+        application: "Z1LMS91P8CMLE5",
+        network: "ZKVM4W9LS7TM",
+    },
+    HostedZoneEntry {
+        region: "ap-southeast-2",
+        application: "Z1GM3OXH4ZPM65",
+        network: "ZCT6FZBF4DROD",
+    },
+    HostedZoneEntry {
+        region: "sa-east-1",
+        application: "Z2P70J7HTTTPLU",
+        network: "ZTK26PT1VY4CU",
+    },
+];
+
+/// The published hosted zone of a load balancer of `family` in `region`, or `None` when
+/// the service publishes none for it — a Region [`HOSTED_ZONES`] does not carry, or a
+/// Gateway Load Balancer, which is reached through its own VPC endpoints rather than
+/// through a DNS name a hosted zone resolves.
+pub fn canonical_hosted_zone_id(region: &str, family: LoadBalancerFamily) -> Option<&'static str> {
+    let entry = HOSTED_ZONES.iter().find(|entry| entry.region == region)?;
+    match family {
+        LoadBalancerFamily::Application => Some(entry.application),
+        LoadBalancerFamily::Network => Some(entry.network),
+        LoadBalancerFamily::Gateway => None,
     }
 }
 
@@ -1213,6 +1410,128 @@ pub fn check_ip_address_type(
         ));
     }
     Ok(())
+}
+
+/// How many subnets an Application Load Balancer is placed in at least, from
+/// `Subnets`/`SubnetMappings`' own documentation: "[Application Load Balancers] You must
+/// specify subnets from at least two Availability Zones" — one subnet per zone, so two
+/// subnets.
+pub const SUBNETS_PER_APPLICATION_LOAD_BALANCER: usize = 2;
+
+/// Whether a load balancer of `family` can be placed in `count` subnets and — when it
+/// cannot — the rule it broke.
+///
+/// `count` is how many PLACEMENTS the request asks for: every entry of `Subnets` and every
+/// entry of `SubnetMappings`, each of which places the load balancer in one subnet whether
+/// or not it spells that subnet's id out. Counting the entries rather than the ids is what
+/// makes this bound dominate every per-entry step that follows it — the zone records
+/// persisted on the load balancer, and the addresses resolved against EC2 — so no request
+/// can ask for more of them than a Region has zones.
+///
+/// Both bounds come from the same documentation. The ceiling is `Subnets`' "you can specify
+/// only one subnet per Availability Zone", so at most the [`SUBNETS_PER_LOAD_BALANCER`]
+/// zones this emulator's Regions have: a request past it names two subnets in one zone
+/// whatever those subnets are. The floor belongs to the Application family alone — its
+/// subnets must come "from at least two Availability Zones" — while a Network or Gateway
+/// Load Balancer "can specify subnets from one or more Availability Zones", so one is
+/// enough.
+///
+/// The ONE reading of both, called by `CreateLoadBalancer` for the subnets a new load
+/// balancer starts in and by `SetSubnets` for the subnets that replace them, BEFORE either
+/// does any work proportional to what the request named.
+pub fn check_placement_count(family: LoadBalancerFamily, count: usize) -> Result<(), String> {
+    if count > SUBNETS_PER_LOAD_BALANCER {
+        return Err(format!(
+            "You can specify only one subnet per Availability Zone, so at most \
+             {SUBNETS_PER_LOAD_BALANCER} subnets, and this request names {count}"
+        ));
+    }
+    if family == LoadBalancerFamily::Application && count < SUBNETS_PER_APPLICATION_LOAD_BALANCER {
+        return Err(format!(
+            "An application load balancer must be placed in at least \
+             {SUBNETS_PER_APPLICATION_LOAD_BALANCER} subnets, in as many Availability Zones, \
+             and this request names {count}"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether the addresses a `SubnetMapping` pins can be pinned on a load balancer of
+/// `family` with this `scheme`, and — when they cannot — the rule the request broke.
+///
+/// Each member of `SubnetMapping` is documented for ONE family, and two of them for one
+/// scheme of it: `AllocationId` is "[Network Load Balancers] the allocation ID of the
+/// Elastic IP address for an internet-facing load balancer", `PrivateIPv4Address` is
+/// "[Network Load Balancers] the private IPv4 address for an internal load balancer", and
+/// `IPv6Address` and `SourceNatIpv6Prefix` are "[Network Load Balancers]" — which
+/// `SubnetMappings`' own documentation states as the same rule from the other side:
+/// "[Application Load Balancers] ... You can't specify Elastic IP addresses for your
+/// subnets", "[Gateway Load Balancers] ... You can't specify Elastic IP addresses for your
+/// subnets", and "[Network Load Balancers] ... You can specify one Elastic IP address per
+/// subnet ... for your internet-facing load balancer. For internal load balancers, you can
+/// specify one private IP address per subnet ... For internet-facing load balancer, you can
+/// specify one IPv6 address per subnet."
+///
+/// So a member the request pins on a load balancer it is not documented for is refused
+/// rather than stored on a load balancer that could never carry it. The ONE reading of
+/// that rule, called by `CreateLoadBalancer` and `SetSubnets`.
+pub fn check_subnet_mapping(
+    family: LoadBalancerFamily,
+    scheme: &str,
+    mapping: &SubnetMapping,
+) -> Result<(), String> {
+    let internal = scheme == INTERNAL_SCHEME;
+    // (what the member pins, whether the request pins it, whether this load balancer
+    // carries it) — the plural the refusal names the member by is the one the
+    // documentation uses for it.
+    let pinned: [(&str, bool, bool); 4] = [
+        (
+            "Elastic IP addresses",
+            mapping.allocation_id.is_some(),
+            family == LoadBalancerFamily::Network && !internal,
+        ),
+        (
+            "private IP addresses",
+            mapping.private_i_pv4_address.is_some(),
+            family == LoadBalancerFamily::Network && internal,
+        ),
+        (
+            "IPv6 addresses",
+            mapping.i_pv6_address.is_some(),
+            family == LoadBalancerFamily::Network && !internal,
+        ),
+        (
+            "IPv6 source NAT prefixes",
+            mapping.source_nat_ipv6_prefix.is_some(),
+            family == LoadBalancerFamily::Network,
+        ),
+    ];
+    for (what, requested, carried) in pinned {
+        if !requested || carried {
+            continue;
+        }
+        // WHICH of the two the caller has to fix: a family that carries the member for no
+        // scheme at all, or the scheme of a family that carries it for the other one.
+        return Err(if family == LoadBalancerFamily::Network {
+            format!("You cannot specify {what} with an {scheme} load balancer")
+        } else {
+            format!(
+                "You cannot specify {what} with a load balancer of type '{}'",
+                family_type_name(family)
+            )
+        });
+    }
+    Ok(())
+}
+
+/// The `LoadBalancerTypeEnum` value a family is named by, for a refusal that states which
+/// kind of load balancer the request asked for.
+fn family_type_name(family: LoadBalancerFamily) -> &'static str {
+    match family {
+        LoadBalancerFamily::Application => "application",
+        LoadBalancerFamily::Network => "network",
+        LoadBalancerFamily::Gateway => "gateway",
+    }
 }
 
 /// The letters AWS appends to a region to name an Availability Zone.

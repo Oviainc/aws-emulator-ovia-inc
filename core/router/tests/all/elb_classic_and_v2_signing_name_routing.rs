@@ -39,9 +39,22 @@
 use std::sync::Arc;
 
 use aws_emulator_router::{build_router, InMemoryEngine};
+use smithy_server_runtime::MultiServiceRouter;
+
+use crate::query_wire::{element, form_encode};
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
 const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
+
+/// The EC2 API version an ec2Query body carries, for the two subnets this suite places a
+/// load balancer in.
+const EC2_VERSION: &str = "2016-11-15";
+
+/// The parameter values the rows below name their subnets by. The ids are EC2's to mint,
+/// and this table is `'static`, so the driver substitutes the subnets the suite created
+/// through EC2 for these two placeholders.
+const FIRST_SUBNET: &str = "@subnet-1";
+const SECOND_SUBNET: &str = "@subnet-2";
 
 /// The API version the Classic model declares.
 const CLASSIC_VERSION: &str = "2012-06-01";
@@ -95,6 +108,34 @@ fn classic_elb_and_elbv2_route_apart_under_one_signing_name() {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("a current-thread runtime");
+
+            // Two subnets in different Availability Zones, created through EC2 — which
+            // owns them — because the ELBv2 `CreateLoadBalancer` rows below are placements:
+            // the subnets a request names are resolved against EC2, which refuses an id the
+            // account holds no subnet for, and an Application Load Balancer must be placed
+            // in at least two zones.
+            let vpc = element(
+                &ec2(&router, &runtime, "CreateVpc", &[("CidrBlock", "10.60.0.0/16")]),
+                "vpcId",
+            );
+            let subnets: Vec<String> = [("10.60.1.0/24", "us-east-1a"), ("10.60.2.0/24", "us-east-1b")]
+                .into_iter()
+                .map(|(cidr, zone)| {
+                    element(
+                        &ec2(
+                            &router,
+                            &runtime,
+                            "CreateSubnet",
+                            &[
+                                ("VpcId", vpc.as_str()),
+                                ("CidrBlock", cidr),
+                                ("AvailabilityZone", zone),
+                            ],
+                        ),
+                        "subnetId",
+                    )
+                })
+                .collect();
 
             // The rows differ along all three axes that decide what answers: how the
             // request is addressed (the shared signing name, the ELBv2 model's own key, a
@@ -212,7 +253,10 @@ fn classic_elb_and_elbv2_route_apart_under_one_signing_name() {
                     version: Some(V2_VERSION),
                     params: &[
                         ("Name", "router-v2-elb"),
-                        ("Subnets.member.1", "subnet-12345678"),
+                        ("Subnets.member.1", FIRST_SUBNET),
+                        // Two subnets, because an Application Load Balancer "must specify
+                        // subnets from at least two Availability Zones".
+                        ("Subnets.member.2", SECOND_SUBNET),
                     ],
                     expected_status: 200,
                     expected_code: None,
@@ -305,7 +349,8 @@ fn classic_elb_and_elbv2_route_apart_under_one_signing_name() {
                     version: Some(V2_VERSION),
                     params: &[
                         ("Name", "router-shared-v2-elb"),
-                        ("Subnets.member.1", "subnet-12345678"),
+                        ("Subnets.member.1", FIRST_SUBNET),
+                        ("Subnets.member.2", SECOND_SUBNET),
                     ],
                     expected_status: 200,
                     expected_code: None,
@@ -491,6 +536,12 @@ fn classic_elb_and_elbv2_route_apart_under_one_signing_name() {
                     body.push_str(&format!("&Version={version}"));
                 }
                 for (name, value) in call.params {
+                    // A row names a subnet by placeholder, because EC2 minted the id.
+                    let value = match *value {
+                        FIRST_SUBNET => subnets[0].as_str(),
+                        SECOND_SUBNET => subnets[1].as_str(),
+                        literal => literal,
+                    };
                     body.push_str(&format!("&{name}={value}"));
                 }
                 let mut builder = http::Request::builder()
@@ -556,6 +607,40 @@ fn classic_elb_and_elbv2_route_apart_under_one_signing_name() {
         .expect("spawn the routing thread")
         .join()
         .expect("Classic Elastic Load Balancing and ELBv2 must route apart");
+}
+
+/// Drive one ec2Query action against the EC2 model and answer its body, which must
+/// succeed: these are the suite's SETUP calls, for the network the ELBv2 rows place a load
+/// balancer in.
+fn ec2(
+    router: &MultiServiceRouter,
+    runtime: &tokio::runtime::Runtime,
+    action: &str,
+    params: &[(&str, &str)],
+) -> String {
+    let mut body = format!("Action={action}&Version={EC2_VERSION}");
+    for (name, value) in params {
+        body.push('&');
+        body.push_str(&form_encode(name));
+        body.push('=');
+        body.push_str(&form_encode(value));
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("http://localhost/")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("host", "localhost")
+        .header("authorization", authorization("ec2"))
+        .body(bytes::Bytes::from(body))
+        .expect("a well-formed request");
+    let response = runtime.block_on(router.dispatch(request));
+    let status = response.status().as_u16();
+    let rendered = String::from_utf8_lossy(response.body()).to_string();
+    assert_eq!(
+        status, 200,
+        "setup: EC2 {action} must succeed, got {status} with {rendered}"
+    );
+    rendered
 }
 
 /// The SigV4 `Authorization` header of a request signed for `signing_name`, as every AWS

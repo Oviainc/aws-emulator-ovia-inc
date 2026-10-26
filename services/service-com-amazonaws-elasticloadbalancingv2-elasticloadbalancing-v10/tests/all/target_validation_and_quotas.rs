@@ -744,6 +744,7 @@ async fn a_not_found_refusal_names_the_identifiers_the_lookup_carried() {
     let mut form = action("CreateLoadBalancer");
     form.push(p("Name", "present-alb"));
     form.push(p("Subnets.member.1", "subnet-0123456789abcdef0"));
+    form.push(p("Subnets.member.2", "subnet-0123456789abcdef1"));
     let created = call(&router, &form).await;
     assert_eq!(
         created.status, 200,
@@ -774,23 +775,33 @@ async fn a_not_found_refusal_names_the_identifiers_the_lookup_carried() {
 async fn a_load_balancer_takes_at_most_one_subnet_per_availability_zone() {
     let (router, _engine) = emulator();
 
-    // (case, how many subnets the request names, whether it is accepted)
+    // (case, the load balancer type, how many subnets the request names, whether it is
+    // accepted)
     //
     // "You can specify only one subnet per Availability Zone" (`Subnets`), so the ceiling
     // is the number of zones a Region has — which this service names with the 26 letters
     // a zone name can carry. A request past it names two subnets in one zone whatever its
-    // subnets are.
-    let rows: [(&str, usize, bool); 4] = [
-        ("one subnet", 1, true),
-        ("two subnets", 2, true),
-        ("one subnet per zone of the region", 26, true),
-        ("one subnet more than the region has zones", 27, false),
+    // subnets are. The FLOOR is the family's: a Network Load Balancer "can specify subnets
+    // from one or more Availability Zones", while an Application Load Balancer "must
+    // specify subnets from at least two".
+    let rows: [(&str, &str, usize, bool); 5] = [
+        ("one subnet on a network load balancer", "network", 1, true),
+        ("one subnet on an application load balancer", "application", 1, false),
+        ("two subnets", "application", 2, true),
+        ("one subnet per zone of the region", "application", 26, true),
+        (
+            "one subnet more than the region has zones",
+            "application",
+            27,
+            false,
+        ),
     ];
 
-    for (index, (case, count, accepted)) in rows.into_iter().enumerate() {
+    for (index, (case, lb_type, count, accepted)) in rows.into_iter().enumerate() {
         let name = format!("subnet-bound-{index}");
         let mut form = action("CreateLoadBalancer");
         form.push(p("Name", &name));
+        form.push(p("Type", lb_type));
         for member in 1..=count {
             form.push(p(
                 &format!("Subnets.member.{member}"),
@@ -874,6 +885,7 @@ async fn a_target_group_is_deleted_unless_a_listener_forwards_to_it() {
     let mut form = action("CreateLoadBalancer");
     form.push(p("Name", "delete-alb"));
     form.push(p("Subnets.member.1", "subnet-0123456789abcdef0"));
+    form.push(p("Subnets.member.2", "subnet-0123456789abcdef1"));
     let created = call(&router, &form).await;
     let load_balancer = created
         .text("LoadBalancerArn")
