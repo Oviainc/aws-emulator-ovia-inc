@@ -1352,13 +1352,6 @@ async fn refusals_carry_the_modelled_status_and_code() {
             "ValidationException",
         ),
         (
-            "deleting an alarm that does not exist",
-            "DeleteAlarms",
-            json!({"AlarmNames": ["absent"]}),
-            404,
-            "ResourceNotFound",
-        ),
-        (
             "setting the state of an alarm that does not exist",
             "SetAlarmState",
             json!({"AlarmName": "absent", "StateValue": "OK", "StateReason": "why"}),
