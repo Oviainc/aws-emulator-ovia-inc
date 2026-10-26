@@ -487,11 +487,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateTrail<Eng> 
         if tags.len() > crate::state::TAGS_PER_RESOURCE_LIMIT {
             return Err(CreateTrailErrorModeled::TagsLimitExceededException(
                 TagsLimitExceededException {
-                    message: Some(format!(
-                        "TagsList carries {} tags; the limit is {} tags per trail",
-                        tags.len(),
-                        crate::state::TAGS_PER_RESOURCE_LIMIT
-                    )),
+                    message: Some(crate::state::tags_limit_exceeded_message()),
                 },
             )
             .into());

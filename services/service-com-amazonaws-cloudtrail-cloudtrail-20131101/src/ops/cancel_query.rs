@@ -15,9 +15,8 @@
 //!   unreadable value is `EventDataStoreARNInvalidException` and a readable one naming
 //!   no store in the Region it addresses is `EventDataStoreNotFoundException`, before
 //!   the query id is looked at;
-//! * a query runs IN an event data store, so a Region — or the account
-//!   `EventDataStoreOwnerAccountId` names — holding no store refuses the call with
-//!   `EventDataStoreNotFoundException` whatever query id it carries;
+//! * a request that names NO store resolves on the query id alone, so an id naming no
+//!   query is `QueryIdNotFoundException` whether or not the Region holds a store;
 //! * a store awaiting deletion serves no query (`InactiveEventDataStoreException`), and
 //!   a query whose store the registry no longer holds resolves no store at all;
 //! * the query id names a query within the Region it ran in and the store it ran on,
@@ -248,21 +247,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let named_store_id = named_store.as_ref().map(|(id, _)| id.clone());
 
-        // A query runs IN an event data store, so the store resolves before the query
-        // id: the one the request names, or — the member being deprecated here — one of
-        // the addressed account's stores in this Region.
-        // `EventDataStoreOwnerAccountId` names the account that owns it, for a query run
-        // against a store shared from another account. A request that resolves no store
-        // names nothing that could hold the query it asks about.
+        // A query is resolved on its QUERY ID: `EventDataStore` is deprecated here ("no
+        // longer required by CancelQueryRequest"), so a request that names no store
+        // names no store to resolve, and the id is what the caller is answered about.
+        // A request that DOES name one has had it resolved above, and only narrows which
+        // store's query this call addresses; `EventDataStoreOwnerAccountId` names the
+        // account that owns it, for a query run against a store shared from another
+        // account, and is held against the store the query actually ran on below.
         let owner = input.event_data_store_owner_account_id.as_deref();
-        let store_resolved = match (named_store.as_ref(), owner) {
-            (Some((_, store_owner)), Some(owner)) => store_owner == owner,
-            (Some(_), None) => true,
-            (None, Some(owner)) => store.has_event_data_store_owned_by(&region, owner),
-            (None, None) => store.has_event_data_store_in(&region),
-        };
-        if !store_resolved {
-            return Err(event_data_store_not_found());
+        if let (Some((_, store_owner)), Some(owner)) = (named_store.as_ref(), owner) {
+            if store_owner != owner {
+                return Err(event_data_store_not_found());
+            }
         }
 
         // "The ID of the query that you want to cancel is also required": the query id

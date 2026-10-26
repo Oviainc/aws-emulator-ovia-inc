@@ -31,7 +31,7 @@ async fn describe_query_dispatches_under_every_published_target_prefix() {
                 &json!({ "QueryId": "0aaaaaaa-1111-2222-3333-444444444444" }),
             )
             .await
-            .expect_error(&case, 400, "EventDataStoreNotFoundException");
+            .expect_error(&case, 400, "QueryIdNotFoundException");
     }
 }
 

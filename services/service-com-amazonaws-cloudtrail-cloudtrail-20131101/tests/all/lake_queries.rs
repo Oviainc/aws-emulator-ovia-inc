@@ -22,10 +22,11 @@
 //!   one naming no store in the addressed Region is
 //!   `EventDataStoreNotFoundException`, and a store awaiting deletion is
 //!   `InactiveEventDataStoreException`;
-//! * a query lives in an event data store, so the store resolves BEFORE the
-//!   selector: a Region — or the account `EventDataStoreOwnerAccountId` names —
-//!   holding no store refuses every selector with
-//!   `EventDataStoreNotFoundException`;
+//! * a query is resolved on the SELECTOR, the deprecated `EventDataStore` member
+//!   only narrowing which store's query a request addresses: a request naming no
+//!   store needs none to exist, while a resolved query's own store must still be
+//!   held by the registry and belong to the account
+//!   `EventDataStoreOwnerAccountId` names;
 //! * a query is reachable only from the Region it ran in and only through the
 //!   event data store it ran on; an unmatched selector is
 //!   `QueryIdNotFoundException`, naming the member and the value it was selected
@@ -719,13 +720,15 @@ async fn a_store_awaiting_deletion_does_not_serve_queries() {
     }
 }
 
-/// A query lives in an event data store, so the store resolves BEFORE the
-/// selector: in a Region holding none, every selector — a query id naming a
-/// persisted query included — is refused with `EventDataStoreNotFoundException`,
-/// and the same calls reach the step that owns them once the Region holds one.
-/// `EventDataStoreOwnerAccountId` is the account the store must belong to.
+/// A query is resolved on the SELECTOR a request carries, the deprecated
+/// `EventDataStore` member only narrowing which store's query it addresses: with no
+/// store member sent, nothing has to exist for the request to be answered about its
+/// selector — an unknown id or alias is `QueryIdNotFoundException` and no selector at
+/// all is `InvalidParameterException` — while a resolved query's own store must still
+/// be held by the registry. `EventDataStoreOwnerAccountId` is the account that store
+/// must belong to.
 #[tokio::test]
-async fn the_event_data_store_resolves_before_the_query_selector() {
+async fn the_query_selector_resolves_without_a_store_member() {
     let emulator = Emulator::new();
     let record = QueryRecord {
         query_alias: Some("DailySignIns".to_string()),
@@ -733,26 +736,38 @@ async fn the_event_data_store_resolves_before_the_query_selector() {
     };
     seed_query(&emulator, &record);
 
-    // No event data store in the Region: nothing could hold a query, whatever
-    // the request selects.
+    // No store in the Region: the selector is still what each call is answered about.
     for (case, body) in [
-        (
-            "a persisted query id with no store",
-            json!({ "QueryId": record.query_id }),
-        ),
         (
             "an unknown query id with no store",
             json!({ "QueryId": query_id(9) }),
         ),
         (
-            "a known alias with no store",
-            json!({ "QueryAlias": "DailySignIns" }),
-        ),
-        (
             "an unknown alias with no store",
             json!({ "QueryAlias": "NeverRun" }),
         ),
-        ("no selector with no store", json!({})),
+    ] {
+        emulator
+            .call("DescribeQuery", &body)
+            .await
+            .expect_error(case, NOT_FOUND_STATUS, "QueryIdNotFoundException");
+    }
+    emulator
+        .call("DescribeQuery", &json!({}))
+        .await
+        .expect_error("no selector with no store", 400, "InvalidParameterException");
+
+    // A selector that DOES resolve, to a query whose store the registry no longer
+    // holds, resolves no store at all.
+    for (case, body) in [
+        (
+            "a persisted query id whose store is gone",
+            json!({ "QueryId": record.query_id }),
+        ),
+        (
+            "a known alias whose store is gone",
+            json!({ "QueryAlias": "DailySignIns" }),
+        ),
     ] {
         emulator
             .call("DescribeQuery", &body)
@@ -760,7 +775,7 @@ async fn the_event_data_store_resolves_before_the_query_selector() {
             .expect_error(case, NOT_FOUND_STATUS, "EventDataStoreNotFoundException");
     }
 
-    // With a store in the Region, each call reaches the step that owns it.
+    // With the store in the Region, each call reaches the step that owns it.
     seed_store(&emulator, STORE_ID, HOME_REGION, EventDataStoreState::Enabled);
     for (case, body) in [
         (

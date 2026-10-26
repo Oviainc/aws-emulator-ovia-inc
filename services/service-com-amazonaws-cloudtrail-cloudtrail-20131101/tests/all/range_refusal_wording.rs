@@ -19,10 +19,13 @@
 //!
 //! The control row pins the other half of the rule: a class this service has NO recorded
 //! value-free wording for — a `@length` violation — keeps the framework's own sentence,
-//! value and all. A page-size member is the one range member that does NOT keep the
-//! generic CODE: its operation's model declares `InvalidMaxResultsException` for a limit
-//! that is not valid, so that is the code it carries — the same value-free clause, naming
-//! the member and the bound. See `EmulatedService::override_refusal` in `src/service.rs`.
+//! value and all. The member an operation declares as its `@paginated` `pageSize` is the
+//! one range member that does NOT keep the generic CODE: its operation's model declares
+//! `InvalidMaxResultsException` for a limit that is not valid, so that is the code it
+//! carries — the same value-free clause, naming the member and the bound. A bounded
+//! integer that is NOT such a page size keeps the generic code, which is what the
+//! recorded answer to an out-of-range `GetQueryResults` `MaxQueryResults` carries. See
+//! `EmulatedService::override_refusal` in `src/service.rs`.
 
 use serde_json::json;
 
@@ -60,9 +63,12 @@ fn limit_clause(member: &str, bound: &str) -> String {
 /// The ranges come from the model, not from this service's own code:
 /// `smithy_query(query="operation", operation="UpdateEventDataStore")` gives
 /// `RetentionPeriod` `@range{min:7,max:3653}`, and
-/// `smithy_query(query="operation", operation="ListEventDataStores")` gives `MaxResults`
-/// `@range{min:1,max:1000}`. Each member is exercised on BOTH published bounds, one past
-/// it in each direction.
+/// `smithy_query(query="operation", operation="GetQueryResults")` gives
+/// `MaxQueryResults` `@range{min:1,max:1000}` on an operation whose `@paginated` trait
+/// names no page size at all — so that member is not the limit
+/// `InvalidMaxResultsException` speaks for and keeps this generic envelope, which is
+/// what the recorded answer to an out-of-range `MaxQueryResults` carries. Each member is
+/// exercised on BOTH published bounds, one past it in each direction.
 #[tokio::test]
 async fn a_value_outside_a_modelled_range_is_refused_without_quoting_it() {
     let emulator = Emulator::new();
@@ -92,6 +98,18 @@ async fn a_value_outside_a_modelled_range_is_refused_without_quoting_it() {
             "UpdateEventDataStore",
             json!({"EventDataStore": "no-such-store", "RetentionPeriod": 6}),
             clause("retentionPeriod", "greater than or equal to 7"),
+        ),
+        (
+            "a bounded integer that is not a declared page size, above its maximum",
+            "GetQueryResults",
+            json!({"QueryId": "00000000-0000-4000-8000-000000000000", "MaxQueryResults": 1001}),
+            clause("maxQueryResults", "less than or equal to 1000"),
+        ),
+        (
+            "the same member below its minimum",
+            "GetQueryResults",
+            json!({"QueryId": "00000000-0000-4000-8000-000000000000", "MaxQueryResults": 0}),
+            clause("maxQueryResults", "greater than or equal to 1"),
         ),
     ];
 
@@ -123,18 +141,17 @@ async fn a_value_outside_a_modelled_range_is_refused_without_quoting_it() {
     }
 }
 
-/// A page-size member outside its modelled `@range` keeps the value-free clause but
-/// carries the code its OPERATION models for a limit that is not valid.
+/// A declared page-size member outside its modelled `@range` keeps the value-free clause
+/// but carries the code its OPERATION models for a limit that is not valid.
 ///
 /// `InvalidMaxResultsException` is "thrown if the limit specified is not valid"
 /// (`smithy_query(query="shape", shape="InvalidMaxResultsException")`), and every
-/// operation below declares it while declaring no `ValidationException`
-/// (`smithy_query(query="operation",
-/// operation="ListEventDataStores,ListQueries,LookupEvents,GetQueryResults")`) — so a
-/// client catching the modelled error would miss a generic refusal altogether. The rows
-/// differ along the member's SPELLING (`MaxResults` / `MaxQueryResults`), the operation
-/// and which published bound is broken; each bound comes from the model, not from this
-/// service's code.
+/// operation below declares it, declares no `ValidationException`, and names the member
+/// as its `@paginated` `pageSize` (`smithy_query(query="operation",
+/// operation="ListEventDataStores,ListQueries")`) — so a client catching the modelled
+/// error would miss a generic refusal altogether. The rows differ along the operation,
+/// the page-size member's own range and which published bound is broken; each bound comes
+/// from the model, not from this service's code.
 #[tokio::test]
 async fn a_page_size_outside_its_range_carries_the_code_its_operation_models() {
     let emulator = Emulator::new();
@@ -154,10 +171,10 @@ async fn a_page_size_outside_its_range_carries_the_code_its_operation_models() {
             limit_clause("maxResults", "less than or equal to 1000"),
         ),
         (
-            "a lookup's max results above its own, narrower maximum",
-            "LookupEvents",
-            json!({"MaxResults": 51}),
-            limit_clause("maxResults", "less than or equal to 50"),
+            "max results far above the maximum",
+            "ListEventDataStores",
+            json!({"MaxResults": 1_000_000}),
+            limit_clause("maxResults", "less than or equal to 1000"),
         ),
         (
             "a query listing's max results below the minimum",
@@ -166,10 +183,10 @@ async fn a_page_size_outside_its_range_carries_the_code_its_operation_models() {
             limit_clause("maxResults", "greater than or equal to 1"),
         ),
         (
-            "the other spelling of the member, above its maximum",
-            "GetQueryResults",
-            json!({"QueryId": "00000000-0000-4000-8000-000000000000", "MaxQueryResults": 1001}),
-            limit_clause("maxQueryResults", "less than or equal to 1000"),
+            "a query listing's max results above the maximum",
+            "ListQueries",
+            json!({"EventDataStore": "00000000-0000-4000-8000-000000000000", "MaxResults": 1001}),
+            limit_clause("maxResults", "less than or equal to 1000"),
         ),
     ];
 

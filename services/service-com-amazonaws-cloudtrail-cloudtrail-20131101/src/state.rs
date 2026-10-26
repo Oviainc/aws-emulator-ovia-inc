@@ -86,10 +86,36 @@ pub const S3_KEY_PREFIX_MAX_LEN: usize = 200;
 /// 256 characters."
 pub const SNS_TOPIC_NAME_MAX_LEN: usize = 256;
 
+/// How CloudTrail words a page-size limit that is outside its bounds: the member the
+/// request carried the limit at, and the bound that limit broke.
+///
+/// `InvalidMaxResultsException` is "thrown if the limit specified is not valid", and the
+/// sentence is built from the request — the member and the broken bound — so it cannot
+/// drift from the model's range. One function for the whole service, read by both places
+/// such a limit is refused from: the pre-dispatch seam in `crate::service`, for the
+/// operations whose declared page size the boundary walk checks, and the handler that
+/// checks the bound itself (`crate::ops::lookup_events`).
+pub fn limit_not_valid_message(member: &str, bound: &str) -> String {
+    format!("The limit at '{member}' is not valid: it must have value {bound}.")
+}
+
 /// From the model doc for `TagsLimitExceededException`: "The number of tags per
 /// trail, event data store, dashboard, or channel has exceeded the permitted amount.
 /// Currently, the limit is 50."
 pub const TAGS_PER_RESOURCE_LIMIT: usize = 50;
+
+/// How CloudTrail words `TagsLimitExceededException`: the RULE it refuses by — a
+/// resultant tag set larger than a resource may carry — and nothing of the request.
+///
+/// The recorded refusal of a tag write whose merged set would pass the limit is "The
+/// resultant tag set must not have more than 50 user tags.", and the limit in it is
+/// [`TAGS_PER_RESOURCE_LIMIT`] so the sentence cannot drift from the bound the
+/// operations enforce. It is the ONE wording of that refusal, read by every operation
+/// that writes tags — the tagging pair and the creates that seed tags — because the
+/// rule they enforce is the same one.
+pub fn tags_limit_exceeded_message() -> String {
+    format!("The resultant tag set must not have more than {TAGS_PER_RESOURCE_LIMIT} user tags.")
+}
 
 /// How many trails the registry holds before `CreateTrail` refuses with the
 /// modelled `MaximumNumberOfTrailsExceededException`.
@@ -2190,22 +2216,6 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
             .filter(|((_, import_region), _)| import_region.as_str() == region)
             .map(|(_, record)| record)
             .find(|record| record.is_running())
-    }
-
-    /// Whether this Region holds any event data store at all — what a request
-    /// that names none resolves against.
-    pub fn has_event_data_store_in(&self, region: &str) -> bool {
-        self.event_data_stores
-            .values()
-            .any(|record| record.region == region)
-    }
-
-    /// Whether this Region holds an event data store owned by `account_id` —
-    /// what a request naming an `EventDataStoreOwnerAccountId` resolves against.
-    pub fn has_event_data_store_owned_by(&self, region: &str, account_id: &str) -> bool {
-        self.event_data_stores
-            .values()
-            .any(|record| record.region == region && record.owner() == account_id)
     }
 
     /// Resolve a caller-supplied event data store identifier (an ARN or the bare

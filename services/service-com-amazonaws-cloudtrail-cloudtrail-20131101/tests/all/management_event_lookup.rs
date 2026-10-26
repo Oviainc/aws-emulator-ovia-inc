@@ -22,9 +22,10 @@
 //!   declares, and each key filters on the event field it names;
 //! * `EventCategory` takes only the value the model declares (`insight`), and an absent
 //!   category asks for management events;
-//! * `MaxResults` bounds the page (1 through 50, default 50), the token is opaque and
-//!   STABLE — the same token answers the same page — and a token from a different lookup
-//!   is refused with `InvalidNextTokenException`;
+//! * `MaxResults` bounds the PAGE (at most 50, default 50) rather than the request — a
+//!   larger limit is served with the page capped, a limit below 1 is refused — the token
+//!   is opaque and STABLE — the same token answers the same page — and a token from a
+//!   different lookup is refused with `InvalidNextTokenException`;
 //! * events are scoped to the Region they were recorded in.
 //!
 //! Cases that need events at KNOWN instants write them straight into the shared log
@@ -845,19 +846,24 @@ async fn max_results_bounds_the_page_and_the_token_is_stable() {
     );
 }
 
-/// `MaxResults` outside the bounds the model declares (`range 1..50`) is refused at the
-/// boundary, before the handler runs, with the error THIS operation's model declares for a
+/// A `MaxResults` BELOW the bound the model declares (`range 1..50`) asks for a page
+/// that cannot exist, and is refused with the error THIS operation's model declares for a
 /// limit that is not valid: `InvalidMaxResultsException` ("this exception is thrown if the
 /// limit specified is not valid"), HTTP 400. `ValidationException` is not an error
 /// `LookupEvents` declares, so a client catching the modelled one would miss the refusal
-/// altogether; the narrowing is wired per operation — only those whose model carries the
-/// shape — in `src/service.rs`.
+/// altogether.
+///
+/// The modelled MAXIMUM is the other half of the rule and is not a refusal at all: it is
+/// stated of the results RETURNED, so a larger limit is served with the page capped at it
+/// — the rows below show such a limit answered, and
+/// `tests/all/page_size_and_query_id_refusals.rs` holds the cap itself over a table of
+/// page sizes.
 #[tokio::test]
-async fn a_max_results_outside_its_bounds_is_refused() {
+async fn a_max_results_below_its_minimum_is_refused() {
     let emulator = Emulator::new();
     emulator.seed(served("CallA", HOME_REGION), base_instant());
 
-    for case in [0, -1, 51, 1_000] {
+    for case in [0, -1, i32::MIN] {
         emulator
             .lookup(&json!({"MaxResults": case}))
             .await
@@ -867,7 +873,7 @@ async fn a_max_results_outside_its_bounds_is_refused() {
                 "InvalidMaxResultsException",
             );
     }
-    for case in [1, 25, 50] {
+    for case in [1, 25, 50, 51, 1_000] {
         emulator
             .lookup(&json!({"MaxResults": case}))
             .await

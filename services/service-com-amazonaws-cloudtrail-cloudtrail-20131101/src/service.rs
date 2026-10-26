@@ -307,11 +307,11 @@ fn invalid_tag_parameter(violations: &[Violation]) -> Option<Refused> {
 /// from the request — the member and the bound it broke, the bound read off the
 /// violation so the sentence cannot drift from the model's range.
 ///
-/// Only a page-size member is read here ([`PAGE_SIZE_MEMBERS`]): a page size is the
-/// one value this error speaks for, and the operations it is wired to are exactly
-/// those whose model declares the shape.
+/// Only the operation's own page-size member is read here ([`PAGE_SIZE_MEMBER`]): a
+/// page size is the one value this error speaks for, and a bounded integer the
+/// operation does not declare as its page size keeps the generic envelope.
 fn max_results_refusal(violation: &Violation) -> Option<String> {
-    if !PAGE_SIZE_MEMBERS.contains(&violation.path.as_str()) {
+    if violation.path != PAGE_SIZE_MEMBER {
         return None;
     }
     let bound = match &violation.kind {
@@ -321,19 +321,22 @@ fn max_results_refusal(violation: &Violation) -> Option<String> {
         // shape speaks for and keeps the framework's own refusal.
         _ => return None,
     };
-    Some(format!(
-        "The limit at '{}' is not valid: it must have value {bound}.",
-        violation.path
+    Some(crate::state::limit_not_valid_message(
+        &violation.path,
+        &bound,
     ))
 }
 
-/// How the validating walk spells the page-size member of a paged operation:
-/// lowerCamel, at the top level of the input. Both spellings the model gives that
-/// member are here — `MaxResults` on the listings, `MaxQueryResults` on
-/// `GetQueryResults` (`smithy_query(query="operation",
-/// operation="GetQueryResults,ListQueries,LookupEvents,ListEventDataStores")`) —
-/// because the error is about the LIMIT, whichever name the operation gives it.
-const PAGE_SIZE_MEMBERS: [&str; 2] = ["maxResults", "maxQueryResults"];
+/// How the validating walk spells the page-size member of the operations wired to
+/// [`ModelledRefusal::InvalidMaxResults`]: lowerCamel, at the top level of the input.
+///
+/// It is the member each of those operations declares as its `@paginated` `pageSize`
+/// (`smithy_query(query="operation", operation="ListQueries,ListEventDataStores")`),
+/// which is the value "the limit specified" names. A bounded integer an operation does
+/// NOT declare as its page size — `GetQueryResults`' `MaxQueryResults`, whose
+/// `@paginated` trait names only the token members — is not that limit, and keeps the
+/// generic input-validation envelope.
+const PAGE_SIZE_MEMBER: &str = "maxResults";
 
 /// Which event-selector member a constraint-violation path walks into, or `None` for a
 /// path that walks into neither.
@@ -444,20 +447,28 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             create_trail::CreateTrail,
             remove_tags::RemoveTags,
         );
-        // Every operation whose model declares `InvalidMaxResultsException` — the four
-        // paged operations that carry a `MaxResults` AND list that error
-        // (`smithy_query(query="digest")`). A paged operation whose model does NOT
-        // declare it is deliberately absent: its limit keeps the framework's own
-        // refusal, because answering a code its model does not carry would be the
-        // same defect in the other direction.
+        // Every operation whose model declares `InvalidMaxResultsException` for the
+        // member it declares as its `@paginated` `pageSize`, and whose page-size upper
+        // bound the service enforces on the REQUEST
+        // (`smithy_query(query="operation", operation="ListQueries,ListEventDataStores")`).
+        // Three paged operations are deliberately absent:
+        //
+        // * a paged operation whose model does NOT declare the shape keeps the
+        //   framework's own refusal, because answering a code its model does not carry
+        //   would be the same defect in the other direction;
+        // * `GetQueryResults`, whose `MaxQueryResults` its `@paginated` trait does not
+        //   name as a page size at all, so a value outside that member's range is the
+        //   generic `ValidationException` envelope the framework renders;
+        // * `LookupEvents`, whose maximum is stated of the results RETURNED ("The
+        //   default number of results returned is 50, with a maximum of 50 possible"),
+        //   so a larger limit is served with a capped page instead of being refused —
+        //   the member carries `skip_validation` and the handler caps the page.
         wrap_operations!(
             in_modelled_envelope,
             engine,
             ModelledRefusal::InvalidMaxResults,
-            get_query_results::GetQueryResults,
             list_event_data_stores::ListEventDataStores,
             list_queries::ListQueries,
-            lookup_events::LookupEvents,
         );
         Self {
             entry: crate::ServiceDefinition::new(engine),
@@ -697,8 +708,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // dozen operations carry one and they model DIFFERENT errors for a bad limit
         // (`InvalidMaxResultsException`, `InvalidParameterException`, or none at all),
         // and this seam is not told which operation was called — so the `@range` clause
-        // above stays here. The operations whose model DOES declare
-        // `InvalidMaxResultsException` answer it through the per-operation seam instead
+        // above stays here, which is also the envelope the recorded answer to an
+        // out-of-range `GetQueryResults` `MaxQueryResults` carries. The operations whose
+        // model declares `InvalidMaxResultsException` for the member they declare as
+        // their page size answer it through the per-operation seam instead
         // ([`ModelledRefusal::InvalidMaxResults`], wired in [`InModelledEnvelope`]), which
         // knows which operation it wraps. Every other refusal, authentication included,
         // keeps the framework's wording because every reader declines it.

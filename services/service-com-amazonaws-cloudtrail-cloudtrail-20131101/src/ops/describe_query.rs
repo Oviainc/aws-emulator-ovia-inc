@@ -14,17 +14,20 @@
 //!
 //! Resolution order, which decides which refusal a caller sees:
 //!
-//! 1. the EVENT DATA STORE, because that is where a query lives: the one
-//!    `EventDataStore` names, or — the member being deprecated and optional here
-//!    — one of the addressed account's stores in this Region. An unreadable
-//!    identifier ⇒ `EventDataStoreARNInvalidException`; nothing resolved ⇒
-//!    `EventDataStoreNotFoundException`; a store awaiting deletion ⇒
-//!    `InactiveEventDataStoreException`. `EventDataStoreOwnerAccountId`, when
-//!    given, is the account the store must belong to.
+//! 1. the EVENT DATA STORE `EventDataStore` names, when the request names one:
+//!    an unreadable identifier ⇒ `EventDataStoreARNInvalidException`; one naming
+//!    no store in the Region it addresses ⇒ `EventDataStoreNotFoundException`; a
+//!    store awaiting deletion ⇒ `InactiveEventDataStoreException`. The member is
+//!    deprecated and optional, so a request that names NO store resolves on its
+//!    selector alone and no store has to exist for it.
 //! 2. the SELECTOR — exactly one of `QueryId` / `QueryAlias`, with `RefreshId`
 //!    only alongside the alias ⇒ otherwise `InvalidParameterException`.
-//! 3. the QUERY, within that store and Region ⇒ `QueryIdNotFoundException`,
-//!    naming the member and value the request selected it with.
+//! 3. the QUERY, within the Region and any store the request named ⇒
+//!    `QueryIdNotFoundException`, naming the member and value the request
+//!    selected it with.
+//! 4. the store the resolved query RAN on, which the registry has to still hold
+//!    and which a cross-account request (`EventDataStoreOwnerAccountId`) has to
+//!    name the owner of.
 //!
 //! The two not-found refusals answer HTTP 400, not the `@httpError(404)` the
 //! model annotates: see `NOT_FOUND_STATUS` below.
@@ -272,23 +275,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let event_data_store_id = named_store.map(|record| record.id.as_str());
 
-        // A query lives IN an event data store, so the store is resolved before
-        // the selector is read: the one the request names, or — the member being
-        // deprecated here ("no longer required by DescribeQueryRequest") — one of
-        // the addressed account's stores in this Region.
-        // `EventDataStoreOwnerAccountId` names the account that owns it, for a
-        // query run against a store shared from another account. A request that
-        // resolves no store names nothing that could hold the query it asks
-        // about, whichever selector it carries.
+        // A query is resolved on the SELECTOR the request carries: `EventDataStore` is
+        // deprecated here ("no longer required by DescribeQueryRequest"), so a request
+        // that names no store names no store to resolve, and the selector is what the
+        // caller is answered about. A request that DOES name one has had it resolved
+        // above, and only narrows which store's query this call addresses;
+        // `EventDataStoreOwnerAccountId` names the account that owns it, for a query run
+        // against a store shared from another account, and is held against the store the
+        // query actually ran on below.
         let owner = input.event_data_store_owner_account_id.as_deref();
-        let store_resolved = match (named_store, owner) {
-            (Some(record), Some(owner)) => record.owner() == owner,
-            (Some(_), None) => true,
-            (None, Some(owner)) => store.has_event_data_store_owned_by(&region, owner),
-            (None, None) => store.has_event_data_store_in(&region),
-        };
-        if !store_resolved {
-            return Err(event_data_store_not_found());
+        if let (Some(record), Some(owner)) = (named_store, owner) {
+            if record.owner() != owner {
+                return Err(event_data_store_not_found());
+            }
         }
 
         // "You must specify either QueryId or QueryAlias": exactly one of the two
@@ -328,9 +327,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .ok_or_else(|| query_not_found("QueryAlias", alias))?,
         };
 
-        // The store the resolved query actually RAN on is the one a cross-account
-        // request has to be addressing: when the caller named an owner account,
-        // that store must belong to it, not merely some store of that account.
+        // The store the resolved query actually RAN on is the one the call is really
+        // addressing: a query whose store the registry no longer holds resolves no store
+        // at all, and a cross-account request has to name that store's owner — not
+        // merely some store of that account.
+        if !store
+            .event_data_stores
+            .contains_key(&query.event_data_store_id)
+        {
+            return Err(event_data_store_not_found());
+        }
         if let Some(owner) = owner {
             let ran_on_owned_store = store
                 .event_data_stores

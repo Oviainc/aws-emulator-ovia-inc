@@ -202,11 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if tags.len() > crate::state::TAGS_PER_RESOURCE_LIMIT {
             return Err(CreateChannelErrorModeled::TagsLimitExceededException(
                 TagsLimitExceededException {
-                    message: Some(format!(
-                        "Tags carries {} tags; the limit is {} tags per channel",
-                        tags.len(),
-                        crate::state::TAGS_PER_RESOURCE_LIMIT
-                    )),
+                    message: Some(crate::state::tags_limit_exceeded_message()),
                 },
             )
             .into());

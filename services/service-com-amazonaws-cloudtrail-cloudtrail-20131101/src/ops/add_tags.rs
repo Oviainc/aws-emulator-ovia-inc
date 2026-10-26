@@ -253,15 +253,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         // "Adds one or more tags … up to a limit of 50": a request carrying more than
-        // the limit cannot be satisfied by any resource.
+        // the limit cannot be satisfied by any resource. The refusal states the RULE,
+        // not the count the request carried — the service's one sentence for it
+        // ([`crate::state::tags_limit_exceeded_message`]).
         if input.tags_list.len() > crate::state::TAGS_PER_RESOURCE_LIMIT {
             return Err(AddTagsErrorModeled::TagsLimitExceededException(
                 TagsLimitExceededException {
-                    message: Some(format!(
-                        "TagsList carries {} tags; the limit is {} tags per resource",
-                        input.tags_list.len(),
-                        crate::state::TAGS_PER_RESOURCE_LIMIT
-                    )),
+                    message: Some(crate::state::tags_limit_exceeded_message()),
                 },
             )
             .into());
@@ -364,12 +362,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if merged.len() > crate::state::TAGS_PER_RESOURCE_LIMIT {
             return Err(AddTagsErrorModeled::TagsLimitExceededException(
                 TagsLimitExceededException {
-                    message: Some(format!(
-                        "{} would carry {} tags; the limit is {} tags per resource",
-                        input.resource_id,
-                        merged.len(),
-                        crate::state::TAGS_PER_RESOURCE_LIMIT
-                    )),
+                    message: Some(crate::state::tags_limit_exceeded_message()),
                 },
             )
             .into());

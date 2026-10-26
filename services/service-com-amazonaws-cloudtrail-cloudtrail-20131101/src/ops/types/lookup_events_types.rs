@@ -11,7 +11,17 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudtrail-cloudtrail-20131101.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.cloudtrail#LookupEventsRequest")]
+// `skip_validation` names `MaxResults`, whose modelled `@range` upper bound CloudTrail
+// does not enforce on the REQUEST: the maximum is stated of the results RETURNED ("The
+// default number of results returned is 50, with a maximum of 50 possible",
+// `smithy_query(query="doc", shape="LookupEventsRequest", member="MaxResults")`), so a
+// larger limit is served with the page capped at it. The handler caps the page and
+// refuses a limit below the modelled minimum itself (`crate::ops::lookup_events`).
+// Every other member of this input keeps its constraint traits.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.cloudtrail#LookupEventsRequest",
+    skip_validation = ["MaxResults"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct LookupEventsInput {
     pub lookup_attributes: Option<Vec<LookupAttribute>>,

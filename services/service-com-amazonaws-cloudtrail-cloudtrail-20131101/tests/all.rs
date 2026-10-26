@@ -159,3 +159,7 @@ mod insight_selectors_api_state;
 // `Destinations` list.
 #[path = "all/channel_destination_identifier.rs"]
 mod channel_destination_identifier;
+// `page_size_and_query_id_refusals` pins what a page size and a query id a request
+// names are answered with, across the operations each rule reaches.
+#[path = "all/page_size_and_query_id_refusals.rs"]
+mod page_size_and_query_id_refusals;

@@ -16,10 +16,12 @@
 //!   one naming no store in the addressed Region is
 //!   `EventDataStoreNotFoundException`, and a store awaiting deletion is
 //!   `InactiveEventDataStoreException`;
-//! * a query runs IN an event data store, so the store resolves BEFORE the query
-//!   id: a Region — or the account `EventDataStoreOwnerAccountId` names — holding
-//!   no store refuses the call with `EventDataStoreNotFoundException`, whatever
-//!   query id it carries;
+//! * a query is resolved on its QUERY ID, the deprecated `EventDataStore` member
+//!   only narrowing which store's query a request addresses: a request that names
+//!   no store needs no store to exist, so an id naming no query is
+//!   `QueryIdNotFoundException`, while the store a resolved query RAN on must
+//!   still be held by the registry, be in the Region, belong to the account
+//!   `EventDataStoreOwnerAccountId` names and serve queries;
 //! * a query is cancellable only from the Region it ran in and only through the
 //!   event data store it ran on; any other query id is
 //!   `QueryIdNotFoundException`, naming the member and the value it was selected
@@ -495,29 +497,36 @@ async fn a_query_id_that_resolves_to_no_query_here_is_not_found() {
 /// RULE: `EventDataStore` is "the ARN (or the ID suffix of the ARN) of an event
 /// data store": an unreadable value is refused as an invalid ARN, and a readable
 /// one naming no store in the Region it addresses is not found — before the query
-/// id is read, so a request naming a persisted query is refused all the same.
+/// id is read, so a request naming a persisted query is refused all the same. The
+/// member is deprecated and optional, so a request that names NO store resolves on
+/// its query id alone: an id naming no query is `QueryIdNotFoundException` whether
+/// or not the Region holds a store.
 #[tokio::test]
 async fn the_event_data_store_resolves_before_the_query_id() {
     let emulator = Emulator::new();
     let record = query_in(1, QueryState::Running);
     seed_query(&emulator, &record);
 
-    // No event data store in the Region at all: nothing could hold the query.
-    for (case, body) in [
-        (
-            "a persisted query id with no store in the Region",
-            json!({ "QueryId": record.query_id }),
-        ),
-        (
-            "an unknown query id with no store in the Region",
-            json!({ "QueryId": query_id(9) }),
-        ),
-    ] {
-        emulator
-            .call("CancelQuery", &body)
-            .await
-            .expect_error(case, NOT_FOUND_STATUS, "EventDataStoreNotFoundException");
-    }
+    // No store member sent: the query id is what the caller is answered about, so an
+    // id that names no query is not found even with no store in the Region.
+    emulator
+        .call("CancelQuery", &json!({ "QueryId": query_id(9) }))
+        .await
+        .expect_error(
+            "an unknown query id with no store named",
+            NOT_FOUND_STATUS,
+            "QueryIdNotFoundException",
+        );
+
+    // A persisted query whose own store the Region does not hold resolves no store.
+    emulator
+        .call("CancelQuery", &json!({ "QueryId": record.query_id }))
+        .await
+        .expect_error(
+            "a persisted query id whose store the registry does not hold",
+            NOT_FOUND_STATUS,
+            "EventDataStoreNotFoundException",
+        );
 
     seed_store(&emulator, STORE_ID, HOME_REGION, EventDataStoreState::Enabled);
 

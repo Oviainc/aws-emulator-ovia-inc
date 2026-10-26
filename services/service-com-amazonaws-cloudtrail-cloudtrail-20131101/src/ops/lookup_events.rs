@@ -7,6 +7,10 @@
 //! A lookup is a REPORTING call: it reads the log and writes nothing to it, so two
 //! identical lookups answer the same page and a lookup never shows up in a later one.
 //!
+//! `MaxResults` bounds the PAGE rather than the request: the documented maximum is
+//! stated of the results returned, so a larger limit is served with the page capped at
+//! it (see [`page_size`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -285,13 +289,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The number of events to return. Possible values are 1 through 50. The default
         // is 50."
-        let page_size = usize::try_from(
-            input
-                .max_results
-                .unwrap_or(MAX_RESULTS_DEFAULT)
-                .clamp(MAX_RESULTS_MIN, MAX_RESULTS_MAX),
-        )
-        .unwrap_or(MAX_RESULTS_DEFAULT as usize);
+        let page_size = page_size(input.max_results)?;
 
         let events: Vec<Event> = selected
             .iter()
@@ -317,6 +315,40 @@ const MAX_RESULTS_MAX: i32 = 50;
 /// `MaxResults`'s documented default: "The default number of results returned is 50".
 /// The same number as [`MAX_RESULTS_MAX`] today, but a different model fact.
 const MAX_RESULTS_DEFAULT: i32 = 50;
+
+/// How many events one page carries, or the refusal a limit that cannot name a page is
+/// answered with.
+///
+/// The documented maximum is stated of the results RETURNED — "The default number of
+/// results returned is 50, with a maximum of 50 possible" — so it bounds the PAGE, not
+/// the request: a lookup that asks for more is served, its page capped at the maximum,
+/// with a `NextToken` while events remain. That is what lets a client paginator
+/// configured with any page size walk the history.
+///
+/// A limit BELOW the modelled minimum asks for a page that cannot exist, and is the
+/// error this operation models for one: `InvalidMaxResultsException`, "thrown if the
+/// limit specified is not valid". `MaxResults` carries `skip_validation` on the input
+/// (see `super::types::lookup_events_types`), so this is the only reader of its bounds.
+fn page_size(requested: Option<i32>) -> Result<usize, LookupEventsError> {
+    let Some(requested) = requested else {
+        return Ok(MAX_RESULTS_DEFAULT as usize);
+    };
+    if requested < MAX_RESULTS_MIN {
+        return Err(LookupEventsErrorModeled::InvalidMaxResultsException(
+            InvalidMaxResultsException {
+                // The ONE wording of a limit refusal this service has
+                // (`crate::state::limit_not_valid_message`), so this sentence and the
+                // pre-dispatch seam's cannot drift apart.
+                message: Some(crate::state::limit_not_valid_message(
+                    "maxResults",
+                    &format!("greater than or equal to {MAX_RESULTS_MIN}"),
+                )),
+            },
+        )
+        .into());
+    }
+    Ok(requested.min(MAX_RESULTS_MAX) as usize)
+}
 
 /// The version prefix inside a pagination token, so a token minted by an older form of
 /// the encoding is refused rather than misread.
