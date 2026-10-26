@@ -5,8 +5,8 @@
 //!
 //! The rule under test: `CreateExportTask` exports from a log group this account HOLDS — a
 //! request naming one it does not hold is refused `ResourceNotFoundException` and starts
-//! nothing — over a window that is a range and that does not end before the log group was
-//! created (`InvalidParameterException` otherwise), while the account has no other active
+//! nothing — over a window that is a range (`InvalidParameterException` otherwise), while the
+//! account has no other active
 //! task (`LimitExceededException` otherwise); it mints the task's id and stores the task,
 //! which `DescribeExportTasks` then reports, `PENDING` at first and moving on the clock to
 //! `RUNNING` and `COMPLETED` without anybody polling it.
@@ -16,10 +16,12 @@
 //! response a handler does not actually compute cannot pass.
 //!
 //! The table spans what the rule generalises over rather than one request: which end of the
-//! window is out of order, whether the window precedes the log group, whether the request
+//! window is out of order, whether the request
 //! names a task name, a destination prefix or a log-stream prefix, and which filter
 //! (`taskId`, `statusCode`, neither) the report is read through. The recorded request an
-//! issue happens to mention is one row.
+//! issue happens to mention is one row. Where the window itself SELECTS the events exported
+//! — including a window wholly in the past of the log group — the rows live in
+//! [`crate::export_time_windows`].
 
 use std::time::Duration;
 
@@ -169,13 +171,6 @@ async fn a_create_the_rule_refuses_starts_nothing() {
     const GROUP: &str = "/export/refusals";
     logs.ok("CreateLogGroup", &json!({"logGroupName": GROUP}))
         .await;
-    let group = logs
-        .describe_group(GROUP)
-        .await
-        .expect("the log group must exist");
-    let created_at = group["creationTime"]
-        .as_i64()
-        .unwrap_or_else(|| panic!("a log group reports its creationTime, got {group}"));
     let now = now_ms();
 
     // (case, the request, the modelled code it is refused under)
@@ -210,16 +205,6 @@ async fn a_create_the_rule_refuses_starts_nothing() {
             }),
             INVALID_PARAMETER,
         ),
-        (
-            "a window ending one millisecond before the log group was created",
-            json!({
-                "logGroupName": GROUP,
-                "from": 0,
-                "to": created_at - 1,
-                "destination": "export-bucket",
-            }),
-            INVALID_PARAMETER,
-        ),
     ];
     for (case, body, expected) in cases {
         let code = logs.err(CREATE, &body).await;
@@ -233,17 +218,16 @@ async fn a_create_the_rule_refuses_starts_nothing() {
         );
     }
 
-    // The window ending exactly when the log group was created is the published boundary,
-    // which is accepted: "You must specify a time that is not earlier than when this log
-    // group was created."
+    // A window of a single instant is still a range, so it is accepted: the refusals above
+    // are the window running backwards and nothing else.
     let id = task_id(
         &logs
             .ok(
                 CREATE,
                 &json!({
                     "logGroupName": GROUP,
-                    "from": 0,
-                    "to": created_at,
+                    "from": now,
+                    "to": now,
                     "destination": "export-bucket",
                 }),
             )
@@ -251,7 +235,7 @@ async fn a_create_the_rule_refuses_starts_nothing() {
     );
     assert!(
         described_task(&logs, &json!({}), &id).await.is_some(),
-        "case a window ending when the log group was created: the task must be started"
+        "case a window of a single instant: the task must be started"
     );
 }
 

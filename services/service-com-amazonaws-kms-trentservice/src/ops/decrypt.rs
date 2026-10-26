@@ -402,7 +402,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx);
-        let state = state.lock();
+        let mut state = state.lock();
 
         // Permission a request draws from a grant is judged below, once the key is
         // known and its key state has been judged.
@@ -441,6 +441,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         },
                     )
                     .into());
+                }
+                crate::state::KeyRef::UnauthorizedAccount => {
+                    return Err(crate::state::unauthorized_account(Self::NAME, requested));
                 }
                 crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
                     return Err(DecryptErrorModeled::NotFoundException(NotFoundException {
@@ -542,10 +545,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(invalid_ciphertext());
         };
+        let key_arn = key.arn.clone();
+        let key_origin = key.origin.clone();
+        let key_id = key.key_id.clone();
+
+        // The key was just used in a successful cryptographic operation, which is what
+        // `GetKeyLastUsage` reports.
+        state.record_last_usage(&key_id, Self::NAME);
 
         Ok(DecryptResponse {
             modelled: DecryptOutput {
-                key_id: Some(key.arn.clone()),
+                key_id: Some(key_arn),
                 plaintext: Some(opened.plaintext),
                 encryption_algorithm: Some(algorithm),
                 // Only a `Recipient` request has a ciphertext for one, and those are
@@ -563,7 +573,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // answers can never disagree. A client branches on it to decide how the
             // backing material is held (`AWS_KMS`, `EXTERNAL`, a CloudHSM or external
             // key store), so a null here is not the same answer as a value.
-            key_origin: Some(key.origin.clone()),
+            key_origin: Some(key_origin),
         })
     }
 }

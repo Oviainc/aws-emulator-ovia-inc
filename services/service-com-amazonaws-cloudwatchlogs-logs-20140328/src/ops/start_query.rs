@@ -361,34 +361,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // A query window that ends before every log group it reads existed can be compiled
-        // against none of them: there is no log group in the window to resolve the query's
-        // fields against, so the query string is refused rather than run over nothing. A
-        // window that reaches into the lifetime of at least one named group is a query of
-        // that group.
-        //
-        // The window is in epoch SECONDS ("the number of seconds since January 1, 1970") and
-        // a log group's creation instant is in epoch MILLISECONDS, so the two are compared in
-        // one unit rather than as the numbers they arrive as.
-        let window_end_ms = input
-            .end_time
-            .saturating_mul(crate::state::MILLIS_PER_SECOND);
-        let window_precedes_every_group = !log_group_names.is_empty()
-            && log_group_names.iter().all(|name| {
-                store
-                    .log_groups
-                    .get(name)
-                    .is_some_and(|group| window_end_ms < group.creation_time_ms)
-            });
-        if window_precedes_every_group {
-            return Err(malformed_query(
-                &crate::state::query_compile::QueryCompileFailure {
-                    message: "The query window ends before the log group was created."
-                        .to_string(),
-                    start_char_offset: 0,
-                    end_char_offset: input.query_string.chars().count(),
-                },
-            ));
+        // A `lookup` command in the query reads a lookup table of this account, which the
+        // command names and the store holds: the query is resolved against that state, so a
+        // table the account does not hold is the missing resource it is rather than a fault
+        // in the query string. The window the request asks for selects which events the query
+        // reads and bounds NO resource's lifetime, so neither a log group nor a lookup table
+        // is judged against it.
+        for table in compiled
+            .as_ref()
+            .map(|compiled| compiled.lookup_tables.as_slice())
+            .unwrap_or_default()
+        {
+            if !store.lookup_tables.contains_key(table) {
+                return Err(StartQueryErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message("lookup table")),
+                    },
+                )
+                .into());
+            }
         }
 
         // "You can have up to 100 concurrent CloudWatch Logs insights queries": the statuses
