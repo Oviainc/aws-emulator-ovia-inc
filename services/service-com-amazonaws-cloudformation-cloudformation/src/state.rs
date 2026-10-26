@@ -4001,6 +4001,17 @@ pub fn stack_does_not_exist(name_or_id: &str) -> String {
     format!("Stack with id {name_or_id} does not exist")
 }
 
+/// The message answered when a stack IS addressable but carries no template: a stack a
+/// `CREATE` change set created has none until that change set is executed, and "if the
+/// template doesn't exist, a ValidationError is returned".
+///
+/// Built from what the request named and the status the stack is in, the way
+/// [`stack_does_not_exist`] is built from the name — and worded once, so the operations that
+/// read a stack's template cannot drift about it.
+pub fn template_does_not_exist(name_or_id: &str, status: &str) -> String {
+    format!("Template does not exist for stack [{name_or_id}] in {status} state")
+}
+
 /// The `StackSetNotFoundException` message CloudFormation answers when a request names a
 /// stack set this administrator account and Region does not hold — an unknown name, an
 /// unknown id, or a stack set another Region holds.

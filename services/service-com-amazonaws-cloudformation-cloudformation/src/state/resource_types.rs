@@ -933,18 +933,29 @@ pub fn unrecognized_message(types: &[String]) -> String {
     )
 }
 
+/// The types `template` declares that [`is_recognized`] does not, with the TRANSFORM rule
+/// already applied: a template declaring a `Transform` names none, because a macro's
+/// expansion is what CloudFormation validates (see the module docs) and the only macro this
+/// emulator expands has already been expanded by the time a template reaches here.
+///
+/// The ONE place that rule lives: [`refuse_unrecognized`] is this list refused, and an
+/// operation that REPORTS the types instead (`GetTemplateSummary`'s
+/// `Warnings$UnrecognizedResourceTypes`, where the request asks for warnings rather than an
+/// error) reports this same list.
+pub fn unrecognized_in(template: &Template) -> Vec<String> {
+    if !template.transforms.is_empty() {
+        return Vec::new();
+    }
+    unrecognized(&template.resources)
+}
+
 /// `Err(message)` for a template declaring a resource type CloudFormation does not
 /// recognise — the refusal a submitted template is held to before anything is created.
 ///
-/// `Ok(())` for a template that declares a `Transform`: a macro's expansion is what
-/// CloudFormation validates, and the only macro this emulator expands is the SAM one (see
-/// the module docs), whose expansion has already happened by the time a template reaches
-/// here.
+/// `Ok(())` for a template that declares a `Transform`, which [`unrecognized_in`] is what
+/// decides.
 pub fn refuse_unrecognized(template: &Template) -> Result<(), String> {
-    if !template.transforms.is_empty() {
-        return Ok(());
-    }
-    let unrecognized = unrecognized(&template.resources);
+    let unrecognized = unrecognized_in(template);
     if unrecognized.is_empty() {
         return Ok(());
     }
