@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteApiKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteApiKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteApiKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: deletes an API key from the stored API — a `GraphqlApi` or an `Api` —
+//! that holds it. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +133,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteApiKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteApiKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteApiKey"))
+        // The deletion depends only on the deserialized `apiId` and `id`, so `ctx` is
+        // unused.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteApiKeyErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // An `apiId` that is not an API id at all is a malformed request, not a
+        // missing resource (see `crate::state::is_api_id`).
+        if !crate::state::is_api_id(&input.api_id) {
+            return Err(DeleteApiKeyErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        let mut guard = state.lock();
+        // The `apiId` label names one identifier space over both API resource
+        // families, so it is resolved through `crate::state`'s single API-key lookup.
+        let Some(api_keys) = guard.api_keys_of_mut(&input.api_id) else {
+            return Err(DeleteApiKeyErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        // A key is addressed by its id within its API, so an id that API does not
+        // hold names no key to delete — including one held by a DIFFERENT API, and
+        // one an earlier delete already removed. Removing the record is what makes
+        // the key gone: `ListApiKeys` answers without it afterwards, and the room it
+        // took in the per-API quota is free again.
+        if api_keys.remove(&input.id).is_none() {
+            return Err(DeleteApiKeyErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::API_KEY_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        }
+
+        Ok(DeleteApiKeyOutput {})
     }
 }

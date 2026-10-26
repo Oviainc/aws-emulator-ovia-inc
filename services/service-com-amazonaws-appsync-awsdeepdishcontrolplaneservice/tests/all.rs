@@ -17,6 +17,8 @@ mod api_cache;
 mod api_cache_create_rules;
 #[path = "all/api_key_update.rs"]
 mod api_key_update;
+#[path = "all/api_keys_across_api_families.rs"]
+mod api_keys_across_api_families;
 #[path = "all/association_refusal_messages.rs"]
 mod association_refusal_messages;
 #[path = "all/data_source_delete.rs"]

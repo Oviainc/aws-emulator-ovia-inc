@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApiKey
-//! Implemented: mints an API key under a stored `GraphqlApi` and persists it in
-//! [`crate::state`]. This is the ONLY file to touch for this operation.
+//! Implemented: mints an API key under a stored API — a `GraphqlApi` or an `Api` —
+//! and persists it in [`crate::state`]. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -198,15 +199,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut guard = state.lock();
-        // The key's parent API must exist, and must have room for another key.
+        // The key's parent API must exist, and must have room for another key. The
+        // `apiId` label names one identifier space over both API resource families,
+        // so it is resolved through `crate::state`'s single API-key lookup.
         {
-            let Some(api) = guard.graphql_apis.get(&input.api_id) else {
+            let Some(api_keys) = guard.api_keys_of(&input.api_id) else {
                 return Err(CreateApiKeyErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
                 })
                 .into());
             };
-            if api.api_keys.len() >= API_KEYS_PER_API {
+            if api_keys.len() >= API_KEYS_PER_API {
                 return Err(CreateApiKeyErrorModeled::ApiKeyLimitExceededException(
                     ApiKeyLimitExceededException {
                         message: Some(format!(
@@ -222,9 +225,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store it under its parent API.
         let mut key_id = format!("{KEY_VERSION_PREFIX}{}", guard.mint_id());
         while guard
-            .graphql_apis
-            .get(&input.api_id)
-            .is_some_and(|api| api.api_keys.contains_key(&key_id))
+            .api_keys_of(&input.api_id)
+            .is_some_and(|api_keys| api_keys.contains_key(&key_id))
         {
             key_id = format!("{KEY_VERSION_PREFIX}{}", guard.mint_id());
         }
@@ -238,18 +240,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             requested,
         );
 
-        let Some(api) = guard.graphql_apis.get_mut(&input.api_id) else {
+        let Some(api_keys) = guard.api_keys_of_mut(&input.api_id) else {
             return Err(CreateApiKeyErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
             })
             .into());
         };
-        api.api_keys.insert(key_id.clone(), record);
+        api_keys.insert(key_id.clone(), record);
 
         // Answer from the STORED key, so `ListApiKeys` reports the same one.
         Ok(CreateApiKeyOutput {
-            api_key: api
-                .api_keys
+            api_key: api_keys
                 .get(&key_id)
                 .map(crate::state::ApiKeyRecord::to_api_key),
         })
@@ -265,7 +266,7 @@ const KEY_VERSION_PREFIX: &str = "da2-";
 /// days from creation time."
 const DEFAULT_VALIDITY_SECONDS: i64 = 7 * crate::state::SECONDS_PER_DAY;
 
-/// The AppSync service quota for API keys on one GraphQL API, which
+/// The AppSync service quota for API keys on one API, which
 /// `ApiKeyLimitExceededException` reports.
 const API_KEYS_PER_API: usize = 50;
 

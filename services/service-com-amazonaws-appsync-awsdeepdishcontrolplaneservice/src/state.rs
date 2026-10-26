@@ -204,7 +204,8 @@ impl ApiCacheRecord {
     }
 }
 
-/// One stored API key of a `GraphqlApiRecord`.
+/// One stored API key of an API, of either resource family — a
+/// [`GraphqlApiRecord`] or an [`EventApiRecord`].
 #[derive(Debug, Clone)]
 pub struct ApiKeyRecord {
     /// Creation order within the parent API, for a stable `ListApiKeys` page order.
@@ -588,6 +589,13 @@ pub struct EventApiRecord {
     pub dns: BTreeMap<String, String>,
     pub tags: BTreeMap<String, String>,
     pub created: SystemTime,
+    /// The API keys created under this API, keyed by key id — the same resource a
+    /// `GraphqlApiRecord` holds, since the API-key operations address an API of
+    /// either family by the same `apiId` label (see
+    /// [`ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::api_keys_of`]).
+    /// Bounded: `CreateApiKey` refuses a create once the API holds the AppSync
+    /// per-API quota of keys, so this map cannot grow without limit.
+    pub api_keys: BTreeMap<String, ApiKeyRecord>,
 }
 
 impl EventApiRecord {
@@ -1352,6 +1360,32 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
         self.source_api_associations.retain(|_, association| {
             association.source_api_id != api_id && association.merged_api_id != api_id
         });
+    }
+
+    /// The API keys the API `api_id` holds, or `None` when no stored API has that id.
+    ///
+    /// An API key belongs to the API its `apiId` path label names, and that label is
+    /// ONE identifier space over both API resource families: a `GraphqlApi` and an
+    /// `Api` are created by operations of their own, but either is given its keys
+    /// through the same `/v1/apis/{apiId}/apikeys` path. So an `apiId` is resolved
+    /// against both stores here — the single lookup every API-key operation uses —
+    /// and only an id that names no API at all is a not-found.
+    pub fn api_keys_of(&self, api_id: &str) -> Option<&BTreeMap<String, ApiKeyRecord>> {
+        self.graphql_apis
+            .get(api_id)
+            .map(|api| &api.api_keys)
+            .or_else(|| self.event_apis.get(api_id).map(|api| &api.api_keys))
+    }
+
+    /// The API keys the API `api_id` holds, for a call that writes one.
+    ///
+    /// Resolves `api_id` exactly as [`Self::api_keys_of`] does, so a write and a read
+    /// of the same API's keys can never disagree about which APIs exist.
+    pub fn api_keys_of_mut(&mut self, api_id: &str) -> Option<&mut BTreeMap<String, ApiKeyRecord>> {
+        match self.graphql_apis.get_mut(api_id) {
+            Some(api) => Some(&mut api.api_keys),
+            None => self.event_apis.get_mut(api_id).map(|api| &mut api.api_keys),
+        }
     }
     /// Mint a fresh opaque id: 26 lowercase base-32 characters, the shape an AppSync
     /// `apiId` takes.

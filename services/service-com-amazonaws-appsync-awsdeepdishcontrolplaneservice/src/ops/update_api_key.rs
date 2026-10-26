@@ -193,7 +193,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut guard = state.lock();
-        let Some(api) = guard.graphql_apis.get_mut(&input.api_id) else {
+        // The `apiId` label names one identifier space over both API resource
+        // families, so it is resolved through `crate::state`'s single API-key lookup.
+        let Some(api_keys) = guard.api_keys_of_mut(&input.api_id) else {
             return Err(UpdateApiKeyErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
             })
@@ -201,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // "You can update the key as long as it's not deleted": a key its parent API
         // does not hold is the not-found case, and nothing is written for it.
-        let Some(stored) = api.api_keys.get_mut(&input.id) else {
+        let Some(stored) = api_keys.get_mut(&input.id) else {
             return Err(UpdateApiKeyErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::API_KEY_NOT_FOUND_MESSAGE.to_string()),
             })

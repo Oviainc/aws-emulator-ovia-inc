@@ -171,14 +171,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let guard = state.lock();
-        let Some(api) = guard.graphql_apis.get(&input.api_id) else {
+        // The `apiId` label names one identifier space over both API resource
+        // families, so it is resolved through `crate::state`'s single API-key lookup.
+        let Some(api_keys) = guard.api_keys_of(&input.api_id) else {
             return Err(ListApiKeysErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
             })
             .into());
         };
 
-        let mut ordered: Vec<&crate::state::ApiKeyRecord> = api.api_keys.values().collect();
+        let mut ordered: Vec<&crate::state::ApiKeyRecord> = api_keys.values().collect();
         ordered.sort_by_key(|key| key.seq);
 
         let Some(page) = crate::state::paginate(
