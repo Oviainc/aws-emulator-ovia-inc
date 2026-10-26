@@ -275,9 +275,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .range(resume_from.unwrap_or_default()..)
             .map(|(_, allocation)| allocation)
             .filter(|allocation| {
+                // `FulfillmentTypes` filters on the fulfillment the ALLOCATION was granted
+                // with (`BenefitAllocation::fulfillment_types`), not on the wider list of
+                // types its benefit offers: an allocation of a benefit offering two is
+                // fulfilled with one of them, and only that one selects it.
                 crate::state::matches_any(
                     input.fulfillment_types.as_ref(),
-                    &allocation.fulfillment_types,
+                    allocation.fulfillment_types(),
                 ) && crate::state::matches_any(
                     input.status.as_ref(),
                     std::slice::from_ref(&allocation.status),
@@ -317,8 +321,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         name: Some(allocation.name.clone()),
                         benefit_id: Some(allocation.benefit_id.clone()),
                         benefit_application_id: allocation.benefit_application_id.clone(),
+                        // The types USED for this allocation, which is what the summary
+                        // member reports and what `GetBenefitAllocation` reports singly as
+                        // `FulfillmentType` — never its benefit's offer list.
                         fulfillment_types: crate::state::optional_list(
-                            &allocation.fulfillment_types,
+                            allocation.fulfillment_types(),
                         ),
                         created_at: Some(crate::state::timestamp(allocation.created_at_millis)),
                         expires_at: Some(crate::state::timestamp(allocation.expires_at_millis)),

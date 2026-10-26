@@ -126,7 +126,11 @@ pub(crate) fn granted(
 
 /// One `ListBenefitAllocations` call that must answer 200: its summaries and its
 /// `NextToken`.
-async fn list(harness: &Harness, case: &str, body: &Value) -> (Vec<Value>, Option<String>) {
+pub(crate) async fn list(
+    harness: &Harness,
+    case: &str,
+    body: &Value,
+) -> (Vec<Value>, Option<String>) {
     let out = harness.ok(case, "ListBenefitAllocations", body).await;
     let summaries = out["BenefitAllocationSummaries"]
         .as_array()
@@ -137,7 +141,7 @@ async fn list(harness: &Harness, case: &str, body: &Value) -> (Vec<Value>, Optio
 }
 
 /// The `Id` of each summary, in the order they were reported.
-fn ids(summaries: &[Value]) -> Vec<String> {
+pub(crate) fn ids(summaries: &[Value]) -> Vec<String> {
     summaries
         .iter()
         .map(|summary| summary["Id"].as_str().unwrap_or("<no Id>").to_string())
@@ -145,12 +149,12 @@ fn ids(summaries: &[Value]) -> Vec<String> {
 }
 
 /// A string member of a summary, or `None` when the summary omits it.
-fn member(summary: &Value, name: &str) -> Option<String> {
+pub(crate) fn member(summary: &Value, name: &str) -> Option<String> {
     summary.get(name).and_then(Value::as_str).map(str::to_string)
 }
 
 /// The entries of a list member, or an empty list when the summary omits it.
-fn members(summary: &Value, name: &str) -> Vec<String> {
+pub(crate) fn members(summary: &Value, name: &str) -> Vec<String> {
     summary
         .get(name)
         .and_then(Value::as_array)
@@ -327,8 +331,9 @@ async fn every_stored_allocation_is_reported_field_for_field_in_every_catalog() 
             );
             assert_eq!(
                 members(summary, "FulfillmentTypes"),
-                allocation.fulfillment_types,
-                "case {case:?}: expected the stored FulfillmentTypes, got {summary:?}"
+                allocation.fulfillment_types(),
+                "case {case:?}: expected the fulfillment types USED for the allocation, \
+                 got {summary:?}"
             );
             assert!(
                 members(summary, "FulfillmentTypes")
@@ -444,7 +449,7 @@ async fn each_filter_selects_exactly_the_stored_allocations_that_match_it() {
             json!({ "FulfillmentTypes": ["CASH", "CREDITS"] }),
             Box::new(|allocation: &BenefitAllocation| {
                 allocation
-                    .fulfillment_types
+                    .fulfillment_types()
                     .iter()
                     .any(|value| value == "CASH" || value == "CREDITS")
             }),
@@ -511,7 +516,7 @@ async fn each_filter_selects_exactly_the_stored_allocations_that_match_it() {
             json!({ "Status": ["ACTIVE"], "FulfillmentTypes": ["CREDITS"] }),
             Box::new(|allocation: &BenefitAllocation| {
                 allocation.status == "ACTIVE"
-                    && allocation.fulfillment_types.iter().any(|v| v == "CREDITS")
+                    && allocation.fulfillment_types().iter().any(|v| v == "CREDITS")
             }),
         ),
         (
@@ -536,7 +541,7 @@ async fn each_filter_selects_exactly_the_stored_allocations_that_match_it() {
             {
                 let wanted = (*value).to_string();
                 Box::new(move |allocation: &BenefitAllocation| {
-                    allocation.fulfillment_types.contains(&wanted)
+                    allocation.fulfillment_types().contains(&wanted)
                 })
             },
         ));

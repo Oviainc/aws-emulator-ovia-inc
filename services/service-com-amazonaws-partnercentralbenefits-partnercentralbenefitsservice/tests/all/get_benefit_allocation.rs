@@ -79,7 +79,7 @@ const DETAIL_MEMBER_BY_TYPE: &[(&str, &str)] = &[
 ];
 
 /// One `GetBenefitAllocation` call that must answer 200.
-async fn get(harness: &Harness, case: &str, catalog: &str, identifier: &str) -> Value {
+pub(crate) async fn get(harness: &Harness, case: &str, catalog: &str, identifier: &str) -> Value {
     harness
         .ok(
             case,
@@ -370,11 +370,12 @@ fn assert_reports_the_store(case: &str, body: &Value, allocation: &BenefitAlloca
         FULFILLMENT_TYPE_VALUES.contains(&fulfillment_type.as_str()),
         "case {case:?}: FulfillmentType {fulfillment_type:?} is not a modelled FulfillmentType"
     );
-    assert!(
-        allocation.fulfillment_types.contains(&fulfillment_type),
-        "case {case:?}: an allocation is fulfilled with one of its benefit's types {:?}, \
-         got {fulfillment_type:?}",
-        allocation.fulfillment_types
+    assert_eq!(
+        allocation.fulfillment_types(),
+        std::slice::from_ref(&fulfillment_type),
+        "case {case:?}: the types used for an allocation are the one it is fulfilled with, \
+         got {:?}",
+        allocation.fulfillment_types()
     );
     assert_eq!(
         members(body, "ApplicableBenefitIds"),

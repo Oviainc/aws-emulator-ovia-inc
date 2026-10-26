@@ -873,11 +873,11 @@ pub struct BenefitAllocation {
     /// A `BenefitAllocationStatus` value.
     pub status: String,
     pub status_reason: Option<String>,
-    /// `FulfillmentType` values: the ones the benefit this allocation is based on offers.
-    pub fulfillment_types: Vec<String>,
     /// The one `FulfillmentType` this allocation is fulfilled with, which is always one of
-    /// [`Self::fulfillment_types`]: a benefit may offer two, and the allocation is fulfilled
-    /// with one of them.
+    /// the types its benefit offers: a benefit may offer two, and the allocation is
+    /// fulfilled with one of them. The benefit's offer list is the BENEFIT's own field —
+    /// what an allocation carries is the fulfillment it got (see
+    /// [`Self::fulfillment_types`]).
     pub fulfillment_type: String,
     /// How this allocation is fulfilled: the amounts, issuances and credit codes behind
     /// [`Self::fulfillment_type`]. `None` for a fulfillment type this store holds no record
@@ -894,6 +894,22 @@ pub struct BenefitAllocation {
 }
 
 impl BenefitAllocation {
+    /// The `FulfillmentType` values USED for this allocation — the fulfillment it was
+    /// granted with, which is the one [`Self::fulfillment_type`] names, so the list holds
+    /// exactly that type. It is NOT the offer list of the benefit the allocation is based
+    /// on, which may be wider and belongs to the benefit; every report of, and filter on,
+    /// an allocation's fulfillment types reads this.
+    ///
+    /// Empty for an allocation no fulfillment type was recorded for, so such an allocation
+    /// reports no fulfillment type rather than an unmodelled empty one.
+    pub fn fulfillment_types(&self) -> &[String] {
+        if self.fulfillment_type.is_empty() {
+            &[]
+        } else {
+            std::slice::from_ref(&self.fulfillment_type)
+        }
+    }
+
     /// Whether this allocation's term has closed at `now_millis` — `ExpiresAt` is the
     /// instant the model documents it "expires and is no longer usable" at, so the term is
     /// closed from that instant on.
@@ -1235,7 +1251,6 @@ impl Catalog {
                     description: Some(benefit.description.clone()),
                     status: seed.status.to_string(),
                     status_reason: seed.status_reason.map(str::to_string),
-                    fulfillment_types: benefit.fulfillment_types.clone(),
                     fulfillment_type: seed.fulfillment_type.to_string(),
                     fulfillment: AllocationFulfillment::new(
                         seed.fulfillment_type,
@@ -1540,9 +1555,8 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
     /// allocation.
     ///
     /// The allocation runs for [`ALLOCATION_TERM_MILLIS`] from `now_millis`, and its
-    /// description, fulfillment types and applicable benefits are the benefit's own rather
-    /// than values the caller supplies. It is fulfilled with the FIRST type its benefit
-    /// offers — a benefit offering two is fulfilled with one of them and nothing here names
+    /// description and applicable benefits are the benefit's own rather than values the
+    /// caller supplies. It is fulfilled with the FIRST type its benefit offers — a benefit offering two is fulfilled with one of them and nothing here names
     /// which — for [`GRANTED_ALLOCATION_AMOUNT_MINOR`], of which nothing has been issued
     /// yet.
     pub fn grant_allocation(
@@ -1579,7 +1593,6 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
             description: Some(benefit.description.clone()),
             status: ALLOCATION_STATUS_ACTIVE.to_string(),
             status_reason: None,
-            fulfillment_types: benefit.fulfillment_types.clone(),
             fulfillment: fulfillment_type.as_deref().and_then(|fulfillment_type| {
                 AllocationFulfillment::new(
                     fulfillment_type,
