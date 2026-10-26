@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEnrichmentJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEnrichmentJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEnrichmentJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORTING read over the enrichment jobs `CreateEnrichmentJob` started: every
+//! member answered below is read off the stored job, or DERIVED from the instant
+//! that create stamped it with, so this operation writes nothing and two readers
+//! of one job cannot disagree about where it has got to.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -199,20 +197,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEnrichmentJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEnrichmentJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEnrichmentJob"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            internal_failure("the IoT SiteWise store is unavailable".to_string())
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // A read, so nothing here writes: the status and every lifecycle instant are
+        // DERIVED from the instant the create recorded, which is why a poll cannot
+        // move a job on and a describe and a listing of one store agree.
+        let store = state.lock();
+
+        // A job is addressed WITHIN a workspace, so the workspace the request names
+        // has to exist: a name this service does not hold addresses no job at all.
+        // Resolved FIRST, as `CreateEnrichmentJob` and `ListEnrichmentJobs` resolve
+        // it, so a request that names neither a held workspace nor a stored job
+        // reports the outer resource its path names.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            )));
+        }
+
+        // A job of one workspace is not reachable through another, which is what the
+        // key the store holds a job under states, so a job id this workspace does not
+        // hold is the modelled not-found refusal.
+        let key = crate::state::enrichment_job_key(&input.workspace_name, &input.job_id);
+        let record = store.enrichment_jobs.get(&key).ok_or_else(|| {
+            not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_ENRICHMENT_JOB,
+                &input.job_id,
+            ))
+        })?;
+
+        Ok(DescribeEnrichmentJobOutput {
+            job_id: record.job_id.clone(),
+            workspace_name: record.workspace_name.clone(),
+            status: record.status(now).to_string(),
+            // "The type of enrichment job, derived from the job configuration" and
+            // "the complete job configuration as originally submitted": the stored
+            // configuration is what the job IS, so both come off it rather than off
+            // anything this read decides.
+            job_type: record.job_type().to_string(),
+            job_configuration: record.configuration.clone(),
+            created_at: crate::state::to_date_time(record.created_at),
+            // "Timestamp when the job status was last updated", absent until a
+            // transition has fallen due, and the completion instant only once the
+            // job has reached its terminal status.
+            updated_at: record.updated_at(now).map(crate::state::to_date_time),
+            completed_at: record.completed_at(now).map(crate::state::to_date_time),
+            // "Only present if status is CANCELLED" and "only present if status is
+            // FAILED": no job of this emulator is cancelled or fails, so neither
+            // member is reported — see `crate::state::EnrichmentJobRecord::status`.
+            cancelled_at: None,
+            failure_message: None,
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> DescribeEnrichmentJobError {
+    DescribeEnrichmentJobErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+    })
+    .into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> DescribeEnrichmentJobError {
+    DescribeEnrichmentJobErrorModeled::InternalFailureException(InternalFailureException { message })
+        .into()
 }

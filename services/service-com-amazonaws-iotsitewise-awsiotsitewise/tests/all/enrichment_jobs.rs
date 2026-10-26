@@ -89,41 +89,41 @@ const JOB_TYPES: [&str; 1] = ["EVENT_DETECTION"];
 
 /// A `TimeSeriesId` of the shortest form the modelled length (36..73) admits: a
 /// single id, which is how this service names a stream no asset property owns.
-const SHORT_SERIES: &str = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
+pub(crate) const SHORT_SERIES: &str = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
 
 /// A `TimeSeriesId` of the longest form that length admits, which this service
 /// builds as `<assetId>.<propertyId>`.
-const LONG_SERIES: &str =
+pub(crate) const LONG_SERIES: &str =
     "11111111-2222-3333-4444-555555555555.66666666-7777-8888-9999-aaaaaaaaaaaa";
 
 /// A `propertyAlias` of the human-readable form the member documents.
-const CAMERA_ALIAS: &str = "/company/windfarm/3/turbine/7/camera";
+pub(crate) const CAMERA_ALIAS: &str = "/company/windfarm/3/turbine/7/camera";
 
 /// A second alias, so a filter naming one cannot pass by reporting every job that
 /// carries any alias.
-const DOOR_ALIAS: &str = "/company/warehouse/zone-a/door-camera";
+pub(crate) const DOOR_ALIAS: &str = "/company/warehouse/zone-a/door-camera";
 
 /// An alias no job of this suite was created with.
 const UNUSED_ALIAS: &str = "/company/warehouse/zone-z/nothing";
 
 /// A `datasetId`-shaped value no `CreateDataset` minted, for the rows about a
 /// filter and a create naming a dataset the store does not hold.
-const UNKNOWN_DATASET: &str = "0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d";
+pub(crate) const UNKNOWN_DATASET: &str = "0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d";
 
 /// How long after the whole span the clock owes a job a read is taken, so a run
 /// whose scheduler is late cannot observe a transient status.
-fn settled() -> Duration {
+pub(crate) fn settled() -> Duration {
     2 * ENRICHMENT_JOB_STEP + Duration::from_millis(250)
 }
 
 /// `/workspaces/{workspaceName}/enrichment-jobs`, as `OPERATIONS.md` reports the
 /// route of both `CreateEnrichmentJob` (POST) and `ListEnrichmentJobs` (GET).
-fn jobs_uri(workspace: &str) -> String {
+pub(crate) fn jobs_uri(workspace: &str) -> String {
     format!("/workspaces/{workspace}/enrichment-jobs")
 }
 
 /// A modelled `TimeInNanos` on the wire.
-fn instant(seconds: i64, nanos: i32) -> Value {
+pub(crate) fn instant(seconds: i64, nanos: i32) -> Value {
     json!({ "timeInSeconds": seconds, "offsetInNanos": nanos })
 }
 
@@ -253,13 +253,17 @@ fn create_body(case: &JobCase, dataset_id: &str) -> Value {
 }
 
 /// `CreateEnrichmentJob` with `body`.
-async fn create(router: &MultiServiceRouter, workspace: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn create(
+    router: &MultiServiceRouter,
+    workspace: &str,
+    body: Value,
+) -> (u16, Value) {
     call(router, "POST", &jobs_uri(workspace), Some(body)).await
 }
 
 /// Create `name` through `CreateWorkspace`, so a job created in it names a
 /// workspace this service really holds.
-async fn create_workspace(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn create_workspace(router: &MultiServiceRouter, name: &str) {
     let (status, body) = call(
         router,
         "POST",
@@ -275,7 +279,7 @@ async fn create_workspace(router: &MultiServiceRouter, name: &str) {
 
 /// Create a dataset through `CreateDataset` and answer its id, so a configuration
 /// names a dataset the store really holds.
-async fn create_dataset(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn create_dataset(router: &MultiServiceRouter, name: &str) -> String {
     let (status, body) = call(
         router,
         "POST",

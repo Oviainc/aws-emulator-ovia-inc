@@ -8155,6 +8155,14 @@ pub fn check_enrichment_job_configuration(
     }
 }
 
+/// The resource kind a `ResourceNotFoundException` names for an enrichment job,
+/// under the one form [`not_found_message`] states every absence in.
+///
+/// Declared here, in this section, rather than beside the other resource kinds:
+/// an enrichment job is addressed by `DescribeEnrichmentJob` alone, so the label
+/// belongs with the record that operation reads.
+pub const RESOURCE_ENRICHMENT_JOB: &str = "Enrichment Job";
+
 /// The ARN segment an enrichment job is named by in the one place this API
 /// reports a job's ARN: the required `resourceArn` of the conflict a duplicate
 /// create is refused with.

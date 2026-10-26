@@ -250,6 +250,11 @@ mod create_workspace_bounds;
 mod dataset_export_jobs;
 #[path = "all/describe_asset_property.rs"]
 mod describe_asset_property;
+// In its alphabetical place inside the sorted list rather than appended after it:
+// the END of this file is where every concurrent iotsitewise change appends a
+// declaration of its own, and each append there lost the squash race with one.
+#[path = "all/describe_enrichment_job_reads.rs"]
+mod describe_enrichment_job_reads;
 // In its alphabetical place inside the sorted list, rather than appended after
 // it: the end of this file is where every concurrent iotsitewise change appends a
 // declaration of its own, and four appends there collided in a row with this one.
