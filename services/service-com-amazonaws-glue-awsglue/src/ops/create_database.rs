@@ -177,16 +177,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let region = crate::state::request_region(ctx.parts());
         // A `CatalogId` this emulator does not hold must not be conjured into existence
         // by the create: the only catalog it holds is its own account's, so any other id
         // names another account's catalog, reachable only through that catalog's own
         // resource policy. Authorization is decided here, before anything is stored (see
         // `crate::state::foreign_catalog_refusal`).
-        if let Some(message) = crate::state::foreign_catalog_refusal(
-            &catalog_id,
-            &crate::state::request_region(ctx.parts()),
-            Self::NAME,
-        ) {
+        if let Some(message) =
+            crate::state::foreign_catalog_refusal(&catalog_id, &region, Self::NAME)
+        {
             return Err(CreateDatabaseErrorModeled::AccessDeniedException(
                 AccessDeniedException {
                     message: Some(message),
@@ -194,6 +193,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // The catalog's security configuration is "applied to every catalog write
+        // thereafter" (`PutDataCatalogEncryptionSettings`), so the key THIS write is
+        // encrypted under is read from the stored setting and the database's data key
+        // produced through KMS before anything is stored; a key KMS refuses refuses the
+        // write (`crate::state::catalog_encryption`).
+        let write_key = crate::state::catalog_encryption::write_key(&state.lock(), &catalog_id);
+        let encryption =
+            match crate::state::catalog_encryption::seal(ctx, &region, write_key.as_deref()).await {
+                Ok(encryption) => encryption,
+                Err(message) => {
+                    return Err(CreateDatabaseErrorModeled::GlueEncryptionException(
+                        GlueEncryptionException {
+                            message: Some(message),
+                        },
+                    )
+                    .into())
+                }
+            };
         let folded = crate::state::fold_name(&input.database_input.name);
 
         let mut store = state.lock();
@@ -243,12 +260,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let entry = crate::state::DatabaseEntry::from_input(
+        let mut entry = crate::state::DatabaseEntry::from_input(
             &input.database_input,
             &catalog_id,
             input.tags.as_ref(),
             ::std::time::SystemTime::now(),
         );
+        // The key material this write was encrypted under, which every later read of the
+        // database has to recover before it can answer the definition.
+        entry.encryption = encryption;
         // The catalog container is created here if this store does not hold it yet, and
         // only if there is room for another one: the number of containers is bounded too,
         // not just what each one holds.

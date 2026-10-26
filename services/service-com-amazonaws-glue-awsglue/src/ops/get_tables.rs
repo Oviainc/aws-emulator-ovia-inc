@@ -353,14 +353,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let region = crate::state::request_region(ctx.parts());
         // Whether the caller may read this catalog at all is decided BEFORE any database
         // is looked up: a `CatalogId` of another account is reachable only through that
         // catalog's own resource policy (see `crate::state::foreign_catalog_refusal`).
-        if let Some(message) = crate::state::foreign_catalog_refusal(
-            &catalog_id,
-            &crate::state::request_region(ctx.parts()),
-            Self::NAME,
-        ) {
+        if let Some(message) =
+            crate::state::foreign_catalog_refusal(&catalog_id, &region, Self::NAME)
+        {
             return Err(GetTablesErrorModeled::AccessDeniedException(
                 AccessDeniedException {
                     message: Some(message),
@@ -402,56 +401,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(MAX_PAGE_SIZE as usize)
             .clamp(1, MAX_PAGE_SIZE as usize);
 
-        let store = state.lock();
-        let Some(database) = store.database(&catalog_id, &input.database_name) else {
-            return Err(GetTablesErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::messages::database_not_found(
-                        &input.database_name,
-                    )),
-                    from_federation_source: None,
+        // The page is built under the store's guard and the guard released before KMS is
+        // asked anything: the key material of the tables on the page travels out with it.
+        let (table_list, next_token, encryptions) = {
+            let store = state.lock();
+            let Some(database) = store.database(&catalog_id, &input.database_name) else {
+                return Err(GetTablesErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::database_not_found(
+                            &input.database_name,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+
+            let matching: Vec<&crate::state::TableEntry> = database
+                .tables_ordered()
+                .into_iter()
+                .filter(|table| !federated_only || table.federated_table.is_some())
+                .filter(|table| {
+                    filter
+                        .as_ref()
+                        .is_none_or(|matcher| matcher.is_match(&table.name))
+                })
+                .collect();
+
+            // The token is the last name of the previous page, so the page resumes at the
+            // first stored name strictly after it — which stays correct across tables
+            // created or deleted between two calls.
+            let start = match input.next_token.as_deref() {
+                Some(cursor) => matching.partition_point(|table| table.name.as_str() <= cursor),
+                None => 0,
+            };
+            let end = start.saturating_add(page_size).min(matching.len());
+
+            let page = &matching[start..end];
+            // The listing serves the SAME projection as the single-table read, element by
+            // element — including the catalog/database identity and the row-filtering flag
+            // — so a client that works from a listing is never less informed than one that
+            // re-reads each table. Only `AttributesToGet` narrows an element, and then to
+            // exactly the members it named.
+            let table_list: Vec<Table> = page
+                .iter()
+                .map(|table| projection.apply(table.to_table(&database.database_id)))
+                .collect();
+            // The key material of every table ON THE PAGE: this read answers each of them,
+            // so each has to be decrypted before any is served.
+            let encryptions: Vec<crate::state::catalog_encryption::ObjectEncryption> = page
+                .iter()
+                .filter_map(|table| table.encryption.clone())
+                .collect();
+            // The token names the last entry of the page, taken from the page itself so
+            // there is no index arithmetic to underflow on an empty page.
+            let next_token = if end < matching.len() {
+                page.last().map(|table| table.name.clone())
+            } else {
+                None
+            };
+            (table_list, next_token, encryptions)
+        };
+
+        // A table written while its catalog encrypted catalog writes under a KMS key is
+        // listed only while that key is usable, exactly as the single-table read serves it
+        // (`crate::ops::get_table`): the page is answered once KMS has opened the data key
+        // of every table on it, and KMS's own refusal is relayed as this operation's
+        // `GlueEncryptionException`.
+        if let Err(message) =
+            crate::state::catalog_encryption::unseal_all(ctx, &region, &encryptions).await
+        {
+            return Err(GetTablesErrorModeled::GlueEncryptionException(
+                GlueEncryptionException {
+                    message: Some(message),
                 },
             )
             .into());
-        };
-
-        let matching: Vec<&crate::state::TableEntry> = database
-            .tables_ordered()
-            .into_iter()
-            .filter(|table| !federated_only || table.federated_table.is_some())
-            .filter(|table| {
-                filter
-                    .as_ref()
-                    .is_none_or(|matcher| matcher.is_match(&table.name))
-            })
-            .collect();
-
-        // The token is the last name of the previous page, so the page resumes at the
-        // first stored name strictly after it — which stays correct across tables
-        // created or deleted between two calls.
-        let start = match input.next_token.as_deref() {
-            Some(cursor) => matching.partition_point(|table| table.name.as_str() <= cursor),
-            None => 0,
-        };
-        let end = start.saturating_add(page_size).min(matching.len());
-
-        let page = &matching[start..end];
-        // The listing serves the SAME projection as the single-table read, element by
-        // element — including the catalog/database identity and the row-filtering flag —
-        // so a client that works from a listing is never less informed than one that
-        // re-reads each table. Only `AttributesToGet` narrows an element, and then to
-        // exactly the members it named.
-        let table_list: Vec<Table> = page
-            .iter()
-            .map(|table| projection.apply(table.to_table(&database.database_id)))
-            .collect();
-        // The token names the last entry of the page, taken from the page itself so
-        // there is no index arithmetic to underflow on an empty page.
-        let next_token = if end < matching.len() {
-            page.last().map(|table| table.name.clone())
-        } else {
-            None
-        };
+        }
 
         Ok(GetTablesOutput {
             table_list: Some(table_list),

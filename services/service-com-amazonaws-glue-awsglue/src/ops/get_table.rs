@@ -20,6 +20,12 @@
 //! metadata is maintained here. `AuditContext` is input-only Lake Formation audit
 //! metadata that does not change this operation's answer.
 //!
+//! A table written while its catalog encrypted catalog writes under a customer managed KMS
+//! key is answered only through that key: the read recovers the table's data key from KMS
+//! first, and a key KMS refuses — one that has been disabled, scheduled for deletion or
+//! deleted — makes this read `GlueEncryptionException` with KMS's own refusal relayed
+//! (`crate::state::catalog_encryption`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -264,14 +270,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let region = crate::state::request_region(ctx.parts());
         // Whether the caller may read this catalog at all is decided BEFORE the entity
         // lookup: a `CatalogId` of another account is reachable only through that
         // catalog's own resource policy (see `crate::state::foreign_catalog_refusal`).
-        if let Some(message) = crate::state::foreign_catalog_refusal(
-            &catalog_id,
-            &crate::state::request_region(ctx.parts()),
-            Self::NAME,
-        ) {
+        if let Some(message) =
+            crate::state::foreign_catalog_refusal(&catalog_id, &region, Self::NAME)
+        {
             return Err(GetTableErrorModeled::AccessDeniedException(
                 AccessDeniedException {
                     message: Some(message),
@@ -279,31 +284,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        let store = state.lock();
-        let Some(database) = store.database(&catalog_id, &input.database_name) else {
-            return Err(GetTableErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::messages::database_not_found(
-                        &input.database_name,
-                    )),
-                    from_federation_source: None,
-                },
+        // The answer is built under the store's guard and the guard released before KMS
+        // is asked anything: the key material travels out with the answer.
+        let (table, encryption) = {
+            let store = state.lock();
+            let Some(database) = store.database(&catalog_id, &input.database_name) else {
+                return Err(GetTableErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::database_not_found(
+                            &input.database_name,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+
+            let Some(entry) = database.tables.get(&crate::state::fold_name(&input.name)) else {
+                return Err(GetTableErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::TABLE_ENTITY_NOT_FOUND.to_string()),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+            (
+                entry.to_table(&database.database_id),
+                entry.encryption.clone(),
             )
-            .into());
         };
 
-        let Some(entry) = database.tables.get(&crate::state::fold_name(&input.name)) else {
-            return Err(GetTableErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::messages::TABLE_ENTITY_NOT_FOUND.to_string()),
-                    from_federation_source: None,
+        // A table written while its catalog encrypted catalog writes under a KMS key is
+        // readable only while that key is: the definition is answered once KMS has opened
+        // the table's data key again, and KMS's own refusal about the key is relayed as
+        // this operation's `GlueEncryptionException` (see
+        // `crate::state::catalog_encryption`).
+        if let Err(message) =
+            crate::state::catalog_encryption::unseal(ctx, &region, encryption.as_ref()).await
+        {
+            return Err(GetTableErrorModeled::GlueEncryptionException(
+                GlueEncryptionException {
+                    message: Some(message),
                 },
             )
             .into());
-        };
+        }
 
         Ok(GetTableOutput {
-            table: Some(entry.to_table(&database.database_id)),
+            table: Some(table),
         })
     }
 }

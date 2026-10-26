@@ -155,7 +155,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // `AuditContext` is "a structure containing the Lake Formation audit context":
         // what a Lake Formation integration asks this read to RECORD about the query
         // behind it. This emulator keeps no audit record, so accepting the member and
@@ -176,47 +175,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
-        let store = state.lock();
-        let Some(database) = store.database(&catalog_id, &input.database_name) else {
-            return Err(GetPartitionErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::messages::database_not_found(
-                        &input.database_name,
-                    )),
-                    from_federation_source: None,
-                },
+        let region = crate::state::request_region(ctx.parts());
+        // The answer is built under the store's guard and the guard released before KMS
+        // is asked anything: the key material travels out with the answer.
+        let (partition, encryption) = {
+            let store = state.lock();
+            let Some(database) = store.database(&catalog_id, &input.database_name) else {
+                return Err(GetPartitionErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::database_not_found(
+                            &input.database_name,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+            let Some(table) = database
+                .tables
+                .get(&crate::state::fold_name(&input.table_name))
+            else {
+                return Err(GetPartitionErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::table_not_found(&input.table_name)),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+            // A partition is addressed by its values WITHIN its table, matched exactly as
+            // sent: a partition value is table data, which the catalog's Hive case fold
+            // for database and table names does not touch.
+            let Some(partition) = table.partition(&input.partition_values) else {
+                return Err(GetPartitionErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::partition_not_found(
+                            &input.partition_values,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+            (
+                partition.to_partition(table),
+                partition.encryption.clone(),
             )
-            .into());
-        };
-        let Some(table) = database
-            .tables
-            .get(&crate::state::fold_name(&input.table_name))
-        else {
-            return Err(GetPartitionErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::messages::table_not_found(&input.table_name)),
-                    from_federation_source: None,
-                },
-            )
-            .into());
-        };
-        // A partition is addressed by its values WITHIN its table, matched exactly as
-        // sent: a partition value is table data, which the catalog's Hive case fold for
-        // database and table names does not touch.
-        let Some(partition) = table.partition(&input.partition_values) else {
-            return Err(GetPartitionErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::messages::partition_not_found(
-                        &input.partition_values,
-                    )),
-                    from_federation_source: None,
-                },
-            )
-            .into());
         };
 
+        // A partition written while its catalog encrypted catalog writes under a KMS key
+        // is readable only while that key is, exactly as its table is
+        // (`crate::ops::get_table`): the partition is answered once KMS has opened its
+        // data key again, and KMS's own refusal about the key is relayed as this
+        // operation's `GlueEncryptionException`.
+        if let Err(message) =
+            crate::state::catalog_encryption::unseal(ctx, &region, encryption.as_ref()).await
+        {
+            return Err(GetPartitionErrorModeled::GlueEncryptionException(
+                GlueEncryptionException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         Ok(GetPartitionOutput {
-            partition: Some(partition.to_partition(table)),
+            partition: Some(partition),
         })
     }
 }

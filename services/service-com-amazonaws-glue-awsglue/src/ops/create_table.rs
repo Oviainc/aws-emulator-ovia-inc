@@ -241,14 +241,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let region = crate::state::request_region(ctx.parts());
         // Whether the caller may address this catalog at all is decided BEFORE the
         // entity lookup: a `CatalogId` of another account is reachable only through that
         // catalog's own resource policy (see `crate::state::foreign_catalog_refusal`).
-        if let Some(message) = crate::state::foreign_catalog_refusal(
-            &catalog_id,
-            &crate::state::request_region(ctx.parts()),
-            Self::NAME,
-        ) {
+        if let Some(message) =
+            crate::state::foreign_catalog_refusal(&catalog_id, &region, Self::NAME)
+        {
             return Err(CreateTableErrorModeled::AccessDeniedException(
                 AccessDeniedException {
                     message: Some(message),
@@ -256,6 +255,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // The catalog's security configuration is "applied to every catalog write
+        // thereafter" (`PutDataCatalogEncryptionSettings`), so the key THIS write is
+        // encrypted under is read from the stored setting and the table's data key
+        // produced through KMS before anything is stored. A key KMS refuses refuses the
+        // write: a catalog that cannot encrypt cannot take the table
+        // (`crate::state::catalog_encryption`).
+        let write_key = crate::state::catalog_encryption::write_key(&state.lock(), &catalog_id);
+        let encryption =
+            match crate::state::catalog_encryption::seal(ctx, &region, write_key.as_deref()).await {
+                Ok(encryption) => encryption,
+                Err(message) => {
+                    return Err(CreateTableErrorModeled::GlueEncryptionException(
+                        GlueEncryptionException {
+                            message: Some(message),
+                        },
+                    )
+                    .into())
+                }
+            };
         let folded_table = crate::state::fold_name(&table_input.name);
         // `CreatedBy` is "the person or entity who created the table": the identity this
         // request speaks for. The emulator publishes one long-term identity, the one STS
@@ -320,13 +338,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let database_name = database.name.clone();
-        let entry = crate::state::TableEntry::from_input(
+        let mut entry = crate::state::TableEntry::from_input(
             table_input,
             &database_name,
             &catalog_id,
             Some(created_by),
             ::std::time::SystemTime::now(),
         );
+        // The key material this write was encrypted under, which every later read of the
+        // table has to recover before it can answer the definition.
+        entry.encryption = encryption;
         database.tables.insert(folded_table.clone(), entry);
         ::tracing::info!(
             operation = "CreateTable",

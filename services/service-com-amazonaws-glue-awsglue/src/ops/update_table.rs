@@ -266,14 +266,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let region = crate::state::request_region(ctx.parts());
         // Whether the caller may address this catalog at all is decided BEFORE the
         // entity lookup: a `CatalogId` of another account is reachable only through that
         // catalog's own resource policy (see `crate::state::foreign_catalog_refusal`).
-        if let Some(message) = crate::state::foreign_catalog_refusal(
-            &catalog_id,
-            &crate::state::request_region(ctx.parts()),
-            Self::NAME,
-        ) {
+        if let Some(message) =
+            crate::state::foreign_catalog_refusal(&catalog_id, &region, Self::NAME)
+        {
             return Err(UpdateTableErrorModeled::AccessDeniedException(
                 AccessDeniedException {
                     message: Some(message),
@@ -281,6 +280,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // An update is a catalog WRITE, so it is encrypted under the key the catalog's
+        // setting names NOW, not under the one the create used: "the specified encryption
+        // is applied to every catalog write thereafter"
+        // (`PutDataCatalogEncryptionSettings`). A key KMS refuses refuses the update and
+        // leaves the stored definition where it is (`crate::state::catalog_encryption`).
+        let write_key = crate::state::catalog_encryption::write_key(&state.lock(), &catalog_id);
+        let encryption =
+            match crate::state::catalog_encryption::seal(ctx, &region, write_key.as_deref()).await {
+                Ok(encryption) => encryption,
+                Err(message) => {
+                    return Err(UpdateTableErrorModeled::GlueEncryptionException(
+                        GlueEncryptionException {
+                            message: Some(message),
+                        },
+                    )
+                    .into())
+                }
+            };
 
         let mut store = state.lock();
         // The store keeps every definition an update replaces, and this update is
@@ -350,6 +367,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ::std::time::SystemTime::now(),
             archive_previous,
         );
+        // The definition now stored is the one THIS write encrypted, so the table is read
+        // back through the key this write used.
+        entry.encryption = encryption;
         ::tracing::info!(
             operation = "UpdateTable",
             catalog_id = %catalog_id,

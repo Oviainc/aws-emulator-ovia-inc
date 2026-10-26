@@ -566,6 +566,10 @@ fn seed_archived_versions(engine: &Arc<engine::InMemoryEngine>, database: &str, 
                     ..TableInput::default()
                 },
                 update_time: SystemTime::now(),
+                // The seeded definitions stand in for versions an update archived, and
+                // this suite configures no catalog encryption, so each was written under
+                // no key.
+                encryption: None,
             },
         );
     }

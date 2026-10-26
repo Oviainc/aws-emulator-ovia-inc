@@ -166,14 +166,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let region = crate::state::request_region(ctx.parts());
         // Whether the caller may read this catalog at all is decided BEFORE the entity
         // lookup: a `CatalogId` of another account is reachable only through that
         // catalog's own resource policy (see `crate::state::foreign_catalog_refusal`).
-        if let Some(message) = crate::state::foreign_catalog_refusal(
-            &catalog_id,
-            &crate::state::request_region(ctx.parts()),
-            Self::NAME,
-        ) {
+        if let Some(message) =
+            crate::state::foreign_catalog_refusal(&catalog_id, &region, Self::NAME)
+        {
             return Err(GetDatabaseErrorModeled::AccessDeniedException(
                 AccessDeniedException {
                     message: Some(message),
@@ -181,19 +180,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        let store = state.lock();
-        let Some(entry) = store.database(&catalog_id, &input.name) else {
-            return Err(GetDatabaseErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::messages::database_not_found(&input.name)),
-                    from_federation_source: None,
+        // The answer is built under the store's guard and the guard released before KMS
+        // is asked anything: the key material travels out with the answer.
+        let (database, encryption) = {
+            let store = state.lock();
+            let Some(entry) = store.database(&catalog_id, &input.name) else {
+                return Err(GetDatabaseErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::database_not_found(&input.name)),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+            (entry.to_database(), entry.encryption.clone())
+        };
+
+        // A database written while its catalog encrypted catalog writes under a KMS key is
+        // readable only while that key is, exactly as a table of it is
+        // (`crate::ops::get_table`): the definition is answered once KMS has opened the
+        // database's data key again, and KMS's own refusal about the key is relayed as
+        // this operation's `GlueEncryptionException`.
+        if let Err(message) =
+            crate::state::catalog_encryption::unseal(ctx, &region, encryption.as_ref()).await
+        {
+            return Err(GetDatabaseErrorModeled::GlueEncryptionException(
+                GlueEncryptionException {
+                    message: Some(message),
                 },
             )
             .into());
-        };
+        }
 
         Ok(GetDatabaseOutput {
-            database: Some(entry.to_database()),
+            database: Some(database),
         })
     }
 }

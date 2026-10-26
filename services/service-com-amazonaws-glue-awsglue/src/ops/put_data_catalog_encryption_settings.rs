@@ -6,6 +6,12 @@
 //! `DataCatalogEncryptionSettings` structure the request carries REPLACES the record the
 //! addressed catalog holds, which `GetDataCatalogEncryptionSettings` then reports.
 //!
+//! The record is not inert: a mode that encrypts catalog writes names the KMS key it
+//! encrypts them under, so the identifier is resolved against KMS before it is stored (a
+//! key KMS cannot resolve is `InvalidInputException`), and every catalog write made after
+//! this one is encrypted under that key — see `crate::state::catalog_encryption` and
+//! `crate::ops::create_table`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -151,15 +157,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let region = crate::state::request_region(ctx.parts());
         // A `CatalogId` this emulator holds no Data Catalog under must not be conjured
         // into existence by the write: any id but this account's names another account's
         // catalog, reachable only through that catalog's own resource policy, so the write
         // is refused as unauthorized (see `crate::state::foreign_catalog_refusal`).
-        if let Some(message) = crate::state::foreign_catalog_refusal(
-            &catalog_id,
-            &crate::state::request_region(ctx.parts()),
-            Self::NAME,
-        ) {
+        if let Some(message) =
+            crate::state::foreign_catalog_refusal(&catalog_id, &region, Self::NAME)
+        {
             return Err(
                 PutDataCatalogEncryptionSettingsErrorModeled::AccessDeniedException(
                     AccessDeniedException {
@@ -168,6 +173,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        }
+
+        // A mode that encrypts catalog writes names the key it encrypts them under, and a
+        // catalog cannot be configured to encrypt under a key that is not there: the
+        // identifier is resolved against KMS before the setting is stored, and a key KMS
+        // cannot resolve is invalid input rather than a setting that reads back healthy and
+        // fails at the first write (see `crate::state::catalog_encryption`).
+        if let Some(key) = input
+            .data_catalog_encryption_settings
+            .encryption_at_rest
+            .as_ref()
+            .filter(|at_rest| {
+                crate::state::catalog_encryption::KEYED_ENCRYPTION_MODES
+                    .contains(&at_rest.catalog_encryption_mode.as_str())
+            })
+            .and_then(|at_rest| at_rest.sse_aws_kms_key_id.as_deref())
+        {
+            if let Err(message) =
+                crate::state::catalog_encryption::resolvable_key(ctx, &region, key).await
+            {
+                return Err(
+                    PutDataCatalogEncryptionSettingsErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(message),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
         }
 
         let mut store = state.lock();

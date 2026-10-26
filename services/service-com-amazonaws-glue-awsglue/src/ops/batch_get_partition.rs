@@ -182,7 +182,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // `AuditContext` is "a structure containing the Lake Formation audit context" and
         // `QuerySessionContext` "a protocol between query engines and Lake Formation or
         // Glue" carrying "a Lake Formation generated authorization identifier": both ask
@@ -212,53 +211,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
-        let store = state.lock();
-        let Some(database) = store.database(&catalog_id, &input.database_name) else {
-            return Err(BatchGetPartitionErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::messages::database_not_found(
-                        &input.database_name,
-                    )),
-                    from_federation_source: None,
-                },
-            )
-            .into());
-        };
-        let Some(table) = database
-            .tables
-            .get(&crate::state::fold_name(&input.table_name))
-        else {
-            return Err(BatchGetPartitionErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::messages::table_not_found(&input.table_name)),
-                    from_federation_source: None,
-                },
-            )
-            .into());
+        let region = crate::state::request_region(ctx.parts());
+        // The answer is built under the store's guard and the guard released before KMS
+        // is asked anything: the key material of the partitions answered travels out with
+        // them.
+        let (partitions, encryptions) = {
+            let store = state.lock();
+            let Some(database) = store.database(&catalog_id, &input.database_name) else {
+                return Err(BatchGetPartitionErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::database_not_found(
+                            &input.database_name,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+            let Some(table) = database
+                .tables
+                .get(&crate::state::fold_name(&input.table_name))
+            else {
+                return Err(BatchGetPartitionErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::table_not_found(&input.table_name)),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+
+            // Each requested value list is looked up on its own, in the order it was sent,
+            // and matched exactly as sent — a partition is addressed by its values WITHIN
+            // its table (`crate::ops::get_partition`), and the catalog's Hive case fold
+            // covers a database and a table name, never table data. A list this table
+            // holds no partition for contributes nothing: this read reports "a list of the
+            // requested partitions", so a miss is an absence and not a failure of the whole
+            // batch, and a request that names the same values twice is answered twice, once
+            // per item.
+            let found: Vec<&crate::state::PartitionEntry> = input
+                .partitions_to_get
+                .iter()
+                .filter_map(|requested| table.partition(&requested.values))
+                .collect();
+            let partitions: Vec<Partition> = found
+                .iter()
+                .map(|partition| partition.to_partition(table))
+                .collect();
+            // The key material of every partition this batch answers: each has to be
+            // decrypted before any is served.
+            let encryptions: Vec<crate::state::catalog_encryption::ObjectEncryption> = found
+                .iter()
+                .filter_map(|partition| partition.encryption.clone())
+                .collect();
+            ::tracing::info!(
+                operation = "BatchGetPartition",
+                catalog_id = %catalog_id,
+                database = %database.name,
+                table = %table.name,
+                requested = input.partitions_to_get.len(),
+                found = partitions.len(),
+                "read Data Catalog partitions in a batch"
+            );
+            (partitions, encryptions)
         };
 
-        // Each requested value list is looked up on its own, in the order it was sent, and
-        // matched exactly as sent — a partition is addressed by its values WITHIN its
-        // table (`crate::ops::get_partition`), and the catalog's Hive case fold covers a
-        // database and a table name, never table data. A list this table holds no
-        // partition for contributes nothing: this read reports "a list of the requested
-        // partitions", so a miss is an absence and not a failure of the whole batch, and a
-        // request that names the same values twice is answered twice, once per item.
-        let partitions: Vec<Partition> = input
-            .partitions_to_get
-            .iter()
-            .filter_map(|requested| table.partition(&requested.values))
-            .map(|partition| partition.to_partition(table))
-            .collect();
-        ::tracing::info!(
-            operation = "BatchGetPartition",
-            catalog_id = %catalog_id,
-            database = %database.name,
-            table = %table.name,
-            requested = input.partitions_to_get.len(),
-            found = partitions.len(),
-            "read Data Catalog partitions in a batch"
-        );
+        // A partition written while its catalog encrypted catalog writes under a KMS key
+        // is readable only while that key is, exactly as the single-partition read serves
+        // it (`crate::ops::get_partition`): the batch is answered once KMS has opened the
+        // data key of every partition in it, and KMS's own refusal is relayed as this
+        // operation's `GlueEncryptionException`.
+        if let Err(message) =
+            crate::state::catalog_encryption::unseal_all(ctx, &region, &encryptions).await
+        {
+            return Err(BatchGetPartitionErrorModeled::GlueEncryptionException(
+                GlueEncryptionException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         Ok(BatchGetPartitionOutput {
             partitions: Some(partitions),

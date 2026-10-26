@@ -161,7 +161,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(BatchCreatePartitionErrorModeled::InternalServiceException(
                 InternalServiceException {
@@ -172,7 +171,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+        // The catalog's security configuration is "applied to every catalog write
+        // thereafter" (`PutDataCatalogEncryptionSettings`), so the key THIS batch is
+        // encrypted under is read from the stored setting and ONE data key produced
+        // through KMS for the batch before anything is stored: the items are written at
+        // one instant under one setting, so they are written under one key. A key KMS
+        // refuses refuses the whole batch, which creates nothing
+        // (`crate::state::catalog_encryption`).
+        let write_key = crate::state::catalog_encryption::write_key(&state.lock(), &catalog_id);
+        let encryption =
+            match crate::state::catalog_encryption::seal(ctx, &region, write_key.as_deref()).await {
+                Ok(encryption) => encryption,
+                Err(message) => {
+                    return Err(BatchCreatePartitionErrorModeled::GlueEncryptionException(
+                        GlueEncryptionException {
+                            message: Some(message),
+                        },
+                    )
+                    .into())
+                }
+            };
 
         let mut store = state.lock();
         // The store is resident memory and this create is reachable by any caller, so the
@@ -219,6 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 requested,
                 now,
                 stored_partitions < crate::state::MAX_STORED_PARTITIONS,
+                encryption.clone(),
             ) {
                 Ok(_) => {
                     created += 1;

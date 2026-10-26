@@ -207,14 +207,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let region = crate::state::request_region(ctx.parts());
         // Whether the caller may read this catalog at all is decided BEFORE the entity
         // lookup: a `CatalogId` of another account is reachable only through that
         // catalog's own resource policy (see `crate::state::foreign_catalog_refusal`).
-        if let Some(message) = crate::state::foreign_catalog_refusal(
-            &catalog_id,
-            &crate::state::request_region(ctx.parts()),
-            Self::NAME,
-        ) {
+        if let Some(message) =
+            crate::state::foreign_catalog_refusal(&catalog_id, &region, Self::NAME)
+        {
             return Err(GetTableVersionErrorModeled::AccessDeniedException(
                 AccessDeniedException {
                     message: Some(message),
@@ -222,46 +221,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        let store = state.lock();
-        let Some(database) = store.database(&catalog_id, &input.database_name) else {
-            return Err(GetTableVersionErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::messages::database_not_found(
-                        &input.database_name,
-                    )),
-                    from_federation_source: None,
-                },
-            )
-            .into());
-        };
-        let Some(entry) = database
-            .tables
-            .get(&crate::state::fold_name(&input.table_name))
-        else {
-            return Err(GetTableVersionErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::messages::TABLE_ENTITY_NOT_FOUND.to_string()),
-                    from_federation_source: None,
-                },
-            )
-            .into());
+        // The answer is built under the store's guard and the guard released before KMS
+        // is asked anything: the key material travels out with the answer.
+        let (table_version, encryption) = {
+            let store = state.lock();
+            let Some(database) = store.database(&catalog_id, &input.database_name) else {
+                return Err(GetTableVersionErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::database_not_found(
+                            &input.database_name,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+            let Some(entry) = database
+                .tables
+                .get(&crate::state::fold_name(&input.table_name))
+            else {
+                return Err(GetTableVersionErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::TABLE_ENTITY_NOT_FOUND.to_string()),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+
+            // The table holds its own versions: the live definition is the version its
+            // `VersionId` names, and every earlier one is the definition the write that
+            // replaced it archived. An id outside that history names no version of this
+            // table.
+            let Some(table_version) = entry.table_version(requested, &database.database_id) else {
+                return Err(GetTableVersionErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::table_version_not_found(
+                            input.version_id.as_deref().unwrap_or_default(),
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+            (table_version, entry.version_encryption(requested))
         };
 
-        // The table holds its own versions: the live definition is the version its
-        // `VersionId` names, and every earlier one is the definition the write that
-        // replaced it archived. An id outside that history names no version of this
-        // table.
-        let Some(table_version) = entry.table_version(requested, &database.database_id) else {
-            return Err(GetTableVersionErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::messages::table_version_not_found(
-                        input.version_id.as_deref().unwrap_or_default(),
-                    )),
-                    from_federation_source: None,
+        // A version of a table is answered through the key the write that stored THAT
+        // definition used — the live record's for the current version, the archived
+        // record's own for an earlier one — exactly as the table's current definition is
+        // (`crate::ops::get_table`): the version is answered once KMS has opened that data
+        // key again, and KMS's own refusal about the key is relayed as this operation's
+        // `GlueEncryptionException`.
+        if let Err(message) =
+            crate::state::catalog_encryption::unseal(ctx, &region, encryption.as_ref()).await
+        {
+            return Err(GetTableVersionErrorModeled::GlueEncryptionException(
+                GlueEncryptionException {
+                    message: Some(message),
                 },
             )
             .into());
-        };
+        }
 
         Ok(GetTableVersionOutput {
             table_version: Some(table_version),

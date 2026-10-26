@@ -24,7 +24,11 @@
 //!
 //! A catalog also holds ONE security configuration of its own
 //! ([`Catalog::encryption_settings`]): the encryption settings a write set for it, which
-//! every later read of that catalog's settings reports.
+//! every later read of that catalog's settings reports. What that setting does to the
+//! catalog's OBJECTS is recorded on each object: a database, table or partition written
+//! while the catalog encrypts its writes under a KMS key carries the key material that
+//! write was encrypted under ([`catalog_encryption::ObjectEncryption`]), because the
+//! setting applies "to every catalog write thereafter" and not to what is already stored.
 //!
 //! Crawlers sit BESIDE that tree too, in one per-account namespace keyed by crawler name:
 //! every operation that addresses a crawler does so by name alone, so a crawler's
@@ -152,9 +156,13 @@
 //! CONNECTION or CRAWLER name is NOT folded: the model documents the fold for the two
 //! Hive-compatible catalog resources only.
 
+pub mod catalog_encryption;
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
+
+use self::catalog_encryption::ObjectEncryption;
 
 use crate::ops::types::{
     Action, AssetTypeFormReference,
@@ -1948,6 +1956,13 @@ pub struct DatabaseEntry {
     pub tags: HashMap<String, String>,
     /// Tables keyed by their folded (lowercased) name.
     pub tables: HashMap<String, TableEntry>,
+    /// The key material the write that last stored this database was encrypted under, or
+    /// `None` when that write was encrypted under no key of the caller's.
+    ///
+    /// Recorded per OBJECT because the catalog's setting applies "to every catalog write
+    /// thereafter": a later change to it leaves this database encrypted under the key its
+    /// own write used. See [`catalog_encryption`].
+    pub encryption: Option<ObjectEncryption>,
 }
 
 impl DatabaseEntry {
@@ -1982,6 +1997,10 @@ impl DatabaseEntry {
             create_time: now,
             tags: tags.cloned().unwrap_or_default(),
             tables: HashMap::new(),
+            // The key material is not in any `DatabaseInput`: it is what the catalog's
+            // own encryption setting had KMS produce for this write, so the handler
+            // records it on the entry it has just built.
+            encryption: None,
         }
     }
 
@@ -2112,6 +2131,10 @@ pub struct TableEntry {
     /// passed in ("ordered in the same order as the partition keys",
     /// `PartitionInput$Values`) groups a table's partitions by their first key.
     pub partitions: BTreeMap<Vec<String>, PartitionEntry>,
+    /// The key material the write that last stored this table's definition was encrypted
+    /// under, or `None` when that write was encrypted under no key of the caller's. See
+    /// [`DatabaseEntry::encryption`].
+    pub encryption: Option<ObjectEncryption>,
     /// The COLUMN STATISTICS TASK SETTINGS of this table — "the settings for a column
     /// statistics task" (`ColumnStatisticsTaskSettings`) — or `None` while no create has
     /// written them.
@@ -2211,6 +2234,10 @@ pub struct PartitionEntry {
     pub last_analyzed_time: Option<::aws_smithy_types::DateTime>,
     /// Server-set, written once at create so every later read reports the same instant.
     pub creation_time: SystemTime,
+    /// The key material the write that stored this partition was encrypted under, or
+    /// `None` when that write was encrypted under no key of the caller's. See
+    /// [`DatabaseEntry::encryption`].
+    pub encryption: Option<ObjectEncryption>,
 }
 
 impl PartitionEntry {
@@ -2228,6 +2255,9 @@ impl PartitionEntry {
             last_access_time: input.last_access_time,
             last_analyzed_time: input.last_analyzed_time,
             creation_time: now,
+            // Recorded by the create, which is where the catalog's encryption setting is
+            // read and the key material produced (see [`TableEntry::create_partition`]).
+            encryption: None,
         }
     }
 
@@ -2268,6 +2298,11 @@ pub struct ArchivedTableVersion {
     /// The instant that definition became current: the `UpdateTime` this version
     /// reports.
     pub update_time: SystemTime,
+    /// The key material the write that stored THIS definition was encrypted under, kept
+    /// with the definition it belongs to: a later write re-keys the live table
+    /// ([`TableEntry::encryption`]) and leaves the versions it archived under the keys
+    /// their own writes used. See [`catalog_encryption`].
+    pub encryption: Option<ObjectEncryption>,
 }
 
 impl TableEntry {
@@ -2309,6 +2344,9 @@ impl TableEntry {
             // KEYS of a table, never a slice of its data, so the first partition arrives
             // through a partition create.
             partitions: BTreeMap::new(),
+            // Not part of any `TableInput`: the handler records what the catalog's own
+            // encryption setting had KMS produce for this write.
+            encryption: None,
             // `TableInput` carries no column statistics task settings either: they arrive
             // through `CreateColumnStatisticsTaskSettings`.
             column_statistics_task_settings: None,
@@ -2345,11 +2383,18 @@ impl TableEntry {
     /// `store_has_room` is whether the STORE as a whole can hold another partition
     /// ([`ComAmazonawsGlueAwsglueState::can_store_partition`]), which this table cannot
     /// see from here; the per-table ceiling is checked here.
+    ///
+    /// `encryption` is the key material this write is encrypted under, which the caller
+    /// resolved from the catalog's own settings before it took the store's guard: a
+    /// partition created while the catalog encrypts its writes under a KMS key is recorded
+    /// under that key, and a read of it has to recover that key material first (see
+    /// [`catalog_encryption`]).
     pub fn create_partition(
         &mut self,
         input: &PartitionInput,
         now: SystemTime,
         store_has_room: bool,
+        encryption: Option<ObjectEncryption>,
     ) -> Result<&PartitionEntry, PartitionCreateRefusal> {
         let values = input.values.clone().unwrap_or_default();
         if values.is_empty() {
@@ -2375,7 +2420,10 @@ impl TableEntry {
                 limit: MAX_STORED_PARTITIONS,
             });
         }
-        let entry = PartitionEntry::from_input(values.clone(), input, now);
+        let mut entry = PartitionEntry::from_input(values.clone(), input, now);
+        // The key material this write was encrypted under, which the caller read from the
+        // catalog's settings and had KMS produce before taking the store's guard.
+        entry.encryption = encryption;
         Ok(self.partitions.entry(values).or_insert(entry))
     }
 
@@ -2424,14 +2472,7 @@ impl TableEntry {
     /// (`CreateTime`, `CreatedBy`, `CatalogId`, `DatabaseName`) as they stand, and
     /// `UpdateTime` the instant that version became current.
     pub fn table_version(&self, version: Option<u64>, database_id: &str) -> Option<TableVersion> {
-        // A request that names no version, or names the one the live definition is
-        // under, addresses the current version.
-        let archived_version = match version {
-            None => None,
-            Some(wanted) if Some(wanted) == parse_version_counter(&self.version_id) => None,
-            Some(wanted) => Some(wanted),
-        };
-        let Some(wanted) = archived_version else {
+        let Some(wanted) = self.archived_version_wanted(version) else {
             return Some(TableVersion {
                 table: Some(self.to_table(database_id)),
                 version_id: Some(self.version_id.clone()),
@@ -2454,6 +2495,38 @@ impl TableEntry {
             table: Some(historical.to_table(database_id)),
             version_id: Some(wanted.to_string()),
         })
+    }
+
+    /// Which ARCHIVED version a version read addresses, or `None` when it addresses the
+    /// live definition: a request that names no version, or names the one
+    /// [`Self::version_id`] is under, addresses the current version.
+    ///
+    /// The one selection both [`Self::table_version`] and [`Self::version_encryption`] go
+    /// through, so the definition a version read answers and the key material it is
+    /// answered through can never come from different versions.
+    fn archived_version_wanted(&self, version: Option<u64>) -> Option<u64> {
+        match version {
+            None => None,
+            Some(wanted) if Some(wanted) == parse_version_counter(&self.version_id) => None,
+            Some(wanted) => Some(wanted),
+        }
+    }
+
+    /// The key material the write that stored the definition of ONE of this table's
+    /// versions was encrypted under — the live record's for the current version, and the
+    /// archived record's own for an earlier one.
+    ///
+    /// `None` is a version whose write was encrypted under no key of the caller's, and
+    /// also a version this table does not hold, which [`Self::table_version`] reports as
+    /// the miss it is.
+    pub fn version_encryption(&self, version: Option<u64>) -> Option<ObjectEncryption> {
+        match self.archived_version_wanted(version) {
+            None => self.encryption.clone(),
+            Some(wanted) => self
+                .archived_versions
+                .get(&wanted)
+                .and_then(|archived| archived.encryption.clone()),
+        }
     }
 
     /// Overwrite this table's definition with the one the client submitted.
@@ -2488,6 +2561,10 @@ impl TableEntry {
                     ArchivedTableVersion {
                         definition: self.to_table_input(),
                         update_time: self.update_time,
+                        // The definition being archived was encrypted by the write that
+                        // stored it, so its key material is archived with it rather than
+                        // left to the key this write is about to record on the table.
+                        encryption: self.encryption.clone(),
                     },
                 );
             }

@@ -32,9 +32,19 @@ service-common = { path = "../common" }
 # The account's own IAM records, read through the same shared engine, so a crawler's
 # `Role` is resolved against the roles `CreateRole`/`PutRolePolicy` wrote.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The KMS client the catalog resolves `EncryptionAtRest$SseAwsKmsKeyId` through, and
+# encrypts and decrypts a catalog object's data key with, over the in-process callback
+# into this same emulator (no network client feature is enabled: the transport is the
+# emulator's own).
+aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# The catalog-encryption suite mounts the KMS service beside Glue on one engine, because a
+# catalog write and a catalog read of an SSE-KMS catalog each call it.
+service-com-amazonaws-kms-trentservice = { workspace = true }
 
 [lints]
 workspace = true
