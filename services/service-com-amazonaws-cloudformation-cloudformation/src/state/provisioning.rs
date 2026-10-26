@@ -716,11 +716,26 @@ pub async fn reconcile(
             // the template or CloudFormation decided.
             Ok(created) => {
                 let computed = resource.physical_resource_id.clone();
+                let computed_attributes = resource.attributes.clone();
                 adopt_minted_identity(&mut resource, created.physical_resource_id);
                 if resource.physical_resource_id != computed {
                     minted.push((computed, resource.physical_resource_id.clone()));
                 }
                 resource.attributes.extend(created.attributes);
+                // An ATTRIBUTE the owning service reports differently from the value the
+                // naming rules computed is re-pointed exactly as the physical id is: a
+                // later resource's property that `Fn::GetAtt` resolved to the stand-in has
+                // to reach its own service as the value this resource REALLY has — a key
+                // ARN carrying the key id KMS minted, say — or that service is handed an
+                // identifier nothing answers to.
+                for (attribute, stand_in) in &computed_attributes {
+                    let Some(assigned) = resource.attributes.get(attribute) else {
+                        continue;
+                    };
+                    if !stand_in.is_empty() && assigned != stand_in {
+                        minted.push((stand_in.clone(), assigned.clone()));
+                    }
+                }
                 resource.materialised = true;
                 outcome
                     .transitions
@@ -823,6 +838,11 @@ const MAX_REPOINTED_NESTING: usize = 64;
 /// naming such a resource (`ResolverRuleId: !Ref Rule`) holds the stand-in the naming rules
 /// computed; `minted` pairs each stand-in with what its service answered, and a property
 /// whose value IS one of those stand-ins becomes the minted identifier.
+///
+/// The same holds for an ATTRIBUTE the owning service reports differently from the computed
+/// one (`KmsMasterKeyId: !GetAtt [Key, Arn]`, where the ARN carries the key id KMS minted):
+/// [`reconcile`] pairs those too, so a property reaches its own service as the value the
+/// resource it names really publishes.
 ///
 /// Matched WHOLE value, never as a substring: a reference resolved to the stand-in is the
 /// entire scalar, while a stand-in is often the NAME the declaration asked for — so a

@@ -68,6 +68,11 @@
 //!   sides, so its arm passes them through as `CreateQueue`'s `Attributes` map, lifting
 //!   out the two that are not attributes (the name CloudFormation decides, and the tag
 //!   list the create takes as its own member);
+//! * `AWS::KMS::Key`'s properties are `CreateKey`'s own members but for five: the key
+//!   policy, which that call takes as the document's TEXT, and the four no member of it
+//!   carries at all — the rotation of the key's material and whether the key is enabled,
+//!   each applied through the KMS call that owns it, the rotation period that first one
+//!   takes, and the waiting period the key's deletion is scheduled with;
 //! * `AWS::SageMaker::ModelPackageGroup`'s are its create's members EXCEPT ONE — a model
 //!   group's resource policy is attached through SageMaker's own
 //!   `PutModelPackageGroupPolicy` — so its arm passes the properties through and then makes
@@ -287,7 +292,8 @@ use super::template::{
     COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, ECR_PUBLIC_REPOSITORY, ECS_CLUSTER,
     EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
     ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
-    ELASTIC_BEANSTALK_ENVIRONMENT, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, MSK_CLUSTER,
+    ELASTIC_BEANSTALK_ENVIRONMENT, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, KMS_KEY,
+    MSK_CLUSTER,
     MSK_SERVERLESS_CLUSTER, ROUTE53RESOLVER_ENDPOINT, ROUTE53RESOLVER_RULE,
     ROUTE53RESOLVER_RULE_ASSOCIATION,
     S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX,
@@ -372,6 +378,7 @@ pub(super) enum Provisioner {
     Wafv2RegexPatternSet,
     GrafanaWorkspace,
     GuardDutyDetector,
+    KmsKey,
     MskCluster,
     MskServerlessCluster,
     RdsDbInstance,
@@ -434,6 +441,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         WAFV2_REGEX_PATTERN_SET => Some(Provisioner::Wafv2RegexPatternSet),
         GRAFANA_WORKSPACE => Some(Provisioner::GrafanaWorkspace),
         GUARDDUTY_DETECTOR => Some(Provisioner::GuardDutyDetector),
+        KMS_KEY => Some(Provisioner::KmsKey),
         MSK_CLUSTER => Some(Provisioner::MskCluster),
         MSK_SERVERLESS_CLUSTER => Some(Provisioner::MskServerlessCluster),
         RDS_DB_INSTANCE => Some(Provisioner::RdsDbInstance),
@@ -572,6 +580,7 @@ impl Provisioner {
             Self::GuardDutyDetector => {
                 create_detector(ctx, region, resource, propagated).await
             }
+            Self::KmsKey => create_kms_key(ctx, region, resource, propagated).await,
             Self::MskCluster => create_msk_cluster(ctx, region, resource, propagated).await,
             Self::MskServerlessCluster => {
                 create_msk_serverless_cluster(ctx, region, resource, propagated).await
@@ -728,6 +737,9 @@ impl Provisioner {
                 | Self::MskServerlessCluster
                 | Self::SqsQueue
                 | Self::CodeCommitRepository
+                // KMS refuses a tag key in the reserved namespace on `CreateKey` and on
+                // `TagResource` alike, in its own crate's tag validation.
+                | Self::KmsKey
                 | Self::Wafv2WebAcl
                 | Self::Wafv2RuleGroup
                 | Self::Wafv2IpSet
@@ -816,6 +828,11 @@ impl Provisioner {
             // changed declaration is applied to the role the stack created rather than
             // replacing it ([`update_role`]).
             Self::IamRole => update_role(ctx, region, resource, declared).await,
+            // Every property of a KMS key that can change on an existing one has a KMS
+            // call that changes it — its description, its key policy, and the two switches
+            // — so a changed declaration is applied to the key the stack created rather
+            // than replacing it ([`update_kms_key`]).
+            Self::KmsKey => update_kms_key(ctx, region, resource, declared).await.map(Some),
             // Every other type's in-place update is its own entry here, exactly as its
             // create and delete are: until one is written, nothing is asked of the owning
             // service and the deployment says so.
@@ -861,6 +878,9 @@ impl Provisioner {
             // [`update_role`] does not carry them: this is the one place the tag set a role
             // is to end up with is reconciled.
             Self::IamRole => retag_role(ctx, region, resource, declared, propagated).await,
+            // A key's tags are KMS's own `TagResource`/`UntagResource`, which is why
+            // [`update_kms_key`] does not carry them either.
+            Self::KmsKey => retag_kms_key(ctx, region, resource, declared, propagated).await,
             // Every other type's re-tagging is its own entry here, for the same reason its
             // create, update and delete are: the tag set is the same for every type, but the
             // calls that apply it are each service's own.
@@ -945,6 +965,12 @@ impl Provisioner {
                 delete_workspace(ctx, region, physical_resource_id).await
             }
             Self::GuardDutyDetector => delete_detector(ctx, region, physical_resource_id).await,
+            // A KMS key is not deleted at once: its deletion is SCHEDULED, for the waiting
+            // period the declaration asks for.
+            Self::KmsKey => {
+                let properties = resource.properties.as_object().cloned().unwrap_or_default();
+                schedule_kms_key_deletion(ctx, region, physical_resource_id, &properties).await
+            }
             // One `DeleteCluster` deletes a cluster of either kind, addressed by the ARN
             // Amazon MSK minted for it.
             Self::MskCluster | Self::MskServerlessCluster => {
@@ -1134,6 +1160,7 @@ impl Provisioner {
                 describe_workspace(ctx, region, physical_resource_id).await
             }
             Self::GuardDutyDetector => describe_detector(ctx, region, physical_resource_id).await,
+            Self::KmsKey => describe_kms_key(ctx, region, physical_resource_id).await,
             // One `DescribeClusterV2` reads a cluster of either kind back.
             Self::MskCluster | Self::MskServerlessCluster => {
                 describe_msk_cluster(ctx, region, physical_resource_id).await
@@ -4120,6 +4147,11 @@ fn renamed_member(property: &str, renamed: &[(&str, &str)]) -> String {
 const SQS_SIGNING_NAME: &str = "sqs";
 const SQS_TARGET_PREFIX: &str = "AmazonSQS";
 
+/// The queue attribute naming the KMS key a queue is encrypted with. An EMPTY value is how
+/// a caller takes a queue off that key ("an empty value" of `KmsMasterKeyId`), which is the
+/// one reset of a dropped property Amazon SQS's own API expresses — see [`update_queue`].
+const SQS_KMS_MASTER_KEY_ID: &str = "KmsMasterKeyId";
+
 /// The error code SQS answers for a queue url no queue answers to (`QueueDoesNotExist`,
 /// the modelled error of `DeleteQueue`).
 const QUEUE_DOES_NOT_EXIST: &str = "QueueDoesNotExist";
@@ -4201,6 +4233,11 @@ async fn create_queue(
 ///   documented default. `SetQueueAttributes` has no way to ask for a default and the
 ///   defaults are Amazon SQS's own (restating them here would be a second copy of its
 ///   documentation), so the removal is answered with `NotImplemented` naming the property.
+///
+/// [`SQS_KMS_MASTER_KEY_ID`] is the one dropped property that IS applied, because Amazon
+/// SQS's own API expresses that reset: an empty `KmsMasterKeyId` is how a caller takes a
+/// queue off its KMS key, so a declaration that no longer names a key reaches SQS as that
+/// empty value — which is what moves a queue back off SSE-KMS.
 async fn update_queue(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -4213,7 +4250,11 @@ async fn update_queue(
 
     // A property the new declaration drops: nothing is called at all, so the queue is left
     // exactly as it is and the deployment reports why.
-    if let Some(dropped) = before.keys().find(|name| !after.contains_key(*name)) {
+    if let Some(dropped) = before
+        .keys()
+        .filter(|name| !after.contains_key(*name))
+        .find(|name| name.as_str() != SQS_KMS_MASTER_KEY_ID)
+    {
         return Err(Refusal {
             code: NOT_IMPLEMENTED.to_string(),
             message: format!(
@@ -4224,10 +4265,20 @@ async fn update_queue(
         });
     }
 
-    let changed: Map<String, Value> = after
-        .into_iter()
-        .filter(|(name, value)| before.get(name) != Some(value))
+    let mut changed: Map<String, Value> = after
+        .iter()
+        .filter(|(name, value)| before.get(*name) != Some(value))
+        .map(|(name, value)| (name.clone(), value.clone()))
         .collect();
+    // The declaration no longer names a KMS key, so the queue comes off the one it is on:
+    // "an empty value" of this attribute is how that is asked for.
+    if before.contains_key(SQS_KMS_MASTER_KEY_ID) && !after.contains_key(SQS_KMS_MASTER_KEY_ID)
+    {
+        changed.insert(
+            SQS_KMS_MASTER_KEY_ID.to_string(),
+            Value::String(String::new()),
+        );
+    }
     if !changed.is_empty() {
         call_json_rpc(
             ctx,
@@ -12556,6 +12607,591 @@ async fn call_codecommit(
         region,
         AWS_JSON_1_1,
         &format!("{CODECOMMIT_TARGET_PREFIX}.{operation}"),
+        request,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// KMS: AWS::KMS::Key
+// ---------------------------------------------------------------------------
+
+/// KMS's signing name and `X-Amz-Target` prefix, from its model (`sigv4Name: kms`, service
+/// shape `TrentService`), which speaks `awsJson1_1`.
+const KMS_SIGNING_NAME: &str = "kms";
+const KMS_TARGET_PREFIX: &str = "TrentService";
+
+/// The error code KMS answers for a key identifier it resolves to no key.
+const KMS_NOT_FOUND: &str = "NotFoundException";
+
+/// The error code KMS answers for a request the key's own state does not admit — among
+/// them scheduling the deletion of a key that is already awaiting it.
+const KMS_INVALID_STATE: &str = "KMSInvalidStateException";
+
+/// The `KeyState` of a key whose deletion is already scheduled, which is the state a
+/// delete of the resource asks for.
+const KMS_KEY_STATE_PENDING_DELETION: &str = "PendingDeletion";
+
+/// A KMS tag's member names: `Tag{TagKey, TagValue}`, which is neither of the two
+/// spellings the other services here use (`smithy_query(shape="Tag")` on the KMS model).
+const KMS_TAG: (&str, &str) = ("TagKey", "TagValue");
+
+/// The properties of `AWS::KMS::Key` that are members of `CreateKey`, each with the member
+/// it is. Every one of them is named identically on both sides — `Description`, `KeySpec`,
+/// `KeyUsage`, `MultiRegion`, `Origin` and `BypassPolicyLockoutSafetyCheck` are properties
+/// of the type and members of `smithy_query(operation="CreateKey")` — and their VALUES are
+/// what the template declared, so KMS's own validation is what judges them.
+const KMS_KEY_CREATE_MEMBERS: &[(&str, &str)] = &[
+    (
+        "BypassPolicyLockoutSafetyCheck",
+        "BypassPolicyLockoutSafetyCheck",
+    ),
+    ("Description", "Description"),
+    ("KeySpec", "KeySpec"),
+    ("KeyUsage", "KeyUsage"),
+    ("MultiRegion", "MultiRegion"),
+    ("Origin", "Origin"),
+];
+
+/// The property carrying the key's own key policy. It is the one property whose NAME
+/// differs from the member that takes it (`CreateKey$Policy`, `PutKeyPolicy$Policy`), and
+/// the member is the document's TEXT, so a template that spells the policy as an object
+/// has it rendered ([`document_text`]).
+const KMS_KEY_POLICY_PROPERTY: &str = "KeyPolicy";
+
+/// The property that says whether the key is enabled. A key `CreateKey` mints is enabled,
+/// so only a declaration asking for a DISABLED key has anything called for it — KMS's own
+/// `DisableKey`, there being no member of the create for it.
+const KMS_KEY_ENABLED_PROPERTY: &str = "Enabled";
+
+/// The property that turns automatic rotation of the key's material on, and the one that
+/// says how long a rotation period is: `EnableKeyRotation` takes both and no member of the
+/// create does.
+const KMS_KEY_ROTATION_PROPERTY: &str = "EnableKeyRotation";
+const KMS_KEY_ROTATION_PERIOD_PROPERTY: &str = "RotationPeriodInDays";
+
+/// The property that says how long KMS waits before it deletes the key, which is a member
+/// of `ScheduleKeyDeletion` rather than of any create or update call.
+const KMS_KEY_PENDING_WINDOW_PROPERTY: &str = "PendingWindowInDays";
+
+/// Every property `AWS::KMS::Key` publishes, which is what this arm carries to KMS: the
+/// create's own members, the four that reach it through a call of their own, and the tag
+/// list. A declaration naming anything else is refused rather than deployed with the
+/// property dropped.
+const KMS_KEY_PROPERTIES: &[&str] = &[
+    "BypassPolicyLockoutSafetyCheck",
+    "Description",
+    KMS_KEY_ENABLED_PROPERTY,
+    KMS_KEY_ROTATION_PROPERTY,
+    KMS_KEY_POLICY_PROPERTY,
+    "KeySpec",
+    "KeyUsage",
+    "MultiRegion",
+    "Origin",
+    KMS_KEY_PENDING_WINDOW_PROPERTY,
+    KMS_KEY_ROTATION_PERIOD_PROPERTY,
+    "Tags",
+];
+
+/// Create the KMS key an `AWS::KMS::Key` declares, in KMS itself.
+///
+/// The key's IDENTITY is KMS's own to mint: `CreateKey` takes no identifier and answers
+/// the `KeyMetadata` carrying the `KeyId` it assigned and the `Arn` it built from it. Both
+/// are reported back — the key id as the resource's physical id, which is what `Ref`
+/// resolves to, and the pair as the type's two published `Fn::GetAtt` attributes — so a
+/// queue, a bucket or a stream whose declaration hands the stack's `Fn::GetAtt
+/// ['Key','Arn']` to its own service resolves it in the SAME store KMS's handlers wrote,
+/// rather than naming a key nothing answers to.
+///
+/// Three properties are not members of the create and reach KMS through the call that owns
+/// each: the rotation the key's material is on (`EnableKeyRotation`, with the period the
+/// declaration asks for), and a declaration asking for a DISABLED key (`DisableKey`).
+/// Rotation is turned on first, because KMS does not take that request for a key that is
+/// disabled. A key whose follow-up call KMS refuses is not left behind half-configured: it
+/// is scheduled for deletion again, and the refusal is what the deployment reports.
+async fn create_kms_key(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let properties = match &resource.properties {
+        Value::Object(object) => object.clone(),
+        _ => Map::new(),
+    };
+    if let Some(unmapped) = kms_key_unmapped_property(&properties) {
+        return Err(Refusal {
+            code: NOT_IMPLEMENTED.to_string(),
+            message: format!(
+                "this emulator does not carry the {unmapped} property of an {KMS_KEY} to \
+                 KMS; the resource was not created."
+            ),
+        });
+    }
+    let mut request = Map::new();
+    copy_members(&properties, KMS_KEY_CREATE_MEMBERS, &mut request);
+    if let Some(policy) = properties.get(KMS_KEY_POLICY_PROPERTY).and_then(document_text) {
+        request.insert("Policy".to_string(), Value::String(policy));
+    }
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("Tags".to_string(), tags_as_list(&tags, KMS_TAG));
+    }
+    let answered = call_kms(ctx, region, "CreateKey", &Value::Object(request)).await?;
+    let metadata = reported_member(&answered, "KeyMetadata");
+    let (Some(key_id), Some(arn)) = (
+        metadata.get("KeyId").and_then(scalar_text),
+        metadata.get("Arn").and_then(scalar_text),
+    ) else {
+        // The create answered 2xx without the identity its output models. Nothing addresses
+        // a key without one, so this is reported as a failure rather than recorded as a
+        // resource whose identifier nothing minted.
+        return Err(Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "CreateKey answered no KeyMetadata.KeyId or KeyMetadata.Arn".to_string(),
+        });
+    };
+    if let Err(refusal) = configure_kms_key(ctx, region, &key_id, &properties).await {
+        return match schedule_kms_key_deletion(ctx, region, &key_id, &properties).await {
+            Ok(()) => Err(refusal),
+            Err(cleanup) => Err(Refusal {
+                code: refusal.code,
+                message: format!(
+                    "{}; the key it created could not be scheduled for deletion again: \
+                     {cleanup}",
+                    refusal.message
+                ),
+            }),
+        };
+    }
+    let mut attributes = BTreeMap::new();
+    attributes.insert("Arn".to_string(), arn);
+    attributes.insert("KeyId".to_string(), key_id.clone());
+    Ok(Created {
+        physical_resource_id: Some(key_id),
+        attributes,
+    })
+}
+
+/// The first declared property of an `AWS::KMS::Key` this arm does not carry to KMS, or
+/// `None` for a declaration whose every property it does ([`KMS_KEY_PROPERTIES`]).
+fn kms_key_unmapped_property(properties: &Map<String, Value>) -> Option<String> {
+    properties
+        .keys()
+        .find(|property| !KMS_KEY_PROPERTIES.contains(&property.as_str()))
+        .cloned()
+}
+
+/// Put the key the create just minted into the state the declaration asks for, through the
+/// KMS calls that own the two switches no member of `CreateKey` carries.
+///
+/// Nothing is called where the declaration asks for what a new key already is: rotation is
+/// off and the key is enabled, so a declaration that states neither switch — or states
+/// each at its default — leaves KMS with one call made about the key.
+async fn configure_kms_key(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    key_id: &str,
+    properties: &Map<String, Value>,
+) -> Result<(), Refusal> {
+    if declared_flag(properties, KMS_KEY_ROTATION_PROPERTY) == Some(true) {
+        let mut request = Map::new();
+        request.insert("KeyId".to_string(), Value::String(key_id.to_string()));
+        if let Some(period) = whole_number(properties.get(KMS_KEY_ROTATION_PERIOD_PROPERTY)) {
+            request.insert(
+                "RotationPeriodInDays".to_string(),
+                Value::from(period),
+            );
+        }
+        call_kms(ctx, region, "EnableKeyRotation", &Value::Object(request)).await?;
+    }
+    // "Enabled ... Default: true" for the type, so only a declaration asking for the key
+    // to be disabled has anything called for it — and it comes last, rotation not being a
+    // request KMS takes for a disabled key.
+    if declared_flag(properties, KMS_KEY_ENABLED_PROPERTY) == Some(false) {
+        call_kms(
+            ctx,
+            region,
+            "DisableKey",
+            &serde_json::json!({ "KeyId": key_id }),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// A boolean property in either spelling a template gives one: JSON's boolean, or the
+/// text a JSON template spells one as, read case-insensitively exactly as every other
+/// template boolean is ([`super::template`]'s own reading of one). `None` is a property
+/// the declaration does not state, or states as something that is not a boolean at all —
+/// which the owning service's own validation is what judges.
+fn declared_flag(properties: &Map<String, Value>, property: &str) -> Option<bool> {
+    match properties.get(property)? {
+        Value::Bool(flag) => Some(*flag),
+        Value::String(text) if text.eq_ignore_ascii_case("true") => Some(true),
+        Value::String(text) if text.eq_ignore_ascii_case("false") => Some(false),
+        _ => None,
+    }
+}
+
+/// Bring the tags of the key a resource record names to the ones this deployment gives it,
+/// through KMS's own `TagResource` and `UntagResource`.
+///
+/// The set is the declaration's own `Tags` beside the ones CloudFormation propagates
+/// ([`tags_of`]) — the same set the CREATE applied — so a key outside it is one this
+/// deployment no longer gives the resource and is removed, and one in it with another value
+/// is re-valued ("adds or edits tags on a customer managed KMS key", `TagResource`). Where
+/// the two sets already agree nothing is called at all, which is what makes this safe to ask
+/// on every deployment.
+///
+/// A key KMS no longer resolves the id to has no tags to reconcile.
+async fn retag_kms_key(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+    propagated: &[(String, String)],
+) -> Result<(), Refusal> {
+    let key_id = resource.physical_resource_id.clone();
+    if describe_kms_key_metadata(ctx, region, &key_id).await?.is_none() {
+        return Ok(());
+    }
+    let desired = tags_of(declared, propagated);
+    let held = kms_key_tags(
+        &call_kms(
+            ctx,
+            region,
+            "ListResourceTags",
+            &serde_json::json!({ "KeyId": &key_id }),
+        )
+        .await?,
+    );
+    let added: Vec<(String, String)> = desired
+        .iter()
+        .filter(|(key, value)| {
+            held.iter()
+                .find(|(held_key, _)| held_key == key)
+                .is_none_or(|(_, held_value)| held_value != value)
+        })
+        .cloned()
+        .collect();
+    let removed: Vec<Value> = held
+        .iter()
+        .filter(|(key, _)| !desired.iter().any(|(wanted, _)| wanted == key))
+        .map(|(key, _)| Value::String(key.clone()))
+        .collect();
+    if !added.is_empty() {
+        call_kms(
+            ctx,
+            region,
+            "TagResource",
+            &serde_json::json!({
+                "KeyId": &key_id,
+                "Tags": tags_as_list(&added, KMS_TAG),
+            }),
+        )
+        .await?;
+    }
+    if !removed.is_empty() {
+        call_kms(
+            ctx,
+            region,
+            "UntagResource",
+            &serde_json::json!({ "KeyId": &key_id, "TagKeys": Value::Array(removed) }),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// The tags a KMS tag read answers with, as the pairs this module reconciles: KMS spells a
+/// tag `{TagKey, TagValue}` ([`KMS_TAG`]), which is neither of the two spellings
+/// [`declared_tags`] reads.
+fn kms_key_tags(answer: &Value) -> Vec<(String, String)> {
+    answer
+        .get("Tags")
+        .and_then(Value::as_array)
+        .map(|tags| {
+            tags.iter()
+                .filter_map(|tag| {
+                    Some((
+                        tag.get(KMS_TAG.0).and_then(Value::as_str)?.to_string(),
+                        tag.get(KMS_TAG.1)
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Apply a changed `AWS::KMS::Key` declaration to the key that already exists.
+///
+/// Each property that can change on a key has a KMS call that changes it, and that is what
+/// this calls: the description through `UpdateKeyDescription`, the key policy through
+/// `PutKeyPolicy`, the enabled switch through `EnableKey`/`DisableKey` and the rotation
+/// switch through `EnableKeyRotation`/`DisableKeyRotation`. A property neither revision
+/// changed is not sent at all, and nothing is called where nothing changed.
+///
+/// The key keeps its identity, so it keeps the id and the ARN everything that references it
+/// resolves through. A change to a property KMS cannot make to an existing key — the key
+/// spec, its usage, its origin or whether it is multi-Region, all of which AWS answers by
+/// REPLACING the key — is refused rather than quietly dropped, so the stack never reports a
+/// key configured differently from its declaration.
+///
+/// This is the key's CONFIGURATION alone. The tags CloudFormation gives it travel
+/// separately, through [`retag_kms_key`], because they change independently of any
+/// declaration.
+async fn update_kms_key(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Created, Refusal> {
+    let before = match &resource.properties {
+        Value::Object(object) => object.clone(),
+        _ => Map::new(),
+    };
+    let after = match declared {
+        Value::Object(object) => object.clone(),
+        _ => Map::new(),
+    };
+    if let Some(unmapped) = kms_key_unmapped_property(&after) {
+        return Err(Refusal {
+            code: NOT_IMPLEMENTED.to_string(),
+            message: format!(
+                "this emulator does not carry the {unmapped} property of an {KMS_KEY} to \
+                 KMS; the resource was left as it is."
+            ),
+        });
+    }
+    // The create-only properties: AWS replaces the key when one of them changes, which is a
+    // new key under a new identity — not a change this arm can make to the key the stack
+    // has.
+    if let Some(replaced) = KMS_KEY_REPLACEMENT_PROPERTIES
+        .iter()
+        .find(|property| before.get(**property) != after.get(**property))
+    {
+        return Err(Refusal {
+            code: NOT_IMPLEMENTED.to_string(),
+            message: format!(
+                "this emulator does not change the {replaced} property of an existing \
+                 {KMS_KEY}, which KMS answers by replacing the key; the resource was left \
+                 as it is."
+            ),
+        });
+    }
+
+    let key_id = resource.physical_resource_id.clone();
+    if before.get("Description") != after.get("Description") {
+        // A description the update no longer declares is the empty one, which is what a key
+        // created without the property carries.
+        let description = after
+            .get("Description")
+            .and_then(scalar_text)
+            .unwrap_or_default();
+        call_kms(
+            ctx,
+            region,
+            "UpdateKeyDescription",
+            &serde_json::json!({ "KeyId": key_id, "Description": description }),
+        )
+        .await?;
+    }
+    let policy_before = before.get(KMS_KEY_POLICY_PROPERTY).and_then(document_text);
+    let policy_after = after.get(KMS_KEY_POLICY_PROPERTY).and_then(document_text);
+    if policy_before != policy_after {
+        let Some(policy) = policy_after else {
+            // There is no way to ask KMS for the default key policy back, and restating it
+            // here would be a second copy of its documentation.
+            return Err(Refusal {
+                code: NOT_IMPLEMENTED.to_string(),
+                message: format!(
+                    "this emulator does not reset the {KMS_KEY_POLICY_PROPERTY} property of \
+                     an existing {KMS_KEY} that an update no longer declares to KMS's \
+                     default key policy; the resource was left as it is."
+                ),
+            });
+        };
+        call_kms(
+            ctx,
+            region,
+            "PutKeyPolicy",
+            &serde_json::json!({ "KeyId": key_id, "Policy": policy }),
+        )
+        .await?;
+    }
+    // Rotation is changed before the enabled switch for the same reason the create turns it
+    // on first: KMS does not take a rotation request for a key that is disabled.
+    let rotation_before = declared_flag(&before, KMS_KEY_ROTATION_PROPERTY).unwrap_or(false);
+    let rotation_after = declared_flag(&after, KMS_KEY_ROTATION_PROPERTY).unwrap_or(false);
+    let period_changed = whole_number(before.get(KMS_KEY_ROTATION_PERIOD_PROPERTY))
+        != whole_number(after.get(KMS_KEY_ROTATION_PERIOD_PROPERTY));
+    if rotation_after && (!rotation_before || period_changed) {
+        let mut request = Map::new();
+        request.insert("KeyId".to_string(), Value::String(key_id.clone()));
+        if let Some(period) = whole_number(after.get(KMS_KEY_ROTATION_PERIOD_PROPERTY)) {
+            request.insert("RotationPeriodInDays".to_string(), Value::from(period));
+        }
+        call_kms(ctx, region, "EnableKeyRotation", &Value::Object(request)).await?;
+    } else if rotation_before && !rotation_after {
+        call_kms(
+            ctx,
+            region,
+            "DisableKeyRotation",
+            &serde_json::json!({ "KeyId": key_id }),
+        )
+        .await?;
+    }
+    let enabled_before = declared_flag(&before, KMS_KEY_ENABLED_PROPERTY).unwrap_or(true);
+    let enabled_after = declared_flag(&after, KMS_KEY_ENABLED_PROPERTY).unwrap_or(true);
+    if enabled_before != enabled_after {
+        let operation = if enabled_after {
+            "EnableKey"
+        } else {
+            "DisableKey"
+        };
+        call_kms(
+            ctx,
+            region,
+            operation,
+            &serde_json::json!({ "KeyId": key_id }),
+        )
+        .await?;
+    }
+    // The key's identity is untouched, so the id and the ARN the create reported still
+    // address it: this arm reports no attribute of its own.
+    Ok(Created::default())
+}
+
+/// The properties of `AWS::KMS::Key` that no KMS call changes on an existing key: the kind
+/// of key material it holds, what it may be used for, where that material came from and
+/// whether it is multi-Region. Each is a property AWS's resource reference marks as
+/// requiring replacement.
+const KMS_KEY_REPLACEMENT_PROPERTIES: &[&str] = &["KeySpec", "KeyUsage", "MultiRegion", "Origin"];
+
+/// Delete the key a stack created, which for a KMS key is scheduling its deletion: KMS has
+/// no call that deletes a key at once — "you can schedule the deletion of a KMS key" — and
+/// the waiting period is the one the declaration asks for, else the one KMS defaults to.
+///
+/// A key KMS no longer resolves the id to (`NotFoundException`) is already in the state the
+/// delete asks for. So is one whose deletion is already scheduled, which KMS answers with
+/// its invalid-state refusal: that is confirmed by READING the key back, so a refusal
+/// caused by any other state is reported rather than passed off as a deletion.
+async fn schedule_kms_key_deletion(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    key_id: &str,
+    properties: &Map<String, Value>,
+) -> Result<(), Refusal> {
+    let mut request = Map::new();
+    request.insert("KeyId".to_string(), Value::String(key_id.to_string()));
+    if let Some(window) = whole_number(properties.get(KMS_KEY_PENDING_WINDOW_PROPERTY)) {
+        request.insert("PendingWindowInDays".to_string(), Value::from(window));
+    }
+    let refusal = match call_kms(
+        ctx,
+        region,
+        "ScheduleKeyDeletion",
+        &Value::Object(request),
+    )
+    .await
+    {
+        Ok(_) => return Ok(()),
+        Err(refusal) if refusal.code == KMS_NOT_FOUND => return Ok(()),
+        Err(refusal) => refusal,
+    };
+    if refusal.code != KMS_INVALID_STATE {
+        return Err(refusal);
+    }
+    match describe_kms_key_metadata(ctx, region, key_id).await {
+        // The key is already awaiting deletion, which is the state the delete asks for.
+        Ok(Some(metadata))
+            if metadata.get("KeyState").and_then(Value::as_str)
+                == Some(KMS_KEY_STATE_PENDING_DELETION) =>
+        {
+            Ok(())
+        }
+        // KMS no longer resolves the id at all: nothing is left to delete.
+        Ok(None) => Ok(()),
+        // The key is in some other state, or the confirming read itself failed and says
+        // nothing about the key: the delete really was refused.
+        Ok(Some(_)) | Err(_) => Err(refusal),
+    }
+}
+
+/// The key's configuration as KMS reports it, for drift detection. A key KMS no longer
+/// resolves the id to was deleted.
+///
+/// Only the properties `DescribeKey` reports in the SAME shape the type declares them in
+/// are reported, because a property the actual document does not carry is not evidence of
+/// anything (`super::drift::differs`): the `KeyMetadata` members named identically to the
+/// type's properties. The key POLICY is not among them — it is read through
+/// `GetKeyPolicy`, as the document's text, while the property is a JSON document — and
+/// neither is the rotation switch, which has a status call of its own.
+async fn describe_kms_key(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let Some(metadata) = describe_kms_key_metadata(ctx, region, physical_resource_id).await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(reported_as_properties(
+        &metadata,
+        KMS_KEY_REPORTED_PROPERTIES,
+    )))
+}
+
+/// The `KeyMetadata` members `DescribeKey` reports that ARE properties of the type, each
+/// under the property's name — which for every one of them is the member's own name.
+const KMS_KEY_REPORTED_PROPERTIES: &[(&str, &str)] = &[
+    ("Description", "Description"),
+    (KMS_KEY_ENABLED_PROPERTY, "Enabled"),
+    ("KeySpec", "KeySpec"),
+    ("KeyUsage", "KeyUsage"),
+    ("MultiRegion", "MultiRegion"),
+    ("Origin", "Origin"),
+];
+
+/// The `KeyMetadata` KMS answers for a key, or `None` for an identifier it resolves to no
+/// key (`NotFoundException`, judged on the CODE and never on a message that carries the
+/// request's own identifier).
+async fn describe_kms_key_metadata(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    key_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    match call_kms(
+        ctx,
+        region,
+        "DescribeKey",
+        &serde_json::json!({ "KeyId": key_id }),
+    )
+    .await
+    {
+        Ok(answer) => Ok(Some(reported_member(&answer, "KeyMetadata"))),
+        Err(refusal) if refusal.code == KMS_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Call one KMS operation on the awsJson1_1 wire its model declares.
+async fn call_kms(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    operation: &str,
+    request: &Value,
+) -> Result<Value, Refusal> {
+    call_json_rpc(
+        ctx,
+        KMS_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{KMS_TARGET_PREFIX}.{operation}"),
         request,
     )
     .await

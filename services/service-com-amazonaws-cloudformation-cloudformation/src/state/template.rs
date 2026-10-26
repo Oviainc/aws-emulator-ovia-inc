@@ -2848,6 +2848,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     FIS_EXPERIMENT_TEMPLATE,
     GUARDDUTY_DETECTOR,
     "AWS::IAM::Role",
+    KMS_KEY,
     FIREHOSE_DELIVERY_STREAM,
     "AWS::Lambda::Function",
     "AWS::Logs::LogGroup",
@@ -3850,6 +3851,23 @@ fn return_values(
             attributes.insert("Id".to_string(), id.clone());
             (id, attributes)
         }
+        // "Ref returns the key ID"; Fn::GetAtt: Arn, KeyId. KMS ASSIGNS that id —
+        // `CreateKey` takes no identifier — so a declaration reports an identifier of KMS's
+        // own shape (a version-4 UUID) rather than CloudFormation's
+        // `<stack>-<logical id>-<unique id>` name, with the key ARN built from it the way
+        // KMS builds one (`key/<key id>`). This is also the type `super::provisioning`
+        // creates in KMS itself, which reports the id IT minted and the ARN it built back
+        // over these attributes — and THOSE, not the ones computed here, are what the stack
+        // reports for a key KMS created.
+        KMS_KEY => {
+            let id = generated_uuid(resource_type, name);
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(KMS_ARN_NAMESPACE, region, &format!("key/{id}")),
+            );
+            attributes.insert("KeyId".to_string(), id.clone());
+            (id, attributes)
+        }
         // "Ref returns the ARN of the cluster" for both kinds of Amazon MSK cluster, and
         // that ARN is the type's one published `Fn::GetAtt` attribute too. Amazon MSK
         // MINTS it: its resource path is `cluster/<name>/<id>`, where the id is the
@@ -3970,6 +3988,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         APIGATEWAYV2_API_MAPPING => &["ApiMappingId"],
         APIGATEWAYV2_DOMAIN_NAME => &["DomainNameArn", "RegionalDomainName"],
         GUARDDUTY_DETECTOR => &["Id"],
+        KMS_KEY => &["Arn", "KeyId"],
         MSK_CLUSTER | MSK_SERVERLESS_CLUSTER => &["Arn"],
         EVENTS_RULE => &["Arn"],
         SSM_PARAMETER => &["Type", "Value"],
@@ -4023,6 +4042,11 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 /// The four WAFv2 types are in that position too ([`WAFV2_WEB_ACL`] and its siblings): each
 /// create answers an `Id` that service minted, and the entity's ARN carries it, so a
 /// deployment can recompute neither.
+///
+/// A KMS key is one more: `CreateKey` takes no identifier and answers the `KeyId` KMS
+/// assigned, that type's `Ref` returns the key id, and the key ARN that identifier is
+/// embedded in is what a queue's `KmsMasterKeyId` (or any other reference to the key)
+/// resolves through.
 pub fn identity_is_service_assigned(resource_type: &str) -> bool {
     resource_type == APIGATEWAYV2_API
         || resource_type == APIGATEWAYV2_API_MAPPING
@@ -4035,6 +4059,7 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == GRAFANA_WORKSPACE
         || resource_type == EMR_CLUSTER
         || resource_type == GUARDDUTY_DETECTOR
+        || resource_type == KMS_KEY
         || resource_type == AOSS_COLLECTION
         || resource_type == ACM_ACME_ENDPOINT
         || resource_type == MSK_CLUSTER
@@ -4312,6 +4337,17 @@ pub const GRAFANA_WORKSPACE: &str = "AWS::Grafana::Workspace";
 /// identifier and MINTS one — so the id a stack's output reports for it is the one that
 /// service answered with.
 pub const GUARDDUTY_DETECTOR: &str = "AWS::GuardDuty::Detector";
+
+/// A KMS key's resource type (the KMS model: `cloudFormationName: KMS`). This is a type
+/// `super::provisioning` creates in KMS itself, and "Ref returns the key ID" — `CreateKey`
+/// takes no identifier and MINTS the key id — so the id a stack reports for the resource,
+/// and the ARN built from it, are the ones KMS answered with and the ones
+/// `kms DescribeKey` (and every service that resolves a `KmsMasterKeyId`) resolves.
+pub const KMS_KEY: &str = "AWS::KMS::Key";
+
+/// KMS's ARN namespace, which is its model's own `awsService.arnNamespace` (`kms`) — the
+/// service segment of a key ARN.
+pub const KMS_ARN_NAMESPACE: &str = "kms";
 
 /// The three Route 53 Resolver resource types a stack creates in that service (the
 /// Route 53 Resolver model: `cloudFormationName: Route53Resolver`).

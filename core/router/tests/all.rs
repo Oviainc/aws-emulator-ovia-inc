@@ -459,3 +459,5 @@ mod cloudformation_provisions_s3vectors_resources;
 mod cloudformation_provisions_msk_clusters;
 #[path = "all/logs_emf_metric_extraction.rs"]
 mod logs_emf_metric_extraction;
+#[path = "all/cloudformation_provisions_kms_keys.rs"]
+mod cloudformation_provisions_kms_keys;

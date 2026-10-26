@@ -50,11 +50,14 @@
 //!    the key policy allows this principal directly, or it delegates to IAM and the
 //!    principal's identity-based policies allow it.
 //!
-//! Two callers are not judged on documents at all, exactly as every other service in this
+//! Two callers are not judged on a GRANT at all, exactly as every other service in this
 //! tree that authorizes reads them: the account's own published credential, which holds no
 //! IAM policies — the position the account's administrator is in — and a principal
 //! carrying a policy document this emulator cannot read (an AWS-managed policy), which may
-//! hold the grant. Neither is refused on evidence nobody has.
+//! hold the grant. Neither is refused for want of evidence nobody has. An explicit `Deny`
+//! stated in the key's own policy is evidence that DOES exist, and it covers every
+//! principal the statement matches — the account root included — so it refuses both of
+//! them too: no grant, and no absence of one, overturns a deny.
 //!
 //! Amazon SQS does not word these refusals itself: it relays the error its KMS call
 //! failed with, so each message is KMS's own sentence with the metadata block an AWS error
@@ -171,6 +174,9 @@ pub fn apply_encryption_choice(
 /// something no queue can be. Amazon SQS refuses it as an attribute NAME rather than an
 /// attribute value: each value on its own is one the attribute accepts, and what the
 /// request got wrong is naming the second attribute at all.
+///
+/// The sentence is [`BOTH_ENCRYPTION_OPTIONS_MESSAGE`]: Amazon SQS states the rule itself
+/// rather than naming the attributes the request carried.
 pub fn encryption_choice_refusal(
     supplied: &HashMap<String, String>,
 ) -> Option<InvalidAttributeName> {
@@ -181,12 +187,18 @@ pub fn encryption_choice_refusal(
         .get(SQS_MANAGED_SSE_ENABLED)
         .is_some_and(|value| value == "true");
     (names_a_key && enables_sqs_managed).then(|| InvalidAttributeName {
-        message: Some(format!(
-            "You can specify either {KMS_MASTER_KEY_ID} or {SQS_MANAGED_SSE_ENABLED}, \
-             but not both."
-        )),
+        message: Some(BOTH_ENCRYPTION_OPTIONS_MESSAGE.to_string()),
     })
 }
+
+/// How Amazon SQS words the refusal of a request that asks for both server-side
+/// encryption options at once: the rule itself, in fixed text. Nothing of the request is
+/// in it — not the attribute names, not the key the request named, not the queue — so the
+/// sentence is the same for every such request, which is what lets a client tell this
+/// `InvalidAttributeName` from the other causes that share the code.
+pub const BOTH_ENCRYPTION_OPTIONS_MESSAGE: &str =
+    "You can use one type of server-side encryption (SSE) at one time. You can either \
+     enable KMS SSE or SQS SSE.";
 
 /// Report the encryption a queue carrying `attributes` has, into the attribute map
 /// `reported` a queue reader answers with.
@@ -446,18 +458,24 @@ fn withheld_by(
     context: &[(String, String)],
 ) -> Option<String> {
     let request = iam::Request::new(action, &key.arn, &caller.principals).with_context(context);
+    // An explicit deny in the key's OWN policy is decided FIRST, and against the account
+    // spellings beside the caller's own: a statement that denies the account denies each of
+    // its principals, so a document stating one covers every caller of that account —
+    // including its own published credential, which no grant exempts from a deny.
+    let mut named = caller.principals.clone();
+    named.extend(caller.account_principals.iter().cloned());
+    let denying = iam::Request::new(action, &key.arn, &named).with_context(context);
+    if iam::resource_decision(&key.policy, &denying) == Decision::Denied {
+        return Some("with an explicit deny in a resource-based policy".to_string());
+    }
     // The account's own published credential holds no IAM policies, and a principal
     // carrying a document this emulator cannot read may hold the grant: neither is judged
-    // on documents at all — the position the account's administrator is in — so neither is
+    // on a GRANT at all — the position the account's administrator is in — so neither is
     // refused on evidence nobody has.
     if caller.account_credential || caller.unreadable_attachment {
         return None;
     }
-    let stated = iam::resource_decision(&key.policy, &request);
-    if stated == Decision::Denied {
-        return Some("with an explicit deny in a resource-based policy".to_string());
-    }
-    if stated == Decision::Allowed {
+    if iam::resource_decision(&key.policy, &request) == Decision::Allowed {
         return None;
     }
     // "The default key policy ... gives the Amazon Web Services account that owns the KMS

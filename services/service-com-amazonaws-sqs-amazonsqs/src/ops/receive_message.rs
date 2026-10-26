@@ -13,7 +13,10 @@
 //! key only KMS can open, so the receive is gated on that key being usable and on this
 //! caller holding the decrypt grant ([`crate::state::encryption::authorize_queue_key`]):
 //! a consumer the key does not permit is answered the `Kms*` error of its class and is
-//! handed no body.
+//! handed no body. That decrypt happens WHEN a message is handed over, so the key is
+//! consulted only by a receive that has one to hand over: a receive that finds the queue
+//! empty decrypts nothing, asks nothing of KMS, and is the empty success an empty queue is
+//! whatever the key permits.
 //!
 //! ## Shape of an operation
 //!
@@ -371,21 +374,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ReceiveMessageErrorModeled::UnsupportedOperation(sqs::store_unavailable())
         })?;
 
-        // A message in a queue encrypted with a customer managed key is sealed under a
-        // data key only KMS can open, so a consumer the key does not permit to decrypt
-        // is refused before anything is handed over — and before anything is made
-        // invisible, so a refused receive takes nothing out of the queue.
-        sqs::encryption::authorize_queue_key(
-            &*self.engine,
-            ctx,
-            &input.queue_url,
-            sqs::encryption::DECRYPT_ACTION,
-        )
-        .map_err(kms_refusal)?;
-
         let started = SystemTime::now();
         loop {
             let now = SystemTime::now();
+            // Amazon SQS asks KMS to decrypt the data key a message was sealed under WHEN
+            // it hands that message over, so a receive with nothing to hand over makes no
+            // KMS request at all: whether this one has a message to deliver is decided
+            // first, under the lock, and the queue's key is consulted only when it has —
+            // before anything is handed over or made invisible, so a refused receive still
+            // takes nothing out of the queue.
+            let delivering = {
+                let mut state = store.lock();
+                state
+                    .queue_by_url_mut(&input.queue_url)
+                    .is_some_and(|queue| {
+                        // Retention lapses and visibility timeouts are owed by the clock,
+                        // so what this sees is what the walk below would deliver.
+                        queue.materialise_due(now);
+                        // A retry under a FIFO attempt token hands the batch that token
+                        // names over again, which opens those messages afresh.
+                        let retrying = attempt_id
+                            .as_deref()
+                            .filter(|_| queue.is_fifo())
+                            .is_some_and(|given| queue.receive_attempts.contains_key(given));
+                        retrying
+                            || !queue
+                                .delivery_order(
+                                    now,
+                                    usize::try_from(max_messages).unwrap_or(1),
+                                )
+                                .is_empty()
+                    })
+            };
+            if delivering {
+                sqs::encryption::authorize_queue_key(
+                    &*self.engine,
+                    ctx,
+                    &input.queue_url,
+                    sqs::encryption::DECRYPT_ACTION,
+                )
+                .map_err(kms_refusal)?;
+            }
             let (messages, wait) = {
                 let mut state = store.lock();
                 let Some(queue) = state.queue_by_url_mut(&input.queue_url) else {
@@ -429,7 +458,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // taken and left unused rather than refused: no recorded call shows a
                 // standard-queue receive being turned away for carrying it, and the
                 // member's own documentation states only which queue type it applies to.
-                let attempt_id = attempt_id.as_ref().filter(|_| queue.is_fifo());
+                //
+                // `delivering` is what the queue's key was decided for: an iteration that
+                // found nothing to hand over hands nothing over, so a batch that arrived
+                // since is served by the NEXT poll iteration — which decides the key
+                // afresh — rather than by this one, which never asked about the decryption.
+                let attempt_id = attempt_id
+                    .as_ref()
+                    .filter(|_| queue.is_fifo() && delivering);
 
                 // "It is possible to retry the same action with an identical
                 // ReceiveRequestAttemptId to retrieve the same set of messages, even if
@@ -501,8 +537,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     });
                 }
 
-                let taking: Vec<usize> =
-                    queue.delivery_order(now, usize::try_from(max_messages).unwrap_or(1));
+                let taking: Vec<usize> = if delivering {
+                    queue.delivery_order(now, usize::try_from(max_messages).unwrap_or(1))
+                } else {
+                    // Nothing was waiting when the queue's key was decided, so nothing is
+                    // handed over here either (see the attempt token above).
+                    Vec::new()
+                };
 
                 let mut delivered = Vec::with_capacity(taking.len());
                 let mut minted = Vec::with_capacity(taking.len());

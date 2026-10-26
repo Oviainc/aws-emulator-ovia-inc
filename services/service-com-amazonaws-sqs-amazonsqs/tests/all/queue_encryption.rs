@@ -25,6 +25,11 @@
 //!   decrypting one for a receive);
 //! * where the grant lives: the key's own policy, and — for a key policy that delegates to
 //!   IAM by naming the account root — the calling principal's identity-based policy;
+//! * which principals an explicit `Deny` in the key's own policy reaches (everyone, the
+//!   account root, the bare account id) and which of the two data-plane actions it denies,
+//!   the account's own published credential included;
+//! * the shapes a request naming BOTH encryption options can take, each refused with the
+//!   same fixed sentence;
 //! * the published bounds of the data key reuse period, and one value past each.
 
 use std::collections::BTreeMap;
@@ -874,7 +879,13 @@ struct GateRow {
     access_key_id: String,
     /// The error code a send must be refused with, or `None` when it must be accepted.
     send_refused_with: Option<&'static str>,
-    /// The error code a receive must be refused with, or `None` when it must be accepted.
+    /// The error code a receive must be refused with, or `None` when it must be served.
+    ///
+    /// `None` covers every row whose SEND is refused: that leaves the queue empty, and a
+    /// receive with nothing to hand over opens no data key, so it asks nothing of the
+    /// queue's key and is the empty success an empty queue is whatever the key says. The
+    /// receive-side refusals are driven, with a message really waiting, by
+    /// [`a_message_waiting_under_a_key_that_stops_serving_it_is_withheld`].
     receive_refused_with: Option<&'static str>,
 }
 
@@ -930,10 +941,17 @@ async fn drive(emulator: &Emulator, prefix: &str, rows: &[GateRow]) {
             None => {
                 assert_eq!(
                     status, 200,
-                    "case {}: the receive had to be accepted, got {status} / {code}",
+                    "case {}: the receive had to be served, got {status} / {code}",
                     row.case
                 );
-                if row.send_refused_with.is_none() {
+                if row.send_refused_with.is_some() {
+                    assert!(
+                        bodies.is_empty(),
+                        "case {}: a queue the refused send left empty must hand nothing \
+                         over, got {bodies:?}",
+                        row.case
+                    );
+                } else {
                     assert_eq!(
                         bodies.as_slice(),
                         &[body.clone()][..],
@@ -949,6 +967,12 @@ async fn drive(emulator: &Emulator, prefix: &str, rows: &[GateRow]) {
 /// A send generates a data key under the queue's KMS key and a receive decrypts one, so
 /// each is refused — with the KMS error of the refusal's class — when the key itself
 /// cannot serve it: it resolves to nothing, or it is in no state to encrypt anything.
+///
+/// Each row's refused send leaves the queue empty, and a receive that hands nothing over
+/// decrypts nothing: it is served whatever the key says, which is why every row here
+/// states a send refusal alone. The same key conditions on the RECEIVE side, with a
+/// message really waiting, are
+/// [`a_message_waiting_under_a_key_that_stops_serving_it_is_withheld`].
 #[tokio::test]
 async fn a_queue_whose_kms_key_cannot_serve_a_call_refuses_it() {
     let emulator = Emulator::new();
@@ -995,35 +1019,35 @@ async fn a_queue_whose_kms_key_cannot_serve_a_call_refuses_it() {
             master_key_id: Some(disabled),
             access_key_id: ACCOUNT_KEY.to_string(),
             send_refused_with: Some("KmsDisabled"),
-            receive_refused_with: Some("KmsDisabled"),
+            receive_refused_with: None,
         },
         GateRow {
             case: "a key awaiting deletion",
             master_key_id: Some(deleting),
             access_key_id: ACCOUNT_KEY.to_string(),
             send_refused_with: Some("KmsInvalidState"),
-            receive_refused_with: Some("KmsInvalidState"),
+            receive_refused_with: None,
         },
         GateRow {
             case: "a key that signs rather than encrypts",
             master_key_id: Some(signing),
             access_key_id: ACCOUNT_KEY.to_string(),
             send_refused_with: Some("KmsInvalidKeyUsage"),
-            receive_refused_with: Some("KmsInvalidKeyUsage"),
+            receive_refused_with: None,
         },
         GateRow {
             case: "a key id no key answers to",
             master_key_id: Some("1234abcd-12ab-34cd-56ef-1234567890ab".to_string()),
             access_key_id: ACCOUNT_KEY.to_string(),
             send_refused_with: Some("KmsNotFound"),
-            receive_refused_with: Some("KmsNotFound"),
+            receive_refused_with: None,
         },
         GateRow {
             case: "an alias no key answers to",
             master_key_id: Some("alias/no-such-key".to_string()),
             access_key_id: ACCOUNT_KEY.to_string(),
             send_refused_with: Some("KmsNotFound"),
-            receive_refused_with: Some("KmsNotFound"),
+            receive_refused_with: None,
         },
         // A KMS ARN whose account segment is not an account id is refused for want of
         // permission before the resource it names is looked up, so neither form of it
@@ -1036,14 +1060,14 @@ async fn a_queue_whose_kms_key_cannot_serve_a_call_refuses_it() {
             )),
             access_key_id: ACCOUNT_KEY.to_string(),
             send_refused_with: Some("KmsAccessDenied"),
-            receive_refused_with: Some("KmsAccessDenied"),
+            receive_refused_with: None,
         },
         GateRow {
             case: "an alias ARN whose account segment is not an account id",
             master_key_id: Some(format!("arn:aws:kms:{REGION}:not-an-account:alias/aws/sqs")),
             access_key_id: ACCOUNT_KEY.to_string(),
             send_refused_with: Some("KmsAccessDenied"),
-            receive_refused_with: Some("KmsAccessDenied"),
+            receive_refused_with: None,
         },
     ];
 
@@ -1085,30 +1109,25 @@ async fn a_queue_key_arn_whose_account_segment_names_no_account_relays_the_denia
             access_key_id: ACCOUNT_KEY.to_string(),
             // Not `KmsNotFound`: the key was never looked up.
             send_refused_with: Some("KmsAccessDenied"),
-            receive_refused_with: Some("KmsAccessDenied"),
+            receive_refused_with: None,
         })
         .collect();
     drive(&emulator, "accountless", &rows).await;
 
     // The relayed sentence is KMS's own for the KMS operation the call performs — a send
-    // generates a data key, a receive decrypts one — naming the identifier the request
-    // carried. Asked of KMS rather than re-worded here, so the two cannot drift apart.
+    // generates a data key — naming the identifier the request carried. Asked of KMS rather
+    // than re-worded here, so the two cannot drift apart. Only the send is driven through
+    // such an identifier: the receive side cannot be, because no message can be put in the
+    // queue under a key identifier that names no account at all.
     let addressed = format!("arn:aws:kms:{REGION}:not-an-account:key/{key_id}");
     let url = emulator
         .queue("accountless-message", &json!({"KmsMasterKeyId": addressed}))
         .await;
-    for (operation, body, kms_operation) in [
-        (
-            "SendMessage",
-            json!({"QueueUrl": url, "MessageBody": "sealed"}),
-            "GenerateDataKey",
-        ),
-        (
-            "ReceiveMessage",
-            json!({"QueueUrl": url, "MaxNumberOfMessages": 1}),
-            "Decrypt",
-        ),
-    ] {
+    for (operation, body, kms_operation) in [(
+        "SendMessage",
+        json!({"QueueUrl": url, "MessageBody": "sealed"}),
+        "GenerateDataKey",
+    )] {
         let (status, refused) = emulator.sqs(ACCOUNT_KEY, operation, &body).await;
         let expected = kms_unauthorized_account_message(kms_operation, &addressed);
         let message = refused
@@ -1257,7 +1276,7 @@ async fn a_queue_on_a_kms_key_serves_each_caller_only_the_calls_its_grants_cover
             master_key_id: Some(neither),
             access_key_id: unprivileged.clone(),
             send_refused_with: Some("KmsAccessDenied"),
-            receive_refused_with: Some("KmsAccessDenied"),
+            receive_refused_with: None,
         },
         GateRow {
             case: "a key policy granting everything and DENYING the decryption",
@@ -1271,7 +1290,7 @@ async fn a_queue_on_a_kms_key_serves_each_caller_only_the_calls_its_grants_cover
             master_key_id: Some(delegating.clone()),
             access_key_id: unprivileged,
             send_refused_with: Some("KmsAccessDenied"),
-            receive_refused_with: Some("KmsAccessDenied"),
+            receive_refused_with: None,
         },
         GateRow {
             case: "a delegating key policy and a principal allowed every KMS action",
@@ -1301,7 +1320,7 @@ async fn a_queue_on_a_kms_key_serves_each_caller_only_the_calls_its_grants_cover
             master_key_id: Some(delegating.clone()),
             access_key_id: on_another_key,
             send_refused_with: Some("KmsAccessDenied"),
-            receive_refused_with: Some("KmsAccessDenied"),
+            receive_refused_with: None,
         },
         GateRow {
             case: "a delegating key policy and a principal whose policy denies the \
@@ -1471,13 +1490,14 @@ async fn a_batch_send_is_gated_on_the_queues_key_as_a_single_send_is() {
 
 /// A queue whose `KmsMasterKeyId` is a KMS ARN whose account segment is not an account id
 /// names no key this endpoint can decide the call against: KMS refuses such an identifier
-/// for want of permission, BEFORE the resource it names is looked up, so both calls the
-/// queue's key gates are refused with the KMS access refusal and nothing is enqueued.
+/// for want of permission, BEFORE the resource it names is looked up, so the send the
+/// queue's key gates is refused with the KMS access refusal and nothing is enqueued — and
+/// the receive, having nothing to hand over, is the empty success an empty queue is.
 ///
 /// The rows differ in the form of the ARN — a key ARN and an alias ARN — and in what
 /// stands where the account id belongs.
 #[tokio::test]
-async fn a_kms_arn_whose_account_segment_is_not_an_account_id_refuses_both_gated_calls() {
+async fn a_kms_arn_whose_account_segment_is_not_an_account_id_refuses_the_send() {
     let emulator = Emulator::new();
     let caller = emulator.assumed_role_key("account-less-arn", None).await;
     // (case, the `KmsMasterKeyId` the queue carries)
@@ -1512,8 +1532,8 @@ async fn a_kms_arn_whose_account_segment_is_not_an_account_id_refuses_both_gated
         let (status, code, bodies) = emulator.receive(&caller, &url).await;
         assert_eq!(
             (status, code.as_str(), bodies.as_slice()),
-            (400, "KmsAccessDenied", &[][..]),
-            "case {case}: the receive had to be refused the same way and hand over nothing"
+            (200, "<no __type>", &[][..]),
+            "case {case}: the receive had nothing to open, so it had to be served empty"
         );
         let reported = emulator.attributes(&url).await;
         assert_eq!(
@@ -1524,5 +1544,512 @@ async fn a_kms_arn_whose_account_segment_is_not_an_account_id_refuses_both_gated
             "case {case}: a refused send must enqueue nothing, got {reported:?}"
         );
     }
+}
+
+/// The sentence Amazon SQS refuses a request naming both server-side encryption options
+/// with. It is entirely FIXED text — the rule itself, with nothing of the request in it —
+/// which is what lets a client tell this `InvalidAttributeName` from the other causes that
+/// share the code.
+const BOTH_SSE_OPTIONS_MESSAGE: &str = "You can use one type of server-side encryption \
+     (SSE) at one time. You can either enable KMS SSE or SQS SSE.";
+
+/// The refusal of a request that asks for both encryption options states the RULE, in the
+/// same fixed sentence whatever the request named: the message carries no attribute name,
+/// no key identifier and no queue name.
+///
+/// The rows differ along everything the request can vary: the form of the KMS key
+/// identifier (a key id, a key ARN, a customer alias, an Amazon Web Services managed
+/// alias), how many other attributes travel beside the pair, and which of the two
+/// operations that take `Attributes` carries it.
+#[tokio::test]
+async fn the_refusal_of_both_encryption_options_states_the_rule_in_fixed_text() {
+    let emulator = Emulator::new();
+    let (key_id, key_arn) = emulator.create_key(json!({})).await;
+    emulator
+        .kms(
+            "CreateAlias",
+            json!({"AliasName": "alias/sse-probe", "TargetKeyId": key_id.clone()}),
+        )
+        .await;
+    // (case, the attributes one request supplies, the values of it that must NOT appear in
+    // the message)
+    let rows: Vec<(&str, Value, Vec<String>)> = vec![
+        (
+            "a bare key id",
+            json!({"KmsMasterKeyId": key_id.clone(), "SqsManagedSseEnabled": "true"}),
+            vec![key_id.clone()],
+        ),
+        (
+            "a key ARN",
+            json!({"KmsMasterKeyId": key_arn.clone(), "SqsManagedSseEnabled": "true"}),
+            vec![key_arn.clone()],
+        ),
+        (
+            "a customer alias",
+            json!({"KmsMasterKeyId": "alias/sse-probe", "SqsManagedSseEnabled": "true"}),
+            vec!["alias/sse-probe".to_string()],
+        ),
+        (
+            "an Amazon Web Services managed alias",
+            json!({"KmsMasterKeyId": "alias/aws/sqs", "SqsManagedSseEnabled": "true"}),
+            vec!["alias/aws/sqs".to_string()],
+        ),
+        (
+            "the pair beside other attributes of the queue",
+            json!({
+                "KmsMasterKeyId": key_arn.clone(),
+                "KmsDataKeyReusePeriodSeconds": "600",
+                "SqsManagedSseEnabled": "true",
+                "VisibilityTimeout": "45",
+            }),
+            vec![key_arn.clone(), "600".to_string(), "45".to_string()],
+        ),
+    ];
+
+    for (index, (case, attributes, absent)) in rows.iter().enumerate() {
+        let name = format!("both-message-{index}");
+        // The same pair at create time and on an existing queue: one helper words the
+        // refusal for both operations, so both must state the same sentence.
+        let existing = emulator.queue(&format!("{name}-target"), &json!({})).await;
+        let calls: Vec<(&str, Value)> = vec![
+            (
+                "CreateQueue",
+                json!({"QueueName": name, "Attributes": attributes}),
+            ),
+            (
+                "SetQueueAttributes",
+                json!({"QueueUrl": existing, "Attributes": attributes}),
+            ),
+        ];
+        for (operation, body) in calls {
+            let (status, refused) = emulator.sqs(ACCOUNT_KEY, operation, &body).await;
+            let message = refused
+                .get("message")
+                .or_else(|| refused.get("Message"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert_eq!(
+                (status, error_code(&refused).as_str(), message),
+                (400, "InvalidAttributeName", BOTH_SSE_OPTIONS_MESSAGE),
+                "case {case} on {operation}: expected a 400 InvalidAttributeName stating \
+                 the rule, got {status} with {refused}"
+            );
+            for value in absent.iter().chain(
+                [
+                    "KmsMasterKeyId".to_string(),
+                    "SqsManagedSseEnabled".to_string(),
+                    name.clone(),
+                ]
+                .iter(),
+            ) {
+                assert!(
+                    !message.contains(value.as_str()),
+                    "case {case} on {operation}: the refusal must state the rule and nothing \
+                     of the request, but {message:?} carries {value:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A key policy granting every KMS action to every principal and denying `denied` to
+/// `principal`, so an explicit deny is what refuses a call rather than the absence of a
+/// grant — and the deny is stated about whichever principal spelling a row names.
+fn key_policy_denying_principal(principal: Value, denied: &[&str]) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "grant",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "kms:*",
+                "Resource": "*",
+            },
+            {
+                "Sid": "refuse",
+                "Effect": "Deny",
+                "Principal": principal,
+                "Action": denied,
+                "Resource": "*",
+            },
+        ],
+    })
+    .to_string()
+}
+
+/// One row of the explicit-deny table: the principal the key's policy denies, the actions
+/// it denies it, and what the two sides of the message plane are then answered for a queue
+/// on that key.
+struct DenyRow {
+    case: &'static str,
+    /// The `Principal` element of the denying statement, in one of the spellings that
+    /// names this caller or the account it belongs to.
+    principal: Value,
+    /// The `Action` element of that statement.
+    denied: Vec<&'static str>,
+    /// The error code a send must be refused with, or `None` when it must be accepted.
+    send_refused_with: Option<&'static str>,
+    /// The error code a receive must be refused with, or `None` when it must be served —
+    /// which a row whose SEND is refused always is, the queue it left empty having no
+    /// message to open ([`GateRow::receive_refused_with`]).
+    receive_refused_with: Option<&'static str>,
+}
+
+/// An explicit `Deny` in a key's own policy overrides every grant and applies to every
+/// principal the statement matches — the account's own credential included, which no grant
+/// and no absence of one exempts from a deny.
+///
+/// The rows differ along what the rule generalises over: the spelling the denying statement
+/// names the principal by (everyone, the account root, the bare account id), which of the
+/// two actions the two sides of the message plane perform is denied, and whether the deny
+/// covers them both.
+#[tokio::test]
+async fn an_explicit_deny_in_a_key_policy_refuses_the_accounts_own_credential() {
+    let emulator = Emulator::new();
+    let account = ::engine::emulator_account_id();
+    let account_root = json!({"AWS": format!("arn:aws:iam::{account}:root")});
+    let rows = [
+        DenyRow {
+            case: "a key whose policy denies nothing, which is the control",
+            principal: json!("*"),
+            denied: vec!["kms:ReEncryptFrom"],
+            send_refused_with: None,
+            receive_refused_with: None,
+        },
+        DenyRow {
+            case: "both data-plane actions denied to every principal",
+            principal: json!("*"),
+            denied: vec!["kms:GenerateDataKey", "kms:Decrypt"],
+            send_refused_with: Some("KmsAccessDenied"),
+            receive_refused_with: None,
+        },
+        DenyRow {
+            case: "only the producer's action denied to every principal",
+            principal: json!("*"),
+            denied: vec!["kms:GenerateDataKey"],
+            send_refused_with: Some("KmsAccessDenied"),
+            receive_refused_with: None,
+        },
+        DenyRow {
+            case: "only the consumer's action denied to every principal",
+            principal: json!("*"),
+            denied: vec!["kms:Decrypt"],
+            send_refused_with: None,
+            receive_refused_with: Some("KmsAccessDenied"),
+        },
+        DenyRow {
+            case: "every KMS action denied to the account root, which covers the account's \
+                   own credential",
+            principal: account_root,
+            denied: vec!["kms:*"],
+            send_refused_with: Some("KmsAccessDenied"),
+            receive_refused_with: None,
+        },
+        DenyRow {
+            case: "both actions denied to the bare account id, the other spelling of that \
+                   account",
+            principal: json!({"AWS": account}),
+            denied: vec!["kms:GenerateDataKey", "kms:Decrypt"],
+            send_refused_with: Some("KmsAccessDenied"),
+            receive_refused_with: None,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let DenyRow {
+            case,
+            principal,
+            denied,
+            send_refused_with: send_refused,
+            receive_refused_with: receive_refused,
+        } = row;
+        let policy = key_policy_denying_principal(principal.clone(), denied);
+        let (_, key_arn) = emulator.create_key(json!({"Policy": policy})).await;
+        let url = emulator
+            .queue(
+                &format!("denied-key-{index}"),
+                &json!({"KmsMasterKeyId": key_arn}),
+            )
+            .await;
+
+        let (status, code) = emulator.send(ACCOUNT_KEY, &url, "sealed").await;
+        match send_refused {
+            Some(expected) => {
+                assert_eq!(
+                    (status, code.as_str()),
+                    (400, *expected),
+                    "case {case}: the send had to be refused {expected}"
+                );
+                let reported = emulator.attributes(&url).await;
+                assert_eq!(
+                    reported
+                        .get("ApproximateNumberOfMessages")
+                        .map(String::as_str),
+                    Some("0"),
+                    "case {case}: a refused send must store nothing, got {reported:?}"
+                );
+            }
+            None => assert_eq!(
+                status, 200,
+                "case {case}: the send had to be accepted, got {status} / {code}"
+            ),
+        }
+
+        let (status, code, bodies) = emulator.receive(ACCOUNT_KEY, &url).await;
+        match receive_refused {
+            Some(expected) => assert_eq!(
+                (status, code.as_str(), bodies.as_slice()),
+                (400, *expected, &[][..]),
+                "case {case}: the receive had to be refused {expected} and hand over nothing"
+            ),
+            None => assert_eq!(
+                status, 200,
+                "case {case}: the receive had to be accepted, got {status} / {code}"
+            ),
+        }
+    }
+}
+
+/// The refusal an explicit deny causes is the KMS error relayed whole — KMS's own sentence
+/// about the principal, the action and the key, with the metadata block an AWS error
+/// carries — and it is read at the instant of the call: taking the deny out of the key's
+/// policy makes the identical send succeed and its body receivable.
+#[tokio::test]
+async fn the_deny_refusal_relays_kms_and_lifts_as_soon_as_the_policy_does() {
+    let emulator = Emulator::new();
+    let (key_id, key_arn) = emulator
+        .create_key(json!({
+            "Policy": key_policy_denying_principal(
+                json!("*"),
+                &["kms:GenerateDataKey", "kms:Decrypt"],
+            ),
+        }))
+        .await;
+    let url = emulator
+        .queue("deny-then-restore", &json!({"KmsMasterKeyId": key_arn}))
+        .await;
+    // The principal the refusal must name is the one STS reports for this credential.
+    let (status, identity) = emulator
+        .query("sts", "2011-06-15", "GetCallerIdentity", &[])
+        .await;
+    assert_eq!(
+        status, 200,
+        "GetCallerIdentity must answer the caller, got {status} {identity}"
+    );
+    let caller = xml_element(&identity, "Arn")
+        .unwrap_or_else(|| panic!("GetCallerIdentity must report an Arn, got {identity}"));
+
+    let (status, refused) = emulator
+        .sqs(
+            ACCOUNT_KEY,
+            "SendMessage",
+            &json!({"QueueUrl": url, "MessageBody": "sealed"}),
+        )
+        .await;
+    let message = refused
+        .get("message")
+        .or_else(|| refused.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        (status, error_code(&refused).as_str()),
+        (400, "KmsAccessDenied"),
+        "the denied send had to be refused as the KMS access refusal, got {refused}"
+    );
+    // Every variable part of the relayed sentence comes from the request and the state: who
+    // asked, what for and on which key. The request id the metadata block ends with is
+    // minted per call, so the block is checked for its fixed parts.
+    for expected in [
+        format!("User: {caller} is not authorized to perform: kms:GenerateDataKey"),
+        format!("on resource: {key_arn}"),
+        "(Service: AWSKMS; Status Code: 400; Error Code: AccessDeniedException; Request ID: "
+            .to_string(),
+    ] {
+        assert!(
+            message.contains(&expected),
+            "case the relayed denial: expected {expected:?} in the message, got {message:?}"
+        );
+    }
+    assert!(
+        message.ends_with("; Proxy: null)"),
+        "case the relayed denial: expected the AWS metadata block to close the message, got \
+         {message:?}"
+    );
+
+    // The deny comes out of the policy: the identical call is served, and what it stored is
+    // handed over.
+    emulator
+        .kms(
+            "PutKeyPolicy",
+            json!({
+                "KeyId": key_id,
+                "PolicyName": "default",
+                "Policy": key_policy_allowing(&["kms:GenerateDataKey", "kms:Decrypt"]),
+            }),
+        )
+        .await;
+    let (status, code) = emulator.send(ACCOUNT_KEY, &url, "sealed").await;
+    assert_eq!(
+        (status, code.as_str()),
+        (200, "<no __type>"),
+        "the send had to be served once the deny was gone"
+    );
+    let (_, _, bodies) = emulator.receive(ACCOUNT_KEY, &url).await;
+    assert_eq!(
+        bodies.as_slice(),
+        &["sealed".to_string()][..],
+        "the body stored under the restored policy had to come over"
+    );
+}
+
+/// One row of the withheld-body table: the KMS call that stops the queue's key serving a
+/// receive, the error that receive must then be refused with, and the calls that put the
+/// key back.
+struct WithheldRow {
+    case: &'static str,
+    /// The access key id the send and the receives are signed with.
+    access_key_id: String,
+    /// The KMS call that stops the key serving the receive: the operation, and the members
+    /// it carries beside the `KeyId`.
+    breaks: (&'static str, Value),
+    /// The calls that put the key back, in order.
+    restores: Vec<(&'static str, Value)>,
+    /// The error code the receive must be refused with while the key is in that state.
+    withheld_with: &'static str,
+}
+
+/// A message already waiting in the queue is what makes a receive ask KMS to decrypt, so a
+/// key that stops serving the decryption withholds that body — with the KMS error of the
+/// refusal's class — and the refusal consumes nothing: the body comes over as soon as the
+/// key serves it again.
+///
+/// The rows differ along WHY the key no longer serves the decryption: its state (disabled,
+/// awaiting deletion) and its policy (the grant withdrawn, an explicit deny added), and for
+/// the deny, whether the caller is a principal the policy decides on documents or the
+/// account's own published credential, which no grant exempts from a deny.
+#[tokio::test]
+async fn a_message_waiting_under_a_key_that_stops_serving_it_is_withheld() {
+    let emulator = Emulator::new();
+    let consumer = emulator.assumed_role_key("withheld-consumer", None).await;
+    let both = key_policy_allowing(&["kms:GenerateDataKey", "kms:Decrypt"]);
+    let rows = [
+        WithheldRow {
+            case: "the key disabled after the body was stored",
+            access_key_id: consumer.clone(),
+            breaks: ("DisableKey", json!({})),
+            restores: vec![("EnableKey", json!({}))],
+            withheld_with: "KmsDisabled",
+        },
+        WithheldRow {
+            case: "the key scheduled for deletion after the body was stored",
+            access_key_id: consumer.clone(),
+            breaks: ("ScheduleKeyDeletion", json!({"PendingWindowInDays": 7})),
+            // Cancelling the deletion leaves the key disabled, so it takes both calls to
+            // put the key back in a state that serves the decryption.
+            restores: vec![("CancelKeyDeletion", json!({})), ("EnableKey", json!({}))],
+            withheld_with: "KmsInvalidState",
+        },
+        WithheldRow {
+            case: "the decrypt grant taken out of the key policy",
+            access_key_id: consumer.clone(),
+            breaks: (
+                "PutKeyPolicy",
+                json!({
+                    "PolicyName": "default",
+                    "Policy": key_policy_allowing(&["kms:GenerateDataKey"]),
+                }),
+            ),
+            restores: vec![(
+                "PutKeyPolicy",
+                json!({"PolicyName": "default", "Policy": both.clone()}),
+            )],
+            withheld_with: "KmsAccessDenied",
+        },
+        WithheldRow {
+            case: "an explicit deny of the decryption added to the key policy",
+            access_key_id: consumer,
+            breaks: (
+                "PutKeyPolicy",
+                json!({
+                    "PolicyName": "default",
+                    "Policy": key_policy_denying("kms:Decrypt"),
+                }),
+            ),
+            restores: vec![(
+                "PutKeyPolicy",
+                json!({"PolicyName": "default", "Policy": both.clone()}),
+            )],
+            withheld_with: "KmsAccessDenied",
+        },
+        WithheldRow {
+            case: "an explicit deny of the decryption, asked for by the account's own \
+                   credential",
+            access_key_id: ACCOUNT_KEY.to_string(),
+            breaks: (
+                "PutKeyPolicy",
+                json!({
+                    "PolicyName": "default",
+                    "Policy": key_policy_denying("kms:Decrypt"),
+                }),
+            ),
+            restores: vec![(
+                "PutKeyPolicy",
+                json!({"PolicyName": "default", "Policy": both.clone()}),
+            )],
+            withheld_with: "KmsAccessDenied",
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let (key_id, key_arn) = emulator.create_key(json!({"Policy": both.clone()})).await;
+        let url = emulator
+            .queue(
+                &format!("withheld-{index}"),
+                &json!({"KmsMasterKeyId": key_arn}),
+            )
+            .await;
+        let body = format!("stored for case {index}");
+        let (status, code) = emulator.send(&row.access_key_id, &url, &body).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (200, "<no __type>"),
+            "case {case}: the send under a key serving both actions had to be accepted"
+        );
+
+        // One call puts the key out of the state the decryption needs.
+        let (operation, members) = &row.breaks;
+        emulator
+            .kms(operation, with_key_id(members, &key_id))
+            .await;
+        let (status, code, bodies) = emulator.receive(&row.access_key_id, &url).await;
+        assert_eq!(
+            (status, code.as_str(), bodies.as_slice()),
+            (400, row.withheld_with, &[][..]),
+            "case {case}: the waiting body had to be withheld as {}",
+            row.withheld_with
+        );
+
+        for (operation, members) in &row.restores {
+            emulator
+                .kms(operation, with_key_id(members, &key_id))
+                .await;
+        }
+        let (status, code, bodies) = emulator.receive(&row.access_key_id, &url).await;
+        assert_eq!(
+            (status, code.as_str(), bodies.as_slice()),
+            (200, "<no __type>", &[body.clone()][..]),
+            "case {case}: the refused receive must not have consumed the body"
+        );
+    }
+}
+
+/// One KMS request: the members a row states, with the key the row acts on named.
+fn with_key_id(members: &Value, key_id: &str) -> Value {
+    let mut request = members.clone();
+    request["KeyId"] = Value::String(key_id.to_string());
+    request
 }
 
