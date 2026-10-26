@@ -145,10 +145,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ///
     /// A REPORTING operation (`@readonly`): it writes nothing and only
     /// materialises the status the CLOCK has already made due, so polling a task
-    /// never moves it. One result item per DISTINCT requested task id, in the
-    /// order the request first names it — a result is per task, so naming one
-    /// task twice does not report it twice. A task id the bundle does not hold,
-    /// and a bundle the store does not hold, are the modelled
+    /// never moves it.
+    ///
+    /// The answer is POSITIONAL: one result item per ENTRY of `taskIdList`, in
+    /// request order, repeats included. The model declares `TaskIdList` a plain
+    /// `list` of `UUID` with `@length(1..50)` and no `@uniqueItems`, so the
+    /// request is a sequence rather than a set and the response is what a caller
+    /// lines its own ids up against — collapsing a repeated id would hand back
+    /// fewer items than ids and break that alignment. A task id the bundle does
+    /// not hold, and a bundle the store does not hold, are the modelled
     /// `ResourceNotFoundException`.
     ///
     /// An id the bundle holds no task for is a MISSING RESOURCE, not a task
@@ -185,12 +190,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One instant for the whole batch, so two tasks that settle at the same
         // instant cannot be reported in two different statuses by one poll.
         let now = ::std::time::SystemTime::now();
-        let mut polled = ::std::collections::HashSet::with_capacity(input.task_id_list.len());
+        // One item per ENTRY, not per distinct id: the requested list is a
+        // sequence the caller lines the answer up against.
         let mut items = Vec::with_capacity(input.task_id_list.len());
         for task_id in &input.task_id_list {
-            if !polled.insert(task_id.as_str()) {
-                continue;
-            }
             let Some(task) = bundle.user_access_tasks.get(task_id) else {
                 return Err(BatchGetUserAccessTasksErrorModeled::ResourceNotFoundException(
                     crate::state::user_access_task_not_found(task_id),
