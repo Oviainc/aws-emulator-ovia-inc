@@ -246,8 +246,9 @@ async fn create_dashboard(router: &MultiServiceRouter, body: Value) -> (u16, Val
     call(router, "POST", DASHBOARDS, Some(body)).await
 }
 
-/// `DescribeDashboard` on `id`.
-async fn describe_dashboard(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+/// `DescribeDashboard` on `id`. Reached by the sibling reporting suite too,
+/// rather than letting it grow a second copy of this request.
+pub(crate) async fn describe_dashboard(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(router, "GET", &format!("{DASHBOARDS}/{id}"), None).await
 }
 

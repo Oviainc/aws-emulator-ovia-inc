@@ -479,3 +479,9 @@ mod asset_model_interface_relationship_delete;
 #[path = "all/list_portals.rs"]
 mod list_portals;
 
+// Declared last, for the same reason the suites above it are: both stretches
+// higher up are where every concurrent iotsitewise change inserts a declaration
+// of its own. Fold it into the sorted list once the churn settles.
+#[path = "all/describe_dashboard_reports.rs"]
+mod describe_dashboard_reports;
+
