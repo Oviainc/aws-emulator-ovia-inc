@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagSyncTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagSyncTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagSyncTasks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one `TagSyncTaskItem` per persisted tag-sync task of the region the request
+//! addressed, in task-ARN order, computed from [`crate::state`]. A page carries at most
+//! `MaxResults` tasks and, when more remain, a `NextToken` the next call resumes after.
+//!
+//! Each `Filters` entry names ONE application group, by its ARN or by its name — each
+//! read as the form its member models, in either the plain or the application-qualified
+//! spelling — and the listing reports the tasks of every group its entries name: entries
+//! are alternatives, because a task belongs to exactly one group, so requiring a task to
+//! satisfy two entries naming different groups could only ever select nothing. A request
+//! carrying no filters reports every task of the region.
+//!
+//! Reporting only: nothing here writes, so a repeated listing answers the same tasks and
+//! a listing never changes what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +171,213 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagSyncTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagSyncTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagSyncTasks"))
+        // Authorization is not emulated: the emulator verifies request signatures
+        // centrally but holds no principals or policies, so the modelled
+        // `ForbiddenException` is deliberately unreachable here and a success says
+        // nothing about the caller's permissions. `ctx` is read below for the region
+        // the request addressed.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagSyncTasksErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the resource-groups store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let filters = input.filters.unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(bad_request(format!(
+                "Filters carries {} filters, which is more than the {MAX_FILTERS} this \
+                 emulator applies in one call",
+                filters.len(),
+            )));
+        }
+        // A filter entry names the application group whose tasks are listed, so an
+        // entry carrying neither of the two ways of naming one narrows the listing to
+        // no group at all; it is refused rather than answered with a listing the
+        // caller did not ask for.
+        if filters
+            .iter()
+            .any(|filter| filter.group_arn.is_none() && filter.group_name.is_none())
+        {
+            return Err(bad_request(
+                "every Filters entry names the application group whose tag-sync tasks \
+                 are listed, in GroupArn or in GroupName",
+            ));
+        }
+
+        // The token is this service's own opaque encoding of the task ARN the
+        // previous page stopped at; anything else cannot name a resume point.
+        let resume_after = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => match crate::state::decode_page_token(LISTING, token) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(bad_request(
+                        "NextToken is not valid: it was not issued by a previous \
+                         ListTagSyncTasks call",
+                    ))
+                }
+            },
+        };
+        let requested_page_size = page_size(input.max_results)?;
+
+        // A task belongs to the region of the group it syncs, and only that region's
+        // callers see it, so this listing enumerates the tasks of the region the
+        // request addressed and no other.
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        // Each entry's identifiers are resolved ONCE here rather than once per task:
+        // resolving reads the stored GROUPS and the scan below walks the stored
+        // TASKS, so the work one call asks for grows with their sum and not with
+        // their product.
+        let selectors: Vec<Vec<(Named, &str, Option<String>)>> = filters
+            .iter()
+            .map(|filter| {
+                [
+                    (Named::Arn, filter.group_arn.as_deref()),
+                    (Named::Name, filter.group_name.as_deref()),
+                ]
+                .into_iter()
+                .filter_map(|(named, identifier)| identifier.map(|value| (named, value)))
+                .map(|(named, identifier)| {
+                    // Each member is read as the form it MODELS: a `GroupArnV2` is
+                    // an ARN and a `GroupName` is a name (which carries no colon),
+                    // so a value shaped like the other form names no group at all
+                    // rather than naming one through the wrong member.
+                    let resolved = match named {
+                        Named::Arn if !identifier.starts_with(ARN_PREFIX) => None,
+                        Named::Name if identifier.contains(':') => None,
+                        _ => store.lookup(&region, identifier).map(|key| key.name),
+                    };
+                    (named, identifier, resolved)
+                })
+                .collect()
+            })
+            .collect();
+
+        let mut matching: Vec<&crate::state::TagSyncTaskRecord> = store
+            .tag_sync_tasks
+            .values()
+            .filter(|task| task.region == region)
+            .filter(|task| {
+                // No filters narrows nothing. One entry can name the group both
+                // ways at once, and both then have to name the task's group, since
+                // both are attributes of the single group that entry selects.
+                selectors.is_empty()
+                    || selectors.iter().any(|selector| {
+                        selector.iter().all(|(named, identifier, resolved)| {
+                            names_group(*named, identifier, resolved.as_deref(), task)
+                        })
+                    })
+            })
+            .collect();
+        // The listing order is task-ARN order, which is what the resume key below is
+        // compared against. The tasks are stored in that order, and sorting here as
+        // well keeps this page correct whatever order it is handed.
+        matching.sort_by(|left, right| left.task_arn.cmp(&right.task_arn));
+        if let Some(resume) = resume_after.as_deref() {
+            matching.retain(|task| task.task_arn.as_str() > resume);
+        }
+        let page_size = requested_page_size.min(matching.len());
+        let page = &matching[..page_size];
+        let next_token = (page.len() < matching.len())
+            .then(|| {
+                page.last()
+                    .map(|task| crate::state::encode_page_token(LISTING, &task.task_arn))
+            })
+            .flatten();
+
+        Ok(ListTagSyncTasksOutput {
+            tag_sync_tasks: Some(page.iter().map(|task| task.to_item()).collect()),
+            next_token,
+        })
     }
 }
+
+/// The listing this operation's pagination tokens belong to: a token issued here
+/// resumes THIS listing and no other.
+const LISTING: &str = "tag-sync-tasks";
+
+/// The largest page the modelled `MaxResults` can ask for (`range 1..50`), and the
+/// page size used when the caller asks for none: the model documents `MaxResults`
+/// as "the maximum number of results to be included in the response" and names no
+/// default, and answering at the modelled maximum bounds the response and keeps
+/// the `NextToken` loop working the same way whether or not `MaxResults` was sent.
+const MAX_RESULTS: usize = 50;
+
+/// The most `Filters` entries this operation applies to one call.
+///
+/// NOT an AWS quota: the modelled `ListTagSyncTasksFilterList` declares no length.
+/// This is the emulator's own bound on the work ONE request can ask for, since
+/// every entry is evaluated against every task of the region; it sits beside the
+/// bound the store already puts on the tasks themselves. Reaching it is a
+/// `BadRequestException`.
+const MAX_FILTERS: usize = 10;
+
+/// What every ARN starts with, and so what tells an ARN from a bare name: the
+/// modelled `GroupArnV2` writes one and the modelled `GroupName` cannot.
+const ARN_PREFIX: &str = "arn:";
+
+/// Which member of a `Filters` entry an identifier arrived in, and so which stored
+/// attribute of a group it names.
+#[derive(Debug, Clone, Copy)]
+enum Named {
+    /// A modelled `GroupArnV2`: the group's ARN.
+    Arn,
+    /// A modelled `GroupName`: the group's name.
+    Name,
+}
+
+/// Whether an identifier one `Filters` entry carries names the application group
+/// of `task`.
+///
+/// An identifier names the attribute of the MEMBER it arrived in — an ARN is not a
+/// name — so it is compared with the task's own stored ARN or its stored name
+/// accordingly, which is what makes a task outlive the group it records: a group
+/// the store no longer holds resolves to nothing. `resolved` is what this service's
+/// one group resolver makes of the identifier in the region the request addressed,
+/// which is how the qualified forms of an application group's identity (its
+/// application ARN and its `<name>/<id>` name) name the group they were minted from.
+fn names_group(
+    named: Named,
+    identifier: &str,
+    resolved: Option<&str>,
+    task: &crate::state::TagSyncTaskRecord,
+) -> bool {
+    let stored = match named {
+        Named::Arn => task.group_arn.as_str(),
+        Named::Name => task.group_name.as_str(),
+    };
+    identifier == stored || resolved == Some(task.group_name.as_str())
+}
+
+/// How many tasks one page carries, from the caller's `MaxResults`.
+///
+/// The framework refuses a value outside the modelled range before this handler
+/// runs; checking it again here keeps the conversion lossless rather than letting
+/// a negative value wrap into "every task".
+fn page_size(max_results: Option<i32>) -> Result<usize, ListTagSyncTasksError> {
+    match max_results {
+        None => Ok(MAX_RESULTS),
+        Some(max) => usize::try_from(max)
+            .ok()
+            .filter(|size| (1..=MAX_RESULTS).contains(size))
+            .ok_or_else(|| {
+                bad_request(format!(
+                    "MaxResults {max} is not valid: it must be between 1 and {MAX_RESULTS}"
+                ))
+            }),
+    }
+}
+
+/// A `BadRequestException` (HTTP 400) — the modelled refusal for a request whose
+/// parameters violate this operation's validation rules.
+fn bad_request(message: impl Into<String>) -> ListTagSyncTasksError {
+    ListTagSyncTasksErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
