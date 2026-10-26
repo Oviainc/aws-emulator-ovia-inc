@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetResourceConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetResourceConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetResourceConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the CURRENT configuration item each requested resource key names, out of the
+//! discovered-resource inventory this service's store holds (`discovered_resources` in
+//! [`crate::state::ComAmazonawsConfigserviceStarlingdoveserviceState`]), for this
+//! account in the Region the request is signed for. Every key the inventory holds no
+//! current configuration item for comes back in `unprocessedResourceKeys`.
+//!
+//! It is a REPORT: it writes nothing, so the inventory a later caller sees is the one
+//! this call saw.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +91,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The fewest and the most resource keys one request may carry
+/// (`BatchGetResourceConfigRequest$resourceKeys` targets `ResourceKeys`, whose
+/// modelled length is 1..100).
+pub const MIN_RESOURCE_KEYS: usize = 1;
+/// See [`MIN_RESOURCE_KEYS`].
+pub const MAX_RESOURCE_KEYS: usize = 100;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,18 +167,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetResourceConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetResourceConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetResourceConfig"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // One batch carries between one and a hundred resource keys. The modelled
+        // length of the list is refused at the request boundary where the boundary
+        // enforces it; the check stands so a batch outside those bounds answers this
+        // operation's own modelled `ValidationException` either way, with a message
+        // BUILT FROM THE REQUEST: the member, the count sent and the bound it missed.
+        let requested = input.resource_keys;
+        if requested.len() < MIN_RESOURCE_KEYS {
+            return Err(refuse(format!(
+                "Value at 'resourceKeys' failed to satisfy constraint: Member must have \
+                 length greater than or equal to {MIN_RESOURCE_KEYS}, and {} resource \
+                 keys were sent",
+                requested.len(),
+            )));
+        }
+        if requested.len() > MAX_RESOURCE_KEYS {
+            return Err(refuse(format!(
+                "Value at 'resourceKeys' failed to satisfy constraint: Member must have \
+                 length less than or equal to {MAX_RESOURCE_KEYS}, and {} resource keys \
+                 were sent",
+                requested.len(),
+            )));
+        }
+
+        // This store stands for ONE account in ONE Region, so a configuration item it
+        // reports belongs to the Region the request is signed for.
+        let region = crate::state::request_region(ctx);
+
+        // Read-only: the guard is taken, the configuration items are projected out of
+        // the inventory, and nothing is written.
+        let store = state.lock();
+
+        // A configuration item is what a CUSTOMER MANAGED configuration recorder
+        // captured, so reporting one needs such a recorder to exist: a service-linked
+        // recorder records for the service it is linked to and does not stand in for
+        // one.
+        if !store.has_customer_managed_recorder() {
+            return Err(
+                BatchGetResourceConfigErrorModeled::NoAvailableConfigurationRecorderException(
+                    NoAvailableConfigurationRecorderException {
+                        message: Some(
+                            crate::state::NO_AVAILABLE_CONFIGURATION_RECORDER_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut items = Vec::new();
+        let mut unprocessed = Vec::new();
+        for key in requested {
+            // Which resource a `(resourceType, resourceId)` pair names, and whether the
+            // inventory holds a current configuration item for it, is the same question
+            // every configuration-item read asks, so it is asked in one place
+            // (`state::current_resource`) for all of them.
+            match store.current_resource(&key.resource_type, &key.resource_id) {
+                Some(entry) => items.push(entry.to_base_configuration_item(
+                    &region,
+                    store.recording_frequency_of(&entry.resource_type),
+                )),
+                // "A list of resource keys that were not processed with the current
+                // response": the inventory holds no current configuration item for this
+                // one, because it holds nothing of the resource or because the resource
+                // was deleted ("The API does not return results for deleted resources").
+                None => unprocessed.push(key),
+            }
+        }
+
+        Ok(BatchGetResourceConfigOutput {
+            base_configuration_items: Some(items),
+            // "If there are no unprocessed resource keys, the response contains an empty
+            // unprocessedResourceKeys list."
+            unprocessed_resource_keys: Some(unprocessed),
+        })
     }
+}
+
+/// Refuse the request with this operation's own modelled `ValidationException` (HTTP
+/// 400), which is what Config answers a batch whose resource key list is outside the
+/// length it accepts.
+fn refuse(message: String) -> BatchGetResourceConfigError {
+    BatchGetResourceConfigErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
 }

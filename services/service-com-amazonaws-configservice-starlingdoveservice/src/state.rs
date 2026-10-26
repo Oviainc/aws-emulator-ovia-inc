@@ -3568,11 +3568,25 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
         if !aggregated {
             return None;
         }
+        self.current_resource(&identifier.resource_type, &identifier.resource_id)
+    }
+
+    /// The CURRENT configuration item this store holds for the resource of type
+    /// `resource_type` with id `resource_id`, where it holds one.
+    ///
+    /// The ONE lookup every configuration-item read uses to turn a `(resourceType,
+    /// resourceId)` pair into the resource's current state, so the batch read, the
+    /// aggregate reads and the history read cannot disagree about what a pair names:
+    /// a resource the inventory does not hold has no current configuration item, and
+    /// neither has one whose deletion the inventory recorded ("The API does not return
+    /// results for deleted resources").
+    pub fn current_resource(
+        &self,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> Option<&DiscoveredResourceEntry> {
         self.discovered_resources
-            .get(&(
-                identifier.resource_type.clone(),
-                identifier.resource_id.clone(),
-            ))
+            .get(&(resource_type.to_string(), resource_id.to_string()))
             .filter(|entry| entry.deleted_at.is_none())
     }
 
