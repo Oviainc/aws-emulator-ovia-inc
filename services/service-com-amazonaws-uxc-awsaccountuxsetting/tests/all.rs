@@ -33,6 +33,8 @@ mod service_catalog;
 mod state_roundtrip;
 #[path = "all/support.rs"]
 mod support;
+#[path = "all/unreadable_body_refusal.rs"]
+mod unreadable_body_refusal;
 #[path = "all/visible_service_catalog_membership.rs"]
 mod visible_service_catalog_membership;
 #[path = "all/visible_services_round_trip.rs"]

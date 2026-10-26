@@ -62,6 +62,15 @@
 //! each modelled operation is served wrapped in it, and the wrapper reads the
 //! HTTP BINDING of the violated member off that operation's own input schema.
 //!
+//! The front door refuses a body it cannot READ on the same terms as one it read
+//! and rejected: a document that is not well-formed JSON, and a member whose JSON
+//! type is not the type the model gives it, never become an input at all, and the
+//! front door that validates a body against the shape will not act on either, so
+//! both earn the same `BadRequestException` answer. Only the request's BODY earns
+//! it: WHICH part of the request the codec could not read is decided by reading
+//! the same request again with no body at all (see [`read_request`]), so a value
+//! bound to the URI keeps the modelled wording.
+//!
 //! The same wrapper is why a URI-bound violation is answered with the MODELLED
 //! `ValidationException` value rather than through the refusal channel: that
 //! channel carries a code and a message only ([`Refused`]), while the modelled
@@ -220,7 +229,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// operation's input schema gives that member, and answers a BODY one with
 /// [`BAD_REQUEST_EXCEPTION`] and a URI-bound one (`@httpLabel`, `@httpQuery`,
 /// `@httpHeader`) with the modelled `ValidationException` naming every refused
-/// member ([`constraint_rejection`]).
+/// member ([`request_rejection`]).
+///
+/// It owns the request the codec could not read for the same reason: a body that
+/// never became an input is one the service will not act on, and placing it needs
+/// the same operation-level reading ([`read_request`]).
 ///
 /// Nothing else is re-implemented. A request this wrapper does not refuse is
 /// handed to the generated `ErasedOperation::run`, which owns deserialize ->
@@ -255,7 +268,7 @@ where
             // The protocol is read, used and dropped inside this one statement:
             // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across
             // the await below would make this future non-`Send`.
-            if let Some(refusal) = constraint_rejection::<O>(svc, req) {
+            if let Some(refusal) = request_rejection::<O>(svc, req) {
                 return refusal;
             }
             // Which body members this request carried as an explicit `null` —
@@ -344,8 +357,8 @@ pub fn sent_as_null(ctx: &OperationContext<'_>, member: &str) -> bool {
 ///
 /// Empty for a request with no body, a body that is not a JSON object, and a body
 /// this operation's input declares no `null` member of — including a body the
-/// codec cannot read, which is refused by the walk that follows rather than
-/// re-judged here.
+/// codec cannot read, which is refused before this is reached
+/// ([`read_request`]) rather than re-judged here.
 fn members_sent_as_null<O: Operation>(req: &RtRequest) -> Vec<String> {
     let Some(bytes) = req.body().bytes() else {
         return Vec::new();
@@ -389,42 +402,121 @@ where
     carried
 }
 
-/// Every modelled constraint `req` breaks, for the operation `O`.
-///
-/// Empty when the request satisfies the model and when it cannot be read into
-/// `O`'s input shape at all — a codec failure is not a constraint violation, so
-/// it is left to the framework's own walk, which refuses it through this
-/// service's refusal wording.
-fn member_violations<O: Operation>(
-    protocol: &dyn ServerHttpProtocol,
-    req: &RtRequest,
-) -> Vec<Violation> {
-    let Ok(mut deserializer) = protocol.deserialize_input(req, O::INPUT_SCHEMA) else {
-        return Vec::new();
-    };
-    let Ok(input) = <O::Input as DeserializableStruct>::deserialize(&mut *deserializer) else {
-        return Vec::new();
-    };
-    drop(deserializer);
-    constraints::validate(&input, O::INPUT_SCHEMA)
+/// What the front door found when it read `req` against `O`'s input schema.
+enum RequestReading {
+    /// The request WAS read into `O`'s input shape, and these are the modelled
+    /// member constraints it breaks — empty when it breaks none.
+    Read(Vec<Violation>),
+    /// The request's BODY is what the codec could not read into that shape,
+    /// carrying the failure the codec reported.
+    UnreadableBody(ProtocolError),
+    /// The codec could not read the request, and taking the body away does not
+    /// change that: what it could not read did not travel in the body, so it is
+    /// left to the framework's own walk, which refuses it through this service's
+    /// refusal wording.
+    UnreadableRequest,
 }
 
-/// How this service answers a request for `O` that breaks a modelled member
-/// constraint, or `None` when it breaks none and the operation should run.
+/// Read `req` into `O`'s input shape with the framework's own machinery — the
+/// protocol's deserializer and the generated `DeserializableStruct` the dispatch
+/// sequence uses — so nothing about the codec or the model is restated here.
+fn read_input<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Result<O::Input, ProtocolError> {
+    let mut deserializer = protocol.deserialize_input(req, O::INPUT_SCHEMA)?;
+    let input = <O::Input as DeserializableStruct>::deserialize(&mut *deserializer)
+        .map_err(ProtocolError::from)?;
+    drop(deserializer);
+    Ok(input)
+}
+
+/// What the front door has to say about `req`, for the operation `O`: the
+/// modelled constraints it breaks, or the fact that its body could not be read
+/// into the input shape at all.
 ///
-/// The two refusals this service words differ only in WHERE the refused value
+/// A body the codec cannot read is one this service will not act on just as much
+/// as a body whose value breaks a declared constraint, so the front door owns it
+/// too. WHICH part of the request the codec could not read is what decides it,
+/// and that is read with the codec rather than guessed: the same request is read
+/// again with NO BODY, and only a request the rest of which reads cleanly on its
+/// own is reported as an unreadable body. An operation that carries no member in
+/// the body validates no body, so a codec failure there is never one of its
+/// ([`reads_a_body`]).
+fn read_request<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> RequestReading {
+    let failure = match read_input::<O>(protocol, req) {
+        Ok(input) => return RequestReading::Read(constraints::validate(&input, O::INPUT_SCHEMA)),
+        Err(failure) => failure,
+    };
+    if !reads_a_body(O::INPUT_SCHEMA) {
+        return RequestReading::UnreadableRequest;
+    }
+    match without_body(req) {
+        Some(stripped) if read_input::<O>(protocol, &stripped).is_ok() => {
+            RequestReading::UnreadableBody(failure)
+        }
+        _ => RequestReading::UnreadableRequest,
+    }
+}
+
+/// Whether `input_schema` carries any member in the request body — the only
+/// operations that have a body to validate at all.
+fn reads_a_body(input_schema: &Schema) -> bool {
+    input_schema
+        .members()
+        .iter()
+        .any(|member| carried_in_the_body(member))
+}
+
+/// `req` with its BODY taken away: the same method, the same request target and
+/// the same headers, carrying no body bytes.
+///
+/// What is left is the half of the request that does NOT travel in the body, so
+/// reading it is how the front door tells a body the codec could not read from a
+/// URI-bound value it could not read. `None` when the request cannot be restated
+/// — its target or method does not parse — which is reported as a failure the
+/// body was not shown to own.
+fn without_body(req: &RtRequest) -> Option<RtRequest> {
+    let mut stripped = RtRequest::new(aws_smithy_types::body::SdkBody::empty());
+    stripped.set_method(req.method()).ok()?;
+    stripped.set_uri(req.uri()).ok()?;
+    for (name, value) in req.headers().iter() {
+        // `append`, not `insert`: a repeated or multi-valued header keeps every
+        // value, so a member bound to one reads exactly what was sent.
+        stripped
+            .headers_mut()
+            .append(name.to_string(), value.to_string());
+    }
+    Some(stripped)
+}
+
+/// How this service answers a request for `O` its front door refuses, or `None`
+/// when it refuses nothing and the operation should run.
+///
+/// The refusals this service words differ only in WHERE what it refused
 /// travelled, which is read off `O`'s own input schema:
 ///
-/// * a member in the request BODY keeps the front door's `BadRequestException`;
+/// * the request BODY — a member whose value breaks a modelled constraint, or a
+///   body the codec could not read into the input shape — keeps the front door's
+///   `BadRequestException`;
 /// * a member bound to the request URI (`@httpQuery`, `@httpLabel`,
 ///   `@httpHeader`) is refused with the modelled `ValidationException`, whose
 ///   `fieldList` names every refused member.
 ///
 /// A request breaking both is a body rejection: the front door refuses a body it
 /// will not read before anything is said about the rest of the request.
-fn constraint_rejection<O: Operation>(svc: &dyn Service, req: &RtRequest) -> Option<RtResponse> {
+fn request_rejection<O: Operation>(svc: &dyn Service, req: &RtRequest) -> Option<RtResponse> {
     let protocol = svc.definition().protocol();
-    let violations = member_violations::<O>(protocol, req);
+    let violations = match read_request::<O>(protocol, req) {
+        RequestReading::Read(violations) => violations,
+        RequestReading::UnreadableBody(failure) => {
+            return Some(front_door_rejection(svc, failure));
+        }
+        RequestReading::UnreadableRequest => return None,
+    };
     if violations.is_empty() {
         return None;
     }
@@ -432,7 +524,7 @@ fn constraint_rejection<O: Operation>(svc: &dyn Service, req: &RtRequest) -> Opt
         .into_iter()
         .partition(|violation| binds_to_body(O::INPUT_SCHEMA, &violation.path));
     if !body.is_empty() {
-        return Some(front_door_rejection(svc, body));
+        return Some(front_door_rejection(svc, ProtocolError::Invalid(body)));
     }
     Some(member_constraint_rejection(svc, protocol, uri))
 }
@@ -474,12 +566,16 @@ fn carried_in_the_body(member: &Schema) -> bool {
 /// The front door's answer to a body it refused: HTTP 400 with the error code
 /// [`BAD_REQUEST_EXCEPTION`], rendered in THIS service's protocol envelope.
 ///
-/// The envelope and the status stay with the framework's refusal channel
-/// (`refusal_response`, which the generated entry renders from the service's
-/// model-derived protocol); only the code and the message are this service's.
-fn front_door_rejection(svc: &dyn Service, refused: Vec<Violation>) -> RtResponse {
+/// `refused` is the failure as the framework stated it — the broken constraints
+/// for a body that was read, the codec's own error for one that could not be —
+/// and it is carried in rather than rebuilt so the status and the envelope stay
+/// with the framework's refusal channel (`refusal_response`, which the generated
+/// entry renders from the service's model-derived protocol). Only the code and
+/// the message are this service's, and they travel together: a client branches on
+/// the code, so one without the other is worse than neither.
+fn front_door_rejection(svc: &dyn Service, refused: ProtocolError) -> RtResponse {
     svc.definition().refusal_response(
-        ProtocolError::Invalid(refused),
+        refused,
         Some(Refused {
             code: BAD_REQUEST_EXCEPTION.to_string(),
             message: INVALID_REQUEST_BODY.to_string(),
@@ -596,11 +692,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
         // service state it. What reaches it here is a refusal `FrontDoor` could
-        // not place against an input member — a request the codec could not read
-        // into the input shape at all — since a violation of a modelled member
-        // constraint is answered by `FrontDoor` before the framework's walk is
-        // reached: a body one with `BadRequestException`, a URI-bound one with the
-        // modelled `ValidationException` and its `fieldList`.
+        // not place in the request BODY — an absent required member, or a value
+        // the codec could not read that did not travel in the body — since a
+        // violation of a modelled member constraint, and a body the codec could
+        // not read, are both answered by `FrontDoor` before the framework's walk
+        // is reached: a body one with `BadRequestException`, a URI-bound one with
+        // the modelled `ValidationException` and its `fieldList`.
         //
         // AWS states it as the `400 ValidationException` envelope the framework
         // already renders — `N validation error(s) detected: Value '<value>' at

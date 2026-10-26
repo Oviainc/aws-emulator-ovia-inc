@@ -54,6 +54,22 @@ pub async fn call(
     let raw = body
         .map(|b| serde_json::to_vec(&b).expect("serialize the request body"))
         .unwrap_or_default();
+    call_bytes(router, method, uri, &raw).await
+}
+
+/// As [`call`], with the request body given as RAW BYTES.
+///
+/// The one way a suite sends a document `serde_json` cannot produce — a body that
+/// is not well-formed JSON — which is a request a client really can send and the
+/// service really has to answer. [`call`] serializes a `Value` and hands the bytes
+/// here, so both forms travel through exactly one request builder.
+pub async fn call_bytes(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    raw: &[u8],
+) -> (u16, String, Value) {
+    let raw = raw.to_vec();
     let request = http::Request::builder()
         .method(method)
         .uri(uri)
@@ -94,6 +110,16 @@ pub async fn update_customizations(
     body: Value,
 ) -> (u16, String, Value) {
     call(router, "PATCH", "/v1/account-customizations", Some(body)).await
+}
+
+/// `UpdateAccountCustomizations` with the body given as RAW BYTES
+/// ([`call_bytes`]): how a suite sends this operation a document that is not
+/// well-formed JSON.
+pub async fn update_customizations_bytes(
+    router: &MultiServiceRouter,
+    raw: &[u8],
+) -> (u16, String, Value) {
+    call_bytes(router, "PATCH", "/v1/account-customizations", raw).await
 }
 
 /// The `ListServices` request URI for one page request.
