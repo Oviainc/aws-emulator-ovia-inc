@@ -57,6 +57,8 @@ mod explicit_auth_flows;
 mod forgot_password_caller_identity;
 #[path = "all/get_identity_provider_by_identifier.rs"]
 mod get_identity_provider_by_identifier;
+#[path = "all/get_tokens_from_refresh_token.rs"]
+mod get_tokens_from_refresh_token;
 #[path = "all/get_user.rs"]
 mod get_user;
 #[path = "all/get_user_auth_factors.rs"]

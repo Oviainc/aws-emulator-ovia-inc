@@ -744,6 +744,7 @@ async fn an_access_token_that_names_no_signed_in_user_is_refused() {
                 issued_at: now - Duration::from_secs(60),
                 expires_at,
                 revoked: false,
+                rotated_out_at: None,
             }
         };
         let live = now + Duration::from_secs(3_600);

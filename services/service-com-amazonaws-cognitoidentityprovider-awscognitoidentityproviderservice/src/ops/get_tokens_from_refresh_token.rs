@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTokensFromRefreshToken
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTokensFromRefreshToken`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Exchanges a refresh token this emulator issued for fresh tokens of the user that
+//! token was issued to (this operation is `@optionalAuth`): the app client's `ClientId`
+//! names the user pool, since this operation models no `UserPoolId`, and every refusal
+//! is read off the stored token record, the stored app client and the stored user.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTokensFromRefreshToken::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An app client that rotates refresh tokens issues a new refresh token beside the new
+//! id and access tokens and invalidates the submitted one when its retry grace period
+//! runs out; one that does not rotate them issues the id and access tokens only and
+//! leaves the submitted refresh token in force. A refresh token rotation has already
+//! invalidated is answered with `RefreshTokenReuseException`.
+//!
+//! On a user pool that remembers devices the request has to present the key of a device
+//! `ConfirmDevice` has confirmed for the token's user.
 //!
 //! ## Shape of an operation
 //!
@@ -199,18 +203,198 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTokensFromRefreshToken` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTokensFromRefreshTokenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTokensFromRefreshToken"))
+        // Request metadata only: the app client in the body names the pool, and
+        // `ClientMetadata` is input for the Lambda triggers this action would invoke,
+        // which this emulator invokes none of.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+
+        // Everything the refresh is decided by is read first, under the one lock, so
+        // nothing is minted for a request a later check refuses.
+        let Refresh {
+            user_pool_id,
+            username,
+            rotation_grace,
+        } = resolve(&guard, &input, now)?;
+
+        // "This operation issues a new refresh token and invalidates the original
+        // refresh token after an optional grace period when refresh token rotation is
+        // enabled. If refresh token rotation is disabled, issues new ID and access
+        // tokens only." (this operation's own doc.)
+        let authentication_result = match rotation_grace {
+            Some(grace) => {
+                // The submitted token is rotated out BEFORE the new triple is minted:
+                // minting sweeps and evicts token records, so a record marked after it
+                // could be a record that is no longer there, leaving the rotated-out
+                // token still usable.
+                let invalid_from = now.checked_add(grace).ok_or_else(internal_error)?;
+                guard.rotate_out_refresh_token(&input.refresh_token, invalid_from);
+                guard
+                    .issue_tokens(&user_pool_id, &input.client_id, &username, now)
+                    .ok_or_else(internal_error)?
+            }
+            None => guard
+                .refresh_tokens(&user_pool_id, &input.client_id, &username, now)
+                .ok_or_else(internal_error)?,
+        };
+
+        Ok(GetTokensFromRefreshTokenOutput {
+            authentication_result: Some(authentication_result),
+        })
     }
+}
+
+/// This service's state, as the handler holds it under the lock.
+type State =
+    crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState;
+
+/// What the stored state decided this request is: whose tokens are minted, and the
+/// grace period rotation leaves the submitted refresh token valid for, or `None` when
+/// the app client does not rotate refresh tokens.
+struct Refresh {
+    user_pool_id: String,
+    username: String,
+    rotation_grace: Option<::std::time::Duration>,
+}
+
+/// Resolve the request against stored state: the app client, its secret, the submitted
+/// refresh token, the user that token was issued to, and the device the pool requires.
+///
+/// A PURE read — every refusal this operation owes is decided here, before anything is
+/// written.
+fn resolve(
+    state: &State,
+    input: &GetTokensFromRefreshTokenInput,
+    now: ::std::time::SystemTime,
+) -> Result<Refresh, GetTokensFromRefreshTokenError> {
+    // This operation models no `UserPoolId`: the app client the request names is what
+    // resolves the pool whose user is signed in again.
+    let pool = state
+        .pool_of_client(&input.client_id)
+        .ok_or_else(|| client_not_found(&input.client_id))?;
+    let user_pool_id = pool.id.clone();
+    let client = pool
+        .clients
+        .get(&input.client_id)
+        .ok_or_else(|| client_not_found(&input.client_id))?;
+
+    // "`ClientSecret`: The client secret of the requested app client, if the client has
+    // a secret" (this operation's own doc), so a request to a client that holds one
+    // proves it holds that secret and nothing else is authorized to refresh its tokens.
+    if !client.accepts_client_secret(input.client_secret.as_deref()) {
+        return Err(not_authorized("Invalid client secret."));
+    }
+
+    // The app client's `ExplicitAuthFlows` are deliberately not consulted: they are
+    // the flows `InitiateAuth` admits for its `AuthFlow` member, and this operation
+    // models no `AuthFlow` and documents no such gate — the refresh token itself is
+    // what authorizes this request.
+    //
+    // "A valid refresh token that can authorize the request for new tokens"
+    // (`RefreshToken`): valid is read off the record this emulator wrote when it issued
+    // the token — a refresh token, of the app client the request names, not revoked and
+    // not past its expiry.
+    let record = state
+        .token(&input.refresh_token)
+        .filter(|record| {
+            record.kind == crate::state::TokenKind::Refresh
+                && !record.revoked
+                && record.expires_at > now
+                && record.client_id == input.client_id
+                && record.user_pool_id == user_pool_id
+        })
+        .ok_or_else(invalid_refresh_token)?;
+    // A token an earlier rotation replaced is answered as the reuse it is, for as long
+    // as the record of it lives: `RefreshTokenReuseException` is "throw when your
+    // application requests token refresh with a refresh token that has been invalidated
+    // by refresh-token rotation" (this service's model).
+    if record.rotated_out_by(now) {
+        return Err(refresh_token_reuse());
+    }
+
+    // The record is only a pointer into the pool: the user it names may have been
+    // disabled, reset or deleted since the token was issued — and a user created later
+    // under that name carries a different id, so it is not the user this token was
+    // issued to.
+    let user = state
+        .pool(&user_pool_id)
+        .and_then(|pool| pool.user(&record.username))
+        .filter(|user| user.sub == record.sub)
+        .ok_or_else(invalid_refresh_token)?;
+    if !user.enabled {
+        return Err(not_authorized("User is disabled."));
+    }
+    match user.status {
+        crate::state::UserStatus::ResetRequired => {
+            return Err(not_authorized("Password reset required for the user."));
+        }
+        crate::state::UserStatus::Unconfirmed => {
+            return Err(not_authorized("User is not confirmed."));
+        }
+        _ => {}
+    }
+
+    // "You must provide the confirmed device key in this request if device remembering
+    // is enabled in your user pool" (`DeviceKey`), so on such a pool the request is
+    // authorized by the key of a device `ConfirmDevice` has confirmed for this user,
+    // and by nothing else — a request that presents none, a device nothing confirmed,
+    // or a key this user holds no device for is not. A pool that remembers no devices
+    // has no device to authenticate, so the member is nothing to check against there.
+    if pool.remembers_devices()
+        && input
+            .device_key
+            .as_deref()
+            .is_none_or(|device_key| user.confirmed_device(device_key).is_none())
+    {
+        return Err(invalid_refresh_token());
+    }
+
+    Ok(Refresh {
+        user_pool_id,
+        username: user.username.clone(),
+        rotation_grace: client.refresh_token_rotation_grace(),
+    })
+}
+
+/// This operation's `ResourceNotFoundException` for a `ClientId` no stored pool holds.
+fn client_not_found(client_id: &str) -> GetTokensFromRefreshTokenError {
+    GetTokensFromRefreshTokenErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool client {client_id} does not exist.")),
+    })
+    .into()
+}
+
+/// The refusal for a `RefreshToken` this emulator cannot resolve to a live refresh token
+/// of the app client the request names, or that the request is not authorized to use.
+fn invalid_refresh_token() -> GetTokensFromRefreshTokenError {
+    not_authorized("Invalid Refresh Token.")
+}
+
+/// This operation's `NotAuthorizedException`, carrying `message`.
+fn not_authorized(message: &str) -> GetTokensFromRefreshTokenError {
+    GetTokensFromRefreshTokenErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `RefreshTokenReuseException` for a refresh token an earlier rotation
+/// already invalidated.
+fn refresh_token_reuse() -> GetTokensFromRefreshTokenError {
+    GetTokensFromRefreshTokenErrorModeled::RefreshTokenReuseException(RefreshTokenReuseException {
+        message: Some("Refresh token has been invalidated by refresh token rotation.".to_string()),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> GetTokensFromRefreshTokenError {
+    GetTokensFromRefreshTokenErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

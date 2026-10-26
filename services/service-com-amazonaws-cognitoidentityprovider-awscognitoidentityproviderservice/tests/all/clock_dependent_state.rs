@@ -521,6 +521,7 @@ async fn issuing_tokens_sweeps_the_records_the_clock_expired() {
             issued_at: now - Duration::from_secs(7200),
             expires_at,
             revoked: false,
+            rotated_out_at: None,
         };
         guard.issued_tokens.insert(
             "planted-expired".to_string(),

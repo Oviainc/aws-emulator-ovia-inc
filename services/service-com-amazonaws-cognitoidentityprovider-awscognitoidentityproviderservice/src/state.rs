@@ -152,6 +152,12 @@ const DEFAULT_USER_POOL_TIER: &str = "ESSENTIALS";
 /// [`crate::ops::types::USER_POOL_TIER_TYPE_VALUES`].
 pub const PLUS_USER_POOL_TIER: &str = "PLUS";
 
+/// `FeatureType`'s value for a setting that is switched on, which
+/// `RefreshTokenRotationType.Feature` carries for an app client that rotates its
+/// refresh tokens; its only other value is the one for a setting that is not
+/// (`crate::ops::types::FEATURE_TYPE_VALUES`).
+const FEATURE_ENABLED: &str = "ENABLED";
+
 /// `UserPoolMfaType` is `OFF` for a pool that configures no MFA
 /// (`MfaConfiguration`: "Sets multi-factor authentication (MFA) to be on, off, or
 /// optional" in this service's model). It is also the mode in which no MFA factor
@@ -698,6 +704,26 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         self.issued_tokens.get(token)
     }
 
+    /// Record that the refresh token `token` stops authorizing a token refresh at
+    /// `invalid_from`, because a refresh with rotation enabled replaced it.
+    ///
+    /// `RefreshTokenRotationType.RetryGracePeriodSeconds`: "the original refresh
+    /// token that you're rotating out can remain valid for a period of time of up
+    /// to 60 seconds. This allows for client-side retries. When
+    /// `RetryGracePeriodSeconds` is `0`, the grace period is disabled and a
+    /// successful request immediately invalidates the submitted refresh token"
+    /// (this service's model). A token already rotated out keeps the EARLIEST
+    /// instant it was invalidated from, so retrying inside the grace period
+    /// cannot push that window further out.
+    pub fn rotate_out_refresh_token(&mut self, token: &str, invalid_from: SystemTime) {
+        if let Some(record) = self.issued_tokens.get_mut(token) {
+            record.rotated_out_at = Some(match record.rotated_out_at {
+                Some(already) => already.min(invalid_from),
+                None => invalid_from,
+            });
+        }
+    }
+
     /// The stored pool and user that an ACCESS token identifies as the currently
     /// signed-in user, as of `now`.
     ///
@@ -953,6 +979,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
                     issued_at: now,
                     expires_at,
                     revoked: false,
+                    rotated_out_at: None,
                 },
             ));
         }
@@ -2323,6 +2350,54 @@ impl UserPoolClient {
             &tag,
         )
         .is_ok()
+    }
+
+    /// Whether `presented` is the `ClientSecret` this app client requires a request
+    /// to carry.
+    ///
+    /// `ClientSecret` is "the client secret of the requested app client, if the
+    /// client has a secret" (this service's model), so a client that holds NO
+    /// secret has nothing for a request to present and every request to it is
+    /// accepted, while one that holds a secret accepts only that value — a request
+    /// that carries none, or another client's secret, proves nothing about holding
+    /// it. The comparison is a constant-time one, so a rejected secret tells a
+    /// caller nothing about how much of it was right.
+    pub fn accepts_client_secret(&self, presented: Option<&str>) -> bool {
+        let Some(secret) = self.client_secret.as_deref() else {
+            return true;
+        };
+        presented.is_some_and(|presented| {
+            bool::from(::subtle::ConstantTimeEq::ct_eq(
+                presented.as_bytes(),
+                secret.as_bytes(),
+            ))
+        })
+    }
+
+    /// How long a refresh token this client rotates out stays valid for retries, or
+    /// `None` when this client does not rotate refresh tokens at all.
+    ///
+    /// `RefreshTokenRotationType` is "the configuration of your app client for
+    /// refresh token rotation. When enabled, your app client issues new ID, access,
+    /// and refresh tokens when users renew their sessions with refresh tokens. When
+    /// disabled, token refresh issues only ID and access tokens", and
+    /// `RetryGracePeriodSeconds` "is `0`" means "the grace period is disabled and a
+    /// successful request immediately invalidates the submitted refresh token"
+    /// (this service's model). A client that stores no rotation configuration, and
+    /// one whose `Feature` is not switched on, rotates nothing; one that rotates
+    /// and asked for no grace period gets none. The modelled range of
+    /// `RetryGracePeriodSeconds` starts at 0, so the boundary validator has already
+    /// refused a negative value before any handler reads one.
+    pub fn refresh_token_rotation_grace(&self) -> Option<Duration> {
+        let rotation = self.refresh_token_rotation.as_ref()?;
+        if rotation.feature != FEATURE_ENABLED {
+            return None;
+        }
+        let seconds = rotation
+            .retry_grace_period_seconds
+            .and_then(|seconds| u64::try_from(seconds).ok())
+            .unwrap_or_default();
+        Some(Duration::from_secs(seconds))
     }
 
     /// The access token lifetime this client issues.
@@ -4095,6 +4170,21 @@ pub struct TokenRecord {
     pub issued_at: SystemTime,
     pub expires_at: SystemTime,
     pub revoked: bool,
+    /// When refresh token rotation stops this REFRESH token authorizing a token
+    /// refresh, once a rotation has replaced it; `None` for a token no rotation
+    /// has replaced. Recorded rather than deleted, so a refresh with the
+    /// replaced token is answered as the reuse it is
+    /// ([`ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::rotate_out_refresh_token`]).
+    pub rotated_out_at: Option<SystemTime>,
+}
+
+impl TokenRecord {
+    /// Whether refresh token rotation has already invalidated this token as of
+    /// `now`: a rotation recorded the instant it stops being accepted, and up to
+    /// that instant it still authorizes a retry.
+    pub fn rotated_out_by(&self, now: SystemTime) -> bool {
+        self.rotated_out_at.is_some_and(|invalid_from| now >= invalid_from)
+    }
 }
 
 /// A passkey registration in flight: what `StartWebAuthnRegistration` handed out

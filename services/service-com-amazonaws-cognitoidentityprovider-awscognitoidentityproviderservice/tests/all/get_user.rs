@@ -717,6 +717,7 @@ async fn get_user_refuses_a_token_that_names_no_signed_in_user() {
                     issued_at: now - Duration::from_secs(60),
                     expires_at,
                     revoked,
+                    rotated_out_at: None,
                 }
             };
         let live = now + Duration::from_secs(3_600);

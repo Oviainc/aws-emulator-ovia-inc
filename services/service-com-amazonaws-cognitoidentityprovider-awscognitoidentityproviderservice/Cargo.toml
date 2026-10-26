@@ -33,6 +33,11 @@ tracing = { workspace = true }
 ring = "0.17"
 # SHA-256 for the RFC 7638 JWK thumbprint used as the key's `kid`.
 sha2 = { workspace = true }
+# Constant-time byte comparison, for checking a presented app client secret
+# against the stored one without leaking how much of it matched. `ring`'s own
+# `constant_time::verify_slices_are_equal` is deprecated, which this
+# workspace's `-D warnings` build rejects.
+subtle = "2.6"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
