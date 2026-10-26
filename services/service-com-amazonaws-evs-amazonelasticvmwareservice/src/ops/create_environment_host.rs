@@ -418,9 +418,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let host_wire = host.to_wire();
         environment.hosts.insert(input.host.host_name.clone(), host);
         let host = host_wire;
-        // Adding a host changes the environment, so the record is re-stamped and the
-        // summary this operation answers with reports that.
-        environment.modified_at_ms = created_at_ms;
+        // Adding a host changes the environment's host inventory, which is part of the
+        // environment, so the record is re-stamped and the summary this operation
+        // answers with reports that — exactly as removing one does.
+        environment.note_child_change(created_at_ms);
         state.note_transition_due(due_at);
         // The new host is part of what the environment's health checks read (the host
         // count, and the cores a license has to cover), so they are recomputed before

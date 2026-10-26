@@ -48,6 +48,8 @@ mod eip_release_on_environment_deletion;
 mod entitlement_connector;
 #[path = "all/entitlements.rs"]
 mod entitlements;
+#[path = "all/environment_child_change_stamps.rs"]
+mod environment_child_change_stamps;
 #[path = "all/environment_deletion_cascade.rs"]
 mod environment_deletion_cascade;
 #[path = "all/environment_deletion_hosts.rs"]

@@ -320,6 +320,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
         };
+        // Creating a connector changes the environment's connector inventory, which is
+        // part of the environment: the record is re-stamped, as removing one re-stamps
+        // it. The idempotent repeat above returns before here, having changed nothing.
+        environment.note_child_change(created_at_ms);
         state.note_transition_due(due_at);
 
         Ok(CreateEnvironmentConnectorOutput {

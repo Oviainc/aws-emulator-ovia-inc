@@ -309,6 +309,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             entitlements.push(entitlement.to_wire(&environment_id));
         }
         if minted {
+            // Creating an entitlement changes the entitlements the environment holds,
+            // which are part of the environment, so the record is re-stamped — as
+            // deleting one re-stamps it. A call that minted nothing changes nothing.
+            environment.note_child_change(created_at_ms);
             state.note_transition_due(due_at);
         }
 

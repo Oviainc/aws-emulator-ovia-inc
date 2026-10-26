@@ -17,6 +17,11 @@
 //! ([`crate::state::StoredEnvironment::live_hosts`]), and its DNS hostname and its
 //! management address are free for the next host.
 //!
+//! The host inventory is part of the environment, so removing a host MODIFIES the
+//! environment as adding one does: the environment record is re-stamped
+//! ([`crate::state::StoredEnvironment::note_child_change`]) and the `environmentSummary`
+//! this operation answers with reports the new `modifiedAt`.
+//!
 //! An Amazon EVS host IS an EC2 bare metal instance — "An ESX host that runs on an
 //! Amazon EC2 bare metal instance" (`Host` doc) — so the delete also TERMINATES that
 //! instance in the account's own Amazon EC2 store
@@ -209,6 +214,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(denied);
         }
+        // One instant for everything this call changes, so the host record and the
+        // environment that holds it are stamped with the same `modifiedAt`.
+        let modified_at_ms = crate::state::now_ms();
 
         let mut state = state.lock();
         // Reporting only: this materialises the state changes the clock already owed,
@@ -254,12 +262,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let pending = crate::state::PendingStatus::starting_now(crate::state::HOST_DELETED);
             due_at = Some(pending.due_at);
             host.state = crate::state::HOST_DELETING.to_string();
-            host.modified_at_ms = crate::state::now_ms();
+            host.modified_at_ms = modified_at_ms;
             host.pending = Some(pending);
             terminated_instance = host.ec2.as_ref().map(|ec2| ec2.instance_id.clone());
         }
         let deleted = host.to_wire();
         if let Some(due_at) = due_at {
+            // Removing a host changes the environment's host inventory, which is part of
+            // the environment, so the record is re-stamped and the summary this
+            // operation answers with reports that — exactly as adding one does.
+            environment.note_child_change(modified_at_ms);
             // The records this environment is finished with are kept so a later read
             // still reports the deletion, up to the cap this bounds them by.
             environment.purge_finished_hosts();
@@ -268,9 +280,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The environment's health checks read its hosts — the host count, and the cores
         // a license has to cover — so they are recomputed before the summary is built.
         state.recompute_environment_checks();
-        // The host was deleted FROM this environment, and the summary reports the
-        // environment as it stands: deleting a child resource of it is no modification of
-        // the environment itself, so its own `modifiedAt` does not move.
+        // The environment the host was deleted FROM, as it stands after the delete.
         let environment_summary = state
             .environment_in_region(&region, &input.environment_id)
             .map(|environment| environment.to_summary())

@@ -217,6 +217,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let requested_secret_arn = input.secret_identifier.as_deref().map(|secret_identifier| {
             crate::state::secret_resources::resolve_secret_arn(&region, secret_identifier)
         });
+        // One instant for everything this call changes, so the connector record and the
+        // environment that holds it are stamped with the same `modifiedAt`.
+        let modified_at_ms = crate::state::now_ms();
 
         let mut state = state.lock();
         // Reporting only: this materialises the state changes the clock already owed,
@@ -301,7 +304,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let pending =
                 crate::state::PendingConnectorState::starting_now(crate::state::CONNECTOR_ACTIVE);
             connector.state = crate::state::CONNECTOR_UPDATING.to_string();
-            connector.modified_at_ms = crate::state::now_ms();
+            connector.modified_at_ms = modified_at_ms;
             let due_at = pending.due_at;
             connector.pending = Some(pending);
             Some(due_at)
@@ -310,6 +313,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let updated = connector.to_wire(&environment_id);
         if let Some(due_at) = due_at {
+            // Reconfiguring a connector changes a record the environment holds, which is
+            // part of the environment, so the environment is re-stamped too — as adding
+            // and removing a child record re-stamp it. An update that changed nothing
+            // moves neither stamp.
+            environment.note_child_change(modified_at_ms);
             state.note_transition_due(due_at);
         }
 

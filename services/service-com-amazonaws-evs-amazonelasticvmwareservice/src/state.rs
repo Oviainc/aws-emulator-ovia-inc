@@ -1551,6 +1551,25 @@ impl StoredEnvironment {
             .count()
     }
 
+    /// Re-stamp this environment because one of the records it HOLDS — a host, a
+    /// connector, an entitlement, or the Elastic IP associations of one of its VLANs —
+    /// was added, reconfigured or removed at `at_ms`.
+    ///
+    /// "The date and time that the environment was modified" (`Environment$modifiedAt`):
+    /// the child records are part of the environment, so every accepted mutation of one
+    /// is a modification of the environment itself, whichever direction it goes in —
+    /// adding and removing move the stamp alike. A call that changes nothing (an
+    /// idempotent repeat, or a refused request) must not reach here, which is why each
+    /// caller guards it on having really changed something.
+    ///
+    /// The stamp never goes backwards: a change is dated at the later of the instant it
+    /// happened and the instant the record already carried, so a transition the clock
+    /// owed at a future instant ([`Self::materialise_due_transition`]) is not undone by a
+    /// child change evaluated before it comes due.
+    pub fn note_child_change(&mut self, at_ms: i64) {
+        self.modified_at_ms = self.modified_at_ms.max(at_ms);
+    }
+
     /// Drop the oldest host records this environment is FINISHED with, until it holds no
     /// more than [`MAX_HOSTS_PER_ENVIRONMENT`].
     ///

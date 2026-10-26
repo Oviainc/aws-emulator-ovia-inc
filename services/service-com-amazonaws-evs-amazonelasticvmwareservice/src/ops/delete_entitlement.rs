@@ -276,6 +276,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 deleted.push(entitlement.stopped(stopped_at_ms).to_wire(&environment_id));
             }
         }
+        if !deleted.is_empty() {
+            // Removing an entitlement changes the entitlements the environment holds,
+            // which are part of the environment, so the record is re-stamped — as
+            // creating one re-stamps it. A call that removed nothing changes nothing.
+            environment.note_child_change(stopped_at_ms);
+        }
 
         Ok(DeleteEntitlementOutput {
             entitlements: Some(deleted),

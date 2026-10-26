@@ -283,7 +283,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let vlan = vlan.to_wire();
         if removed {
-            environment.modified_at_ms = modified_at_ms;
+            environment.note_child_change(modified_at_ms);
         }
         // The EC2 store is written while this service's lock is held, the same order
         // `CreateEnvironment` and `DeleteEnvironment` take the two locks in.

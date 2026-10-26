@@ -445,7 +445,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         vlan.to_wire()
                     });
                 if wire.is_some() && !already_associated {
-                    environment.modified_at_ms = modified_at_ms;
+                    environment.note_child_change(modified_at_ms);
                 }
                 wire
             }

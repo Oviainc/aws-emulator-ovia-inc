@@ -207,6 +207,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(denied);
         }
+        // One instant for everything this call changes, so the connector record and the
+        // environment that holds it are stamped with the same `modifiedAt`.
+        let modified_at_ms = crate::state::now_ms();
 
         let mut state = state.lock();
         // Reporting only: this materialises the state changes the clock already owed,
@@ -284,20 +287,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::PendingConnectorState::starting_now(crate::state::CONNECTOR_DELETED);
             let due_at = pending.due_at;
             connector.state = crate::state::CONNECTOR_DELETING.to_string();
-            connector.modified_at_ms = crate::state::now_ms();
+            connector.modified_at_ms = modified_at_ms;
             connector.pending = Some(pending);
             Some(due_at)
         };
         let deleted = connector.to_wire(&environment_id);
         if let Some(due_at) = due_at {
+            // Removing a connector changes the environment's connector inventory, which
+            // is part of the environment, so the record is re-stamped and the summary
+            // this operation answers with reports that — as creating one does.
+            environment.note_child_change(modified_at_ms);
             // The records this environment is finished with are kept so a later read
             // still reports the deletion, up to the cap this bounds them by.
             environment.purge_finished_connectors();
             state.note_transition_due(due_at);
         }
-        // The connector was deleted FROM this environment, and the summary reports the
-        // environment as it stands: deleting a child resource of it is no modification
-        // of the environment itself, so its own `modifiedAt` does not move.
+        // The environment the connector was deleted FROM, as it stands after the delete.
         let environment_summary = state
             .environment_in_region(&region, &input.environment_id)
             .map(|environment| environment.to_summary())
