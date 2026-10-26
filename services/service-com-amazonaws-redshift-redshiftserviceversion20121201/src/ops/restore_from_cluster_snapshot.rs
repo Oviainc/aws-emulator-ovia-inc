@@ -509,21 +509,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        if let Some(application_arn) = input.redshift_idc_application_arn.as_deref() {
+
+        let mut store = state.lock();
+        store.settle(started);
+
+        // The same precondition every operation taking a
+        // `RedshiftIdcApplicationArn` enforces: the ARN must name an application
+        // the account created. Until `CreateRedshiftIdcApplication` existed the
+        // store could hold none, so every such ARN was refused; now the refusal
+        // is decided on the store.
+        if let Some(application_arn) = input
+            .redshift_idc_application_arn
+            .as_deref()
+            .filter(|arn| store.redshift_idc_application_position(arn).is_none())
+        {
             return Err(
                 RestoreFromClusterSnapshotErrorModeled::RedshiftIdcApplicationNotExistsFault(
                     RedshiftIdcApplicationNotExistsFault {
-                        message: Some(format!(
-                            "The Redshift IDC application {application_arn} doesn't exist."
-                        )),
+                        message: Some(st::redshift_idc_application_not_exists(application_arn)),
                     },
                 )
                 .into(),
             );
         }
-
-        let mut store = state.lock();
-        store.settle(started);
 
         let Some(stored) = store
             .snapshot_located(snapshot_identifier, snapshot_arn)
