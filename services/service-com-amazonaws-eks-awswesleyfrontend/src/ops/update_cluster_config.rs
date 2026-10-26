@@ -146,7 +146,8 @@ use std::time::SystemTime;
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    self, ClusterRecord, PendingClusterConfig, UpdateRecord, AUTHENTICATION_MODE_LADDER,
+    self, ClusterRecord, PendingClusterConfig, UpdateRecord, UpdateScope,
+    AUTHENTICATION_MODE_LADDER,
     CONTROL_PLANE_EGRESS_AWS_MANAGED, CONTROL_PLANE_EGRESS_CUSTOMER_ROUTED, STATUS_ACTIVE,
     STATUS_UPDATING, UPDATE_COMPLETION_DELAY, UPDATE_IN_PROGRESS,
     UPDATE_PARAM_AUTHENTICATION_MODE, UPDATE_PARAM_CLUSTER_LOGGING, UPDATE_PARAM_COMPUTE_CONFIG,
@@ -397,6 +398,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // update": none has been, so `CancelUpdate` is the only writer of either.
             cancellation: None,
             cancellation_request_token: None,
+            // A configuration change is a change to the cluster's own control
+            // plane, not to a resource inside it.
+            scope: UpdateScope::Cluster,
         };
         let answer = update.to_update();
 
