@@ -576,6 +576,10 @@ async fn a_job_lookup_is_scoped_to_its_environment() {
 /// app is refused earlier, as HTTP 400 `ValidationException` (see
 /// `app_registration_gate.rs`), so every row below names a registered app and is unknown
 /// in some part BELOW it.
+///
+/// `GetBackendJob` is not a row here: a job read answers the recorded
+/// `ResourceNotFoundException` for its whole address rather than the modelled shape, and
+/// `backend_job_not_found.rs` is where that rule is pinned.
 #[tokio::test]
 async fn an_unknown_resource_is_a_modelled_not_found() {
     let router = router();
@@ -623,12 +627,6 @@ async fn an_unknown_resource_is_a_modelled_not_found() {
             "POST",
             "/backend/dknown/auth/staging/details".to_string(),
             Some(json!({ "resourceName": "unknownresource" })),
-        ),
-        (
-            "the job id, on GetBackendJob",
-            "GET",
-            "/backend/dknown/job/staging/999".to_string(),
-            None,
         ),
         (
             "the environment, on CreateBackendAuth",

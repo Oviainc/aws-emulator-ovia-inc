@@ -3,11 +3,12 @@
 //! @op GetBackendJob
 //!
 //! Reads back the job a mutating call recorded, by (AppId, BackendEnvironmentName,
-//! JobId); an id this app never minted answers `NotFoundException` (404). An `AppId`
-//! that identifies no registered Amplify app is refused with HTTP 400
-//! `ValidationException` before any lookup ([`crate::state::require_registered_app`]).
-//! Jobs outlive
-//! the environment they ran against, so a lookup after `DeleteBackend` still resolves.
+//! JobId). The whole address is STATE, so an address that resolves to no job answers ONE
+//! refusal whichever of its three parts is the unknown one — HTTP 404 with the error code
+//! `ResourceNotFoundException` ([`crate::state::job_not_found`]) — and this read does not
+//! run the app-identity gate: a job that does not exist is absent state, never a
+//! malformed request. Jobs outlive the environment they ran against, so a lookup after
+//! `DeleteBackend` still resolves.
 //!
 //! Reporting, with ONE write: it materialises the completion the clock already made
 //! due (see `BackendJob::settle`), which was owed at that instant whether or not
@@ -162,34 +163,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        // The app-identity gate, BEFORE any per-resource lookup: a well-formed app id
-        // that identifies no registered Amplify app is a client-input error (400
-        // `ValidationException`), not a missing backend.
-        crate::state::require_registered_app(&*self.engine, &input.app_id)?;
-
         let now = std::time::SystemTime::now();
         let mut store = state.lock();
-        let app = store.app_mut(&input.app_id).ok_or_else(|| {
-            GetBackendJobError::from(GetBackendJobErrorModeled::NotFoundException(
-                crate::state::not_found(
-                    crate::state::RESOURCE_TYPE_BACKEND,
-                    format!("no backend exists for app {}", input.app_id),
-                ),
-            ))
-        })?;
-        let job = app
-            .job_mut(&input.backend_environment_name, &input.job_id)
-            .ok_or_else(|| {
-                GetBackendJobError::from(GetBackendJobErrorModeled::NotFoundException(
-                    crate::state::not_found(
-                        crate::state::RESOURCE_TYPE_BACKEND_JOB,
-                        format!(
-                            "no job {} exists for backend environment {} of app {}",
-                            input.job_id, input.backend_environment_name, input.app_id
-                        ),
-                    ),
-                ))
-            })?;
+        // ONE lookup for the whole address, and ONE refusal for it: an unknown app, an
+        // unknown environment and a job id this app never minted are all "no job matches
+        // these parameters", so none of them is distinguished and none is answered as a
+        // client-input error.
+        let job = store
+            .app_mut(&input.app_id)
+            .and_then(|app| app.job_mut(&input.backend_environment_name, &input.job_id))
+            .ok_or_else(crate::state::job_not_found::<GetBackendJobErrorModeled>)?;
 
         job.settle(now);
 

@@ -15,6 +15,8 @@
 mod app_registration_gate;
 #[path = "all/backend_job_listing.rs"]
 mod backend_job_listing;
+#[path = "all/backend_job_not_found.rs"]
+mod backend_job_not_found;
 #[path = "all/backend_lifecycle.rs"]
 mod backend_lifecycle;
 #[path = "all/backend_storage.rs"]

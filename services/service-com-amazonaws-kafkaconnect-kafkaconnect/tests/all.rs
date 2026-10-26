@@ -31,6 +31,8 @@ mod describe_connector_operation;
 mod duplicate_name_conflict_message;
 #[path = "all/iso8601_timestamps.rs"]
 mod iso8601_timestamps;
+#[path = "all/list_worker_configurations.rs"]
+mod list_worker_configurations;
 #[path = "all/region_scoping.rs"]
 mod region_scoping;
 #[path = "all/restart_connector_scope.rs"]

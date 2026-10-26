@@ -1178,6 +1178,24 @@ impl WorkerConfigurationRecord {
         }
     }
 
+    /// This configuration as `ListWorkerConfigurations` reports it.
+    ///
+    /// Member set from
+    /// `smithy_query(query="shape", shape="WorkerConfigurationSummary")`: it
+    /// carries the identity, the description, the state, the creation instant and
+    /// the latest revision summary, and NO properties file — only the
+    /// `WorkerConfigurationRevisionDescription` a describe answers with does.
+    pub fn summary(&self) -> WorkerConfigurationSummary {
+        WorkerConfigurationSummary {
+            creation_time: Some(date_time(self.creation_time)),
+            description: self.description.clone(),
+            latest_revision: Some(self.latest_revision()),
+            name: Some(self.name.clone()),
+            worker_configuration_arn: Some(self.arn.clone()),
+            worker_configuration_state: Some(self.state.clone()),
+        }
+    }
+
     /// This configuration's latest revision as `DescribeWorkerConfiguration`
     /// reports it: the summary plus the stored properties file.
     pub fn revision_description(&self) -> WorkerConfigurationRevisionDescription {
@@ -1441,6 +1459,17 @@ impl ComAmazonawsKafkaconnectKafkaconnectState {
         arn: &str,
     ) -> Option<&mut WorkerConfigurationRecord> {
         record_in_mut(&mut self.worker_configurations, region, arn)
+    }
+
+    /// The worker configurations of `region` — what `ListWorkerConfigurations`
+    /// answered through that region's endpoint reports ("all of the worker
+    /// configurations in this account and Region"), and nothing of any other
+    /// region.
+    pub fn worker_configurations_in<'store>(
+        &'store self,
+        region: &'store str,
+    ) -> impl Iterator<Item = &'store WorkerConfigurationRecord> + 'store {
+        records_in(&self.worker_configurations, region)
     }
 
     /// The connector operation `arn` names, as an endpoint for `region` sees
