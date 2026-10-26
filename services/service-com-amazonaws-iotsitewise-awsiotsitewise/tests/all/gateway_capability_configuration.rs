@@ -46,7 +46,10 @@ fn past_the_owed_transition() -> Duration {
 }
 
 /// Create a gateway named `name` and return its id.
-async fn create_gateway(router: &MultiServiceRouter, name: &str) -> String {
+///
+/// `pub(crate)` so the sibling capability suite reaches it rather than growing a
+/// second copy of the same create.
+pub(crate) async fn create_gateway(router: &MultiServiceRouter, name: &str) -> String {
     let (status, created) = call(
         router,
         "POST",
@@ -78,12 +81,12 @@ fn capability_write_uri(gateway_id: &str) -> String {
 
 /// `GET /20200301/gateways/{id}/capability/{namespace}` — the route
 /// `DescribeGatewayCapabilityConfiguration` is bound to.
-fn capability_read_uri(gateway_id: &str, namespace: &str) -> String {
+pub(crate) fn capability_read_uri(gateway_id: &str, namespace: &str) -> String {
     format!("{GATEWAYS}/{gateway_id}/capability/{namespace}")
 }
 
 /// Write `configuration` under `namespace` and return `(status, body)`.
-async fn write_capability(
+pub(crate) async fn write_capability(
     router: &MultiServiceRouter,
     gateway_id: &str,
     namespace: &str,

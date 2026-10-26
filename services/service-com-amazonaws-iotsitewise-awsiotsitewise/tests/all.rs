@@ -327,6 +327,8 @@ mod time_series_ingestion;
 mod update_asset;
 #[path = "all/update_asset_model.rs"]
 mod update_asset_model;
+#[path = "all/update_gateway_capability_configuration.rs"]
+mod update_gateway_capability_configuration;
 
 // Declared at the very END of this file, after the sorted list, rather than in
 // either of the two stretches above: both are where every concurrent iotsitewise
