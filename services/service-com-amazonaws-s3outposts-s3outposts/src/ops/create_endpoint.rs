@@ -189,14 +189,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The endpoint hangs off an Outpost: one this caller owns, or one shared
-        // with it. An id that names neither is the modelled 404, carrying the
+        // with it — and one installed in the Region this request was signed for,
+        // since that is the only Region an Outpost and its endpoints are reached
+        // through. An id that names neither is the modelled 404, carrying the
         // one service constant for an Outpost that does not resolve.
-        if !store.outposts.contains_key(&input.outpost_id) {
+        let Some(home_region) = store
+            .outpost_in(&region, &input.outpost_id)
+            .map(|outpost| outpost.region.clone())
+        else {
             return Err(CreateEndpointErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(),
             )
             .into());
-        }
+        };
 
         // One endpoint per (Outpost, subnet, security group): a repeat of the
         // same request would commit a second range of the same subnet to the
@@ -265,8 +270,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // its pattern admits only some of the `OutpostId` branches, so an
         // endpoint on an Outpost outside them has no legal ARN and the member is
         // left out rather than filled with a value the pattern rejects. The
-        // endpoint itself is stored either way and the listings report it.
-        let endpoint_arn = endpoint.endpoint_arn(&region);
+        // endpoint itself is stored either way and the listings report it. The
+        // Region the ARN names is the parent Outpost's home Region, which is the
+        // endpoint's own, so every later read reports this same ARN.
+        let endpoint_arn = endpoint.endpoint_arn(&home_region);
         store
             .endpoints
             .insert((input.outpost_id, endpoint_id), endpoint);

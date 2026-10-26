@@ -160,7 +160,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteEndpointErrorModeled::InternalServerException(
                 InternalServerException {
@@ -170,14 +169,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let region = crate::state::request_region(ctx.parts());
         let caller = crate::state::caller_account();
         let mut store = state.lock();
 
         // The Outpost is resolved FIRST: an endpoint is named by the (Outpost,
         // endpoint) pair, so an Outpost that resolves to nothing this caller has
-        // access to is the modelled 404 before any endpoint under it is looked
-        // at — its text is the one the caller sees.
-        if !store.outposts.contains_key(&input.outpost_id) {
+        // access to — including one installed in another Region, which this
+        // Region's endpoint does not reach — is the modelled 404 before any
+        // endpoint under it is looked at, and its text is the one the caller
+        // sees.
+        if store.outpost_in(&region, &input.outpost_id).is_none() {
             return Err(DeleteEndpointErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(),
             )

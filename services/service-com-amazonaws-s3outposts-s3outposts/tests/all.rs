@@ -27,6 +27,8 @@ mod endpoint_paging;
 mod not_found_messages;
 #[path = "all/one_listing_rule.rs"]
 mod one_listing_rule;
+#[path = "all/region_scoping.rs"]
+mod region_scoping;
 #[path = "all/shared_endpoint_listing.rs"]
 mod shared_endpoint_listing;
 #[path = "all/state_roundtrip.rs"]

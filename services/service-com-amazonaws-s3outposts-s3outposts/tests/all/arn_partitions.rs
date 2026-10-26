@@ -17,7 +17,8 @@
 use serde_json::Value;
 
 use crate::endpoint_lifecycle::{
-    call_in, emulator, endpoint_id_of, minimal_create, owned_outposts, string_at, Answer,
+    call_in, emulator_holding, emulator_in_region, endpoint_id_of, minimal_create,
+    owned_outposts_in, string_at, Answer,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -190,10 +191,10 @@ async fn every_arn_names_the_partition_of_the_region_the_request_was_signed_for(
         partition,
     } in ROWS
     {
-        // Its own emulator per row, so the endpoint the row creates is the only one of
-        // this account in the answer.
-        let router = emulator();
-        let outpost_id = owned_outposts(&router)
+        // Its own emulator per row, whose Outposts are installed in the row's Region, so
+        // the endpoint the row creates is the only one of this account in the answer.
+        let router = emulator_in_region(region);
+        let outpost_id = owned_outposts_in(&router, region)
             .await
             .first()
             .expect("the emulator presents an owned Outpost")
@@ -259,50 +260,82 @@ async fn every_arn_names_the_partition_of_the_region_the_request_was_signed_for(
     }
 }
 
-/// The partition is a function of the Region ALONE: one store, read in several Regions,
-/// reports every ARN of one answer in that caller's partition — no ARN of an answer names
-/// a partition another ARN of the same answer contradicts, and no two Regions in different
-/// partitions report the same partition.
+/// The partition is a function of the Region ALONE: one store holding an Outpost in every
+/// row's Region reports each one in that Region's partition — no ARN of an answer names a
+/// partition another ARN of the same answer contradicts, no two Regions in different
+/// partitions report the same partition, and each Region's answer carries only what is
+/// installed in it.
 #[tokio::test]
 async fn one_store_reports_each_region_s_own_partition_consistently() {
-    let router = emulator();
-    let outpost_id = owned_outposts(&router)
-        .await
-        .first()
-        .expect("the emulator presents an owned Outpost")
-        .clone();
-
-    // One endpoint, created once, then read back from every Region: the records are the
-    // same, so any difference in the answers is the projection under test.
-    let created = create_in(&router, "us-east-1", minimal_create(&outpost_id)).await;
-    assert_eq!(
-        created.status, 200,
-        "CreateEndpoint must answer 200, got {} with {:?}",
-        created.status, created.body
+    let caller = engine::emulator_account_id().to_string();
+    // One Outpost per row, in that row's Region, all in ONE store: the records differ only
+    // in the Region they are installed in, so any difference in the answers is the
+    // projection under test.
+    let declared: Vec<(String, &Row)> = ROWS
+        .iter()
+        .enumerate()
+        .map(|(index, row)| (format!("op-{index:017x}"), row))
+        .collect();
+    let router = emulator_holding(
+        &declared
+            .iter()
+            .map(|(outpost_id, row)| (outpost_id.clone(), row.region))
+            .collect::<Vec<_>>(),
     );
-    let endpoint_id = endpoint_id_of(&string_at(&created.body, "EndpointArn"));
 
-    for Row {
-        case,
-        region,
-        partition,
-    } in ROWS
-    {
+    // One endpoint of this account on each of them, created through the Region the Outpost
+    // is installed in.
+    for (outpost_id, row) in &declared {
+        let created = create_in(&router, row.region, minimal_create(outpost_id)).await;
+        assert_eq!(
+            created.status, 200,
+            "case {:?} ({}): CreateEndpoint must answer 200, got {} with {:?}",
+            row.case, row.region, created.status, created.body
+        );
+    }
+
+    for (outpost_id, row) in &declared {
+        let Row {
+            case,
+            region,
+            partition,
+        } = row;
+
         let listed = list_endpoints_in(&router, region).await;
-        let endpoint_arn = listed
+        let endpoint_arns: Vec<String> = listed
             .endpoints()
             .iter()
             .map(|endpoint| string_at(endpoint, "EndpointArn"))
-            .find(|arn| arn.ends_with(&format!("/endpoint/{endpoint_id}")))
-            .unwrap_or_else(|| {
-                panic!(
-                    "case {case:?} ({region}): endpoint {endpoint_id} must be listed, got {:?}",
-                    listed.body
-                )
-            });
+            .collect();
+        assert_eq!(
+            endpoint_arns.len(),
+            1,
+            "case {case:?} ({region}): the Region must report exactly the endpoint installed \
+             in it, got {endpoint_arns:?}"
+        );
+        let endpoint_arn = endpoint_arns[0].clone();
+        let endpoint_id = endpoint_id_of(&endpoint_arn);
+        assert_eq!(
+            endpoint_arn,
+            format!(
+                "arn:{partition}:s3-outposts:{region}:{caller}:outpost/{outpost_id}/endpoint/{endpoint_id}"
+            ),
+            "case {case:?} ({region}): the EndpointArn must name this Region and its partition"
+        );
 
         let outposts = list_outposts_in(&router, region).await;
-        let outpost = outpost_with_id(&outposts, &outpost_id);
+        let reported: Vec<String> = outposts
+            .outposts()
+            .iter()
+            .map(|outpost| string_at(outpost, "OutpostId"))
+            .collect();
+        assert_eq!(
+            reported,
+            vec![outpost_id.clone()],
+            "case {case:?} ({region}): the inventory must report exactly the Outpost installed \
+             in this Region, got {reported:?}"
+        );
+        let outpost = outpost_with_id(&outposts, outpost_id);
         let outpost_arn = string_at(&outpost, "OutpostArn");
         let s3_outpost_arn = string_at(&outpost, "S3OutpostArn");
 

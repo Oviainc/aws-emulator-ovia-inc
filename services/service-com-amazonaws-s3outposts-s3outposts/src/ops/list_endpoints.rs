@@ -161,11 +161,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let caller = crate::state::caller_account();
         let mut store = state.lock();
 
-        // The walk, the page bound and the cursor are the one listing rule this
-        // service's listings serve, so they live in `crate::state`; what is this
-        // operation's own is which endpoints it reports: the caller's own, across
-        // every Outpost it has them on. `ListSharedEndpoints` is the listing
-        // scoped to one named Outpost.
+        // The walk, the page bound, the cursor and the Region a listing serves are
+        // the one listing rule this service's listings follow, so they live in
+        // `crate::state`; what is this operation's own is which endpoints it
+        // reports: the caller's own, across every Outpost it has them on in this
+        // Region. `ListSharedEndpoints` is the listing scoped to one named
+        // Outpost.
         let page = crate::state::endpoint_page(
             &mut store,
             now,

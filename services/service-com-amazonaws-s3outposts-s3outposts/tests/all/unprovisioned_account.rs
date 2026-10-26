@@ -198,13 +198,15 @@ async fn every_outpost_reference_on_an_unprovisioned_account_is_the_modelled_404
 }
 
 /// The operator setting is the ONLY thing that puts an Outpost in the inventory, and what
-/// the listing reports is exactly the records it declared: the id, the owning account and
-/// the capacity, with the ARNs built from them.
+/// the listing reports is exactly the records it declared that belong to the Region the
+/// request is served in: the id, the owning account and the capacity, with the ARNs built
+/// from them.
 ///
 /// The rows differ along what the rule generalises over: how many Outposts are declared,
 /// which branch of `OutpostId` names them, whether the owner is the caller or another
-/// account, and the surrounding space — plus every way an entry can fail to declare an
-/// Outpost this API could report, which must provision nothing.
+/// account, which Region they are installed in, and the surrounding space — plus every way
+/// an entry can fail to declare an Outpost this API could report, which must provision
+/// nothing.
 #[tokio::test]
 async fn only_what_was_provisioned_is_reported() {
     let caller = engine::emulator_account_id().to_string();
@@ -300,8 +302,27 @@ async fn only_what_was_provisioned_is_reported() {
             Vec::new(),
         ),
         (
+            "an Outpost declared in this Region explicitly",
+            "op-0a1b2c3d4e5f60718:52776558133248:000000000001:us-east-1",
+            vec![(
+                "op-0a1b2c3d4e5f60718".to_string(),
+                "000000000001".to_string(),
+                52_776_558_133_248,
+            )],
+        ),
+        (
+            "an Outpost declared in another Region, which this Region does not reach",
+            "op-0a1b2c3d4e5f60718:52776558133248:000000000001:eu-west-1",
+            Vec::new(),
+        ),
+        (
+            "a Region code the ARN members' own Region field does not admit",
+            "op-0a1b2c3d4e5f60718:1024:000000000001:US-East-1",
+            Vec::new(),
+        ),
+        (
             "a field the form does not have",
-            "op-0a1b2c3d4e5f60718:1024:000000000001:extra",
+            "op-0a1b2c3d4e5f60718:1024:000000000001:us-east-1:extra",
             Vec::new(),
         ),
     ];
@@ -329,10 +350,10 @@ async fn only_what_was_provisioned_is_reported() {
             answer.next_token()
         );
 
-        // The ARNs are built from the record's own ids and owner, for the Region the
-        // request was signed for — and only where the member's own pattern admits that
-        // id, since the two patterns admit different branches of `OutpostId`
-        // (`arn_patterns.rs` covers that branch by branch).
+        // The ARNs are built from the record's own ids, owner and home Region — and only
+        // where the member's own pattern admits that id, since the two patterns admit
+        // different branches of `OutpostId` (`arn_patterns.rs` covers that branch by
+        // branch).
         for outpost in answer.outposts() {
             let id = string_at(outpost, "OutpostId");
             let owner = string_at(outpost, "OwnerId");

@@ -150,17 +150,23 @@ fn owner_of(row: &Row) -> String {
     }
 }
 
-/// One emulator whose inventory holds exactly the Outpost `row` declares.
-fn emulator_holding(row: &Row) -> MultiServiceRouter {
+/// One emulator whose inventory holds exactly the Outpost `row` declares, installed in
+/// `region` — an Outpost has a home Region, so a case reading in a Region needs its
+/// fixture provisioned there.
+fn emulator_holding(row: &Row, region: &str) -> MultiServiceRouter {
     let owner = owner_of(row);
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     {
         let state = engine.state::<ComAmazonawsS3outpostsS3outpostsState>();
         let mut store = state.lock();
         store.provision_outpost(
-            OutpostRecord::provisioned(row.outpost_id, &owner, 48 * TEBIBYTE).unwrap_or_else(
-                || panic!("{} owned by {owner} must be provisionable", row.outpost_id),
-            ),
+            OutpostRecord::provisioned(row.outpost_id, &owner, 48 * TEBIBYTE, region)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} owned by {owner} in {region} must be provisionable",
+                        row.outpost_id
+                    )
+                }),
         );
     }
     let mut router = MultiServiceRouter::new();
@@ -264,11 +270,12 @@ async fn an_outpost_reports_only_the_arns_its_members_patterns_admit() {
 
     for row in ROWS {
         let owner = owner_of(row);
-        let router = emulator_holding(row);
         let id = row.outpost_id;
 
         for (region, partition) in REGIONS {
             let case = format!("{} in {region}", row.case);
+            // Its own emulator per Region, since the Outpost is installed in one Region.
+            let router = emulator_holding(row, region);
             let outpost = the_outpost(&router, region).await;
 
             // The Outpost itself is reported whatever its id's branch: an ARN a pattern
@@ -349,7 +356,7 @@ async fn an_endpoint_reports_only_an_arn_its_pattern_admits() {
         for (region, partition) in REGIONS {
             let case = format!("{} in {region}", row.case);
             // Its own emulator per case, so the endpoint created here is the only one.
-            let router = emulator_holding(row);
+            let router = emulator_holding(row, region);
 
             let created = create_in(&router, region, id).await;
             assert_eq!(

@@ -26,16 +26,25 @@
 //! `CreateEndpoint` then has a parent Outpost to attach an endpoint to. Unset —
 //! the default — means no capacity, which is what a new AWS account has.
 //!
-//! ## Why an ARN is projected and not stored
+//! ## Which Region a resource belongs to
+//!
+//! An Outpost is installed at a site anchored to ONE Region, and the S3 on
+//! Outposts endpoints on it are reached through that Region's endpoint, so each
+//! resource here belongs to one Region and is reachable only through it:
+//! [`OutpostRecord::region`] records the Outpost's own (home) Region, an endpoint
+//! takes the Region of the Outpost it is on ([`ComAmazonawsS3outpostsS3outpostsState::outpost_region`]),
+//! and every lookup and listing resolves inside the Region the request was signed
+//! for alone ([`request_region`]) — so a resource of another Region is reported by
+//! no listing and resolves to the modelled 404, exactly as if the store held one
+//! set of resources per Region.
 //!
 //! Every ARN this service reports (`Outpost$OutpostArn`, `Outpost$S3OutpostArn`,
-//! `Endpoint$EndpointArn`, `CreateEndpointResult$EndpointArn`) is built from the
-//! record's ids and owner account plus the Region the request was signed for —
-//! and that Region's own partition ([`arn_partition`]) — so all the ARNs in one
-//! answer name one Region, in one partition: the Region the caller is talking
-//! to. The store holds one set of resources rather than one per Region, so
-//! storing a Region on the record would let an endpoint's ARN name a different
-//! Region from its own parent Outpost's ARN.
+//! `Endpoint$EndpointArn`, `CreateEndpointResult$EndpointArn`) is therefore built
+//! from the record's ids and owner account plus the Region the RECORD belongs to —
+//! and that Region's own partition ([`arn_partition`]) — never from the Region of
+//! whoever is reading: an ARN identifies its resource, so the same record is
+//! reported under one ARN to every caller, and an endpoint's ARN and its parent
+//! Outpost's ARN always name the same Region.
 //!
 //! ## Why an ARN member can be ABSENT
 //!
@@ -85,15 +94,16 @@ pub const PAGE_LIMIT: i32 = 100;
 /// whichever later call reports the endpoint — nothing sleeps.
 pub const ENDPOINT_TRANSITION: Duration = Duration::from_millis(500);
 
-/// The Region an ARN names when the request carries no SigV4 credential scope to
-/// read one from.
+/// The Region a request is served in when it carries no SigV4 credential scope to
+/// read one from, and the home Region an operator who names none provisions an
+/// Outpost in.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// The environment variable an operator uses to tell this emulated service which
 /// Outposts have S3 on Outposts capacity provisioned, since the API models no
 /// operation that provisions one: comma-separated
-/// `<OutpostId>:<CapacityInBytes>[:<OwnerAccountId>]` entries, read once when
-/// this service's store is created
+/// `<OutpostId>:<CapacityInBytes>[:<OwnerAccountId>[:<Region>]]` entries, read
+/// once when this service's store is created
 /// (`S3_OUTPOSTS_PROVISIONED_OUTPOSTS="op-0a1b2c3d4e5f60718:52776558133248"`).
 ///
 /// Unset means no capacity at all, which is what an account that never had S3 on
@@ -102,13 +112,16 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// another account is one shared with the caller through Resource Access
 /// Manager, which is what `Outpost$OwnerId` ("useful for comparing owned versus
 /// shared outposts") distinguishes and what a caller can create endpoints on and
-/// list with `ListSharedEndpoints`.
+/// list with `ListSharedEndpoints`. An entry's Region is the home Region of the
+/// Outpost it declares — the only Region that Outpost, and every endpoint on it,
+/// is reachable through — and defaults to [`DEFAULT_REGION`].
 pub const PROVISIONED_OUTPOSTS_ENV: &str = "S3_OUTPOSTS_PROVISIONED_OUTPOSTS";
 
 /// The Outposts `setting` declares: comma-separated
-/// `<OutpostId>:<CapacityInBytes>[:<OwnerAccountId>]` entries, surrounding space
-/// trimmed. The owner defaults to the account this emulator serves, so an
-/// operator naming only an id and a capacity gets an Outpost the caller owns.
+/// `<OutpostId>:<CapacityInBytes>[:<OwnerAccountId>[:<Region>]]` entries,
+/// surrounding space trimmed. The owner defaults to the account this emulator
+/// serves, so an operator naming only an id and a capacity gets an Outpost the
+/// caller owns, in [`DEFAULT_REGION`].
 ///
 /// An entry that is not of that form, or whose values are not ones this API
 /// could report (see [`OutpostRecord::provisioned`]), is SKIPPED rather than
@@ -126,12 +139,13 @@ pub fn parse_provisioned_outposts(setting: &str) -> Vec<OutpostRecord> {
                 Some(owner) => owner.to_string(),
                 None => caller_account(),
             };
-            // A fourth field means the entry is not the form documented above,
+            let region = fields.next().unwrap_or(DEFAULT_REGION);
+            // A fifth field means the entry is not the form documented above,
             // so it says something this parser does not understand.
             if fields.next().is_some() {
                 return None;
             }
-            OutpostRecord::provisioned(outpost_id, &owner_id, capacity_in_bytes)
+            OutpostRecord::provisioned(outpost_id, &owner_id, capacity_in_bytes, region)
         })
         .collect()
 }
@@ -157,32 +171,46 @@ pub struct OutpostRecord {
     /// an owned Outpost, another account for one shared with the caller.
     pub owner_id: String,
     pub capacity_in_bytes: i64,
+    /// The Outpost's home Region: the one Region it, and every endpoint on it,
+    /// is reachable through, and the Region every ARN naming it carries.
+    pub region: String,
 }
 
 impl OutpostRecord {
     /// The record for an Outpost provisioned with S3 capacity, or `None` when the
     /// values are not ones this API could ever report: `OutpostId`'s
     /// `^(op-[a-f0-9]{17}|\d{12}|ec2)$` for the id, `AwsAccountId`'s `^\d{12}$`
-    /// for the owner, and a capacity above zero — an Outpost with no S3 capacity
-    /// is not one `ListOutpostsWithS3` reports at all.
-    pub fn provisioned(outpost_id: &str, owner_id: &str, capacity_in_bytes: i64) -> Option<Self> {
-        (is_outpost_id(outpost_id) && is_account_outpost_id(owner_id) && capacity_in_bytes > 0)
-            .then(|| Self {
-                outpost_id: outpost_id.to_string(),
-                owner_id: owner_id.to_string(),
-                capacity_in_bytes,
-            })
+    /// for the owner, a capacity above zero — an Outpost with no S3 capacity
+    /// is not one `ListOutpostsWithS3` reports at all — and a Region code the
+    /// ARN members' own Region field admits ([`is_region`]).
+    pub fn provisioned(
+        outpost_id: &str,
+        owner_id: &str,
+        capacity_in_bytes: i64,
+        region: &str,
+    ) -> Option<Self> {
+        (is_outpost_id(outpost_id)
+            && is_account_outpost_id(owner_id)
+            && capacity_in_bytes > 0
+            && is_region(region))
+        .then(|| Self {
+            outpost_id: outpost_id.to_string(),
+            owner_id: owner_id.to_string(),
+            capacity_in_bytes,
+            region: region.to_string(),
+        })
     }
 
     /// `arn:<partition>:outposts:<region>:<owner>:outpost/<id>`, as
-    /// `OutpostArn`'s pattern spells it, in the partition `region` belongs to
-    /// ([`arn_partition`]) — or `None` for an Outpost whose id that pattern
-    /// does not admit ([`OUTPOST_ARN_BRANCHES`]).
-    pub fn outpost_arn(&self, region: &str) -> Option<String> {
+    /// `OutpostArn`'s pattern spells it, naming the Outpost's own home Region and
+    /// the partition that Region belongs to ([`arn_partition`]) — or `None` for an
+    /// Outpost whose id that pattern does not admit ([`OUTPOST_ARN_BRANCHES`]).
+    pub fn outpost_arn(&self) -> Option<String> {
         arn_admits_outpost(OUTPOST_ARN_BRANCHES, &self.outpost_id).then(|| {
             format!(
-                "arn:{}:outposts:{region}:{}:outpost/{}",
-                arn_partition(region),
+                "arn:{}:outposts:{}:{}:outpost/{}",
+                arn_partition(&self.region),
+                self.region,
                 self.owner_id,
                 self.outpost_id
             )
@@ -190,14 +218,15 @@ impl OutpostRecord {
     }
 
     /// `arn:<partition>:s3-outposts:<region>:<owner>:outpost/<id>/s3`, as
-    /// `S3OutpostArn`'s pattern spells it: the name RAM shares — or `None` for
-    /// an Outpost whose id that pattern does not admit
-    /// ([`S3_OUTPOST_ARN_BRANCHES`]).
-    pub fn s3_outpost_arn(&self, region: &str) -> Option<String> {
+    /// `S3OutpostArn`'s pattern spells it: the name RAM shares, naming the
+    /// Outpost's own home Region — or `None` for an Outpost whose id that pattern
+    /// does not admit ([`S3_OUTPOST_ARN_BRANCHES`]).
+    pub fn s3_outpost_arn(&self) -> Option<String> {
         arn_admits_outpost(S3_OUTPOST_ARN_BRANCHES, &self.outpost_id).then(|| {
             format!(
-                "arn:{}:s3-outposts:{region}:{}:outpost/{}/s3",
-                arn_partition(region),
+                "arn:{}:s3-outposts:{}:{}:outpost/{}/s3",
+                arn_partition(&self.region),
+                self.region,
                 self.owner_id,
                 self.outpost_id
             )
@@ -205,10 +234,10 @@ impl OutpostRecord {
     }
 
     /// The `Outpost` projection `ListOutpostsWithS3` returns.
-    pub fn to_outpost(&self, region: &str) -> Outpost {
+    pub fn to_outpost(&self) -> Outpost {
         Outpost {
-            outpost_arn: self.outpost_arn(region),
-            s3_outpost_arn: self.s3_outpost_arn(region),
+            outpost_arn: self.outpost_arn(),
+            s3_outpost_arn: self.s3_outpost_arn(),
             outpost_id: Some(self.outpost_id.clone()),
             owner_id: Some(self.owner_id.clone()),
             capacity_in_bytes: self.capacity_in_bytes,
@@ -246,14 +275,19 @@ pub struct EndpointRecord {
 
 impl EndpointRecord {
     /// `arn:<partition>:s3-outposts:<region>:<owner>:outpost/<outpost>/endpoint/<id>`,
-    /// as `EndpointArn`'s pattern spells it, in the partition `region` belongs
-    /// to ([`arn_partition`]) — or `None` for an endpoint whose Outpost's id
-    /// that pattern does not admit ([`ENDPOINT_ARN_BRANCHES`]).
-    pub fn endpoint_arn(&self, region: &str) -> Option<String> {
+    /// as `EndpointArn`'s pattern spells it, in the partition `home_region`
+    /// belongs to ([`arn_partition`]) — or `None` for an endpoint whose Outpost's
+    /// id that pattern does not admit ([`ENDPOINT_ARN_BRANCHES`]).
+    ///
+    /// `home_region` is the Region of the Outpost this endpoint is on
+    /// ([`ComAmazonawsS3outpostsS3outpostsState::outpost_region`]), which is the
+    /// endpoint's own Region: an endpoint has no Region apart from its parent
+    /// Outpost's, so the two ARNs always agree on it.
+    pub fn endpoint_arn(&self, home_region: &str) -> Option<String> {
         arn_admits_outpost(ENDPOINT_ARN_BRANCHES, &self.outpost_id).then(|| {
             format!(
-                "arn:{}:s3-outposts:{region}:{}:outpost/{}/endpoint/{}",
-                arn_partition(region),
+                "arn:{}:s3-outposts:{home_region}:{}:outpost/{}/endpoint/{}",
+                arn_partition(home_region),
                 self.owner_account,
                 self.outpost_id,
                 self.endpoint_id
@@ -278,9 +312,12 @@ impl EndpointRecord {
     }
 
     /// The `Endpoint` structure every list operation reports.
-    pub fn to_endpoint(&self, region: &str) -> Endpoint {
+    ///
+    /// `home_region` is the Region of the Outpost this endpoint is on — see
+    /// [`Self::endpoint_arn`].
+    pub fn to_endpoint(&self, home_region: &str) -> Endpoint {
         Endpoint {
-            endpoint_arn: self.endpoint_arn(region),
+            endpoint_arn: self.endpoint_arn(home_region),
             outposts_id: Some(self.outpost_id.clone()),
             cidr_block: Some(self.cidr_block.clone()),
             status: Some(self.status.clone()),
@@ -311,9 +348,12 @@ impl EndpointRecord {
 /// Per-service state for com-amazonaws-s3outposts-s3outposts. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsS3outpostsS3outpostsState {
-    /// Every Outpost with S3 capacity, keyed by its id. The `BTreeMap` is what
-    /// gives `ListOutpostsWithS3` the one stable total order its pagination
-    /// cursor indexes into.
+    /// Every Outpost with S3 capacity, keyed by its id — which names ONE
+    /// Outpost, installed in the one home Region its record carries
+    /// ([`OutpostRecord::region`]), so the key needs no Region beside it and
+    /// [`Self::outpost_in`] is what resolves an id for the Region being served.
+    /// The `BTreeMap` is what gives `ListOutpostsWithS3` the one stable total
+    /// order its pagination cursor indexes into.
     ///
     /// BOUNDED: nothing a client can send adds an entry — the API models no
     /// operation that provisions an Outpost, so the only writer is
@@ -322,7 +362,9 @@ pub struct ComAmazonawsS3outpostsS3outpostsState {
     pub outposts: BTreeMap<String, OutpostRecord>,
     /// Every endpoint, keyed by `(OutpostId, EndpointId)` — the pair
     /// `DeleteEndpoint` names — which is also the stable order the endpoint
-    /// listings page over.
+    /// listings page over. The `OutpostId` half is what puts the endpoint in a
+    /// Region: it is the Outpost's, and so the endpoint's
+    /// ([`Self::outpost_region`]).
     ///
     /// BOUNDED: an endpoint is only stored once [`Self::allocate_cidr_block`]
     /// has committed one of the `ENDPOINT_CIDR_BLOCK_COUNT` ranges the emulator
@@ -393,6 +435,33 @@ impl ComAmazonawsS3outpostsS3outpostsState {
     /// account that does have capacity.
     pub fn provision_outpost(&mut self, record: OutpostRecord) {
         self.outposts.insert(record.outpost_id.clone(), record);
+    }
+
+    /// The Outpost `outpost_id` as it is reached from `region`, or `None` when the
+    /// store holds no such Outpost in that Region.
+    ///
+    /// An `OutpostId` names one Outpost, which sits in one home Region, so an
+    /// Outpost of another Region resolves to nothing here: every reference a
+    /// request makes to an Outpost — creating an endpoint on it, listing its
+    /// endpoints, deleting one — goes through this lookup, so a resource of
+    /// another Region is the modelled 404 rather than something this Region's
+    /// endpoint serves.
+    pub fn outpost_in(&self, region: &str, outpost_id: &str) -> Option<&OutpostRecord> {
+        self.outposts
+            .get(outpost_id)
+            .filter(|outpost| outpost.region == region)
+    }
+
+    /// The home Region of the Outpost `outpost_id`, or `None` when the store holds
+    /// no such Outpost.
+    ///
+    /// This is the Region of every endpoint on that Outpost, and the Region their
+    /// ARNs name: an endpoint is reached through the Outpost it is on, so it has
+    /// no Region of its own to disagree with.
+    pub fn outpost_region(&self, outpost_id: &str) -> Option<&str> {
+        self.outposts
+            .get(outpost_id)
+            .map(|outpost| outpost.region.as_str())
     }
 
     /// Mint an unused endpoint id matching `EndpointId`'s `^[a-zA-Z0-9]{19}$`.
@@ -512,11 +581,28 @@ pub fn caller_account() -> String {
     ::engine::emulator_account_id().to_string()
 }
 
-/// The Region this request was signed for — what every ARN in the answer names.
+/// The Region this request was signed for — the Region whose resources it is
+/// served, and so the Region every ARN in the answer names.
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// True when `value` is a Region code this service's ARNs can name: non-empty and
+/// inside the `[a-z\-0-9]*` charset the Region field of `OutpostArn`,
+/// `S3OutpostArn` and `EndpointArn` publishes.
+///
+/// A Region a stored record carries ends up in those members, so one outside the
+/// charset would make an ARN its own pattern rejects — which is why
+/// [`OutpostRecord::provisioned`] refuses it instead of storing it. A REQUEST may
+/// still be signed for anything: such a request simply resolves no resource,
+/// since no record belongs to that Region.
+pub fn is_region(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// The partition field of every ARN this service builds for `region`: the
@@ -742,12 +828,14 @@ pub fn outpost_cursor(
     list_cursor(next_token, operation, decode_outpost_cursor)
 }
 
-/// The page the Outpost inventory serves: the Outposts the store holds, in its
-/// own `OutpostId` order, starting at `resume` and at most [`page_size`] of them.
+/// The page the Outpost inventory serves: the Outposts the store holds IN
+/// `region`, in its own `OutpostId` order, starting at `resume` and at most
+/// [`page_size`] of them.
 ///
 /// Every Outpost in the store has S3 capacity provisioned and is either owned by
-/// this caller or shared with it, which is what the inventory reports — so this
-/// listing filters nothing and the one walk in [`list_page`] serves it.
+/// this caller or shared with it, which is what the inventory reports — so the
+/// one thing this listing filters on is the Region: an Outpost is installed at a
+/// site in one Region and reported only through that Region's endpoint.
 pub fn outpost_page(
     store: &ComAmazonawsS3outpostsS3outpostsState,
     region: &str,
@@ -758,9 +846,9 @@ pub fn outpost_page(
         &store.outposts,
         max_results,
         resume,
-        |_| true,
+        |outpost| outpost.region == region,
         String::clone,
-        |outpost| outpost.to_outpost(region),
+        OutpostRecord::to_outpost,
     )
 }
 
@@ -817,33 +905,52 @@ pub fn check_coip_pool(
     Ok(())
 }
 
-/// The page every endpoint listing serves: the endpoints `include` accepts, in
-/// [`ComAmazonawsS3outpostsS3outpostsState::endpoints`]'s own key order, starting at
-/// `resume` and at most [`page_size`] of them, plus the cursor naming the first key
-/// the page did not serve.
+/// The page every endpoint listing serves: the endpoints of `region` that
+/// `include` accepts, in [`ComAmazonawsS3outpostsS3outpostsState::endpoints`]'s own
+/// key order, starting at `resume` and at most [`page_size`] of them, plus the
+/// cursor naming the first key the page did not serve.
 ///
-/// Each listing differs only in which endpoints it reports — `include` — and the walk
-/// itself is [`list_page`]'s: both listings then page over one order, settle what the
-/// clock owes at the same point, and mint the same cursor for the same key.
+/// An endpoint belongs to the Region of the Outpost it is on, so the Region is
+/// filtered on here rather than per listing: both listings report only what
+/// `region`'s own endpoint reaches, and each endpoint's ARN names that same home
+/// Region. What is left to differ per listing is `include`, which endpoints it
+/// reports; the walk itself is [`list_page`]'s, so both page over one order,
+/// settle what the clock owes at the same point, and mint the same cursor for the
+/// same key.
 pub fn endpoint_page(
     store: &mut ComAmazonawsS3outpostsS3outpostsState,
     now: SystemTime,
     region: &str,
     max_results: i32,
     resume: Option<(String, String)>,
-    include: impl FnMut(&EndpointRecord) -> bool,
+    mut include: impl FnMut(&EndpointRecord) -> bool,
 ) -> ListPage<Endpoint> {
     // A listing reports every endpoint it serves, so every status change the clock
     // already owes is materialised before the page is taken.
     store.settle_all(now);
 
+    // The two maps are read side by side: the endpoint records the walk pages
+    // over, and the Outposts they hang off, which is where their Region lives.
+    let ComAmazonawsS3outpostsS3outpostsState {
+        endpoints,
+        outposts,
+        ..
+    } = &*store;
+    let home_region = |endpoint: &EndpointRecord| {
+        outposts
+            .get(&endpoint.outpost_id)
+            .map(|outpost| outpost.region.as_str())
+    };
+
     list_page(
-        &store.endpoints,
+        endpoints,
         max_results,
         resume,
-        include,
+        |endpoint| home_region(endpoint) == Some(region) && include(endpoint),
         encode_endpoint_cursor,
-        |endpoint| endpoint.to_endpoint(region),
+        // The filter above admits only endpoints whose Outpost is in `region`, so
+        // the Region each `Endpoint` is projected for is that Outpost's own.
+        |endpoint| endpoint.to_endpoint(home_region(endpoint).unwrap_or(region)),
     )
 }
 

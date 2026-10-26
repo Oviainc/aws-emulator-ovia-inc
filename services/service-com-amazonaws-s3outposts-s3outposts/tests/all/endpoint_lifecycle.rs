@@ -57,10 +57,34 @@ pub(crate) fn unprovisioned_emulator() -> MultiServiceRouter {
     unprovisioned_emulator_with_engine().0
 }
 
+/// One emulator whose inventory holds exactly the `(OutpostId, home Region)` pairs given,
+/// every one owned by the account this emulator serves.
+///
+/// An Outpost is hardware nothing in this API provisions, so the store's own provisioning
+/// seam is the one way to stand one up — the same seam `S3_OUTPOSTS_PROVISIONED_OUTPOSTS`
+/// reaches in a running emulator.
+pub(crate) fn emulator_holding(outposts: &[(String, &str)]) -> MultiServiceRouter {
+    let owner = engine::emulator_account_id().to_string();
+    let (router, engine) = unprovisioned_emulator_with_engine();
+    {
+        let state = engine.state::<ComAmazonawsS3outpostsS3outpostsState>();
+        let mut store = state.lock();
+        for (outpost_id, region) in outposts {
+            store.provision_outpost(
+                OutpostRecord::provisioned(outpost_id, &owner, 48 * TEBIBYTE, region)
+                    .unwrap_or_else(|| {
+                        panic!("{outpost_id} in {region} must be a provisionable Outpost")
+                    }),
+            );
+        }
+    }
+    router
+}
+
 /// One emulator for an account that DOES have S3 on Outposts capacity: two Outposts of
 /// its own and one another account shares with it, plus that account's own endpoint on
 /// the Outpost it shared — an endpoint on the shared Outpost that is not this account's,
-/// so `ListEndpoints` does not report it.
+/// so `ListEndpoints` does not report it. Every Outpost is installed in [`REGION`].
 ///
 /// None of those three facts is something an operation of this API creates, so the
 /// capacity is stood up through the store's own provisioning seam — the same seam
@@ -69,6 +93,15 @@ pub(crate) fn unprovisioned_emulator() -> MultiServiceRouter {
 ///
 /// Returned beside the router for the cases that have to look at the store itself.
 pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    emulator_in_region_with_engine(REGION)
+}
+
+/// One emulator like [`emulator_with_engine`], whose Outposts are installed in `region`:
+/// an Outpost has a home Region, so a case reading in another Region needs its fixture
+/// provisioned in the Region it reads.
+pub(crate) fn emulator_in_region_with_engine(
+    region: &str,
+) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let (router, engine) = unprovisioned_emulator_with_engine();
     let state = engine.state::<ComAmazonawsS3outpostsS3outpostsState>();
     let mut store = state.lock();
@@ -84,9 +117,9 @@ pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemor
         ),
     ] {
         store.provision_outpost(
-            OutpostRecord::provisioned(outpost_id, &owner_id, capacity).unwrap_or_else(|| {
-                panic!("{outpost_id} owned by {owner_id} must be a provisionable Outpost")
-            }),
+            OutpostRecord::provisioned(outpost_id, &owner_id, capacity, region).unwrap_or_else(
+                || panic!("{outpost_id} owned by {owner_id} must be a provisionable Outpost"),
+            ),
         );
     }
 
@@ -128,6 +161,12 @@ pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemor
 /// [`emulator_with_engine`]).
 pub(crate) fn emulator() -> MultiServiceRouter {
     emulator_with_engine().0
+}
+
+/// One emulator for an account whose capacity is installed in `region` (see
+/// [`emulator_in_region_with_engine`]).
+pub(crate) fn emulator_in_region(region: &str) -> MultiServiceRouter {
+    emulator_in_region_with_engine(region).0
 }
 
 /// What the emulator answered: the HTTP status and the JSON body.
@@ -178,8 +217,8 @@ impl Answer {
 }
 
 /// A SigV4 credential scope naming this service, signed for `region`. It is what routes a
-/// request to the s3-outposts service, and its Region is what every ARN in the answer
-/// names.
+/// request to the s3-outposts service, and its Region is the Region the request is served
+/// in — the one whose resources it reaches.
 fn authorization(region: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/s3-outposts/aws4_request, \
@@ -223,7 +262,7 @@ pub(crate) async fn call_in(
     Answer { status, body }
 }
 
-async fn create_in(router: &MultiServiceRouter, region: &str, request: Value) -> Answer {
+pub(crate) async fn create_in(router: &MultiServiceRouter, region: &str, request: Value) -> Answer {
     call_in(
         router,
         region,
@@ -238,7 +277,11 @@ pub(crate) async fn create(router: &MultiServiceRouter, request: Value) -> Answe
     create_in(router, REGION, request).await
 }
 
-async fn list_endpoints_in(router: &MultiServiceRouter, region: &str, query: &str) -> Answer {
+pub(crate) async fn list_endpoints_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    query: &str,
+) -> Answer {
     call_in(
         router,
         region,
@@ -272,12 +315,36 @@ pub(crate) async fn list_outposts(router: &MultiServiceRouter, query: &str) -> A
     list_outposts_in(router, REGION, query).await
 }
 
-pub(crate) async fn list_shared(router: &MultiServiceRouter, query: &str) -> Answer {
+pub(crate) async fn list_shared_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    query: &str,
+) -> Answer {
     call_in(
         router,
-        REGION,
+        region,
         "GET",
         &format!("/S3Outposts/ListSharedEndpoints{query}"),
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn list_shared(router: &MultiServiceRouter, query: &str) -> Answer {
+    list_shared_in(router, REGION, query).await
+}
+
+pub(crate) async fn delete_endpoint_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    outpost_id: &str,
+    endpoint_id: &str,
+) -> Answer {
+    call_in(
+        router,
+        region,
+        "DELETE",
+        &format!("/S3Outposts/DeleteEndpoint?endpointId={endpoint_id}&outpostId={outpost_id}"),
         None,
     )
     .await
@@ -288,21 +355,14 @@ pub(crate) async fn delete_endpoint(
     outpost_id: &str,
     endpoint_id: &str,
 ) -> Answer {
-    call_in(
-        router,
-        REGION,
-        "DELETE",
-        &format!("/S3Outposts/DeleteEndpoint?endpointId={endpoint_id}&outpostId={outpost_id}"),
-        None,
-    )
-    .await
+    delete_endpoint_in(router, REGION, outpost_id, endpoint_id).await
 }
 
-/// The `(OutpostId, OwnerId)` pairs the emulator presents, in the order
+/// The `(OutpostId, OwnerId)` pairs the emulator presents in `region`, in the order
 /// `ListOutpostsWithS3` reports them. Nothing in these cases hardcodes a provisioned id:
 /// the Outposts are discovered through the API, the way a client discovers them.
-async fn all_outposts(router: &MultiServiceRouter) -> Vec<(String, String)> {
-    let answer = list_outposts(router, "?maxResults=100").await;
+async fn all_outposts_in(router: &MultiServiceRouter, region: &str) -> Vec<(String, String)> {
+    let answer = list_outposts_in(router, region, "?maxResults=100").await;
     assert_eq!(
         answer.status, 200,
         "ListOutpostsWithS3 must answer 200, got {} with {:?}",
@@ -320,9 +380,14 @@ async fn all_outposts(router: &MultiServiceRouter) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The Outposts this caller owns.
-pub(crate) async fn owned_outposts(router: &MultiServiceRouter) -> Vec<String> {
-    all_outposts(router)
+/// The `(OutpostId, OwnerId)` pairs the emulator presents in [`REGION`].
+async fn all_outposts(router: &MultiServiceRouter) -> Vec<(String, String)> {
+    all_outposts_in(router, REGION).await
+}
+
+/// The Outposts this caller owns in `region`.
+pub(crate) async fn owned_outposts_in(router: &MultiServiceRouter, region: &str) -> Vec<String> {
+    all_outposts_in(router, region)
         .await
         .into_iter()
         .filter(|(_, owner)| owner == engine::emulator_account_id())
@@ -330,14 +395,24 @@ pub(crate) async fn owned_outposts(router: &MultiServiceRouter) -> Vec<String> {
         .collect()
 }
 
-/// An Outpost another account shared with this caller.
-pub(crate) async fn shared_outpost(router: &MultiServiceRouter) -> String {
-    all_outposts(router)
+/// The Outposts this caller owns.
+pub(crate) async fn owned_outposts(router: &MultiServiceRouter) -> Vec<String> {
+    owned_outposts_in(router, REGION).await
+}
+
+/// An Outpost another account shared with this caller, in `region`.
+pub(crate) async fn shared_outpost_in(router: &MultiServiceRouter, region: &str) -> String {
+    all_outposts_in(router, region)
         .await
         .into_iter()
         .find(|(_, owner)| owner != engine::emulator_account_id())
         .map(|(id, _)| id)
         .expect("the emulator presents an Outpost shared by another account")
+}
+
+/// An Outpost another account shared with this caller.
+pub(crate) async fn shared_outpost(router: &MultiServiceRouter) -> String {
+    shared_outpost_in(router, REGION).await
 }
 
 /// The id of an endpoint on `outpost_id` that this account does NOT own, read back through
@@ -568,18 +643,19 @@ async fn a_created_endpoint_is_listed_from_what_was_stored() {
     }
 }
 
-/// Every ARN in an answer names the Region the request was signed for, the account that
-/// owns the resource, and the resource's own ids — so an endpoint's ARN and its parent
-/// Outpost's ARN always agree on the Region.
+/// Every ARN in an answer names the Region the resource lives in, the account that owns
+/// it, and its own ids — so an endpoint's ARN and its parent Outpost's ARN always agree on
+/// the Region, and that Region is the resource's, not the reader's.
 ///
-/// The rows are Regions in different partitions' naming shapes; each gets its own
-/// emulator so the created endpoint is the only one in the answer.
+/// The rows are Regions in different partitions' naming shapes; each gets its own emulator,
+/// whose Outposts are installed in that Region, so the created endpoint is the only one in
+/// the answer.
 #[tokio::test]
-async fn every_arn_names_the_region_the_request_was_signed_for() {
+async fn every_arn_names_the_region_the_resource_lives_in() {
     let account = engine::emulator_account_id();
     for region in ["us-east-1", "eu-west-1", "ap-southeast-2", "me-central-1"] {
-        let router = emulator();
-        let outpost_id = owned_outposts(&router)
+        let router = emulator_in_region(region);
+        let outpost_id = owned_outposts_in(&router, region)
             .await
             .first()
             .expect("the emulator presents an owned Outpost")
@@ -596,7 +672,7 @@ async fn every_arn_names_the_region_the_request_was_signed_for() {
         assert_eq!(
             arn,
             format!("arn:aws:s3-outposts:{region}:{account}:outpost/{outpost_id}/endpoint/{endpoint_id}"),
-            "case {region:?}: the EndpointArn must be built from the request's Region, the \
+            "case {region:?}: the EndpointArn must be built from the endpoint's own Region, the \
              owning account and the stored ids, got {arn:?}"
         );
 
