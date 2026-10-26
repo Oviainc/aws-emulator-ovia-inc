@@ -323,12 +323,12 @@ async fn a_scaffolded_operation_still_answers_501() {
     // Rows: operations this crate has not implemented yet, control plane and data
     // plane (`grep -l 'SCAFFOLDED, NOT IMPLEMENTED' src/ops/`).
     let cases: Vec<(&str, Value)> = vec![
-        ("ListKeyPolicies", json!({"KeyId": key_id})),
-        ("ListKeyRotations", json!({"KeyId": key_id})),
+        ("GetPublicKey", json!({"KeyId": key_id})),
         (
-            "GenerateDataKey",
-            json!({"KeyId": key_id, "KeySpec": "AES_256"}),
+            "GenerateDataKeyPair",
+            json!({"KeyId": key_id, "KeyPairSpec": "RSA_2048"}),
         ),
+        ("GenerateRandom", json!({"NumberOfBytes": 32})),
     ];
     for (operation, body) in cases {
         let (status, payload) = call(&router, REGION, operation, &body).await;

@@ -317,7 +317,7 @@ fn plan_entry(
             addressed.component_name, addressed.entity_id
         )));
     }
-    if !crate::state::property_is_time_series(definition) {
+    if !crate::state::property_is_time_series(definition.as_ref()) {
         return Err(invalid_entry(
             crate::state::property_not_time_series_message(property_name),
         ));
@@ -332,7 +332,7 @@ fn plan_entry(
     let mut values = Vec::with_capacity(requested.len());
     for value in requested {
         if let Some(violation) =
-            crate::state::data_value_type_violation(property_name, definition, &value.value)
+            crate::state::data_value_type_violation(property_name, definition.as_ref(), &value.value)
         {
             return Err(invalid_entry(violation));
         }
@@ -603,7 +603,7 @@ fn carries_external_ids(
         if !definition.is_external_id.unwrap_or(false) {
             return false;
         }
-        crate::state::latest_property_value(properties.get(property_name), Some(definition))
+        crate::state::latest_property_value(properties.get(property_name), Some(&definition))
             .and_then(|value| value.string_value)
             .is_some_and(|carried| carried == *external_id)
     })

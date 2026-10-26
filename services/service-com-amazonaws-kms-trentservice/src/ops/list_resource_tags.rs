@@ -198,6 +198,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the tag writers.
         let key = match state.resolve(&region, &input.key_id) {
             crate::state::KeyRef::Found(key) => key,
+            crate::state::KeyRef::UnauthorizedAccount => {
+                return Err(crate::state::unauthorized_account(
+                    Self::NAME,
+                    &input.key_id,
+                ));
+            }
             crate::state::KeyRef::MalformedArn => {
                 return Err(ListResourceTagsErrorModeled::InvalidArnException(
                     InvalidArnException {

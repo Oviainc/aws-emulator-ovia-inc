@@ -99,6 +99,14 @@
 //! — `GetResourcePolicyRequest$ResourceArn`), which is therefore keyed by the Data
 //! Catalog's own ARN ([`catalog_arn`]).
 //!
+//! DATA QUALITY RULE RECOMMENDATION RUNS — the runs `StartDataQualityRuleRecommendationRun`
+//! starts over one data source (a catalog table) — sit beside the catalog tree in the same
+//! per-account list as the column statistics task runs
+//! ([`ComAmazonawsGlueAwsglueState::data_quality_rule_recommendation_runs`]): a run is
+//! ADDRESSED by the `RunId` the start mints, which
+//! `GetDataQualityRuleRecommendationRun` takes and nothing else, so the data source a run
+//! covers is recorded on the run rather than the run on the table.
+//!
 //! USAGE PROFILES — the job and session parameter sets an admin registers with
 //! `CreateUsageProfile` — sit beside the catalog tree in another per-account namespace
 //! keyed by profile name ([`ComAmazonawsGlueAwsglueState::usage_profiles`]), because every
@@ -121,7 +129,9 @@ use crate::ops::types::{
     ConnectionPasswordEncryption, ConnectionsList, Crawler, CrawlerTargets, CreateCrawlerInput,
     CreateCustomEntityTypeInput, CreateGlossaryInput, CreateGlossaryTermInput, CreateJobInput,
     CreateSecurityConfigurationInput, CustomEntityType,
-    DataCatalogEncryptionSettings, DataLakePrincipal, Database, DatabaseIdentifier, DatabaseInput,
+    DataCatalogEncryptionSettings, DataLakePrincipal,
+    DataQualityRuleRecommendationRunAdditionalRunOptions,
+    DataSource, Database, DatabaseIdentifier, DatabaseInput,
     EncryptionAtRest, EncryptionConfiguration, ErrorDetail, ExecutionProperty, FederatedDatabase,
     FederatedTable, Job,
     CreateUsageProfileInput,
@@ -131,6 +141,7 @@ use crate::ops::types::{
     RecrawlPolicy, RegistryId, Schedule,
     SchemaChangePolicy, SchemaId, SecurityConfiguration, SourceControlDetails,
     StartColumnStatisticsTaskRunInput,
+    StartDataQualityRuleRecommendationRunInput,
     StartJobRunInput, StorageDescriptor, Table, TableIdentifier, TableInput, TableVersion,
     UpdateCrawlerInput,
 };
@@ -652,6 +663,16 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// `ListColumnStatisticsTaskRuns` has one deterministic order to page over, and
     /// bounded by [`MAX_COLUMN_STATISTICS_TASK_RUNS`].
     pub column_statistics_task_runs: Vec<ColumnStatisticsTaskRunEntry>,
+    /// Every data quality rule recommendation run this emulator holds, oldest first.
+    ///
+    /// A run lives BESIDE the catalog tree rather than on the table it covers, for the
+    /// same reason a column statistics task run does:
+    /// `GetDataQualityRuleRecommendationRun` addresses one by `RunId` alone, with no
+    /// catalog, database or table member, so the namespace is per account and the data
+    /// source a run covers is recorded ON the run
+    /// ([`DataQualityRuleRecommendationRunEntry`]). Kept in start order and bounded by
+    /// [`MAX_DATA_QUALITY_RULE_RECOMMENDATION_RUNS`].
+    pub data_quality_rule_recommendation_runs: Vec<DataQualityRuleRecommendationRunEntry>,
     /// Every resource policy this emulator holds, keyed by the ARN of the resource it is
     /// attached to, in ARN order.
     ///
@@ -715,6 +736,125 @@ impl ComAmazonawsGlueAwsglueState {
         if self.column_statistics_task_runs.len() > MAX_COLUMN_STATISTICS_TASK_RUNS {
             let overflow = self.column_statistics_task_runs.len() - MAX_COLUMN_STATISTICS_TASK_RUNS;
             self.column_statistics_task_runs.drain(..overflow);
+        }
+    }
+
+    /// Give every data quality rule recommendation run the state the CLOCK already owed
+    /// it at `now`, exactly as [`Self::settle_due_column_statistics_task_runs`] does for a
+    /// statistics run.
+    pub fn settle_due_data_quality_rule_recommendation_runs(&mut self, now: SystemTime) {
+        // A run a cancel asked to stop settles as that stop, whatever its data source
+        // holds, so those are settled first and read no catalog at all.
+        for run in &mut self.data_quality_rule_recommendation_runs {
+            if run.is_stopping() {
+                run.settle_stop_if_due(now);
+            }
+        }
+        // What an ANALYSING run settles into is read off the catalog — the columns the
+        // covered table declares — so the outcome of every run still due is resolved first
+        // and applied afterwards: one walk reads the catalog, the next writes the runs.
+        let outcomes: Vec<(usize, RecommendationRunOutcome)> = self
+            .data_quality_rule_recommendation_runs
+            .iter()
+            .enumerate()
+            .filter(|(_, run)| run.is_due(now))
+            .map(|(index, run)| (index, self.covered_table_outcome(run)))
+            .collect();
+        for (index, outcome) in outcomes {
+            if let Some(run) = self.data_quality_rule_recommendation_runs.get_mut(index) {
+                run.settle(outcome);
+            }
+        }
+    }
+
+    /// What the data source of `run` offers a recommendation run: the columns the covered
+    /// table declares, or the reason there is nothing to analyse.
+    fn covered_table_outcome(
+        &self,
+        run: &DataQualityRuleRecommendationRunEntry,
+    ) -> RecommendationRunOutcome {
+        let Some(database) = self.database(&run.catalog_id, &run.database_name) else {
+            return RecommendationRunOutcome::NothingToAnalyse(messages::database_not_found(
+                &run.database_name,
+            ));
+        };
+        match database.tables.get(&fold_name(&run.table_name)) {
+            Some(table) => RecommendationRunOutcome::Recommended(table_column_names(table)),
+            None => RecommendationRunOutcome::NothingToAnalyse(messages::table_not_found(
+                &run.table_name,
+            )),
+        }
+    }
+
+    /// The stored data quality rule recommendation run with this id, or `None` when this
+    /// account holds no such run.
+    pub fn data_quality_rule_recommendation_run(
+        &self,
+        id: &str,
+    ) -> Option<&DataQualityRuleRecommendationRunEntry> {
+        self.data_quality_rule_recommendation_runs
+            .iter()
+            .find(|run| run.id == id)
+    }
+
+    /// The stored data quality rule recommendation run with this id, mutably: what a cancel
+    /// moves.
+    pub fn data_quality_rule_recommendation_run_mut(
+        &mut self,
+        id: &str,
+    ) -> Option<&mut DataQualityRuleRecommendationRunEntry> {
+        self.data_quality_rule_recommendation_runs
+            .iter_mut()
+            .find(|run| run.id == id)
+    }
+
+    /// The run an earlier start with this `ClientToken` recorded, if one did.
+    ///
+    /// `StartDataQualityRuleRecommendationRunRequest$ClientToken` is "used for idempotency
+    /// … to avoid creating or starting multiple instances of the same resource", so a start
+    /// carrying a token already recorded is the duplicate the service refuses rather than a
+    /// second run.
+    pub fn data_quality_rule_recommendation_run_of_client_token(
+        &self,
+        client_token: &str,
+    ) -> Option<&DataQualityRuleRecommendationRunEntry> {
+        self.data_quality_rule_recommendation_runs
+            .iter()
+            .find(|run| run.client_token.as_deref() == Some(client_token))
+    }
+
+    /// The recommendation run of this data source that has not finished, if one has not.
+    ///
+    /// Call [`Self::settle_due_data_quality_rule_recommendation_runs`] first, or a run the
+    /// clock has already finished still counts as in flight. `database_name` and
+    /// `table_name` are matched folded, the way the catalog stores them.
+    pub fn running_data_quality_rule_recommendation_run(
+        &self,
+        catalog_id: &str,
+        database_name: &str,
+        table_name: &str,
+    ) -> Option<&DataQualityRuleRecommendationRunEntry> {
+        self.data_quality_rule_recommendation_runs.iter().find(|run| {
+            !run.is_terminal()
+                && run.catalog_id == catalog_id
+                && run.database_name == fold_name(database_name)
+                && run.table_name == fold_name(table_name)
+        })
+    }
+
+    /// Append a data quality rule recommendation run, keeping at most
+    /// [`MAX_DATA_QUALITY_RULE_RECOMMENDATION_RUNS`] of them.
+    pub fn record_data_quality_rule_recommendation_run(
+        &mut self,
+        run: DataQualityRuleRecommendationRunEntry,
+    ) {
+        self.data_quality_rule_recommendation_runs.push(run);
+        if self.data_quality_rule_recommendation_runs.len()
+            > MAX_DATA_QUALITY_RULE_RECOMMENDATION_RUNS
+        {
+            let overflow = self.data_quality_rule_recommendation_runs.len()
+                - MAX_DATA_QUALITY_RULE_RECOMMENDATION_RUNS;
+            self.data_quality_rule_recommendation_runs.drain(..overflow);
         }
     }
 
@@ -4682,6 +4822,43 @@ pub mod messages {
     /// requested name.
     pub const REGISTRY_ALREADY_EXISTS: &str = "Registry already exists.";
 
+    /// A data quality rule recommendation run lookup
+    /// (`GetDataQualityRuleRecommendationRun`) for an id no run in this account has. NOT
+    /// recorded: the sentence follows the per-resource template of
+    /// [`column_statistics_task_run_not_found`], built from the requested id, which is the
+    /// whole address of a run.
+    pub fn data_quality_rule_recommendation_run_not_found(run_id: &str) -> String {
+        format!("Data quality rule recommendation run with id {run_id} does not exist")
+    }
+
+    /// `StartDataQualityRuleRecommendationRun` for a data source whose recommendation run
+    /// has not finished. NOT recorded: what is pinned is the behaviour — 400 with the
+    /// operation's modelled `ConflictException` — and the sentence names the table the
+    /// request addressed, the way [`column_statistics_task_already_running`] names its
+    /// table.
+    pub fn data_quality_run_already_running(database_name: &str, table_name: &str) -> String {
+        format!(
+            "A data quality rule recommendation run is already in progress for table \
+             {database_name}.{table_name}"
+        )
+    }
+
+    /// `StartDataQualityRuleRecommendationRun` whose `ClientToken` an earlier start already
+    /// used. RECORDED template: the sentence is fixed and carries the `ClientToken` the
+    /// request itself sent. The start is refused with the operation's modelled
+    /// `ConflictException` — a token stands for ONE start, so the service answers a second
+    /// one carrying it as the duplicate it is rather than starting another run.
+    pub fn idempotent_start_with_token(client_token: &str) -> String {
+        format!("Idempotent start Data Quality run with token {client_token}")
+    }
+
+    /// A data quality run start whose `DataSource` carries neither kind of Glue table. NOT
+    /// recorded: what is pinned is the behaviour — 400 with the operation's modelled
+    /// `InvalidInputException` — and the sentence names the members the input has to carry
+    /// one of, the way [`PARTITION_VALUES_REQUIRED`] names its member.
+    pub const DATA_SOURCE_REQUIRES_A_TABLE: &str =
+        "DataSource must specify either a GlueTable or a DataQualityGlueTable.";
+
     /// A partition create whose `PartitionInput` carries no `Values`. NOT recorded: what
     /// is pinned is the behaviour — `InvalidInputException`, as a per-item error for a
     /// batch create — and the sentence names the member the input has to carry, which is
@@ -5385,3 +5562,394 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsGlueAwsglueState>)
 }
+
+/// The `TaskStatusType` a data quality run is recorded in by a start: of the modelled enum
+/// (`STARTING | RUNNING | STOPPING | STOPPED | SUCCEEDED | FAILED | TIMEOUT`), the one that
+/// says the run has been accepted and nothing has begun analysing the data source yet.
+pub const DATA_QUALITY_RUN_STATE_STARTING: &str = "STARTING";
+/// See [`DATA_QUALITY_RUN_STATE_STARTING`]: the status of a run that finished its
+/// analysis.
+pub const DATA_QUALITY_RUN_STATE_SUCCEEDED: &str = "SUCCEEDED";
+/// See [`DATA_QUALITY_RUN_STATE_STARTING`]: the status of a run that could not finish.
+pub const DATA_QUALITY_RUN_STATE_FAILED: &str = "FAILED";
+/// See [`DATA_QUALITY_RUN_STATE_STARTING`]: the status of a run a cancel has asked to
+/// stop, which still owes the clock the status it stops in.
+pub const DATA_QUALITY_RUN_STATE_STOPPING: &str = "STOPPING";
+/// See [`DATA_QUALITY_RUN_STATE_STARTING`]: the status of a run a cancel stopped.
+pub const DATA_QUALITY_RUN_STATE_STOPPED: &str = "STOPPED";
+
+/// The `TaskStatusType` values a data quality run never moves out of again: of the
+/// modelled enum quoted on [`DATA_QUALITY_RUN_STATE_STARTING`], the ones that name a
+/// finished run. The other three (`STARTING`, `RUNNING`, `STOPPING`) each still owe a
+/// further status.
+pub const TERMINAL_DATA_QUALITY_RUN_STATES: [&str; 4] =
+    ["STOPPED", "SUCCEEDED", "FAILED", "TIMEOUT"];
+
+/// How long a data quality rule recommendation run stays in
+/// [`DATA_QUALITY_RUN_STATE_STARTING`] before the clock owes it its terminal status.
+///
+/// CHOSEN, not documented: Glue publishes no duration for a recommendation run, so this is
+/// the emulator's own span — deliberately not zero, so a caller that reads
+/// `GetDataQualityRuleRecommendationRun` straight after starting one still observes the run
+/// in flight, and the refusal that goes with a run in flight. The due instant is stored on
+/// the run and materialised by whichever later call reads it; nothing sleeps.
+pub const DATA_QUALITY_RULE_RECOMMENDATION_RUN_SETTLES_AFTER: Duration =
+    Duration::from_millis(500);
+
+/// The `NumberOfWorkers` a recommendation run uses when the start names none: "The number
+/// of G.1X workers to be used in the run. The default is 5."
+/// (`StartDataQualityRuleRecommendationRunRequest$NumberOfWorkers`).
+pub const DEFAULT_DATA_QUALITY_RUN_WORKERS: i32 = 5;
+
+/// The `Timeout` in minutes a recommendation run uses when the start names none: "The
+/// default is 2,880 minutes (48 hours)."
+/// (`StartDataQualityRuleRecommendationRunRequest$Timeout`).
+pub const DEFAULT_DATA_QUALITY_RUN_TIMEOUT_MINUTES: i32 = 2_880;
+
+/// The `RecommendationMode` a recommendation run uses when the start names none: "The mode
+/// that Glue Data Quality uses to recommend rules. The default is `BASIC`."
+/// (`StartDataQualityRuleRecommendationRunRequest$RecommendationMode`).
+pub const DEFAULT_RECOMMENDATION_MODE: &str = "BASIC";
+
+/// How many data quality rule recommendation runs this account keeps.
+///
+/// CHOSEN: the emulator's own window, for the same reason as
+/// [`MAX_COLUMN_STATISTICS_TASK_RUNS`] — it bounds
+/// [`ComAmazonawsGlueAwsglueState::data_quality_rule_recommendation_runs`] and every walk
+/// over it. The OLDEST record is dropped first. (Glue documents that "recommendation runs
+/// are automatically deleted after 90 days", which is a retention this process never
+/// reaches.)
+pub const MAX_DATA_QUALITY_RULE_RECOMMENDATION_RUNS: usize = 100;
+
+/// How many data quality rule recommendation run ids this process has minted. A nonce
+/// source for [`new_data_quality_rule_recommendation_run_id`], exactly as
+/// [`MINTED_COLUMN_STATISTICS_TASK_RUN_IDS`] is for a statistics run id.
+static MINTED_DATA_QUALITY_RULE_RECOMMENDATION_RUN_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh `RunId`: the id the service assigns a data quality rule recommendation run when
+/// it starts.
+///
+/// 32 lowercase hexadecimal characters, i.e. 128 bits, which is inside `HashString`'s
+/// `length 1..255`. The bits come from [`mint_hex_id`], so two runs started in the same
+/// nanosecond cannot be given the same id. It is stored on the run, so every later read of
+/// that run reports the same id.
+///
+/// This names a RESOURCE, not a credential: a credential would come from the credential
+/// store, never from here.
+pub fn new_data_quality_rule_recommendation_run_id() -> String {
+    mint_hex_id(
+        &MINTED_DATA_QUALITY_RULE_RECOMMENDATION_RUN_IDS,
+        DATA_QUALITY_RUN_ID_WORDS,
+    )
+}
+
+/// How many 64-bit words a data quality run id carries: two, i.e. 128 bits rendered as 32
+/// lowercase hexadecimal characters.
+const DATA_QUALITY_RUN_ID_WORDS: usize = 2;
+
+/// What the data source of a due recommendation run offers it: either the columns the
+/// covered table declares, which is what the run recommends rules over, or the reason the
+/// catalog offers it nothing to analyse.
+#[derive(Debug, Clone)]
+pub enum RecommendationRunOutcome {
+    /// The covered table is stored and declares these columns, in the order it declares
+    /// them.
+    Recommended(Vec<String>),
+    /// The catalog holds no such database or table, so the run has nothing to analyse and
+    /// finishes carrying this reason.
+    NothingToAnalyse(String),
+}
+
+/// The data source (a catalog table) a data quality run covers, as the request's
+/// `DataSource` named it.
+///
+/// `DataSource` carries either a `GlueTable` ("An Glue table") or a
+/// `DataQualityGlueTable` ("An Glue table for Data Quality Operations"), both of which
+/// address a table by `DatabaseName` and `TableName` (`@required` on each) inside an
+/// optional `CatalogId` — so the table a run covers is read out of whichever of the two the
+/// request carried.
+#[derive(Debug, Clone)]
+pub struct DataSourceTable {
+    /// `GlueTable$CatalogId`/`DataQualityGlueTable$CatalogId`, as named.
+    pub catalog_id: Option<String>,
+    /// The database name as the request spelled it.
+    pub database_name: String,
+    /// The table name as the request spelled it.
+    pub table_name: String,
+}
+
+/// The table `data_source` addresses, or `None` when it addresses neither kind of table.
+///
+/// A `DataSource` that carries both is read as the plain `GlueTable` it names: that member
+/// is the one every data quality operation documents as "an Glue table", and the other adds
+/// only data-quality processing options on top of the same address.
+pub fn data_source_table(data_source: &DataSource) -> Option<DataSourceTable> {
+    if let Some(table) = data_source.glue_table.as_ref() {
+        return Some(DataSourceTable {
+            catalog_id: table.catalog_id.clone(),
+            database_name: table.database_name.clone(),
+            table_name: table.table_name.clone(),
+        });
+    }
+    data_source
+        .data_quality_glue_table
+        .as_ref()
+        .map(|table| DataSourceTable {
+            catalog_id: table.catalog_id.clone(),
+            database_name: table.database_name.clone(),
+            table_name: table.table_name.clone(),
+        })
+}
+
+/// One data quality rule recommendation run, as `StartDataQualityRuleRecommendationRun`
+/// recorded it.
+///
+/// A run carries the data source it covers and the configuration the request named — with
+/// each member the request left unset filled in with the default the model documents for it
+/// — plus the members only a run has: its id, its status, the instants it moved between
+/// statuses and the ruleset it recommended.
+#[derive(Debug, Clone)]
+pub struct DataQualityRuleRecommendationRunEntry {
+    /// `RunId`, minted by [`new_data_quality_rule_recommendation_run_id`].
+    pub id: String,
+    /// The `DataSource` the start named, reported back as it arrived.
+    pub data_source: DataSource,
+    /// The catalog the covered table was resolved in, as [`resolve_catalog_id`] resolved
+    /// it.
+    pub catalog_id: String,
+    /// The covered database's name, folded the way the catalog stores it.
+    pub database_name: String,
+    /// The covered table's name, folded the way the catalog stores it.
+    pub table_name: String,
+    /// `Role`: "The IAM role that Glue assumes to access resources for the run."
+    pub role: String,
+    /// `NumberOfWorkers`, defaulting to [`DEFAULT_DATA_QUALITY_RUN_WORKERS`].
+    pub number_of_workers: i32,
+    /// `Timeout` in minutes, defaulting to
+    /// [`DEFAULT_DATA_QUALITY_RUN_TIMEOUT_MINUTES`].
+    pub timeout: i32,
+    /// `CreatedRulesetName`: "A name for the ruleset" the run creates, absent when the
+    /// start named none.
+    pub created_ruleset_name: Option<String>,
+    /// `DataQualitySecurityConfiguration`, as the start named it.
+    pub data_quality_security_configuration: Option<String>,
+    /// The `ClientToken` the start carried, which is what makes a repeat of that start
+    /// answer this run instead of starting another.
+    pub client_token: Option<String>,
+    /// `AdditionalRunOptions`, as the start named them.
+    pub additional_run_options: Option<DataQualityRuleRecommendationRunAdditionalRunOptions>,
+    /// `RecommendationMode`, defaulting to [`DEFAULT_RECOMMENDATION_MODE`].
+    pub recommendation_mode: String,
+    /// One of the modelled `TaskStatusType` values.
+    pub status: String,
+    /// The instant the clock owes this run its next status; `None` once it has settled.
+    pub settles_at: Option<SystemTime>,
+    /// `StartedOn`: "The date and time when this run started."
+    pub started_on: SystemTime,
+    /// `LastModifiedOn`: "The last point in time when this data quality rule
+    /// recommendation run was modified."
+    pub last_modified_on: SystemTime,
+    /// `CompletedOn`: "The date and time when this run was completed", absent until the run
+    /// has finished.
+    pub completed_on: Option<SystemTime>,
+    /// `RecommendedRuleset`: the rules the finished run recommends, in DQDL, absent until
+    /// it has finished and when it recommended none.
+    pub recommended_ruleset: Option<String>,
+    /// `ErrorString`: "The error strings that are associated with the run", absent unless
+    /// the run failed.
+    pub error_string: Option<String>,
+}
+
+impl DataQualityRuleRecommendationRunEntry {
+    /// Record a run of the data source the `StartDataQualityRuleRecommendationRun` request
+    /// names, in [`DATA_QUALITY_RUN_STATE_STARTING`] with its next status due
+    /// [`DATA_QUALITY_RULE_RECOMMENDATION_RUN_SETTLES_AFTER`] out.
+    ///
+    /// `catalog_id` is the catalog the data source resolved in, and `table` the address it
+    /// carried.
+    pub fn start(
+        input: &StartDataQualityRuleRecommendationRunInput,
+        table: &DataSourceTable,
+        catalog_id: &str,
+        id: String,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            id,
+            data_source: input.data_source.clone(),
+            catalog_id: catalog_id.to_string(),
+            database_name: fold_name(&table.database_name),
+            table_name: fold_name(&table.table_name),
+            role: input.role.clone(),
+            number_of_workers: input
+                .number_of_workers
+                .unwrap_or(DEFAULT_DATA_QUALITY_RUN_WORKERS),
+            timeout: input
+                .timeout
+                .unwrap_or(DEFAULT_DATA_QUALITY_RUN_TIMEOUT_MINUTES),
+            created_ruleset_name: input.created_ruleset_name.clone(),
+            data_quality_security_configuration: input.data_quality_security_configuration.clone(),
+            client_token: input.client_token.clone(),
+            additional_run_options: input.additional_run_options.clone(),
+            recommendation_mode: input
+                .recommendation_mode
+                .clone()
+                .unwrap_or_else(|| DEFAULT_RECOMMENDATION_MODE.to_string()),
+            status: DATA_QUALITY_RUN_STATE_STARTING.to_string(),
+            settles_at: Some(
+                now.checked_add(DATA_QUALITY_RULE_RECOMMENDATION_RUN_SETTLES_AFTER)
+                    .unwrap_or(now),
+            ),
+            started_on: now,
+            last_modified_on: now,
+            completed_on: None,
+            // Nothing has been analysed yet, and nothing has failed.
+            recommended_ruleset: None,
+            error_string: None,
+        }
+    }
+
+    /// Whether this run has finished, by [`TERMINAL_DATA_QUALITY_RUN_STATES`].
+    pub fn is_terminal(&self) -> bool {
+        TERMINAL_DATA_QUALITY_RUN_STATES.contains(&self.status.as_str())
+    }
+
+    /// Whether the clock owed this run its next status at `now`.
+    pub fn is_due(&self, now: SystemTime) -> bool {
+        self.settles_at.is_some_and(|due| due <= now)
+    }
+
+    /// Whether a cancel has asked this run to stop, so what it settles into is that stop
+    /// rather than anything its data source holds.
+    pub fn is_stopping(&self) -> bool {
+        self.status == DATA_QUALITY_RUN_STATE_STOPPING
+    }
+
+    /// How long the run consumed resources, in whole seconds: `ExecutionTime`, "the amount
+    /// of time (in seconds) that the run consumed resources", which is the span between the
+    /// instant it started and the instant it completed. A run still in flight has consumed
+    /// no completed time, so it reports the member's own default of 0.
+    pub fn execution_time_seconds(&self) -> i32 {
+        self.completed_on
+            .and_then(|completed| completed.duration_since(self.started_on).ok())
+            .map_or(0, |consumed| {
+                i32::try_from(consumed.as_secs()).unwrap_or(i32::MAX)
+            })
+    }
+
+    /// Close this run at the DUE instant the clock set for it, and answer that instant;
+    /// `None` when the clock owed it nothing, in which case nothing is written.
+    ///
+    /// The instants recorded are that DUE instant rather than the instant somebody read it,
+    /// so two reads of a settled run report the same run.
+    fn close_at_due_instant(&mut self) -> Option<SystemTime> {
+        let due = self.settles_at?;
+        self.settles_at = None;
+        self.completed_on = Some(due);
+        self.last_modified_on = due;
+        Some(due)
+    }
+
+    /// Move this run into the status the clock owed it, given what its data source offers.
+    ///
+    /// The run was due to leave [`DATA_QUALITY_RUN_STATE_STARTING`] at
+    /// [`Self::settles_at`] whether or not anybody called. A run a cancel asked to stop
+    /// settles through [`Self::settle_stop_if_due`] instead, which consults no data source.
+    pub fn settle(&mut self, outcome: RecommendationRunOutcome) {
+        if self.close_at_due_instant().is_none() {
+            return;
+        }
+        match outcome {
+            RecommendationRunOutcome::Recommended(columns) => {
+                self.status = DATA_QUALITY_RUN_STATE_SUCCEEDED.to_string();
+                self.recommended_ruleset = recommended_ruleset(&columns);
+            }
+            RecommendationRunOutcome::NothingToAnalyse(reason) => {
+                self.status = DATA_QUALITY_RUN_STATE_FAILED.to_string();
+                self.error_string = Some(reason);
+            }
+        }
+    }
+
+    /// Settle a run a cancel asked to stop, once the stop the clock owed it is due: it
+    /// finishes [`DATA_QUALITY_RUN_STATE_STOPPED`], having analysed nothing further, so its
+    /// data source is never consulted and it recommends no ruleset.
+    pub fn settle_stop_if_due(&mut self, now: SystemTime) {
+        if !self.is_due(now) || self.close_at_due_instant().is_none() {
+            return;
+        }
+        self.status = DATA_QUALITY_RUN_STATE_STOPPED.to_string();
+    }
+
+    /// Ask this run to stop, as `CancelDataQualityRuleRecommendationRun` does, and answer
+    /// whether it was still running.
+    ///
+    /// A run in flight moves into [`DATA_QUALITY_RUN_STATE_STOPPING`] and the clock owes it
+    /// [`DATA_QUALITY_RUN_STATE_STOPPED`] one span later, so the stop is observable while it
+    /// drains. A run that has already finished is left exactly as it is.
+    pub fn cancel(&mut self, now: SystemTime) -> bool {
+        if self.is_terminal() {
+            return false;
+        }
+        self.status = DATA_QUALITY_RUN_STATE_STOPPING.to_string();
+        self.last_modified_on = now;
+        self.settles_at = Some(
+            now.checked_add(DATA_QUALITY_RULE_RECOMMENDATION_RUN_SETTLES_AFTER)
+                .unwrap_or(now),
+        );
+        true
+    }
+}
+
+/// The most bytes a recommended ruleset may carry: the model's own `length 1..65536` on
+/// `DataQualityRulesetString`, the shape
+/// `GetDataQualityRuleRecommendationRunResponse$RecommendedRuleset` targets. A table wide
+/// enough to overrun it is recommended as many rules as fit and no more, so the member
+/// stays inside the constraint it is modelled with.
+pub const MAX_DATA_QUALITY_RULESET_BYTES: usize = 65_536;
+
+/// How a DQDL rule list opens, and how it closes.
+const DQDL_RULES_PREFIX: &str = "Rules = [\n";
+/// See [`DQDL_RULES_PREFIX`].
+const DQDL_RULES_SUFFIX: &str = "\n]";
+
+/// The ruleset a finished recommendation run recommends over a table that declares
+/// `columns`, in DQDL — "when a start rule recommendation run completes, it creates a
+/// recommended ruleset (a set of rules). This member has those rules in Data Quality
+/// Definition Language (DQDL) format"
+/// (`GetDataQualityRuleRecommendationRunResponse$RecommendedRuleset`).
+///
+/// The rules are computed from the SCHEMA the catalog holds for the covered table: one
+/// `ColumnExists` rule per column the table declares, in the order it declares them. This
+/// emulator holds the Glue CONTROL plane and reads none of the objects behind the table, so
+/// it profiles no data and a rule whose truth depends on the DATA (a row count, a
+/// completeness, a uniqueness or a value range — which is most of what a real recommendation
+/// run proposes) is deliberately not recommended: what the run recommends is what the stored
+/// schema actually supports. A table that declares no columns yields no rules at all, and so
+/// no ruleset.
+///
+/// A quote inside a column name is escaped, so one name can never end the string its rule
+/// sits in, and rules stop being added once the next one would carry the ruleset past
+/// [`MAX_DATA_QUALITY_RULESET_BYTES`].
+pub fn recommended_ruleset(columns: &[String]) -> Option<String> {
+    let mut rules = String::new();
+    for column in columns {
+        let rule = format!("    ColumnExists \"{}\"", column.replace('"', "\\\""));
+        let separator = if rules.is_empty() { "" } else { ",\n" };
+        let would_carry = DQDL_RULES_PREFIX.len()
+            + rules.len()
+            + separator.len()
+            + rule.len()
+            + DQDL_RULES_SUFFIX.len();
+        if would_carry > MAX_DATA_QUALITY_RULESET_BYTES {
+            break;
+        }
+        rules.push_str(separator);
+        rules.push_str(&rule);
+    }
+    if rules.is_empty() {
+        return None;
+    }
+    Some(format!("{DQDL_RULES_PREFIX}{rules}{DQDL_RULES_SUFFIX}"))
+}
+

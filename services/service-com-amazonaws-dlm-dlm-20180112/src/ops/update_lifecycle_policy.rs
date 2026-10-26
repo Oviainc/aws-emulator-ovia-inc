@@ -94,6 +94,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The request-body half of the `[Default policies only]` parameter set, read
+// through the one trait `state.rs` declares for it.
+use crate::state::DefaultPolicyOnlyBody;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -226,7 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exist before its kind can be read) and before the first write, so a
         // refused update leaves the stored policy exactly as it was.
         if !policy.default_policy {
-            let mut refused = default_policy_only_body_parameters(&input).stated_names("");
+            let mut refused = input.default_policy_only_body_parameters().stated_names("");
             refused.extend(
                 crate::state::DefaultPolicyOnlyParameters::in_policy_details(
                     input.policy_details.as_ref(),
@@ -269,7 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stating the configuration twice leaves no record holding two copies of
         // it.
         if policy.default_policy && input.policy_details.is_some() {
-            let duplicated = default_policy_only_body_parameters(&input).stated_names("");
+            let duplicated = input.default_policy_only_body_parameters().stated_names("");
             if !duplicated.is_empty() {
                 return Err(
                     UpdateLifecyclePolicyErrorModeled::InvalidRequestException(
@@ -390,32 +394,5 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         policy.date_modified = now;
 
         Ok(UpdateLifecyclePolicyOutput {})
-    }
-}
-
-/// The `[Default policies only]` parameters this request states in the request
-/// BODY, as against inside its `PolicyDetails` structure.
-///
-/// The ONE place this operation maps its request-body members onto that set, so
-/// the refusal of a default-only parameter and the "either in the request body,
-/// or in the PolicyDetails request structure, but not both" rule read the same
-/// list — as `create_lifecycle_policy.rs` does for the create's own input.
-///
-/// `PolicyDetails$ResourceType` has no request-body counterpart to read: the
-/// resource type is not something an update may change, so the update refuses a
-/// configuration naming a different one
-/// ([`crate::state::resource_type_cannot_be_updated`]) rather than reading it as
-/// an alternative form of some body member.
-fn default_policy_only_body_parameters(
-    input: &UpdateLifecyclePolicyInput,
-) -> crate::state::DefaultPolicyOnlyParameters {
-    crate::state::DefaultPolicyOnlyParameters {
-        resource_type: false,
-        create_interval: input.create_interval.is_some(),
-        retain_interval: input.retain_interval.is_some(),
-        copy_tags: input.copy_tags.is_some(),
-        cross_region_copy_targets: input.cross_region_copy_targets.is_some(),
-        extend_deletion: input.extend_deletion.is_some(),
-        exclusions: input.exclusions.is_some(),
     }
 }

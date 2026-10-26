@@ -210,36 +210,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The log group the export reads is resolved FIRST: a group this account does not
         // hold is the more specific client error, and resolution must not mint a task id.
-        let Some(group_created_at_ms) = store
-            .log_groups
-            .get(&input.log_group_name)
-            .map(|group| group.creation_time_ms)
-        else {
+        if !store.log_groups.contains_key(&input.log_group_name) {
             return Err(CreateExportTaskErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::resource_not_found_message("log group")),
                 },
             )
             .into());
-        };
-
-        // The window is `[from, to]` over event timestamps ("Events with a timestamp earlier
-        // than this time are not exported" / "later than this time are not exported"), so a
-        // window whose end precedes its start spans nothing and is refused rather than
-        // exported as empty. The sentence names the two members that bound it and
-        // interpolates neither of their values.
-        if input.to < input.from {
-            return Err(invalid(
-                crate::state::EXPORT_REVERSED_TIME_RANGE_MESSAGE.to_string(),
-            ));
         }
-        // "You must specify a time that is not earlier than when this log group was created"
-        // (`CreateExportTask$to`).
-        if input.to < group_created_at_ms {
-            return Err(invalid(
-                "The parameter to must not be earlier than when the log group was created."
-                    .to_string(),
-            ));
+
+        // The window is `[from, to]` over EVENT TIMESTAMPS ("Events with a timestamp earlier
+        // than this time are not exported" / "later than this time are not exported"), so it
+        // is a filter over the events the log group holds and not a constraint against the
+        // group itself: a window wholly in the past of the group's own creation exports the
+        // events whose timestamp falls in it, whether that is all of them or none. The one
+        // window that is no window at all is the one whose end precedes its start, which spans
+        // no instant; the service refuses it naming the window it was sent.
+        if input.to < input.from {
+            return Err(invalid(crate::state::export_time_range_message(
+                input.from, input.to,
+            )));
         }
 
         // "Each account can only have one active (RUNNING or PENDING) export task at a
