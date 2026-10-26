@@ -304,7 +304,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut component_summaries = Vec::new();
         for listed in remaining.by_ref().take(page_size) {
-            component_summaries.push(listed.summary(&status));
+            component_summaries.push(listed.summary(workspace, &status));
         }
         // The token the next call resumes at: the first component this page left
         // over. Absent on the last page, which is how a caller knows to stop.
@@ -347,11 +347,15 @@ impl Listed<'_> {
     /// record with `status` — the holding entity's, since a component has none
     /// of its own.
     ///
-    /// `definedIn` and `syncSource` are absent for the reasons `GetEntity` omits
-    /// them from the same component: this service resolves no inheritance from a
-    /// component type (every `isInherited` it reports is false), and an entity it
-    /// created is not projected from a linked service.
-    fn summary(&self, status: &Status) -> ComponentSummary {
+    /// `propertyGroups` and `definedIn` are resolved against `workspace` the
+    /// same way `GetEntity` resolves them for the same component: naming a
+    /// `componentTypeId` is what gives a component that type's groups, so a
+    /// group the entity never restated is reported here too and marked
+    /// `isInherited`, and `definedIn` names the component type the inherited
+    /// definition set came from. `syncSource` is absent for the reason
+    /// `GetEntity` omits it: an entity this service created is not projected
+    /// from a linked service.
+    fn summary(&self, workspace: &crate::state::Workspace, status: &Status) -> ComponentSummary {
         match self {
             Self::Component(component) => ComponentSummary {
                 component_name: component.component_name.clone(),
@@ -361,9 +365,14 @@ impl Listed<'_> {
                 // reports the components the entity holds rather than hiding the
                 // ones whose create named no component type.
                 component_type_id: component.component_type_id.clone().unwrap_or_default(),
-                defined_in: None,
+                defined_in: workspace
+                    .component_defined_in(component.component_type_id.as_deref()),
                 description: component.description.clone(),
-                property_groups: Some(property_groups(&component.property_groups)),
+                property_groups: Some(property_groups(
+                    workspace,
+                    component.component_type_id.as_deref(),
+                    &component.property_groups,
+                )),
                 status: status.clone(),
                 sync_source: None,
                 // Absent for a top-level component: `componentPath` is the path
@@ -376,9 +385,13 @@ impl Listed<'_> {
             Self::Composite(composite) => ComponentSummary {
                 component_name: composite.component_name.clone(),
                 component_type_id: composite.component_type_id.clone(),
-                defined_in: None,
+                defined_in: workspace.component_defined_in(Some(&composite.component_type_id)),
                 description: composite.description.clone(),
-                property_groups: Some(property_groups(&composite.property_groups)),
+                property_groups: Some(property_groups(
+                    workspace,
+                    Some(&composite.component_type_id),
+                    &composite.property_groups,
+                )),
                 status: status.clone(),
                 sync_source: None,
                 // The whole path the composite component was created by, which
@@ -444,21 +457,17 @@ fn components_under<'a>(
     )
 }
 
-/// The stored property groups of one component as the modelled map a summary
-/// carries, through the one projection every reader of a component's property
-/// groups shares ([`crate::state::component_property_group_response`]).
+/// The property groups one component HAS as the modelled map a summary carries,
+/// through the one projection every reader of a component's property groups
+/// shares ([`crate::state::component_property_groups_response`]): the groups the
+/// component declares itself plus the ones the component type it instantiates
+/// gives it, each marked `isInherited` as it was resolved.
 fn property_groups(
+    workspace: &crate::state::Workspace,
+    component_type_id: Option<&str>,
     groups: &::std::collections::BTreeMap<String, crate::state::PropertyGroupRecord>,
 ) -> ::std::collections::HashMap<String, ComponentPropertyGroupResponse> {
-    groups
-        .iter()
-        .map(|(group_name, group)| {
-            (
-                group_name.clone(),
-                crate::state::component_property_group_response(group),
-            )
-        })
-        .collect()
+    crate::state::component_property_groups_response(workspace, component_type_id, groups)
 }
 
 /// The top of the `maxResults` member's modelled `range` (0..200), which is the

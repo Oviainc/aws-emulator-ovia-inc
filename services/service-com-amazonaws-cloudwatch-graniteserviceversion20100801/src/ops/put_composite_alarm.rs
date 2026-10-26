@@ -334,12 +334,12 @@ fn write_composite_alarm(
     // "The name for the composite alarm. This name must be unique within the Region."
     // (`PutCompositeAlarmInput$AlarmName`) — one name names ONE alarm, so a name another kind
     // of alarm already holds cannot also name a composite alarm.
-    if let Some(kind) = store
+    if store
         .alarm_kind(&input.alarm_name)
-        .filter(|kind| *kind != crate::state::ALARM_TYPE_COMPOSITE)
+        .is_some_and(|kind| kind != crate::state::ALARM_TYPE_COMPOSITE)
     {
         return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-            "a {kind} named {} already exists in this Region",
+            "AlarmName [{}] is already used by another alarm of a different type",
             input.alarm_name
         )));
     }

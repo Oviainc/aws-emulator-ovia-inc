@@ -16,7 +16,8 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     AccountScope, AdminAccountSummary, AdminScope, AppsListData, AppsListDataSummary,
     ComplianceViolator,
-    DiscoveredResource, EvaluationResult, OrganizationalUnitScope, Policy, PolicyComplianceStatus,
+    DiscoveredResource, EvaluationResult, InvalidOperationException, OrganizationalUnitScope,
+    Policy, PolicyComplianceStatus,
     PolicySummary, PolicyTypeScope, ProtocolsListData, ProtocolsListDataSummary, RegionScope,
     ResourceNotFoundException, ResourceSet, ResourceSetSummary, Tag,
 };
@@ -1536,6 +1537,49 @@ impl ComAmazonawsFmsAwsfms20180101State {
         } else {
             POLICY_STATUS_OUT_OF_ADMIN_SCOPE
         }
+    }
+
+    /// Why the caller may not EDIT or DELETE this stored policy, or `None` when
+    /// it may — the modelled refusal that follows from the status
+    /// [`Self::policy_status`] derives, built in ONE place so every mutating
+    /// reader of a policy refuses on the same rule and with the same wording.
+    ///
+    /// The two `CustomerPolicyStatus` values say what the administrator governing
+    /// a policy may DO with it, not merely what a reader is told:
+    /// [`POLICY_STATUS_ACTIVE`] is "the administrator can manage and delete the
+    /// policy", while [`POLICY_STATUS_OUT_OF_ADMIN_SCOPE`] is "the administrator
+    /// can view the policy, but they can't edit or delete the policy. Existing
+    /// policy protections stay in place" (`Policy$PolicyStatus`). So a policy
+    /// reported out of the governing administrative scope is readable but
+    /// IMMUTABLE: editing its document and removing it are both refused, and the
+    /// protections it already applies are left exactly as they are.
+    ///
+    /// `InvalidOperationException` — "the operation failed because … the
+    /// operation wasn't possible" — is the modelled refusal, declared by every
+    /// operation that edits or deletes a policy, so the refusal needs no
+    /// unmodelled shape. The message names the policy, the administrator whose
+    /// scope does not cover it and the status that follows, which is what the
+    /// caller needs to widen the scope (`PutAdminAccount`) and retry.
+    ///
+    /// Judged per CALL, from the derived status rather than from a stored flag,
+    /// so widening the administrator's scope makes the policy editable again
+    /// without the policy being touched.
+    pub fn policy_mutation_refusal(
+        &self,
+        record: &PolicyRecord,
+    ) -> Option<InvalidOperationException> {
+        if self.policy_status(record) != POLICY_STATUS_OUT_OF_ADMIN_SCOPE {
+            return None;
+        }
+        Some(InvalidOperationException {
+            message: Some(format!(
+                "policy {} is {POLICY_STATUS_OUT_OF_ADMIN_SCOPE} for Firewall Manager \
+                 administrator {}: the administrator can view the policy, but they can't edit \
+                 or delete the policy",
+                record.policy_id,
+                ::engine::emulator_account_id()
+            )),
+        })
     }
 
     /// The `PolicyComplianceStatus` of ONE member account under ONE stored
