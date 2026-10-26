@@ -210,13 +210,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // region's inventory and of no other's, so that is where the identifier is
         // resolved — one region's endpoint cannot change another region's quote.
         let region = crate::state::request_region(ctx.parts());
-        // `QuoteIdentifier` accepts the bare id or the full quote ARN; both name the
-        // same stored record.
-        let quote_id = crate::state::resolve_quote_id(&input.quote_identifier).ok_or_else(|| {
-            UpdateQuoteErrorModeled::ValidationException(ValidationException {
-                message: Some(crate::state::quote_identifier_pattern_report()),
-            })
-        })?;
+        // `QuoteIdentifier` accepts the bare id or the full quote ARN. A bare id names
+        // a quote of the inventory this endpoint serves; an ARN carries a partition, a
+        // Region and an account of its own, and one that is not this endpoint's names
+        // no quote it holds — so it changes nothing here.
+        let quote_id = crate::state::resolve_quote_id(&input.quote_identifier, &region)
+            .ok_or_else(|| {
+                UpdateQuoteErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::quote_identifier_pattern_report()),
+                })
+            })?
+            .here()
+            .ok_or_else(|| quote_not_found(&input.quote_identifier))?
+            .to_string();
 
         let mut store = state.lock();
         // This call reports the quote it updated, so it reports the status that quote
@@ -237,25 +243,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => Association::Unchanged,
             Some("") => Association::Removed,
             Some(supplied) => {
-                let outpost_id = crate::state::resolve_outpost_id(supplied).ok_or_else(|| {
-                    UpdateQuoteErrorModeled::ValidationException(ValidationException {
-                        message: Some(crate::state::outpost_identifier_pattern_report()),
-                    })
-                })?;
-                // A quote may be associated only with an Outpost that exists, in the
-                // region this request is addressed to: one of another region is not
-                // part of this region's inventory. The ARN the quote reports is that
-                // Outpost's OWN `OutpostArn`, whichever identifier form named it.
-                let outpost = store.outpost(&region, &outpost_id).ok_or_else(|| {
+                // How this operation states that the `OutpostIdentifier` names no
+                // Outpost this endpoint holds: the identifier echo names the member
+                // the identifier arrived in and echoes the value AS SUPPLIED.
+                let outpost_not_found = || {
                     UpdateQuoteErrorModeled::NotFoundException(NotFoundException {
-                        // The identifier echo names the member the absent identifier
-                        // arrived in and echoes the value AS SUPPLIED.
                         message: Some(crate::state::identifier_not_found(
                             crate::state::OUTPOST_IDENTIFIER_MEMBER,
                             supplied,
                         )),
                     })
-                })?;
+                };
+                // A bare id names an Outpost of the inventory this endpoint serves; an
+                // ARN carries a partition, a Region and an account of its own, and one
+                // that is not this endpoint's names no Outpost it holds.
+                let outpost_id = crate::state::resolve_outpost_id(supplied, &region)
+                    .ok_or_else(|| {
+                        UpdateQuoteErrorModeled::ValidationException(ValidationException {
+                            message: Some(crate::state::outpost_identifier_pattern_report()),
+                        })
+                    })?
+                    .here()
+                    .ok_or_else(outpost_not_found)?
+                    .to_string();
+                // A quote may be associated only with an Outpost that exists, in the
+                // region this request is addressed to: one of another region is not
+                // part of this region's inventory. The ARN the quote reports is that
+                // Outpost's OWN `OutpostArn`, whichever identifier form named it.
+                let outpost = store
+                    .outpost(&region, &outpost_id)
+                    .ok_or_else(outpost_not_found)?;
                 // An Outpost this store holds always carries the ARN its create
                 // minted, so an Outpost without one is this service's own invariant
                 // broken — reported as the server error it is, never as a not-found
@@ -330,7 +347,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .quote
             .outpost_arn
             .as_deref()
-            .and_then(crate::state::resolve_outpost_id);
+            .and_then(crate::state::outpost_id_in_arn)
+            .map(str::to_string);
 
         let derived_options = match reprice {
             true => Some(store.quote_options(

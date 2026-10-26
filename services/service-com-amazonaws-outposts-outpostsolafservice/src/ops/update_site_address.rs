@@ -181,15 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(crate::state::address_type_value_report()),
                 })
             })?;
-        // `SiteId` accepts the bare id or the full site ARN; both name the same
-        // stored record.
-        let site_id = crate::state::resolve_site_id(&input.site_id).ok_or_else(|| {
-            UpdateSiteAddressErrorModeled::ValidationException(ValidationException {
-                message: Some(crate::state::site_id_pattern_report()),
-            })
-        })?;
-
-        // How this operation states that the `SiteId` names no site this store
+        // How this operation states that the `SiteId` names no site this endpoint
         // holds: the identifier echo of the value AS SUPPLIED — not of `site_id`,
         // which is the bare id an ARN resolved to.
         let not_found = || {
@@ -200,6 +192,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             })
         };
+        // `SiteId` accepts the bare id or the full site ARN. A bare id names a site of
+        // the inventory this endpoint serves; an ARN carries a partition, a Region and
+        // an account of its own, and one that is not this endpoint's names no site it
+        // holds — so it changes nothing here.
+        let site_id = crate::state::resolve_site_id(&input.site_id, &region)
+            .ok_or_else(|| {
+                UpdateSiteAddressErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::site_id_pattern_report()),
+                })
+            })?
+            .here()
+            .ok_or_else(not_found)?
+            .to_string();
 
         let mut store = state.lock();
         // Whether an order is still in progress depends on the status it holds NOW,
