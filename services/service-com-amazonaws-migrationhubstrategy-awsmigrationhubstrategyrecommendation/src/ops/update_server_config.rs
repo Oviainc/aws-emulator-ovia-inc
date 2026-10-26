@@ -12,6 +12,13 @@
 //! names no `strategyOption` (or one whose every strategy member is absent, so it selects
 //! nothing) changes nothing and leaves the preference exactly as it was.
 //!
+//! The update is applied to the portfolio the CLOCK has already produced: every completion
+//! this account's tasks were owed at the instant of the call is materialised first
+//! ([`crate::state::RegionState::settle_all`]) — owed then even if nobody had called — so
+//! the server this call looks up is the one the clock has already brought into the
+//! inventory, and work the clock owed is computed from the records as they stood when it
+//! fell due rather than from what this call stores.
+//!
 //! A `serverId` that names no server of the portfolio is refused with the modelled 404
 //! `ResourceNotFoundException`, and a `strategyOption` whose `strategy`, `targetDestination`
 //! or `toolName` is not a value its enumeration declares — the boundary validator lets
@@ -203,7 +210,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let preference = preference_of(input.strategy_option)?;
 
         let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // Before anything is read or written: materialise what the clock already owed this
+        // portfolio at this same instant even if nobody had called — the terminal status
+        // of each task whose span has passed, and the analysis an assessment's completion
+        // stands for — so the clock-owed work is computed from the records as they stood
+        // when it fell due and this update lands on the portfolio the clock has already
+        // produced.
+        if let Some(portfolio) = store.region_mut(&region) {
+            portfolio.settle_all(now);
+        }
         // The update applies to a server of THIS account's portfolio in the Region the
         // request was signed for: an id naming none is reported as the missing resource
         // it is, never silently created.

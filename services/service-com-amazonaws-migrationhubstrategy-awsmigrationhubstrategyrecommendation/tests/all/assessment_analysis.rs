@@ -106,11 +106,15 @@ const DATABASE_MANAGEMENT_PREFERENCES: &[&str] = &["AWS-managed", "Self-manage",
 
 /// What one analysis must have recommended for one resource: the three members
 /// `RecommendationSet` declares.
+///
+/// `pub(crate)` so the suite beside this one — the ordering a write of the analysis inputs
+/// has to keep — asserts the same recommendation against the same table rather than
+/// standing up a second copy of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Expected {
-    strategy: &'static str,
-    destination: &'static str,
-    tool: Option<&'static str>,
+pub(crate) struct Expected {
+    pub(crate) strategy: &'static str,
+    pub(crate) destination: &'static str,
+    pub(crate) tool: Option<&'static str>,
 }
 
 /// The recommendation an APPLICATION workload — a server, or a component that is not a
@@ -127,7 +131,9 @@ struct Expected {
 /// IIS — applies to a Windows workload and to no other, so nothing is named for the
 /// others; and the enumerations' own "None specified" names no destination, so nothing is
 /// moved anywhere.
-fn expected_application(destination: &'static str, windows: bool) -> Expected {
+///
+/// `pub(crate)` for the same reason as [`Expected`].
+pub(crate) fn expected_application(destination: &'static str, windows: bool) -> Expected {
     match destination {
         "None specified" => Expected {
             strategy: "Retain",
@@ -383,7 +389,10 @@ fn portfolio() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
 /// It is the same thing the passing of the completion span does — the due instant is what
 /// the store compares `now` against — without a case spending that span asleep. The
 /// completion the reads then observe is still the stored one, timestamps included.
-fn complete_the_span(engine: &Arc<engine::InMemoryEngine>) {
+///
+/// `pub(crate)` so the suite beside this one brings the same completion forward the same
+/// way.
+pub(crate) fn complete_the_span(engine: &Arc<engine::InMemoryEngine>) {
     let state =
         engine.state::<ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState>();
     let mut store = state.lock();
@@ -523,7 +532,16 @@ async fn read_component(router: &MultiServiceRouter, id: &str) -> Reads {
 }
 
 /// Assert the `RecommendationSet` at `prefix` is the one `expected` names.
-fn assert_recommendation(case: &str, read: &str, body: &Value, prefix: &str, expected: Expected) {
+///
+/// `pub(crate)` for the same reason as [`Expected`]: one spelled-out expectation, asserted
+/// the same way by every suite that drives an analysis.
+pub(crate) fn assert_recommendation(
+    case: &str,
+    read: &str,
+    body: &Value,
+    prefix: &str,
+    expected: Expected,
+) {
     for (member, want) in [
         ("strategy", json!(expected.strategy)),
         ("targetDestination", json!(expected.destination)),

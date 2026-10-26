@@ -17,6 +17,16 @@
 //! `strategyOption` whose every strategy member is absent selects nothing and so stores
 //! nothing.
 //!
+//! The update is applied to the portfolio the CLOCK has already produced: every completion
+//! this account's tasks were owed at the instant of the call is materialised first
+//! ([`crate::state::RegionState::settle_all`]) — owed then even if nobody had called — so
+//! the analysis an assessment's completion records is computed from the configuration that
+//! was stored when that completion fell due, and a configuration this call stores applies
+//! only from here on. `appType` and `inclusionStatus` are inputs of that analysis
+//! ([`crate::state::analysis::component_recommendation`]), which is why the order matters:
+//! without it the recommendation a component reports would depend on when the portfolio
+//! was first read.
+//!
 //! `configureOnly` decides what the update does BESIDE storing the configuration: it is
 //! documented "If it is set to true, the source code and/or database credentials are
 //! updated. If it is set to false, the source code and/or database credentials are updated
@@ -292,7 +302,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let configures_database = input.secrets_manager_key.is_some();
 
         let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // Before anything is read or written: materialise what the clock already owed this
+        // portfolio at this same instant even if nobody had called — the terminal status
+        // of each task whose span has passed, and the analysis an assessment's completion
+        // stands for. Two of the members written below (`appType`, `inclusionStatus`) are
+        // inputs that analysis is computed from, so settling first is what makes the
+        // analysis the one that was due at the completion instant rather than one computed
+        // from a configuration stored after it; it is also what puts a record an already
+        // due import brought in into the inventory this update looks the component up in.
+        if let Some(portfolio) = store.region_mut(&region) {
+            portfolio.settle_all(now);
+        }
         // The update applies to a component of THIS account's portfolio in the Region the
         // request was signed for: an id naming none is reported as the missing resource
         // it is, never silently created.
