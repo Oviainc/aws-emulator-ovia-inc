@@ -585,10 +585,7 @@ fn sealing_key<'a>(
     let key = match state.resolve(region, identifier) {
         crate::state::KeyRef::Found(key) => key,
         crate::state::KeyRef::UnauthorizedAccount => {
-            return Err(crate::state::unauthorized_account(
-                OPERATION_NAME,
-                identifier,
-            ));
+            return Err(crate::state::unauthorized_account(OPERATION_NAME));
         }
         crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
             return Err(

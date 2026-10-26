@@ -268,11 +268,25 @@ async fn every_tracked_cryptographic_operation_writes_the_key_last_usage_record(
 
         // A key that has had no cryptographic operation reports no usage at all, and
         // its tracking starts when it was created.
+        //
+        // This response names the key by its KEY ID: `KeyId` here is "the globally
+        // unique identifier for the KMS key"
+        // (`smithy_query(query="doc",shape="GetKeyLastUsageResponse",member="KeyId")`),
+        // which carries none of the "the Amazon Resource Name (key ARN)" wording the
+        // same member carries on the cryptographic operations — and the recorded
+        // response for this operation is the bare key id.
         let fresh = last_usage(&router, &key_id).await;
         assert_eq!(
             fresh["KeyId"].as_str().unwrap_or_default(),
+            key_id,
+            "case {operation}: this answer names the key by its key ID — \"the globally \
+             unique identifier for the KMS key\" — not by its ARN, got {fresh}"
+        );
+        assert_ne!(
+            fresh["KeyId"].as_str().unwrap_or_default(),
             key_arn,
-            "case {operation}: the answer names the key by its ARN, got {fresh}"
+            "case {operation}: the key ARN is not the globally unique identifier this \
+             member carries, got {fresh}"
         );
         assert!(
             fresh["KeyLastUsage"].is_null(),

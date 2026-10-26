@@ -74,12 +74,31 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // A request whose resolved route key names this service is this service's, as the
+        // framework's rule says. A request that names NO service is this service's when it
+        // addresses the URI path space this service's own model publishes, and nobody
+        // else's.
+        //
+        // The second half is what makes this data plane reachable at all. The framework's
+        // `resolve_route_key` names a service from a five-field `AWS4-HMAC-SHA256`
+        // credential scope, then `X-Amz-Target`, then the first `Host` label. This API is
+        // `restJson1`, so it sends no `X-Amz-Target`; its endpoint resolution lists
+        // `sigv4a`, so a client configured from the model signs with SigV4A, whose
+        // credential scope carries no region field at all (one such signature covers the
+        // region SET the request names in `X-Amz-Region-Set`) and so does not parse as the
+        // five-field form; and a client pinned to an emulator endpoint sends an address as
+        // its `Host`, which names no service. Every request to this data plane therefore
+        // resolved to NO routing key, was claimed by nobody, and was answered the front
+        // door's own `404 UnknownService` in an awsJson envelope — a code this model does
+        // not declare — however completely each operation was implemented.
+        //
+        // The path space is read off the model (`crate::ROUTE_PATH_SEGMENTS`, derived from
+        // this service's `smithy.api#http` URIs), so it names nothing this file decides,
+        // and a request whose key names ANOTHER service is still left to that service: the
+        // path only answers for a request no signal has claimed.
         match smithy_server_runtime::resolve_route_key(parts) {
             Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+            None => addresses_this_models_path_space(parts.uri.path()),
         }
     }
 
@@ -166,6 +185,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 const KEY_VALUE_STORES_SEGMENT: &str = "key-value-stores";
 /// The literal `keys` collection segment the key routes share.
 const KEYS_SEGMENT: &str = "keys";
+
+/// Whether `path` addresses the URI path space this service's own model publishes —
+/// `crate::ROUTE_PATH_SEGMENTS`, the sorted set of first path segments the generator
+/// derives from this model's `smithy.api#http` URIs (for this model, the one literal
+/// [`KEY_VALUE_STORES_SEGMENT`] every route begins with).
+///
+/// This is the PATH half of the framework's own claim rule
+/// (`emulator_server::can_handle_based_on_route_key_and_path`), which cannot be called
+/// here because it requires a resolved routing key as well, and a request to this data
+/// plane has none (see [`Service::can_handle`]). Matching is exact segment equality,
+/// never a prefix test, and an EMPTY published set — which this model does not produce —
+/// would mean the model publishes no discriminator, so nothing may be claimed on it.
+fn addresses_this_models_path_space(path: &str) -> bool {
+    let Some(first) = path.trim_start_matches('/').split('/').next() else {
+        return false;
+    };
+    !first.is_empty() && crate::ROUTE_PATH_SEGMENTS.contains(&first)
+}
 
 /// Whether `req` addresses one of this service's mutating routes — `PutKey`
 /// (`PUT /key-value-stores/{KvsARN}/keys/{Key}`), `DeleteKey` (the same path under

@@ -134,6 +134,10 @@ const INCLUDE_KEY_MATERIAL_ALL: &str = "ALL_KEY_MATERIAL";
 const KEY_MATERIAL_STATE_CURRENT: &str = "CURRENT";
 /// See [`KEY_MATERIAL_STATE_CURRENT`].
 const KEY_MATERIAL_STATE_NON_CURRENT: &str = "NON_CURRENT";
+/// The `KeyMaterialState` of material a caller has imported for a rotation that has not
+/// happened yet: "PENDING_ROTATION identifies key material that has been imported for
+/// on-demand key rotation but the rotation hasn't completed" (the same doc).
+const KEY_MATERIAL_STATE_PENDING_ROTATION: &str = "PENDING_ROTATION";
 
 /// The `ImportState` of key material a caller has supplied, and of a key still waiting
 /// for some: "it has two possible values: IMPORTED or PENDING_IMPORT"
@@ -241,10 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = match state.resolve(&region, &input.key_id) {
             crate::state::KeyRef::Found(key) => key,
             crate::state::KeyRef::UnauthorizedAccount => {
-                return Err(crate::state::unauthorized_account(
-                    Self::NAME,
-                    &input.key_id,
-                ));
+                return Err(crate::state::unauthorized_account(Self::NAME));
             }
             crate::state::KeyRef::MalformedArn => {
                 return Err(ListKeyRotationsErrorModeled::InvalidArnException(
@@ -286,24 +287,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "A list of completed key material rotations", oldest first — the order the
         // key record keeps them in, so a page boundary is stable across calls and a new
         // rotation never reshuffles an earlier page. `ALL_KEY_MATERIAL` prepends the
-        // material the key was created with, which is not a rotation and so carries
-        // neither a `RotationDate` nor a `RotationType`: both "field[s] [are] not
-        // present for the first key material"
+        // material the key was created with and appends anything imported for a rotation
+        // that has not happened; neither is a rotation, so neither carries a
+        // `RotationDate` or a `RotationType`: both "field[s] [are] not present for the
+        // first key material"
         // (`smithy_query(query="shape",shape="RotationsListEntry")`).
         //
         // The members that are "only present for symmetric encryption KMS keys with
         // EXTERNAL origin" — the key material description, the import state, the
         // expiration model and its `ValidTo` — describe IMPORTED key material, so they
-        // are filled from what the caller stated at the import
-        // ([`crate::state::ImportedKeyMaterial`]) for such a key and are absent for
-        // every other. Only the first-material entry can carry them: a key whose
-        // material a caller supplies is not one this service rotates, so it has no
-        // rotation entries.
+        // are filled from what the caller stated at the import that supplied it
+        // ([`crate::state::ImportedKeyMaterial`]) and are absent for material KMS
+        // generated.
+        let external = key.origin == crate::state::ORIGIN_EXTERNAL;
         let mut listed: Vec<RotationsListEntry> = Vec::new();
         if include_first_material {
             let first_key_material_id = key.first_key_material_id();
-            let external = key.origin == crate::state::ORIGIN_EXTERNAL;
-            let imported = key.imported_material.as_ref().filter(|_| external);
+            // The first material is the one the key still holds only while no rotation
+            // has replaced it, which is when what the caller stated about the material it
+            // holds describes that version.
+            let imported = key
+                .imported_material
+                .as_ref()
+                .filter(|_| external && key.rotations.is_empty());
             listed.push(RotationsListEntry {
                 key_id: Some(key.key_id.clone()),
                 key_material_state: Some(material_state(key, first_key_material_id.as_deref())),
@@ -314,7 +320,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // of `EXTERNAL` origin that holds material has it imported, and one
                 // waiting for material does not.
                 import_state: external.then(|| {
-                    if imported.is_some() {
+                    if key.has_key_material() {
                         IMPORT_STATE_IMPORTED.to_string()
                     } else {
                         IMPORT_STATE_PENDING_IMPORT.to_string()
@@ -331,19 +337,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 rotation_type: None,
             });
         }
-        listed.extend(key.rotations.iter().map(|rotation| RotationsListEntry {
-            key_id: Some(key.key_id.clone()),
-            key_material_id: rotation.key_material_id.clone(),
-            // A rotation this service performs replaces material KMS generated, never
-            // imported material, so the imported-material members describe nothing here.
-            key_material_description: None,
-            import_state: None,
-            key_material_state: Some(material_state(key, rotation.key_material_id.as_deref())),
-            expiration_model: None,
-            valid_to: None,
-            rotation_date: Some(crate::state::date_time(rotation.rotation_date)),
-            rotation_type: Some(rotation.rotation_type.clone()),
+        listed.extend(key.rotations.iter().map(|rotation| {
+            // A rotation onto material a CALLER supplied carries what the caller stated
+            // about it; one onto material KMS generated has nothing to state.
+            let imported = rotation.imported.as_ref().filter(|_| external);
+            RotationsListEntry {
+                key_id: Some(key.key_id.clone()),
+                key_material_id: rotation.key_material_id.clone(),
+                key_material_description: imported
+                    .and_then(|imported| imported.description.clone()),
+                import_state: imported.map(|_| IMPORT_STATE_IMPORTED.to_string()),
+                key_material_state: Some(material_state(key, rotation.key_material_id.as_deref())),
+                expiration_model: imported.map(|imported| imported.expiration_model.clone()),
+                valid_to: imported
+                    .and_then(|imported| imported.valid_to)
+                    .map(crate::state::date_time),
+                rotation_date: Some(crate::state::date_time(rotation.rotation_date)),
+                rotation_type: Some(rotation.rotation_type.clone()),
+            }
         }));
+        // "When you specify a value of ALL_KEY_MATERIAL, KMS adds the first key material
+        // AND ANY IMPORTED KEY MATERIAL PENDING ROTATION to the response" (that member's
+        // documentation): material a caller has imported for a rotation that has not
+        // completed is the newest material associated with the key, and carries the state
+        // it waits in and what the caller stated about it.
+        if let Some(pending) = key
+            .pending_rotation_material
+            .as_ref()
+            .filter(|_| include_first_material)
+        {
+            listed.push(RotationsListEntry {
+                key_id: Some(key.key_id.clone()),
+                key_material_id: key.pending_rotation_key_material_id(),
+                key_material_description: pending.imported.description.clone(),
+                import_state: Some(IMPORT_STATE_IMPORTED.to_string()),
+                key_material_state: Some(KEY_MATERIAL_STATE_PENDING_ROTATION.to_string()),
+                expiration_model: Some(pending.imported.expiration_model.clone()),
+                valid_to: pending.imported.valid_to.map(crate::state::date_time),
+                rotation_date: None,
+                rotation_type: None,
+            });
+        }
 
         // "Set it to the value of NextMarker from the truncated response you just
         // received", so a marker resumes after the last entry the previous page

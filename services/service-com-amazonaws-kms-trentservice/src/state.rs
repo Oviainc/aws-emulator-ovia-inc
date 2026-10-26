@@ -967,18 +967,21 @@ pub const INCORRECT_KEY_MESSAGE: &str =
 
 /// How a request addressing a resource through an ARN that names no account is
 /// refused: KMS answers an authorization failure, and words it the way every AWS
-/// service words one — naming the principal it refused, the IAM action it refused, and
-/// the resource the request named.
+/// service words one — naming the principal it refused and the IAM action it refused.
 ///
 /// The principal is [`caller_identity_arn`]: every request to this emulator
 /// authenticates as the one identity it publishes, so that is who the refusal is about.
 ///
-/// One function for the whole service, so no two operations word it differently.
-pub fn unauthorized_account_message(operation: &str, requested: &str) -> String {
+/// The resource is NOT named. Authorization is evaluated before the identifier's
+/// contents are, so a refusal on this path cannot report anything about the resource —
+/// not even that it exists — and says so: the resource may not exist in this Region, or
+/// no policy may allow or a policy may deny the action. One function for the whole
+/// service, so no two operations word it differently.
+pub fn unauthorized_account_message(operation: &str) -> String {
     format!(
-        "User: {} is not authorized to perform: {ARN_SERVICE}:{operation} on resource: \
-         {requested} because no resource-based policy allows the {ARN_SERVICE}:{operation} \
-         action",
+        "User: {} is not authorized to perform: {ARN_SERVICE}:{operation} on this resource \
+         because the resource does not exist in this Region, no resource-based policies \
+         allow access, or a resource-based policy explicitly denies access",
         caller_identity_arn()
     )
 }
@@ -995,13 +998,8 @@ pub fn caller_identity_arn() -> String {
 /// `AccessDeniedException` is not in this service's model at all — KMS answers an
 /// authorization failure with it regardless — so it travels on the error channel's
 /// own variant and is built here once, for every operation's error type.
-pub fn unauthorized_account<E>(
-    operation: &str,
-    requested: &str,
-) -> crate::scaffolded::Scaffolded<E> {
-    crate::scaffolded::Scaffolded::access_denied(unauthorized_account_message(
-        operation, requested,
-    ))
+pub fn unauthorized_account<E>(operation: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::access_denied(unauthorized_account_message(operation))
 }
 
 /// The Region segment of `identifier`, when it is a KMS key or alias ARN.
@@ -1612,6 +1610,42 @@ pub struct Cmk {
     /// [`ImportedKeyMaterial`]. It is what the `ExpirationModel` and `ValidTo`
     /// metadata members report, and what makes the material expire.
     pub imported_material: Option<ImportedKeyMaterial>,
+    /// Key material a caller imported for an on-demand rotation that has not happened
+    /// yet, or `None` while none is waiting — see [`PendingRotationMaterial`].
+    pub pending_rotation_material: Option<PendingRotationMaterial>,
+}
+
+/// Key material a caller has imported for an on-demand rotation of a KMS key, before
+/// that rotation completes.
+///
+/// "`PENDING_ROTATION` identifies key material that has been imported for on-demand key
+/// rotation but the rotation hasn't completed"
+/// (`smithy_query(query="doc",shape="RotationsListEntry",member="KeyMaterialState")`), so
+/// it is NOT the material the key encrypts under: it is held beside that material until
+/// `RotateKeyOnDemand` makes it current. "Key material in `PENDING_ROTATION` state is not
+/// permanently associated with the KMS key. You can delete this key material and import
+/// different key material in its place" (same doc), which is why a later import replaces
+/// it rather than being refused.
+///
+/// `Debug` is written by hand rather than derived so the material is REDACTED.
+#[derive(Clone)]
+pub struct PendingRotationMaterial {
+    /// The material itself, which becomes the key's current material when the rotation
+    /// completes.
+    pub material: KeyMaterial,
+    /// What the caller stated about it at the import that supplied it.
+    pub imported: ImportedKeyMaterial,
+}
+
+impl std::fmt::Debug for PendingRotationMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingRotationMaterial")
+            // The material itself never appears; its id identifies it without
+            // disclosing it.
+            .field("key_material_id", &self.material.id())
+            .field("imported", &self.imported)
+            .finish()
+    }
 }
 
 /// One use of a KMS key in a successful cryptographic operation, as
@@ -1674,6 +1708,7 @@ impl std::fmt::Debug for Cmk {
             .field("rotation_schedule", &self.rotation_schedule)
             .field("last_usage", &self.last_usage)
             .field("imported_material", &self.imported_material)
+            .field("pending_rotation_material", &self.pending_rotation_material)
             .finish()
     }
 }
@@ -1746,6 +1781,9 @@ impl Cmk {
             // A key created with no key material has not been given any yet, and a key
             // whose material KMS generated never carries imported material.
             imported_material: None,
+            // Nothing has been imported for a rotation of a key that has just been
+            // created.
+            pending_rotation_material: None,
         }
     }
 
@@ -1839,6 +1877,9 @@ impl Cmk {
             // material is imported into it, and one of a key whose material KMS
             // generated never carries imported material.
             imported_material: None,
+            // What is waiting for a rotation of the primary key is waiting there: the
+            // same material has to be imported into this replica for the set to rotate.
+            pending_rotation_material: None,
         }
     }
 
@@ -1912,6 +1953,101 @@ impl Cmk {
             .any(|material| material.id().as_deref() == Some(key_material_id))
     }
 
+    /// Whether `material` is key material this KMS key is ALREADY associated with: the
+    /// version it encrypts under now, any version it still retains, or the version
+    /// already waiting for a rotation.
+    ///
+    /// It is what tells material a caller presents as NEW from material the key already
+    /// has, and it compares the MATERIAL — every version of every kind this store holds
+    /// the bytes of — rather than the `KeyMaterialId` a reader reports, which a key of
+    /// only one kind carries. Material whose bytes are not held here is not recognised as
+    /// a version of anything.
+    pub fn associates_key_material(&self, material: &KeyMaterial) -> bool {
+        let Some(digest) = material.digest() else {
+            return false;
+        };
+        ::std::iter::once(&self.material)
+            .chain(
+                self.pending_rotation_material
+                    .as_ref()
+                    .map(|pending| &pending.material),
+            )
+            .chain(self.superseded_material.iter())
+            .any(|version| version.digest().as_deref() == Some(digest.as_str()))
+    }
+
+    /// Whether this key has key material at all: a key still waiting for its first
+    /// material has none.
+    pub fn has_key_material(&self) -> bool {
+        !matches!(self.material, KeyMaterial::AwaitingImport)
+    }
+
+    /// The `KeyMaterialId` of the material waiting for an on-demand rotation of this
+    /// key, or `None` while none is waiting — see [`PendingRotationMaterial`].
+    pub fn pending_rotation_key_material_id(&self) -> Option<String> {
+        self.pending_rotation_material
+            .as_ref()
+            .and_then(|pending| pending.material.id())
+    }
+
+    /// Drop the material waiting for a rotation, reporting its `KeyMaterialId`.
+    ///
+    /// "Key material in `PENDING_ROTATION` state is not permanently associated with the
+    /// KMS key. You can delete this key material and import different key material in its
+    /// place"
+    /// (`smithy_query(query="doc",shape="RotationsListEntry",member="KeyMaterialState")`),
+    /// so dropping it leaves the material the key encrypts under — and the key's
+    /// usability — exactly as they were.
+    ///
+    /// `None` means nothing was waiting.
+    pub fn forget_pending_key_material(&mut self) -> Option<String> {
+        let pending = self.pending_rotation_material.take()?;
+        pending.material.id()
+    }
+
+    /// Hold `material` beside the material this key encrypts under, for the on-demand
+    /// rotation that will make it current, and report its `KeyMaterialId`.
+    ///
+    /// "When you initiate on-demand key rotation on a symmetric encryption KMS key with
+    /// imported key material, you must have already imported new key material and that
+    /// key material's state should be `PENDING_ROTATION`"
+    /// (`smithy_query(query="doc",shape="RotateKeyOnDemand")`), so an import of NEW
+    /// material into a key that already has material changes nothing the key is used
+    /// with: what the key seals under, its key state and what it reports as current all
+    /// stay as they were until [`Self::rotate_to_pending_material`] completes the
+    /// rotation. Material already waiting is replaced, because material in that state
+    /// "is not permanently associated with the KMS key".
+    pub fn stage_key_material(
+        &mut self,
+        material: KeyMaterial,
+        imported: ImportedKeyMaterial,
+    ) -> Option<String> {
+        let key_material_id = material.id();
+        self.pending_rotation_material = Some(PendingRotationMaterial { material, imported });
+        key_material_id
+    }
+
+    /// Complete the rotation the material waiting on this key was imported for: that
+    /// material becomes the current version, the version it replaces is retained, and
+    /// the rotation is recorded — exactly as [`Self::rotate_material`] does for material
+    /// KMS generated, except that the rotation also keeps what the caller stated about
+    /// the material it installed, which is what a reader reports for an imported version.
+    ///
+    /// `false` means nothing was waiting, so no rotation happened and nothing changed.
+    pub fn rotate_to_pending_material(&mut self, rotation_type: &str) -> bool {
+        let Some(pending) = self.pending_rotation_material.take() else {
+            return false;
+        };
+        self.rotate_material(pending.material, rotation_type);
+        if let Some(rotation) = self.rotations.last_mut() {
+            rotation.imported = Some(pending.imported.clone());
+        }
+        // What the caller stated about the material that is now current is what the
+        // metadata readers report from here on.
+        self.imported_material = Some(pending.imported);
+        true
+    }
+
     /// Delete the key material this key encrypts under, leaving it with none, and
     /// report the `KeyMaterialId` of what was deleted.
     ///
@@ -1927,6 +2063,10 @@ impl Cmk {
         let deleted = self.current_key_material_id.take();
         self.material = KeyMaterial::AwaitingImport;
         self.imported_material = None;
+        // A rotation replaces the material the key encrypts under, so with none left
+        // there is nothing to rotate FROM: material that was waiting for that rotation
+        // goes with it rather than staying to be promoted onto a later, unrelated import.
+        self.pending_rotation_material = None;
         if self.key_state != KEY_STATE_PENDING_DELETION {
             self.key_state = KEY_STATE_PENDING_IMPORT.to_string();
             self.enabled = false;
@@ -2004,6 +2144,10 @@ impl Cmk {
             key_material_id,
             rotation_date: SystemTime::now(),
             rotation_type: rotation_type.to_string(),
+            // Material KMS generated is not imported material, so there is nothing a
+            // caller stated about it; [`Self::rotate_to_pending_material`] fills this in
+            // for a rotation onto material a caller supplied.
+            imported: None,
         });
     }
 
@@ -2270,6 +2414,12 @@ pub struct KeyRotation {
     pub rotation_date: SystemTime,
     /// A `RotationType` value (`smithy_query(shape="RotationType")`).
     pub rotation_type: String,
+    /// What the caller stated about the material this rotation made current, when that
+    /// material is material the caller IMPORTED, and `None` when KMS generated it — see
+    /// [`ImportedKeyMaterial`]. It is what the imported-material members of this
+    /// rotation's listing entry report, which are "only present for symmetric encryption
+    /// KMS keys with EXTERNAL origin".
+    pub imported: Option<ImportedKeyMaterial>,
 }
 
 /// One KMS key's automatic key rotation schedule: how long KMS waits between
@@ -2627,6 +2777,16 @@ pub enum KeyMaterial {
     /// asymmetric spec — answers the scaffold's 501 rather than a fabricated
     /// signature, public key or ciphertext.
     KeyPairNotGenerated,
+    /// The PRIVATE key of an asymmetric KMS key whose key material a caller imported,
+    /// as a DER-encoded PKCS#8 `PrivateKeyInfo` — the form the wrapped material of an
+    /// asymmetric key takes, and the form every key pair in this service is encoded
+    /// in. Held as the caller supplied it, after it was parsed as a private key of the
+    /// key pair the key's `KeySpec` names (see [`imported_key_pair`]), so an operation
+    /// that uses it signs with the caller's key rather than with one minted here.
+    ///
+    /// The bytes never leave this process: the private half of a KMS key "never leaves
+    /// KMS unencrypted" (`smithy_query(query="doc",shape="CreateKey")`).
+    PrivateKeyPkcs8(Vec<u8>),
     /// No key material, because the caller asked for a key with none: "To create a
     /// KMS key with no key material (for imported key material), set this value to
     /// EXTERNAL"
@@ -2648,10 +2808,7 @@ impl KeyMaterial {
         let Self::Aes256(material) = self else {
             return None;
         };
-        let mut hasher = Sha256::new();
-        hasher.update(b"kms-key-material-id\0");
-        hasher.update(material);
-        Some(hex::encode(hasher.finalize()))
+        Some(sha256_hex(&[b"kms-key-material-id\0", material]))
     }
 
     /// The AES-256-GCM key behind a symmetric encryption KMS key, or `None` for
@@ -2659,8 +2816,28 @@ impl KeyMaterial {
     pub fn aes256(&self) -> Option<&[u8; MATERIAL_LEN]> {
         match self {
             Self::Aes256(material) => Some(material),
-            Self::Hmac(_) | Self::KeyPairNotGenerated | Self::AwaitingImport => None,
+            Self::Hmac(_)
+            | Self::KeyPairNotGenerated
+            | Self::PrivateKeyPkcs8(_)
+            | Self::AwaitingImport => None,
         }
+    }
+
+    /// A value that identifies this material to THIS store, for every kind whose bytes
+    /// it holds — unlike [`Self::id`], the `KeyMaterialId` a reader reports, which only
+    /// one kind of material carries.
+    ///
+    /// It is a digest rather than the bytes, so comparing two versions of a key's
+    /// material never compares the material itself. `None` for material whose bytes are
+    /// not held here, which is therefore never equal to anything.
+    fn digest(&self) -> Option<String> {
+        let (kind, bytes): (&[u8], &[u8]) = match self {
+            Self::Aes256(material) => (b"aes256", material),
+            Self::Hmac(material) => (b"hmac", material),
+            Self::PrivateKeyPkcs8(material) => (b"pkcs8", material),
+            Self::KeyPairNotGenerated | Self::AwaitingImport => return None,
+        };
+        Some(sha256_hex(&[b"kms-key-material\0", kind, b"\0", bytes]))
     }
 
     /// Key material of `kind` made of exactly these bytes — how material a caller
@@ -2681,12 +2858,102 @@ impl KeyMaterial {
     }
 }
 
+/// The SHA-256 of `parts`, as lowercase hex: the one construction both material
+/// identifiers are built with ([`KeyMaterial::id`] and [`KeyMaterial::digest`]), so the
+/// two cannot drift apart in form. Each identifier supplies its own leading domain string,
+/// which is what keeps them distinct values over the same material.
+fn sha256_hex(parts: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// Key material a caller IMPORTED into an ASYMMETRIC KMS key of `key_spec`: the private
+/// key of the key pair that spec names, as a DER-encoded PKCS#8 `PrivateKeyInfo`.
+///
+/// The bytes are material of THIS key only when they really are a private key of the key
+/// pair `key_spec` names, which is what parsing them with the library that implements
+/// that algorithm decides — nothing is taken on trust, and a private key of another spec
+/// does not parse as one of this spec. `None` means they are not such a private key, or
+/// `key_spec` names no key pair at all.
+pub fn imported_key_pair(key_spec: &str, pkcs8: &[u8]) -> Option<KeyMaterial> {
+    let parses = match key_pair_kind(key_spec)? {
+        KeyPairKind::Rsa(modulus_bits) => ::aws_lc_rs::rsa::PrivateDecryptingKey::from_pkcs8(pkcs8)
+            .is_ok_and(|private_key| private_key.key_size_bits() == modulus_bits),
+        KeyPairKind::Ecdsa(signing_algorithm) => {
+            ::aws_lc_rs::signature::EcdsaKeyPair::from_pkcs8(signing_algorithm, pkcs8).is_ok()
+        }
+        KeyPairKind::Ed25519 => ::aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8(pkcs8).is_ok(),
+        KeyPairKind::Sm2 => {
+            <::sm2::SecretKey as ::sm2::pkcs8::DecodePrivateKey>::from_pkcs8_der(pkcs8).is_ok()
+        }
+    };
+    parses.then(|| KeyMaterial::PrivateKeyPkcs8(pkcs8.to_vec()))
+}
+
+/// Whether this service can tell a private key of the key pair `key_spec` names from
+/// other bytes, which is what it has to do before material a caller wrapped can become
+/// such a key's material. `false` for a key pair no library here parses the private key
+/// of, which the caller answers as not implemented rather than refusing correct material
+/// as incorrect.
+pub fn parses_key_pair(key_spec: &str) -> bool {
+    key_pair_kind(key_spec).is_some()
+}
+
+/// Which asymmetric key pair one `KeySpec` names: one variant per family, described by
+/// the parameter that differs (the RSA modulus size, the elliptic curve) rather than by a
+/// case per spec.
+enum KeyPairKind {
+    /// An RSA key pair with a modulus of this many bits.
+    Rsa(usize),
+    /// An elliptic curve key pair on the curve this ECDSA signing algorithm names.
+    Ecdsa(&'static ::aws_lc_rs::signature::EcdsaSigningAlgorithm),
+    /// An Ed25519 key pair.
+    Ed25519,
+    /// An SM2 key pair, which `aws-lc-rs` does not expose and the `sm2` crate does.
+    Sm2,
+}
+
+/// The key pair a `KeySpec` names, or `None` for a spec that names no key pair or one
+/// whose private key no library reachable from here parses (an ML-DSA key pair).
+///
+/// Every other value of `smithy_query(query="shape",shape="KeySpec")` whose material is a
+/// key pair is here: an `RSA_<bits>` spec states its modulus size in its own name, so it
+/// is read from the spec the way [`data_key_bytes`] reads `AES_<bits>`, and each curve
+/// spec names its curve.
+fn key_pair_kind(key_spec: &str) -> Option<KeyPairKind> {
+    use ::aws_lc_rs::signature::{
+        ECDSA_P256K1_SHA256_ASN1_SIGNING, ECDSA_P256_SHA256_ASN1_SIGNING,
+        ECDSA_P384_SHA384_ASN1_SIGNING, ECDSA_P521_SHA512_ASN1_SIGNING,
+    };
+
+    let profile = key_spec_profile(key_spec)?;
+    if !matches!(profile.material, MaterialKind::KeyPair) {
+        return None;
+    }
+    if let Some(bits) = key_spec.strip_prefix("RSA_") {
+        let bits: usize = bits.parse().ok()?;
+        return (bits > 0 && bits.is_multiple_of(8)).then_some(KeyPairKind::Rsa(bits));
+    }
+    match key_spec {
+        "ECC_NIST_P256" => Some(KeyPairKind::Ecdsa(&ECDSA_P256_SHA256_ASN1_SIGNING)),
+        "ECC_NIST_P384" => Some(KeyPairKind::Ecdsa(&ECDSA_P384_SHA384_ASN1_SIGNING)),
+        "ECC_NIST_P521" => Some(KeyPairKind::Ecdsa(&ECDSA_P521_SHA512_ASN1_SIGNING)),
+        "ECC_SECG_P256K1" => Some(KeyPairKind::Ecdsa(&ECDSA_P256K1_SHA256_ASN1_SIGNING)),
+        "ECC_NIST_EDWARDS25519" => Some(KeyPairKind::Ed25519),
+        "SM2" => Some(KeyPairKind::Sm2),
+        _ => None,
+    }
+}
+
 /// The key material a key of `kind` is minted with.
 ///
 /// The kinds that HAVE material draw it from the OS CSPRNG; `MaterialKind::KeyPair`
 /// mints none, because this emulator does not generate asymmetric key pairs, and
 /// says so in the material it returns rather than inventing bytes that are not a key
-/// pair.
+/// pair. Material a caller IMPORTS into such a key is [`imported_key_pair`].
 ///
 /// `None` means the platform refused to produce entropy; the caller answers a
 /// modelled server error rather than minting a key with predictable material.
@@ -4193,52 +4460,130 @@ pub fn mint_wrapping_key(wrapping_key_spec: &str) -> Option<(Vec<u8>, Vec<u8>)> 
 ///
 /// The RSA-OAEP decryption comes from `aws-lc-rs` (`aws_lc_rs::rsa`), under the private
 /// half this store kept when the public half was handed out, so what comes back is
-/// exactly the material the caller wrapped.
+/// exactly the material the caller wrapped. An `RSA_AES` wrapping has a second step:
+/// what the RSA public key encrypted is an ephemeral AES key, and that key wrapped the
+/// material — see [`Wrapping`].
 ///
 /// `None` means the bytes are not key material those parameters can open: either the
 /// wrapping algorithm is one this service does not unwrap (see
 /// [`unwraps_wrapping_algorithm`]) or the unwrapping failed.
 pub fn unwrap_key_material(parameters: &ImportParameters, wrapped: &[u8]) -> Option<Vec<u8>> {
-    let algorithm = oaep_algorithm(&parameters.wrapping_algorithm)?;
+    let wrapping = wrapping_of(&parameters.wrapping_algorithm)?;
     let private_key =
         ::aws_lc_rs::rsa::PrivateDecryptingKey::from_pkcs8(&parameters.private_key_pkcs8).ok()?;
+    let key_size_bytes = private_key.key_size_bytes();
     let oaep = ::aws_lc_rs::rsa::OaepPrivateDecryptingKey::new(private_key).ok()?;
-    let mut opened = vec![0u8; oaep.key_size_bytes()];
+    // What the RSA public key encrypted is the whole material for an RSAES wrapping and
+    // the ephemeral AES key alone for an `RSA_AES` one, in which case it occupies exactly
+    // one RSA block and the AES-wrapped material is the rest.
+    let (sealed, aes_wrapped) = match wrapping {
+        Wrapping::Direct(_) => (wrapped, None),
+        Wrapping::AesKeyWrap(_) => {
+            if wrapped.len() <= key_size_bytes {
+                return None;
+            }
+            let (block, rest) = wrapped.split_at(key_size_bytes);
+            (block, Some(rest))
+        }
+    };
+    let mut opened = vec![0u8; key_size_bytes];
     let len = oaep
-        .decrypt(algorithm, wrapped, &mut opened, None)
+        .decrypt(wrapping.oaep_algorithm(), sealed, &mut opened, None)
         .ok()?
         .len();
+    opened.truncate(len);
+    match aes_wrapped {
+        None => Some(opened),
+        Some(aes_wrapped) => aes_key_unwrap(&opened, aes_wrapped),
+    }
+}
+
+/// Open key material wrapped with the ephemeral AES key `kek` under AES key wrap with
+/// padding, which is the second step of an `RSA_AES` wrapping.
+///
+/// "Generate a 256-bit AES symmetric key", "encrypt your key material with the AES key"
+/// and "encrypt the AES key with the public key", then concatenate the two
+/// (`smithy_query(query="doc",shape="GetParametersForImportRequest",member="WrappingAlgorithm")`),
+/// so the material is unwrapped with the AES key the RSA block carried. The key wrap
+/// comes from `aws-lc-rs` (`aws_lc_rs::key_wrap`), not from anything written here.
+///
+/// `None` means the bytes are not material wrapped with that key.
+fn aes_key_unwrap(kek: &[u8], wrapped: &[u8]) -> Option<Vec<u8>> {
+    use ::aws_lc_rs::key_wrap::KeyWrapPadded;
+
+    let kek = ::aws_lc_rs::key_wrap::AesKek::new(&::aws_lc_rs::key_wrap::AES_256, kek).ok()?;
+    let mut opened = vec![0u8; wrapped.len()];
+    let len = kek.unwrap_with_padding(wrapped, &mut opened).ok()?.len();
     opened.truncate(len);
     Some(opened)
 }
 
 /// Whether this service can unwrap key material wrapped with `wrapping_algorithm`.
 pub fn unwraps_wrapping_algorithm(wrapping_algorithm: &str) -> bool {
-    oaep_algorithm(wrapping_algorithm).is_some()
+    wrapping_of(wrapping_algorithm).is_some()
 }
 
-/// The RSA-OAEP parameters an `AlgorithmSpec` names, or `None` for a spec that is not
-/// one of the two RSAES-OAEP values of `smithy_query(query="shape",shape="AlgorithmSpec")`:
-/// "for RSAES wrapping algorithms, you encrypt your key material directly with the RSA
-/// public key from KMS"
-/// (`smithy_query(query="doc",shape="GetParametersForImportRequest",member="WrappingAlgorithm")`),
-/// while the `RSA_AES` ones wrap an AES key that wraps the material, and `SM2PKE` is not
-/// RSA at all.
-fn oaep_algorithm(
-    wrapping_algorithm: &str,
-) -> Option<&'static ::aws_lc_rs::rsa::OaepAlgorithm> {
+/// How a caller wrapped the key material it is importing, which is what the
+/// `AlgorithmSpec` of the parameters it names states.
+#[derive(Debug, Clone, Copy)]
+enum Wrapping {
+    /// The material itself is encrypted under the RSA public key: "for RSAES wrapping
+    /// algorithms, you encrypt your key material directly with the RSA public key from
+    /// KMS", with these OAEP parameters.
+    Direct(&'static ::aws_lc_rs::rsa::OaepAlgorithm),
+    /// An ephemeral AES key is encrypted under the RSA public key with these OAEP
+    /// parameters, and the material is wrapped with that AES key: "for RSA_AES wrapping
+    /// algorithms, you encrypt your key material with an AES symmetric key that you
+    /// generate, then encrypt your AES key with the RSA public key from KMS".
+    AesKeyWrap(&'static ::aws_lc_rs::rsa::OaepAlgorithm),
+}
+
+impl Wrapping {
+    /// The OAEP parameters the RSA step uses, which both forms of wrapping carry.
+    fn oaep_algorithm(&self) -> &'static ::aws_lc_rs::rsa::OaepAlgorithm {
+        match self {
+            Self::Direct(algorithm) | Self::AesKeyWrap(algorithm) => algorithm,
+        }
+    }
+}
+
+/// The wrapping an `AlgorithmSpec` names, or `None` for a spec that is not one this
+/// service unwraps: the four RSA values of
+/// `smithy_query(query="shape",shape="AlgorithmSpec")` are wrappings under the RSA key
+/// pair `GetParametersForImport` handed out, while `SM2PKE` is not RSA at all.
+///
+/// The digest in the name is the digest of the OAEP step, for both forms
+/// (`smithy_query(query="doc",shape="GetParametersForImportRequest",member="WrappingAlgorithm")`).
+fn wrapping_of(wrapping_algorithm: &str) -> Option<Wrapping> {
     match wrapping_algorithm {
-        ALGORITHM_SPEC_RSAES_OAEP_SHA_1 => Some(&::aws_lc_rs::rsa::OAEP_SHA1_MGF1SHA1),
-        ALGORITHM_SPEC_RSAES_OAEP_SHA_256 => Some(&::aws_lc_rs::rsa::OAEP_SHA256_MGF1SHA256),
+        ALGORITHM_SPEC_RSAES_OAEP_SHA_1 => Some(Wrapping::Direct(
+            &::aws_lc_rs::rsa::OAEP_SHA1_MGF1SHA1,
+        )),
+        ALGORITHM_SPEC_RSAES_OAEP_SHA_256 => Some(Wrapping::Direct(
+            &::aws_lc_rs::rsa::OAEP_SHA256_MGF1SHA256,
+        )),
+        ALGORITHM_SPEC_RSA_AES_KEY_WRAP_SHA_1 => Some(Wrapping::AesKeyWrap(
+            &::aws_lc_rs::rsa::OAEP_SHA1_MGF1SHA1,
+        )),
+        ALGORITHM_SPEC_RSA_AES_KEY_WRAP_SHA_256 => Some(Wrapping::AesKeyWrap(
+            &::aws_lc_rs::rsa::OAEP_SHA256_MGF1SHA256,
+        )),
         _ => None,
     }
 }
 
 /// The `AlgorithmSpec` values a caller wraps key material with directly under the RSA
-/// public key — see [`oaep_algorithm`].
+/// public key — see [`wrapping_of`].
 pub const ALGORITHM_SPEC_RSAES_OAEP_SHA_1: &str = "RSAES_OAEP_SHA_1";
 /// See [`ALGORITHM_SPEC_RSAES_OAEP_SHA_1`].
 pub const ALGORITHM_SPEC_RSAES_OAEP_SHA_256: &str = "RSAES_OAEP_SHA_256";
+/// The `AlgorithmSpec` values that wrap key material with an ephemeral AES key and that
+/// AES key under the RSA public key — see [`wrapping_of`]. They are what "supported for
+/// wrapping RSA and ECC key material" names
+/// (`smithy_query(query="doc",shape="GetParametersForImportRequest",member="WrappingAlgorithm")`).
+pub const ALGORITHM_SPEC_RSA_AES_KEY_WRAP_SHA_1: &str = "RSA_AES_KEY_WRAP_SHA_1";
+/// See [`ALGORITHM_SPEC_RSA_AES_KEY_WRAP_SHA_1`].
+pub const ALGORITHM_SPEC_RSA_AES_KEY_WRAP_SHA_256: &str = "RSA_AES_KEY_WRAP_SHA_256";
 
 /// How long one wrapping key pair and its import token stay usable: "Each public key
 /// and import token set is valid for 24 hours"

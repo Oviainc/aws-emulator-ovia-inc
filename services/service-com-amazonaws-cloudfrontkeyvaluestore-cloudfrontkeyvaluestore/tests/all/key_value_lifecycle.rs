@@ -26,7 +26,10 @@ const ISSUE_ARN: &str = "arn:aws:cloudfront::123456789012:key-value-store/111111
 ///
 /// The UUID is derived from `label` so each case addresses its own store and the same
 /// case always addresses the same one.
-fn arn(label: &str) -> String {
+///
+/// `pub(crate)` so the sibling suite that drives these same routes through every way a
+/// client ADDRESSES this service (`sigv4_flavour_routing`) names its stores the one way.
+pub(crate) fn arn(label: &str) -> String {
     let digest = hex::encode(Sha256::digest(label.as_bytes()));
     format!(
         "arn:aws:cloudfront::123456789012:key-value-store/{}-{}-{}-{}-{}",
@@ -240,7 +243,9 @@ impl Kvs {
 
 /// Percent-encode one URI path segment. An ARN carries `:` and `/`, both of which a
 /// non-greedy `@httpLabel` must arrive escaped — exactly as an AWS SDK sends it.
-fn segment(raw: &str) -> String {
+///
+/// `pub(crate)` for the same reason as [`arn`]: both suites address the same routes.
+pub(crate) fn segment(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for byte in raw.bytes() {
         match byte {

@@ -400,10 +400,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 .into());
                             }
                             crate::state::KeyRef::UnauthorizedAccount => {
-                                return Err(crate::state::unauthorized_account(
-                                    Self::NAME,
-                                    requested,
-                                ));
+                                return Err(crate::state::unauthorized_account(Self::NAME));
                             }
                             crate::state::KeyRef::NotFound
                             | crate::state::KeyRef::MalformedArn => {
@@ -428,7 +425,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     match state.resolve(&region, requested) {
                         crate::state::KeyRef::Found(key) => key,
                         crate::state::KeyRef::UnauthorizedAccount => {
-                            return Err(crate::state::unauthorized_account(Self::NAME, requested));
+                            return Err(crate::state::unauthorized_account(Self::NAME));
                         }
                         crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
                             return Err(not_found(crate::state::key_not_found_message(
@@ -444,10 +441,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let destination_key = match state.resolve(&region, &input.destination_key_id) {
                 crate::state::KeyRef::Found(key) => key,
                 crate::state::KeyRef::UnauthorizedAccount => {
-                    return Err(crate::state::unauthorized_account(
-                        Self::NAME,
-                        &input.destination_key_id,
-                    ));
+                    return Err(crate::state::unauthorized_account(Self::NAME));
                 }
                 crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
                     return Err(not_found(crate::state::key_not_found_message(
@@ -721,14 +715,15 @@ fn dry_run_refusal() -> ReEncryptError {
 
 /// The ciphertext is not one this service can open: it is not an envelope, or its
 /// authentication tag did not verify under the source key and encryption context given.
+///
+/// The refusal carries NO message, exactly as `Decrypt` words the same class: what it
+/// would have to say is which of the ciphertext, the key and the encryption context did
+/// not agree, and a caller who presented a ciphertext that cannot be opened is told none
+/// of that. The exception shape's own documentation is API-reference prose, not a message
+/// the wire carries.
 fn invalid_ciphertext() -> ReEncryptError {
     ReEncryptErrorModeled::InvalidCiphertextException(InvalidCiphertextException {
-        message: Some(
-            "The request was rejected because the specified ciphertext, or additional \
-             authenticated data incorporated into the ciphertext, such as the encryption \
-             context, is corrupted, missing, or otherwise invalid."
-                .to_string(),
-        ),
+        message: None,
     })
     .into()
 }

@@ -44,38 +44,11 @@ use service_com_amazonaws_kms_trentservice::state::{
 };
 
 use super::harness::{
-    b64, call, create_key, describe, error_code, ok, router, router_with_engine, text, unb64,
-    REGION,
+    b64, create_key, describe, ok, refused, router, router_with_engine, text, unb64, wrap, REGION,
 };
 
 /// The Region a row belongs to when the row is about regional scoping.
 const OTHER_REGION: &str = "eu-west-2";
-
-/// The `message` an error body carries, which the harness does not report (it reports
-/// the `__type`).
-fn error_message(payload: &Value) -> String {
-    payload["message"]
-        .as_str()
-        .or_else(|| payload["Message"].as_str())
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// Call an operation that must fail, and report its status, wire error code and
-/// message.
-async fn refused(
-    router: &smithy_server_runtime::MultiServiceRouter,
-    region: &str,
-    operation: &str,
-    body: &Value,
-) -> (u16, String, String) {
-    let (status, payload) = call(router, region, operation, body).await;
-    assert_ne!(
-        status, 200,
-        "case {operation} {body}: expected a failure, got HTTP 200 with {payload}"
-    );
-    (status, error_code(&payload), error_message(&payload))
-}
 
 /// Rule 1: every cryptographic operation refuses a key that is not enabled, with the
 /// error that names the key state it is in, and the metadata plane stays readable.
@@ -272,11 +245,18 @@ async fn an_arn_whose_account_segment_is_not_an_account_id_is_not_authorized() {
                     message,
                     format!(
                         "User: arn:aws:iam::{account}:user/emulator is not authorized to \
-                         perform: kms:{operation} on resource: {identifier} because no \
-                         resource-based policy allows the kms:{operation} action"
+                         perform: kms:{operation} on this resource because the resource \
+                         does not exist in this Region, no resource-based policies allow \
+                         access, or a resource-based policy explicitly denies access"
                     ),
-                    "case {case:?}: expected the refusal to name the principal, the action \
-                     and the resource, got {message:?}"
+                    "case {case:?}: expected the refusal to name the principal and the \
+                     action, got {message:?}"
+                );
+                assert!(
+                    !message.contains(identifier.as_str()),
+                    "case {case:?}: authorization is evaluated before the identifier's \
+                     contents are, so the refusal must not echo the resource, got \
+                     {message:?}"
                 );
             }
         }
@@ -340,11 +320,24 @@ async fn get_key_last_usage_reports_the_last_cryptographic_operation() {
 
     // A key that has had no cryptographic operation reports no usage at all, and began
     // being tracked when it was created.
+    //
+    // This response names the key by its KEY ID: `KeyId` here is "the globally unique
+    // identifier for the KMS key"
+    // (`smithy_query(query="doc",shape="GetKeyLastUsageResponse",member="KeyId")`), with
+    // none of the "the Amazon Resource Name (key ARN)" wording the same member carries on
+    // the cryptographic operations — and the recorded response is the bare key id.
     let fresh = ok(&router, "GetKeyLastUsage", &json!({"KeyId": key_id})).await;
     assert_eq!(
         fresh["KeyId"].as_str().unwrap_or_default(),
+        key_id,
+        "case fresh key: this answer names the key by its key ID — \"the globally unique \
+         identifier for the KMS key\" — not by its ARN, got {fresh}"
+    );
+    assert_ne!(
+        fresh["KeyId"].as_str().unwrap_or_default(),
         key_arn,
-        "case fresh key: the answer names the key by its ARN, got {fresh}"
+        "case fresh key: the key ARN is not the globally unique identifier this member \
+         carries, got {fresh}"
     );
     assert!(
         fresh["KeyLastUsage"].is_null(),
@@ -1354,28 +1347,6 @@ fn in_days(days: f64) -> f64 {
         .expect("the clock is after the epoch")
         .as_secs_f64();
     (now + days * 24.0 * 60.0 * 60.0).trunc()
-}
-
-/// Wrap `material` under the public wrapping key `GetParametersForImport` answered,
-/// with the wrapping algorithm the parameters were asked for — what a caller importing
-/// key material does before calling `ImportKeyMaterial`.
-fn wrap(case: &str, public_key: &[u8], wrapping_algorithm: &str, material: &[u8]) -> Vec<u8> {
-    let algorithm = match wrapping_algorithm {
-        "RSAES_OAEP_SHA_256" => &aws_lc_rs::rsa::OAEP_SHA256_MGF1SHA256,
-        "RSAES_OAEP_SHA_1" => &aws_lc_rs::rsa::OAEP_SHA1_MGF1SHA1,
-        other => panic!("case {case}: {other} is not a wrapping algorithm this test uses"),
-    };
-    let public_key = aws_lc_rs::rsa::PublicEncryptingKey::from_der(public_key)
-        .unwrap_or_else(|error| panic!("case {case}: the public key is DER: {error}"));
-    let oaep = aws_lc_rs::rsa::OaepPublicEncryptingKey::new(public_key)
-        .unwrap_or_else(|error| panic!("case {case}: the public key wraps: {error}"));
-    let mut wrapped = vec![0u8; oaep.key_size_bytes()];
-    let len = oaep
-        .encrypt(algorithm, material, &mut wrapped, None)
-        .unwrap_or_else(|error| panic!("case {case}: the material wraps: {error}"))
-        .len();
-    wrapped.truncate(len);
-    wrapped
 }
 
 /// Rule 4: `UpdateCustomKeyStore` resolves its target first, and every

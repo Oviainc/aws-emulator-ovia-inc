@@ -5,7 +5,8 @@
 //! Reports the suppression list the request selects — a tenant's when it carries
 //! `TenantName`, the account-level list when it omits it — as summaries computed
 //! from the stored entries, narrowed by the request's `Reasons` and date window and
-//! paged by `PageSize` with a `NextToken` of this listing's own making.
+//! paged by `PageSize` with a `NextToken` of this listing's own making. A window whose
+//! `EndDate` precedes its `StartDate` describes no window, and is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -187,6 +188,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The two bounds describe ONE window — `StartDate` keeps the addresses added
+        // "after a specific date" and `EndDate` those added "before a specific date" —
+        // so a request whose end precedes its start describes no window at all. That is
+        // invalid input, refused with the error the model binds for it and naming both
+        // bounds as the request gave them, rather than answered with the empty page the
+        // comparison would otherwise produce.
+        if let (Some(start), Some(end)) = (input.start_date.as_ref(), input.end_date.as_ref()) {
+            if end.as_secs_f64() < start.as_secs_f64() {
+                return Err(ListSuppressedDestinationsErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(format!(
+                            "Start date {} must be before end date {}",
+                            window_bound(start),
+                            window_bound(end)
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
         // "The number of results to show in a single call": the model declares no range
         // on `PageSize`, so only a positive count truncates a page and a non-positive
         // one is read as no truncation rather than refused.
@@ -288,4 +310,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token,
         })
     }
+}
+
+/// One bound of the listing window, as the refusal of an inverted window prints it:
+/// the instant to the minute, with no seconds and no zone suffix.
+///
+/// The value is the request's own bound; only its rendering is fixed here.
+fn window_bound(at: &::aws_smithy_types::DateTime) -> String {
+    // `Format::DateTime` renders `YYYY-MM-DDThh:mm:ssZ` (with a fraction when the
+    // instant carries one); the sentence names the minute, so the rendering stops
+    // where the minutes end.
+    const TO_THE_MINUTE: usize = "YYYY-MM-DDThh:mm".len();
+    at.fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .map(|rendered| rendered.chars().take(TO_THE_MINUTE).collect())
+        .unwrap_or_default()
 }

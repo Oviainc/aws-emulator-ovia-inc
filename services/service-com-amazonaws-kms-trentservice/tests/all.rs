@@ -41,6 +41,8 @@ mod get_key_rotation_status_reads;
 mod grants;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/imported_key_material.rs"]
+mod imported_key_material;
 #[path = "all/key_deletion_cancellation.rs"]
 mod key_deletion_cancellation;
 #[path = "all/key_last_usage.rs"]

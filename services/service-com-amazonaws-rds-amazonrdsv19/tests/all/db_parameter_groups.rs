@@ -45,7 +45,10 @@ const NO_PARAMS: [(&str, &str); 0] = [];
 
 /// The ARN a group stored in `region` under `name` reports: the `pg` resource type AWS
 /// uses for a DB parameter group under the `rds` ARN namespace.
-fn expected_arn(region: &str, name: &str) -> String {
+///
+/// `pub(crate)` so the sibling suites of this one test target assert the one ARN shape
+/// rather than growing a second copy of it.
+pub(crate) fn expected_arn(region: &str, name: &str) -> String {
     format!("arn:aws:rds:{region}:{ACCOUNT}:pg:{name}")
 }
 

@@ -431,15 +431,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::KeyRef::Found(requested_key)
                     if requested_key.key_id == key.key_id => {}
                 crate::state::KeyRef::Found(_) => {
-                    return Err(DecryptErrorModeled::IncorrectKeyException(
-                        IncorrectKeyException {
-                            message: Some(crate::state::INCORRECT_KEY_MESSAGE.to_string()),
-                        },
-                    )
-                    .into());
+                    return Err(incorrect_key());
                 }
                 crate::state::KeyRef::UnauthorizedAccount => {
-                    return Err(crate::state::unauthorized_account(Self::NAME, requested));
+                    return Err(crate::state::unauthorized_account(Self::NAME));
                 }
                 crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
                     return Err(DecryptErrorModeled::NotFoundException(NotFoundException {
@@ -576,14 +571,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The ciphertext is not one this service can open: it is not an envelope, or its
 /// authentication tag did not verify under the key and encryption context given.
+///
+/// The refusal carries NO message. What it would have to say is which of the ciphertext,
+/// the key and the encryption context did not agree, and a caller who presented a
+/// ciphertext it cannot open is told none of that: the exception shape's own
+/// documentation is API-reference prose, not a message the wire carries.
 fn invalid_ciphertext() -> DecryptError {
     DecryptErrorModeled::InvalidCiphertextException(InvalidCiphertextException {
-        message: Some(
-            "The request was rejected because the specified ciphertext, or additional \
-             authenticated data incorporated into the ciphertext, such as the encryption \
-             context, is corrupted, missing, or otherwise invalid."
-                .to_string(),
-        ),
+        message: None,
+    })
+    .into()
+}
+
+/// The `KeyId` the request named is not the key whose material sealed the ciphertext.
+///
+/// The message is [`crate::state::INCORRECT_KEY_MESSAGE`], the one wording the whole
+/// service gives this refusal: fixed text that names NEITHER key, because the caller
+/// asked whether the key it named can perform this operation on this ciphertext and the
+/// answer is that it cannot — naming the key that CAN would disclose a key the caller
+/// never presented.
+fn incorrect_key() -> DecryptError {
+    DecryptErrorModeled::IncorrectKeyException(IncorrectKeyException {
+        message: Some(crate::state::INCORRECT_KEY_MESSAGE.to_string()),
     })
     .into()
 }

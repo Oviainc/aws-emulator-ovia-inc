@@ -6,6 +6,10 @@
 //! decrypts, and records the rotation on the key. This is the ONLY file to touch for this
 //! operation.
 //!
+//! A key whose material a CALLER supplies rotates to material the caller has already
+//! imported for it — the version waiting in `PENDING_ROTATION` — rather than to one
+//! generated here, and a key with nothing waiting has nothing to rotate to.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -215,10 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = match state.resolve_mut(&region, &input.key_id) {
             crate::state::KeyRefMut::Found(key) => key,
             crate::state::KeyRefMut::UnauthorizedAccount => {
-                return Err(crate::state::unauthorized_account(
-                    Self::NAME,
-                    &input.key_id,
-                ));
+                return Err(crate::state::unauthorized_account(Self::NAME));
             }
             crate::state::KeyRefMut::MalformedArn => {
                 return Err(RotateKeyOnDemandErrorModeled::InvalidArnException(
@@ -289,11 +290,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // generates. "When you initiate on-demand key rotation on a symmetric
         // encryption KMS key with imported key material, you must have already
         // imported new key material and that key material's state should be
-        // PENDING_ROTATION": this slice holds no imported key material at all
-        // (`ImportKeyMaterial` is not implemented), so a key whose material does not
-        // originate in KMS has nothing waiting to become current, and the call is
-        // refused rather than served with material the caller never supplied.
-        if key.origin != crate::state::ORIGIN_AWS_KMS {
+        // PENDING_ROTATION": for such a key the rotation completes an import the caller
+        // has already made, so a key whose material does not originate in KMS and has
+        // nothing waiting has nothing to rotate TO, and the call is refused rather than
+        // served with material the caller never supplied.
+        let rotates_pending_material = key.origin != crate::state::ORIGIN_AWS_KMS;
+        if rotates_pending_material && key.pending_rotation_material.is_none() {
             return Err(unsupported());
         }
 
@@ -323,7 +325,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // conflict is not manufactured.
 
         // The replacement material is drawn the way the key's first version was: from
-        // the OS CSPRNG, in the form the key's spec calls for.
+        // the OS CSPRNG, in the form the key's spec calls for — unless the caller
+        // supplied it, in which case the material waiting on the key IS the replacement
+        // and nothing is generated.
+        if rotates_pending_material {
+            if !key.rotate_to_pending_material(crate::state::ROTATION_TYPE_ON_DEMAND) {
+                return Err(unsupported());
+            }
+            return Ok(RotateKeyOnDemandOutput {
+                // KMS answers with the key ARN, not the identifier the request used.
+                key_id: Some(key.arn.clone()),
+            });
+        }
         let Some(profile) = crate::state::key_spec_profile(&key.key_spec) else {
             return Err(RotateKeyOnDemandErrorModeled::KMSInternalException(
                 KMSInternalException {

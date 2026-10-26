@@ -43,8 +43,13 @@ use super::package_associations::{
     available_packages, member, stored_status, PACKAGE_TYPES, UNKNOWN_PACKAGE_ID,
 };
 
-/// `AssociatePackages`: `POST /2021-01-01/packages/associateMultiple`.
-async fn associate(emulator: &Emulator, domain: &str, package_ids: &[String]) -> Answer {
+/// `AssociatePackages`: `POST /2021-01-01/packages/associateMultiple`. A sibling suite
+/// drives the same path, rather than growing a second copy of it.
+pub(crate) async fn associate(
+    emulator: &Emulator,
+    domain: &str,
+    package_ids: &[String],
+) -> Answer {
     let package_list: Vec<Value> = package_ids
         .iter()
         .map(|package_id| json!({ "PackageID": package_id }))
@@ -82,8 +87,12 @@ async fn dissociate_one(emulator: &Emulator, domain: &str, package_id: &str) -> 
 
 /// `ListPackagesForDomain`: `GET /2021-01-01/domain/{DomainName}/packages` — the wire
 /// read path for a domain's associations, so a case asserts what a client sees rather
-/// than only what the store holds.
-async fn packages_of_domain(emulator: &Emulator, domain: &str, case: &str) -> Vec<Value> {
+/// than only what the store holds. A sibling suite reads the same listing through it.
+pub(crate) async fn packages_of_domain(
+    emulator: &Emulator,
+    domain: &str,
+    case: &str,
+) -> Vec<Value> {
     let answer = emulator
         .call("GET", &format!("{PREFIX}/domain/{domain}/packages"), None)
         .await;
@@ -131,7 +140,7 @@ async fn domains_of_package(emulator: &Emulator, package_id: &str, case: &str) -
 
 /// The `DomainPackageStatus` the domain's listing reports for `package_id`, or `None`
 /// where that listing no longer reports the package at all.
-async fn listed_status(
+pub(crate) async fn listed_status(
     emulator: &Emulator,
     domain: &str,
     package_id: &str,
