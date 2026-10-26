@@ -167,7 +167,11 @@ fn associate_body(asset_ids: &[String], client_token: Option<&str>) -> Value {
 }
 
 /// Create a project in a fresh portal and answer its id.
-async fn create_project(router: &MultiServiceRouter, case: &str, name: &str) -> String {
+pub(crate) async fn create_project(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+) -> String {
     let portal_id = create_portal(router, &format!("{name}-portal")).await;
     let (status, created) = call(
         router,
@@ -189,7 +193,11 @@ async fn create_project(router: &MultiServiceRouter, case: &str, name: &str) -> 
 }
 
 /// Create `count` assets of one fresh asset model and answer their ids.
-async fn create_assets(router: &MultiServiceRouter, case: &str, count: usize) -> Vec<String> {
+pub(crate) async fn create_assets(
+    router: &MultiServiceRouter,
+    case: &str,
+    count: usize,
+) -> Vec<String> {
     let model_id = create_model(router, &format!("{case}-model"), json!([])).await;
     let mut ids = Vec::with_capacity(count);
     for at in 0..count {
@@ -201,7 +209,7 @@ async fn create_assets(router: &MultiServiceRouter, case: &str, count: usize) ->
 /// Send one association request and assert it was served: HTTP 200 with an EMPTY
 /// per-asset error list, which is what "a list of associated error information, if
 /// any" states when every asset was associated.
-async fn associate(
+pub(crate) async fn associate(
     router: &MultiServiceRouter,
     case: &str,
     project_id: &str,
@@ -234,7 +242,7 @@ async fn associate(
 ///
 /// Asserts the paging contract on the way: no page is longer than the size in
 /// force, and a `nextToken` comes back exactly when more assets follow.
-async fn list_project_assets(
+pub(crate) async fn list_project_assets(
     router: &MultiServiceRouter,
     case: &str,
     project_id: &str,
@@ -285,7 +293,7 @@ async fn list_project_assets(
 
 /// The membership stored on the project's own record — the only way to tell the
 /// listing answers from the store rather than from the request that wrote it.
-fn stored_membership(
+pub(crate) fn stored_membership(
     engine: &std::sync::Arc<engine::InMemoryEngine>,
     project_id: &str,
 ) -> Vec<String> {
