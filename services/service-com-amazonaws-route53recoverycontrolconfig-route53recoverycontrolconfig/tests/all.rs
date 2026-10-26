@@ -15,6 +15,8 @@
 mod common;
 #[path = "all/list_clusters.rs"]
 mod list_clusters;
+#[path = "all/not_found_message.rs"]
+mod not_found_message;
 #[path = "all/recovery_control_lifecycle.rs"]
 mod recovery_control_lifecycle;
 #[path = "all/state_roundtrip.rs"]
