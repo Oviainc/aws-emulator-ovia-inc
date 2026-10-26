@@ -84,11 +84,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3vectors-s3vectors.jso
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.s3vectors#DeleteVectorBucket",
-    extra_errors = ["ValidationException"]
+    extra_errors = ["ValidationException", "AccessDeniedException"]
 )]
 #[derive(Debug)]
 pub enum DeleteVectorBucketErrorModeled {
     ValidationException(ValidationException),
+    AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     NotFoundException(NotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
@@ -145,7 +146,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteVectorBucketErrorModeled::ServiceUnavailableException(
                 ServiceUnavailableException {
@@ -161,8 +161,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(refusal)?;
 
+        // Who the request speaks for, resolved before this service's own store is
+        // locked, so only one store is ever held at a time.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
         let mut store = state.lock();
         let bucket = store.bucket(&bucket_name).map_err(refusal)?;
+
+        // The vector bucket's own resource policy decides this call before it deletes
+        // anything: an explicit Deny of the action refuses it.
+        if let Some(message) = store
+            .authorization_target(&bucket_name, None)
+            .map_err(refusal)?
+            .refusal(&caller, &[Self::NAME])
+        {
+            return Err(DeleteVectorBucketErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
         // "All vector indexes in the vector bucket must be deleted before the vector
         // bucket can be deleted" — so a non-empty bucket is refused rather than
         // silently dropping the indexes it holds.
