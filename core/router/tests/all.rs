@@ -119,6 +119,11 @@ mod cloudtrail_import_failures_routing;
 mod config_compliance_change_event;
 #[path = "all/connect_signing_name_routing.rs"]
 mod connect_signing_name_routing;
+// Declared HERE, in sorted position beside the other DynamoDB suite rather than appended
+// at the end of this file: the tail is where every suite landing in the same window
+// appends, so it is the contended region, while these neighbouring lines are stable.
+#[path = "all/ddb_stream_lambda_esm_provisioning.rs"]
+mod ddb_stream_lambda_esm_provisioning;
 #[path = "all/dynamodb_streams_routing.rs"]
 mod dynamodb_streams_routing;
 // Declared HERE, in the sorted list, rather than appended at the end of this file: the

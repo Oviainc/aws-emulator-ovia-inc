@@ -16,7 +16,7 @@ use crate::ops::types::{
     EventBridgeDataSourceConfig, FunctionConfiguration, GraphqlApi, HttpDataSourceConfig,
     LambdaAuthorizerConfig, LambdaDataSourceConfig, LogConfig, OpenIDConnectConfig,
     OpenSearchServiceDataSourceConfig, RelationalDatabaseDataSourceConfig, SourceApiAssociation,
-    SourceApiAssociationConfig, SyncConfig, UserPoolConfig,
+    SourceApiAssociationConfig, SourceApiAssociationSummary, SyncConfig, UserPoolConfig,
 };
 
 /// One stored `GraphqlApi`, plus the API keys created under it.
@@ -884,6 +884,25 @@ impl SourceApiAssociationRecord {
                 .map(::aws_smithy_types::DateTime::from),
         }
     }
+
+    /// This record as the modelled `SourceApiAssociationSummary` shape: "the ARNs and
+    /// IDs of associations, Merged APIs, and source APIs", plus the description.
+    ///
+    /// Projected from the SAME stored record [`Self::to_source_api_association`]
+    /// answers from, so a listing and a read cannot disagree about the members both
+    /// shapes carry; the members the summary leaves out are the association's
+    /// merge configuration and status, which only the full shape reports.
+    pub fn to_source_api_association_summary(&self) -> SourceApiAssociationSummary {
+        SourceApiAssociationSummary {
+            association_id: Some(self.association_id.clone()),
+            association_arn: Some(self.association_arn.clone()),
+            source_api_id: Some(self.source_api_id.clone()),
+            source_api_arn: Some(self.source_api_arn.clone()),
+            merged_api_id: Some(self.merged_api_id.clone()),
+            merged_api_arn: Some(self.merged_api_arn.clone()),
+            description: self.description.clone(),
+        }
+    }
 }
 
 /// What a request to associate a source API with a Merged API asks for, in the form
@@ -1284,6 +1303,26 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
             .ok_or_else(|| {
                 AssociationLookupRefusal::AssociationNotFound(association_id.to_string())
             })
+    }
+
+    /// Every association the API `api_id` takes part in, on either side, in creation
+    /// order.
+    ///
+    /// An association names two APIs and is addressed from either of them, so the API's
+    /// own association state is every link it is a side of — the same set
+    /// [`Self::remove_api_associations`] drops with the API. Creation order is the
+    /// stable order a listing pages over, which the opaque `associationId` cannot
+    /// carry.
+    pub fn associations_of_api(&self, api_id: &str) -> Vec<&SourceApiAssociationRecord> {
+        let mut associations: Vec<&SourceApiAssociationRecord> = self
+            .source_api_associations
+            .values()
+            .filter(|association| {
+                association.source_api_id == api_id || association.merged_api_id == api_id
+            })
+            .collect();
+        associations.sort_by_key(|association| association.seq);
+        associations
     }
 
     /// Drop every association the API `api_id` takes part in, on either side.
@@ -1843,8 +1882,9 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 
 /// The page size this service serves when a list call names no `maxResults`.
 ///
-/// Both list operations model `maxResults` with a range of 0..25 and a default of
-/// `0`, i.e. "unspecified", so an unspecified page is the whole modelled maximum.
+/// The list operations of this service all model `maxResults` on the same shape, with
+/// a range of 0..25 and a default of `0`, i.e. "unspecified", so an unspecified page is
+/// the whole modelled maximum.
 pub const DEFAULT_PAGE_SIZE: usize = 25;
 
 /// One page of a list operation: the items to return and the `nextToken` that

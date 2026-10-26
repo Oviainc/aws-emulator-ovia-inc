@@ -261,6 +261,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 answer_summary(
                     question,
                     workload.answer(&input.lens_alias, &question.question_id),
+                    workload
+                        .question_jira_configuration(&input.lens_alias, &question.question_id),
                 )
             })
             .collect();
@@ -293,6 +295,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn answer_summary(
     question: &crate::state::ReviewQuestion,
     answer: Option<&crate::state::AnswerRecord>,
+    jira_configuration: Option<JiraConfiguration>,
 ) -> AnswerSummary {
     AnswerSummary {
         question_id: Some(question.question_id.clone()),
@@ -332,9 +335,11 @@ fn answer_summary(
         // `Reason` exists only once an answer gives one.
         reason: answer.and_then(|answer| answer.reason.clone()),
         question_type: Some(crate::state::DEFAULT_QUESTION_TYPE.to_string()),
-        // A question's Jira issue exists once the workload's Jira integration has
-        // synced one; `UpdateIntegration` is still a stub, so nothing is synced here.
-        jira_configuration: None,
+        // The integration state of this question's issue in the integrated service,
+        // which exists once a sync has recorded one
+        // (`crate::state::WorkloadRecord::question_jira_configuration`, the one place
+        // every read of an answer reads it from).
+        jira_configuration,
     }
 }
 
