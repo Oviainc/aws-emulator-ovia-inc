@@ -283,7 +283,10 @@ async fn create_case(router: &MultiServiceRouter, row: &ClusterCase) -> (u16, St
 }
 
 /// The one `<DBCluster>` subtree in `xml`.
-fn the_cluster(case: &str, xml: &str) -> String {
+///
+/// `pub(crate)` so the sibling suites of this one test target read a cluster envelope the
+/// same way rather than each writing the check again.
+pub(crate) fn the_cluster(case: &str, xml: &str) -> String {
     let found = subtrees(xml, "DBCluster");
     assert_eq!(
         found.len(),
@@ -295,7 +298,13 @@ fn the_cluster(case: &str, xml: &str) -> String {
 }
 
 /// `DescribeDBClusters` for one identifier, as the one `<DBCluster>` it reports.
-async fn describe_one(router: &MultiServiceRouter, case: &str, identifier: &str) -> String {
+///
+/// `pub(crate)` for the same reason as [`the_cluster`].
+pub(crate) async fn describe_one(
+    router: &MultiServiceRouter,
+    case: &str,
+    identifier: &str,
+) -> String {
     let body = expect_ok(
         case,
         call(
