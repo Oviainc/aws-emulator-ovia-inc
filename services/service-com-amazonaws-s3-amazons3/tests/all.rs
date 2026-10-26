@@ -135,6 +135,8 @@ mod object_tag_set_removal;
 mod object_tagging;
 #[path = "all/object_tagging_on_put.rs"]
 mod object_tagging_on_put;
+#[path = "all/object_torrent.rs"]
+mod object_torrent;
 #[path = "all/object_versioning.rs"]
 mod object_versioning;
 #[path = "all/object_write_and_read_back.rs"]
