@@ -95,3 +95,5 @@ mod table_versions;
 mod usage_profiles;
 #[path = "all/wire.rs"]
 mod wire;
+#[path = "all/workflows.rs"]
+mod workflows;

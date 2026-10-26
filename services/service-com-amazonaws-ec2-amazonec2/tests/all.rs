@@ -102,6 +102,13 @@ mod capacity_reservation_billing_requests;
 mod capacity_reservation_fleets;
 #[path = "all/carrier_gateways.rs"]
 mod carrier_gateways;
+// What `DescribeClassicLinkInstances` reports out of the ClassicLink link store, and how the
+// instance ids, the documented filters and the page size narrow it. Declared in the MIDDLE
+// of the list rather than at either end: the head and the tail are both where concurrent ec2
+// landings insert their two lines, and these two lost repeated serialized squash merges at
+// the tail.
+#[path = "all/classic_link_instances.rs"]
+mod classic_link_instances;
 #[path = "all/coip_pools.rs"]
 mod coip_pools;
 #[path = "all/confirm_product_instance.rs"]

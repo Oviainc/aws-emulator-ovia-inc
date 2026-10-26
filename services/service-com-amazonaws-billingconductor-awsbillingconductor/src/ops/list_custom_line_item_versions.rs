@@ -126,8 +126,8 @@ fn end_billing_period(
     version: &CustomLineItemVersion,
     successor: Option<&CustomLineItemVersion>,
 ) -> Option<String> {
-    let own = version.exclusive_end_billing_period.clone();
-    let next = successor.map(|successor| successor.start_billing_period.clone());
+    let own = version.exclusive_end_billing_period();
+    let next = successor.map(CustomLineItemVersion::start_billing_period);
     match (own, next) {
         (Some(own), Some(next)) => {
             // Two spellings of one month are one billing period, so which bound comes
@@ -201,7 +201,7 @@ fn element(
         creation_time: version.creation_time_millis,
         last_modified_time: version.last_modified_time_millis,
         association_size: version.association_size,
-        start_billing_period: Some(version.start_billing_period.clone()),
+        start_billing_period: Some(version.start_billing_period()),
         end_billing_period,
         arn: Some(item_arn.to_string()),
         start_time: version.start_time_millis,
@@ -328,7 +328,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut selected: Vec<(String, CustomLineItemVersionListElement)> = Vec::new();
         for (index, version) in versions.iter().enumerate() {
             let end = end_billing_period(version, versions.get(index + 1));
-            if !in_filter(&version.start_billing_period, end.as_deref(), filter) {
+            if !in_filter(&version.start_billing_period(), end.as_deref(), filter) {
                 continue;
             }
             // The pagination key is the generation's position in that order, written

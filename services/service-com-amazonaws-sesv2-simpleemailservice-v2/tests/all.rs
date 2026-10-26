@@ -21,6 +21,8 @@ mod configuration_sets;
 mod contact_lists;
 #[path = "all/email_identity_lifecycle.rs"]
 mod email_identity_lifecycle;
+#[path = "all/multi_region_endpoints.rs"]
+mod multi_region_endpoints;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/suppressed_destinations.rs"]

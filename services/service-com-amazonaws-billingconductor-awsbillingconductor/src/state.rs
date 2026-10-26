@@ -1452,10 +1452,14 @@ pub struct CustomLineItemRecord {
     pub computation_rule: Option<String>,
     /// `PresentationDetails.Service`.
     pub presentation_service: Option<String>,
-    /// The billing periods this item applies in, as the stretches
-    /// ([`BillingPeriodSpan`]) a read reports it for. An item created with no
-    /// `BillingPeriodRange` at all is the one fully open span, so it applies to every
+    /// The billing periods this item's CURRENT generation applies in, as the stretches
+    /// ([`BillingPeriodSpan`]) a read reports that generation for. An item created with
+    /// no `BillingPeriodRange` at all is the one fully open span, so it applies to every
     /// billing period.
+    ///
+    /// The periods the item applies in AT ALL are these plus the ones its superseded
+    /// generations still hold ([`Self::covers`]), because a write applied from a billing
+    /// period on takes only that period and the later ones over.
     ///
     /// It is a LIST because a call that deletes the item in a bounded billing period
     /// range deletes it only there: taking a range out of the middle of the item's
@@ -1497,17 +1501,50 @@ impl CustomLineItemRecord {
         i64::try_from(self.associated_resources.len()).unwrap_or(i64::MAX)
     }
 
-    /// Is this custom line item in effect during `billing_period`? Each stretch it
-    /// applies in is half-open and an item stored without a `BillingPeriodRange`
-    /// applies to every billing period — see [`billing_period_range_covers`].
+    /// Is this custom line item in effect during `billing_period`? Each stretch a
+    /// generation of it applies in is half-open and an item stored without a
+    /// `BillingPeriodRange` applies to every billing period — see
+    /// [`billing_period_range_covers`].
+    ///
+    /// EVERY generation counts, not just the one in effect now: a write applied from a
+    /// billing period on leaves the periods before it to the generation it superseded
+    /// ([`Self::effective_in`]), so the item is still in effect in them.
     pub fn covers(&self, billing_period: &str) -> bool {
         self.spans.iter().any(|span| span.covers(billing_period))
+            || self
+                .superseded_versions
+                .iter()
+                .any(|version| version.covers(billing_period))
     }
 
-    /// Is this item in effect in no billing period at all, so that nothing of it is
-    /// left for a read to report?
+    /// The generation of this item that applies in `billing_period` — what a read
+    /// scoped to that period reports — or `None` when the item applies in no part of
+    /// that period.
+    ///
+    /// A write takes the billing periods it is applied in OVER from the generation
+    /// before it, so the generations hold disjoint stretches of periods and at most one
+    /// of them answers for a period; the newest is preferred, so a period two
+    /// generations could claim reports the later write.
+    pub fn effective_in(&self, billing_period: &str) -> Option<CustomLineItemVersion> {
+        let current = self.current_version();
+        if current.covers(billing_period) {
+            return Some(current);
+        }
+        self.superseded_versions
+            .iter()
+            .rev()
+            .find(|version| version.covers(billing_period))
+            .cloned()
+    }
+
+    /// Is this item in effect in no billing period at all — in none of its generations
+    /// — so that nothing of it is left for a read to report?
     pub fn is_empty(&self) -> bool {
         self.spans.is_empty()
+            && self
+                .superseded_versions
+                .iter()
+                .all(|version| version.spans.is_empty())
     }
 
     /// Take the billing periods `removed` names out of this item, and report what that
@@ -1516,40 +1553,29 @@ impl CustomLineItemRecord {
     /// that range names, so the item keeps the periods on either side of it. An item
     /// left applying in no period at all is empty ([`Self::is_empty`]) and its record
     /// goes.
+    ///
+    /// EVERY generation loses them, because a period the item was deleted from reports
+    /// no version of it at all. Nothing is written unless every generation's removal
+    /// stays inside [`MAX_BILLING_PERIOD_SPANS`], so a refused removal leaves the whole
+    /// item as it was.
     pub fn remove_periods(&mut self, removed: &BillingPeriodSpan) -> PeriodsRemoval {
-        remove_billing_periods(&mut self.spans, removed)
-    }
-
-    /// The billing period this item starts applying in, INCLUSIVE, as the write that
-    /// set it spelled it; absent when it has always applied.
-    pub fn inclusive_start_billing_period(&self) -> Option<String> {
-        self.spans
-            .first()
-            .and_then(|span| span.inclusive_start.clone())
-    }
-
-    /// The billing period this item stops applying at, EXCLUSIVE; absent when it does
-    /// not stop.
-    ///
-    /// A `CustomLineItemVersionListElement` carries ONE start and end billing period,
-    /// so a generation is reported by the outer bounds of the stretches it applies in;
-    /// which periods inside them a read reports the item for is decided by the stretches
-    /// themselves ([`Self::covers`]).
-    pub fn exclusive_end_billing_period(&self) -> Option<String> {
-        self.spans
-            .last()
-            .and_then(|span| span.exclusive_end.clone())
-    }
-
-    /// The billing period this item's CURRENT generation is in effect FROM.
-    ///
-    /// The billing-period range a write names is the span the item it leaves applies
-    /// in, and a write that names none leaves the item in effect from the billing
-    /// period that write itself landed in — so a generation always has a start billing
-    /// period, and that period is what identifies it.
-    pub fn version_start_billing_period(&self) -> String {
-        self.inclusive_start_billing_period()
-            .unwrap_or_else(|| billing_period_at(self.version_start_time_millis))
+        let mut spans = self.spans.clone();
+        let mut superseded = self.superseded_versions.clone();
+        let mut outcome = PeriodsRemoval::Unchanged;
+        for generation in std::iter::once(&mut spans)
+            .chain(superseded.iter_mut().map(|version| &mut version.spans))
+        {
+            match remove_billing_periods(generation, removed) {
+                PeriodsRemoval::Changed => outcome = PeriodsRemoval::Changed,
+                PeriodsRemoval::Unchanged => {}
+                PeriodsRemoval::AtSpanLimit => return PeriodsRemoval::AtSpanLimit,
+            }
+        }
+        if outcome == PeriodsRemoval::Changed {
+            self.spans = spans;
+            self.superseded_versions = superseded;
+        }
+        outcome
     }
 
     /// This item's CURRENT generation, as a version snapshot.
@@ -1568,8 +1594,7 @@ impl CustomLineItemRecord {
             association_size: self.association_size(),
             computation_rule: self.computation_rule.clone(),
             presentation_service: self.presentation_service.clone(),
-            start_billing_period: self.version_start_billing_period(),
-            exclusive_end_billing_period: self.exclusive_end_billing_period(),
+            spans: self.spans.clone(),
             creation_time_millis: self.creation_time_millis,
             last_modified_time_millis: self.last_modified_time_millis,
             start_time_millis: self.version_start_time_millis,
@@ -1637,19 +1662,53 @@ pub struct CustomLineItemVersion {
     pub computation_rule: Option<String>,
     /// `PresentationDetails.Service`.
     pub presentation_service: Option<String>,
-    /// The billing period this generation is in effect FROM, inclusive — see
-    /// [`CustomLineItemRecord::version_start_billing_period`].
-    pub start_billing_period: String,
-    /// The billing period this generation stops applying at, EXCLUSIVE, when the write
-    /// that left it named one. A generation that outlived no range of its own is closed
-    /// by the generation that replaced it instead.
-    pub exclusive_end_billing_period: Option<String>,
+    /// The billing periods THIS generation applies in, as the stretches
+    /// ([`BillingPeriodSpan`]) a read scoped to a period finds it by
+    /// ([`CustomLineItemRecord::effective_in`]). A write takes its own periods over
+    /// from the generation before it, so the generations' stretches are disjoint and
+    /// one is left holding exactly the periods the write did not claim.
+    pub spans: Vec<BillingPeriodSpan>,
     /// The item's `CreationTime`, which every generation of it shares.
     pub creation_time_millis: i64,
     pub last_modified_time_millis: i64,
     /// `StartTime`: "The inclusive start time" — the instant this generation took
     /// effect.
     pub start_time_millis: i64,
+}
+
+impl CustomLineItemVersion {
+    /// Does this generation apply in `billing_period`? Each stretch it applies in is
+    /// half-open, and a generation left by a write that named no billing period range
+    /// applies in every period — see [`billing_period_range_covers`].
+    pub fn covers(&self, billing_period: &str) -> bool {
+        self.spans.iter().any(|span| span.covers(billing_period))
+    }
+
+    /// `StartBillingPeriod`: the billing period this generation is in effect FROM,
+    /// inclusive.
+    ///
+    /// The range a write names is the stretch the generation it leaves applies in, and
+    /// a write that names none leaves a generation in effect from the billing period
+    /// that write itself landed in — so a generation always has a start billing period.
+    pub fn start_billing_period(&self) -> String {
+        self.spans
+            .first()
+            .and_then(|span| span.inclusive_start.clone())
+            .unwrap_or_else(|| billing_period_at(self.start_time_millis))
+    }
+
+    /// The billing period this generation stops applying at, EXCLUSIVE; absent when it
+    /// does not stop.
+    ///
+    /// A `CustomLineItemVersionListElement` carries ONE start and end billing period, so
+    /// a generation is reported by the outer bounds of the stretches it applies in;
+    /// which periods inside them a read reports the item for is decided by the stretches
+    /// themselves ([`Self::covers`]).
+    pub fn exclusive_end_billing_period(&self) -> Option<String> {
+        self.spans
+            .last()
+            .and_then(|span| span.exclusive_end.clone())
+    }
 }
 
 /// The auto billing group creation preference recorded for ONE billing transfer, as
@@ -2326,37 +2385,55 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         Some(removed)
     }
 
-    /// Write `updated` over the stored custom line item it names, keeping the
-    /// generations a version read reports.
+    /// Write `updated` over the stored custom line item it names as the generation that
+    /// applies from `takes_effect_from` on, keeping the generations a read of an earlier
+    /// billing period reports.
     ///
-    /// A version of a custom line item is the generation of it that applies in a
-    /// billing period, so the billing period a write takes effect in decides what the
-    /// write does to the history: a write taking effect in a DIFFERENT billing period
-    /// than the one the item's current generation started in closes that generation —
-    /// frozen as it stood, so a later read of the history reports the item as it really
-    /// was — and opens a new generation at `now`, while a write taking effect in the
-    /// generation's own billing period REPLACES it, because one billing period has one
-    /// version of the item.
+    /// A version of a custom line item is the generation of it that applies in a billing
+    /// period, so a write APPLIED FROM a billing period takes that period and every
+    /// later one over from the generation before it: that generation is frozen holding
+    /// exactly the earlier periods, so a read of one of them still reports the item as
+    /// it stood then, and this write opens a new generation at `now`. A write that names
+    /// no billing period to be applied from (`takes_effect_from` `None`) takes over
+    /// wherever the item applies, so it REPLACES the current generation and the item's
+    /// history is left as it was.
     ///
     /// The kept history is bounded like every other store here, since a caller decides
     /// how many writes to make: past [`MAX_CUSTOM_LINE_ITEM_VERSIONS`] superseded
-    /// generations the OLDEST is dropped, which reads back as a history that starts
-    /// later — never as a lost current item, which a later caller must still see.
-    pub fn put_custom_line_item(&mut self, mut updated: CustomLineItemRecord, now: i64) {
+    /// generations the OLDEST is dropped, which reads back as a history — and an item —
+    /// that starts later, never as a lost current generation, which a later caller must
+    /// still see.
+    pub fn put_custom_line_item(
+        &mut self,
+        mut updated: CustomLineItemRecord,
+        now: i64,
+        takes_effect_from: Option<&str>,
+    ) {
         let arn = updated.arn.clone();
-        let superseded = self
-            .custom_line_items
-            .get(&arn)
-            .filter(|previous| {
-                previous.version_start_billing_period() != updated.version_start_billing_period()
-            })
-            .map(CustomLineItemRecord::current_version);
-        if let Some(superseded) = superseded {
-            updated.superseded_versions.push(superseded);
-            while updated.superseded_versions.len() > MAX_CUSTOM_LINE_ITEM_VERSIONS {
-                updated.superseded_versions.remove(0);
+        let previous = self.custom_line_items.get(&arn).map(|previous| {
+            (
+                previous.superseded_versions.clone(),
+                previous.current_version(),
+            )
+        });
+        if let Some((mut kept, mut replaced)) = previous {
+            // The billing periods this write takes over: the one it is applied from and
+            // every later one, which is every period at all when it names none.
+            let taken = BillingPeriodSpan::new(takes_effect_from.map(str::to_string), None);
+            for generation in kept.iter_mut().chain(std::iter::once(&mut replaced)) {
+                remove_billing_periods(&mut generation.spans, &taken);
             }
-            updated.version_start_time_millis = now;
+            // A generation this write left no billing period to is not a version of the
+            // item in any period, so there is nothing for a read to report it for.
+            kept.retain(|version| !version.spans.is_empty());
+            if !replaced.spans.is_empty() {
+                kept.push(replaced);
+                updated.version_start_time_millis = now;
+            }
+            while kept.len() > MAX_CUSTOM_LINE_ITEM_VERSIONS {
+                kept.remove(0);
+            }
+            updated.superseded_versions = kept;
         }
         self.custom_line_items.insert(arn, updated);
     }
@@ -2802,6 +2879,10 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// items from being associated to each other, and an item whose own value is not
     /// settled yet has no value to lend, so it contributes nothing and that nothing is not
     /// remembered — it is a property of the walk rather than of the item.
+    ///
+    /// The charge values are the ones of the GENERATION of the item that applies in that
+    /// billing period ([`CustomLineItemRecord::effective_in`]), so a bill of a period a
+    /// later write did not claim is computed from what the item charged then.
     fn custom_line_item_charge(
         &self,
         item: &CustomLineItemRecord,
@@ -2812,9 +2893,13 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         if let Some(charge) = computed.get(&item.arn) {
             return *charge;
         }
-        let charge = if let Some(charge_value) = item.flat_charge_value {
-            charge_value
-        } else if let Some(percentage_value) = item.percentage_value {
+        let details = item
+            .effective_in(billing_period)
+            .map_or_else(|| item.charge_details(), |version| version.charge_details);
+        let charge = if let Some(flat) = details.flat {
+            flat.charge_value
+        } else if let Some(percentage) = details.percentage {
+            let percentage_value = percentage.percentage_value;
             if !being_computed.insert(item.arn.clone()) {
                 return 0.0;
             }

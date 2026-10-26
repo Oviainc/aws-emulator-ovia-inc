@@ -24,8 +24,8 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_sns_amazonsimplenotificationservice::state::{
-    platform_application_arn, PlatformApplicationRecord, INVALID_NEXT_TOKEN_REFUSAL, PAGE_SIZE,
-    PLATFORM_CREDENTIAL_ATTRIBUTE_NAMES,
+    platform_application_arn, PlatformApplicationRecord, MOBILE_PUSH_INVALID_NEXT_TOKEN_REFUSAL,
+    PAGE_SIZE, PLATFORM_CREDENTIAL_ATTRIBUTE_NAMES,
 };
 
 use super::topics_subscriptions_publish::{text_of, Answer, Sns};
@@ -98,8 +98,8 @@ async fn list(sns: &Sns, params: &[(&str, &str)]) -> Answer {
     sns.call("ListPlatformApplications", params).await
 }
 
-/// Write one platform application into persisted state, `created_at` ordering it, and
-/// answer its ARN.
+/// Write one platform application into persisted state in the region this suite signs
+/// its calls for, `created_at` ordering it, and answer its ARN.
 fn seed(
     sns: &Sns,
     at: u64,
@@ -107,7 +107,25 @@ fn seed(
     name: &str,
     attributes: &[(&str, &str)],
 ) -> String {
-    let arn = platform_application_arn(REGION, platform, name);
+    seed_in_region(sns, REGION, at, platform, name, attributes)
+}
+
+/// Write one platform application into persisted state in `region`, `created_at`
+/// ordering it, and answer its ARN.
+///
+/// `pub(crate)` so the sibling suite that drives the REGION an account-wide listing is
+/// scoped to seeds an application of another region through this same writer rather
+/// than a second copy of it. The records are written straight into state because
+/// `CreatePlatformApplication` is still a scaffold stub (see this suite's module doc).
+pub(crate) fn seed_in_region(
+    sns: &Sns,
+    region: &str,
+    at: u64,
+    platform: &str,
+    name: &str,
+    attributes: &[(&str, &str)],
+) -> String {
+    let arn = platform_application_arn(region, platform, name);
     let state = sns.state();
     let mut state = state.lock();
     state.platform_applications.insert(
@@ -425,7 +443,7 @@ async fn a_next_token_the_listing_did_not_mint_is_refused() {
         );
         assert_eq!(
             answer.element("Message").as_deref(),
-            Some(INVALID_NEXT_TOKEN_REFUSAL),
+            Some(MOBILE_PUSH_INVALID_NEXT_TOKEN_REFUSAL),
             "case {case:?}: expected the member's refusal sentence, got {}",
             answer.body
         );

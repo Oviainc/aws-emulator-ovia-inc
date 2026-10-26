@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRemediationExceptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRemediationExceptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRemediationExceptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds the remediation exception one Config rule holds for each resource the request
+//! names, so auto-remediation is blocked for it ("This API adds a new exception or
+//! updates an existing exception for a specified resource with a specified Config
+//! rule").
+//!
+//! The rules this handler applies: one exception per rule and resource, so a second
+//! write for the same pair REVISES the one the rule holds (its explanation and the
+//! instant it falls due for deletion) rather than adding another; a resource the rule's
+//! own verdict places as COMPLIANT or NOT_APPLICABLE gets NO exception ("Placing an
+//! exception can only be performed on resources that are NON_COMPLIANT") and comes back
+//! in `FailedBatches`, as does every resource named under a rule this account does not
+//! hold, which has no remediation to except them from; and a key naming no resource is
+//! refused 400 `InvalidParameterValueException`.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +189,163 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRemediationExceptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRemediationExceptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRemediationExceptions"))
+        // `ctx` carries request metadata only; the exceptions are written to this
+        // service's own state.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // A resource key names ONE resource by its type and its id, so a key missing
+        // either names no resource to place an exception on. Both members are optional in
+        // the model, so this is judged here rather than at the boundary.
+        if let Some(incomplete) = input.resource_keys.iter().find(|key| {
+            key.resource_type
+                .as_deref()
+                .is_none_or(|resource_type| resource_type.trim().is_empty())
+                || key
+                    .resource_id
+                    .as_deref()
+                    .is_none_or(|resource_id| resource_id.trim().is_empty())
+        }) {
+            return Err(
+                PutRemediationExceptionsErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "A ResourceKey must name both a resourceType and a resourceId; \
+                             got resourceType '{}' and resourceId '{}'.",
+                            incomplete.resource_type.clone().unwrap_or_default(),
+                            incomplete.resource_id.clone().unwrap_or_default(),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The instant the exceptions fall due for deletion ("The exception is
+        // automatically deleted after the expiration date"), taken from the request once
+        // on the way in; a value this service cannot place as an instant is refused
+        // rather than stored.
+        let expires_at = match input.expiration_time {
+            None => None,
+            Some(at) => match crate::state::instant(at) {
+                Some(instant) => Some(instant),
+                None => {
+                    return Err(
+                        PutRemediationExceptionsErrorModeled::InvalidParameterValueException(
+                            InvalidParameterValueException {
+                                message: Some(crate::state::unplaceable_timestamp_message(
+                                    "ExpirationTime",
+                                    at,
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // An exception the clock has already taken past its expiration time is gone
+        // whether or not anybody deleted it, so the deletions the clock owes are
+        // materialised before this request decides what the rule holds.
+        store.expire_remediation_exceptions(now);
+
+        // Which resources the rule's own verdicts already place outside auto-remediation:
+        // one it evaluated as COMPLIANT, or as NOT_APPLICABLE to it, gets no exception.
+        // Read before anything is written, so the decision is about the state this call
+        // arrived at.
+        let rule = store.config_rules.get(&input.config_rule_name);
+        // An exception exempts a resource from ONE rule's remediation, so a rule this
+        // account does not hold has nothing to exempt a resource from: every key the
+        // request named comes back as failed, as the sibling writer of a rule's
+        // remediation configuration reports the same precondition. It is also what keeps
+        // the exceptions one account holds bounded by the rules it holds.
+        let unknown_rule = rule.is_none();
+        let no_exception_for: ::std::collections::BTreeSet<(String, String)> = rule
+            .map(|rule| {
+                rule.evaluation_results
+                    .values()
+                    .filter(|result| {
+                        result.compliance_type == crate::state::COMPLIANCE_TYPE_COMPLIANT
+                            || result.compliance_type
+                                == crate::state::COMPLIANCE_TYPE_NOT_APPLICABLE
+                    })
+                    .map(|result| (result.resource_type.clone(), result.resource_id.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Each key is written on its own, so one key the rule cannot hold an exception
+        // for does not cost the others their write; the failures come back as the
+        // request's `FailedBatches`, each with the reason that item failed.
+        let mut failed_batches: Vec<FailedRemediationExceptionBatch> = Vec::new();
+        for key in &input.resource_keys {
+            let entry = crate::state::RemediationExceptionEntry {
+                config_rule_name: input.config_rule_name.clone(),
+                resource_type: key.resource_type.clone().unwrap_or_default(),
+                resource_id: key.resource_id.clone().unwrap_or_default(),
+                // "The message contains an explanation of the exception": absent when
+                // the request carried none, so a caller reading the exception back can
+                // tell an unexplained exception from an explained one.
+                message: input.message.clone(),
+                expires_at,
+            };
+            let identity = (entry.resource_type.clone(), entry.resource_id.clone());
+
+            let reason = if unknown_rule {
+                Some(crate::state::no_such_config_rule_message(
+                    &input.config_rule_name,
+                ))
+            } else if no_exception_for.contains(&identity) {
+                Some(not_non_compliant_message(&input.config_rule_name))
+            } else if !store.put_remediation_exception(entry.clone()) {
+                Some(exceptions_per_rule_message(&input.config_rule_name))
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                failed_batches.push(FailedRemediationExceptionBatch {
+                    failure_message: Some(reason),
+                    failed_items: Some(vec![entry.to_shape()]),
+                });
+            }
+        }
+
+        // "Returns a list of failed remediation exceptions batch objects": the member
+        // reports the per-resource outcome of an accepted request, so it is always there
+        // to be read — EMPTY when the rule took an exception for every resource the
+        // request named, which is what tells a caller "all accepted" apart from a partial
+        // acceptance.
+        Ok(PutRemediationExceptionsOutput {
+            failed_batches: Some(failed_batches),
+        })
     }
+}
+
+/// The `FailureMessage` for a resource the rule's own verdict places as COMPLIANT or as
+/// NOT_APPLICABLE, which the operation documents as taking no exception ("Placing an
+/// exception can only be performed on resources that are NON_COMPLIANT. If you use this
+/// API for COMPLIANT resources or resources that are NOT_APPLICABLE, a remediation
+/// exception will not be generated").
+fn not_non_compliant_message(config_rule_name: &str) -> String {
+    format!(
+        "The resource is not NON_COMPLIANT with the AWS Config rule {config_rule_name}, so no \
+         remediation exception was generated for it."
+    )
+}
+
+/// The `FailureMessage` for a resource the rule can hold no further exception for,
+/// because it already holds as many as one call can add
+/// ([`crate::state::REMEDIATION_EXCEPTIONS_PER_RULE`]).
+fn exceptions_per_rule_message(config_rule_name: &str) -> String {
+    format!(
+        "The AWS Config rule {config_rule_name} already holds {} remediation exceptions, so no \
+         remediation exception was generated for this resource.",
+        crate::state::REMEDIATION_EXCEPTIONS_PER_RULE,
+    )
 }
