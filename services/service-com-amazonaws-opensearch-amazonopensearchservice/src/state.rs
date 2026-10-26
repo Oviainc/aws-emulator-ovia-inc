@@ -61,6 +61,7 @@ use crate::ops::types::{
     SnapshotOptionsStatus, SoftwareUpdateOptions, SoftwareUpdateOptionsStatus, StorageType,
     StorageTypeLimit, Tag, UpgradeHistory, UpgradeStepItem, UseCaseStatus,
     VPCDerivedInfo, VPCDerivedInfoStatus, VPCOptions, ValidationException, VersionStatus,
+    VpcEndpoint, VpcEndpointError, VpcEndpointSummary,
     OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES, RESERVED_INSTANCE_PAYMENT_OPTION_VALUES,
     VOLUME_TYPE_VALUES,
 };
@@ -553,6 +554,200 @@ pub const VPC_ENDPOINT_ACCESS_QUOTA: usize = 50;
 /// [`VPC_ENDPOINT_ACCESS_QUOTA`], so a domain's set can span more than one page and a
 /// caller that ignores the token cannot mistake a first page for the whole set.
 pub const VPC_ENDPOINT_ACCESS_PAGE: usize = 10;
+
+// ---------------------------------------------------------------------------
+// Service-managed VPC endpoints
+//
+// An endpoint is the proxy a caller in ANOTHER VPC reaches one domain through:
+// `CreateVpcEndpoint` mints one, `DescribeVpcEndpoints` reports the ones a
+// request names, `ListVpcEndpoints` reports the account's set and
+// `DeleteVpcEndpoint` releases one. [`VpcEndpointRecord`] below is the ONE copy
+// all of them read and write, plus the two projections the model asks for
+// (`VpcEndpoint` and `VpcEndpointSummary`), so no two of them can report the
+// same endpoint differently.
+//
+// The endpoint is held BESIDE the domains rather than on the domain it serves:
+// it is addressed by its own id, by callers that name no domain at all
+// (`DescribeVpcEndpoints`, `ListVpcEndpoints`), and it names the domain by ARN
+// the way the model does.
+// ---------------------------------------------------------------------------
+
+/// `VpcEndpointStatus`'s `CREATING` value: the endpoint has been asked for and is
+/// being provisioned.
+pub const VPC_ENDPOINT_STATUS_CREATING: &str = "CREATING";
+
+/// `VpcEndpointStatus`'s `ACTIVE` value: the endpoint is up and can be connected
+/// through.
+pub const VPC_ENDPOINT_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `VpcEndpointStatus`'s `DELETING` value: the endpoint has been released and is
+/// being torn down.
+pub const VPC_ENDPOINT_STATUS_DELETING: &str = "DELETING";
+
+/// `VpcEndpointErrorCode`'s `ENDPOINT_NOT_FOUND` value — the code
+/// `DescribeVpcEndpoints` reports IN ITS PAYLOAD for an id that names no endpoint,
+/// rather than refusing the whole call: that read reports on a LIST of ids, so one
+/// id nothing holds is an error about that id and not about the request.
+pub const VPC_ENDPOINT_ERROR_ENDPOINT_NOT_FOUND: &str = "ENDPOINT_NOT_FOUND";
+
+/// How many service-managed VPC endpoints this account holds before
+/// `CreateVpcEndpoint` refuses with the modelled `LimitExceededException`.
+///
+/// Like [`DOMAIN_QUOTA`] this is the emulator's OWN bound on the store — it models
+/// neither Service Quotas nor an account's adjustments — and it is what stops a
+/// caller looping from growing the state without end: every record it counts is
+/// released by deleting the endpoint. Because the stored set IS what
+/// `ListVpcEndpoints` pages through, it also bounds that listing.
+pub const VPC_ENDPOINT_QUOTA: usize = 50;
+
+/// How many endpoint summaries ONE page of `ListVpcEndpoints` carries.
+///
+/// That operation takes a `NextToken` and its response declares one as REQUIRED, so
+/// the listing is paged; the model gives it no page-size member, so the page size is
+/// the service's to pick and this is the emulator's choice of it — smaller than
+/// [`VPC_ENDPOINT_QUOTA`], so the set can span more than one page and a caller that
+/// ignores the token cannot mistake a first page for the whole set.
+pub const VPC_ENDPOINT_PAGE: usize = 10;
+
+/// One service-managed VPC endpoint of this account, as this emulator persists it.
+#[derive(Debug, Clone)]
+pub struct VpcEndpointRecord {
+    /// `VpcEndpoint$VpcEndpointId`: unique per endpoint, so it IS the key the store
+    /// holds the record under.
+    pub vpc_endpoint_id: String,
+    /// `VpcEndpoint$VpcEndpointOwner`: "the creator of the endpoint", which is the
+    /// account this emulator serves.
+    pub owner: String,
+    /// `VpcEndpoint$DomainArn`: the domain the endpoint connects to, as the request
+    /// named it — and it named a domain this account holds, which is what
+    /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::vpc_endpoint_domain`]
+    /// resolved before the record was made.
+    pub domain_arn: String,
+    /// `VpcEndpoint$VpcOptions`: the subnets and security groups the endpoint was
+    /// created with, stored as the modelled shape the read paths report rather than
+    /// as a second mirror of its members.
+    pub vpc_options: VPCDerivedInfo,
+    /// Where the endpoint is in its lifecycle: one of `VpcEndpointStatus`'s values.
+    pub status: String,
+    /// The status move the clock owes this endpoint, if any is outstanding.
+    pub owed: Option<OwedStatus>,
+    /// `VpcEndpoint$Endpoint`: "the connection endpoint ID for connecting to the
+    /// domain".
+    pub endpoint: String,
+    /// The request's `ClientToken`, absent where it carried none: "unique,
+    /// case-sensitive identifier to ensure idempotency of the request", so a repeat
+    /// of the same create is answered with THIS record rather than minting a second
+    /// endpoint.
+    pub client_token: Option<String>,
+}
+
+impl VpcEndpointRecord {
+    /// Materialise the status move the clock owes this endpoint, if `now` is past its
+    /// due instant: an endpoint that was being provisioned becomes one that is up.
+    ///
+    /// This is the only write a reporting operation makes, and it writes only what was
+    /// already owed at the same instant had nobody called.
+    pub fn settle(&mut self, now: SystemTime) {
+        let Some(owed) = self.owed.take_if(|owed| now >= owed.due) else {
+            return;
+        };
+        self.status = owed.status;
+    }
+
+    /// This record as `VpcEndpoint` — the shape `CreateVpcEndpoint` answers with and
+    /// `DescribeVpcEndpoints` reports, so a create's answer and a later read of the
+    /// endpoint cannot disagree.
+    pub fn to_endpoint(&self) -> VpcEndpoint {
+        VpcEndpoint {
+            vpc_endpoint_id: Some(self.vpc_endpoint_id.clone()),
+            vpc_endpoint_owner: Some(self.owner.clone()),
+            domain_arn: Some(self.domain_arn.clone()),
+            vpc_options: Some(self.vpc_options.clone()),
+            status: Some(self.status.clone()),
+            endpoint: Some(self.endpoint.clone()),
+        }
+    }
+
+    /// This record as `VpcEndpointSummary` — the shape `ListVpcEndpoints` pages
+    /// through and `DeleteVpcEndpoint` answers with: the same record as
+    /// [`Self::to_endpoint`] without the subnets and the connection endpoint, which
+    /// the model's summary declares no member for.
+    pub fn to_summary(&self) -> VpcEndpointSummary {
+        VpcEndpointSummary {
+            vpc_endpoint_id: Some(self.vpc_endpoint_id.clone()),
+            vpc_endpoint_owner: Some(self.owner.clone()),
+            domain_arn: Some(self.domain_arn.clone()),
+            status: Some(self.status.clone()),
+        }
+    }
+}
+
+/// The `ValidationException` payload for a `CreateVpcEndpoint` whose `DomainArn`
+/// names no domain this account holds, or names one no endpoint can be created for.
+///
+/// The service states these as ONE refusal, and deliberately: which of them holds is
+/// something the caller may not be entitled to learn, so the sentence names all the
+/// reasons rather than the one that applied. It carries no value of the request for
+/// the same reason.
+pub fn vpc_endpoint_domain_unavailable() -> ValidationException {
+    ValidationException {
+        message: Some(
+            "Either the domain doesn't exist, it doesn't support creation of VPC \
+             endpoints, or you don't have permission to create a VPC endpoint for the \
+             domain."
+                .to_string(),
+        ),
+    }
+}
+
+/// The sentence `DescribeVpcEndpoints` states IN ITS PAYLOAD for an id that names no
+/// service-managed VPC endpoint: fixed text carrying no value of the request, because
+/// the entry beside it already names the id it is about.
+pub const ENDPOINT_DOES_NOT_EXIST: &str = "Endpoint does not exist";
+
+/// The sentence a call that ADDRESSES one endpoint refuses a missing id with.
+///
+/// Worded differently from [`ENDPOINT_DOES_NOT_EXIST`], and deliberately: a caller
+/// addressing an endpoint may not be entitled to learn which of the two reasons holds,
+/// so the refusal names both rather than the one that applied — the same reticence
+/// [`vpc_endpoint_domain_unavailable`] shows about a domain.
+pub const ENDPOINT_INACCESSIBLE: &str =
+    "The VPC endpoint doesn't exist, or you don't have access to it.";
+
+/// The `ResourceNotFoundException` payload for an id that names no endpoint of this
+/// account — the endpoint mirror of [`domain_not_found`].
+///
+/// This is what a call ADDRESSING one endpoint (releasing it) answers; a read that
+/// names a LIST of ids reports the same condition per id in its payload instead
+/// ([`vpc_endpoint_missing`]).
+pub fn vpc_endpoint_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(ENDPOINT_INACCESSIBLE.to_string()),
+    }
+}
+
+/// The `ValidationException` payload for a read that names more endpoint ids than this
+/// account can hold endpoints: the answer carries one entry per id the request names,
+/// so the request would otherwise choose the size of the response.
+pub fn too_many_vpc_endpoint_ids(named: usize) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "VpcEndpointIds names {named} endpoints; at most {VPC_ENDPOINT_QUOTA} can be \
+             described in one call."
+        )),
+    }
+}
+
+/// The `VpcEndpointError` `DescribeVpcEndpoints` reports for one id that names no
+/// endpoint: the id it was asked about, the modelled code for that condition and the
+/// service's own sentence for it.
+pub fn vpc_endpoint_missing(vpc_endpoint_id: &str) -> VpcEndpointError {
+    VpcEndpointError {
+        vpc_endpoint_id: Some(vpc_endpoint_id.to_string()),
+        error_code: Some(VPC_ENDPOINT_ERROR_ENDPOINT_NOT_FOUND.to_string()),
+        error_message: Some(ENDPOINT_DOES_NOT_EXIST.to_string()),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Indexes
@@ -1177,6 +1372,13 @@ pub struct SoftwareDeployment {
     pub rollback: bool,
 }
 
+/// `RollbackServiceSoftwareOptions$Description` for a domain that has no earlier
+/// release to return to: the service's own sentence for that decline, which names
+/// the reason (no previous version) and where to take it further.
+pub const NO_ROLLBACK_TARGET_DESCRIPTION: &str =
+    "No previous software version available for rollback. Please contact AWS Support \
+     for assistance.";
+
 /// The service software of one domain: the release it runs, the deployment in flight
 /// on it, and whether the release it last came off is still within its rollback
 /// window.
@@ -1304,6 +1506,11 @@ impl ServiceSoftware {
     /// `Description` is "a description of the rollback status", so it names which part
     /// of the rule the record fails: a deployment already running, a window that has
     /// closed, or no landed deployment to undo at all.
+    ///
+    /// The last of those is the sentence the service itself answers a domain with no
+    /// earlier release to return to — the condition every domain is in until a
+    /// deployment has landed on it — so it is reproduced as the service words it,
+    /// including the direction it gives a caller that believes a rollback was due.
     pub fn rollback_unavailable(&self) -> RollbackServiceSoftwareOptions {
         let description = if self.deploying() {
             "A service software deployment is already in progress on this domain.".to_string()
@@ -1311,7 +1518,7 @@ impl ServiceSoftware {
             "The rollback window of this domain's last service software update has closed."
                 .to_string()
         } else {
-            "No service software rollback is available for this domain.".to_string()
+            NO_ROLLBACK_TARGET_DESCRIPTION.to_string()
         };
         RollbackServiceSoftwareOptions {
             current_version: Some(self.current_version.clone()),
@@ -2149,8 +2356,11 @@ impl Domain {
             // A version 2 endpoint and a dual-stack hosted zone are provisioned by
             // the parts of the service this slice does not model.
             endpoint_v2: None,
-            // The `Endpoints` map exists only for a VPC domain's endpoints, which
-            // `CreateVpcEndpoint` would mint; it is still a stub.
+            // `Endpoints` is the domain's OWN endpoint map, keyed by the kind of
+            // endpoint ("vpc"), which the parts of the service this slice does not
+            // model provision; the endpoint a caller reaches this domain on is reported
+            // in `Endpoint` above. A service-managed VPC endpoint is a resource of its
+            // own, reported by `DescribeVpcEndpoints` rather than here.
             endpoints: None,
             domain_endpoint_v2_hosted_zone_id: None,
             // A domain applying a service software deployment is processing too, even
@@ -3788,6 +3998,20 @@ pub fn prerequisite_not_associated(
     }
 }
 
+/// The `ValidationException` payload for a package-association call whose
+/// `DomainName` names no domain this account holds.
+///
+/// Linking a package resolves the domain as part of READING the request: a name that
+/// resolves to no domain is a value the caller has to fix, so the refusal is the
+/// client-input one rather than the missing-resource one, and it names the domain
+/// that could not be resolved. Compare [`domain_not_found`], which is what a call
+/// that ADDRESSES a domain (describing it, changing it, deleting it) answers.
+pub fn domain_does_not_exist(domain_name: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!("The domain {domain_name} does not exist.")),
+    }
+}
+
 /// The `ValidationException` payload for a package the same call names twice: a
 /// domain holds ONE association per package, so a request that names it twice asks
 /// for two states of one association and cannot be served as asked.
@@ -3891,6 +4115,16 @@ pub struct ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// live on that domain ([`Domain::insights`]), so an insight has exactly one
     /// home whichever entity holds it. See [`InsightRecord`].
     pub account_insights: BTreeMap<String, InsightRecord>,
+    /// Every service-managed VPC endpoint of this account, keyed by its
+    /// `VpcEndpointId` — unique per endpoint, so the id IS the key.
+    /// `CreateVpcEndpoint` mints one and `DescribeVpcEndpoints` / `ListVpcEndpoints`
+    /// report it, from THIS one record. Iterating a `BTreeMap` is order-stable, which
+    /// is what lets a paged listing resume where the previous page stopped without
+    /// repeating or skipping a record. Bounded by [`VPC_ENDPOINT_QUOTA`].
+    pub vpc_endpoints: BTreeMap<String, VpcEndpointRecord>,
+    /// Drives
+    /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_vpc_endpoint_id`].
+    pub vpc_endpoint_seq: u64,
 }
 
 impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
@@ -3910,6 +4144,8 @@ impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
             billing_subscription_seq: 0,
             packages: BTreeMap::new(),
             account_insights: BTreeMap::new(),
+            vpc_endpoints: BTreeMap::new(),
+            vpc_endpoint_seq: 0,
         }
     }
 }
@@ -3938,6 +4174,11 @@ const SUFFIX_OFFSET: u128 = 734_291;
 /// [`SUFFIX_OFFSET`], so the nth connection id and the nth endpoint suffix — minted
 /// off two counters that both start at zero — do not carry the same token.
 const CONNECTION_ID_OFFSET: u128 = 51_539_607_551;
+
+/// The bijection's constant term for a service-managed VPC endpoint's id. Different
+/// from the two above for the same reason: three counters that start at zero must not
+/// render the same token.
+const VPC_ENDPOINT_ID_OFFSET: u128 = 8_589_934_591;
 
 /// The opaque lowercase-alphanumeric token seed `seq` scrambles to, through the
 /// bijection described on [`SUFFIX_MULTIPLIER`]: distinct seeds under one `offset`
@@ -3979,6 +4220,68 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
             "cc-{}",
             opaque_token(self.connection_seq, CONNECTION_ID_OFFSET)
         )
+    }
+
+    /// Mint the identifier a service-managed VPC endpoint is addressed by, so two
+    /// endpoints never share one.
+    ///
+    /// `VpcEndpointId` is `@length(min: 5, max: 256)` with pattern
+    /// `^aos-[a-zA-Z0-9]*$`: the `aos-` prefix is the service's own, and the body is
+    /// minted off its own counter through the same bijection as
+    /// [`Self::mint_endpoint_suffix`], so it is unpredictable-looking yet never
+    /// repeats.
+    pub fn mint_vpc_endpoint_id(&mut self) -> String {
+        self.vpc_endpoint_seq = self.vpc_endpoint_seq.wrapping_add(1);
+        format!(
+            "aos-{}",
+            opaque_token(self.vpc_endpoint_seq, VPC_ENDPOINT_ID_OFFSET)
+        )
+    }
+
+    /// Materialise the status move the clock owes every stored VPC endpoint, for a
+    /// caller about to report on any of them.
+    pub fn settle_vpc_endpoints(&mut self, now: SystemTime) {
+        for endpoint in self.vpc_endpoints.values_mut() {
+            endpoint.settle(now);
+        }
+    }
+
+    /// The domain a `CreateVpcEndpoint` can mint an endpoint for, given the
+    /// `DomainArn` the request named.
+    ///
+    /// TWO conditions, and the refusal does not say which failed
+    /// ([`vpc_endpoint_domain_unavailable`]): the ARN must name a domain this account
+    /// holds, and that domain must be one an endpoint can be created for — a domain
+    /// provisioned inside a VPC, because the endpoint exists to reach a cluster that
+    /// has no public endpoint of its own. A domain with no `VPCOptions` has nothing
+    /// for an endpoint to proxy into.
+    ///
+    /// Reads ONLY.
+    pub fn vpc_endpoint_domain(&self, domain_arn: &str) -> Option<&Domain> {
+        self.domains
+            .values()
+            .find(|domain| domain.arn == domain_arn && domain.vpc_options.is_some())
+    }
+
+    /// The endpoint a create carrying `client_token` already minted, if this account
+    /// holds one.
+    ///
+    /// `ClientToken` is "a unique, case-sensitive identifier to ensure idempotency of
+    /// the request", so a repeat of the same create is answered with the record the
+    /// first one made rather than minting a second endpoint.
+    ///
+    /// Reads ONLY.
+    pub fn vpc_endpoint_of_client_token(&self, client_token: &str) -> Option<&VpcEndpointRecord> {
+        self.vpc_endpoints
+            .values()
+            .find(|endpoint| endpoint.client_token.as_deref() == Some(client_token))
+    }
+
+    /// Store `endpoint` and hand back the stored copy, so a create answers with the
+    /// record this service persisted rather than a copy beside it.
+    pub fn insert_vpc_endpoint(&mut self, endpoint: VpcEndpointRecord) -> &VpcEndpointRecord {
+        let id = endpoint.vpc_endpoint_id.clone();
+        self.vpc_endpoints.entry(id).or_insert(endpoint)
     }
 
     /// The domain `name` names, with any configuration change the clock owes it
@@ -4156,7 +4459,7 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
         let domain = self
             .domains
             .get(domain_name)
-            .ok_or_else(|| AssociationRefusal::NotFound(domain_not_found(domain_name)))?;
+            .ok_or_else(|| AssociationRefusal::Validation(domain_does_not_exist(domain_name)))?;
         let package = self
             .packages
             .get(&request.package_id)
@@ -4505,6 +4808,16 @@ pub fn domain_arn(domain_name: &str, region: &str) -> String {
 /// service's endpoint prefix.
 pub fn domain_endpoint(domain_name: &str, suffix: &str, region: &str) -> String {
     format!("search-{domain_name}-{suffix}.{region}.{ARN_NAMESPACE}.amazonaws.com")
+}
+
+/// The connection endpoint a service-managed VPC endpoint is reached on.
+///
+/// The same host shape as [`domain_endpoint`] — the domain, an opaque per-endpoint
+/// suffix, the Region and this service's endpoint prefix — behind the `vpc-` prefix
+/// the service gives an endpoint that proxies into a VPC rather than the `search-`
+/// one a domain's own endpoint carries, so the two are never mistaken for each other.
+pub fn vpc_endpoint_host(domain_name: &str, suffix: &str, region: &str) -> String {
+    format!("vpc-{domain_name}-{suffix}.{region}.{ARN_NAMESPACE}.amazonaws.com")
 }
 
 /// The region this request was signed for — what a domain's ARN and endpoint name.

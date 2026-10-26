@@ -28,7 +28,8 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    ServiceSoftware, SoftwareDeployment, DEFAULT_SERVICE_SOFTWARE_VERSION, ROLLBACK_WINDOW,
+    ServiceSoftware, SoftwareDeployment, DEFAULT_SERVICE_SOFTWARE_VERSION,
+    NO_ROLLBACK_TARGET_DESCRIPTION, ROLLBACK_WINDOW,
 };
 
 use super::domain_lifecycle::{create_baseline, error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
@@ -391,6 +392,112 @@ async fn a_rollback_on_a_domain_that_does_not_exist_is_the_modelled_not_found() 
              got {:?}",
             answer.body
         );
+    }
+}
+
+#[tokio::test]
+async fn a_domain_with_no_release_to_return_to_is_declined_with_the_services_own_reason() {
+    let emulator = Emulator::new();
+
+    // `RollbackServiceSoftwareOptions$Description` is "a description of the rollback
+    // status": it is the only machine-readable reason a decline carries, so the rule is
+    // that it names WHY the rollback was declined. Rows one to four are the ways a
+    // domain can have no earlier release to return to, which all state the service's
+    // one sentence for that reason; rows five and six fail the rule for a DIFFERENT
+    // reason and must not state it.
+    let rows: Vec<(&str, Option<ServiceSoftware>, bool)> = vec![
+        // A domain no deployment has ever landed on: as `CreateDomain` left it.
+        ("reason-never-deployed", None, true),
+        // An open window with nothing behind it.
+        (
+            "reason-no-target",
+            Some(ServiceSoftware {
+                rollback_to: None,
+                ..after_update("R20250101", "R20241001", Duration::from_secs(60 * 60))
+            }),
+            true,
+        ),
+        // A closed window with nothing behind it either.
+        (
+            "reason-no-target-closed",
+            Some(ServiceSoftware {
+                rollback_to: None,
+                rollback_until: None,
+                ..after_update("R20250101", "R20241001", Duration::from_secs(0))
+            }),
+            true,
+        ),
+        // A rollback that has itself landed: rolling back does not open a window to
+        // roll forward again, so there is no release to return to.
+        (
+            "reason-rolled-back",
+            Some(ServiceSoftware {
+                available_version: Some("R20250101".to_string()),
+                rollback_to: None,
+                rollback_until: None,
+                ..after_update("R20241001", "R20250101", Duration::from_secs(0))
+            }),
+            true,
+        ),
+        // A release to return to, but its window has closed: a different reason.
+        (
+            "reason-window-closed",
+            Some(after_update("R20250101", "R20241001", Duration::from_secs(0))),
+            false,
+        ),
+        // A deployment already in flight inside an open window: a different reason
+        // again.
+        (
+            "reason-deploying",
+            Some(ServiceSoftware {
+                deployment: Some(SoftwareDeployment {
+                    target_version: "R20250601".to_string(),
+                    completes_at: SystemTime::now() + Duration::from_secs(60 * 60),
+                    rollback: false,
+                }),
+                ..after_update("R20250101", "R20241001", Duration::from_secs(60 * 60))
+            }),
+            false,
+        ),
+    ];
+
+    for (name, software, no_release_to_return_to) in rows {
+        settled_domain(&emulator, name).await;
+        if let Some(software) = software {
+            seed(&emulator, name, software);
+        }
+        let answer = rollback(&emulator, name).await;
+        assert_eq!(
+            answer.status, 200,
+            "case RollbackServiceSoftwareUpdate({name:?}): a decline is answered, not refused: \
+             got {} with {:?}",
+            answer.status, answer.body
+        );
+        let options = answer.body["RollbackServiceSoftwareOptions"].clone();
+        assert_eq!(
+            options["RollbackAvailable"].as_bool(),
+            Some(false),
+            "case RollbackServiceSoftwareUpdate({name:?}): expected the decline, got {options:?}"
+        );
+        let stated = options["Description"].as_str().unwrap_or_default();
+        if no_release_to_return_to {
+            assert_eq!(
+                stated, NO_ROLLBACK_TARGET_DESCRIPTION,
+                "case RollbackServiceSoftwareUpdate({name:?}): expected \
+                 {NO_ROLLBACK_TARGET_DESCRIPTION:?}, got {stated:?}"
+            );
+        } else {
+            assert_ne!(
+                stated, NO_ROLLBACK_TARGET_DESCRIPTION,
+                "case RollbackServiceSoftwareUpdate({name:?}): a domain declined for another \
+                 reason must not state the no-previous-version one, got {stated:?}"
+            );
+            assert!(
+                !stated.is_empty(),
+                "case RollbackServiceSoftwareUpdate({name:?}): expected a description of the \
+                 rollback status, got {options:?}"
+            );
+        }
     }
 }
 

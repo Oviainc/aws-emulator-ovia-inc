@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListVpcEndpoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListVpcEndpoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListVpcEndpoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages through the service-managed VPC endpoints this account holds, reporting each
+//! stored [`crate::state::VpcEndpointRecord`] through the same `VpcEndpointSummary`
+//! projection `DeleteVpcEndpoint` answers with — so a listing and the record a
+//! create minted cannot disagree, and an endpoint that was released is in no page.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +73,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{invalid_next_token, VPC_ENDPOINT_PAGE};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -88,12 +86,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-opensearch-amazonopense
 // here — hence the `ListVpcEndpointsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.opensearch#ListVpcEndpoints")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.opensearch#ListVpcEndpoints",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum ListVpcEndpointsErrorModeled {
     BaseException(BaseException),
     DisabledOperationException(DisabledOperationException),
     InternalException(InternalException),
+    // Widened in through `extra_errors`: the SERVICE models `ValidationException` and
+    // this operation needs it for a `NextToken` that names no place in the set being
+    // paged, which its own `errors` list omits. See `crate::state::invalid_next_token`.
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -147,18 +152,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListVpcEndpoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListVpcEndpointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Reporting the set materialises only the status moves the clock already owed
+        // its records at `now` — each would have fallen due whether or not anybody
+        // called.
+        store.settle_vpc_endpoints(now);
+
+        // Order-stable, because the store is keyed by the endpoint's id: the same
+        // request reports the same order twice, which is what lets a token name a place
+        // in the set.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListVpcEndpoints"))
+        // A token names the endpoint the next page starts at, so paging resumes from a
+        // place in the set rather than from an offset a create or a release would have
+        // shifted. A token naming no endpoint of the set — one this service never handed
+        // out, or one whose endpoint has since been released — names no such place,
+        // which is a malformed request rather than an empty page. The EMPTY token is the
+        // one this operation itself hands out at the end of a listing, so it starts from
+        // the first page exactly as naming no token does.
+        let start = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            None => 0,
+            Some(token) => store
+                .vpc_endpoints
+                .keys()
+                .position(|id| id == token)
+                .ok_or_else(|| {
+                    ListVpcEndpointsErrorModeled::ValidationException(invalid_next_token())
+                })?,
+        };
+        // ONE page, so the answer is bounded by the page size however large the stored
+        // set is.
+        let page: Vec<VpcEndpointSummary> = store
+            .vpc_endpoints
+            .values()
+            .skip(start)
+            .take(VPC_ENDPOINT_PAGE)
+            .map(crate::state::VpcEndpointRecord::to_summary)
+            .collect();
+
+        Ok(ListVpcEndpointsOutput {
+            vpc_endpoint_summary_list: page,
+            // "When nextToken is returned, there are more results available": the token
+            // is the endpoint the next page starts at, and there is none once this page
+            // ended the set. The member is REQUIRED by the model, so the end of the
+            // listing is the empty token rather than no member — which is also what a
+            // paginating client stops on.
+            next_token: store
+                .vpc_endpoints
+                .keys()
+                .nth(start.saturating_add(VPC_ENDPOINT_PAGE))
+                .cloned()
+                .unwrap_or_default(),
+        })
     }
 }

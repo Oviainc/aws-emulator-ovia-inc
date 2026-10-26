@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeVpcEndpoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeVpcEndpoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeVpcEndpoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored [`crate::state::VpcEndpointRecord`] of each endpoint the call
+//! names, through the same `VpcEndpoint` projection `CreateVpcEndpoint` answers with.
+//!
+//! The call reports on a LIST of ids, so an id that names no endpoint is an error
+//! about THAT id rather than a refusal of the request: it is reported in the
+//! response's own `VpcEndpointErrors` channel
+//! ([`crate::state::vpc_endpoint_missing`]), and every id that does resolve is still
+//! reported.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +75,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::{too_many_vpc_endpoint_ids, vpc_endpoint_missing, VPC_ENDPOINT_QUOTA};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -147,18 +149,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeVpcEndpoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeVpcEndpointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeVpcEndpoints"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The answer carries one entry per id the request names, so its size is the
+        // request's choice unless it is bounded here. The bound is the most endpoints
+        // this account can hold: a request naming more ids than that cannot be a
+        // request about the endpoints it holds, and it is refused rather than answered
+        // with a response sized by the request.
+        if input.vpc_endpoint_ids.len() > VPC_ENDPOINT_QUOTA {
+            return Err(DescribeVpcEndpointsErrorModeled::ValidationException(
+                too_many_vpc_endpoint_ids(input.vpc_endpoint_ids.len()),
+            )
+            .into());
+        }
+
+        // Reporting an endpoint materialises only the status move the clock already
+        // owed it at `now` — it would have fallen due whether or not anybody called.
+        // Nothing else about the record changes on a read.
+        store.settle_vpc_endpoints(now);
+
+        // One answer per id the request named, in the order it named them: an id the
+        // store holds an endpoint for is reported, and one it does not is reported in
+        // the error channel. Both members are REQUIRED by the model, so each is a list
+        // that may be empty rather than an absent member.
+        let mut endpoints = Vec::new();
+        let mut errors = Vec::new();
+        for id in &input.vpc_endpoint_ids {
+            match store.vpc_endpoints.get(id) {
+                Some(endpoint) => endpoints.push(endpoint.to_endpoint()),
+                None => errors.push(vpc_endpoint_missing(id)),
+            }
+        }
+
+        Ok(DescribeVpcEndpointsOutput {
+            vpc_endpoints: endpoints,
+            vpc_endpoint_errors: errors,
+        })
     }
 }
