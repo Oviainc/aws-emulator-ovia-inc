@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AdminDisableProviderForUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AdminDisableProviderForUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Prevents the identity the request names from signing in: an external IdP identity's
+//! link to a local profile is removed, and for the native `Cognito` provider the local
+//! profile's password sign-in is withdrawn. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AdminDisableProviderForUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The call acts on a LINK, so an account the pool holds no link for is refused with a
+//! 400 `InvalidParameterException`
+//! ([`crate::state::ACCOUNT_NOT_LINKED_MESSAGE`]); `AdminLinkProviderForUser` is what
+//! makes a link in the first place.
 //!
 //! ## Shape of an operation
 //!
@@ -179,20 +179,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AdminDisableProviderForUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AdminDisableProviderForUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AdminDisableProviderForUser"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        // The identifier must name a provider, an attribute and a value: that
+        // triple is the identity whose link is acted on, and for a SAML or
+        // social identity it is "the same values that were used for the
+        // `SourceUser` when the identities were originally linked" (this
+        // operation's model).
+        let identity = crate::state::ProviderIdentity::from_identifier(&input.user)
+            .map_err(|missing| missing_parameter(missing.as_str()))?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        if identity.is_native() {
+            // "To deactivate a local user, set `ProviderName` to `Cognito` ...
+            // The `ProviderAttributeValue` must be user's local username" (this
+            // operation's model), and for such a user "they can't use their
+            // password to sign in": the stored password is what password
+            // sign-in checks, so withdrawing it is what deactivates that
+            // sign-in, and the links to the profile stay: only the native
+            // factor is deactivated. An administrator setting a password again
+            // restores it, exactly as it restores a user that never had one.
+            let key = pool
+                .user_storage_key(&identity.provider_attribute_value)
+                .ok_or_else(user_not_found)?;
+            let user = pool.users.get_mut(&key).ok_or_else(internal_error)?;
+            if user.provider_links.is_empty() {
+                return Err(account_not_linked());
+            }
+            user.password = None;
+            user.password_permanent = false;
+            user.password_set_at = None;
+            user.user_last_modified_date = now;
+        } else {
+            // "If the user to deactivate is a linked external IdP user, any
+            // link between that user and an existing user is removed" (this
+            // operation's model): the link is held on the local profile it
+            // resolves to, so the stored identity is dropped from that profile
+            // and a later call finds nothing left to remove.
+            let key = pool
+                .linked_user_key(&identity)
+                .ok_or_else(account_not_linked)?;
+            let user = pool.users.get_mut(&key).ok_or_else(internal_error)?;
+            user.provider_links.remove(&identity);
+            user.user_last_modified_date = now;
+        }
+        Ok(AdminDisableProviderForUserOutput {})
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> AdminDisableProviderForUserError {
+    AdminDisableProviderForUserErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(format!("User pool {user_pool_id} does not exist.")),
+        },
+    )
+    .into()
+}
+
+/// This operation's `UserNotFoundException` for a local user the pool does not
+/// hold. Carries the fixed message of
+/// [`crate::state::USER_NOT_FOUND_MESSAGE`], which names no user.
+fn user_not_found() -> AdminDisableProviderForUserError {
+    AdminDisableProviderForUserErrorModeled::UserNotFoundException(UserNotFoundException {
+        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException` for an account the pool holds
+/// no provider link for.
+fn account_not_linked() -> AdminDisableProviderForUserError {
+    invalid_parameter(crate::state::ACCOUNT_NOT_LINKED_MESSAGE.to_string())
+}
+
+/// This operation's `InvalidParameterException` for a member of the submitted
+/// `ProviderUserIdentifierType` the request left out.
+fn missing_parameter(parameter: &str) -> AdminDisableProviderForUserError {
+    invalid_parameter(format!("Missing required parameter {parameter}"))
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: String) -> AdminDisableProviderForUserError {
+    AdminDisableProviderForUserErrorModeled::InvalidParameterException(
+        InvalidParameterException {
+            message: Some(message),
+            // "The reason code of the exception" (this service's model) names a
+            // further classification Amazon Cognito reports only for some
+            // refusals; none applies to a provider link, so none is invented.
+            reason_code: None,
+        },
+    )
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> AdminDisableProviderForUserError {
+    AdminDisableProviderForUserErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

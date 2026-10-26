@@ -118,6 +118,7 @@ fn stored_user(password_permanent: bool, password_set_at: Option<SystemTime>) ->
         devices: std::collections::BTreeMap::new(),
         outstanding_codes: std::collections::BTreeMap::new(),
         web_authn_credentials: Vec::new(),
+        provider_links: std::collections::BTreeMap::new(),
         software_token_registered: false,
         web_authn_mfa_enabled: None,
     }

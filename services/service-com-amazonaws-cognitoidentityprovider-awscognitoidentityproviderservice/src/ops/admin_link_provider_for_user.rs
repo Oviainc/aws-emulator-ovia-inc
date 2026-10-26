@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AdminLinkProviderForUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AdminLinkProviderForUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Links a federated `SourceUser` identity to the local `DestinationUser` profile it
+//! resolves to: the link is stored on that profile, so a later de-link or read sees it.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AdminLinkProviderForUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A link's destination profile is the local user the identity resolves to; the identity
+//! itself is the (provider, attribute name, attribute value) triple the request names, and
+//! `AdminDisableProviderForUser` is what removes it again.
 //!
 //! ## Shape of an operation
 //!
@@ -190,20 +188,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AdminLinkProviderForUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AdminLinkProviderForUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AdminLinkProviderForUser"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        // The source identifier must name a provider, an attribute and a value:
+        // that triple is the KEY the link is stored under, and the one a later
+        // de-link has to present again.
+        let source = crate::state::ProviderIdentity::from_identifier(&input.source_user)
+            .map_err(|missing| missing_parameter(missing.as_str()))?;
+        // "The `ProviderAttributeName` of the `DestinationUser` is ignored"
+        // (this operation's model), so the destination is read as its provider
+        // and the value that names the profile, and nothing else.
+        let destination_value =
+            crate::state::ProviderIdentity::destination_value(&input.destination_user)
+                .map_err(|missing| missing_parameter(missing.as_str()))?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // The source "must be a federated user (for example, a SAML or Facebook
+        // user), not another native user" (this operation's model), and the IdP
+        // it federates through is one the pool holds — the same rule
+        // `AdminDisableProviderForUser` states as "the value of `ProviderName`
+        // must match the name of a user pool IdP". Its stored type is what the
+        // linked identity renders as its `providerType`.
+        let provider_type = pool
+            .identity_providers
+            .get(&source.provider_name)
+            .map(|provider| provider.provider_type.clone())
+            .ok_or_else(|| identity_provider_not_found(&source.provider_name, &input.user_pool_id))?;
+
+        // "If the user doesn't exist, Amazon Cognito generates an exception"
+        // (`DestinationUser`): the profile is resolved by the value that
+        // identifier carries, which "should be the username in the user pool"
+        // for a native user.
+        let destination_key = pool
+            .user_storage_key(&destination_value)
+            .ok_or_else(user_not_found)?;
+
+        // A source identity links to ONE local profile, so a second call does
+        // not re-point one already linked elsewhere; linking it to the profile
+        // it already names changes nothing.
+        if let Some(linked_key) = pool.linked_user_key(&source) {
+            if linked_key != destination_key {
+                return Err(invalid_parameter(format!(
+                    "Provider {} user {} is already linked to another user.",
+                    source.provider_name, source.provider_attribute_value
+                )));
+            }
+            return Ok(AdminLinkProviderForUserOutput {});
+        }
+
+        let user = pool
+            .users
+            .get_mut(&destination_key)
+            .ok_or_else(internal_error)?;
+        if user.provider_links.len() >= crate::state::MAX_LINKED_PROVIDER_IDENTITIES {
+            return Err(limit_exceeded(format!(
+                "The maximum number of federated identities linked to a user is {}.",
+                crate::state::MAX_LINKED_PROVIDER_IDENTITIES
+            )));
+        }
+        user.provider_links.insert(
+            source,
+            crate::state::LinkedProvider {
+                provider_type,
+                created_at: now,
+            },
+        );
+        user.user_last_modified_date = now;
+        Ok(AdminLinkProviderForUserOutput {})
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> AdminLinkProviderForUserError {
+    AdminLinkProviderForUserErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for a `ProviderName` the pool
+/// holds no identity provider under.
+fn identity_provider_not_found(
+    provider_name: &str,
+    user_pool_id: &str,
+) -> AdminLinkProviderForUserError {
+    AdminLinkProviderForUserErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::identity_provider_not_found_message(
+            provider_name,
+            user_pool_id,
+        )),
+    })
+    .into()
+}
+
+/// This operation's `UserNotFoundException` for a destination the pool holds no
+/// user for. Carries the fixed message of
+/// [`crate::state::USER_NOT_FOUND_MESSAGE`], which names no user.
+fn user_not_found() -> AdminLinkProviderForUserError {
+    AdminLinkProviderForUserErrorModeled::UserNotFoundException(UserNotFoundException {
+        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException` for a member of a submitted
+/// `ProviderUserIdentifierType` the request left out.
+fn missing_parameter(parameter: &str) -> AdminLinkProviderForUserError {
+    invalid_parameter(format!("Missing required parameter {parameter}"))
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: String) -> AdminLinkProviderForUserError {
+    AdminLinkProviderForUserErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        // "The reason code of the exception" (this service's model) names a
+        // further classification Amazon Cognito reports only for some refusals;
+        // none applies to a provider link, so none is invented.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// This operation's `LimitExceededException`, carrying `message`.
+fn limit_exceeded(message: String) -> AdminLinkProviderForUserError {
+    AdminLinkProviderForUserErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> AdminLinkProviderForUserError {
+    AdminLinkProviderForUserErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

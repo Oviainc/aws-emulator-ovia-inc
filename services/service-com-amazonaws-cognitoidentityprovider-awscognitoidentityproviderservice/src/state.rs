@@ -24,7 +24,8 @@ use crate::ops::types::{
     KeyConfigurationType, LambdaConfigType, LimitDefinitionType, LimitType,
     LogConfigurationType, LogDeliveryConfigurationType,
     MFAOptionType, NewDeviceMetadataType,
-    NumberAttributeConstraintsType, PasswordPolicyType, RefreshTokenRotationType,
+    NumberAttributeConstraintsType, PasswordPolicyType, ProviderUserIdentifierType,
+    RefreshTokenRotationType,
     ResourceServerScopeType, ResourceServerType, RiskConfigurationType,
     RiskExceptionConfigurationType, RoutingType,
     SchemaAttributeType, SignInPolicyType, SmsConfigurationType, SmsMfaConfigType,
@@ -229,6 +230,29 @@ pub const GROUP_NOT_FOUND_MESSAGE: &str = "Group not found.";
 pub fn identity_provider_not_found_message(asked_for: &str, user_pool_id: &str) -> String {
     format!("Identity provider {asked_for} for tenantId {user_pool_id} does not exist.")
 }
+
+/// The `ProviderName` that names a user pool's OWN users rather than one of its
+/// third-party identity providers: "To deactivate a local user, set
+/// `ProviderName` to `Cognito`" (`AdminDisableProviderForUser`), and "the
+/// `ProviderName` should be set to `Cognito` for users in Cognito user pools"
+/// (`AdminLinkProviderForUser.DestinationUser`), both in this service's model.
+pub const NATIVE_PROVIDER_NAME: &str = "Cognito";
+
+/// The message an `InvalidParameterException` carries when a request names a
+/// provider identity the pool holds no link for.
+///
+/// Deactivating a provider for a user acts on a LINK — the external identity's
+/// link to a local profile, or, for the native `Cognito` provider, the links a
+/// local profile is the destination of — so an account that is linked to
+/// nothing has no link to act on, and the refusal is the same sentence whatever
+/// the provider or the identity named.
+pub const ACCOUNT_NOT_LINKED_MESSAGE: &str =
+    "Account isn't linked to anyone else, verify that the account has been linked";
+
+/// How many federated identities may link to one local user: "The maximum
+/// number of federated identities linked to a user is five."
+/// (`AdminLinkProviderForUser` in this service's model).
+pub const MAX_LINKED_PROVIDER_IDENTITIES: usize = 5;
 
 /// The message a `TermsExistsException` carries for a `TermsName` the app client
 /// already holds terms documents under.
@@ -1386,6 +1410,22 @@ impl UserPool {
         keys
     }
 
+    /// The storage key of the user `identity` is linked to, or `None` when no
+    /// user of this pool holds a link for it.
+    ///
+    /// A provider identity links to ONE local profile — `AdminLinkProviderForUser`
+    /// links a `SourceUser` to "an existing user account in a user pool, or
+    /// `DestinationUser`" (this service's model) — so at most one key answers;
+    /// the lowest-ordered one is taken, so the lookup is stable whatever order
+    /// the users are held in.
+    pub fn linked_user_key(&self, identity: &ProviderIdentity) -> Option<String> {
+        self.users
+            .iter()
+            .filter(|(_, user)| user.provider_links.contains_key(identity))
+            .map(|(key, _)| key.clone())
+            .min()
+    }
+
     /// The stored user `username` names, mutably.
     pub fn user_mut(&mut self, username: &str) -> Option<&mut User> {
         let key = self.user_storage_key(username)?;
@@ -2448,6 +2488,15 @@ pub struct User {
     /// appends, so the order the credentials are held in is the order they were
     /// created in. Bounded by [`MAX_WEB_AUTHN_CREDENTIALS_PER_USER`].
     pub web_authn_credentials: Vec<WebAuthnCredential>,
+    /// The external identity-provider identities linked to this local profile,
+    /// keyed by the identity: `AdminLinkProviderForUser` "links an existing
+    /// user account in a user pool, or `DestinationUser`, to an identity from
+    /// an external IdP, or `SourceUser`" (this service's model), so a link is
+    /// held on the local profile it resolves to and is gone once that profile
+    /// is. Ordered, so a read of several is stable, and bounded by
+    /// [`MAX_LINKED_PROVIDER_IDENTITIES`]. Rendered as the profile's
+    /// [`IDENTITIES_ATTRIBUTE`].
+    pub provider_links: BTreeMap<ProviderIdentity, LinkedProvider>,
     /// Whether this user has REGISTERED a time-based one-time password (TOTP)
     /// authenticator: "users must register a TOTP authenticator before they set
     /// this as their preferred MFA method"
@@ -2465,15 +2514,66 @@ pub struct User {
 }
 
 impl User {
-    /// The stored attributes as the modelled list, in name order.
+    /// The stored attributes as the modelled list, in name order, with the
+    /// [`IDENTITIES_ATTRIBUTE`] this profile's provider links render among
+    /// them.
     pub fn attribute_list(&self) -> Vec<AttributeType> {
-        self.attributes
+        let mut attributes: Vec<AttributeType> = self
+            .attributes
             .iter()
             .map(|(name, value)| AttributeType {
                 name: name.clone(),
                 value: Some(value.clone()),
             })
-            .collect()
+            .collect();
+        if let Some(identities) = self.identities_attribute() {
+            attributes.push(AttributeType {
+                name: IDENTITIES_ATTRIBUTE.to_string(),
+                value: Some(identities),
+            });
+            attributes.sort_by(|left, right| left.name.cmp(&right.name));
+        }
+        attributes
+    }
+
+    /// The value this profile's [`IDENTITIES_ATTRIBUTE`] renders: the links it
+    /// holds as the JSON array Amazon Cognito reports them in, oldest link
+    /// first. `None` for a profile that holds no link, which renders no such
+    /// attribute at all.
+    pub fn identities_attribute(&self) -> Option<String> {
+        if self.provider_links.is_empty() {
+            return None;
+        }
+        let mut links: Vec<(&ProviderIdentity, &LinkedProvider)> =
+            self.provider_links.iter().collect();
+        links.sort_by(|(left_identity, left), (right_identity, right)| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left_identity.cmp(right_identity))
+        });
+        let rendered: Vec<serde_json::Value> = links
+            .into_iter()
+            .map(|(identity, link)| {
+                serde_json::json!({
+                    // The identity's own value is the id the external IdP knows
+                    // this user by, and the provider is the pool IdP it
+                    // federates through, whose stored type is reported beside
+                    // it.
+                    "userId": identity.provider_attribute_value,
+                    "providerName": identity.provider_name,
+                    "providerType": link.provider_type,
+                    // The issuer of a linked identity is known only once the
+                    // external IdP has asserted one, so none is invented.
+                    "issuer": serde_json::Value::Null,
+                    // The local profile the link resolves to is the primary
+                    // identity: a linked external identity is an additional way
+                    // into that profile, not the identity that created it.
+                    "primary": false,
+                    "dateCreated": unix_millis(link.created_at),
+                })
+            })
+            .collect();
+        Some(serde_json::Value::Array(rendered).to_string())
     }
 
     /// The modelled view of this user, rendered from what is stored.
@@ -2781,6 +2881,115 @@ impl User {
     pub fn consume_code(&mut self, purpose: &CodePurpose) -> Option<VerificationCode> {
         self.outstanding_codes.remove(purpose)
     }
+}
+
+/// One stored link from an external IdP identity to a local profile: what the
+/// identity's own triple does not carry, so a read can render the link.
+#[derive(Debug, Clone)]
+pub struct LinkedProvider {
+    /// The `ProviderType` of the pool IdP the identity federates through, as
+    /// `CreateIdentityProvider` stored it.
+    pub provider_type: String,
+    /// When the link was made, which is what the rendered identity reports as
+    /// its creation instant.
+    pub created_at: SystemTime,
+}
+
+/// The attribute a local profile reports its provider links under: Amazon
+/// Cognito renders a linked user's identities as a JSON array under the
+/// `identities` attribute name, so a profile nothing is linked to reports no
+/// such attribute.
+pub const IDENTITIES_ATTRIBUTE: &str = "identities";
+
+/// One provider identity: the (`ProviderName`, `ProviderAttributeName`,
+/// `ProviderAttributeValue`) triple a `ProviderUserIdentifierType` names.
+///
+/// It is the key a link is stored and looked up under, because the attribute
+/// identifying the external user is part of the identity: de-linking requires
+/// that "the `ProviderAttributeName` and `ProviderAttributeValue` must be the
+/// same values that were used for the `SourceUser` when the identities were
+/// originally linked" (`AdminDisableProviderForUser` in this service's model).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProviderIdentity {
+    pub provider_name: String,
+    pub provider_attribute_name: String,
+    pub provider_attribute_value: String,
+}
+
+/// The member of a `ProviderUserIdentifierType` a submitted identifier left
+/// out, as [`ProviderIdentity::from_identifier`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingProviderMember {
+    ProviderName,
+    ProviderAttributeName,
+    ProviderAttributeValue,
+}
+
+impl MissingProviderMember {
+    /// The modelled member name, as a refusal names it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderName => "ProviderName",
+            Self::ProviderAttributeName => "ProviderAttributeName",
+            Self::ProviderAttributeValue => "ProviderAttributeValue",
+        }
+    }
+}
+
+impl ProviderIdentity {
+    /// The identity `identifier` names, or the first member it left out.
+    ///
+    /// Every member of a `ProviderUserIdentifierType` is optional in the model,
+    /// so an identifier naming no provider, no attribute or no value identifies
+    /// nothing and the refusal names the member that is missing. An empty value
+    /// is no value either: `ProviderNameType` starts at length 1, and an
+    /// identity is what a link is keyed by.
+    pub fn from_identifier(
+        identifier: &ProviderUserIdentifierType,
+    ) -> Result<Self, MissingProviderMember> {
+        Ok(Self {
+            provider_name: provider_member(&identifier.provider_name)
+                .ok_or(MissingProviderMember::ProviderName)?,
+            provider_attribute_name: provider_member(&identifier.provider_attribute_name)
+                .ok_or(MissingProviderMember::ProviderAttributeName)?,
+            provider_attribute_value: provider_member(&identifier.provider_attribute_value)
+                .ok_or(MissingProviderMember::ProviderAttributeValue)?,
+        })
+    }
+
+    /// The value that names the local profile a DESTINATION identifier resolves
+    /// to, or the member it left out.
+    ///
+    /// "The `ProviderAttributeName` of the `DestinationUser` is ignored"
+    /// (`AdminLinkProviderForUser` in this service's model), so a destination is
+    /// read as the provider it names and the value that names the profile —
+    /// each under the same rule [`ProviderIdentity::from_identifier`] applies to
+    /// every member, so the two identifiers cannot disagree about what an
+    /// absent member is.
+    pub fn destination_value(
+        identifier: &ProviderUserIdentifierType,
+    ) -> Result<String, MissingProviderMember> {
+        provider_member(&identifier.provider_name).ok_or(MissingProviderMember::ProviderName)?;
+        provider_member(&identifier.provider_attribute_value)
+            .ok_or(MissingProviderMember::ProviderAttributeValue)
+    }
+
+    /// Whether this identity names a user pool's own users rather than a
+    /// third-party IdP ([`NATIVE_PROVIDER_NAME`]).
+    pub fn is_native(&self) -> bool {
+        self.provider_name == NATIVE_PROVIDER_NAME
+    }
+}
+
+/// One member of a submitted `ProviderUserIdentifierType`, or `None` when the
+/// request left it out: a member sent as whitespace or as an empty string names
+/// nothing either, and `ProviderNameType` starts at length 1.
+fn provider_member(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// What one stored verification code was issued for.
@@ -5018,6 +5227,14 @@ pub fn to_date_time(time: SystemTime) -> ::aws_smithy_types::DateTime {
 fn unix_seconds(time: SystemTime) -> i64 {
     time.duration_since(UNIX_EPOCH)
         .map(|since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
+}
+
+/// `time` as whole milliseconds since the epoch, the unit a rendered linked
+/// identity reports its creation instant in.
+fn unix_millis(time: SystemTime) -> i64 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or_default()
 }
 

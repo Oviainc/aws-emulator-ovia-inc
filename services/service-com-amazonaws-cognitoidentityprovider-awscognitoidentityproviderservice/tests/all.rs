@@ -17,6 +17,8 @@ mod add_custom_attributes;
 mod admin_confirm_sign_up;
 #[path = "all/admin_group_listing.rs"]
 mod admin_group_listing;
+#[path = "all/admin_provider_links.rs"]
+mod admin_provider_links;
 #[path = "all/admin_remove_user_from_group.rs"]
 mod admin_remove_user_from_group;
 #[path = "all/admin_respond_to_auth_challenge.rs"]

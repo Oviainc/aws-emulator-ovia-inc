@@ -373,6 +373,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A registered user has registered no passkey: one exists only once
             // a registration this user started has completed.
             web_authn_credentials: Vec::new(),
+            // No external identity is linked to a user that just registered
+            // itself: a link exists only once `AdminLinkProviderForUser` has
+            // made one.
+            provider_links: ::std::collections::BTreeMap::new(),
             // Nor has it registered a TOTP authenticator, and it has expressed
             // no passkey MFA preference of its own.
             software_token_registered: false,
