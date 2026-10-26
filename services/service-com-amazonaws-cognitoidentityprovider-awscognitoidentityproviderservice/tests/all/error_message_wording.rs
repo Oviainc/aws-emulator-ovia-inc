@@ -6,10 +6,13 @@
 //! what a caller, a log scrubber or a CLI user reads, so each of these three is
 //! built by a rule rather than freely worded. The rules under test:
 //!
-//! * `UserNotFoundException` carries ONE fixed sentence, the same for every
-//!   request and every operation that resolves a username: it reports that the
-//!   lookup found no user and names neither the username asked for nor the pool,
-//!   so the refusal cannot be read as an answer about one particular identity.
+//! * `UserNotFoundException` carries ONE fixed sentence for every request of
+//!   every operation that resolves a username against a pool the request names
+//!   or against an access token: it reports that the lookup found no user and
+//!   names neither the username asked for nor the pool, so the refusal cannot be
+//!   read as an answer about one particular identity. (The public operations
+//!   that resolve the user from a `Username` and a `ClientId` together carry
+//!   their own fixed sentence, asserted in `public_user_not_found_message`.)
 //! * the `ResourceNotFoundException` of a group lookup carries ONE fixed
 //!   sentence too, the same for every group name and for every operation that
 //!   resolves a `GroupName` against a pool's stored groups.
@@ -41,7 +44,8 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 /// A password satisfying a default pool's password policy.
 const GOOD_PASSWORD: &str = "Passw0rd!2024";
 
-/// The one sentence a `UserNotFoundException` says.
+/// The one sentence a `UserNotFoundException` says for a lookup against a pool
+/// the request names or against an access token.
 const USER_NOT_FOUND_MESSAGE: &str = "User does not exist.";
 
 /// The one sentence a group lookup that found nothing says.

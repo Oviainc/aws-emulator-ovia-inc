@@ -180,26 +180,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        if let Some(why) = crate::state::encryption_configuration_rejection(
+        // The chain of rules a write's configuration has to satisfy, and the order they
+        // are applied in, live in `crate::state` next to the rules they compose — the
+        // create path applies the same chain — and the sentence it hands back is
+        // rendered as this operation's own modelled `ValidationException`.
+        // `UpdateInvestigationGroup` accepts no `tags` member.
+        if let Some(why) = crate::state::write_configuration_rejection(
             input.encryption_configuration.as_ref(),
-        )
-        .or_else(|| {
-            // A cross-account source role must name another account; the modelled
-            // `^arn:.*$` cannot express that, so the rule is applied here, exactly as
-            // the create path applies it.
-            crate::state::cross_account_configurations_rejection(
-                input.cross_account_configurations.as_deref(),
-            )
-        })
-        .or_else(|| {
-            // `tagKeyBoundaries` and `chatbotNotificationChannel` carry no modelled
-            // length, so a replacement is bounded here before it reaches the store.
-            // `UpdateInvestigationGroup` accepts no `tags` member.
-            crate::state::collection_bounds_rejection(
-                input.tag_key_boundaries.as_deref(),
-                input.chatbot_notification_channel.as_ref(),
-            )
-        }) {
+            input.cross_account_configurations.as_deref(),
+            input.tag_key_boundaries.as_deref(),
+            input.chatbot_notification_channel.as_ref(),
+        ) {
             return Err(UpdateInvestigationGroupErrorModeled::ValidationException(
                 ValidationException { message: Some(why) },
             )

@@ -2298,6 +2298,23 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// over. [`ComAmazonawsEc2Amazonec2State::insert_client_vpn_target_network`] is the one
     /// way an association is stored.
     pub client_vpn_target_networks: BTreeMap<String, ClientVpnTargetNetworkRecord>,
+    /// Every route of those endpoints' route tables, by [`ClientVpnRouteKey`] — the endpoint,
+    /// the destination and the target that name ONE route — as the modelled
+    /// [`crate::ops::types::ClientVpnRoute`] shape plus the move the clock owes it
+    /// ([`ClientVpnRouteRecord`]).
+    ///
+    /// Keyed by those three rather than by an id because a route HAS no id of its own: it is
+    /// what `DeleteClientVpnRoute` names one by, and it is what makes a second
+    /// `CreateClientVpnRoute` for the same destination through the same target a duplicate
+    /// ([`client_vpn_duplicate_route`]) rather than a second route.
+    /// [`ComAmazonawsEc2Amazonec2State::insert_client_vpn_route`] is the one way a route is
+    /// stored.
+    pub client_vpn_routes: BTreeMap<ClientVpnRouteKey, ClientVpnRouteRecord>,
+    /// A `CreateClientVpnRoute` `ClientToken` and the route that request added, so a repeat
+    /// of the same request answers with that route instead of refusing it as a duplicate —
+    /// "Unique, case-sensitive identifier that you provide to ensure the idempotency of the
+    /// request" (`CreateClientVpnRouteRequest$ClientToken`).
+    pub client_vpn_route_client_tokens: HashMap<String, ClientVpnRouteKey>,
     /// Every Reserved Instance the account holds, by `ReservedInstancesId`, as the modelled
     /// [`crate::ops::types::ReservedInstances`] shape itself — for the same reason
     /// [`Self::vpcs`] holds [`Vpc`]s: every member a writer sets round-trips through a
@@ -3153,6 +3170,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // target network is associated with one either.
             client_vpn_endpoints: BTreeMap::new(),
             client_vpn_target_networks: BTreeMap::new(),
+            // No endpoint, so no route table of one holds a route either.
+            client_vpn_routes: BTreeMap::new(),
+            client_vpn_route_client_tokens: HashMap::new(),
             // A fresh account has bought nothing, so it holds no Reserved Instances.
             reserved_instances: BTreeMap::new(),
             network_insights_access_scopes: BTreeMap::new(),
@@ -5849,6 +5869,10 @@ impl ComAmazonawsEc2Amazonec2State {
         // `associating` is `associated` once its due instant has passed, whether or not
         // anybody called again — the same contract as a `pending` VPC's move above.
         self.materialize_due_client_vpn_target_networks(now);
+        // A route `CreateClientVpnRoute` answered as `creating` is `active` once its due
+        // instant has passed, whether or not anybody called again — the same contract as the
+        // target network association above.
+        self.materialize_due_client_vpn_routes(now);
         // An IPAM pool `CreateIpamPool` answered as `create-in-progress` reaches
         // `create-complete` once its due instant has passed, whether or not anybody called —
         // the same contract as the `pending` VPC above, and the reason the pool's due

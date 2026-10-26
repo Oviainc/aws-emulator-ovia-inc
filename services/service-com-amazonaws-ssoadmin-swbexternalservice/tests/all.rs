@@ -63,6 +63,8 @@ mod application_providers;
 mod application_session_configuration;
 #[path = "all/application_update.rs"]
 mod application_update;
+#[path = "all/create_tag_fingerprint.rs"]
+mod create_tag_fingerprint;
 #[path = "all/customer_managed_policy_references.rs"]
 mod customer_managed_policy_references;
 #[path = "all/discovered_instance_surface.rs"]

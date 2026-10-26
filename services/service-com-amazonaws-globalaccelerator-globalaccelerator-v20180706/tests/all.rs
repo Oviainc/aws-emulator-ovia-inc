@@ -15,6 +15,8 @@
 mod accelerator_lifecycle;
 #[path = "all/endpoint_groups.rs"]
 mod endpoint_groups;
+#[path = "all/error_message_member.rs"]
+mod error_message_member;
 #[path = "all/input_refusals.rs"]
 mod input_refusals;
 #[path = "all/not_found_error_status.rs"]

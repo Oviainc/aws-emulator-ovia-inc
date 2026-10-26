@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/add_custom_attributes.rs"]
 mod add_custom_attributes;
+#[path = "all/admin_confirm_sign_up.rs"]
+mod admin_confirm_sign_up;
 #[path = "all/admin_group_listing.rs"]
 mod admin_group_listing;
 #[path = "all/admin_remove_user_from_group.rs"]
@@ -75,6 +77,8 @@ mod list_users_in_group;
 mod managed_login_branding;
 #[path = "all/log_delivery_configuration.rs"]
 mod log_delivery_configuration;
+#[path = "all/public_user_not_found_message.rs"]
+mod public_user_not_found_message;
 #[path = "all/resend_confirmation_code.rs"]
 mod resend_confirmation_code;
 #[path = "all/resource_server_lifecycle.rs"]

@@ -224,6 +224,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Removing the policy writes the cluster's own record, so it is held to the
+        // same rule as every other mutation of a cluster: a cluster the clock
+        // still owes a transition, or one on its way out, takes no policy change.
+        if let Some(conflict) = cluster.mutation_conflict("have its policy deleted") {
+            return Err(DeleteClusterPolicyErrorModeled::ConflictException(conflict).into());
+        }
+
         // Nothing attached: there is no policy, and no version, to delete.
         let Some(attached) = cluster.policy.as_ref().map(|policy| policy.version.clone()) else {
             return Err(DeleteClusterPolicyErrorModeled::ResourceNotFoundException(
