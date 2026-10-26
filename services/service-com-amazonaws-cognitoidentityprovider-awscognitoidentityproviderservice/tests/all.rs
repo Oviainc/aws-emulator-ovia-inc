@@ -97,6 +97,8 @@ mod resource_server_lifecycle;
 mod risk_configuration;
 #[path = "all/self_service_sign_up.rs"]
 mod self_service_sign_up;
+#[path = "all/set_user_mfa_preference.rs"]
+mod set_user_mfa_preference;
 #[path = "all/set_user_settings.rs"]
 mod set_user_settings;
 #[path = "all/sign_up_client_secret.rs"]

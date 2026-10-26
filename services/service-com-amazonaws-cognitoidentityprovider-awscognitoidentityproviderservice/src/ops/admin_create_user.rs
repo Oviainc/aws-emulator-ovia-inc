@@ -367,6 +367,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A created user has registered no passkey: one exists only once a
             // registration this user started has completed.
             web_authn_credentials: Vec::new(),
+            // Nor has it registered a TOTP authenticator, and it has expressed
+            // no passkey MFA preference of its own.
+            software_token_registered: false,
+            web_authn_mfa_enabled: None,
         };
         pool.users.insert(key.clone(), user);
 

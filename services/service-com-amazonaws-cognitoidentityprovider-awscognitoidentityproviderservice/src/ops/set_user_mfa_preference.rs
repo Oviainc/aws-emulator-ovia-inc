@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetUserMFAPreference
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetUserMFAPreference`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetUserMFAPreference::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +180,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetUserMFAPreference` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetUserMFAPreferenceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetUserMFAPreference"))
+        // Request metadata only: the user whose preference this is is named by the
+        // access token in the body, not by the request's signature.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        // An access token's lifetime is read against the clock, so an expired token is
+        // refused whether or not anything has swept it.
+        let now = ::std::time::SystemTime::now();
+
+        // Decide WHICH stored user the preference applies to first, so the write
+        // below reaches the same user the token names.
+        let mut guard = state.lock();
+        let (user_pool_id, username) = {
+            let (pool, user) = guard
+                .signed_in_user(&input.access_token, now)
+                .map_err(token_rejected)?;
+            // The username as STORED, which a case-insensitive pool may case
+            // differently from the one the token's sign-in named.
+            (pool.id.clone(), user.username.clone())
+        };
+
+        let requested = requested_settings(&input);
+        let user = guard
+            .pool_mut(&user_pool_id)
+            .and_then(|pool| pool.user_mut(&username))
+            .ok_or_else(internal_error)?;
+        // Checked as a whole before anything is written, so a refused request
+        // leaves this user's activated factors and preferred factor as they were.
+        user.set_mfa_preference(&requested, now)
+            .map_err(|rejection| invalid_parameter(rejection.message()))?;
+        // Passkey MFA is the one submitted factor that is no `UserMFASettingList`
+        // setting and carries no `PreferredMfa` member — "this type doesn't include
+        // a `PreferredMfa` option because passkey MFA applies only when passkey is
+        // the first authentication factor" (`WebAuthnMfaSettingsType` in this
+        // service's model) — so what it asks for is stored on its own.
+        if let Some(settings) = &input.web_authn_mfa_settings {
+            user.set_web_authn_mfa_enabled(settings.enabled, now);
+        }
+
+        // This operation models no output member: what it asserts is the stored
+        // preference a later read of the same user renders.
+        Ok(SetUserMFAPreferenceOutput {})
     }
+}
+
+/// What the submitted settings ask for, one entry per factor the request names,
+/// in the order this operation's input declares them.
+///
+/// Each of the three structures configures the factor it is named for, and the
+/// `UserMFASettingList` setting that factor is reported under is what the stored
+/// preference is kept as: that member's "possible values ... are `SMS_MFA`,
+/// `EMAIL_OTP`, and `SOFTWARE_TOKEN_MFA`" (this service's model). A structure the
+/// request leaves out asks for nothing, so that factor keeps what it held.
+fn requested_settings(
+    input: &SetUserMFAPreferenceInput,
+) -> Vec<crate::state::MfaSettingRequest<'static>> {
+    let mut requested = Vec::new();
+    if let Some(settings) = &input.sms_mfa_settings {
+        requested.push(crate::state::MfaSettingRequest {
+            setting: crate::state::SMS_MFA_SETTING,
+            enabled: settings.enabled,
+            preferred: settings.preferred_mfa,
+        });
+    }
+    if let Some(settings) = &input.software_token_mfa_settings {
+        requested.push(crate::state::MfaSettingRequest {
+            setting: crate::state::SOFTWARE_TOKEN_MFA_SETTING,
+            enabled: settings.enabled,
+            preferred: settings.preferred_mfa,
+        });
+    }
+    if let Some(settings) = &input.email_mfa_settings {
+        requested.push(crate::state::MfaSettingRequest {
+            setting: crate::state::EMAIL_OTP_MFA_SETTING,
+            enabled: settings.enabled,
+            preferred: settings.preferred_mfa,
+        });
+    }
+    requested
+}
+
+/// This operation's answer to an `AccessToken` that names no signed-in user.
+///
+/// Every rejection of the token itself answers `NotAuthorizedException`, which "is
+/// thrown when a user isn't authorized" (this service's model), while a token whose
+/// pool or user has since been deleted answers the error for the resource that is
+/// gone. No message names a stored value, so the refusal reports why the token was
+/// not accepted and nothing else.
+fn token_rejected(rejection: crate::state::TokenRejection) -> SetUserMFAPreferenceError {
+    match rejection {
+        crate::state::TokenRejection::NotAnAccessToken => not_authorized("Invalid Access Token"),
+        crate::state::TokenRejection::Expired => not_authorized("Access Token has expired"),
+        crate::state::TokenRejection::PoolGone => {
+            SetUserMFAPreferenceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                // The caller named no pool — the token did — so this message names
+                // none either.
+                message: Some("User pool does not exist.".to_string()),
+            })
+            .into()
+        }
+        crate::state::TokenRejection::UserGone => {
+            SetUserMFAPreferenceErrorModeled::UserNotFoundException(UserNotFoundException {
+                message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into()
+        }
+    }
+}
+
+/// This operation's `NotAuthorizedException`, carrying `message`.
+fn not_authorized(message: &str) -> SetUserMFAPreferenceError {
+    SetUserMFAPreferenceErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: String) -> SetUserMFAPreferenceError {
+    SetUserMFAPreferenceErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        // `reasonCode` is AWS's own classification of the bad parameter and this
+        // service's model documents no value for it, so nothing is invented here.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> SetUserMFAPreferenceError {
+    SetUserMFAPreferenceErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

@@ -1662,17 +1662,20 @@ impl UserPool {
     ///
     /// A factor the user has ACTIVATED is available as one
     /// ([`User::activates_mfa_auth_factor`]). `WEB_AUTHN` is the one factor the
-    /// POOL activates rather than the user: it "is available as an MFA factor only
+    /// POOL has to enable as well: it "is available as an MFA factor only
     /// when passkey MFA is enabled at the user pool level"
     /// (`ConfiguredUserAuthFactors`), which
     /// `WebAuthnConfigurationType.FactorConfiguration` is "when set to
     /// `MULTI_FACTOR_WITH_USER_VERIFICATION`, passkey authentication with user
     /// verification satisfies MFA requirements. When set to `SINGLE_FACTOR` or not
     /// set, passkeys are a single authentication factor" (both in this service's
-    /// model) — and presenting it still needs a registered passkey.
+    /// model) — and presenting it still needs a registered passkey the user has
+    /// not deactivated passkey MFA for ([`User::activates_passkey_mfa`]).
     pub fn offers_mfa_auth_factor(&self, user: &User, factor: &str) -> bool {
         if factor == WEB_AUTHN_AUTH_FACTOR {
-            return self.passkeys_satisfy_mfa() && !user.web_authn_credentials.is_empty();
+            return self.passkeys_satisfy_mfa()
+                && !user.web_authn_credentials.is_empty()
+                && user.activates_passkey_mfa();
         }
         user.activates_mfa_auth_factor(factor)
     }
@@ -2445,6 +2448,20 @@ pub struct User {
     /// appends, so the order the credentials are held in is the order they were
     /// created in. Bounded by [`MAX_WEB_AUTHN_CREDENTIALS_PER_USER`].
     pub web_authn_credentials: Vec<WebAuthnCredential>,
+    /// Whether this user has REGISTERED a time-based one-time password (TOTP)
+    /// authenticator: "users must register a TOTP authenticator before they set
+    /// this as their preferred MFA method"
+    /// (`SetUserMFAPreference.SoftwareTokenMfaSettings` in this service's model),
+    /// so this is the delivery configuration TOTP MFA is delivered with
+    /// ([`User::holds_mfa_delivery_config`]). A user registers one by associating
+    /// a software token and verifying a code from it, so `false` until that
+    /// registration succeeds.
+    pub software_token_registered: bool,
+    /// Whether this user has activated or deactivated passkey MFA for itself
+    /// (`SetUserMFAPreference.WebAuthnMfaSettings.Enabled`), or `None` while the
+    /// user has expressed no preference and the pool's passkey configuration
+    /// alone decides ([`User::activates_passkey_mfa`]).
+    pub web_authn_mfa_enabled: Option<bool>,
 }
 
 impl User {
@@ -2534,6 +2551,100 @@ impl User {
         self.mfa_setting_list
             .iter()
             .any(|setting| mfa_auth_factor_of(setting.as_str()) == Some(factor))
+    }
+
+    /// Whether this user holds the delivery configuration the
+    /// `UserMFASettingList` setting `setting` is delivered with.
+    ///
+    /// Each of the three factors reaches the user through something the user has
+    /// to hold first: SMS message MFA through the verified phone number the text
+    /// message is sent to, email message MFA through the verified email address
+    /// the message is sent to ([`User::verified_destination_of`]), and TOTP MFA
+    /// through the registered authenticator the one-time password is read from
+    /// ([`User::software_token_registered`]). A value that names none of the three
+    /// settings is delivered by nothing.
+    pub fn holds_mfa_delivery_config(&self, setting: &str) -> bool {
+        match setting {
+            SMS_MFA_SETTING => self.verified_destination_of("phone_number").is_some(),
+            EMAIL_OTP_MFA_SETTING => self.verified_destination_of("email").is_some(),
+            SOFTWARE_TOKEN_MFA_SETTING => self.software_token_registered,
+            _ => false,
+        }
+    }
+
+    /// Apply `requested` as this user's MFA preference as of `now`, or report why
+    /// it is refused.
+    ///
+    /// Each submitted setting REPLACES what this user held for the factor it
+    /// configures, and a factor the request names none of is left exactly as it
+    /// was. Turning a factor on — activating it, or making it the preferred one —
+    /// needs the delivery configuration it reaches the user through
+    /// ([`User::holds_mfa_delivery_config`]), so a request that asks for one the
+    /// user cannot receive is refused. The WHOLE request is checked before
+    /// anything is written, so a refused one leaves this user untouched.
+    ///
+    /// "Only one factor can be set as preferred" (`SetUserMFAPreference` in this
+    /// service's model), so the preference a request expresses replaces the one
+    /// the user held; and a factor that is not activated is not one the user
+    /// prefers, so deactivating the preferred factor, or submitting it as no
+    /// longer preferred, leaves the user with no preference at all.
+    pub fn set_mfa_preference(
+        &mut self,
+        requested: &[MfaSettingRequest<'_>],
+        now: SystemTime,
+    ) -> Result<(), MfaPreferenceRejection> {
+        if let Some(refused) = requested
+            .iter()
+            .find(|setting| setting.turns_on() && !self.holds_mfa_delivery_config(setting.setting))
+        {
+            return Err(MfaPreferenceRejection::NoDeliveryConfig(
+                refused.setting.to_string(),
+            ));
+        }
+        for setting in requested {
+            if setting.setting == SMS_MFA_SETTING {
+                // SMS MFA is activated exactly while an MFA option is stored for
+                // it ([`User::set_sms_mfa_options`]), so activating the factor
+                // stores the one option that configures it and deactivating the
+                // factor stores none.
+                let options = if setting.enabled {
+                    vec![sms_mfa_option()]
+                } else {
+                    Vec::new()
+                };
+                self.set_sms_mfa_options(options, now);
+            } else {
+                self.mfa_setting_list.retain(|held| held != setting.setting);
+                if setting.enabled {
+                    self.mfa_setting_list.push(setting.setting.to_string());
+                }
+            }
+            if setting.enabled && setting.preferred {
+                self.preferred_mfa_setting = Some(setting.setting.to_string());
+            } else if self.preferred_mfa_setting.as_deref() == Some(setting.setting) {
+                self.preferred_mfa_setting = None;
+            }
+        }
+        if !requested.is_empty() {
+            self.user_last_modified_date = now;
+        }
+        Ok(())
+    }
+
+    /// Store whether passkey MFA is activated for this user, as of `now`.
+    pub fn set_web_authn_mfa_enabled(&mut self, enabled: bool, now: SystemTime) {
+        self.web_authn_mfa_enabled = Some(enabled);
+        self.user_last_modified_date = now;
+    }
+
+    /// Whether passkey MFA is activated for this user.
+    ///
+    /// `WebAuthnMfaSettings.Enabled` "specifies whether passkey MFA is activated
+    /// for a user" (this service's model), so a user that deactivated it presents
+    /// no passkey as an MFA factor. A user that expressed no preference leaves the
+    /// pool's passkey configuration to decide ([`UserPool::passkeys_satisfy_mfa`]).
+    pub fn activates_passkey_mfa(&self) -> bool {
+        self.web_authn_mfa_enabled.is_none_or(|enabled| enabled)
     }
 
     /// Whether the stored password is a temporary one that has outlived
@@ -4080,6 +4191,59 @@ pub const MFA_OPTION_DELIVERY_MEDIUM: &str = "SMS";
 /// `MFAOptionType.AttributeName` is "the attribute name of the MFA option type.
 /// The only valid value is `phone_number`" (this service's model).
 pub const MFA_OPTION_ATTRIBUTE: &str = "phone_number";
+
+/// The one SMS MFA option a user holds while SMS message MFA is activated for
+/// it: an option sets the only delivery medium ([`MFA_OPTION_DELIVERY_MEDIUM`])
+/// and names the only attribute ([`MFA_OPTION_ATTRIBUTE`]) an `MFAOptionType`
+/// may carry, so a user holds either this option or none.
+pub fn sms_mfa_option() -> MFAOptionType {
+    MFAOptionType {
+        delivery_medium: Some(MFA_OPTION_DELIVERY_MEDIUM.to_string()),
+        attribute_name: Some(MFA_OPTION_ATTRIBUTE.to_string()),
+    }
+}
+
+/// What one submitted MFA settings structure asks for one factor
+/// ([`User::set_mfa_preference`]): the `UserMFASettingList` setting the factor is
+/// reported under, whether the request activates it, and whether the request
+/// makes it the user's preferred factor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MfaSettingRequest<'a> {
+    pub setting: &'a str,
+    pub enabled: bool,
+    pub preferred: bool,
+}
+
+impl MfaSettingRequest<'_> {
+    /// Whether this setting asks to TURN THE FACTOR ON — to activate it, or to
+    /// make it the preferred one, which is what needs the delivery configuration
+    /// the factor reaches the user through. A setting that asks for neither turns
+    /// the factor off, which needs nothing.
+    pub fn turns_on(&self) -> bool {
+        self.enabled || self.preferred
+    }
+}
+
+/// Why a submitted MFA preference is refused ([`User::set_mfa_preference`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MfaPreferenceRejection {
+    /// The `UserMFASettingList` setting the request asks to turn on while the
+    /// user holds no delivery configuration for it.
+    NoDeliveryConfig(String),
+}
+
+impl MfaPreferenceRejection {
+    /// What the refusal reports: the factor the request asked to turn on, and
+    /// that the user has no configuration to receive it with. Only the submitted
+    /// setting is named, so nothing stored is disclosed.
+    pub fn message(&self) -> String {
+        match self {
+            Self::NoDeliveryConfig(setting) => {
+                format!("User does not have delivery config set to turn on {setting}")
+            }
+        }
+    }
+}
 
 /// Why a submitted `MFAOptionListType` configures no SMS MFA option
 /// ([`sms_mfa_options`]).
