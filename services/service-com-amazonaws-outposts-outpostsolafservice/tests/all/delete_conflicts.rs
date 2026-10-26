@@ -23,12 +23,13 @@
 //!    on it: a private connectivity configuration and the Amazon EC2 instances
 //!    recorded as running on the Outpost go away WITH it and block nothing.
 //!
-//! Where the seeded state comes from: three of the modelled `CapacityTaskStatus`
-//! values are reached only through an operation that is still a scaffold stub
-//! (`CancelCapacityTask`), and the `ORDER_SUBMITTED` quote status of a quote whose
-//! submitted order this store has no record of is reached by no call at all, so a row
-//! that needs one puts the stored record in it through the same store seam
-//! [`crate::outpost_decommission`] uses. Every assertion still goes over the wire.
+//! Where the seeded state comes from: two of the modelled `CapacityTaskStatus`
+//! values are reached by no call of this API at all — a task this emulator starts
+//! never waits for an instance to be evacuated, and nothing fails one — and the
+//! `ORDER_SUBMITTED` quote status of a quote whose submitted order this store has no
+//! record of is reached by no call either, so a row that needs one puts the stored
+//! record in it through the same store seam [`crate::outpost_decommission`] uses.
+//! Every assertion still goes over the wire.
 
 use std::collections::VecDeque;
 
@@ -99,7 +100,7 @@ async fn a_task(outposts: &Outposts, outpost_id: &str) -> String {
 
 /// Hold the stored capacity task in `status`, with no clock-owed transition left to
 /// move it out again. See this module's header for why a row seeds a status.
-fn hold_task_in(outposts: &Outposts, capacity_task_id: &str, status: &str, case: &str) {
+pub(crate) fn hold_task_in(outposts: &Outposts, capacity_task_id: &str, status: &str, case: &str) {
     let store = outposts.store();
     let mut store = store.lock();
     let task = store

@@ -154,7 +154,13 @@ fn progression() -> [&'static str; 3] {
 /// [`crate::site_and_outpost_lifecycle::settle`] does: the workspace's `tokio`
 /// carries no timer driver.
 pub(crate) fn settle_capacity_task() {
-    std::thread::sleep(2 * CAPACITY_TASK_STEP + std::time::Duration::from_millis(500));
+    settle_capacity_task_steps(2);
+}
+
+/// Wait until `steps` of a capacity task's clock-owed course have fallen due: the
+/// two a start owes, or the one a cancellation owes. See [`settle_capacity_task`].
+pub(crate) fn settle_capacity_task_steps(steps: u32) {
+    std::thread::sleep(steps * CAPACITY_TASK_STEP + std::time::Duration::from_millis(500));
 }
 
 /// Whether `id` is a `CapacityTaskId` of the modelled form: `cap-` plus exactly 17
@@ -199,7 +205,7 @@ fn stable(task: &Value) -> Value {
 /// An epoch-seconds timestamp member — how restJson1 renders this model's
 /// `ISO8601Timestamp`, which carries no `@timestampFormat` — or `None` when the
 /// response omits it.
-fn stamp(task: &Value, member: &str) -> Option<f64> {
+pub(crate) fn stamp(task: &Value, member: &str) -> Option<f64> {
     task.get(member).and_then(Value::as_f64)
 }
 
@@ -232,14 +238,22 @@ pub(crate) async fn start_ok(
 }
 
 /// `GetCapacityTask`.
-async fn get(outposts: &Outposts, outpost_identifier: &str, capacity_task_id: &str) -> Reply {
+pub(crate) async fn get(
+    outposts: &Outposts,
+    outpost_identifier: &str,
+    capacity_task_id: &str,
+) -> Reply {
     outposts
         .call("GET", &task_route(outpost_identifier, capacity_task_id), None)
         .await
 }
 
 /// `GetCapacityTask`, required to have answered 200.
-async fn get_ok(outposts: &Outposts, outpost_identifier: &str, capacity_task_id: &str) -> Value {
+pub(crate) async fn get_ok(
+    outposts: &Outposts,
+    outpost_identifier: &str,
+    capacity_task_id: &str,
+) -> Value {
     outposts
         .ok("GET", &task_route(outpost_identifier, capacity_task_id), None)
         .await
