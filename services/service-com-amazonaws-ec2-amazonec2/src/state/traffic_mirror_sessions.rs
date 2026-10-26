@@ -32,6 +32,17 @@ pub const TRAFFIC_MIRROR_SESSION_TAGGABLE_RESOURCE: &str = "traffic-mirror-sessi
 /// against that budget too ([`traffic_mirror_session_payload_bytes`]).
 pub const MAX_TRAFFIC_MIRROR_SESSIONS: usize = 1_000;
 
+/// The largest page `DescribeTrafficMirrorSessions` serves, and the page it serves when the
+/// request names no size.
+///
+/// The top of the modelled `MaxResults` range, `TrafficMirroringMaxResults`'s
+/// `range 5..1000`
+/// (`smithy_query(query="operation",operation="DescribeTrafficMirrorSessions")`), so a
+/// request that names no page size is answered with the largest page the operation can be
+/// ASKED for and the `NextToken` path behaves the same either way — the same contract as
+/// [`super::MAX_TRAFFIC_MIRROR_FILTERS_PAGE_SIZE`].
+pub const MAX_TRAFFIC_MIRROR_SESSIONS_PAGE_SIZE: usize = 1_000;
+
 /// EC2's code for a Traffic Mirror session id that names no session of the account.
 ///
 /// EC2's model declares no error shape at all (see [`crate::scaffolded::ServiceError`]),

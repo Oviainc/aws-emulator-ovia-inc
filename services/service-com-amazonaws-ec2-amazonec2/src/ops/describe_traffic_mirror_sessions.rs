@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTrafficMirrorSessions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTrafficMirrorSessions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTrafficMirrorSessions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +75,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::TAG_FILTER_PREFIX;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -151,18 +144,273 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTrafficMirrorSessions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTrafficMirrorSessionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTrafficMirrorSessions"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            decode_page_token, encode_page_token, invalid_pagination_token,
+            invalid_traffic_mirror_session_id_not_found, matches_every_filter,
+            require_service_state, CompiledFilter, MatchBudget, MAX_FILTERS,
+            MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_RESOURCE_IDS,
+            MAX_TRAFFIC_MIRROR_SESSIONS_PAGE_SIZE,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — the
+        // modelled `TrafficMirrorSession` names no Region. The store is reached through the
+        // engine held on `self`.
+        let _ = ctx;
+
+        // Read in place rather than copied: the ids are only compared against, and the cap
+        // below is asked before anything proportional to them is done.
+        let requested_ids: &[String] = input
+            .traffic_mirror_session_ids
+            .as_deref()
+            .unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "TrafficMirrorSessionIds carries {} ids, above the maximum of \
+                 {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+
+        // Matching cost is filters x values x held values x stored sessions, and the model
+        // bounds none of those, so the request-controlled factors are capped here, before
+        // any work proportional to them is done — and their PRODUCT is charged to ONE
+        // [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not document is NOT refused. The recorded
+        // behaviour of the real service settles it: the corpus unit
+        // `ec2.op-contract-describe-traffic-mirror-sessions` calls this operation with the
+        // filter name `sim2real-not-a-real-filter` and AWS answers a RESULT, not
+        // `InvalidParameterValue` — unlike `DescribeVolumes` and `DescribeImages`, which do
+        // refuse an undocumented name (and whose handlers here do too). A filter naming an
+        // attribute a Traffic Mirror session does not carry compares against no values, so
+        // it selects nothing ([`filter_values`]). What is still bounded is the SIZE of what
+        // the caller sent, below.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The token for the next page of results"
+        // (`DescribeTrafficMirrorSessionsRequest$NextToken`) — anything else is refused
+        // rather than read as an id, and it is refused before any other member is looked
+        // at, so whether a bogus token is caught never depends on the rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_page_token(token).ok_or_else(invalid_pagination_token)?),
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // "The ID of the Traffic Mirror session"
+        // (`DescribeTrafficMirrorSessionsRequest$TrafficMirrorSessionIds`): an id that names
+        // no session of the account is an error, not an absent row.
+        for traffic_mirror_session_id in requested_ids {
+            if !store
+                .traffic_mirror_sessions
+                .contains_key(traffic_mirror_session_id)
+            {
+                return Err(invalid_traffic_mirror_session_id_not_found(
+                    traffic_mirror_session_id,
+                ));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every named session
+        // resolved: the flag asks whether the request WOULD have succeeded, so one that
+        // would have been refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // Every comparison is charged to ONE budget, so the PRODUCT of stored sessions,
+        // request filters, values, held values and value length is bounded however the
+        // caller combines them — which is also what bounds how long this holds the state
+        // lock. This loop only READS: a Traffic Mirror session AWS hands back is ready, so
+        // the clock owes it no transition for a read to materialise.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<&TrafficMirrorSession> = Vec::new();
+        for (traffic_mirror_session_id, session) in &store.traffic_mirror_sessions {
+            if budget.exhausted() {
+                break;
+            }
+            // The id narrowing is read off the stored key, so a session the request did not
+            // name costs no comparison at all.
+            if !requested_ids.is_empty()
+                && !requested_ids
+                    .iter()
+                    .any(|id| id == traffic_mirror_session_id.as_str())
+            {
+                continue;
+            }
+            if matches_every_filter(&selectors, &mut budget, &|name| filter_values(session, name)) {
+                selected.push(session);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report
+        // as a result: the request asked for more filtering than one call will do, and is
+        // told so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // Page in `TrafficMirrorSessionId` order, which the cursor below names a position
+        // in. The store is an ordered map, so its iteration order already satisfies this
+        // sort; doing it here establishes the invariant the cursor depends on at the point
+        // of use.
+        selected.sort_by(|left, right| {
+            left.traffic_mirror_session_id
+                .cmp(&right.traffic_mirror_session_id)
+        });
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|session| {
+                session
+                    .traffic_mirror_session_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "The maximum number of results to return with a single call"
+        // (`DescribeTrafficMirrorSessionsRequest$MaxResults`). A request that names none
+        // gets the largest page this operation can be asked for, so the `NextToken` path
+        // behaves the same whether or not a page size was asked for. The modelled
+        // `range 5..1000` has already refused a size outside it.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_TRAFFIC_MIRROR_SESSIONS_PAGE_SIZE)
+            .clamp(1, MAX_TRAFFIC_MIRROR_SESSIONS_PAGE_SIZE);
+
+        // A token only when a session follows this page: "The value is null when there are
+        // no more results to return" (`DescribeTrafficMirrorSessionsResult$NextToken`).
+        let next_token = page
+            .get(limit)
+            .and_then(|session| session.traffic_mirror_session_id.as_deref())
+            .map(encode_page_token);
+
+        Ok(DescribeTrafficMirrorSessionsOutput {
+            traffic_mirror_sessions: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|session| (*session).clone())
+                    .collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+/// The values the EC2 filter `name` compares against this Traffic Mirror session.
+///
+/// The names this operation answers are the documented ones — "One or more filters. The
+/// possible values are: description: The Traffic Mirror session description.
+/// network-interface-id: The ID of the Traffic Mirror session network interface. owner-id:
+/// The ID of the account that owns the Traffic Mirror session. packet-length: The assigned
+/// number of packets to mirror. session-number: The assigned session number.
+/// traffic-mirror-filter-id: The ID of the Traffic Mirror filter. traffic-mirror-session-id:
+/// The ID of the Traffic Mirror session. traffic-mirror-target-id: The ID of the Traffic
+/// Mirror target. virtual-network-id: The virtual network ID of the Traffic Mirror session"
+/// (`DescribeTrafficMirrorSessionsRequest$Filters`) — plus `tag-key` and `tag:<key>`, the
+/// resource-wide tag filters EC2 documents for every taggable resource ("List and filter
+/// using the CLI and API", linked from `Filter`), and a Traffic Mirror session is taggable:
+/// `TrafficMirrorSession$Tags` reports the tags assigned to it. The `tag:<key>` prefix comes
+/// from the crate's one definition of it, [`crate::state::TAG_FILTER_PREFIX`], so that
+/// spelling cannot drift between the describes that answer the tag filter.
+///
+/// Every other name — "Filter names are case-sensitive" (`Filter$Name`), so a case-shifted
+/// spelling is one of them — compares against NO values, and so selects nothing rather than
+/// being refused (see the handler). A documented name compares against no values too when
+/// the session carries no such member, which is the answer for `description` on a session
+/// created without one. The three integer members are compared as the decimal text the wire
+/// reports them as, so `packet-length=100` selects the session whose `PacketLength` is
+/// `100`.
+fn filter_values<'a>(
+    session: &'a TrafficMirrorSession,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    // A `tag:` prefix with no key names no tag, so it selects on nothing the way any other
+    // undocumented name does.
+    if let Some(key) = name
+        .strip_prefix(TAG_FILTER_PREFIX)
+        .filter(|key| !key.is_empty())
+    {
+        return session
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    let number = |value: Option<i32>| -> Vec<Cow<'a, str>> {
+        value
+            .map(|value| Cow::Owned(value.to_string()))
+            .into_iter()
+            .collect()
+    };
+    match name {
+        "description" => text(session.description.as_deref()),
+        "network-interface-id" => text(session.network_interface_id.as_deref()),
+        "owner-id" => text(session.owner_id.as_deref()),
+        "packet-length" => number(session.packet_length),
+        "session-number" => number(session.session_number),
+        "tag-key" => session
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "traffic-mirror-filter-id" => text(session.traffic_mirror_filter_id.as_deref()),
+        "traffic-mirror-session-id" => text(session.traffic_mirror_session_id.as_deref()),
+        "traffic-mirror-target-id" => text(session.traffic_mirror_target_id.as_deref()),
+        "virtual-network-id" => number(session.virtual_network_id),
+        // A name this operation does not document compares against nothing, so it selects
+        // nothing and can never widen a result.
+        _ => Vec::new(),
     }
 }
