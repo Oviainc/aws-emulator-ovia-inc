@@ -70,6 +70,7 @@ enum IdKind {
     ProductPage,
     ProductRestEndpointPage,
     ApiMapping,
+    RoutingRule,
 }
 
 impl IdKind {
@@ -90,6 +91,7 @@ impl IdKind {
         IdKind::ProductPage,
         IdKind::ProductRestEndpointPage,
         IdKind::ApiMapping,
+        IdKind::RoutingRule,
     ];
 
     /// The kind declared LAST, whose ordinal is therefore the largest. Named so the
@@ -97,7 +99,7 @@ impl IdKind {
     /// the last ordinal plus one) and that the largest ordinal still has a residue class
     /// of its own: a variant added to the enum and forgotten in `ALL`, or one added past
     /// [`ID_KIND_STRIDE`], fails the build rather than minting another kind's id.
-    const LAST: IdKind = IdKind::ApiMapping;
+    const LAST: IdKind = IdKind::RoutingRule;
 
     /// This kind's residue class in the id space, below [`ID_KIND_STRIDE`].
     const fn ordinal(self) -> u128 {
@@ -405,6 +407,158 @@ pub fn validate_api_mapping_key(key: &str) -> Result<(), String> {
         return Err(API_MAPPING_KEY_ILLEGAL_CHARACTER.to_string());
     }
     Ok(())
+}
+
+/// The most routing rules one custom domain name may hold, after which
+/// `CreateRoutingRule` is refused.
+///
+/// An EMULATOR growth bound, not a figure AWS publishes: this takes the same shape as
+/// [`MAX_API_MAPPINGS_PER_DOMAIN`], the other per-domain-name collection, and is what
+/// stops a loop of `CreateRoutingRule` calls growing this store without end.
+/// `TooManyRequestsException` ("A limit has been exceeded") is the modelled error the
+/// operation refuses with.
+pub const MAX_ROUTING_RULES_PER_DOMAIN: usize = 200;
+
+/// The most `matchHeaders` conditions one routing rule may carry, from
+/// `CreateRoutingRule$Conditions`: "Conditions can contain up to two matchHeaders
+/// conditions and one matchBasePaths conditions."
+pub const MAX_MATCH_HEADERS_CONDITIONS: usize = 2;
+
+/// The most `matchBasePaths` conditions one routing rule may carry — the same documented
+/// sentence as [`MAX_MATCH_HEADERS_CONDITIONS`].
+pub const MAX_MATCH_BASE_PATHS_CONDITIONS: usize = 1;
+
+/// The refusal a routing rule whose `Conditions` carry more of one kind than the
+/// documented sentence allows takes: the constraint itself, naming nothing from the
+/// request.
+pub const ROUTING_RULE_CONDITION_LIMITS: &str = "Conditions can contain up to two \
+     matchHeaders conditions and one matchBasePaths conditions.";
+
+/// The refusal a routing rule naming no action takes. `Actions` is a required member and
+/// a rule with no action would do nothing to a request it matched, so a list with no
+/// entry is incomplete input — the same form as [`EMPTY_DOMAIN_NAME_CONFIGURATIONS`].
+pub const EMPTY_ROUTING_RULE_ACTIONS: &str = "Invalid input. Expected one routing rule action";
+
+/// The refusal a routing rule naming no condition takes. `Conditions` is a required
+/// member and a rule with no condition selects no request, so a list with no entry is
+/// incomplete input.
+pub const EMPTY_ROUTING_RULE_CONDITIONS: &str =
+    "Invalid input. Expected one routing rule condition";
+
+/// Refuse a routing rule whose `Actions` or `Conditions` do not describe a rule API
+/// Gateway could evaluate.
+///
+/// The rules, each from what the model documents for the two required members: a rule
+/// names at least one action (`Actions`, "the only supported action is invokeApi") and at
+/// least one condition (`Conditions`); every condition names EXACTLY ONE of the two
+/// alternatives its structure offers, since a condition naming neither says nothing and
+/// one naming both says two things; a condition's `AnyOf` names at least one value to
+/// match on; and the whole list carries at most [`MAX_MATCH_HEADERS_CONDITIONS`]
+/// `matchHeaders` and [`MAX_MATCH_BASE_PATHS_CONDITIONS`] `matchBasePaths` conditions.
+///
+/// Shared by every writer of the resource, so `CreateRoutingRule` and `PutRoutingRule`
+/// cannot drift. `Err` carries the message for the operation's `BadRequestException`.
+pub fn validate_routing_rule(
+    actions: &[wire::RoutingRuleAction],
+    conditions: &[wire::RoutingRuleCondition],
+) -> Result<(), String> {
+    if actions.is_empty() {
+        return Err(EMPTY_ROUTING_RULE_ACTIONS.to_string());
+    }
+    if conditions.is_empty() {
+        return Err(EMPTY_ROUTING_RULE_CONDITIONS.to_string());
+    }
+    let mut match_headers = 0usize;
+    let mut match_base_paths = 0usize;
+    for (index, condition) in conditions.iter().enumerate() {
+        let member = format!("Conditions[{index}]");
+        validate_exclusive_choice(
+            &member,
+            &[
+                ("MatchBasePaths", condition.match_base_paths.is_some()),
+                ("MatchHeaders", condition.match_headers.is_some()),
+            ],
+        )?;
+        if let Some(base_paths) = &condition.match_base_paths {
+            match_base_paths += 1;
+            if base_paths.any_of.is_empty() {
+                return Err(empty_any_of(&member, "MatchBasePaths"));
+            }
+        }
+        if let Some(headers) = &condition.match_headers {
+            match_headers += 1;
+            if headers.any_of.is_empty() {
+                return Err(empty_any_of(&member, "MatchHeaders"));
+            }
+        }
+    }
+    if match_headers > MAX_MATCH_HEADERS_CONDITIONS
+        || match_base_paths > MAX_MATCH_BASE_PATHS_CONDITIONS
+    {
+        return Err(ROUTING_RULE_CONDITION_LIMITS.to_string());
+    }
+    Ok(())
+}
+
+/// The refusal a condition whose `AnyOf` carries no value takes: the member is what the
+/// condition is matched on, so a condition with nothing in it matches nothing.
+fn empty_any_of(member: &str, alternative: &str) -> String {
+    format!("{member}.{alternative}.AnyOf must name at least one value.")
+}
+
+/// The published bounds of `RoutingRulePriority` (`smithy_query(query="shape",
+/// shape="RoutingRulePriority")`: `range` 1..1000000), the shape every routing-rule
+/// writer's `Priority` targets. The boundary validator refuses a value outside them; the
+/// bounds are named here so the sentence that explains the refusal
+/// ([`routing_rule_priority_range_message`]) cannot drift from the constraint.
+pub const MIN_ROUTING_RULE_PRIORITY: i32 = 1;
+
+/// The upper bound of the range [`MIN_ROUTING_RULE_PRIORITY`] opens.
+pub const MAX_ROUTING_RULE_PRIORITY: i32 = 1_000_000;
+
+/// The sentence API Gateway refuses a `Priority` outside its published range with.
+///
+/// The service states this member's refusal in the member's OWN terms — the whole range
+/// it has to fall in, not the single bound that was crossed — rather than in the generic
+/// "value at path failed to satisfy constraint" form, and it writes the bound with the
+/// thousands separators a number of that size is written with. Built from the modelled
+/// bounds, so it cannot drift from the constraint it explains.
+pub fn routing_rule_priority_range_message() -> String {
+    format!(
+        "Priority must be between {} and {}.",
+        grouped(MIN_ROUTING_RULE_PRIORITY),
+        grouped(MAX_ROUTING_RULE_PRIORITY)
+    )
+}
+
+/// `value` with its digits grouped in threes by commas, the way a bound of that size is
+/// written in a refusal.
+fn grouped(value: i32) -> String {
+    let digits = value.unsigned_abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    if value < 0 {
+        out.push('-');
+    }
+    for (position, digit) in digits.char_indices() {
+        if position > 0 && (digits.len() - position).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// The ARN of one `RoutingRule` of the custom domain name `domain_name`, in `region`.
+///
+/// Built from the resource path the operations address the rule at
+/// (`/v2/domainnames/{DomainName}/routingrules/{RoutingRuleId}`) under the same account
+/// and namespace as [`domain_name_arn`], the resource that owns it.
+pub fn routing_rule_arn(domain_name: &str, routing_rule_id: &str, region: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("/domainnames/{domain_name}/routingrules/{routing_rule_id}"),
+    )
 }
 
 /// The most authorizers one api may hold, after which CreateAuthorizer is refused.
@@ -3332,6 +3486,12 @@ impl VpcLink {
 #[derive(Debug, Clone)]
 pub struct DomainName {
     pub domain_name: String,
+    /// The id this store minted for the resource, stable for its life. It is the
+    /// `DomainNameId` the routing-rule operations take as an optional disambiguator
+    /// beside the name in their path (see
+    /// [`DomainName::answers_to_requested_id`]), and it is the id of the regional host
+    /// the resource is served on (see [`api_gateway_domain_host`]).
+    pub domain_name_id: String,
     /// The resource's ARN, built once at create time from the request's region so it
     /// stays stable for the life of the resource.
     pub domain_name_arn: String,
@@ -3365,6 +3525,36 @@ pub struct DomainName {
     /// Drives [`DomainName::mint_api_mapping_id`]. Per-domain, because an
     /// `ApiMappingId` only has to be unique within the domain name that owns it.
     pub api_mapping_id_seed: u64,
+    /// This domain name's routing rules, keyed by `RoutingRuleId`. A rule is addressed
+    /// only under the domain that owns it
+    /// (`/v2/domainnames/{DomainName}/routingrules/{RoutingRuleId}`), so it is stored
+    /// INSIDE the record for the same reason the api mappings are. `BTreeMap` for the
+    /// stable key order `ListRoutingRules` pages over.
+    pub routing_rules: BTreeMap<String, RoutingRule>,
+    /// Drives [`DomainName::mint_routing_rule_id`]. Per-domain, because a
+    /// `RoutingRuleId` only has to be unique within the domain name that owns it.
+    pub routing_rule_id_seed: u64,
+}
+
+impl DomainName {
+    /// Mint a fresh `RoutingRuleId` for this domain name: ten lowercase alphanumerics,
+    /// never one this domain name already minted.
+    pub fn mint_routing_rule_id(&mut self) -> String {
+        self.routing_rule_id_seed = self.routing_rule_id_seed.wrapping_add(1);
+        mint_id(IdKind::RoutingRule, self.routing_rule_id_seed)
+    }
+
+    /// Whether this record is the domain name a request addressing it by name ALSO
+    /// addressed by id.
+    ///
+    /// The routing-rule operations name the domain name in their path and take
+    /// `DomainNameId` beside it, so a request that names an id is addressing the domain
+    /// name that carries it: this record answers to its own id and to a request that
+    /// names none, and to nothing else — a request naming another id addresses another
+    /// resource, which this account does not hold under this name.
+    pub fn answers_to_requested_id(&self, requested: Option<&str>) -> bool {
+        requested.is_none_or(|id| id == self.domain_name_id)
+    }
 }
 
 impl DomainName {
@@ -3418,6 +3608,39 @@ impl ApiMapping {
             api_mapping_id: Some(self.api_mapping_id.clone()),
             api_mapping_key: self.api_mapping_key.clone(),
             stage: self.stage.clone(),
+        }
+    }
+}
+
+/// A persisted `RoutingRule`: one rule of a custom domain name, matching a request on
+/// its conditions and invoking the api stage its action names.
+///
+/// Keyed in its owning [`DomainName`] by [`RoutingRule::routing_rule_id`]. `Actions` and
+/// `Conditions` are held as the modelled shapes: both are the caller's own composite
+/// values, reported back exactly as they were stored, and no member of either is
+/// service-computed.
+#[derive(Debug, Clone)]
+pub struct RoutingRule {
+    pub routing_rule_id: String,
+    /// The rule's ARN, built once at write time from the request's region (see
+    /// [`routing_rule_arn`]) so it stays stable for the life of the rule.
+    pub routing_rule_arn: String,
+    /// "The order in which API Gateway evaluates a rule" (`RoutingRule$Priority`), within
+    /// the modelled 1..1000000 range.
+    pub priority: i32,
+    pub actions: Vec<wire::RoutingRuleAction>,
+    pub conditions: Vec<wire::RoutingRuleCondition>,
+}
+
+impl RoutingRule {
+    /// Project the record onto the modelled `RoutingRule` shape.
+    pub fn to_wire(&self) -> wire::RoutingRule {
+        wire::RoutingRule {
+            actions: Some(self.actions.clone()),
+            conditions: Some(self.conditions.clone()),
+            priority: Some(self.priority),
+            routing_rule_arn: Some(self.routing_rule_arn.clone()),
+            routing_rule_id: Some(self.routing_rule_id.clone()),
         }
     }
 }
@@ -4140,6 +4363,10 @@ pub fn parse_boolean_query(member: &str, raw: Option<&str>) -> Result<bool, Stri
 /// Resolve a `MaxResults` query value into the page size to serve — see
 /// [`paging::parse_max_results`], which clamps it to [`MAX_PAGE_SIZE`].
 pub use paging::parse_max_results;
+
+/// Resolve a modelled-integer `MaxResults` into the page size to serve — see
+/// [`paging::resolve_max_results`].
+pub use paging::resolve_max_results;
 
 /// The sentence a paginated reader refuses a `NextToken` it did not issue with — see
 /// [`paging::INVALID_NEXT_TOKEN_MESSAGE`].

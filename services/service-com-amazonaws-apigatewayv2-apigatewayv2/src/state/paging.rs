@@ -41,6 +41,23 @@ pub fn parse_max_results(raw: Option<&str>) -> Result<usize, String> {
     }
 }
 
+/// Resolve a modelled-integer `MaxResults` into the page size to serve.
+///
+/// Several of this service's paginated operations model `MaxResults` as the `MaxResults`
+/// integer shape (range 1..100), so the boundary validator has already refused a value
+/// outside that window and there is nothing left to parse — only the server-side bound to
+/// apply: the request's value clamped into `1..=`[`MAX_PAGE_SIZE`], and [`MAX_PAGE_SIZE`]
+/// for a request that names none. TOTAL and monotone over its input, so a value a future
+/// widening of the modelled range let through still costs one bounded page.
+pub fn resolve_max_results(requested: Option<i32>) -> usize {
+    let Some(asked) = requested else {
+        return MAX_PAGE_SIZE;
+    };
+    // A negative page size is below the window, so it takes the window's floor the same
+    // way zero does.
+    usize::try_from(asked).unwrap_or(1).clamp(1, MAX_PAGE_SIZE)
+}
+
 /// The sentence a paginated reader refuses a `NextToken` it did not issue with.
 ///
 /// A pagination token is OPAQUE: the service mints it and the caller echoes it back
@@ -148,7 +165,7 @@ pub fn page<'a, V>(
 
 #[cfg(test)]
 mod tests {
-    use super::{page, page_scope, parse_max_results, MAX_PAGE_SIZE};
+    use super::{page, page_scope, parse_max_results, resolve_max_results, MAX_PAGE_SIZE};
     use std::collections::BTreeMap;
 
     /// A collection of `count` records, keyed the way the store keys its children.
@@ -207,6 +224,32 @@ mod tests {
             assert!(
                 resolved.is_err(),
                 "case {raw:?}: expected a refusal, got {resolved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_modelled_integer_page_size_is_clamped_to_the_server_side_maximum() {
+        // (the `MaxResults` the request carries, the page size it resolves to). The rows
+        // span the modelled 1..100 window, its two bounds, what a request naming none
+        // gets, and the values outside the window the validator refuses before a handler
+        // ever sees them — which still resolve to a bounded page here.
+        let rows = [
+            (None, MAX_PAGE_SIZE),
+            (Some(1), 1),
+            (Some(17), 17),
+            (Some(100), MAX_PAGE_SIZE),
+            (Some(101), MAX_PAGE_SIZE),
+            (Some(i32::MAX), MAX_PAGE_SIZE),
+            (Some(0), 1),
+            (Some(-1), 1),
+            (Some(i32::MIN), 1),
+        ];
+        for (asked, expected) in rows {
+            let resolved = resolve_max_results(asked);
+            assert_eq!(
+                resolved, expected,
+                "case {asked:?}: expected the page size {expected}, got {resolved}"
             );
         }
     }

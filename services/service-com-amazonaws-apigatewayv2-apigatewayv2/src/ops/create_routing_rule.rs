@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRoutingRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRoutingRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRoutingRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -163,18 +153,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRoutingRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRoutingRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The rule's own form is checked before anything is looked up: what makes a set
+        // of actions and conditions a rule API Gateway could evaluate depends on neither
+        // the store nor the clock. `Priority` needs no check here — it targets
+        // `RoutingRulePriority` (range 1..1000000), which the boundary validator already
+        // refused anything outside of.
+        if let Err(message) = crate::state::validate_routing_rule(&input.actions, &input.conditions)
+        {
+            return Err(bad_request(&message));
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateRoutingRule",
+            ));
+        };
+        let mut store = state.lock();
+
+        // The domain name is the resource this rule is created UNDER (it is the
+        // operation's `@httpLabel`), so the name the path addresses — under the
+        // `DomainNameId` the request named, when it named one — is resolved first: a name
+        // the account does not hold is reported as the missing resource it is, before
+        // anything is stored.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRoutingRule"))
+        // The api stage an action INVOKES is NOT resolved here: `RoutingRuleActionInvokeApi`
+        // is a reference the rule carries rather than a resource the rule is created under,
+        // and the service stores a rule whose action names an api the account does not hold
+        // rather than refusing the write — so the reference is kept exactly as the request
+        // wrote it and reported back that way.
+        let Some(domain) = store
+            .domain_names
+            .get_mut(&input.domain_name)
+            .filter(|domain| domain.answers_to_requested_id(input.domain_name_id.as_deref()))
+        else {
+            return Err(not_found(crate::state::INVALID_DOMAIN_NAME_IDENTIFIER));
+        };
+
+        // Bound the growth a caller drives. `TooManyRequestsException` is the modelled
+        // error for "a limit has been exceeded" and carries the limit's name.
+        if domain.routing_rules.len() >= crate::state::MAX_ROUTING_RULES_PER_DOMAIN {
+            return Err(CreateRoutingRuleErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    limit_type: Some("RoutingRule".to_string()),
+                    message: Some(format!(
+                        "The maximum number of routing rules ({}) for this domain name has \
+                         been reached.",
+                        crate::state::MAX_ROUTING_RULES_PER_DOMAIN
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let routing_rule_id = domain.mint_routing_rule_id();
+        let record = crate::state::RoutingRule {
+            routing_rule_arn: crate::state::routing_rule_arn(
+                &domain.domain_name,
+                &routing_rule_id,
+                &region,
+            ),
+            routing_rule_id: routing_rule_id.clone(),
+            priority: input.priority,
+            actions: input.actions,
+            conditions: input.conditions,
+        };
+
+        // Project the STORED record, so what the caller is told is what a later
+        // ListRoutingRules reports.
+        let stored = domain
+            .routing_rules
+            .entry(routing_rule_id)
+            .or_insert(record)
+            .to_wire();
+        Ok(CreateRoutingRuleOutput {
+            actions: stored.actions,
+            conditions: stored.conditions,
+            priority: stored.priority,
+            routing_rule_arn: stored.routing_rule_arn,
+            routing_rule_id: stored.routing_rule_id,
+        })
     }
+}
+
+/// This operation's refusal of a request it models no more specific error for: the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect"), whose message names the constraint that was not met.
+fn bad_request(message: &str) -> CreateRoutingRuleError {
+    CreateRoutingRuleErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's refusal of a request naming a resource the account does not hold:
+/// the modelled `NotFoundException` ("The resource specified in the request was not
+/// found").
+fn not_found(message: &str) -> CreateRoutingRuleError {
+    CreateRoutingRuleErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.to_string()),
+        resource_type: ::std::option::Option::None,
+    })
+    .into()
 }

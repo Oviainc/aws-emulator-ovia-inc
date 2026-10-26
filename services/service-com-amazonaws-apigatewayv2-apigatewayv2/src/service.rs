@@ -142,6 +142,12 @@ fn stated_violation(violation: &Violation) -> Option<String> {
                 crate::state::MAX_INTEGRATION_TIMEOUT_MILLIS
             ))
         }
+        // A routing rule's `Priority`, whose shape declares the order a rule may be
+        // evaluated in (`RoutingRulePriority`, range 1..1000000). Stated as the whole
+        // range the member has to fall in, however far outside it the value sat.
+        ("priority", ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)) => {
+            Some(crate::state::routing_rule_priority_range_message())
+        }
         _ => None,
     }
 }

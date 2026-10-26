@@ -229,6 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::DomainName {
             domain_name_arn: crate::state::domain_name_arn(&input.domain_name, &region),
             api_gateway_domain_name: crate::state::api_gateway_domain_host(&domain_id, &region),
+            domain_name_id: domain_id,
             domain_name: input.domain_name.clone(),
             configurations,
             mutual_tls_authentication: input.mutual_tls_authentication,
@@ -244,6 +245,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // what adds one.
             api_mappings: ::std::collections::BTreeMap::new(),
             api_mapping_id_seed: 0,
+            // And with no routing rule: `CreateRoutingRule` is what adds one.
+            routing_rules: ::std::collections::BTreeMap::new(),
+            routing_rule_id_seed: 0,
         };
 
         // Taking the entry back gives the STORED record, so what the caller is told is
