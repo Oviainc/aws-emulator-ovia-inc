@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBuildBatches
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBuildBatches`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBuildBatches::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the ids of every batch build this account holds, across all of its projects —
+//! this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +139,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBuildBatches` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBuildBatchesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBuildBatches"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListBuildBatches (this engine carries no CodeBuild state)",
+            ));
+        };
+        let _ = ctx;
+
+        // `BuildBatchFilter$status`: "The status of the batch builds to retrieve. Only
+        // batch builds that have this status will be retrieved." A filter carrying no
+        // status selects every batch build, as an absent filter does. The value is a
+        // `StatusType`, so the boundary walk has already refused anything that enum
+        // does not name.
+        let wanted_status = input
+            .filter
+            .as_ref()
+            .and_then(|filter| filter.status.as_deref());
+
+        // Every batch build of every project, oldest first. Each record is read past
+        // the transition the clock already owes it, so the status filtered on here is
+        // the one `BatchGetBuildBatches` reports for the same batch build.
+        let mut ids = state
+            .lock()
+            .build_batch_ids_by_start(crate::state::now_millis(), wanted_status);
+        if input.sort_order.as_deref() != Some(ASCENDING_SORT_ORDER) {
+            ids.reverse();
+        }
+
+        let Some((page, next_token)) =
+            crate::state::page_limited(&ids, input.next_token.as_deref(), input.max_results)
+        else {
+            return Err(ListBuildBatchesErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some("Invalid nextToken".to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(ListBuildBatchesOutput {
+            // `BuildBatchIds` is `@length(min: 0, max: 100)`, so an account holding no
+            // batch build states its empty listing as `[]` rather than omitting `ids`.
+            ids: Some(page),
+            next_token,
+        })
     }
 }
+
+/// The one `SortOrderType` value that asks for the oldest batch build first.
+///
+/// `ListBuildBatchesInput$sortOrder` states no default, so the default here is the one
+/// CodeBuild documents for the sibling member it does describe,
+/// `ListBuildsForProjectInput$sortOrder`: "If this is not specified, the results are
+/// sorted in descending order." Anything that is not `ASCENDING` therefore reports the
+/// most recently started batch build first.
+///
+/// The direction is over the order
+/// [`crate::state::ComAmazonawsCodebuildCodebuild20161006State::build_batch_ids_by_start`]
+/// establishes — each batch build's start instant, NOT the id's opaque uuid, even though
+/// the member's wording says "by identifier": the reasoning, and the observed answers it
+/// rests on, are recorded on that method.
+const ASCENDING_SORT_ORDER: &str = "ASCENDING";

@@ -499,6 +499,12 @@ pub const VPC_LINK_STATUS_PENDING: &str = "PENDING";
 /// `VPC_LINK_STATUS_VALUES`.
 pub const VPC_LINK_STATUS_AVAILABLE: &str = "AVAILABLE";
 
+/// The `VpcLinkStatus` a VPC link carries once its deletion has been accepted and while
+/// the service is still tearing its network interfaces down, from
+/// `VPC_LINK_STATUS_VALUES`. A link in this status is still readable; it stops being
+/// readable when its deprovisioning is done (see [`VPC_LINK_DELETE_SPAN`]).
+pub const VPC_LINK_STATUS_DELETING: &str = "DELETING";
+
 /// The only `VpcLinkVersion` this API models (`VPC_LINK_VERSION_VALUES`: `V2`), so it is
 /// the version every link this service mints reports.
 pub const VPC_LINK_VERSION_V2: &str = "V2";
@@ -512,6 +518,17 @@ pub const VPC_LINK_VERSION_V2: &str = "V2";
 /// not to slow a caller down and long enough that a caller reading straight after
 /// `CreateVpcLink` still observes [`VPC_LINK_STATUS_PENDING`].
 pub const VPC_LINK_CREATE_SPAN: Duration = Duration::from_millis(500);
+
+/// How long a deleted VPC link reports [`VPC_LINK_STATUS_DELETING`] before it is gone
+/// from the store: the delete call is ACCEPTED (HTTP 202) while the link's network
+/// interfaces are still being detached, which is why the status enum carries a
+/// `DELETING` value at all.
+///
+/// API Gateway documents no duration for it, so this span is the emulator's own — the
+/// one [`VPC_LINK_CREATE_SPAN`] uses for the same kind of clock-owed transition, short
+/// enough not to slow a caller down and long enough that a caller reading straight
+/// after the delete still observes the link going away.
+pub const VPC_LINK_DELETE_SPAN: Duration = Duration::from_millis(500);
 
 /// Per-service state for com-amazonaws-apigatewayv2-apigatewayv2. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -586,6 +603,17 @@ impl ComAmazonawsApigatewayv2Apigatewayv2State {
     pub fn mint_vpc_link_id(&mut self) -> String {
         self.vpc_link_id_seed = self.vpc_link_id_seed.wrapping_add(1);
         mint_id(IdKind::VpcLink, self.vpc_link_id_seed)
+    }
+
+    /// Drop every VPC link whose deprovisioning the CLOCK has already finished (see
+    /// [`VpcLink::is_deprovisioned`]).
+    ///
+    /// The transition is owed by the clock, not by a caller: it was due at the same
+    /// instant whether or not anybody called, so materialising it here leaves every
+    /// reader agreeing on which links the account still holds — and frees the quota slot
+    /// a gone link no longer occupies.
+    pub fn purge_deprovisioned_vpc_links(&mut self) {
+        self.vpc_links.retain(|_, link| !link.is_deprovisioned());
     }
 
     /// Mint the id of the regional host a custom domain name is served on: ten
@@ -1659,9 +1687,11 @@ pub const PORTAL_PRODUCT_RESOURCE: &str = "PortalProduct";
 /// How [`invalid_identifier_message`] names a PRODUCT PAGE of a portal product.
 pub const PRODUCT_PAGE_RESOURCE: &str = "ProductPage";
 
-/// How [`invalid_identifier_message`] names a VPC LINK, spelled the way the operations
-/// that address one do ("Invalid VPC link identifier specified").
-pub const VPC_LINK_RESOURCE: &str = "VPC link";
+/// How [`invalid_identifier_message`] names a VPC LINK ("Invalid Vpc Link identifier
+/// specified"). The casing is the service's own in THIS sentence — each word
+/// capitalised, not the `VPC link` of its prose — so do not "correct" it to match the
+/// documentation.
+pub const VPC_LINK_RESOURCE: &str = "Vpc Link";
 
 /// The sentence this service answers `NotFoundException` with for an `ApiId` no api
 /// holds: the account-qualified form API Gateway reports an unknown API identifier in
@@ -2960,6 +2990,12 @@ pub struct VpcLink {
     /// [`VPC_LINK_STATUS_AVAILABLE`]; before it, [`VPC_LINK_STATUS_PENDING`]. See
     /// [`VpcLink::status`] and [`VPC_LINK_CREATE_SPAN`].
     pub available_at: Instant,
+    /// When this link's deprovisioning finishes, after which no reader reports it at
+    /// all; `None` for a link whose deletion has not been accepted. Set by the delete
+    /// call to one [`VPC_LINK_DELETE_SPAN`] from then, so the link reports
+    /// [`VPC_LINK_STATUS_DELETING`] until the clock makes its removal due. See
+    /// [`VpcLink::is_deprovisioned`].
+    pub deprovisioned_at: Option<Instant>,
 }
 
 impl VpcLink {
@@ -2967,15 +3003,28 @@ impl VpcLink {
     ///
     /// A created link is still being provisioned when the create call answers, so it is
     /// reported [`VPC_LINK_STATUS_PENDING`] until [`VPC_LINK_CREATE_SPAN`] has passed
-    /// and [`VPC_LINK_STATUS_AVAILABLE`] after it. The transition is one the CLOCK owes,
-    /// materialised from the stored due instant rather than by sleeping or by being
-    /// read, so every reader agrees on it and a read changes nothing.
+    /// and [`VPC_LINK_STATUS_AVAILABLE`] after it; a link whose deletion was accepted is
+    /// reported [`VPC_LINK_STATUS_DELETING`] for as long as it is still readable at all.
+    /// Every transition is one the CLOCK owes, materialised from a stored due instant
+    /// rather than by sleeping or by being read, so every reader agrees on it and a read
+    /// changes nothing.
     pub fn status(&self) -> &'static str {
-        if Instant::now() < self.available_at {
+        if self.deprovisioned_at.is_some() {
+            VPC_LINK_STATUS_DELETING
+        } else if Instant::now() < self.available_at {
             VPC_LINK_STATUS_PENDING
         } else {
             VPC_LINK_STATUS_AVAILABLE
         }
+    }
+
+    /// Whether the clock has finished this link's deprovisioning, so the account no
+    /// longer holds it: true only for a link whose deletion was accepted and whose due
+    /// instant has passed. [`ComAmazonawsApigatewayv2Apigatewayv2State::purge_deprovisioned_vpc_links`]
+    /// is what drops such a record.
+    pub fn is_deprovisioned(&self) -> bool {
+        self.deprovisioned_at
+            .is_some_and(|due| Instant::now() >= due)
     }
 
     /// The `VpcLinkStatusMessage` this link reports now: "a message summarizing the
@@ -2989,6 +3038,11 @@ impl VpcLink {
             VPC_LINK_STATUS_PENDING => {
                 "The VPC link is being provisioned and is not ready to be used by an \
                  integration yet."
+                    .to_string()
+            }
+            VPC_LINK_STATUS_DELETING => {
+                "The VPC link is being deleted and can no longer be used by an \
+                 integration."
                     .to_string()
             }
             // VPC_LINK_STATUS_AVAILABLE: the only other status a stored record reaches.

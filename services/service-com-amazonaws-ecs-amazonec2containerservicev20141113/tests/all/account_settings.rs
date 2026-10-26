@@ -25,7 +25,8 @@
 //!   the root user for an account": the principal's stored value is removed, so the
 //!   value in effect for it falls back to the account-wide default (and, for the root
 //!   user, to the setting's documented default), and the response reports the setting
-//!   that stopped applying.
+//!   that stopped applying. A principal that holds no setting of that name has nothing to
+//!   disable, so the call is refused rather than answered with what is already in effect.
 //! * `ClusterSetting$value`: "If a cluster value is specified, it will override the
 //!   `containerInsights` value set with PutAccountSetting or PutAccountSettingDefault" —
 //!   so a cluster that set nothing reports the account setting in effect.
@@ -928,68 +929,127 @@ async fn a_disabled_setting_stops_applying_and_the_account_default_takes_over() 
     }
 }
 
-#[tokio::test]
-async fn disabling_a_setting_nobody_wrote_reports_what_is_in_effect_and_changes_nothing() {
-    let router = service();
+/// The sentence a disable of a setting its principal does not hold is refused with.
+const SETTING_NOT_FOUND_MESSAGE: &str = "Referenced setting doesn't exist";
 
-    // The rows span the value forms a never-written setting can have: off, on, a word
-    // pair and a number — one row per documented default shape, including names this
-    // suite's other rows never write.
-    let names = [
-        "fargateFIPSMode",
-        "serviceLongArnFormat",
-        "taskLongArnFormat",
-        "defaultLogDriverMode",
-        "fargateTaskRetirementWaitPeriod",
+/// One row of the table below: how the principal came to hold NO setting of the name the
+/// disable names, and the disable it then makes.
+struct AbsentSettingCase {
+    case: &'static str,
+    name: &'static str,
+    /// The calls that set the row up, each an operation and the body it is sent.
+    setup: Vec<(&'static str, Value)>,
+    /// The `DeleteAccountSetting` the row makes.
+    request: Value,
+}
+
+#[tokio::test]
+async fn disabling_a_setting_the_principal_does_not_hold_is_refused_and_changes_nothing() {
+    // One row per way a principal can hold NO setting of the name a disable names: nobody
+    // ever wrote it, ANOTHER principal wrote it, only the ACCOUNT DEFAULT holds it (so it
+    // belongs to the root user alone), this principal wrote it and already disabled it
+    // (the re-delete a teardown or a converge loop makes), and the ROOT user's own default
+    // was never written. The rows also span the value forms a setting takes: off, on, a
+    // word pair and a number.
+    let other = format!("arn:aws:iam::{ACCOUNT}:role/deployer");
+    let rows = [
+        AbsentSettingCase {
+            case: "nobody wrote it",
+            name: "fargateFIPSMode",
+            setup: Vec::new(),
+            request: json!({ "name": "fargateFIPSMode" }),
+        },
+        AbsentSettingCase {
+            case: "another principal wrote it",
+            name: "serviceLongArnFormat",
+            setup: vec![(
+                "PutAccountSetting",
+                json!({
+                    "name": "serviceLongArnFormat",
+                    "value": "disabled",
+                    "principalArn": other,
+                }),
+            )],
+            request: json!({ "name": "serviceLongArnFormat" }),
+        },
+        AbsentSettingCase {
+            case: "only the account default holds it",
+            name: "defaultLogDriverMode",
+            setup: vec![(
+                "PutAccountSettingDefault",
+                json!({ "name": "defaultLogDriverMode", "value": "blocking" }),
+            )],
+            request: json!({ "name": "defaultLogDriverMode" }),
+        },
+        AbsentSettingCase {
+            case: "already disabled",
+            name: "fargateTaskRetirementWaitPeriod",
+            setup: vec![
+                (
+                    "PutAccountSetting",
+                    json!({ "name": "fargateTaskRetirementWaitPeriod", "value": "14" }),
+                ),
+                (
+                    "DeleteAccountSetting",
+                    json!({ "name": "fargateTaskRetirementWaitPeriod" }),
+                ),
+            ],
+            request: json!({ "name": "fargateTaskRetirementWaitPeriod" }),
+        },
+        AbsentSettingCase {
+            case: "the root user holds no default",
+            name: "taskLongArnFormat",
+            setup: Vec::new(),
+            request: json!({ "name": "taskLongArnFormat", "principalArn": root_principal() }),
+        },
     ];
 
-    for name in names {
-        let case = format!("{name} never written");
-        let expected = documented_default(name);
-        // Twice: a disable of a setting that is not stored is idempotent, and the second
-        // call answers exactly what the first did.
-        for attempt in 0..2 {
-            let reported = disable(&router, json!({ "name": name }), &case).await;
-            assert_eq!(
-                (
-                    reported["name"].clone(),
-                    reported["value"].clone(),
-                    reported["principalArn"].clone()
-                ),
-                (
-                    json!(name),
-                    json!(expected),
-                    json!(root_principal())
-                ),
-                "case {case:?}: attempt {attempt} must report the setting in effect, got \
-                 {reported}"
-            );
+    for AbsentSettingCase {
+        case,
+        name,
+        setup,
+        request,
+    } in rows
+    {
+        // A fresh engine per row, so one row's writes cannot leak into another.
+        let router = service();
+        for (operation, body) in setup {
+            ok(&router, operation, body, case).await;
         }
+        let before = effective(&router, name, case).await;
 
+        let (code, message) = refusal(&router, "DeleteAccountSetting", request, case).await;
+        assert_eq!(
+            code, "InvalidParameterException",
+            "case {case:?}: expected an InvalidParameterException, got {code:?} with \
+             {message:?}"
+        );
+        assert_eq!(
+            message, SETTING_NOT_FOUND_MESSAGE,
+            "case {case:?}: the refusal must state the condition and name nothing the \
+             request carried, got {message:?}"
+        );
+
+        // The refusal stored nothing and removed nothing: the setting in effect for the
+        // principal is the one that was in effect before the call, and the principal
+        // still holds no setting of its own.
+        let after = effective(&router, name, case).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: a refused disable must change nothing, got {after} after \
+             {before}"
+        );
         let own = all_settings(
             &router,
             json!({ "name": name, "effectiveSettings": false }),
-            &case,
+            case,
         )
         .await;
         assert!(
             own.is_empty(),
-            "case {case:?}: a disable must not store a setting, got {own:?}"
+            "case {case:?}: a refused disable must store nothing, got {own:?}"
         );
     }
-
-    // Every name is still at its documented default: the disables wrote nothing.
-    let reported = all_settings(&router, json!({ "effectiveSettings": true }), "after disabling").await;
-    let expected: Vec<(String, String)> = ACCOUNT_SETTINGS
-        .iter()
-        .map(|(name, value, _)| ((*name).to_string(), (*value).to_string()))
-        .collect();
-    assert_eq!(
-        values(&reported),
-        expected,
-        "case \"after disabling\": a disable of an unwritten setting must leave every \
-         setting at its default, got {reported:?}"
-    );
 }
 
 #[tokio::test]

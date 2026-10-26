@@ -14,6 +14,9 @@
 //!   the authorization's (`app`, tenant) pair and the start call's email;
 //! * a task is `IN_PROGRESS` until the span the clock owes has passed and
 //!   terminal afterwards, and polling it never changes what a later poll sees;
+//! * a poll answers POSITIONALLY — one result per ENTRY of `taskIdList`, in
+//!   request order, repeats included, because the model declares that list
+//!   without `@uniqueItems`;
 //! * an app bundle or a task id the store does not hold is the modelled
 //!   `ResourceNotFoundException` (HTTP 404), in either `Identifier` form.
 //!
@@ -553,11 +556,169 @@ async fn an_unknown_app_bundle_is_refused_by_both_operations() {
     }
 }
 
+/// The bound the model puts on one poll's `taskIdList`
+/// (`smithy_query(shape=TaskIdList)`: a `list` of `UUID` with
+/// `@length(min: 1, max: 50)` and NO `@uniqueItems`).
+const MAX_TASK_IDS_PER_POLL: usize = 50;
+const MIN_TASK_IDS_PER_POLL: usize = 1;
+
+/// RULE: `BatchGetUserAccessTasks` answers POSITIONALLY — exactly one
+/// `UserAccessResultItem` per ENTRY of the requested id list, in request order,
+/// repeats included — because the model declares that list as a plain sequence
+/// (no `@uniqueItems`), so the caller lines the answer up against the ids it
+/// submitted. Outside the modelled length bound the request is refused with
+/// HTTP 400 and no partial answer.
+///
+/// The table spans the number of entries (1 up to the published maximum), how
+/// many distinct ids they name, how often each repeats, where the repeats sit,
+/// and the order the ids are named in — plus each published bound and one past
+/// it.
+#[tokio::test]
+async fn a_poll_answers_one_result_per_requested_entry_in_request_order() {
+    let emulator = Emulator::new();
+    let bundle = app_bundle(&emulator).await;
+    // Applications from the model's own supported set, including ones the issue
+    // did not cite, each with its own tenant so each gets its own task.
+    let setup: Setup<'_> = &[
+        ("SLACK", "tenant-pos-1", true),
+        ("ZENDESK", "tenant-pos-2", true),
+        ("SMARTSHEET", "tenant-pos-3", true),
+        ("GOOGLE", "tenant-pos-4", true),
+    ];
+    for (app, tenant, connected) in setup {
+        authorization(&emulator, &bundle, app, tenant, *connected).await;
+    }
+    let started = start_tasks(&emulator, &bundle, EMAIL).await;
+    let task_ids: Vec<String> = task_items(&started)
+        .iter()
+        .map(|item| member(item, "taskId"))
+        .collect();
+    assert_eq!(
+        task_ids.len(),
+        setup.len(),
+        "the set-up bundle must hold one task per authorization, got {}",
+        started.body
+    );
+
+    // (case, the positions of `task_ids` the poll names, in request order)
+    let cases: Vec<(&str, Vec<usize>)> = vec![
+        ("one id once — the modelled minimum", vec![0; MIN_TASK_IDS_PER_POLL]),
+        ("one id twice", vec![0, 0]),
+        ("another id three times", vec![1, 1, 1]),
+        ("every id once, in start order", vec![0, 1, 2, 3]),
+        ("every id once, reversed", vec![3, 2, 1, 0]),
+        ("a repeat at the end", vec![0, 1, 1]),
+        ("a repeat at the front", vec![2, 2, 3]),
+        ("repeats interleaved with other ids", vec![2, 0, 2, 1, 0]),
+        ("every id twice, pairwise", vec![0, 0, 1, 1, 2, 2, 3, 3]),
+        (
+            "one id filling the modelled maximum",
+            vec![3; MAX_TASK_IDS_PER_POLL],
+        ),
+        (
+            "every id cycled up to the modelled maximum",
+            (0..MAX_TASK_IDS_PER_POLL).map(|index| index % 4).collect(),
+        ),
+    ];
+
+    for (case, positions) in cases {
+        let ids: Vec<String> = positions
+            .iter()
+            .map(|position| task_ids[*position].clone())
+            .collect();
+        let answer = poll_tasks(&emulator, &bundle, &ids).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected HTTP 200, got {} with body {}",
+            answer.status, answer.body
+        );
+        let results = result_items(&answer);
+        assert_eq!(
+            results.len(),
+            ids.len(),
+            "case {case:?}: expected one result per requested entry ({}), got {} results",
+            ids.len(),
+            results.len()
+        );
+        for (index, result) in results.iter().enumerate() {
+            let position = positions[index];
+            assert_eq!(
+                member(result, "taskId"),
+                task_ids[position],
+                "case {case:?}: result {index} must report the id requested at that position, got {result}"
+            );
+            // Each entry is answered out of the task that id names, so a
+            // repeated id reports that task's own authorization every time.
+            let (app, tenant, _) = setup[position];
+            assert_eq!(
+                member(result, "app"),
+                app,
+                "case {case:?}: result {index} must report app {app:?}, got {result}"
+            );
+            assert_eq!(
+                member(result, "tenantId"),
+                tenant,
+                "case {case:?}: result {index} must report tenantId {tenant:?}, got {result}"
+            );
+            assert!(
+                RESULT_STATUS_VALUES.contains(&member(result, "resultStatus").as_str()),
+                "case {case:?}: result {index} must report a modelled ResultStatus, got {result}"
+            );
+        }
+    }
+
+    // One past each published bound, and a repeat that cannot dodge the refusal
+    // for an id the bundle does not hold.
+    let refused: Vec<(&str, Vec<String>, u16)> = vec![
+        ("no entries at all — below the modelled minimum", Vec::new(), 400),
+        (
+            "one entry past the modelled maximum",
+            vec![task_ids[0].clone(); MAX_TASK_IDS_PER_POLL + 1],
+            400,
+        ),
+        (
+            "an unknown id named twice",
+            vec![unknown_uuid(), unknown_uuid()],
+            404,
+        ),
+        (
+            "a known id named twice beside an unknown one",
+            vec![task_ids[0].clone(), task_ids[0].clone(), unknown_uuid()],
+            404,
+        ),
+    ];
+    for (case, ids, expected) in refused {
+        let answer = poll_tasks(&emulator, &bundle, &ids).await;
+        assert_eq!(
+            answer.status, expected,
+            "case {case:?}: expected HTTP {expected}, got {} with body {}",
+            answer.status, answer.body
+        );
+        assert!(
+            answer.body.get("userAccessResultsList").is_none(),
+            "case {case:?}: a refused poll must answer no partial result list, got {}",
+            answer.body
+        );
+    }
+
+    // A poll is a REPORT: after every call above, the tasks are still pollable
+    // and still report what they did.
+    let after = poll_tasks(&emulator, &bundle, &task_ids).await;
+    let reported: Vec<String> = result_items(&after)
+        .iter()
+        .map(|result| member(result, "taskId"))
+        .collect();
+    assert_eq!(
+        reported, task_ids,
+        "polling must leave every task pollable, expected {task_ids:?}, got {reported:?}"
+    );
+}
+
 /// RULE: a poll resolves a task id only within the bundle that holds it, so an
 /// id no start call minted — and an id minted under ANOTHER bundle — is refused
 /// with the modelled `ResourceNotFoundException` (HTTP 404) naming that task. A
-/// poll of ids the bundle does hold reports one result per DISTINCT id, in the
-/// order the request first names it.
+/// poll of ids the bundle does hold reports one result per ENTRY of the
+/// requested list, in request order.
 #[tokio::test]
 async fn a_task_id_resolves_only_within_its_own_bundle() {
     let emulator = Emulator::new();
@@ -628,7 +789,7 @@ async fn a_task_id_resolves_only_within_its_own_bundle() {
         );
     }
 
-    // (case, the ids polled, the distinct ids the poll must report in order)
+    // (case, the ids polled, the ids the poll must report in order)
     let accepted: Vec<(&str, Vec<String>, Vec<String>)> = vec![
         (
             "one id",
@@ -644,7 +805,7 @@ async fn a_task_id_resolves_only_within_its_own_bundle() {
         (
             "one id named twice",
             vec![first_ids[0].clone(), first_ids[0].clone()],
-            vec![first_ids[0].clone()],
+            vec![first_ids[0].clone(), first_ids[0].clone()],
         ),
         (
             "both ids, the first named twice",
@@ -653,7 +814,11 @@ async fn a_task_id_resolves_only_within_its_own_bundle() {
                 first_ids[1].clone(),
                 first_ids[0].clone(),
             ],
-            vec![first_ids[0].clone(), first_ids[1].clone()],
+            vec![
+                first_ids[0].clone(),
+                first_ids[1].clone(),
+                first_ids[0].clone(),
+            ],
         ),
     ];
     for (case, ids, expected) in accepted {

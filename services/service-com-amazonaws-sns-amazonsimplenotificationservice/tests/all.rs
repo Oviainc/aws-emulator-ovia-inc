@@ -23,6 +23,9 @@ mod delivery_policy_and_message_branches;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 
+#[path = "all/fifo_message_deduplication.rs"]
+mod fifo_message_deduplication;
+
 #[path = "all/fifo_topic_deduplication_attribute.rs"]
 mod fifo_topic_deduplication_attribute;
 
@@ -82,6 +85,12 @@ mod subscription_dead_letter_queue;
 
 #[path = "all/subscription_pending_confirmation.rs"]
 mod subscription_pending_confirmation;
+
+#[path = "all/subscription_policy_attributes.rs"]
+mod subscription_policy_attributes;
+
+#[path = "all/topic_archive_window.rs"]
+mod topic_archive_window;
 
 #[path = "all/topic_attributes.rs"]
 mod topic_attributes;

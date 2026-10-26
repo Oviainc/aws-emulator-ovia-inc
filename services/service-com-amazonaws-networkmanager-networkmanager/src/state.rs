@@ -678,9 +678,22 @@ pub const MAX_CONNECTIONS_PER_GLOBAL_NETWORK: usize = 100;
 /// The documented maximum length, in characters, of a device's `Vendor`, `Model` and
 /// `SerialNumber`: "Constraints: Maximum length of 128 characters" on each of the three
 /// (`smithy_query query="doc" shape="CreateDeviceRequest" member="Vendor"`, the same
-/// sentence for `Model` and `SerialNumber`) — a bound the modelled `ConstrainedString`
-/// (len 0..256) does not express, so it is checked by the handler instead.
+/// sentence for `Model` and `SerialNumber`, and for the same three members of
+/// `UpdateDeviceRequest`) — a bound the modelled `ConstrainedString` (len 0..256) does not
+/// express, so it is checked by [`device_descriptor_problem`] instead.
 pub const MAX_DEVICE_DESCRIPTOR_CHARS: usize = 128;
+
+/// Check one free-form device descriptor against the constraint
+/// [`MAX_DEVICE_DESCRIPTOR_CHARS`] documents.
+///
+/// Answers `None` when `value` satisfies it, otherwise the member-level reason the refusal
+/// reports. Shared by every operation that takes those descriptors, so a value a create
+/// refuses an update refuses too — the same seam [`link_descriptor_problem`] gives a link.
+pub fn device_descriptor_problem(value: &str) -> Option<String> {
+    let max = MAX_DEVICE_DESCRIPTOR_CHARS;
+    let length = value.chars().count();
+    (length > max).then(|| format!("must be at most {max} characters, but is {length}"))
+}
 
 /// The documented maximum length, in characters, of a link's `Type` and `Provider`, and
 /// the characters the documentation forbids in them: "Constraints: Maximum length of 128
@@ -1166,18 +1179,30 @@ pub struct DeviceRecord {
     pub created_at: SystemTime,
     /// The instant the `PENDING` -> `AVAILABLE` transition the clock owes becomes due.
     pub available_at: SystemTime,
+    /// The instant the `UPDATING` -> `AVAILABLE` transition the clock owes becomes due,
+    /// set by the update that reconfigured the device and `None` while no update has ever
+    /// touched it. See [`DeviceRecord::state_at`].
+    pub updating_until: Option<SystemTime>,
     pub tags: Vec<Tag>,
 }
 
 impl DeviceRecord {
     /// This device's lifecycle state as of `now`. `DeviceState` carries the same four
     /// values as the three enums above (`smithy_query shape=DeviceState`: PENDING,
-    /// AVAILABLE, DELETING, UPDATING), so a device waits in [`STATE_PENDING`] too.
+    /// AVAILABLE, DELETING, UPDATING), so a device waits in [`STATE_PENDING`] too and
+    /// reports [`STATE_UPDATING`] while a reconfiguration is outstanding, exactly as
+    /// [`LinkRecord::state_at`] reports a link's.
+    ///
+    /// Both transitions are a function of the clock, so reading a device never writes, and
+    /// an outstanding update is what it reports even when the create has not settled yet:
+    /// that update is the later of the two requests it is still working on.
     pub fn state_at(&self, now: SystemTime) -> &'static str {
-        if now >= self.available_at {
-            STATE_AVAILABLE
-        } else {
+        if self.updating_until.is_some_and(|due| now < due) {
+            STATE_UPDATING
+        } else if now < self.available_at {
             STATE_PENDING
+        } else {
+            STATE_AVAILABLE
         }
     }
 

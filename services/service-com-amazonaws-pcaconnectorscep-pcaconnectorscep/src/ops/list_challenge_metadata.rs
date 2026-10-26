@@ -165,8 +165,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
+        // This service is regional: a connector exists only in the Region its ARN names, so
+        // the Region the request was signed for is part of resolving that ARN.
+        let region = crate::state::request_region(ctx);
 
         // A `NextToken` this service never minted names no position to resume from;
         // `ValidationException`'s own doc names "an invalid pagination token" as one of its
@@ -188,10 +190,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(now);
 
         // `ConnectorArn` is required, so this lists exactly one connector's challenges and
-        // a connector that is not stored is a 404 rather than an empty page.
+        // a connector this Region does not hold is a 404 rather than an empty page.
         let connector = store
-            .connectors
-            .get(&input.connector_arn)
+            .connector(&region, &input.connector_arn)
             .ok_or_else(|| not_found(&input.connector_arn))?;
 
         let ordered: Vec<(String, ChallengeMetadataSummary)> = connector
@@ -208,7 +209,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// No connector is stored under this ARN — HTTP 404 `ResourceNotFoundException`.
+/// No connector is stored under this ARN in the Region the request was signed for — HTTP 404
+/// `ResourceNotFoundException`.
 fn not_found(connector_arn: &str) -> ListChallengeMetadataError {
     ListChallengeMetadataErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: format!("Connector {connector_arn} could not be found"),

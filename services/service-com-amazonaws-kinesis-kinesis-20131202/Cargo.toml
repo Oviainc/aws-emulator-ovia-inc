@@ -23,6 +23,10 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Encodes the opaque pagination token a truncated shard listing hands back.
 hex = { workspace = true }
+# The hash that places a data record in a shard: "an MD5 hash function is used to map
+# partition keys to 128-bit integer values and to map associated data records to shards"
+# (`PutRecordInput$PartitionKey`).
+md-5 = "0.10"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

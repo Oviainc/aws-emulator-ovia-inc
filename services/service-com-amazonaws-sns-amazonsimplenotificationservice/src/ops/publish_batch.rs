@@ -136,11 +136,6 @@ const MAX_BATCH_ENTRIES: usize = 10;
 /// (`PublishBatchRequestEntry$Id` doc).
 const MAX_ENTRY_ID_CHARS: usize = 80;
 
-/// The awsQuery error code of `InvalidParameterException`, which is the code a
-/// per-entry failure carries: an entry SNS would have refused a single `Publish` for
-/// fails on its own, inside a request the batch still answers 200 for.
-const INVALID_PARAMETER_CODE: &str = "InvalidParameter";
-
 /// The sentence SNS refuses a batch of more than [`MAX_BATCH_ENTRIES`] entries with:
 /// the condition alone, with neither the count sent nor the maximum in it.
 const TOO_MANY_ENTRIES_REFUSAL: &str = "The batch request contains more entries than permissible.";
@@ -379,56 +374,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect();
 
             // "The result of publishing each message is reported individually in the
-            // response. Because the batch request can result in a combination of successful
-            // and unsuccessful actions, you should check for batch errors even when the call
-            // returns an HTTP status code of 200" (the `PublishBatch` doc): an entry that
-            // breaks a per-message rule fails on its own, and the rest are still published.
-            //
-            // The entries are walked in request order, which is the order "multiple messages
-            // within a single batch are published in" for a FIFO topic.
+            // response" (the `PublishBatch` doc) — but a message whose own parameters
+            // break a documented rule is not a message SNS publishes part of a batch
+            // for: the per-message rules are judged for EVERY entry before any entry is
+            // recorded, and a request holding one the rules refuse is refused whole, so
+            // a batch is never partly applied. The reasons are the sentences a single
+            // `Publish` of that entry would be refused with, because it is the same
+            // rule.
+            let mut deduplication_ids: Vec<Option<String>> = Vec::with_capacity(entries.len());
+            for entry in &entries {
+                let request = MessageRequest {
+                    message: &entry.message,
+                    subject: entry.subject.as_deref(),
+                    message_structure: entry.message_structure.as_deref(),
+                    message_group_id: entry.message_group_id.as_deref(),
+                    message_deduplication_id: entry.message_deduplication_id.as_deref(),
+                };
+                let judgement = match state::message_refusal(request) {
+                    Some(reason) => Err(reason),
+                    None => state::topic_message_refusal(&topic, request),
+                };
+                match judgement {
+                    Ok(deduplication_id) => deduplication_ids.push(deduplication_id),
+                    Err(reason) => return Err(invalid_parameter(reason)),
+                }
+            }
+
+            // Every entry of the request is publishable, so every one of them is
+            // published, in request order — which is the order "multiple messages within
+            // a single batch are published in" for a FIFO topic. Nothing here can fail,
+            // so the `Failed` list of the answer is empty: the conditions SNS reports per
+            // entry are the ones this emulator has no path to (a KMS key it cannot read,
+            // a disabled platform endpoint).
             let mut successful: Vec<PublishBatchResultEntry> =
                 Vec::with_capacity(entries.len());
-            let mut failed: Vec<BatchResultErrorEntry> = Vec::new();
+            let failed: Vec<BatchResultErrorEntry> = Vec::new();
             let mut deliveries: Vec<QueueDelivery> = Vec::new();
             // ONE delivery budget for the whole batch, so the (entries x subscriptions x body
             // bytes) product one request can fan out to is capped rather than each factor on
             // its own.
             let mut budget = DeliveryBudget::new();
-            for entry in entries {
-                let judgement = {
-                    let request = MessageRequest {
-                        message: &entry.message,
-                        subject: entry.subject.as_deref(),
-                        message_structure: entry.message_structure.as_deref(),
-                        message_group_id: entry.message_group_id.as_deref(),
-                        message_deduplication_id: entry.message_deduplication_id.as_deref(),
-                    };
-                    match state::message_refusal(request) {
-                        Some(reason) => Err(reason),
-                        None => state::topic_message_refusal(&topic, request),
-                    }
-                };
-                let message_deduplication_id = match judgement {
-                    Ok(deduplication_id) => deduplication_id,
-                    Err(reason) => {
-                        failed.push(BatchResultErrorEntry {
-                            id: entry.id,
-                            code: INVALID_PARAMETER_CODE.to_string(),
-                            message: Some(reason),
-                            // "Specifies whether the error happened due to the caller of the
-                            // batch API action" — a per-message rule is the caller's to
-                            // satisfy.
-                            sender_fault: true,
-                        });
-                        continue;
-                    }
-                };
+            for (entry, message_deduplication_id) in entries.into_iter().zip(deduplication_ids) {
+                // A batched publish is deduplicated like any other: "messages are
+                // deduplicated within the batch and across batches for five minutes"
+                // (the `PublishBatch` doc), against the records `Publish` writes, so a
+                // duplicate entry reports the message that WAS delivered and is not
+                // delivered again.
+                let deduplication_key = message_deduplication_id.as_deref().map(|id| {
+                    state::deduplication_key(&topic, entry.message_group_id.as_deref(), id)
+                });
+                if let Some(accepted) = deduplication_key
+                    .as_deref()
+                    .and_then(|key| store.deduplicated_publish(key))
+                {
+                    successful.push(PublishBatchResultEntry {
+                        id: Some(entry.id),
+                        message_id: Some(accepted.message_id),
+                        sequence_number: accepted.sequence_number,
+                    });
+                    continue;
+                }
 
                 // Only a FIFO topic is sequenced: "This parameter applies only to FIFO
                 // (first-in-first-out) topics" (`PublishBatchResultEntry$SequenceNumber`
                 // doc).
                 let sequence_number = topic.is_fifo.then(|| store.next_sequence_number());
                 let message_id = store.next_unique_id();
+                if let Some(key) = deduplication_key {
+                    store.remember_deduplication(key, &message_id, sequence_number.as_deref());
+                }
                 // ONE record per entry, SHARED by every subscription that receives it.
                 let published = ::std::sync::Arc::new(PublishedMessage {
                     message_id: message_id.clone(),

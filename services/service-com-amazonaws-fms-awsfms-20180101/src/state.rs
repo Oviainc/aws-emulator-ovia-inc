@@ -1023,11 +1023,13 @@ pub struct ComAmazonawsFmsAwsfms20180101State {
     /// Which copy wins: the TAGS ON THE RECORD of the resource are authoritative
     /// ([`PolicyRecord::tags`], [`ResourceSetRecord::tags`],
     /// [`AppsListRecord::tags`], [`ProtocolsListRecord::tags`]) and this map is
-    /// maintained from them — each writer inserts the record's tags under the
-    /// resource's ARN and each deleter removes the entry. A tag write therefore
-    /// goes through [`ComAmazonawsFmsAwsfms20180101State::set_tags`], which writes
-    /// the record and refreshes this entry from the SAME value, so the two cannot
-    /// disagree; a tag read goes through
+    /// maintained from them by ONE writer,
+    /// [`ComAmazonawsFmsAwsfms20180101State::refresh_tag_index`]: every writer
+    /// and deleter of a taggable resource calls it with the record's ARN once the
+    /// record is written, and it reads the entry's value back off that record, so
+    /// the two cannot disagree. A tag write therefore goes through
+    /// [`ComAmazonawsFmsAwsfms20180101State::set_tags`], which writes the record
+    /// and then refreshes this entry from it; a tag read goes through
     /// [`ComAmazonawsFmsAwsfms20180101State::tags_for_arn`], which reads the
     /// authoritative record rather than this index.
     pub tags_by_arn: HashMap<String, Vec<Tag>>,
@@ -1247,37 +1249,63 @@ impl ComAmazonawsFmsAwsfms20180101State {
             .map(|(_, tags)| tags.to_vec())
     }
 
+    /// Make the ARN-keyed tag index agree with the AUTHORITATIVE record for
+    /// `arn`: the entry becomes exactly the tags the stored resource carrying
+    /// that ARN holds — of whichever taggable kind it is — and is removed when
+    /// this store holds no such resource any more.
+    ///
+    /// This is the ONE writer of [`Self::tags_by_arn`]: every writer and deleter
+    /// of a taggable resource calls it AFTER writing the record, so the rule
+    /// "the index entry equals the record's tags, keyed by the record's own ARN"
+    /// is stated here and nowhere else. Because it reads the tags through
+    /// [`Self::tags_for_arn`] — off the record that owns them — an index entry
+    /// that disagrees with the record it mirrors is not expressible, and a fifth
+    /// taggable kind needs no new copy of the maintenance step.
+    pub fn refresh_tag_index(&mut self, arn: &str) {
+        match self.tags_for_arn(arn) {
+            // A stored resource: the entry is its own tags.
+            Some(tags) => {
+                self.tags_by_arn.insert(arn.to_string(), tags);
+            }
+            // No record, so no entry — the tags of a removed resource do not
+            // outlive it.
+            None => {
+                self.tags_by_arn.remove(arn);
+            }
+        }
+    }
+
     /// Make `tags` the tag set `resource` carries, for a resource of ANY taggable
     /// kind.
     ///
-    /// The record is written first and [`Self::tags_by_arn`] refreshed from the
-    /// same value under the record's OWN ARN, so the authoritative copy and the
+    /// The record is written first and [`Self::tags_by_arn`] refreshed from it
+    /// through [`Self::refresh_tag_index`], so the authoritative copy and the
     /// index can never disagree. Answers whether the resource was still there to
     /// write to.
     pub fn set_tags(&mut self, resource: &TaggedResource, tags: Vec<Tag>) -> bool {
         let arn = match resource {
             TaggedResource::Policy(id) => self.policies.get_mut(id).map(|record| {
-                record.tags = tags.clone();
+                record.tags = tags;
                 record.policy_arn.clone()
             }),
             TaggedResource::ResourceSet(id) => self.resource_sets.get_mut(id).map(|record| {
-                record.tags = tags.clone();
+                record.tags = tags;
                 record.arn.clone()
             }),
             TaggedResource::AppsList(id) => self.apps_lists.get_mut(id).map(|record| {
-                record.tags = tags.clone();
+                record.tags = tags;
                 record.list_arn.clone()
             }),
             TaggedResource::ProtocolsList(id) => {
                 self.protocols_lists.get_mut(id).map(|record| {
-                    record.tags = tags.clone();
+                    record.tags = tags;
                     record.list_arn.clone()
                 })
             }
         };
         match arn {
             Some(arn) => {
-                self.tags_by_arn.insert(arn, tags);
+                self.refresh_tag_index(&arn);
                 true
             }
             None => false,
@@ -1694,7 +1722,8 @@ impl ComAmazonawsFmsAwsfms20180101State {
             return false;
         };
         self.apps_lists.remove(list_id);
-        self.tags_by_arn.remove(&arn);
+        // The record is gone, so the single index writer drops its entry.
+        self.refresh_tag_index(&arn);
         true
     }
 
@@ -1709,7 +1738,8 @@ impl ComAmazonawsFmsAwsfms20180101State {
             return false;
         };
         self.protocols_lists.remove(list_id);
-        self.tags_by_arn.remove(&arn);
+        // The record is gone, so the single index writer drops its entry.
+        self.refresh_tag_index(&arn);
         true
     }
 
@@ -1743,7 +1773,8 @@ impl ComAmazonawsFmsAwsfms20180101State {
         delete_all_resources: bool,
     ) -> Option<PolicyRecord> {
         let removed = self.policies.remove(policy_id)?;
-        self.tags_by_arn.remove(&removed.policy_arn);
+        // The record is gone, so the single index writer drops its entry.
+        self.refresh_tag_index(&removed.policy_arn);
         if delete_all_resources {
             self.policy_violations
                 .retain(|_, violation| violation.policy_id != policy_id);

@@ -237,6 +237,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .entry(state::CONTENT_BASED_DEDUPLICATION_ATTRIBUTE.into())
                 .or_insert_with(|| state::attribute_flag(false));
         }
+        // A topic whose owner has configured a message archive also reports where the
+        // replayable window starts: "BeginningArchiveTime – The earliest starting point
+        // at which a message in the topic's archive can be replayed from"
+        // (`GetTopicAttributesResponse$Attributes` doc). It is computed from the archive
+        // policy in force and the clock rather than stored, so a topic that archives
+        // nothing reports no such point.
+        if let Some(beginning) = topic.beginning_archive_time().and_then(state::rfc3339) {
+            attributes.insert(
+                state::BEGINNING_ARCHIVE_TIME_ATTRIBUTE.into(),
+                beginning,
+            );
+        }
 
         Ok(GetTopicAttributesOutput {
             attributes: Some(attributes),

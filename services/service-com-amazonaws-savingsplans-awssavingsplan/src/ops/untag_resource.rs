@@ -131,19 +131,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The model's `@pattern` already refused anything that is not a
-        // Savings Plan ARN; what is left to refuse is an ARN of some other
-        // service or resource type.
-        if crate::state::savings_plan_id_from_arn(&input.resource_arn).is_none() {
-            return Err(UntagResourceErrorModeled::ValidationException(ValidationException {
-                message: format!(
-                    "resourceArn '{}' is not the ARN of a {} savingsplan resource",
-                    input.resource_arn,
-                    crate::state::SERVICE_NAMESPACE
-                ),
-            })
-            .into());
-        }
+        // An ARN that is not this service's own is refused by the one shared
+        // rule, so this handler only names the error it answers with.
+        crate::state::savings_plan_id_or_refusal(&input.resource_arn).map_err(|message| {
+            UntagResourceErrorModeled::ValidationException(ValidationException { message })
+        })?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UntagResourceErrorModeled::InternalServerException(InternalServerException {

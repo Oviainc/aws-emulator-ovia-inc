@@ -8,11 +8,16 @@
 //! members `Site` projects from it, so `GetSite` and `ListSites` stay in step with
 //! `GetSiteAddress`.
 //!
-//! The documented limit on WHEN the operating address may change — "You can update the
-//! operating address before you place an order at the site, or after all Outposts that
-//! belong to the site have been deactivated" — is the modelled `ConflictException` (409)
-//! while an Outpost still belongs to the site; see
-//! [`crate::state::site_address_conflict`].
+//! AWS documents TWO limits on WHEN a site address may change, and both are the
+//! modelled `ConflictException` (409); see
+//! [`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::site_address_block`],
+//! which states them. "You can't update a site address if there is an order in progress"
+//! holds a change to an address of EITHER type while an order placed at the site is
+//! still
+//! outstanding, naming that order; "You can update the operating address before you
+//! place an order at the site, or after all Outposts that belong to the site have been
+//! deactivated" additionally holds an OPERATING change while an Outpost still belongs to
+//! the site, naming that Outpost.
 //!
 //! ## Shape of an operation
 //!
@@ -197,31 +202,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
+        // Whether an order is still in progress depends on the status it holds NOW,
+        // and an order moves on the clock, so the transition that was already due at
+        // this instant is materialised before the statuses are read.
+        store.settle_orders();
         // An identifier that names no site is answered before anything about a
-        // site's Outposts is read.
+        // site's orders or Outposts is read.
         if store.site(&region, &site_id).is_none() {
             return Err(not_found().into());
         }
-        // The Outpost that holds the site's OPERATING address, read before the
-        // mutable borrow below. A shipping address is unaffected: the documented
-        // limit is on the address the site itself is at.
-        let blocking = match kind {
-            crate::state::SiteAddressKind::Operating => store
-                .outpost_at_site(&region, &site_id)
-                .and_then(|record| record.outpost.outpost_id.clone()),
-            crate::state::SiteAddressKind::Shipping => None,
-        };
-        // An Outpost at the site still depends on where that site is, so the
-        // operating address is held until no Outpost belongs to it. Nothing is
-        // written: the stored addresses are left exactly as they were.
-        if let Some(outpost_id) = blocking {
-            return Err(UpdateSiteAddressErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(crate::state::site_address_conflict(&site_id, &outpost_id)),
-                    resource_id: Some(outpost_id),
-                    resource_type: Some(crate::state::RESOURCE_TYPE_OUTPOST.to_string()),
-                },
-            )
+        // What holds this change up, read before the mutable borrow below: an order
+        // still in progress at the site, on an address of either type, or — for the
+        // OPERATING address, which is where the site itself is — an Outpost that
+        // still belongs to the site. Nothing is written in either case: the stored
+        // addresses are left exactly as they were.
+        if let Some(block) = store.site_address_block(&region, &site_id, kind) {
+            let (resource_type, resource_id) = match block.resource {
+                Some((resource_type, resource_id)) => {
+                    (Some(resource_type.to_string()), Some(resource_id))
+                }
+                None => (None, None),
+            };
+            return Err(UpdateSiteAddressErrorModeled::ConflictException(ConflictException {
+                message: Some(block.message),
+                resource_id,
+                resource_type,
+            })
             .into());
         }
         let record = store.site_mut(&region, &site_id).ok_or_else(not_found)?;

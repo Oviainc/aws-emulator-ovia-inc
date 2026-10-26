@@ -431,19 +431,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .enumerate()
             .map(|(index, (starting_hash_key, ending_hash_key))| {
                 let index = u32::try_from(index).unwrap_or(u32::MAX);
-                crate::state::ShardRecord {
-                    shard_id: crate::state::shard_id(index),
+                crate::state::ShardRecord::open_at(
+                    index,
+                    created_at,
                     starting_hash_key,
                     ending_hash_key,
-                    starting_sequence_number: crate::state::starting_sequence_number(
-                        created_at, index,
-                    ),
-                    // A shard a create laid down is OPEN, so it has no ending sequence
-                    // number and no close instant.
-                    ending_sequence_number: None,
-                    created_at,
-                    closed_at: None,
-                }
+                )
             })
             .collect();
 

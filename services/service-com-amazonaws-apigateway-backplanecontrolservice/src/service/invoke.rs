@@ -52,6 +52,12 @@
 //! template — is what the caller sees, and the uncustomized case falls back to the status
 //! code the response type documents ([`crate::state::default_gateway_status_code`]).
 //!
+//! Whatever the outcome, the response NAMES THE REQUEST it answered: every response this
+//! endpoint serves carries a freshly minted per-request id in the header API Gateway
+//! reports it in, which is what lets a client correlate the answer it holds with what the
+//! API processed. [`serve`] is the one funnel both seams reach, so no outcome can answer
+//! without one.
+//!
 //! # What it does not do, and what it answers instead
 //!
 //! Only the `MOCK` integration type returns a backend's answer without a backend: it is
@@ -566,7 +572,21 @@ fn addresses_connections(path: &str) -> bool {
 /// data plane — `Service::override_routing_error` for a request carrying no credential and
 /// `CredentialedDataPlane` for one carrying a SigV4 credential — answer identically; they
 /// differ only in whether the emulator verified a signature on the way in.
+///
+/// Every response leaves here NAMING THE REQUEST it answered, in the header API Gateway
+/// reports a request id in: this is the one funnel both seams reach, so a served
+/// integration, a gateway refusal and an endpoint that serves nothing all report one, and
+/// a client can correlate the response it holds with the request the API processed.
+/// `service_common` owns both the minting and the header, so this data plane reports the
+/// id in the one spelling the rest of the emulator reports it in.
 pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtResponse {
+    ::service_common::query_error_envelope::with_request_id_header(serve_resolved(engine, req))
+}
+
+/// The response this data plane's own records compute for `req`, before the request id is
+/// reported on it — the resolution and the serving, which is everything the module docs
+/// describe.
+fn serve_resolved<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtResponse {
     let addressed = Addressed::of_request(req);
     let Some(state) = crate::state::service_state(engine) else {
         return refusal_response(None, API_CONFIGURATION_ERROR);

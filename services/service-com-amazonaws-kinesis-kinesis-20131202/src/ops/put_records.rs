@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRecords
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRecords`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: places each entry of the batch in the shard its partition key or explicit
+//! hash key maps to, appends them to those shards in the shared store in request order,
+//! and answers one result entry per record naming the shard and sequence number it was
+//! stored under. This is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`PutRecords::handle`] with real behaviour and
@@ -200,6 +201,66 @@ pub struct PutRecords<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// Refuse the request with the error this operation models for a parameter that "exceeds
+/// its restrictions, is not supported, or can't be used".
+fn invalid_argument(message: String) -> PutRecordsError {
+    PutRecordsErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled refusal for a resource this account and region do not hold: "The requested
+/// resource could not be found. The stream might not be specified correctly."
+fn not_found(message: String) -> PutRecordsError {
+    PutRecordsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled refusal for a request whose `StreamName` / `StreamARN` pair names no stream
+/// of this account and region: the rule the operation's own doc publishes for a request that
+/// names neither ("you must use either the StreamARN or the StreamName parameter, or both"),
+/// and `ResourceNotFoundException` for one that names a stream nothing created.
+fn lookup_refusal(failure: crate::state::StreamLookupFailure, identifier: &str) -> PutRecordsError {
+    match failure {
+        crate::state::StreamLookupFailure::Unspecified => {
+            invalid_argument(crate::state::STREAM_IDENTIFIER_REQUIRED_MESSAGE.to_string())
+        }
+        crate::state::StreamLookupFailure::Mismatch => {
+            invalid_argument(crate::state::STREAM_IDENTIFIER_MISMATCH_MESSAGE.to_string())
+        }
+        crate::state::StreamLookupFailure::NotFound => {
+            not_found(crate::state::stream_not_found_message(identifier))
+        }
+    }
+}
+
+/// How an entry this stream cannot place is refused. `PutRecordsResultEntry$ErrorCode` is
+/// "either ProvisionedThroughputExceededException or InternalFailure", neither of which a
+/// malformed entry is, so the whole request is refused rather than the entry being reported
+/// as failed — and nothing of the batch is stored.
+fn placement_refusal(failure: crate::state::RecordPlacementFailure, index: usize) -> PutRecordsError {
+    let position = index.saturating_add(1);
+    match failure {
+        crate::state::RecordPlacementFailure::PartitionKeyRequired => invalid_argument(format!(
+            "record {position} of the batch: {}",
+            crate::state::PARTITION_KEY_REQUIRED_MESSAGE
+        )),
+        crate::state::RecordPlacementFailure::OutsideTheShardMap(hash_key) => {
+            invalid_argument(format!(
+                "record {position} of the batch: {}",
+                crate::state::hash_key_outside_the_shard_map_message(&hash_key)
+            ))
+        }
+        crate::state::RecordPlacementFailure::NoOpenShard => invalid_argument(format!(
+            "record {position} of the batch: {}",
+            crate::state::NO_OPEN_SHARD_MESSAGE
+        )),
+    }
+}
+
 impl<Eng> PutRecords<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -226,18 +287,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRecords` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRecordsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRecords"))
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutRecordsError::from(PutRecordsErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the stream store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let identifier = input
+            .stream_name
+            .as_deref()
+            .or(input.stream_arn.as_deref())
+            .unwrap_or_default()
+            .to_string();
+        // `StreamId` is documented "Not Implemented. Reserved for future use", so no stream
+        // carries one and a request naming only that member names no stream.
+        let stream = store
+            .resolve_stream_mut(
+                &region,
+                input.stream_name.as_deref(),
+                input.stream_arn.as_deref(),
+            )
+            .map_err(|failure| lookup_refusal(failure, &identifier))?;
+
+        // A stream whose creation has not fallen due yet has no shard a record can be
+        // placed in, which is the modelled not-found refusal, stating the status it is in.
+        let status = stream.status(now);
+        if status != crate::state::STREAM_ACTIVE {
+            return Err(not_found(crate::state::stream_not_active_message(
+                &identifier, status,
+            )));
+        }
+
+        // Every entry is judged BEFORE any of them is stored, so a batch this stream
+        // cannot place in full leaves nothing behind — and the shard each entry belongs in
+        // is resolved in that same pass, so the store pass below has nothing left to fail
+        // on halfway through.
+        let maximum = stream.max_record_size_bytes();
+        let mut placements: Vec<usize> = Vec::with_capacity(input.records.len());
+        let mut batch_bytes = 0usize;
+        for (index, entry) in input.records.iter().enumerate() {
+            let size = entry.data.len()
+                + entry
+                    .partition_key
+                    .as_deref()
+                    .map(str::len)
+                    .unwrap_or_default();
+            if size > maximum {
+                return Err(invalid_argument(format!(
+                    "record {} of the batch: {}",
+                    index.saturating_add(1),
+                    crate::state::record_too_large_message(size, maximum)
+                )));
+            }
+            batch_bytes = batch_bytes.saturating_add(size);
+            placements.push(
+                stream
+                    .placement(
+                        entry.explicit_hash_key.as_deref(),
+                        entry.partition_key.as_deref(),
+                        // The entry's position in this batch, so a stream that distributes
+                        // records itself spreads one batch over its open shards instead of
+                        // resolving every entry of it to the same shard.
+                        u64::try_from(index).unwrap_or_default(),
+                    )
+                    .map_err(|failure| placement_refusal(failure, index))?,
+            );
+        }
+        // "Each record in the request can be as large as 1 MiB, up to a limit of 5 MiB for
+        // the entire request" (`PutRecords`): the per-record maximum above bounds one
+        // entry, this bounds what they total.
+        if batch_bytes > crate::state::MAX_PUT_RECORDS_REQUEST_BYTES {
+            return Err(invalid_argument(crate::state::batch_too_large_message(
+                batch_bytes,
+                crate::state::MAX_PUT_RECORDS_REQUEST_BYTES,
+            )));
+        }
+
+        // "Checks if your request will succeed. DryRun is an optional parameter"
+        // (`PutRecordsInput$DryRun`): the batch is judged in full above and then refused
+        // with the error the model declares for it, so a dry run stores no record.
+        if input.dry_run.unwrap_or(false) {
+            return Err(PutRecordsErrorModeled::DryRunOperationException(
+                DryRunOperationException {
+                    message: Some(
+                        "The request was rejected because the DryRun parameter was specified."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "The response Records array includes both successfully and unsuccessfully
+        // processed records... A record that is successfully added to a stream includes
+        // SequenceNumber and ShardId in the result": every entry goes into the shard the
+        // pass above resolved for it, in the order the request carried them.
+        let encryption_type = stream.encryption_type.clone();
+        let mut records: Vec<PutRecordsResultEntry> = Vec::with_capacity(input.records.len());
+        let mut failed = 0i32;
+        for (entry, shard_index) in input.records.into_iter().zip(placements) {
+            match stream.append_at(shard_index, entry.partition_key, entry.data, now) {
+                Some((shard_id, sequence_number)) => records.push(PutRecordsResultEntry {
+                    sequence_number: Some(sequence_number),
+                    shard_id: Some(shard_id),
+                    // Reported only for a record that failed, which this one did not.
+                    error_code: None,
+                    error_message: None,
+                }),
+                // The shard map answered this index a moment ago, under the same `&mut`
+                // borrow, so nothing reaches here — and if it did, "a single record failure
+                // does not stop the processing of subsequent records" (`PutRecords`), so
+                // the batch continues and this one entry carries the modelled per-record
+                // failure: "An ErrorCode value of InternalFailure has the error message
+                // 'Internal Service Failure'" (`PutRecordsResultEntry$ErrorMessage`).
+                None => {
+                    failed = failed.saturating_add(1);
+                    records.push(PutRecordsResultEntry {
+                        sequence_number: None,
+                        shard_id: None,
+                        error_code: Some("InternalFailure".to_string()),
+                        error_message: Some("Internal Service Failure".to_string()),
+                    });
+                }
+            }
+        }
+
+        Ok(PutRecordsOutput {
+            records,
+            // `FailedRecordCount` is modelled `range 1..`, so a batch nothing failed in
+            // reports no count at all rather than a zero the member cannot carry.
+            failed_record_count: (failed > 0).then_some(failed),
+            encryption_type: Some(encryption_type),
+        })
     }
 }

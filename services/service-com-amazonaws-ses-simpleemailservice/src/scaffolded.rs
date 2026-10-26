@@ -196,9 +196,10 @@ static INVALID_PARAMETER_VALUE_MESSAGE: Schema = Schema::new_member(
 /// shape is not in any service's model, so it must not collide with a modeled one. It
 /// exists because `InvalidParameterValue` is the error code this service answers a
 /// request carrying a value it cannot act on with — a page token it never issued, a
-/// page size outside the published bounds — while its model declares no client-input
-/// error for any of it, and the error code is what a client branches on. It is a
-/// CLIENT fault (HTTP 400), so the query envelope reports it as `<Type>Sender</Type>`.
+/// page size outside the published bounds, an ARN naming no resource it holds — while
+/// its model declares no client-input error for any of it, and the error code is what a
+/// client branches on. It is a CLIENT fault (HTTP 400), so the query envelope reports it
+/// as `<Type>Sender</Type>`.
 pub static INVALID_PARAMETER_VALUE_SCHEMA: Schema = Schema::new_struct(
     ShapeId::from_static(
         "smithy.framework#InvalidParameterValue",
@@ -265,10 +266,10 @@ impl<E> Scaffolded<E> {
     ///
     /// This is the refusal SES itself answers with for a value that is well formed
     /// but not one it can use — a pagination token it never issued, a page size
-    /// outside the bounds the operation publishes. The model declares no
-    /// client-input error for any of it, so the code lives here rather than on an
-    /// operation's error enum; name the member and the value, because the caller has
-    /// to fix the request from this text alone.
+    /// outside the bounds the operation publishes, an ARN naming no resource it
+    /// holds. The model declares no client-input error for any of it, so the code
+    /// lives here rather than on an operation's error enum; name the member and the
+    /// value, because the caller has to fix the request from this text alone.
     pub fn invalid_parameter_value(message: impl Into<String>) -> Self {
         Self::InvalidParameterValue(ValidationException::new(message))
     }

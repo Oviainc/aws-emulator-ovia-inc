@@ -249,6 +249,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // A policy-valued attribute is REMOVED by an empty value, so a create that
+        // carries one empty makes a topic that holds none of it.
+        let attributes: HashMap<String, String> = attributes
+            .into_iter()
+            .filter(|(name, value)| !state::clears_attribute(name, value))
+            .collect();
         // The document's one documented bound, held through the shared rule every
         // write of a topic's data protection policy uses, so this create and
         // `PutDataProtectionPolicy` cannot disagree about which documents fit.
@@ -351,6 +357,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .expect("the topic was just found under this ARN");
             topic.attributes = merged_attributes;
             topic.tags = merged_tags;
+            // The archive window follows the attribute map: a re-create that adds the
+            // archive policy starts archiving now.
+            topic.refresh_archive_window();
             if let Some(policy) = input.data_protection_policy {
                 topic.data_protection_policy = Some(policy);
             }
@@ -374,7 +383,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(refusal) = oversized(&stored_attributes, &stored_tags) {
                 return Err(refusal);
             }
-            let topic = TopicRecord {
+            let mut topic = TopicRecord {
                 arn: arn.clone(),
                 name: input.name.clone(),
                 owner: state::owner_account_id(),
@@ -384,7 +393,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 is_fifo,
                 created_at: std::time::SystemTime::now(),
                 subscriptions_deleted: 0,
+                archive_enabled_at: None,
             };
+            // A topic created WITH an archive policy archives from the moment it exists.
+            topic.refresh_archive_window();
             store.topics.insert(arn.clone(), topic);
         }
 
