@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutGroupConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutGroupConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutGroupConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches a service configuration to a stored group in [`crate::state`]. The update is
+//! ASYNCHRONOUS — the model answers HTTP 202 with no body — so the configuration this
+//! call accepts is the group's PROPOSED one, reported by `GetGroupConfiguration` under
+//! [`crate::state::CONFIGURATION_UPDATING`] beside the configuration still in effect,
+//! until it falls due [`crate::state::CONFIGURATION_UPDATE_SETTLE_DELAY`] after the call
+//! and becomes the one in effect.
+//!
+//! The configuration REPLACES the stored one rather than merging into it, and a request
+//! that carries no configuration item leaves the group with none at all — exactly as a
+//! create that sent none. A second accepted call supersedes an update still in flight,
+//! so the LAST one decides the outcome.
+//!
+//! A group contains either a resource query or a service configuration, never both
+//! (`PutGroupConfigurationInput$Configuration`), so a group that is queried cannot be
+//! given a configuration: that is the modelled `BadRequestException`, the same mutual
+//! exclusion `CreateGroup` and `UpdateGroupQuery` refuse a request for.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +166,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutGroupConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutGroupConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutGroupConfiguration"))
+        // Authorization is not emulated: the emulator verifies request signatures
+        // centrally but holds no principals or policies, so the modelled
+        // `ForbiddenException` is deliberately unreachable here and a success says
+        // nothing about the caller's permissions. `ctx` is read for the request's
+        // region and for the audit record this operation emits.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                PutGroupConfigurationErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: Some("the resource-groups store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        // `Group` is not `@required`, but the operation attaches the configuration to
+        // exactly one group, so a request naming none cannot be served.
+        let Some(identifier) = input.group.as_deref() else {
+            return Err(bad_request(
+                "the request must name the group whose configuration to update, in Group",
+            ));
+        };
+        // The service-configuration rules this service decides in one place, so a put
+        // stores exactly the document a create would have stored. Judged before the
+        // group is resolved and before anything is written, so a refused configuration
+        // leaves the stored one alone.
+        if let Some(items) = input.configuration.as_ref() {
+            crate::state::check_configuration(items).map_err(bad_request)?;
+        }
+        // A `Configuration` present but EMPTY carries no configuration item, so this
+        // request attaches nothing: the group ends with no service configuration, and
+        // the mutual exclusion below — which is about a group CONTAINING a
+        // configuration — does not reach it.
+        let configured = input.configuration.as_ref().is_some_and(|c| !c.is_empty());
+        // The configuration can declare the group an APPLICATION group, which is the
+        // one kind of group that carries an application identity and reports a
+        // membership tag for it.
+        let application_group = input
+            .configuration
+            .iter()
+            .flatten()
+            .any(|item| item.r#type == crate::state::APPLICATION_GROUP_CONFIGURATION_TYPE);
+        let not_found = || {
+            PutGroupConfigurationError::from(PutGroupConfigurationErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::GROUP_NOT_FOUND_MESSAGE.to_string()),
+                },
+            ))
+        };
+        // A group lives in the region whose endpoint created it, so the request's own
+        // region is where the identifier is resolved: a group of another region takes
+        // no configuration from here.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let key = store.lookup(&region, identifier).ok_or_else(not_found)?;
+        let record = store.groups.get_mut(&key).ok_or_else(not_found)?;
+        // Modelled on `PutGroupConfigurationInput$Configuration`: "A resource group can
+        // contain either a Configuration or a ResourceQuery, but not both" — so a group
+        // that is queried takes no configuration, the same exclusion `UpdateGroupQuery`
+        // refuses a request for from the other side.
+        if configured {
+            if let Some(queried) = record.resource_query.as_ref() {
+                let message = format!(
+                    "a resource group can contain either a Configuration or a ResourceQuery, \
+                     but not both, and the group {} is queried by {}",
+                    key.name, queried.query_type,
+                );
+                return Err(bad_request(message));
+            }
+        }
+        // An application group's ARN QUALIFIES its name with its application id, and
+        // the modelled `ApplicationArn` writes that name segment narrower than a group
+        // name may be, so a longer name cannot be given the identity an application
+        // group has — the same rule `CreateGroup` refuses such a name for.
+        if application_group && !crate::state::is_qualifiable_group_name(&record.name) {
+            let message = format!(
+                "the group {} is not valid for this Configuration: an application group's \
+                 ARN qualifies its name with the group's application id, and writes that \
+                 name as at most {} characters",
+                record.name,
+                crate::state::MAX_QUALIFIED_GROUP_NAME_LENGTH,
+            );
+            return Err(bad_request(message));
+        }
+        // An application group's identity carries the application id that qualifies its
+        // name, so a group this configuration makes one is given an id now if it has
+        // none — minted ONCE and stored, so every later read reports the same identity
+        // and the same membership tag. It stays invisible until the configuration that
+        // needs it is in effect, since the membership tag is reported only for a group
+        // whose EFFECTIVE configuration declares it an application group.
+        if application_group {
+            record
+                .application_id
+                .get_or_insert_with(crate::state::new_qualifying_id);
+        }
+        // Accepted, not applied: the configuration becomes the proposed one and falls
+        // due a span later, so a caller reading straight after this call still sees the
+        // update in flight.
+        record.put_configuration(input.configuration, now);
+        let items_proposed = record
+            .configuration_update_in_flight(now)
+            .map(|pending| pending.configuration.iter().flatten().count())
+            .unwrap_or_default();
+        // Everything below is owned, so the store lock is released before the record is
+        // formatted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, where, what, and the
+        // outcome. Metadata only — no configuration parameters — and request-derived
+        // values are `Debug`-escaped so none can split a record.
+        tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            region = ?region,
+            group = ?key.name,
+            configuration_items = items_proposed,
+            outcome = "configuration update accepted",
+            "resource group configuration update accepted",
+        );
+        // The model gives this operation no output members at all: the 202 is the whole
+        // answer, and a caller reads the result through `GetGroupConfiguration`.
+        Ok(PutGroupConfigurationOutput {})
     }
+}
+
+/// A `BadRequestException` (HTTP 400) — the modelled refusal for a request whose
+/// parameters violate this operation's validation rules.
+fn bad_request(message: impl Into<String>) -> PutGroupConfigurationError {
+    PutGroupConfigurationErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }

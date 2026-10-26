@@ -3,7 +3,8 @@
 //! Engine state for the com-amazonaws-resourcegroups-ardi service.
 //!
 //! Every resource group this emulator holds lives in ONE map, [`ComAmazonawsResourcegroupsArdiState::groups`],
-//! so `CreateGroup`, `GetGroup`, `GetGroupConfiguration`, `ListGroups`, `GroupResources`,
+//! so `CreateGroup`, `GetGroup`, `GetGroupConfiguration`, `PutGroupConfiguration`,
+//! `ListGroups`, `GroupResources`,
 //! `UngroupResources`, `ListGroupResources`, `ListGroupingStatuses`, `UpdateGroup` and
 //! `DeleteGroup` all read and write the same records. The map is a
 //! [`BTreeMap`] keyed by [`GroupKey`] — the region the group was created in and its
@@ -447,6 +448,64 @@ pub fn check_resource_query(query: &ResourceQuery) -> Result<(), String> {
 /// effect, with no update in flight to report.
 pub const CONFIGURATION_IN_EFFECT: &str = "UPDATE_COMPLETE";
 
+/// The modelled `GroupConfigurationStatus` of a service configuration whose
+/// update has been accepted and is not in effect yet.
+///
+/// `PutGroupConfiguration` is documented as asynchronous — "This occurs
+/// asynchronously, and can take time to complete. You can use
+/// GetGroupConfiguration to check the status of the update"
+/// (`smithy_query(query="doc",shape="PutGroupConfiguration")`) — and the model
+/// answers it HTTP 202 with no body, so the configuration a put accepts is
+/// reported as the PROPOSED one under this status until it falls due.
+pub const CONFIGURATION_UPDATING: &str = "UPDATING";
+
+/// How long after an accepted configuration update the configuration it carries
+/// is owed.
+///
+/// The model documents the update as asynchronous but names no duration, so this
+/// span is the emulator's own choice: long enough that a caller reading straight
+/// after the put still observes the update in flight, short enough that a caller
+/// polling for completion does not wait. It is stored as a due INSTANT on the
+/// record ([`PendingGroupConfiguration::due_at`]) and nothing ever sleeps on it.
+pub const CONFIGURATION_UPDATE_SETTLE_DELAY: Duration = Duration::from_millis(500);
+
+/// `Ok(())` when `items` are a service configuration this service stores, else
+/// the message the refusal reports.
+///
+/// The ONE place this service decides whether a `GroupConfigurationList` is one
+/// it accepts, so a create and a later put judge the same document the same way.
+/// Modelled on `GroupConfigurationItem$Type`: "Each item must have a unique
+/// value for type." The list's own 0..2 length and each `Type`'s pattern are
+/// modelled constraints, refused at the request boundary before any handler
+/// runs, so they are not restated here.
+pub fn check_configuration(items: &[GroupConfigurationItem]) -> Result<(), String> {
+    let duplicate = items
+        .iter()
+        .enumerate()
+        .find(|(at, item)| items[..*at].iter().any(|earlier| earlier.r#type == item.r#type))
+        .map(|(_, item)| item.r#type.as_str());
+    if let Some(duplicate) = duplicate {
+        return Err(format!(
+            "Configuration is not valid: each configuration item must have a \
+             unique Type, and {duplicate} appears more than once",
+        ));
+    }
+    Ok(())
+}
+
+/// A service-configuration update that the clock already owes at
+/// [`PendingGroupConfiguration::due_at`], whether or not anybody calls.
+#[derive(Debug, Clone)]
+pub struct PendingGroupConfiguration {
+    /// The configuration that is in effect from `due_at` on, and `None` when the
+    /// accepted update carries no configuration item at all — which leaves the
+    /// group with no service configuration, exactly as a create that sent none.
+    pub configuration: Option<Vec<GroupConfigurationItem>>,
+    /// The instant the update finishes. Public so a test can move the instant the
+    /// store holds instead of sleeping for the span.
+    pub due_at: SystemTime,
+}
+
 /// The service-configuration parameter that decides whether a group may be
 /// deleted.
 ///
@@ -533,10 +592,17 @@ pub struct GroupRecord {
     pub display_name: Option<String>,
     /// The resource query the group was created with, if any.
     pub resource_query: Option<ResourceQueryRecord>,
-    /// The service configuration the group was created with, if any. A group
-    /// contains either a configuration or a resource query, never both, and a
-    /// group created with neither carries `None` here.
+    /// The service configuration the group was created with, or the one an
+    /// accepted `PutGroupConfiguration` has already put in effect, if any. A
+    /// group contains either a configuration or a resource query, never both,
+    /// and a group created with neither carries `None` here.
     pub configuration: Option<Vec<GroupConfigurationItem>>,
+    /// The configuration update the clock still owes, written by an accepted
+    /// `PutGroupConfiguration` and `None` when this group has none in flight.
+    /// While it is in flight the group is still configured by
+    /// [`GroupRecord::configuration`], which is what makes the update the
+    /// modelled `ProposedConfiguration` rather than the one in effect.
+    pub pending_configuration: Option<PendingGroupConfiguration>,
     /// The group's tags, kept in key order so the stored record is deterministic
     /// (the wire map itself is unordered).
     pub tags: BTreeMap<String, String>,
@@ -558,6 +624,85 @@ pub struct GroupRecord {
 }
 
 impl GroupRecord {
+    /// The service-configuration update the clock still owes at `now`, or `None`
+    /// when this group has none in flight.
+    pub fn configuration_update_in_flight(
+        &self,
+        now: SystemTime,
+    ) -> Option<&PendingGroupConfiguration> {
+        self.pending_configuration
+            .as_ref()
+            .filter(|pending| pending.due_at > now)
+    }
+
+    /// The service configuration in effect at `now`: the one an accepted update
+    /// has already put in effect, else the one the record holds.
+    ///
+    /// An update is owed at its stored instant whether or not anybody calls, so
+    /// the configuration in effect is a function of the record AND the clock; the
+    /// record itself catches up at the next write
+    /// ([`GroupRecord::settle_configuration_due`]), which is why no read has to
+    /// change it.
+    pub fn configuration_at(&self, now: SystemTime) -> Option<&Vec<GroupConfigurationItem>> {
+        match self.pending_configuration.as_ref() {
+            Some(pending) if pending.due_at <= now => pending.configuration.as_ref(),
+            _ => self.configuration.as_ref(),
+        }
+    }
+
+    /// The service configuration in effect at this instant — what every attribute
+    /// derived from the configuration below is derived from, so each of them
+    /// answers for the configuration a caller can see right now and none of them
+    /// reads a superseded one.
+    fn effective_configuration(&self) -> Option<&Vec<GroupConfigurationItem>> {
+        self.configuration_at(SystemTime::now())
+    }
+
+    /// Accept `configuration` as this group's new service configuration at `now`.
+    ///
+    /// It becomes the proposed configuration, reported under
+    /// [`CONFIGURATION_UPDATING`], and falls due
+    /// [`CONFIGURATION_UPDATE_SETTLE_DELAY`] later, so a caller reading straight
+    /// after the write still sees the update in flight. It REPLACES the whole
+    /// configuration rather than merging into it, and a request that carries no
+    /// configuration item leaves the group with none at all. A second update
+    /// supersedes one still in flight, which is what makes the LAST accepted
+    /// request the one that decides the outcome.
+    pub fn put_configuration(
+        &mut self,
+        configuration: Option<Vec<GroupConfigurationItem>>,
+        now: SystemTime,
+    ) {
+        // An update that had already fallen due is in effect, so it is
+        // materialised before this one supersedes it: the configuration this
+        // update is reported against is then the one actually in effect.
+        self.settle_configuration_due(now);
+        self.pending_configuration = Some(PendingGroupConfiguration {
+            // A configuration that carries no item configures nothing, so it is
+            // stored exactly as a group that was sent none.
+            configuration: configuration.filter(|items| !items.is_empty()),
+            due_at: now + CONFIGURATION_UPDATE_SETTLE_DELAY,
+        });
+    }
+
+    /// Materialise the configuration update the clock already made due at `now`.
+    ///
+    /// It was owed at this instant whether or not anybody called, so a caller may
+    /// settle it; an update not yet due is left alone, and a record with nothing
+    /// in flight is unchanged.
+    pub fn settle_configuration_due(&mut self, now: SystemTime) {
+        if self
+            .pending_configuration
+            .as_ref()
+            .is_none_or(|pending| pending.due_at > now)
+        {
+            return;
+        }
+        if let Some(pending) = self.pending_configuration.take() {
+            self.configuration = pending.configuration;
+        }
+    }
+
     /// Whether this group's stored service configuration declares it an
     /// APPLICATION group, i.e. carries an item of type
     /// [`APPLICATION_GROUP_CONFIGURATION_TYPE`].
@@ -566,8 +711,8 @@ impl GroupRecord {
     /// configuration is one document whatever order its items are in; a group
     /// with no configuration declares nothing.
     pub fn is_application_group(&self) -> bool {
-        self.configuration
-            .iter()
+        self.effective_configuration()
+            .into_iter()
             .flatten()
             .any(|item| item.r#type == APPLICATION_GROUP_CONFIGURATION_TYPE)
     }
@@ -663,19 +808,34 @@ impl GroupRecord {
         }
     }
 
-    /// The modelled `GroupConfiguration` for this record, if it was created with
-    /// a service configuration, and `None` for a group that has none.
+    /// The modelled `GroupConfiguration` for this record, if it holds a service
+    /// configuration or has an update to one in flight, and `None` for a group
+    /// that has neither.
     ///
-    /// `ProposedConfiguration` is reported only while an update is in flight, and
-    /// `FailureReason` only for one that failed; a stored configuration is in
-    /// effect, so neither is reported here.
+    /// `ProposedConfiguration` is reported only while an update is in flight,
+    /// beside the configuration that is still in effect and the `UPDATING`
+    /// status; a configuration with no update in flight is the one in effect, so
+    /// it reports neither a proposal nor a `FailureReason` — no update this
+    /// emulator accepts fails, so nothing writes that reason.
     pub fn to_group_configuration(&self) -> Option<GroupConfiguration> {
-        self.configuration.as_ref().map(|items| GroupConfiguration {
-            configuration: Some(items.clone()),
-            proposed_configuration: None,
-            status: Some(CONFIGURATION_IN_EFFECT.to_string()),
-            failure_reason: None,
-        })
+        let now = SystemTime::now();
+        if let Some(in_flight) = self.configuration_update_in_flight(now) {
+            return Some(GroupConfiguration {
+                configuration: self.configuration.clone(),
+                proposed_configuration: Some(
+                    in_flight.configuration.clone().unwrap_or_default(),
+                ),
+                status: Some(CONFIGURATION_UPDATING.to_string()),
+                failure_reason: None,
+            });
+        }
+        self.configuration_at(now)
+            .map(|items| GroupConfiguration {
+                configuration: Some(items.clone()),
+                proposed_configuration: None,
+                status: Some(CONFIGURATION_IN_EFFECT.to_string()),
+                failure_reason: None,
+            })
     }
 
     /// Whether this record's stored service configuration sets `parameter` to
@@ -687,8 +847,8 @@ impl GroupRecord {
     /// A group with no configuration, an item with no parameters and a parameter
     /// with no values all set nothing.
     pub fn configuration_parameter_has_value(&self, parameter: &str, value: &str) -> bool {
-        self.configuration
-            .iter()
+        self.effective_configuration()
+            .into_iter()
             .flatten()
             .filter_map(|item| item.parameters.as_ref())
             .flatten()
@@ -724,8 +884,8 @@ impl GroupRecord {
     /// rather than configured, and a group created with neither carries no
     /// configuration, so both answer `None`.
     pub fn static_membership_configuration_type(&self) -> Option<&str> {
-        self.configuration
-            .iter()
+        self.effective_configuration()
+            .into_iter()
             .flatten()
             .map(|item| item.r#type.as_str())
             .find(|declared| STATIC_MEMBERSHIP_CONFIGURATION_TYPES.contains(declared))
@@ -739,10 +899,31 @@ impl GroupRecord {
     /// configuration types as it has items. A group created with a resource
     /// query, or with neither, declares none.
     pub fn configuration_types(&self) -> impl Iterator<Item = &str> {
-        self.configuration
-            .iter()
+        self.effective_configuration()
+            .into_iter()
             .flatten()
             .map(|item| item.r#type.as_str())
+    }
+
+    /// A service-configuration type that makes this group one that CONTAINS a
+    /// configuration at `now` — one its configuration declares in effect, or one
+    /// an accepted update is about to put in effect — or `None` when it contains
+    /// none.
+    ///
+    /// The modelled either/or ("A resource group can contain either a
+    /// Configuration or a ResourceQuery, but not both") is judged against this,
+    /// so a group whose configuration update is still in flight cannot be given a
+    /// resource query that would land beside it.
+    pub fn configured_type(&self, now: SystemTime) -> Option<&str> {
+        self.configuration_at(now)
+            .into_iter()
+            .chain(
+                self.configuration_update_in_flight(now)
+                    .and_then(|pending| pending.configuration.as_ref()),
+            )
+            .flatten()
+            .map(|item| item.r#type.as_str())
+            .next()
     }
 
     /// The resource types this group's stored resource query limits itself to,

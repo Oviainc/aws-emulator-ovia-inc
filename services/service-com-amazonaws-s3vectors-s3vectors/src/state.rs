@@ -8,8 +8,10 @@
 //! `src/ops/mod.rs` is an `include!` of generated code, so this module is the
 //! one place a helper several operations need can live.
 
-use std::collections::BTreeMap;
-use std::time::SystemTime;
+pub mod authorization;
+
+use std::collections::{BTreeMap, VecDeque};
+use std::time::{Duration, Instant, SystemTime};
 
 use aws_smithy_types::{Document, Number};
 
@@ -90,6 +92,31 @@ pub const MAX_POLICY_BYTES: usize = 20 * 1024;
 /// express and the handlers enforce (see [`validate_tag_keys`]).
 pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
+/// The `ValidationException` message for a caller-supplied tag key in the reserved
+/// namespace, as the service words it: ONE fixed sentence about the kind of tag the
+/// request tried to write, carrying no value from the request. This is the sentence the
+/// real service answered in the recorded response; the status (400) and the error code
+/// (`ValidationException`) are the requirements either way.
+pub const SYSTEM_TAG_REFUSED: &str = "System tags cannot be added/updated by requester";
+
+/// See [`MAX_VECTOR_BUCKETS`]: how many deleted vectors one index keeps as tombstones
+/// (see [`VectorIndexRecord::tombstones`]). A tombstone holds the vector it replaced, so
+/// the pool a query ranks — and the memory an index costs — stays bounded however many
+/// deletes a caller issues; at the ceiling the oldest tombstone is given up, which is the
+/// one point this emulator models the graph compaction that frees a candidate slot.
+pub const MAX_TOMBSTONES_PER_INDEX: usize = 1_000;
+
+/// How long a tag write on ONE resource takes to commit.
+///
+/// Tag state on a single resource is updated under optimistic concurrency control, so the
+/// span a write is in flight is what decides a racing caller's fate: a mutation that
+/// arrives while another mutation of the SAME resource is still committing is refused with
+/// `ConflictException` (HTTP 409), the signal to retry its read-modify-write. The write is
+/// committed before its own caller is answered, so a caller that waits for its response
+/// can never collide with itself — only genuinely overlapping callers do, whatever this
+/// span is. The value is this emulator's own; AWS publishes no commit latency.
+pub const TAG_WRITE_COMMIT: Duration = Duration::from_millis(250);
+
 /// The two `Effect` values the IAM policy grammar allows in a statement.
 pub const POLICY_EFFECT_ALLOW: &str = "Allow";
 /// See [`POLICY_EFFECT_ALLOW`].
@@ -105,6 +132,11 @@ pub struct ComAmazonawsS3vectorsS3vectorsState {
     /// pruned by the `/tags/{resourceArn}` operations. A resource carrying no tags
     /// holds NO entry, so an absent entry and an empty map mean the same thing.
     pub tags: BTreeMap<String, BTreeMap<String, String>>,
+    /// The tag writes still committing, by resource ARN, each holding the instant its
+    /// commit completes ([`TAG_WRITE_COMMIT`]). This is the optimistic lock the tagging
+    /// operations take: see [`Self::begin_tag_write`]. An entry whose instant has passed
+    /// is one whose caller never came back to release it, and holds nothing up.
+    pub tag_writes: BTreeMap<String, Instant>,
 }
 
 /// A stored vector bucket, with the vector indexes it contains.
@@ -144,6 +176,15 @@ pub struct VectorIndexRecord {
     /// Vectors by key. A `BTreeMap` so ListVectors order, its `nextToken`
     /// cursor and its segment partition are deterministic.
     pub vectors: BTreeMap<String, StoredVector>,
+    /// The vectors DeleteVectors removed, newest last, for as long as the index keeps
+    /// them (see [`MAX_TOMBSTONES_PER_INDEX`] and [`Self::candidate_pool`]).
+    ///
+    /// A deleted vector is gone from every read of the index — it is in no `vectors`
+    /// entry — but the slot it occupies in the approximate-nearest-neighbour graph is
+    /// not freed by the delete, so it still costs a query one of the candidates that
+    /// query asked for. A queue, so the oldest tombstone is the one the ceiling gives up
+    /// and giving it up costs nothing.
+    pub tombstones: VecDeque<StoredVector>,
 }
 
 /// One stored vector: its key, its `float32` data and its metadata document.
@@ -265,6 +306,14 @@ pub const INDEX_NOT_FOUND: &str = "The specified vector index could not be found
 /// but carries none — so a client reads the missing kind from the sentence and a
 /// bucket that is missing cannot be confused with a policy that is.
 pub const POLICY_NOT_FOUND: &str = "The specified vector bucket policy could not be found";
+
+/// The `ConflictException` message for a tag mutation that raced another mutation of the
+/// same resource: ONE fixed sentence, carrying no value from the request, saying what the
+/// caller has to do about it — the conflict is between two callers rather than about
+/// anything either of them named.
+pub const TAG_WRITE_CONFLICT: &str =
+    "A conflicting conditional operation is currently in progress against this resource. \
+     Try again.";
 
 /// Wording for the one failure that is not about the request: the shared engine
 /// did not hand this service's store back. Every operation models
@@ -524,29 +573,59 @@ pub fn resolve_index_name(
 
 /// Refuse a caller-supplied tag key that lies in the reserved `aws:` namespace.
 ///
-/// `member` is the input member the keys came from, so one implementation serves
-/// every operation that takes caller-supplied tag keys — a create request's
-/// `tags`, TagResource's `tags`, UntagResource's `tagKeys` — because the
-/// namespace belongs to AWS whichever member names it. The prefix is matched
-/// case-insensitively, as AWS documents it.
+/// One implementation serves every operation that takes caller-supplied tag keys —
+/// a create request's `tags`, TagResource's `tags`, UntagResource's `tagKeys` —
+/// because the namespace belongs to AWS whichever member names it. The prefix is
+/// matched case-insensitively, as AWS documents it.
 pub fn validate_tag_keys<'a>(
-    member: &str,
     keys: impl IntoIterator<Item = &'a str>,
 ) -> Result<(), LookupError> {
     let prefix = RESERVED_TAG_KEY_PREFIX.as_bytes();
     for key in keys {
         let bytes = key.as_bytes();
         if bytes.len() >= prefix.len() && bytes[..prefix.len()].eq_ignore_ascii_case(prefix) {
-            return Err(LookupError::invalid(
-                member,
-                format!(
-                    "`{member}` must not name a tag key in the reserved \
-                     `{RESERVED_TAG_KEY_PREFIX}` namespace: {key}"
-                ),
-            ));
+            return Err(LookupError::invalid_request(SYSTEM_TAG_REFUSED));
         }
     }
     Ok(())
+}
+
+impl VectorIndexRecord {
+    /// The candidates a nearest-neighbour query over this index ranks, each paired with
+    /// whether it is a LIVE vector (`true`) or a tombstone of a deleted one (`false`).
+    ///
+    /// A query asks the graph for a bounded number of candidates and reports the ones
+    /// that are still there: a tombstone is never reported, but it is in the pool that
+    /// bound applies to, so a query for as many candidates as the index holds vectors is
+    /// short by however many tombstones outrank them.
+    pub fn candidate_pool(&self) -> Vec<(&StoredVector, bool)> {
+        self.vectors
+            .values()
+            .map(|stored| (stored, true))
+            .chain(self.tombstones.iter().map(|stored| (stored, false)))
+            .collect()
+    }
+
+    /// Record that `key` was deleted: the vector leaves the index and its candidate slot
+    /// stays occupied by a tombstone. A no-op for a key the index does not hold, so a
+    /// repeated delete leaves exactly one tombstone.
+    pub fn tombstone(&mut self, key: &str) {
+        let Some(deleted) = self.vectors.remove(key) else {
+            return;
+        };
+        self.tombstones.push_back(deleted);
+        // At the ceiling the oldest tombstone is given up, which frees its slot: this is
+        // what bounds what one index keeps however many deletes a caller issues.
+        while self.tombstones.len() > MAX_TOMBSTONES_PER_INDEX {
+            self.tombstones.pop_front();
+        }
+    }
+
+    /// Give up the tombstone of `key`, which a write of that key replaces: the vector is
+    /// in the index again, so it occupies its slot as a live candidate rather than twice.
+    pub fn clear_tombstone(&mut self, key: &str) {
+        self.tombstones.retain(|stored| stored.key != key);
+    }
 }
 
 impl ComAmazonawsS3vectorsS3vectorsState {
@@ -609,6 +688,69 @@ impl ComAmazonawsS3vectorsS3vectorsState {
             let bucket = bucket_from_arn(member, arn)?;
             Ok(self.bucket(&bucket)?.arn.clone())
         }
+    }
+
+    /// What the authorization decision for a request against `bucket` — and, when it
+    /// addresses one, `index` — is made from: the bucket's stored resource policy and the
+    /// ARNs the request acts on. See [`authorization`].
+    pub fn authorization_target(
+        &self,
+        bucket: &str,
+        index: Option<&str>,
+    ) -> Result<authorization::Target, LookupError> {
+        let record = self.bucket(bucket)?;
+        // The resource the action is taken on comes first: see `authorization::Target`.
+        let mut resources = match index {
+            Some(index) => vec![self.index(bucket, index)?.arn.clone()],
+            None => Vec::new(),
+        };
+        resources.push(record.arn.clone());
+        Ok(authorization::Target {
+            policy: record.policy.clone(),
+            resources,
+        })
+    }
+
+    /// [`Self::authorization_target`] for a request that names its resource by ARN — a
+    /// tagging request, whose `resourceArn` is either a vector bucket or a vector index —
+    /// resolved through the same two ARN parsers as [`Self::tagged_resource_arn`].
+    pub fn authorization_target_for_arn(
+        &self,
+        member: &str,
+        arn: &str,
+    ) -> Result<authorization::Target, LookupError> {
+        let names_index = arn_resource(arn).is_some_and(|resource| resource.contains("/index/"));
+        if names_index {
+            let (bucket, index) = index_from_arn(member, arn)?;
+            self.authorization_target(&bucket, Some(&index))
+        } else {
+            let bucket = bucket_from_arn(member, arn)?;
+            self.authorization_target(&bucket, None)
+        }
+    }
+
+    /// Take the optimistic lock on the tag state of the resource `arn` names, so the
+    /// write that follows commits against the state it read.
+    ///
+    /// `Err` is the `ConflictException` message for a caller whose write raced another
+    /// mutation of the SAME resource: the tag state it read was invalidated while its own
+    /// write was still being made, so there is nothing for it to do but retry. Release the
+    /// lock with [`Self::end_tag_write`] once the write is committed.
+    pub fn begin_tag_write(&mut self, arn: &str, now: Instant) -> Result<(), String> {
+        // A lock whose commit instant has passed was left behind by a caller that never
+        // came back for it, so it holds nothing up.
+        self.tag_writes.retain(|_, commits_at| *commits_at > now);
+        if self.tag_writes.contains_key(arn) {
+            return Err(TAG_WRITE_CONFLICT.to_string());
+        }
+        self.tag_writes
+            .insert(arn.to_string(), now + TAG_WRITE_COMMIT);
+        Ok(())
+    }
+
+    /// Release the optimistic lock [`Self::begin_tag_write`] took.
+    pub fn end_tag_write(&mut self, arn: &str) {
+        self.tag_writes.remove(arn);
     }
 }
 

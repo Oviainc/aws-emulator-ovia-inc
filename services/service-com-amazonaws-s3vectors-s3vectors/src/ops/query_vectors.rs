@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op QueryVectors
-//! IMPLEMENTED: computes the nearest neighbours of `queryVector` over the vectors
-//! persisted in the stored index, under that index's own `distanceMetric`. A read: it
-//! changes nothing. This is the ONLY file to touch for this operation.
+//! IMPLEMENTED: computes the nearest neighbours of `queryVector` over the candidates the
+//! stored index holds — its vectors, and the deleted ones still occupying a candidate
+//! slot, which `topK` is spent on and which are never reported — under that index's own
+//! `distanceMetric`. A read: it changes nothing. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -132,11 +134,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3vectors-s3vectors.jso
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.s3vectors#QueryVectors",
-    extra_errors = ["ValidationException"]
+    extra_errors = ["ValidationException", "AccessDeniedException"]
 )]
 #[derive(Debug)]
 pub enum QueryVectorsErrorModeled {
     ValidationException(ValidationException),
+    AccessDeniedException(AccessDeniedException),
     KmsDisabledException(KmsDisabledException),
     KmsInvalidKeyUsageException(KmsInvalidKeyUsageException),
     KmsInvalidStateException(KmsInvalidStateException),
@@ -196,7 +199,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(QueryVectorsErrorModeled::ServiceUnavailableException(
                 ServiceUnavailableException {
@@ -223,8 +225,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // Who the request speaks for, resolved before this service's own store is
+        // locked, so only one store is ever held at a time.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
         let store = state.lock();
         let index = store.index(&bucket_name, &index_name).map_err(refusal)?;
+
+        // The vector bucket's own resource policy decides this call before it searches
+        // anything: an explicit Deny of the action refuses it.
+        if let Some(message) = store
+            .authorization_target(&bucket_name, Some(&index_name))
+            .map_err(refusal)?
+            .refusal(&caller, &[Self::NAME])
+        {
+            return Err(QueryVectorsErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
         let VectorData::Float32(query) = &input.query_vector;
         crate::state::validate_vector_data("queryVector", index, query).map_err(refusal)?;
 
@@ -243,8 +261,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whether metadata filters are applied before or during an APPROXIMATE
         // search — cannot change which vectors are nearest: filtering first and
         // ranking the survivors gives the same answer either way.
-        let mut scored: Vec<(f32, &crate::state::StoredVector)> = Vec::new();
-        for stored in index.vectors.values() {
+        //
+        // `topK` bounds the CANDIDATES the graph is asked for, not the vectors that come
+        // back: a vector a delete removed keeps its candidate slot until its tombstone is
+        // given up, so it is ranked here and then not reported. A query whose `topK` has
+        // no room to spare is therefore short by however many tombstones outrank the
+        // vectors it would otherwise have reported, and what it does report is the
+        // surviving ranking's own prefix.
+        let mut scored: Vec<(f32, &crate::state::StoredVector, bool)> = Vec::new();
+        for (stored, live) in index.candidate_pool() {
             if !crate::state::metadata_matches(&filter, &stored.metadata, non_filterable)
                 .map_err(refusal)?
             {
@@ -252,7 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             let distance =
                 crate::state::vector_distance(&index.distance_metric, query, &stored.data);
-            scored.push((distance, stored));
+            scored.push((distance, stored, live));
         }
         // Ascending by distance — nearest first for both metrics — with the vector
         // key breaking ties so equally distant vectors come back in a stable order.
@@ -265,7 +290,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let vectors = scored
             .into_iter()
-            .map(|(distance, stored)| QueryOutputVector {
+            .filter(|(_, _, live)| *live)
+            .map(|(distance, stored, _)| QueryOutputVector {
                 key: stored.key.clone(),
                 // Both flags default to false, and each member is populated ONLY
                 // when its own flag is set.
