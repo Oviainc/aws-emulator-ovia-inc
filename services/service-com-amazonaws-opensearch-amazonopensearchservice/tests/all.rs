@@ -33,6 +33,8 @@ mod domain_health;
 mod domain_lifecycle;
 #[path = "all/domain_nodes.rs"]
 mod domain_nodes;
+#[path = "all/inbound_connections.rs"]
+mod inbound_connections;
 #[path = "all/index_registry.rs"]
 mod index_registry;
 #[path = "all/index_schema_updates.rs"]
