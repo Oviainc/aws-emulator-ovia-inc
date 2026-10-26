@@ -531,7 +531,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // key material are the store's, and another request may have moved either
         // while the pair was being generated. The answer is therefore built from the
         // key as it is at the instant it seals, or not built at all.
-        let state = state.lock();
+        let mut state = state.lock();
         let key = sealing_key(&state, &region, &input.key_id)?;
         // The private key leaves this handler ONLY sealed: the response models no
         // plaintext private key member, and the bytes are dropped with `pair` when
@@ -541,20 +541,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(internal("the private key could not be encrypted"));
         };
+        // "The Amazon Resource Name (key ARN) of the KMS key that encrypted the
+        // private key" — the key ARN, not the identifier the request used — and "the
+        // identifier of the key material used to encrypt the private key": the version
+        // of the key's material that sealed it, which is the current one.
+        let key_arn = key.arn.clone();
+        let key_material_id = key.current_key_material_id.clone();
+        let key_id = key.key_id.clone();
+
+        // The key was just used in a successful cryptographic operation, which is what
+        // `GetKeyLastUsage` reports.
+        state.record_last_usage(&region, &key_id, Self::NAME);
 
         Ok(GenerateDataKeyPairWithoutPlaintextOutput {
             private_key_ciphertext_blob: Some(private_key_ciphertext_blob),
             public_key: Some(pair.public_key),
-            // "The Amazon Resource Name (key ARN) of the KMS key that encrypted the
-            // private key" — the key ARN, not the identifier the request used.
-            key_id: Some(key.arn.clone()),
+            key_id: Some(key_arn),
             // "The type of data key pair that was generated", which is the type the
             // request asked for.
             key_pair_spec: Some(input.key_pair_spec.clone()),
-            // "The identifier of the key material used to encrypt the private key":
-            // the version of the key's material that sealed it, which is the current
-            // one.
-            key_material_id: key.current_key_material_id.clone(),
+            key_material_id,
         })
     }
 }

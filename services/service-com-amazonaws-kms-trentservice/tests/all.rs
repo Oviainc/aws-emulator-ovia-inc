@@ -43,6 +43,8 @@ mod grants;
 mod harness;
 #[path = "all/key_deletion_cancellation.rs"]
 mod key_deletion_cancellation;
+#[path = "all/key_last_usage.rs"]
+mod key_last_usage;
 #[path = "all/key_lifecycle.rs"]
 mod key_lifecycle;
 #[path = "all/key_policy.rs"]
