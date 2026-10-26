@@ -14,6 +14,9 @@
 #[path = "all/account_subscriptions_listing.rs"]
 mod account_subscriptions_listing;
 
+#[path = "all/confirm_subscription.rs"]
+mod confirm_subscription;
+
 #[path = "all/data_protection_policy.rs"]
 mod data_protection_policy;
 
@@ -43,6 +46,9 @@ mod phone_number_opt_in;
 
 #[path = "all/phone_number_opt_out_listing.rs"]
 mod phone_number_opt_out_listing;
+
+#[path = "all/platform_application_reads.rs"]
+mod platform_application_reads;
 
 #[path = "all/platform_applications.rs"]
 mod platform_applications;

@@ -184,19 +184,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let mut attributes = endpoint.attributes.clone();
-        // The device token is the record's own field, so it is reported from there
-        // rather than from the attribute map beside it: one source for one value.
-        attributes.insert(
-            crate::state::ENDPOINT_TOKEN_ATTRIBUTE.to_string(),
-            endpoint.token.clone(),
-        );
-        attributes
-            .entry(crate::state::ENDPOINT_ENABLED_ATTRIBUTE.to_string())
-            .or_insert_with(|| crate::state::attribute_flag(true));
-
+        // The attributes an endpoint report carries, built where every report of an
+        // endpoint builds them, so this read and the listing of an application's
+        // endpoints cannot describe one endpoint differently.
         Ok(GetEndpointAttributesOutput {
-            attributes: Some(attributes),
+            attributes: Some(endpoint.reported_attributes()),
         })
     }
 }

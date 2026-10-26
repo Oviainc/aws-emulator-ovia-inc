@@ -35,7 +35,11 @@ use super::topics_subscriptions_publish::{text_of, Answer, Sns};
 const REGION: &str = "us-east-1";
 
 /// Every `<key>…</key>` / `<value>…</value>` pair inside `block`, in document order.
-fn entries_of(block: &str) -> HashMap<String, String> {
+///
+/// `pub(crate)` so a sibling suite that reads the attribute map of a MOBILE PUSH list
+/// member — which [`Answer::elements`] cannot pair up — scrapes it the same way rather
+/// than writing a second copy of this walk.
+pub(crate) fn entries_of(block: &str) -> HashMap<String, String> {
     let mut found = HashMap::new();
     let mut rest = block;
     while let Some(start) = rest.find("<entry>") {

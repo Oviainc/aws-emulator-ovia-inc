@@ -106,6 +106,28 @@ pub fn is_pending_confirmation_sentinel(value: &str) -> bool {
     value == PENDING_CONFIRMATION_REPORTED || value == PENDING_CONFIRMATION_LISTED
 }
 
+/// How many hexadecimal characters a confirmation token this service mints carries —
+/// one SHA-256 digest's worth, which is the most
+/// [`ComAmazonawsSnsAmazonsimplenotificationserviceState::next_confirmation_token`]
+/// encodes.
+///
+/// `smithy_query(query="shape", shape="token")` reports a plain string with no length
+/// or pattern, and `ConfirmSubscriptionInput$Token` documents only "Short-lived token
+/// sent to an endpoint during the Subscribe action", so the token is opaque: nothing
+/// but equality against the minted value is read off it, and this width only has to
+/// make a guess hopeless.
+pub const CONFIRMATION_TOKEN_HEX_CHARS: usize = 64;
+
+/// The sentence a `ConfirmSubscription` carrying a token that is not the one sent to
+/// one of the topic's awaiting endpoints is refused with.
+///
+/// `Invalid parameter:` plus the member the rejected value was carried in, as every
+/// other parameter refusal of this service is worded, and nothing else: the token is
+/// opaque and secret, so the sentence reproduces NEITHER the token the caller sent nor
+/// the one that was sent to the endpoint. The HTTP 400 and the `InvalidParameter` code
+/// are the requirement; this is SNS's wording of the reason.
+pub const INVALID_CONFIRMATION_TOKEN_REFUSAL: &str = "Invalid parameter: Token";
+
 /// The attribute names SNS defines for a subscription, from the `Subscribe` /
 /// `SetSubscriptionAttributes` docs. Closed for the same two reasons as
 /// [`TOPIC_ATTRIBUTE_NAMES`].
@@ -1023,6 +1045,17 @@ pub struct SubscriptionRecord {
     pub attributes: HashMap<String, String>,
     /// The subscriber has not confirmed yet, so SNS delivers nothing to it.
     pub pending_confirmation: bool,
+    /// The confirmation token `Subscribe` minted for this subscription, held for the
+    /// subscriptions whose subscriber has to confirm and `None` for the ones SNS
+    /// confirms itself.
+    ///
+    /// AWS sends it to the ENDPOINT — in the `SubscriptionConfirmation` message posted
+    /// to an HTTP/S endpoint or mailed to an email address — so it never travels on the
+    /// wire in either direction but the `ConfirmSubscription` caller's: this field is
+    /// this emulator's stand-in for that carrier, the way
+    /// [`SandboxPhoneNumberRecord::one_time_password`] stands in for the SMS one. No
+    /// response carries it and no refusal names it.
+    pub confirmation_token: Option<String>,
     pub created_at: SystemTime,
 }
 
@@ -2488,6 +2521,28 @@ pub struct PlatformEndpointRecord {
     pub created_at: SystemTime,
 }
 
+impl PlatformEndpointRecord {
+    /// The attributes a report of this endpoint carries: the device token the record
+    /// holds, the delivery flag, and whatever user data its owner associated with it.
+    ///
+    /// Shared by every report of an endpoint — the single read and the listing of an
+    /// application's endpoints — because what an endpoint's attributes are does not
+    /// depend on which call asked for them (`Endpoint$Attributes` is the same map
+    /// `GetEndpointAttributes` answers with). The token comes from the record's own
+    /// field rather than from the attribute map beside it, so one value has one
+    /// source; an endpoint nobody has disabled reports delivery ENABLED, since "Amazon
+    /// SNS will set this to false when a notification service indicates to Amazon SNS
+    /// that the endpoint is invalid" (`GetEndpointAttributes` doc).
+    pub fn reported_attributes(&self) -> HashMap<String, String> {
+        let mut attributes = self.attributes.clone();
+        attributes.insert(ENDPOINT_TOKEN_ATTRIBUTE.to_string(), self.token.clone());
+        attributes
+            .entry(ENDPOINT_ENABLED_ATTRIBUTE.to_string())
+            .or_insert_with(|| attribute_flag(true));
+        attributes
+    }
+}
+
 /// Per-service state for com-amazonaws-sns-amazonsimplenotificationservice. A handler reaches it through [`service_state`].
 ///
 /// Every CALLER-DRIVEN store here is therefore BOUNDED: `topics`,
@@ -2671,6 +2726,31 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
         found
     }
 
+    /// Every device endpoint of the platform application `application_arn`, oldest
+    /// first (the endpoint's own ARN breaking a tie), so a listing and its pagination
+    /// token are stable across calls — the endpoint counterpart of
+    /// [`Self::platform_applications_in_region`].
+    ///
+    /// Selected on the application the record names rather than on the region, because
+    /// an endpoint belongs to one application and that application's ARN carries the
+    /// region: the listing is already scoped by the application the caller named.
+    pub fn endpoints_of_application(
+        &self,
+        application_arn: &str,
+    ) -> Vec<&PlatformEndpointRecord> {
+        let mut found: Vec<&PlatformEndpointRecord> = self
+            .platform_endpoints
+            .values()
+            .filter(|endpoint| endpoint.platform_application_arn == application_arn)
+            .collect();
+        found.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.arn.cmp(&b.arn))
+        });
+        found
+    }
+
     /// `(SubscriptionsConfirmed, SubscriptionsPending)` for a topic, counted from the
     /// subscription records rather than from a stored counter.
     pub fn subscription_counts(&self, topic_arn: &str) -> (usize, usize) {
@@ -2755,6 +2835,28 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
             value = u64::from_be_bytes(bytes) % modulus,
             width = SANDBOX_OTP_DIGITS,
         )
+    }
+
+    /// A fresh confirmation token to send to the endpoint of a subscription awaiting
+    /// its subscriber's confirmation: the value `ConfirmSubscription` checks the
+    /// caller's `Token` against.
+    ///
+    /// [`CONFIRMATION_TOKEN_HEX_CHARS`] lowercase hexadecimal characters, minted from
+    /// the store's own id counter ([`Self::next_unique_id`]) so two subscriptions never
+    /// share a token, and NOT derived from the request, because a token the caller's own
+    /// request determines would leave the confirmation step deciding nothing. Opaque to
+    /// the caller: nothing but equality is read off it.
+    pub fn next_confirmation_token(&mut self) -> String {
+        let seed = self.next_unique_id();
+        // The width comes from the constant, not from the digest: a token is as many
+        // hexadecimal characters as the constant names, capped by the digest it is
+        // encoded from, so raising or lowering the constant cannot leave the token
+        // disagreeing with its own documented width.
+        let bytes: Vec<u8> = Sha256::digest(seed.as_bytes())
+            .into_iter()
+            .take(CONFIRMATION_TOKEN_HEX_CHARS / 2)
+            .collect();
+        hex::encode(bytes)
     }
 
     /// Record one delivery of `message` to `subscription_arn`, then bring the log back
@@ -3092,6 +3194,13 @@ pub const SUBSCRIPTION_DOES_NOT_EXIST: &str = "Subscription does not exist";
 /// identifier echoed back. The HTTP 404 and the `NotFound` code are the requirement;
 /// this is SNS's wording of the reason.
 pub const ENDPOINT_DOES_NOT_EXIST: &str = "Endpoint does not exist";
+
+/// The sentence SNS states for a PLATFORM APPLICATION this emulator holds no record of
+/// — the application counterpart of [`ENDPOINT_DOES_NOT_EXIST`], worded the same way:
+/// the resource kind that is missing, named as the mobile-push plane names it, with
+/// none of the caller's identifier echoed back. The HTTP 404 and the `NotFound` code
+/// are the requirement; this is SNS's wording of the reason.
+pub const PLATFORM_APPLICATION_DOES_NOT_EXIST: &str = "PlatformApplication does not exist";
 
 /// The sentence SNS states for a RESOURCE a call names and the account does not hold:
 /// the operations whose miss is the resource-scoped `ResourceNotFoundException` (the

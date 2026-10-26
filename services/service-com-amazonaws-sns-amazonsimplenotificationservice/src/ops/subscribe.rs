@@ -520,6 +520,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if let Some(held) = store.subscriptions.get_mut(&arn) {
                     held.attributes = merged;
                 }
+                // Its confirmation token is left as it is: the token already sent to
+                // that endpoint still names this subscription, so a subscriber part way
+                // through confirming is not stranded by a re-subscribe.
                 (arn, pending_confirmation)
             }
             None => {
@@ -538,6 +541,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 let pending_confirmation =
                     PROTOCOLS_NEEDING_CONFIRMATION.contains(&protocol.as_str());
+                // A subscription whose subscriber has to confirm gets the token SNS
+                // sends to its endpoint; one SNS confirms itself never has one to send.
+                let confirmation_token =
+                    pending_confirmation.then(|| store.next_confirmation_token());
                 let arn = {
                     let id = store.next_unique_id();
                     state::subscription_arn(&input.topic_arn, &id)
@@ -556,6 +563,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         owner,
                         attributes,
                         pending_confirmation,
+                        confirmation_token,
                         created_at: std::time::SystemTime::now(),
                     },
                 );
