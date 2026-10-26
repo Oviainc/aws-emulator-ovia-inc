@@ -466,24 +466,27 @@ impl JobState {
     /// Whether a job in this state has a device that can still be returned to AWS.
     ///
     /// `CreateReturnShippingLabel` "creates a shipping label that will be used to return
-    /// the Snow device to Amazon Web Services", so the job must still have a device on the
-    /// customer's side of that journey. Two groups of states leave it with none: a job in
-    /// `Cancelled` stopped before any appliance was prepared for it ("You can only cancel a
-    /// job before its `JobState` value changes to `PreparingAppliance`", `CancelJob`), so no
-    /// device of its own will ever ship; and a job that has reached
-    /// `WithAWSSortingFacility`, `WithAWS`, `InProgress` or `Complete` has its device back
-    /// at Amazon Web Services already — the `JobState` values that say where the device
-    /// is — so there is nothing left to return. From every other state the device is on its
-    /// way to the customer, with the customer, or on its way back and not yet received, and
-    /// a return shipment is still in play.
+    /// the Snow device to Amazon Web Services", so the label presupposes a device that has
+    /// left Amazon Web Services and has not been received back: `ShippingDetails` splits a
+    /// job's journey into the `OutboundShipment` of "a Snow device being delivered to the
+    /// address that you specified for a particular job" and the `InboundShipment` of "a Snow
+    /// device being returned to Amazon Web Services for a particular job", and the
+    /// `JobState` values that say where the device is put it on the customer's side of that
+    /// journey in exactly three of them: `InTransitToCustomer`, `WithCustomer` and
+    /// `InTransitToAWS`.
+    ///
+    /// Every other state leaves nothing to return. Before those three the order is still
+    /// being prepared and no device has been handed over: `New`, the state a job is created
+    /// in, `PreparingAppliance`, `PreparingShipment`, and `Cancelled`, which stopped before
+    /// any appliance was prepared for it ("You can only cancel a job before its `JobState`
+    /// value changes to `PreparingAppliance`", `CancelJob`), so no device of its own will
+    /// ever ship; `Listing` and `Pending` likewise say nothing about a device in the
+    /// customer's hands. After those three — `WithAWSSortingFacility`, `WithAWS`,
+    /// `InProgress`, `Complete` — the device is back at Amazon Web Services already.
     pub fn has_returnable_device(self) -> bool {
-        !matches!(
+        matches!(
             self,
-            Self::Cancelled
-                | Self::WithAWSSortingFacility
-                | Self::WithAWS
-                | Self::InProgress
-                | Self::Complete
+            Self::InTransitToCustomer | Self::WithCustomer | Self::InTransitToAWS
         )
     }
 
