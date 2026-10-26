@@ -33,6 +33,8 @@ mod domain_health;
 mod domain_lifecycle;
 #[path = "all/domain_nodes.rs"]
 mod domain_nodes;
+#[path = "all/engine_version_resolution.rs"]
+mod engine_version_resolution;
 #[path = "all/inbound_connections.rs"]
 mod inbound_connections;
 #[path = "all/index_registry.rs"]
@@ -71,6 +73,8 @@ mod scheduled_action_updates;
 mod scheduled_actions;
 #[path = "all/service_software_rollback.rs"]
 mod service_software_rollback;
+#[path = "all/service_software_update.rs"]
+mod service_software_update;
 #[path = "all/shared_es_signing_name_claim.rs"]
 mod shared_es_signing_name_claim;
 #[path = "all/single_package_association.rs"]

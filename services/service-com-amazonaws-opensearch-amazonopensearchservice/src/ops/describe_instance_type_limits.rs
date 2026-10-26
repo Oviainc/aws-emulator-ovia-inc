@@ -2,6 +2,11 @@
 
 //! @op DescribeInstanceTypeLimits
 //!
+//! The engine version is RESOLVED against the catalog of releases the service
+//! publishes ([`crate::state::resolve_engine_version`], the set `ListVersions`
+//! advertises) before any limit is reported: there are no limits to publish for a
+//! release the service does not offer.
+//!
 //! Reports the limits one instance type publishes on an engine version, per instance
 //! ROLE that type can serve: how many of it a domain holds in that role, the storage
 //! types that attach to it with their published ranges, and the role's additional
@@ -167,14 +172,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
 
         // "Version of OpenSearch or Elasticsearch, in the format Elasticsearch_X.Y or
-        // OpenSearch_X.Y" — which instance types exist is a function of that version,
-        // so a value no engine release can be read out of is refused rather than
-        // answered for an engine nothing runs.
-        let version = crate::state::parse_engine_version(&input.engine_version).ok_or_else(|| {
-            DescribeInstanceTypeLimitsErrorModeled::ValidationException(
-                crate::state::malformed_engine_version("EngineVersion", &input.engine_version),
-            )
-        })?;
+        // OpenSearch_X.Y" — the limits are a function of that release, so the label is
+        // RESOLVED against the published catalog rather than merely read apart: a value
+        // the catalog does not hold names no release the service offers, and there are
+        // no limits to publish for an engine nothing runs. `VersionString`'s pattern
+        // admits plenty of such values, so passing it is not resolving.
+        let version = crate::state::resolve_engine_version("EngineVersion", &input.engine_version)
+            .map_err(DescribeInstanceTypeLimitsErrorModeled::ValidationException)?;
 
         // `InstanceType` targets `OpenSearchPartitionInstanceType`, the model's record
         // of which instance types exist, so a value outside it names no instance type
