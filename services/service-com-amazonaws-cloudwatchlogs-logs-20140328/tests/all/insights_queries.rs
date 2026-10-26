@@ -13,8 +13,8 @@
 //!   `logGroupName`, `logGroupNames`, `logGroupIdentifiers`, or a `SOURCE` command in the
 //!   query string) are refused `InvalidParameterException`;
 //! * a request naming a log group this account does not hold is refused
-//!   `ResourceNotFoundException`, and one whose window ends before every log group it names
-//!   existed is refused `MalformedQueryException`;
+//!   `ResourceNotFoundException`, and so is one whose `lookup` command names a lookup table
+//!   this account does not hold;
 //! * an accepted request mints a `queryId` and stores the query, which `DescribeQueries`
 //!   then reports — `Scheduled` at first and `Complete` once the clock is past the spans the
 //!   start armed, filtered by the log group, the status and the query language the request
@@ -384,16 +384,6 @@ async fn the_window_and_the_log_group_selection_are_judged_as_parameters() {
             }),
             NOT_FOUND,
         ),
-        (
-            "a window that ends before the log group was created",
-            json!({
-                "logGroupName": GROUP,
-                "startTime": 0,
-                "endTime": 1_000,
-                "queryString": VALID_QUERY,
-            }),
-            MALFORMED,
-        ),
     ];
     for (case, body, expected) in cases {
         let (status, response) = logs.call(START, &body).await;
@@ -440,6 +430,18 @@ async fn the_window_and_the_log_group_selection_are_judged_as_parameters() {
                 "logGroupName": GROUP,
                 "startTime": end_time,
                 "endTime": end_time,
+                "queryString": VALID_QUERY,
+            }),
+        ),
+        (
+            // The window selects which EVENTS the query reads; it bounds no log group's
+            // lifetime, so a window wholly in the past of the group is a query that reads
+            // whatever events fall in it.
+            "a window that ends before the log group was created",
+            json!({
+                "logGroupName": GROUP,
+                "startTime": 0,
+                "endTime": 1_000,
                 "queryString": VALID_QUERY,
             }),
         ),

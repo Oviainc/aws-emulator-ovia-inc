@@ -196,179 +196,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(
-                ExportECSServiceRecommendationsErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: Some(
-                            "The Compute Optimizer recommendation store is unavailable."
-                                .to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        };
-
-        // A malformed request is refused BEFORE the store is read, so
-        // InvalidParameterValueException takes precedence over the opt-in gate below, as it
-        // does in every other operation of this service.
+        // Admitting the request and recording the job is the rule EVERY
+        // `Export*Recommendations` operation of this service applies, so it lives once in
+        // [`crate::state::export::create_export_job`] and this operation supplies only what
+        // its own surface settles.
         //
-        // `accountIds`: "You can specify multiple account IDs per request", each an Amazon
-        // Web Services account ID. "This parameter can't be specified together with the
-        // include member accounts parameter. The parameters are mutually exclusive."
-        let account_ids = input.account_ids.unwrap_or_default();
-        if !account_ids.is_empty() && input.include_member_accounts {
-            return Err(invalid_parameter(
-                "The value supplied for parameter accountIds is not valid: accountIds and \
-                 includeMemberAccounts are mutually exclusive."
-                    .to_string(),
-            ));
-        }
-        if let Some(value) = account_ids
-            .iter()
-            .find(|value| !crate::state::is_account_id(value))
-        {
-            return Err(invalid_parameter(format!(
-                "The value supplied for parameter accountIds is not valid: {value} is not a \
-                 12-digit Amazon Web Services account ID."
-            )));
-        }
-
-        // The filters select "a more specific set of Amazon ECS service recommendations":
-        // the same `ECSServiceRecommendationFilters` `GetECSServiceRecommendations` selects
-        // with, so a name or value outside that vocabulary is refused here too rather than
-        // silently exporting a different set. The modelled `@enum` on
-        // `ECSServiceRecommendationFilter$name` already refuses an unmodelled name at the
-        // request boundary, so this covers the VALUES a filter carries and a filter with no
-        // name.
-        let filters = input.filters.unwrap_or_default();
-        if let Some(reason) = crate::state::ecs_filter_rejection(&filters) {
-            return Err(invalid_parameter(reason));
-        }
-
         // `fileFormat` is a `FileFormat` ("The CSV file is the only export file format
         // currently supported") and `fieldsToExport` a list of `ExportableECSServiceField`,
         // both modelled enums whose values the request boundary already refuses anything
         // outside of, so reaching here means every value is one the model declares.
-
-        // "You must create the destination Amazon S3 bucket for your recommendations export
-        // before you create the export job. Compute Optimizer does not create the S3 bucket
-        // for you." There is no export without a bucket to write it to, so a request that
-        // names none is refused.
-        let bucket = input
-            .s3_destination_config
-            .bucket
-            .as_deref()
-            .map(str::trim)
-            .filter(|bucket| !bucket.is_empty());
-        let Some(bucket) = bucket else {
-            return Err(invalid_parameter(
-                "The value supplied for parameter s3DestinationConfig is not valid: a \
-                 destination bucket must be supplied."
-                    .to_string(),
-            ));
-        };
-        // And the bucket must already exist: the export is written INTO it, so a name no
-        // bucket of this emulator's object store answers to is refused rather than queued
-        // into a job whose export file could never appear.
-        if let Some(reason) =
-            crate::state::export::destination_bucket_rejection(&*self.engine, bucket)
-        {
-            return Err(invalid_parameter(reason));
-        }
-
-        // Compute Optimizer is regional: the export job belongs to the Region whose
-        // endpoint created it, and so does the one-job-in-progress limit below.
-        let region = crate::state::request_region(ctx);
-        let now = crate::state::now_secs();
-
-        let mut guard = state.lock();
-        if !guard.enrollment.is_opted_in() {
-            return Err(
-                ExportECSServiceRecommendationsErrorModeled::OptInRequiredException(
-                    OptInRequiredException {
-                        message: Some(
-                            "The account is not opted in to Compute Optimizer.".to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        }
-
-        // Creating a job is a write, so this is where the jobs the seven-day reporting
-        // window has dropped are let go of — a reader never writes.
-        guard.export_jobs.prune_expired(now);
-
-        // "You can only have one Amazon ECS service export job in progress per Amazon Web
-        // Services Region." A job that has reached its terminal status is not in progress,
-        // so the next export is admitted once the previous one completes, and a job of
-        // another resource type never blocks this one.
-        if let Some(running) = guard
-            .export_jobs
-            .in_progress_in(&region, EXPORTED_RESOURCE_TYPE, now)
-        {
-            let running = running.job_id.clone();
-            return Err(limit_exceeded(format!(
-                "You can only have one Amazon ECS service export job in progress per Amazon \
-                 Web Services Region. Export job {running} is still in progress."
-            )));
-        }
-        if !guard.export_jobs.can_hold() {
-            return Err(limit_exceeded(format!(
-                "The request exceeds a limit of the service: this emulator holds at most {} \
-                 recommendation export jobs.",
-                crate::state::MAX_EXPORT_JOBS
-            )));
-        }
-
-        // The export is for the account the request is signed for, which is the one account
-        // this emulator presents; `accountIds` and `includeMemberAccounts` select WHOSE
-        // recommendations go into the file, not where it is written.
-        let job_id = guard.export_jobs.mint_job_id();
-        let (key, metadata_key) = crate::state::export_destination_keys(
-            input.s3_destination_config.key_prefix.as_deref(),
-            ::engine::emulator_account_id(),
-            EXPORTED_RESOURCE_TYPE,
-            &job_id,
-        );
-        let plan = crate::state::export::ExportPlan {
-            job_id: job_id.clone(),
-            region,
-            resource_type: EXPORTED_RESOURCE_TYPE.to_string(),
-            bucket: bucket.to_string(),
-            key,
-            metadata_key,
-            // "The recommendations data to include in the export file", or every field the
-            // model declares for this resource type when the request selects none.
-            columns: crate::state::export::export_columns(
-                input.fields_to_export.as_deref(),
-                EXPORTABLE_E_C_S_SERVICE_FIELD_VALUES,
-            ),
-            file_format: input
-                .file_format
-                .unwrap_or_else(|| crate::state::export::FILE_FORMAT_CSV.to_string()),
-            account_ids,
-            include_member_accounts: input.include_member_accounts,
-            // The filters export "a more specific set of" recommendations, so they select
-            // which recommendations the export file holds.
-            filters: crate::state::export::filter_pairs(&filters),
-        };
-        // The destination this call answers is the job's own, so it names exactly the
-        // objects `DescribeRecommendationExportJobs` reports for the job and exactly the
-        // objects the completed job writes.
-        let s3_destination = guard.record_export_job(&plan, now).s3_destination();
-        drop(guard);
-
-        // An export this call did not create may have come due meanwhile, and this one comes
-        // due two lifecycle steps from now — the task is what makes the objects appear for a
-        // client that makes no further call to this service.
-        crate::state::export::deliver_and_schedule(&self.engine, now);
+        let created = crate::state::export::create_export_job(
+            &self.engine,
+            ctx,
+            crate::state::export::ExportRequest {
+                resource_type: EXPORTED_RESOURCE_TYPE,
+                account_ids: input.account_ids,
+                include_member_accounts: input.include_member_accounts,
+                // The filters select "a more specific set of Amazon ECS service
+                // recommendations": the same `ECSServiceRecommendationFilters`
+                // `GetECSServiceRecommendations` selects with, so a name or value outside
+                // that vocabulary is refused here too rather than silently exporting a
+                // different set. The modelled `@enum` on
+                // `ECSServiceRecommendationFilter$name` already refuses an unmodelled name
+                // at the request boundary, so this covers the VALUES a filter carries and a
+                // filter with no name.
+                filters: input.filters,
+                filter_rejection: crate::state::ecs_filter_rejection,
+                destination: &input.s3_destination_config,
+                fields_to_export: input.fields_to_export.as_deref(),
+                exportable_fields: EXPORTABLE_E_C_S_SERVICE_FIELD_VALUES,
+                file_format: input.file_format,
+                one_job_in_progress: ONE_JOB_IN_PROGRESS,
+            },
+        )
+        .map_err(refuse)?;
 
         Ok(ExportECSServiceRecommendationsOutput {
-            job_id: Some(job_id),
-            s3_destination: Some(s3_destination),
+            job_id: Some(created.job_id),
+            s3_destination: Some(created.s3_destination),
         })
     }
 }
@@ -379,22 +244,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// analysed resources are Amazon ECS services.
 const EXPORTED_RESOURCE_TYPE: &str = crate::state::RESOURCE_TYPE_ECS_SERVICE;
 
-/// The 400 `InvalidParameterValueException` this operation refuses a bad request with:
-/// "The value supplied for the input parameter is out of range or not valid."
-fn invalid_parameter(message: String) -> ExportECSServiceRecommendationsError {
-    ExportECSServiceRecommendationsErrorModeled::InvalidParameterValueException(
-        InvalidParameterValueException {
-            message: Some(message),
-        },
-    )
-    .into()
-}
+/// The one-job-in-progress limit this operation documents: "You can only have one Amazon ECS
+/// service export job in progress per Amazon Web Services Region." The shared admission rule
+/// refuses a second in-progress export of this resource type with it, naming the job that
+/// still holds it.
+const ONE_JOB_IN_PROGRESS: &str = "You can only have one Amazon ECS service export job in \
+                                   progress per Amazon Web Services Region.";
 
-/// The 400 `LimitExceededException` this operation refuses a request with when it cannot
-/// create another job: "The request exceeds a limit of the service."
-fn limit_exceeded(message: String) -> ExportECSServiceRecommendationsError {
-    ExportECSServiceRecommendationsErrorModeled::LimitExceededException(LimitExceededException {
-        message: Some(message),
-    })
+/// Lift a refusal of the shared export rule into this operation's modelled error channel:
+/// a 400 `InvalidParameterValueException` ("The value supplied for the input parameter is out
+/// of range or not valid"), a 400 `LimitExceededException` ("The request exceeds a limit of
+/// the service"), a 403 `OptInRequiredException` ("The account is not opted in to Compute
+/// Optimizer") or a 500 `InternalServerException`.
+fn refuse(refusal: crate::state::export::ExportRefusal) -> ExportECSServiceRecommendationsError {
+    use crate::state::export::ExportRefusal;
+
+    let message = Some(refusal.message());
+    match refusal {
+        ExportRefusal::StoreUnavailable => {
+            ExportECSServiceRecommendationsErrorModeled::InternalServerException(
+                InternalServerException { message },
+            )
+        }
+        ExportRefusal::InvalidParameter(_) => {
+            ExportECSServiceRecommendationsErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException { message },
+            )
+        }
+        ExportRefusal::OptInRequired => {
+            ExportECSServiceRecommendationsErrorModeled::OptInRequiredException(
+                OptInRequiredException { message },
+            )
+        }
+        ExportRefusal::LimitExceeded(_) => {
+            ExportECSServiceRecommendationsErrorModeled::LimitExceededException(
+                LimitExceededException { message },
+            )
+        }
+    }
     .into()
 }

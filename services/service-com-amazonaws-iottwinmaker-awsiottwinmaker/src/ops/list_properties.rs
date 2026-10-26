@@ -415,10 +415,12 @@ fn property_summary(
         component.properties,
         &property_name,
     );
-    let value =
-        crate::state::latest_property_value(component.properties.get(&property_name), definition);
+    let value = crate::state::latest_property_value(
+        component.properties.get(&property_name),
+        definition.as_ref(),
+    );
     PropertySummary {
-        definition: definition.and_then(|definition| {
+        definition: definition.as_ref().and_then(|definition| {
             crate::state::property_definition_response(
                 definition,
                 crate::state::property_definition_is_inherited(
