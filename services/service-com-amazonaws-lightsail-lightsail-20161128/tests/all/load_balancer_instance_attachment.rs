@@ -53,7 +53,11 @@ const DOES_NOT_EXIST: &str = "DoesNotExist";
 const MAX_INSTANCE_NAMES_PER_REQUEST: usize = 50;
 
 /// The stored load balancer `name` in `region`, as `GetLoadBalancer` reports it.
-async fn load_balancer(emulator: &Emulator, region: &str, name: &str) -> Value {
+///
+/// `pub(crate)` so the sibling suite that DETACHES instances reads the same
+/// registration through the same front door rather than writing the read a
+/// second time.
+pub(crate) async fn load_balancer(emulator: &Emulator, region: &str, name: &str) -> Value {
     emulator
         .ok_at(
             None,
@@ -67,7 +71,7 @@ async fn load_balancer(emulator: &Emulator, region: &str, name: &str) -> Value {
 
 /// The `instanceHealthSummary` entries the load balancer `name` reports in
 /// `region`, in the order it holds them.
-async fn health_summary(emulator: &Emulator, region: &str, name: &str) -> Vec<Value> {
+pub(crate) async fn health_summary(emulator: &Emulator, region: &str, name: &str) -> Vec<Value> {
     load_balancer(emulator, region, name).await["instanceHealthSummary"]
         .as_array()
         .cloned()
@@ -76,7 +80,11 @@ async fn health_summary(emulator: &Emulator, region: &str, name: &str) -> Vec<Va
 
 /// The instance names the load balancer `name` reports as registered in
 /// `region`, in registration order.
-async fn registered_instances(emulator: &Emulator, region: &str, name: &str) -> Vec<String> {
+pub(crate) async fn registered_instances(
+    emulator: &Emulator,
+    region: &str,
+    name: &str,
+) -> Vec<String> {
     health_summary(emulator, region, name)
         .await
         .iter()
@@ -90,7 +98,12 @@ async fn registered_instances(emulator: &Emulator, region: &str, name: &str) -> 
 }
 
 /// Create the load balancer `name` in `region` on `instance_port`.
-async fn create_load_balancer(emulator: &Emulator, region: &str, name: &str, instance_port: i64) {
+pub(crate) async fn create_load_balancer(
+    emulator: &Emulator,
+    region: &str,
+    name: &str,
+    instance_port: i64,
+) {
     emulator
         .ok_at(
             None,
@@ -106,7 +119,7 @@ async fn create_load_balancer(emulator: &Emulator, region: &str, name: &str, ins
 ///
 /// The transition is owed by the clock, not by the poll: it arrives without
 /// anyone asking more than once.
-async fn wait_for_load_balancer_state(
+pub(crate) async fn wait_for_load_balancer_state(
     emulator: &Emulator,
     region: &str,
     name: &str,
@@ -129,7 +142,7 @@ async fn wait_for_load_balancer_state(
 
 /// Poll `GetOperation` until the log entry `id` reports the terminal
 /// `Succeeded`, answering it.
-async fn wait_for_operation(emulator: &Emulator, id: &str) -> Value {
+pub(crate) async fn wait_for_operation(emulator: &Emulator, id: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let operation = emulator

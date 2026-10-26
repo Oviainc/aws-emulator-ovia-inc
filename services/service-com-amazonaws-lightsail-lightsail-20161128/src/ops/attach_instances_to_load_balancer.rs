@@ -278,9 +278,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             };
             for (name, _) in &targets {
-                if !balancer.attached_instances.contains(name) {
-                    balancer.attached_instances.push(name.clone());
-                }
+                balancer.register_instance(name);
             }
 
             // `operations` is a list because a Lightsail call can act on several

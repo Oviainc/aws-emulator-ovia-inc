@@ -10188,6 +10188,56 @@ pub struct StoredLoadBalancerCertificate {
     pub tags: Vec<Tag>,
 }
 
+/// One instance registered with a load balancer: the instance it names, and the
+/// instant its deregistration is due while one is outstanding.
+///
+/// A registration is a record of the load balancer, not of the instance: it is
+/// what `instanceHealthSummary` reports one entry per.
+#[derive(Debug, Clone)]
+pub struct StoredLoadBalancerRegistration {
+    /// The instance name the registration was made for, kept verbatim — it is
+    /// what `InstanceHealthSummary$instanceName` reports.
+    pub name: String,
+    /// The instant the clock owes this registration its removal, while a
+    /// deregistration is outstanding. While it is set the instance is still
+    /// registered and still reported, in the modelled `draining` health state.
+    pub drains_at_ms: Option<i64>,
+}
+
+impl StoredLoadBalancerRegistration {
+    /// Whether this registration is being deregistered.
+    pub fn is_draining(&self) -> bool {
+        self.drains_at_ms.is_some()
+    }
+
+    /// This registration as the modelled `InstanceHealthSummary`.
+    fn view(&self) -> InstanceHealthSummary {
+        // A registered instance starts out `initial`, and the modelled
+        // `instanceHealthReason` documentation gives the reason for that:
+        // "`Lb.RegistrationInProgress` - The target instance is in the process
+        // of being registered with the load balancer." This emulator runs no
+        // health checks, so no instance leaves it except by being deregistered,
+        // which the same enum names: "`Instance.DeregistrationInProgress` - The
+        // target instance is in the process of being deregistered".
+        let (health, reason) = if self.is_draining() {
+            (
+                INSTANCE_HEALTH_DRAINING,
+                INSTANCE_HEALTH_REASON_DEREGISTRATION_IN_PROGRESS,
+            )
+        } else {
+            (
+                INSTANCE_HEALTH_INITIAL,
+                INSTANCE_HEALTH_REASON_REGISTRATION_IN_PROGRESS,
+            )
+        };
+        InstanceHealthSummary {
+            instance_name: Some(self.name.clone()),
+            instance_health: Some(health.to_string()),
+            instance_health_reason: Some(reason.to_string()),
+        }
+    }
+}
+
 /// One stored load balancer: the configuration the caller asked for, the members
 /// the service assigned, and the lifecycle it is in.
 #[derive(Debug, Clone)]
@@ -10220,7 +10270,7 @@ pub struct StoredLoadBalancer {
     pub certificates: Vec<StoredLoadBalancerCertificate>,
     /// The instances registered with this load balancer, in registration order
     /// — what `instanceHealthSummary` reports one entry per.
-    pub attached_instances: Vec<String>,
+    pub attached_instances: Vec<StoredLoadBalancerRegistration>,
     /// Whether session stickiness is on, and for how long its cookie lives.
     ///
     /// `CreateLoadBalancer` exposes no stickiness parameter at all and its
@@ -10244,6 +10294,43 @@ impl StoredLoadBalancer {
         self.certificates
             .iter()
             .any(|certificate| certificate.is_attached)
+    }
+
+    /// Register the instance `name` with this load balancer.
+    ///
+    /// An instance is registered with a load balancer at most once — the
+    /// modelled `instanceHealthSummary` carries one entry per registered
+    /// instance — so registering one that is already registered leaves its
+    /// place in the registration order as it is. A registration that was
+    /// DRAINING stops draining: the instance the deregistration was going to
+    /// remove is one this call asks the load balancer to serve again.
+    pub fn register_instance(&mut self, name: &str) {
+        match self
+            .attached_instances
+            .iter_mut()
+            .find(|registration| registration.name == name)
+        {
+            Some(registration) => registration.drains_at_ms = None,
+            None => self.attached_instances.push(StoredLoadBalancerRegistration {
+                name: name.to_string(),
+                drains_at_ms: None,
+            }),
+        }
+    }
+
+    /// Begin the deregistration of the instance `name`, due at `at_ms`, and
+    /// answer the instant its removal is owed — or `None` when that instance is
+    /// not registered with this load balancer and there is nothing to remove.
+    ///
+    /// A deregistration already in flight keeps the instant it was already owed
+    /// rather than pushing it further out, so repeating the call cannot hold an
+    /// instance registered for longer.
+    pub fn start_deregistration(&mut self, name: &str, at_ms: i64) -> Option<i64> {
+        let registration = self
+            .attached_instances
+            .iter_mut()
+            .find(|registration| registration.name == name)?;
+        Some(*registration.drains_at_ms.get_or_insert(at_ms))
     }
 
     /// The certificate `name` names among the ones this load balancer holds.
@@ -10323,21 +10410,13 @@ impl StoredLoadBalancer {
             }),
             health_check_path: Some(self.health_check_path.clone()),
             instance_port: Some(self.instance_port),
-            // A registered instance starts out `initial`, and the modelled
-            // `instanceHealthReason` documentation gives the reason for that:
-            // "`Lb.RegistrationInProgress` - The target instance is in the
-            // process of being registered with the load balancer." This
-            // emulator runs no health checks, so no instance ever leaves it.
+            // One entry per registered instance, in registration order, each
+            // reporting the health its own registration is in (see
+            // [`StoredLoadBalancerRegistration::view`]).
             instance_health_summary: Some(
                 self.attached_instances
                     .iter()
-                    .map(|instance_name| InstanceHealthSummary {
-                        instance_name: Some(instance_name.clone()),
-                        instance_health: Some(INSTANCE_HEALTH_INITIAL.to_string()),
-                        instance_health_reason: Some(
-                            INSTANCE_HEALTH_REASON_REGISTRATION_IN_PROGRESS.to_string(),
-                        ),
-                    })
+                    .map(StoredLoadBalancerRegistration::view)
                     .collect(),
             ),
             tls_certificate_summaries: Some(
@@ -10362,6 +10441,17 @@ impl StoredLoadBalancer {
 pub const INSTANCE_HEALTH_INITIAL: &str = "initial";
 /// See [`INSTANCE_HEALTH_INITIAL`].
 pub const INSTANCE_HEALTH_REASON_REGISTRATION_IN_PROGRESS: &str = "Lb.RegistrationInProgress";
+
+/// The `InstanceHealthState` an instance whose deregistration is outstanding is
+/// in, from the modelled enum: it is still registered and still finishing the
+/// requests it holds, which is what `DetachInstancesFromLoadBalancer`'s own
+/// documentation describes ("This operation waits until the instances are no
+/// longer needed before they are detached from the load balancer").
+pub const INSTANCE_HEALTH_DRAINING: &str = "draining";
+/// See [`INSTANCE_HEALTH_DRAINING`] — the modelled `InstanceHealthReason` value
+/// for it.
+pub const INSTANCE_HEALTH_REASON_DEREGISTRATION_IN_PROGRESS: &str =
+    "Instance.DeregistrationInProgress";
 
 // ---------------------------------------------------------------------------
 // SSL/TLS certificates and CDN distributions
@@ -11920,13 +12010,13 @@ impl ComAmazonawsLightsailLightsail20161128State {
             if !balancer
                 .attached_instances
                 .iter()
-                .any(|attached| attached == name)
+                .any(|registration| registration.name == name)
             {
                 continue;
             }
             balancer
                 .attached_instances
-                .retain(|attached| attached != name);
+                .retain(|registration| registration.name != name);
             released.push(ReleasedAttachment {
                 operation_type: OPERATION_TYPE_DETACH_INSTANCES_FROM_LOAD_BALANCER,
                 resource_type: RESOURCE_TYPE_LOAD_BALANCER,
@@ -13218,6 +13308,13 @@ impl ComAmazonawsLightsailLightsail20161128State {
             }
         }
         for balancer in self.load_balancers.values_mut() {
+            // A registration whose deregistration has fallen due is gone: the
+            // instance was going to come off the load balancer at that instant
+            // whether or not anybody asked again, so the clock is what removes
+            // it rather than whoever happens to read the load balancer next.
+            balancer.attached_instances.retain(|registration| {
+                registration.drains_at_ms.is_none_or(|at_ms| at_ms > now_ms)
+            });
             let Some(due) = balancer.due else { continue };
             if due.at_ms <= now_ms {
                 balancer.state = due.state;
