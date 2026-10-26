@@ -6841,15 +6841,28 @@ pub fn invalid_setting_message(member: &str) -> String {
     format!("Invalid setting '{member}'")
 }
 
+/// The segment a validation path marks a step from a COLLECTION into one of its elements
+/// with: it stands after the element's position (a list) or the entry's key (a map), so a
+/// refused element reads `requiresCompatibilities.1.member`. It names no member of this
+/// API, and neither does the position or the key beside it, so a sentence that names a
+/// member reads through that pair to the collection member holding it.
+const COLLECTION_PATH_STEP: &str = "member";
+
 /// The words Amazon ECS names a member by in a refusal it builds from the request: the
 /// member's own name split at its camelCase boundaries, lower-cased
 /// (`assignPublicIp` -> `assign public ip`). A dotted validation path is named by its LAST
-/// segment, which is the member whose value was refused.
+/// segment that names a member — a nested member by its own name, an element or an entry
+/// of a collection by the collection member that holds it, never by the position or the
+/// key the caller put it at.
 pub fn member_words(member_path: &str) -> String {
-    let member = member_path
-        .rsplit('.')
-        .next()
-        .unwrap_or(member_path);
+    let mut segments: Vec<&str> = member_path.split('.').collect();
+    // A collection step is always preceded by the position or the key it stepped through,
+    // so the pair is dropped together, one pair per level of nesting. The leading segment
+    // is a member name whatever it spells, so it always stays.
+    while segments.len() > 2 && segments.last() == Some(&COLLECTION_PATH_STEP) {
+        segments.truncate(segments.len() - 2);
+    }
+    let member = segments.last().copied().unwrap_or(member_path);
     let mut words = String::with_capacity(member.len() + 4);
     for letter in member.chars() {
         if letter.is_uppercase() && !words.is_empty() {

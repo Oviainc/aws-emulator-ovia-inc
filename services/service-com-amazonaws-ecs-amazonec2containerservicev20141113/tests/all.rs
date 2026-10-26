@@ -43,6 +43,8 @@ mod daemons;
 mod describe_failure_identifiers;
 #[path = "all/ecs_wire.rs"]
 mod ecs_wire;
+#[path = "all/enum_value_refusals.rs"]
+mod enum_value_refusals;
 #[path = "all/error_messages.rs"]
 mod error_messages;
 #[path = "all/express_gateway_services.rs"]

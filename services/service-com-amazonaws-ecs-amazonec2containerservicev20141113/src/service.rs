@@ -97,17 +97,22 @@ const INVALID_PARAMETER_MESSAGE: &str =
 /// ([`INVALID_CLUSTER_IDENTIFIER`]). A value outside an ENUM's value set is worded from
 /// the request — the member in Amazon ECS's own words and the values it accepts
 /// ([`crate::state::enum_value_message`]), the sentence the corpus records for
-/// `assignPublicIp`. Every other one keeps the framework's clause, which states the
-/// value, the position and the requirement it failed, falling back to
-/// [`INVALID_PARAMETER_MESSAGE`] when there is no clause to state.
+/// `assignPublicIp`; when more than one value is outside its set, the sentence names the
+/// FIRST of them, which is the one member the caller has to change first, as every other
+/// refusal this service derives from a request does. Every other one keeps the
+/// framework's clause, which states the value, the position and the requirement it
+/// failed, falling back to [`INVALID_PARAMETER_MESSAGE`] when there is no clause to
+/// state.
 fn refusal_message(violations: &[Violation]) -> String {
     if violations.iter().any(is_unknown_cluster_field) {
         return INVALID_CLUSTER_IDENTIFIER.to_string();
     }
-    if let [violation] = violations {
-        if let ViolationKind::EnumValue(accepted) = &violation.kind {
-            return crate::state::enum_value_message(&violation.path, accepted);
-        }
+    let outside_an_enum = violations.iter().find_map(|violation| match &violation.kind {
+        ViolationKind::EnumValue(accepted) => Some((&violation.path, accepted)),
+        _ => None,
+    });
+    if let Some((path, accepted)) = outside_an_enum {
+        return crate::state::enum_value_message(path, accepted);
     }
     ::aws_smithy_schema_server::envelope(violations)
         .unwrap_or_else(|| INVALID_PARAMETER_MESSAGE.to_string())
