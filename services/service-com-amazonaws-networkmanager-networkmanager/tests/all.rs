@@ -111,6 +111,8 @@ mod organization_service_access;
 mod resource_not_found_message;
 #[path = "all/resource_policy_lifecycle.rs"]
 mod resource_policy_lifecycle;
+#[path = "all/resource_state_machine.rs"]
+mod resource_state_machine;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/route_analysis.rs"]

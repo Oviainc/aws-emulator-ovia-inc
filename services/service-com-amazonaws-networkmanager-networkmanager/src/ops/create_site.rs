@@ -221,6 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             location: input.location,
             created_at: now,
             available_at: now + crate::state::SETTLE_DELAY,
+            updating_until: None,
             tags: input.tags.unwrap_or_default(),
         };
         let site = record.to_shape(now);

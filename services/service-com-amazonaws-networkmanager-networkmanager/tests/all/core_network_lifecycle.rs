@@ -4,8 +4,8 @@
 //! router (the harness lives in `crate::global_network_lifecycle`).
 //!
 //! The rule under test: `CreateCoreNetwork` mints a core network inside the named global
-//! network and stores it, a core network is `CREATING` until the transition the clock owes
-//! falls due and `AVAILABLE` after it, and everything it then reports — its segments, its
+//! network and stores it, answering it already `AVAILABLE` — the state AWS reports a
+//! created core network in — and everything it then reports — its segments, its
 //! network function groups and its edges — is DERIVED from the policy document it holds,
 //! by the rules of the published core network policy schema. The tables below span that
 //! class: documents differing in how many edge locations they configure, whether an edge
@@ -381,24 +381,22 @@ async fn core_network_topology_is_derived_from_the_stored_policy_document() {
             "case {:?}: CreatedAt must be a timestamp, got {core_network}",
             case.name
         );
-        // The transition the clock owes has not fallen due yet, so the policy is not in
-        // force and the core network reports no topology.
+        // The create answers the core network ready, with the policy it carried already in
+        // force, so the topology the rules derive from that document is reported at once.
         assert_eq!(
             core_network["State"],
-            json!("CREATING"),
-            "case {:?}: a just-created core network is CREATING, got {core_network}",
+            json!("AVAILABLE"),
+            "case {:?}: a just-created core network is AVAILABLE, got {core_network}",
             case.name
         );
         assert_eq!(
-            core_network["Edges"],
-            json!([]),
-            "case {:?}: a CREATING core network has no edges yet, got {core_network}",
+            core_network["Edges"], case.edges,
+            "case {:?}: expected the edges the policy configures, got {core_network}",
             case.name
         );
         assert_eq!(
-            core_network["Segments"],
-            json!([]),
-            "case {:?}: a CREATING core network has no segments yet, got {core_network}",
+            core_network["Segments"], case.segments,
+            "case {:?}: expected the segments the policy names, got {core_network}",
             case.name
         );
         created.push((case, id));

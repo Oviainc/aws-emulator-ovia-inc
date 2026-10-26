@@ -203,7 +203,8 @@ async fn update_site_writes_only_the_supplied_members_and_round_trips_through_ge
     let sibling = create_seeded_site(&emulator, &network).await;
 
     // The PENDING -> AVAILABLE transition the create owes is past before the first
-    // update, so an update that restarted that clock would be visible here.
+    // update, so the UPDATING state each row observes below is the one its own update
+    // started rather than the create's unfinished span.
     std::thread::sleep(PAST_SETTLE);
 
     for (row, site_id) in rows.iter().zip(&sites) {
@@ -260,10 +261,12 @@ async fn update_site_writes_only_the_supplied_members_and_round_trips_through_ge
             "case {}: Tags must not be rewritten, got {site}",
             row.case
         );
+        // Applying the change is not instant, so the reconfigured site reports the
+        // transitional state its update is outstanding in.
         assert_eq!(
             site["State"],
-            json!("AVAILABLE"),
-            "case {}: an update must not restart the create's settle clock, got {site}",
+            json!("UPDATING"),
+            "case {}: an update answers the site as UPDATING, got {site}",
             row.case
         );
 

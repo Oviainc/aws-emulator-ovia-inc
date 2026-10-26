@@ -175,15 +175,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Only the members the request supplied are changed; an absent member leaves the
         // stored value alone, and a supplied one replaces it — an empty `Description`, or
         // a `Location` whose members are empty strings, is how the caller removes the
-        // information it holds. Ids, ARN, `CreatedAt`, tags and the clock-derived
-        // lifecycle state are never rewritten.
+        // information it holds. Ids, ARN, `CreatedAt` and tags are never rewritten.
         if input.description.is_some() {
             record.description = input.description;
         }
         if input.location.is_some() {
             record.location = input.location;
         }
-        let site = record.to_shape(::std::time::SystemTime::now());
+        // An update is not applied instantly: AWS answers the reconfigured site in the
+        // non-terminal `UPDATING` state, so the clock owes the `UPDATING` -> `AVAILABLE`
+        // transition and a caller reading straight after this call still observes it. The
+        // due instant is stored and compared against the clock; nothing sleeps for it.
+        let now = ::std::time::SystemTime::now();
+        record.updating_until = Some(now + crate::state::SETTLE_DELAY);
+        let site = record.to_shape(now);
 
         Ok(UpdateSiteOutput { site: Some(site) })
     }

@@ -7,11 +7,10 @@
 //! as it was, a supplied one REPLACES it, the empty string included — and rewrites nothing
 //! else. For a core network that means its ids, its ARN, its parent back-reference, its
 //! `CreatedAt`, its tags and the topology derived from the policy document it holds all
-//! survive the update, and its lifecycle state stays the one the clock gives it rather than
-//! one this call invents: a description configures no edge, no segment and no route, so
-//! nothing on the network has to be reconciled. Addressing a core network the store does
-//! not hold is the missing-resource answer (404 `ResourceNotFoundException`) and stores
-//! nothing.
+//! survive the update, while the record itself reads `UPDATING` until the transition the
+//! clock owes that reconfiguration falls due and `AVAILABLE` after it. Addressing a core
+//! network the store does not hold is the missing-resource answer (404
+//! `ResourceNotFoundException`) and stores nothing.
 //!
 //! Nothing reaches into `crate::state`: a core network is only ever read back through
 //! `GetCoreNetwork`. The harness is the one `global_network_lifecycle` defines.
@@ -163,8 +162,8 @@ async fn update_core_network_writes_only_the_description_and_round_trips_through
     }
     let (_, sibling) = create_seeded_core_network(&emulator, "sibling").await;
 
-    // The CREATING -> AVAILABLE transition the create owes is past before the first
-    // update, so an update that restarted that clock would be visible here.
+    // The create answers the core network already AVAILABLE, so the UPDATING state each
+    // row observes below is the one its own update started.
     tokio::time::sleep(PAST_SETTLE).await;
 
     for (row, (network, id)) in rows.iter().zip(&seeded) {
@@ -217,10 +216,13 @@ async fn update_core_network_writes_only_the_description_and_round_trips_through
             "case {}: Tags must not be rewritten, got {core_network}",
             row.case
         );
+        // Applying the change is not instant, so the reconfigured core network reports the
+        // transitional state its update is outstanding in — without losing the topology the
+        // policy in force configures, asserted below.
         assert_eq!(
             core_network["State"],
-            json!("AVAILABLE"),
-            "case {}: an update must not restart the create's settle clock, got {core_network}",
+            json!("UPDATING"),
+            "case {}: an update answers the core network as UPDATING, got {core_network}",
             row.case
         );
         assert_eq!(
@@ -329,42 +331,49 @@ async fn successive_updates_accumulate_on_the_stored_record() {
 }
 
 #[tokio::test]
-async fn update_core_network_keeps_the_lifecycle_state_the_clock_gives_the_record() {
+async fn update_core_network_reports_updating_until_the_transition_the_clock_owes_falls_due() {
     let emulator = Emulator::new();
     let (_, id) = create_seeded_core_network(&emulator, "settling").await;
 
-    // The create's transition is not due yet, so the record is still CREATING and the
-    // policy it holds is not in force: an update reports exactly that, rather than a state
-    // of its own.
+    // The create answers the core network AVAILABLE with its policy in force, so the
+    // transitional state below is the update's own.
+    let created = read_core_network(&emulator, &id).await;
+    assert_eq!(
+        created["State"],
+        json!("AVAILABLE"),
+        "case before the update: a created core network is AVAILABLE, got {created}"
+    );
+
     let (status, answer) = emulator
         .patch(
             &format!("/core-networks/{id}"),
-            json!({ "Description": "updated while creating" }),
+            json!({ "Description": "updated description" }),
         )
         .await;
     assert_eq!(
         status, 200,
-        "case while creating: expected 200, got {status} with {answer}"
+        "case while updating: expected 200, got {status} with {answer}"
     );
     let core_network = &answer["CoreNetwork"];
     assert_eq!(
         core_network["State"],
-        json!("CREATING"),
-        "case while creating: expected the create's state, got {core_network}"
+        json!("UPDATING"),
+        "case while updating: expected the update's state, got {core_network}"
     );
     assert_eq!(
         core_network["Description"],
-        json!("updated while creating"),
-        "case while creating: the description must still be written, got {core_network}"
+        json!("updated description"),
+        "case while updating: the description must be written, got {core_network}"
     );
+    // The policy in force is still in force while the update is outstanding.
     assert_eq!(
         core_network["Edges"],
-        json!([]),
-        "case while creating: a CREATING core network reports no edges, got {core_network}"
+        base_edges(),
+        "case while updating: expected the edges the policy configures, got {core_network}"
     );
 
-    // Once that transition falls due the record is AVAILABLE with the topology its policy
-    // configures, and the description the update wrote is still there.
+    // Once the transition the clock owes falls due the record is AVAILABLE again, with the
+    // description the update wrote still there — and nothing called in between.
     tokio::time::sleep(PAST_SETTLE).await;
     let stored = read_core_network(&emulator, &id).await;
     assert_eq!(
@@ -374,7 +383,7 @@ async fn update_core_network_keeps_the_lifecycle_state_the_clock_gives_the_recor
     );
     assert_eq!(
         stored["Description"],
-        json!("updated while creating"),
+        json!("updated description"),
         "case past the settle span: the update must have persisted, got {stored}"
     );
     assert_eq!(

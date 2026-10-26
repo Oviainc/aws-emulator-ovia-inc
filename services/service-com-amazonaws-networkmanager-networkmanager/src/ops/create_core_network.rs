@@ -3,9 +3,10 @@
 //! @op CreateCoreNetwork
 //! Creates the core network of a global network: mints the `CoreNetworkId` and
 //! `CoreNetworkArn`, stamps `CreatedAt`, stores the `PolicyDocument` the request supplied
-//! (the LIVE policy its reported segments and edges are derived from) and leaves the
-//! record `CREATING` until the settle span the clock owes elapses. `GetCoreNetwork`
-//! answers from that one record. This is the ONLY file to touch for this operation.
+//! (the LIVE policy its reported segments and edges are derived from) and answers the
+//! record already `AVAILABLE`, which is the state AWS reports a created core network in.
+//! `GetCoreNetwork` answers from that one record. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Reaching this service's state
 //!
@@ -272,7 +273,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             global_network_id: input.global_network_id,
             description: input.description,
             created_at: now,
-            available_at: now + crate::state::SETTLE_DELAY,
             policy_versions: ::std::collections::BTreeMap::new(),
             live_policy_version: None,
             policy_version_counter: 0,
@@ -291,8 +291,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(document) = input.policy_document {
             record.add_policy_version(document, None, None, now, true);
         }
-        // A core network is `CREATING` until the settle span the clock owes elapses, so the
-        // response reports the state the stored record is in now.
+        // AWS answers this create with the core network already `AVAILABLE`, so no
+        // transition is owed on its creation and the policy the create carried is in force
+        // at once: the response reports the state the stored record is in now
+        // (`crate::state::CoreNetworkRecord::state_at`).
         let core_network = record.to_shape(now);
         store.core_networks.insert(id, record);
 

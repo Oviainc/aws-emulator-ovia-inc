@@ -303,6 +303,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description,
             created_at: now,
             available_at: now + crate::state::SETTLE_DELAY,
+            updating_until: None,
             tags: input.tags.unwrap_or_default(),
         };
         let connection = record.to_shape(now);

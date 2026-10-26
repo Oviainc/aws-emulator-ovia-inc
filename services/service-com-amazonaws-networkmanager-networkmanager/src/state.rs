@@ -94,11 +94,18 @@ pub const STATE_DELETING: &str = "DELETING";
 /// update that reconfigures it and the instant that reconfiguration is applied.
 pub const STATE_UPDATING: &str = "UPDATING";
 
-/// The state a freshly created CORE network is in. `CoreNetworkState` is a different enum
-/// from the three above — CREATING, UPDATING, AVAILABLE, DELETING (`smithy_query
-/// shape=CoreNetworkState`, mirrored in `ops::types::CORE_NETWORK_STATE_VALUES`) — so a
-/// core network waits in CREATING where the resources above wait in [`STATE_PENDING`];
-/// AVAILABLE and DELETING it shares with them.
+/// The state a resource whose CREATION is still in flight is in, where the resources
+/// above wait in [`STATE_PENDING`]: a value of `CoreNetworkState`, `PeeringState`,
+/// `ConnectPeerState` and `AttachmentState` (`smithy_query
+/// shape=CoreNetworkState,PeeringState,ConnectPeerState,AttachmentState`, mirrored in
+/// `ops::types::CORE_NETWORK_STATE_VALUES` and the three beside it), which carry CREATING
+/// where `GlobalNetworkState` and its two siblings carry PENDING; AVAILABLE and DELETING
+/// they share with them.
+///
+/// A peering, a Connect peer and an attachment are each answered in it by the call that
+/// creates them and wait in it for the transition the clock owes. A CORE NETWORK is not:
+/// its create answers it already [`STATE_AVAILABLE`] ([`CoreNetworkRecord::state_at`]), so
+/// nothing of this service reports a core network in this state.
 pub const STATE_CREATING: &str = "CREATING";
 
 /// The state an ATTACHMENT waits in while the `attachment-policies` rule of the core
@@ -318,6 +325,10 @@ pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found.";
 ///
 /// `kind` is one of the ARN resource types this service mints ([`GLOBAL_NETWORK_KIND`],
 /// [`SITE_KIND`], [`LINK_KIND`]), which is also the `ResourceType` AWS reports.
+///
+/// `id` is the identifying detail the operation reports: the value the request addressed
+/// the resource by, except where AWS reports the NAME of the member that addressed it
+/// instead, which is what `ops/get_core_network.rs` passes [`FIELD_CORE_NETWORK_ID`] for.
 pub fn resource_not_found(kind: &str, id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: RESOURCE_NOT_FOUND_MESSAGE.to_string(),
@@ -1014,16 +1025,30 @@ pub struct GlobalNetworkRecord {
     pub created_at: SystemTime,
     /// The instant the `PENDING` -> `AVAILABLE` transition the clock owes becomes due.
     pub available_at: SystemTime,
+    /// The instant the `UPDATING` -> `AVAILABLE` transition the clock owes becomes due,
+    /// set by the update that reconfigured the global network and `None` while no update
+    /// has ever touched it. See [`GlobalNetworkRecord::state_at`].
+    pub updating_until: Option<SystemTime>,
     pub tags: Vec<Tag>,
 }
 
 impl GlobalNetworkRecord {
     /// This network's lifecycle state as of `now`.
+    ///
+    /// Both transitions are a function of the clock, so reading one never writes: a global
+    /// network is `UPDATING` from an update until that reconfiguration is applied,
+    /// `PENDING` until the create settles, and `AVAILABLE` once neither is outstanding. An
+    /// update OUTSTANDING is what it reports even when the create has not settled yet,
+    /// since that update is the later of the two requests it is still working on — the rule
+    /// [`LinkRecord::state_at`] states for every record of this service whose state enum
+    /// carries `UPDATING`.
     pub fn state_at(&self, now: SystemTime) -> &'static str {
-        if now >= self.available_at {
-            STATE_AVAILABLE
-        } else {
+        if self.updating_until.is_some_and(|due| now < due) {
+            STATE_UPDATING
+        } else if now < self.available_at {
             STATE_PENDING
+        } else {
+            STATE_AVAILABLE
         }
     }
 
@@ -1057,16 +1082,24 @@ pub struct SiteRecord {
     pub created_at: SystemTime,
     /// The instant the `PENDING` -> `AVAILABLE` transition the clock owes becomes due.
     pub available_at: SystemTime,
+    /// The instant the `UPDATING` -> `AVAILABLE` transition the clock owes becomes due,
+    /// set by the update that reconfigured the site and `None` while no update has ever
+    /// touched it. See [`SiteRecord::state_at`].
+    pub updating_until: Option<SystemTime>,
     pub tags: Vec<Tag>,
 }
 
 impl SiteRecord {
-    /// This site's lifecycle state as of `now`.
+    /// This site's lifecycle state as of `now`, by the rule [`LinkRecord::state_at`]
+    /// states: `UPDATING` while an update is outstanding, `PENDING` until the create
+    /// settles, and `AVAILABLE` once neither is.
     pub fn state_at(&self, now: SystemTime) -> &'static str {
-        if now >= self.available_at {
-            STATE_AVAILABLE
-        } else {
+        if self.updating_until.is_some_and(|due| now < due) {
+            STATE_UPDATING
+        } else if now < self.available_at {
             STATE_PENDING
+        } else {
+            STATE_AVAILABLE
         }
     }
 
@@ -1122,6 +1155,13 @@ impl LinkRecord {
     /// the create settles, and `AVAILABLE` once neither is outstanding. An update
     /// OUTSTANDING is what the link reports even when the create has not settled yet,
     /// since that update is the later of the two requests the link is still working on.
+    ///
+    /// This is the rule EVERY record of this service whose state enum carries `UPDATING`
+    /// follows ([`GlobalNetworkRecord::state_at`], [`SiteRecord::state_at`],
+    /// [`DeviceRecord::state_at`], [`ConnectionRecord::state_at`],
+    /// [`CoreNetworkRecord::state_at`], [`AttachmentRecord::state_at`]): an update of such
+    /// a resource is not applied instantly, so the resource reports the non-terminal state
+    /// its reconfiguration is outstanding in until the transition the clock owes falls due.
     pub fn state_at(&self, now: SystemTime) -> &'static str {
         if self.updating_until.is_some_and(|due| now < due) {
             STATE_UPDATING
@@ -1726,6 +1766,10 @@ pub struct ConnectionRecord {
     pub created_at: SystemTime,
     /// The instant the `PENDING` -> `AVAILABLE` transition the clock owes becomes due.
     pub available_at: SystemTime,
+    /// The instant the `UPDATING` -> `AVAILABLE` transition the clock owes becomes due,
+    /// set by the update that reconfigured the connection and `None` while no update has
+    /// ever touched it. See [`ConnectionRecord::state_at`].
+    pub updating_until: Option<SystemTime>,
     pub tags: Vec<Tag>,
 }
 
@@ -1733,12 +1777,15 @@ impl ConnectionRecord {
     /// This connection's lifecycle state as of `now`. `ConnectionState` carries the same
     /// four values as the enums above (`smithy_query shape=ConnectionState`: PENDING,
     /// AVAILABLE, DELETING, UPDATING, mirrored in `ops::types::CONNECTION_STATE_VALUES`),
-    /// so a connection waits in [`STATE_PENDING`] too.
+    /// so a connection waits in [`STATE_PENDING`] too and reports [`STATE_UPDATING`] while
+    /// a reconfiguration is outstanding, by the rule [`LinkRecord::state_at`] states.
     pub fn state_at(&self, now: SystemTime) -> &'static str {
-        if now >= self.available_at {
-            STATE_AVAILABLE
-        } else {
+        if self.updating_until.is_some_and(|due| now < due) {
+            STATE_UPDATING
+        } else if now < self.available_at {
             STATE_PENDING
+        } else {
+            STATE_AVAILABLE
         }
     }
 
@@ -1779,8 +1826,6 @@ pub struct CoreNetworkRecord {
     pub global_network_id: String,
     pub description: Option<String>,
     pub created_at: SystemTime,
-    /// The instant the `CREATING` -> `AVAILABLE` transition the clock owes becomes due.
-    pub available_at: SystemTime,
     /// Every policy version this core network holds, by `PolicyVersionId`. The documents
     /// live in these records alone, so a read of a version reports what was put, and the
     /// LIVE document is the document of the version [`Self::live_policy_version`] names.
@@ -1798,8 +1843,9 @@ pub struct CoreNetworkRecord {
     /// this untouched.
     pub topology: PolicyTopology,
     /// The instant the `UPDATING` -> `AVAILABLE` transition the clock owes becomes due,
-    /// set by the execution that put a policy version in force and `None` while no
-    /// execution has ever been started here. See [`CoreNetworkRecord::state_at`].
+    /// set by the update that reconfigured this core network — a description the caller
+    /// supplied, or the execution that put a policy version in force — and `None` while no
+    /// update has ever touched it. See [`CoreNetworkRecord::state_at`].
     pub updating_until: Option<SystemTime>,
     /// Whether the CREATE of this core network carried a policy document, which is what
     /// makes its first version the one [`Self::created_policy_document`] answers.
@@ -1973,17 +2019,16 @@ impl CoreNetworkRecord {
 
     /// This core network's lifecycle state as of `now`.
     ///
-    /// Both transitions are a function of the clock, so reading one never writes: a core
-    /// network is `UPDATING` while a policy version it is being deployed is still being
-    /// put in force, `CREATING` until the create settles, and `AVAILABLE` once neither is
-    /// outstanding. A deployment OUTSTANDING is what it reports even when the create has
-    /// not settled yet, since that execution is the later of the two requests it is still
-    /// working on.
+    /// The transition is a function of the clock, so reading one never writes: a core
+    /// network is `UPDATING` while a reconfiguration of it is still outstanding — a policy
+    /// version being put in force, or an update of its own members — and `AVAILABLE` once
+    /// none is, which is the state it is created in. `CreateCoreNetwork` answers the core
+    /// network ALREADY `AVAILABLE`, so nothing is owed on its creation and the modelled
+    /// `CREATING` ([`STATE_CREATING`]) is a state no core network of this service passes
+    /// through.
     pub fn state_at(&self, now: SystemTime) -> &'static str {
         if self.updating_until.is_some_and(|due| now < due) {
             STATE_UPDATING
-        } else if now < self.available_at {
-            STATE_CREATING
         } else {
             STATE_AVAILABLE
         }
@@ -1997,16 +2042,16 @@ impl CoreNetworkRecord {
     /// The modelled `CoreNetwork` for this record, forcing `state` — used by a delete,
     /// which reports the record it just removed as `DELETING`.
     ///
-    /// A core network's segments and edges exist only once its policy is in force, which
-    /// is what the `CREATING` -> `AVAILABLE` transition stands for, so before that instant
-    /// the topology is reported empty and afterwards it is the one derived from the stored
+    /// A core network's segments and edges are the ones the policy in force configures, so
+    /// a record being REMOVED — the one state a stored core network never reports itself in
+    /// — carries no topology, and every other state carries the one derived from the stored
     /// policy document. A policy being deployed over it (`UPDATING`) does not take the
     /// topology away: a policy IS in force there, the one that execution put in force.
     pub fn to_shape_with_state(&self, state: &str) -> CoreNetwork {
-        let topology = if state == STATE_AVAILABLE || state == STATE_UPDATING {
-            ::std::borrow::Cow::Borrowed(&self.topology)
-        } else {
+        let topology = if state == STATE_DELETING {
             ::std::borrow::Cow::Owned(PolicyTopology::default())
+        } else {
+            ::std::borrow::Cow::Borrowed(&self.topology)
         };
         CoreNetwork {
             global_network_id: Some(self.global_network_id.clone()),

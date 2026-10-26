@@ -587,7 +587,8 @@ async fn update_connection_writes_only_the_supplied_members_and_round_trips_thro
     let sibling = create_seeded_connection(&emulator, &seed).await;
 
     // The PENDING -> AVAILABLE transition the create owes is past before the first update,
-    // so an update that restarted that clock would be visible here.
+    // so the UPDATING state each row observes below is the one its own update started
+    // rather than the create's unfinished span.
     std::thread::sleep(PAST_SETTLE);
 
     for (row, connection_id) in rows.iter().zip(&connections) {
@@ -661,10 +662,12 @@ async fn update_connection_writes_only_the_supplied_members_and_round_trips_thro
             "case {}: Tags must not be rewritten, got {connection}",
             row.case
         );
+        // Applying the change is not instant, so the reconfigured connection reports the
+        // transitional state its update is outstanding in.
         assert_eq!(
             connection["State"],
-            json!("AVAILABLE"),
-            "case {}: an update must not restart the create's settle clock, got {connection}",
+            json!("UPDATING"),
+            "case {}: an update answers the connection as UPDATING, got {connection}",
             row.case
         );
 

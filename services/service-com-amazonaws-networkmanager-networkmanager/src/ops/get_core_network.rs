@@ -3,8 +3,10 @@
 //! @op GetCoreNetwork
 //! Answers from the one stored core network record `CreateCoreNetwork` minted: its state
 //! as of the clock, and the segments, network function groups and edges derived from the
-//! policy document in force on it. A pure read — it writes nothing. This is the ONLY file
-//! to touch for this operation.
+//! policy document in force on it. A pure read — it writes nothing. An id this store
+//! cannot resolve is the modelled `ResourceNotFoundException` (404), which names the
+//! REQUEST MEMBER the core network was addressed through rather than the id it carried.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Reaching this service's state
 //!
@@ -134,10 +136,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         let record = store.core_networks.get(&input.core_network_id).ok_or_else(|| {
+            // A core network this store cannot resolve is the modelled 404, and the
+            // identifying detail AWS reports for it is the NAME of the member the request
+            // addressed the core network through — `coreNetworkId`, in the lowerCamelCase
+            // spelling this service names its request members in — rather than the id that
+            // member carried: the recorded poll of this operation on a deleted core
+            // network (trace `networkmanager-core-network-lifecycle`, step `teardown#8`)
+            // answers `ResourceId` = `coreNetworkId` beside the constant message and the
+            // `core-network` resource type, and that step's request addressed a
+            // well-formed, store-minted id, which is what tells the two apart. The answer
+            // is therefore the same for every unresolvable id, which
+            // `tests/all/resource_not_found_message.rs` tables over two of them.
             GetCoreNetworkErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(
                     crate::state::CORE_NETWORK_KIND,
-                    &input.core_network_id,
+                    crate::state::FIELD_CORE_NETWORK_ID,
                 ),
             )
         })?;

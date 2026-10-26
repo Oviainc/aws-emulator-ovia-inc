@@ -13,6 +13,14 @@
 //! Every row below addresses a different resource kind through a different operation, so
 //! a message built from the request would differ between rows and fail here.
 //!
+//! The identifying detail is the VALUE the request addressed the resource by, except where
+//! AWS reports the NAME of the member that addressed it: a recorded poll of
+//! `GetCoreNetwork` on a deleted core network answers `ResourceId` = `coreNetworkId`, the
+//! service's own lowerCamelCase spelling of that request member, beside the same constant
+//! message and the `core-network` resource type. The two `GetCoreNetwork` rows below are
+//! what pin it: they address two DIFFERENT unresolvable ids and both answer that same
+//! `ResourceId`, which no refusal built from the request could.
+//!
 //! Every row is an operation acting on an EXISTING resource, which is what makes the
 //! absent resource a not-found. A CREATE whose input merely REFERENCES a parent that does
 //! not exist is the other half of the rule — a field-validation failure on the referencing
@@ -38,6 +46,13 @@ const SITE: &str = "site";
 const LINK: &str = "link";
 /// See [`GLOBAL_NETWORK`].
 const DEVICE: &str = "device";
+/// See [`GLOBAL_NETWORK`].
+const CORE_NETWORK: &str = "core-network";
+
+/// The request member `GetCoreNetwork` addresses a core network through, in the
+/// lowerCamelCase spelling this service names its members in — which is the identifying
+/// detail its not-found refusal reports, whatever id the request carried.
+const CORE_NETWORK_ID_MEMBER: &str = "coreNetworkId";
 
 /// One row: a request that must be refused as not found, and the resource the refusal
 /// has to identify.
@@ -143,12 +158,37 @@ async fn every_not_found_refusal_carries_the_constant_message_and_identifies_the
         "DeleteGlobalNetwork: expected 200, got {status} with {deleted_network}"
     );
 
+    // A core network of the kept global network, created and then deleted, so its id is
+    // well-formed and names nothing.
+    let (status, created_core) = emulator
+        .post(
+            "/core-networks",
+            json!({ "GlobalNetworkId": live_network, "Description": "to be deleted" }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "CreateCoreNetwork: expected 200, got {status} with {created_core}"
+    );
+    let gone_core = created_core["CoreNetwork"]["CoreNetworkId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateCoreNetwork: no CoreNetworkId in {created_core}"))
+        .to_string();
+    let (status, deleted_core) = emulator
+        .delete(&format!("/core-networks/{gone_core}"))
+        .await;
+    assert_eq!(
+        status, 200,
+        "DeleteCoreNetwork: expected 200, got {status} with {deleted_core}"
+    );
+
     // Ids and ARNs that were never minted, for the rows that address a resource the store
     // never held at all.
     let unknown_network = "global-network-00000000000000099".to_string();
     let unknown_site = "site-00000000000000099".to_string();
     let unknown_link = "link-00000000000000099".to_string();
     let unknown_device = "device-00000000000000099".to_string();
+    let unknown_core = "core-network-00000000000000099".to_string();
 
     let rows = vec![
         NotFoundCase {
@@ -238,6 +278,25 @@ async fn every_not_found_refusal_carries_the_constant_message_and_identifies_the
             body: None,
             resource_id: unknown_site,
             resource_type: SITE,
+        },
+        // The two rows AWS answers the MEMBER NAME for: two different unresolvable ids,
+        // one never minted and one deleted, both identified by the member that addressed
+        // them.
+        NotFoundCase {
+            case: "GetCoreNetwork on a core network that never existed",
+            method: "GET",
+            uri: format!("/core-networks/{unknown_core}"),
+            body: None,
+            resource_id: CORE_NETWORK_ID_MEMBER.to_string(),
+            resource_type: CORE_NETWORK,
+        },
+        NotFoundCase {
+            case: "GetCoreNetwork on a deleted core network",
+            method: "GET",
+            uri: format!("/core-networks/{gone_core}"),
+            body: None,
+            resource_id: CORE_NETWORK_ID_MEMBER.to_string(),
+            resource_type: CORE_NETWORK,
         },
     ];
 

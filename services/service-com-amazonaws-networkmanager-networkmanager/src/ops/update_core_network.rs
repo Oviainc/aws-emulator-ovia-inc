@@ -9,11 +9,9 @@
 //! update writes ONLY the members the request carries — an absent member leaves the stored
 //! value as it was, a supplied one REPLACES it, the empty string included — and rewrites
 //! nothing else, so the record keeps the identity (ids, ARN, `CreatedAt`), the tags, the
-//! policy history and the derived topology it already had. A description is metadata of
-//! the record alone: it configures no edge, no segment and no route, so nothing about the
-//! network has to be reconciled and the core network keeps the lifecycle state the clock
-//! gives it (`CREATING` until the create's transition falls due, `AVAILABLE` after it)
-//! rather than taking a state of this call's own.
+//! policy history and the derived topology it already had. Applying the change is not
+//! instant: the core network reads `UPDATING` until the transition the clock owes falls due
+//! and `AVAILABLE` after it, exactly as every other updatable record of this service does.
 //!
 //! An id the store does not hold is the missing-resource answer (404
 //! `ResourceNotFoundException`) and writes nothing.
@@ -165,13 +163,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the stored one alone, and a supplied one replaces it — the empty string
         // included, which is how this service's updates document removing information. The
         // ids, the ARN, `CreatedAt`, the tags, the policy versions and the topology derived
-        // from the policy in force are never rewritten, and the lifecycle state stays the
-        // one the clock gives the record: a description configures nothing on the network,
-        // so this call owes no transition of its own.
+        // from the policy in force are never rewritten.
         if input.description.is_some() {
             record.description = input.description;
         }
-        let core_network = record.to_shape(::std::time::SystemTime::now());
+        // An update is not applied instantly: AWS answers the reconfigured core network in
+        // the non-terminal `UPDATING` state, so the clock owes the `UPDATING` ->
+        // `AVAILABLE` transition and a caller reading straight after this call still
+        // observes it. The due instant is stored and compared against the clock; nothing
+        // sleeps for it, and the policy in force stays in force throughout
+        // (`crate::state::CoreNetworkRecord::to_shape_with_state`).
+        let now = ::std::time::SystemTime::now();
+        record.updating_until = Some(now + crate::state::SETTLE_DELAY);
+        let core_network = record.to_shape(now);
 
         Ok(UpdateCoreNetworkOutput {
             core_network: Some(core_network),
