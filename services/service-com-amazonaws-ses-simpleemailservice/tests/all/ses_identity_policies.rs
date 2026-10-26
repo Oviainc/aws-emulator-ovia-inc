@@ -23,7 +23,7 @@
 //! * an identity this account has not verified is refused by every one of these
 //!   operations ("this operation is for the identity owner only").
 
-use crate::harness::{call, element, elements, emulator, field, map_entries, Field};
+use crate::harness::{call, element, elements, emulator, field, map_entries, xml_text, Field};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The documented ceiling on one policy document: `PutIdentityPolicyRequest$Policy`
@@ -136,21 +136,6 @@ async fn fetched_policies(
         .into_iter()
         .map(|(name, document)| (name, xml_text(&document)))
         .collect()
-}
-
-/// XML character data as the value it stands for.
-///
-/// A policy document carries `"` and may carry `&`, which an XML body escapes;
-/// the assertion is about the DOCUMENT, so the escaping is undone before
-/// comparing. The five XML entities are the only ones a body can carry, and a
-/// document that was not escaped passes through unchanged.
-fn xml_text(data: &str) -> String {
-    data.replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&#39;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
 }
 
 /// One sending-authorization policy, written the way a client sends one: a

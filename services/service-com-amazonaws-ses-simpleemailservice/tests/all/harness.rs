@@ -132,3 +132,20 @@ pub fn map_entries(xml: &str) -> Vec<(String, String)> {
         })
         .collect()
 }
+
+/// XML character data as the value it stands for.
+///
+/// A value an assertion is about — a policy document, a refusal message — may
+/// carry `"`, `'`, `<`, `>` or `&`, which an XML body escapes; the escaping is
+/// undone before comparing. Those five entities are the only ones a body can
+/// carry, and data that was not escaped passes through unchanged. `&amp;` is
+/// replaced last, so an escaped ampersand is not re-read as the start of
+/// another entity.
+pub fn xml_text(data: &str) -> String {
+    data.replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}

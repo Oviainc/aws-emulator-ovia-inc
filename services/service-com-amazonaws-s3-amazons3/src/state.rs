@@ -4405,6 +4405,33 @@ impl Bucket {
         self.analytics_configurations.get(id)
     }
 
+    /// Drop the analytics configuration the bucket carries under `id`, reporting whether one
+    /// was there to drop.
+    ///
+    /// Per-ID, like the put: a delete "specified by the analytics configuration ID"
+    /// (`DeleteBucketAnalyticsConfiguration`'s own documentation) removes THAT configuration
+    /// and leaves every other id the bucket carries in place. `false` means the bucket
+    /// carried none under that id, which is what makes a delete answer
+    /// [`NO_SUCH_CONFIGURATION_CODE`] rather than report a removal it did not make.
+    pub fn delete_analytics_configuration(&mut self, id: &str) -> bool {
+        self.analytics_configurations.remove(id).is_some()
+    }
+
+    /// Every analytics configuration the bucket carries, in ascending id order — empty for a
+    /// bucket that carries none.
+    ///
+    /// The order is the store's own (a `BTreeMap` of ids), the reading
+    /// [`Self::metrics_configurations`] gives: two listings of an unchanged bucket report the
+    /// same sequence and a page can resume at the next id. The stored containers themselves,
+    /// so a listing reports what the puts recorded.
+    pub fn analytics_configurations(
+        &self,
+    ) -> impl Iterator<Item = (&str, &crate::ops::types::AnalyticsConfiguration)> + '_ {
+        self.analytics_configurations
+            .iter()
+            .map(|(id, configuration)| (id.as_str(), configuration))
+    }
+
     /// Associate `configuration` with the bucket under `id`, and report what that did.
     ///
     /// Per-ID and a full replacement of that id alone: a put "specified by the analytics

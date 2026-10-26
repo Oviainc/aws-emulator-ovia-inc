@@ -63,5 +63,7 @@ mod tagging_a_resource_not_ready;
 mod update_member_log_publishing;
 #[path = "all/update_node_log_publishing.rs"]
 mod update_node_log_publishing;
+#[path = "all/update_status_window.rs"]
+mod update_status_window;
 #[path = "all/vote_on_proposal.rs"]
 mod vote_on_proposal;
