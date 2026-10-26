@@ -163,7 +163,10 @@ const ROWS: &[Row] = &[
 /// Every operation-log entry a mutating response reports, in the order it lists
 /// them: a Lightsail call answers either one `operation` or a list of
 /// `operations`, depending on how many resources it can act on.
-fn answered_entries(case: &str, body: &Value) -> Vec<Value> {
+///
+/// `pub(crate)` so the suite for the ACCOUNT-wide read of the same log
+/// (`operations_log.rs`) reads a mutating answer exactly as this one does.
+pub(crate) fn answered_entries(case: &str, body: &Value) -> Vec<Value> {
     if let Some(entries) = body["operations"].as_array() {
         return entries.clone();
     }
@@ -174,8 +177,9 @@ fn answered_entries(case: &str, body: &Value) -> Vec<Value> {
     vec![body["operation"].clone()]
 }
 
-/// The `id` of each entry of `entries`, in order.
-fn ids(entries: &[Value]) -> Vec<String> {
+/// The `id` of each entry of `entries`, in order. Shared with the suite for the
+/// account-wide read of the same log (see [`answered_entries`]).
+pub(crate) fn ids(entries: &[Value]) -> Vec<String> {
     entries
         .iter()
         .map(|entry| {
@@ -187,8 +191,9 @@ fn ids(entries: &[Value]) -> Vec<String> {
         .collect()
 }
 
-/// The `operationType` of each entry of `entries`, in order.
-fn operation_types(entries: &[Value]) -> Vec<String> {
+/// The `operationType` of each entry of `entries`, in order. Shared with the
+/// suite for the account-wide read of the same log (see [`answered_entries`]).
+pub(crate) fn operation_types(entries: &[Value]) -> Vec<String> {
     entries
         .iter()
         .map(|entry| {

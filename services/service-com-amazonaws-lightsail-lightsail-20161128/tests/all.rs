@@ -181,6 +181,8 @@ mod load_balancer_tls_certificate_delete;
 mod load_balancer_tls_policies;
 #[path = "all/operations_for_resource.rs"]
 mod operations_for_resource;
+#[path = "all/operations_log.rs"]
+mod operations_log;
 #[path = "all/paging.rs"]
 mod paging;
 #[path = "all/region_catalog.rs"]

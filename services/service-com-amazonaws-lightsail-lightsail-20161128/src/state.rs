@@ -994,6 +994,14 @@ pub const ACTIVE_NAME_PAGE_SIZE: usize = 10;
 /// [`INSTANCE_PAGE_SIZE`], so every listing in this slice pages the same way.
 pub const OPERATIONS_FOR_RESOURCE_PAGE_SIZE: usize = 10;
 
+/// How many log entries one `GetOperations` page carries.
+///
+/// PUBLISHED, from that operation's own documentation: "Returns information
+/// about all operations. Results are returned from oldest to newest, up to a
+/// maximum of 200." It is therefore NOT the chosen size the rest of this
+/// slice's listings share.
+pub const OPERATIONS_PAGE_SIZE: usize = 200;
+
 // ---------------------------------------------------------------------------
 // Catalog paging
 // ---------------------------------------------------------------------------
@@ -13227,6 +13235,37 @@ impl ComAmazonawsLightsailLightsail20161128State {
                     Some(std::borrow::Cow::Borrowed(entry.id.as_str()))
                 },
             )?;
+        Some((
+            page.into_iter().map(StoredOperation::view).collect(),
+            next_page_token,
+        ))
+    }
+
+    /// One page of the WHOLE log — every entry recorded against every resource
+    /// of this account — oldest first, together with the id of the first entry
+    /// of the page after it, present only while entries remain.
+    ///
+    /// This is [`Self::operations_for_resource_page`] without the name filter,
+    /// and it pages exactly the same way (the one [`catalog_page`] walk, a token
+    /// that NAMES the entry a page starts at, `None` when the token names no
+    /// entry of the log) at the size `GetOperations` publishes,
+    /// [`OPERATIONS_PAGE_SIZE`].
+    ///
+    /// The log is append-only, so insertion order IS oldest first and an entry
+    /// outlives the resource it was recorded against. The walk is bounded by
+    /// [`MAX_OPERATION_HISTORY`], and the modelled view is built only for the
+    /// entries the page carries.
+    pub fn operations_page(
+        &self,
+        page_token: Option<&str>,
+    ) -> Option<(Vec<Operation>, Option<String>)> {
+        let reported: Vec<&StoredOperation> = self.operations.iter().collect();
+        let (page, next_page_token) =
+            catalog_page(&reported, OPERATIONS_PAGE_SIZE, page_token, |entry| {
+                // An entry's token is its own `id`, a member it already holds,
+                // so the walk LENDS it rather than cloning it.
+                Some(std::borrow::Cow::Borrowed(entry.id.as_str()))
+            })?;
         Some((
             page.into_iter().map(StoredOperation::view).collect(),
             next_page_token,
