@@ -55,6 +55,10 @@ const LATE_ACCOUNT: &str = "555555555555";
 /// `DisassociateAccounts` is tested too.
 const RELEASED_ACCOUNT: &str = "666666666666";
 
+/// An account a THIRD billing group bills, so ONE request can name resources of more
+/// than one billing group outside the target item's scope.
+const THIRD_GROUP_ACCOUNT: &str = "777777777777";
+
 /// A live emulator holding only this service.
 struct Emulator {
     router: MultiServiceRouter,
@@ -211,6 +215,37 @@ impl Emulator {
             .collect();
         pairs.sort();
         pairs
+    }
+
+    /// The `AssociationSize` `ListCustomLineItems` reports for the one item named
+    /// `name`: the count of resources the item holds, which an association that was
+    /// refused must not raise.
+    async fn association_size(&self, case: &str, name: &str) -> i64 {
+        let (status, body) = self
+            .send(
+                "POST",
+                "/list-custom-line-items",
+                &json!({ "Filters": { "Names": [name] } }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 listing the items, got {status} with {body}"
+        );
+        let items = body
+            .get("CustomLineItems")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            items.len(),
+            1,
+            "case {case:?}: expected exactly the item {name:?} reported, got {body}"
+        );
+        items[0]
+            .get("AssociationSize")
+            .and_then(Value::as_i64)
+            .unwrap_or_else(|| panic!("case {case:?}: expected an AssociationSize, got {body}"))
     }
 
     /// The `Name`s `ListCustomLineItems` reports for the request's `Filters`.
@@ -806,6 +841,353 @@ async fn the_account_an_item_is_applied_to_is_one_the_billing_group_bills() {
                     .is_empty(),
                 "case {case:?}: expected no item reported under an account the group does not \
                  bill"
+            );
+        }
+    }
+}
+
+/// THREE billing groups, so one `ResourceArns` list can name a resource the target
+/// percentage custom line item's charge may be computed over AND resources of more than
+/// one billing group it may not.
+struct BatchScope {
+    emulator: Emulator,
+    /// The billing group the target percentage custom line item applies to.
+    home: String,
+    /// The percentage custom line item the resources are associated to.
+    target: String,
+    /// A custom line item of the home group.
+    sibling: String,
+    /// A second one, so a row can name more than one in-scope custom line item.
+    second_sibling: String,
+    /// Another billing group, and a custom line item of it.
+    foreign: String,
+    foreigners_item: String,
+    /// A third billing group, and a custom line item of it.
+    third: String,
+    thirds_item: String,
+}
+
+impl BatchScope {
+    /// The three groups, their custom line items, and the percentage item under test.
+    async fn new() -> Self {
+        let emulator = Emulator::new();
+        let home = emulator
+            .billing_group("home", &[HOME_ACCOUNT, OTHER_HOME_ACCOUNT])
+            .await;
+        let foreign = emulator.billing_group("foreign", &[FOREIGN_ACCOUNT]).await;
+        let third = emulator.billing_group("third", &[THIRD_GROUP_ACCOUNT]).await;
+        let target = emulator.percentage_item(&home, "target").await;
+        let sibling = emulator.flat_item(&home, "sibling").await;
+        let second_sibling = emulator.flat_item(&home, "secondsibling").await;
+        let foreigners_item = emulator.flat_item(&foreign, "foreignitem").await;
+        let thirds_item = emulator.flat_item(&third, "thirditem").await;
+        Self {
+            emulator,
+            home,
+            target,
+            sibling,
+            second_sibling,
+            foreign,
+            foreigners_item,
+            third,
+            thirds_item,
+        }
+    }
+
+    /// The resource as the REQUEST spells it, in the form the row asks for.
+    fn named(&self, resource: BatchResource) -> String {
+        match resource {
+            BatchResource::OwnGroup => self.home.clone(),
+            BatchResource::OwnGroupById => bare_id(&self.home),
+            BatchResource::Sibling => self.sibling.clone(),
+            BatchResource::SiblingById => bare_id(&self.sibling),
+            BatchResource::SecondSibling => self.second_sibling.clone(),
+            BatchResource::OtherGroup => self.foreign.clone(),
+            BatchResource::OtherGroupById => bare_id(&self.foreign),
+            BatchResource::OtherGroupsItem => self.foreigners_item.clone(),
+            BatchResource::OtherGroupsItemById => bare_id(&self.foreigners_item),
+            BatchResource::ThirdGroup => self.third.clone(),
+            BatchResource::ThirdGroupsItem => self.thirds_item.clone(),
+        }
+    }
+
+    /// The FULL ARN of the resource the row names, whichever form it used: what a read
+    /// reports, and what a refusal names.
+    fn resolved(&self, resource: BatchResource) -> String {
+        match resource {
+            BatchResource::OwnGroup | BatchResource::OwnGroupById => self.home.clone(),
+            BatchResource::Sibling | BatchResource::SiblingById => self.sibling.clone(),
+            BatchResource::SecondSibling => self.second_sibling.clone(),
+            BatchResource::OtherGroup | BatchResource::OtherGroupById => self.foreign.clone(),
+            BatchResource::OtherGroupsItem | BatchResource::OtherGroupsItemById => {
+                self.foreigners_item.clone()
+            }
+            BatchResource::ThirdGroup => self.third.clone(),
+            BatchResource::ThirdGroupsItem => self.thirds_item.clone(),
+        }
+    }
+}
+
+/// Which resource a `ResourceArns` entry names, and in which of the two forms the
+/// member admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchResource {
+    /// The billing group the target applies to, by full ARN.
+    OwnGroup,
+    /// The same group, by bare id.
+    OwnGroupById,
+    /// A custom line item of that same group, by full ARN.
+    Sibling,
+    /// The same item, by bare id.
+    SiblingById,
+    /// A second custom line item of that same group.
+    SecondSibling,
+    /// Another billing group, by full ARN.
+    OtherGroup,
+    /// The same other group, by bare id.
+    OtherGroupById,
+    /// A custom line item of that other group, by full ARN.
+    OtherGroupsItem,
+    /// The same item, by bare id.
+    OtherGroupsItemById,
+    /// A THIRD billing group.
+    ThirdGroup,
+    /// A custom line item of that third group.
+    ThirdGroupsItem,
+}
+
+impl BatchResource {
+    /// Whether this resource is one the target's percentage can be computed over: the
+    /// billing group the target applies to, or a custom line item of that same group.
+    fn in_scope(self) -> bool {
+        matches!(
+            self,
+            Self::OwnGroup
+                | Self::OwnGroupById
+                | Self::Sibling
+                | Self::SiblingById
+                | Self::SecondSibling
+        )
+    }
+
+    /// The `Relationship` an accepted resource is reported with: the item's own billing
+    /// group is its PARENT, a custom line item of that group a CHILD
+    /// (`smithy_query(query="shape",shape="CustomLineItemRelationship")`).
+    fn relationship(self) -> &'static str {
+        match self {
+            Self::OwnGroup | Self::OwnGroupById => "PARENT",
+            _ => "CHILD",
+        }
+    }
+}
+
+/// The `Arn`s of `SuccessfullyAssociatedResources`, in the order the answer lists them.
+fn success_arns(body: &Value) -> Vec<String> {
+    body.get("SuccessfullyAssociatedResources")
+        .and_then(Value::as_array)
+        .unwrap_or(&Vec::new())
+        .iter()
+        .map(|element| string_at(element, "Arn"))
+        .collect()
+}
+
+/// The `(Arn, Error.Reason)` pairs of `FailedAssociatedResources`, in answer order.
+fn failed_reasons(body: &Value) -> Vec<(String, String)> {
+    body.get("FailedAssociatedResources")
+        .and_then(Value::as_array)
+        .unwrap_or(&Vec::new())
+        .iter()
+        .map(|element| {
+            (
+                string_at(element, "Arn"),
+                element
+                    .get("Error")
+                    .map(|error| string_at(error, "Reason"))
+                    .unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// The `Error.Message` of the failed element the caller named `arn`.
+fn failure_message(body: &Value, arn: &str) -> String {
+    body.get("FailedAssociatedResources")
+        .and_then(Value::as_array)
+        .unwrap_or(&Vec::new())
+        .iter()
+        .find(|element| string_at(element, "Arn") == arn)
+        .and_then(|element| element.get("Error"))
+        .map(|error| string_at(error, "Message"))
+        .unwrap_or_default()
+}
+
+/// The same scope rule, decided PER RESOURCE by
+/// `BatchAssociateResourcesToCustomLineItem`: it associates the billing group the target
+/// percentage item applies to and the custom line items of that same group, and reports
+/// every other resource — another billing group, another group's custom line item, by
+/// full ARN or bare id, anywhere in `ResourceArns`, however many of them — as its own
+/// `FailedAssociatedResources` element with the modelled `AssociateResourceErrorReason`,
+/// persisting it nowhere and never counting it in `AssociationSize`.
+///
+/// The rows differ along the class of the resource, the form it is named in, the side of
+/// the scope it is on, its position in the list, and how many resources of each side the
+/// one request names. Each row is sent TWICE, because the operation is `@idempotent`:
+/// the retry answers the same and the counts do not move.
+#[tokio::test]
+async fn a_batch_association_takes_only_resources_of_the_targets_own_billing_group() {
+    // (case, the resources `ResourceArns` names, in request order)
+    let rows: [(&str, &[BatchResource]); 12] = [
+        ("the item's own billing group alone", &[BatchResource::OwnGroup]),
+        (
+            "the own group by bare id and two sibling items",
+            &[
+                BatchResource::OwnGroupById,
+                BatchResource::Sibling,
+                BatchResource::SecondSibling,
+            ],
+        ),
+        ("a sibling item by bare id", &[BatchResource::SiblingById]),
+        (
+            "one sibling item named in both forms",
+            &[BatchResource::Sibling, BatchResource::SiblingById],
+        ),
+        ("another billing group alone", &[BatchResource::OtherGroup]),
+        (
+            "another billing group by bare id alone",
+            &[BatchResource::OtherGroupById],
+        ),
+        (
+            "another group's custom line item alone",
+            &[BatchResource::OtherGroupsItem],
+        ),
+        (
+            "another group's custom line item by bare id alone",
+            &[BatchResource::OtherGroupsItemById],
+        ),
+        (
+            "an out-of-scope resource first",
+            &[
+                BatchResource::OtherGroup,
+                BatchResource::OwnGroup,
+                BatchResource::Sibling,
+            ],
+        ),
+        (
+            "an out-of-scope resource last",
+            &[
+                BatchResource::OwnGroup,
+                BatchResource::Sibling,
+                BatchResource::OtherGroupsItem,
+            ],
+        ),
+        (
+            "an out-of-scope resource between two in scope",
+            &[
+                BatchResource::Sibling,
+                BatchResource::OtherGroupById,
+                BatchResource::SecondSibling,
+            ],
+        ),
+        (
+            "resources of two other billing groups",
+            &[
+                BatchResource::ThirdGroup,
+                BatchResource::ThirdGroupsItem,
+                BatchResource::OtherGroup,
+                BatchResource::OtherGroupsItemById,
+            ],
+        ),
+    ];
+
+    for (row, resources) in rows {
+        let scope = BatchScope::new().await;
+        let named: Vec<String> = resources
+            .iter()
+            .map(|resource| scope.named(*resource))
+            .collect();
+        // Every outcome below follows from which side of the scope each resource is on,
+        // not from the row: the in-scope ones succeed as the caller spelled them, the
+        // rest fail with the modelled reason.
+        let expected_success: Vec<String> = resources
+            .iter()
+            .filter(|resource| resource.in_scope())
+            .map(|resource| scope.named(*resource))
+            .collect();
+        // `AssociateResourceErrorReason` values from
+        // `smithy_query(query="shape",shape="AssociateResourceErrorReason")`: the one
+        // that classifies a resource this custom line item cannot be a percentage of.
+        let expected_failed: Vec<(String, String)> = resources
+            .iter()
+            .filter(|resource| !resource.in_scope())
+            .map(|resource| (scope.named(*resource), "ILLEGAL_CUSTOMLINEITEM".to_string()))
+            .collect();
+        let mut expected_associations: Vec<(String, String)> = resources
+            .iter()
+            .filter(|resource| resource.in_scope())
+            .map(|resource| {
+                (
+                    scope.resolved(*resource),
+                    resource.relationship().to_string(),
+                )
+            })
+            .collect();
+        expected_associations.sort();
+        // One resource named twice is ONE association.
+        expected_associations.dedup();
+
+        for attempt in ["first call", "retry"] {
+            let case = format!("{row} ({attempt})");
+            let (status, body) = scope.emulator.associate(&scope.target, &named).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a per-resource outcome is still a 200 batch answer, got \
+                 {status} with {body}"
+            );
+            assert_eq!(
+                success_arns(&body),
+                expected_success,
+                "case {case:?}: expected only the in-scope resources associated, as the caller \
+                 named them, got {body}"
+            );
+            assert_eq!(
+                failed_reasons(&body),
+                expected_failed,
+                "case {case:?}: expected every out-of-scope resource reported failed with the \
+                 modelled reason, got {body}"
+            );
+            for resource in resources.iter().filter(|resource| !resource.in_scope()) {
+                let named = scope.named(*resource);
+                let message = failure_message(&body, &named);
+                let resolved = scope.resolved(*resource);
+                assert!(
+                    message.contains(&resolved) && message.contains(&scope.home),
+                    "case {case:?}: expected the failure for {named:?} to name the resource \
+                     {resolved:?} and the billing group {:?} the item applies to, got \
+                     {message:?}",
+                    scope.home
+                );
+            }
+            assert_eq!(
+                scope.emulator.associations(&case, &scope.target).await,
+                expected_associations,
+                "case {case:?}: expected only the in-scope resources persisted"
+            );
+            assert_eq!(
+                scope.emulator.association_size(&case, "target").await,
+                i64::try_from(expected_associations.len()).expect("the association count fits"),
+                "case {case:?}: expected AssociationSize to count only the in-scope resources"
+            );
+        }
+
+        // The refused resources hold nothing of their own either: the request wrote on
+        // neither side of the scope.
+        for (label, arn) in [
+            ("the other group's item", &scope.foreigners_item),
+            ("the third group's item", &scope.thirds_item),
+        ] {
+            assert!(
+                scope.emulator.associations(row, arn).await.is_empty(),
+                "case {row:?}: expected {label} to hold no association"
             );
         }
     }
