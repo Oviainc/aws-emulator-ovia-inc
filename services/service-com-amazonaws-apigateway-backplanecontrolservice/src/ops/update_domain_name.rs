@@ -145,7 +145,7 @@
 use super::types::*;
 
 use crate::state::{
-    edge_distribution_domain_name, patch_enum_string, patch_optional_string,
+    edge_distribution_domain_name, patch_enum_string, patch_optional_string, patch_security_policy,
     patch_string_set, regional_endpoint_domain_name, DomainNameEntry, Patch, PatchFailure,
     PatchOpKind, DOMAIN_NAME_MIGRATION_SPAN, DOMAIN_NAME_UPDATING, EDGE_DISTRIBUTION_HOSTED_ZONE_ID,
     MAX_COLLECTION_ENTRIES, MAX_POLICY_CHARS, MAX_STRING_CHARS, PRIVATE_ENDPOINT_TYPE,
@@ -217,10 +217,9 @@ fn apply_patch(entry: &mut DomainNameEntry, patch: &Patch) -> Result<(), PatchFa
             MAX_STRING_CHARS,
         ),
         // A patch `value` is a bare string on the wire, so an enum-typed member's value
-        // set is checked here rather than by the boundary validator.
-        "securityPolicy" => {
-            patch_enum_string(&mut entry.security_policy, patch, SECURITY_POLICY_VALUES)
-        }
+        // set is checked here rather than by the boundary validator. `securityPolicy`
+        // carries its own refusal sentence; see `patch_security_policy`.
+        "securityPolicy" => patch_security_policy(&mut entry.security_policy, patch),
         "endpointAccessMode" => patch_enum_string(
             &mut entry.endpoint_access_mode,
             patch,

@@ -29,7 +29,7 @@ use crate::ops::types::{
     AccessLogSettings, ApiStage, CanarySettings, DocumentationPartLocation, EndpointConfiguration,
     GetGatewayResponseOutput, GetIntegrationOutput, GetMethodResponseOutput, GetSdkTypeOutput,
     MethodSetting, MethodSnapshot, MutualTlsAuthentication, QuotaSettings,
-    SdkConfigurationProperty, ThrottleSettings,
+    SdkConfigurationProperty, ThrottleSettings, SECURITY_POLICY_VALUES,
 };
 
 /// Per-service state for com-amazonaws-apigateway-backplanecontrolservice. A handler reaches it through [`service_state`].
@@ -2302,23 +2302,68 @@ pub fn patch_required_string(
 /// Apply `patch` to a single-valued string member whose value set the model declares as
 /// an enum: as [`patch_optional_string`], plus the enum's own values, because a patch
 /// `value` is a bare string on the wire and so reaches the handler unvalidated.
+///
+/// The member is refused with the generic sentence this service has for a value no
+/// declared set holds — the member, its values and the rejected one. A member whose
+/// out-of-set value API Gateway answers with a sentence of its OWN passes that sentence
+/// to [`patch_enum_string_refused_with`] instead.
 pub fn patch_enum_string(
     current: &mut Option<String>,
     patch: &Patch,
     values: &[&str],
 ) -> Result<(), PatchFailure> {
+    patch_enum_string_refused_with(current, patch, values, |value| {
+        format!(
+            "{} takes one of {}, got {value:?}",
+            patch.path,
+            values.join(", ")
+        )
+    })
+}
+
+/// Apply `patch` to an enum-typed member as [`patch_enum_string`] does, refusing a value
+/// the declared set does not hold with the sentence `refusal` builds.
+///
+/// The op rules and the bound live here once, so a member with its own refusal wording
+/// cannot drift from the members that take the generic one.
+pub fn patch_enum_string_refused_with(
+    current: &mut Option<String>,
+    patch: &Patch,
+    values: &[&str],
+    refusal: impl FnOnce(&str) -> String,
+) -> Result<(), PatchFailure> {
     if matches!(patch.op, PatchOpKind::Add | PatchOpKind::Replace) {
         patch.require_single_valued()?;
         let value = patch.require_value()?;
         if !values.contains(&value) {
-            return Err(PatchFailure::BadRequest(format!(
-                "{} takes one of {}, got {value:?}",
-                patch.path,
-                values.join(", ")
-            )));
+            return Err(PatchFailure::BadRequest(refusal(value)));
         }
     }
     patch_optional_string(current, patch, MAX_STRING_CHARS)
+}
+
+/// The `BadRequestException` message for a TLS security policy that is not one of the
+/// values the modelled `SecurityPolicy` enum declares
+/// (`smithy_query(query="shape", shape="SecurityPolicy")`).
+///
+/// API Gateway answers this condition with ONE sentence of entirely fixed text: it names
+/// neither the rejected value, nor the member or patch path that carried it, nor the
+/// policies it would have accepted, as a recorded refusal of a `/securityPolicy` replace
+/// shows. One copy for every resource whose `securityPolicy` a caller can set, so a
+/// client classifying this refusal against the operation's other bad requests reads the
+/// same sentence whichever resource it was made on.
+pub const INVALID_SECURITY_POLICY: &str = "Invalid security policy specified";
+
+/// Apply `patch` to a `securityPolicy` member: as [`patch_enum_string`], except that a
+/// value outside the member's declared set is refused with [`INVALID_SECURITY_POLICY`],
+/// the service's own sentence for that condition.
+pub fn patch_security_policy(
+    current: &mut Option<String>,
+    patch: &Patch,
+) -> Result<(), PatchFailure> {
+    patch_enum_string_refused_with(current, patch, SECURITY_POLICY_VALUES, |_| {
+        INVALID_SECURITY_POLICY.to_string()
+    })
 }
 
 /// Apply `patch` to a boolean member. `remove` is refused: a boolean member declared

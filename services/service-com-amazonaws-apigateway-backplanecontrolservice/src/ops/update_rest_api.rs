@@ -118,8 +118,8 @@
 use super::types::*;
 
 use crate::state::{
-    patch_bool, patch_enum_string, patch_optional_string, patch_string_set, Patch, PatchFailure,
-    RestApiEntry, MAX_COLLECTION_ENTRIES, MAX_POLICY_CHARS, MAX_STRING_CHARS,
+    patch_bool, patch_enum_string, patch_optional_string, patch_security_policy, patch_string_set,
+    Patch, PatchFailure, RestApiEntry, MAX_COLLECTION_ENTRIES, MAX_POLICY_CHARS, MAX_STRING_CHARS,
 };
 
 // `minimumCompressionSize` is checked through the SAME checker `CreateRestApi` runs — the
@@ -147,13 +147,12 @@ fn apply_patch(entry: &mut RestApiEntry, patch: &Patch) -> Result<(), PatchFailu
             patch_bool(&mut entry.disable_execute_api_endpoint, patch)
         }
         // A patch `value` is a bare string on the wire, so an enum-typed member's value
-        // set is checked here rather than by the boundary validator.
+        // set is checked here rather than by the boundary validator. `securityPolicy`
+        // carries its own refusal sentence; see `patch_security_policy`.
         "apiKeySource" => {
             patch_enum_string(&mut entry.api_key_source, patch, API_KEY_SOURCE_TYPE_VALUES)
         }
-        "securityPolicy" => {
-            patch_enum_string(&mut entry.security_policy, patch, SECURITY_POLICY_VALUES)
-        }
+        "securityPolicy" => patch_security_policy(&mut entry.security_policy, patch),
         "endpointAccessMode" => patch_enum_string(
             &mut entry.endpoint_access_mode,
             patch,

@@ -210,3 +210,5 @@ mod stage_invoke_request_id;
 mod update_api_key_patch_path_refusal;
 #[path = "all/delete_request_validator.rs"]
 mod delete_request_validator;
+#[path = "all/invalid_security_policy.rs"]
+mod invalid_security_policy;
