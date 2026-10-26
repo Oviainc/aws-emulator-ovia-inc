@@ -276,12 +276,19 @@ async fn every_deletable_resource_is_accepted_and_reported_in_the_state_it_reach
 
         // Deleting it again follows that resource's own single-resource delete:
         // `DeleteInput` and the group's delete are idempotent once the state the
-        // caller asks for is reached or on its way, while `DeleteChannel` and a
-        // multiplex delete refuse a channel or multiplex that is not IDLE.
+        // caller asks for is reached or on its way; `DeleteChannel` answers an
+        // id whose delete it has already accepted as NOT FOUND, because that id
+        // names no channel left to delete; and a multiplex delete refuses a
+        // multiplex that is not IDLE with its state conflict.
         let (successful, failed) =
             batch_delete(&router, case, json!({ member: [id.clone()] })).await;
-        match member {
-            "inputSecurityGroupIds" | "inputIds" => {
+        let repeated_code = match member {
+            "inputSecurityGroupIds" | "inputIds" => None,
+            "channelIds" => Some("NotFoundException"),
+            _ => Some("ConflictException"),
+        };
+        match repeated_code {
+            None => {
                 assert_eq!(
                     successful.len(),
                     1,
@@ -303,7 +310,7 @@ async fn every_deletable_resource_is_accepted_and_reported_in_the_state_it_reach
                     successful[0]
                 );
             }
-            _ => {
+            Some(code) => {
                 assert!(
                     successful.is_empty(),
                     "case {case:?}: expected no second accepted delete, got {successful:?}"
@@ -315,8 +322,8 @@ async fn every_deletable_resource_is_accepted_and_reported_in_the_state_it_reach
                 );
                 assert_eq!(
                     failed[0]["code"],
-                    json!("ConflictException"),
-                    "case {case:?}: expected ConflictException, got {:?}",
+                    json!(code),
+                    "case {case:?}: expected {code}, got {:?}",
                     failed[0]
                 );
             }
@@ -326,10 +333,11 @@ async fn every_deletable_resource_is_accepted_and_reported_in_the_state_it_reach
 
 /// Rule: a resource `BatchDelete` cannot delete is reported in `Failed` with the
 /// error code the single-resource delete of that resource answers with — an id
-/// the account does not hold is `NotFoundException`, a resource whose state does
-/// not allow the delete is `ConflictException`, and a resource another one still
-/// uses is the client error its own delete models — and the resource is left
-/// exactly as it was.
+/// the account does not hold and a channel id whose delete it has already
+/// accepted are `NotFoundException`, a resource that still exists whose state
+/// does not allow the delete is `ConflictException`, and a resource another one
+/// still uses is the client error its own delete models — and the resource is
+/// left exactly as it was.
 ///
 /// The table spans every refusal this slice can produce, over all four request
 /// members, and the two shapes an entry takes: with the resource's ARN when the
