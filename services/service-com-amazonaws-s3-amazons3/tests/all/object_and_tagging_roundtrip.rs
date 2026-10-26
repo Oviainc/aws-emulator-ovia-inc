@@ -77,6 +77,8 @@ fn sized_object(length: usize) -> Object {
         restore: None,
         // And it attaches no annotation; `PutObjectAnnotation` is what does.
         annotations: std::collections::BTreeMap::new(),
+        // Nor an ACL; `PutObjectAcl` is what sets one.
+        acl: None,
         body,
     }
 }

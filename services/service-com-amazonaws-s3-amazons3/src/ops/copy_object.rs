@@ -730,6 +730,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             } else {
                 source_object.annotations.clone()
             },
+            // The destination carries no ACL of the source's: an ACL is not copied with the
+            // bytes ("the ACL of the destination object" is the one the copy request names,
+            // `CopyObjectRequest$ACL`), so the copy starts where every write starts — the
+            // owner's `FULL_CONTROL`, which a reader derives — until a `PutObjectAcl` sets
+            // one on it.
+            acl: None,
             body: source_object.body.clone(),
         };
         if replaces_metadata {
