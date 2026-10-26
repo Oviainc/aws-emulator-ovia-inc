@@ -392,6 +392,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carries one and a request naming only that member names no stream.
         let stream = store
             .resolve_stream(
+                now,
                 &region,
                 input.stream_name.as_deref(),
                 input.stream_arn.as_deref(),
