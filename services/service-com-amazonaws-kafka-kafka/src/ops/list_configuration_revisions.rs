@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConfigurationRevisions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConfigurationRevisions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Pages one MSK configuration's revision history, reporting each stored revision
+//! as the `ConfigurationRevision` shape — the same rendering
+//! [`crate::state::ConfigurationRevisionRecord::to_configuration_revision`] gives
+//! `UpdateConfiguration` and `DescribeConfiguration`, so the writer and every
+//! reader of a stored revision agree on one record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConfigurationRevisions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The history is append-only and numbered from 1, so it is already in revision
+//! order: this listing walks it in that order, `MaxResults` bounds the page (a
+//! value outside the modelled 1..100 range is refused at the boundary with this
+//! service's `BadRequestException`), and `NextToken` is an opaque encoding of the
+//! configuration and the revision the page stopped at — absent from the last page.
+//!
+//! A configuration is addressed by ARN, so a value that is not an MSK
+//! configuration ARN is a bad request, while a well-formed one this endpoint's
+//! region holds no configuration for is not found: the same distinction
+//! `DescribeConfigurationRevision` draws.
+//!
+//! A reporting operation: it only reads the registry. A configuration is created
+//! `ACTIVE` and a stored revision never changes, so the clock owes this read no
+//! transition to materialise.
+//!
+//! Authentication and authorization are NOT this handler's business: the emulator
+//! verifies every request signature centrally (see `AGENTS.md`), so the modelled
+//! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
+//! constructed here.
 //!
 //! ## Shape of an operation
 //!
@@ -115,6 +131,47 @@ impl From<ListConfigurationRevisionsErrorModeled> for ListConfigurationRevisions
     }
 }
 
+/// The largest page `MaxResults` may ask for, from that member's `range` in the
+/// model (`MaxResults`, 1..100); a request outside that range is refused at the
+/// boundary.
+const MAX_RESULTS_LIMIT: i32 = 100;
+
+/// Marker that prefixes a token's plaintext, so a token minted for some other
+/// list cannot be mistaken for one of these.
+const NEXT_TOKEN_PREFIX: &str = "kafka:configuration-revisions:";
+
+/// Separates the configuration ARN a token was minted for from the revision the
+/// page stopped at. An MSK ARN cannot contain it, so the plaintext splits back
+/// into exactly two fields.
+const NEXT_TOKEN_SEPARATOR: char = '#';
+
+/// Encode the configuration and the revision a page stopped at as a token. Base64
+/// of a marked plaintext: the token is ENCODED, not authenticated, so a caller
+/// could decode it or mint one. That is harmless here — the number inside is only
+/// used as a `>` comparison against the revisions of the configuration the request
+/// already names, so a forged resume point can only skip or repeat revisions the
+/// caller may already list.
+fn encode_next_token(arn: &str, last_revision: i64) -> String {
+    ::aws_smithy_types::base64::encode(format!(
+        "{NEXT_TOKEN_PREFIX}{arn}{NEXT_TOKEN_SEPARATOR}{last_revision}"
+    ))
+}
+
+/// The revision a token resumes after, or `None` when the token is not one this
+/// operation minted FOR THIS CONFIGURATION: a token carries the list it was minted
+/// from, so one configuration's token cannot resume another's history.
+fn decode_next_token(token: &str, arn: &str) -> Option<i64> {
+    let decoded = ::aws_smithy_types::base64::decode(token).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (token_arn, last_revision) = decoded
+        .strip_prefix(NEXT_TOKEN_PREFIX)?
+        .rsplit_once(NEXT_TOKEN_SEPARATOR)?;
+    if token_arn != arn {
+        return None;
+    }
+    last_revision.parse::<i64>().ok()
+}
+
 /// The `ListConfigurationRevisions` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -151,18 +208,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConfigurationRevisions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConfigurationRevisionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConfigurationRevisions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListConfigurationRevisionsErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some("the kafka service state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        if !crate::state::is_configuration_arn(&input.arn) {
+            return Err(
+                ListConfigurationRevisionsErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("Arn".to_string()),
+                    message: Some(format!(
+                        "{} is not a valid Amazon MSK configuration ARN.",
+                        input.arn
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // `MaxResults` outside the modelled 1..100 range never reaches here: the
+        // boundary refuses it with this service's own `BadRequestException` (see
+        // `override_refusal` in `crate::service`), so a page size is never
+        // silently clamped to the nearest legal size behind the caller's back.
+
+        // A token names the revision the previous page stopped at; the next page
+        // starts after it in revision order, so a revision appended between
+        // pages shifts nothing already returned.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match decode_next_token(token, &input.arn) {
+                Some(revision) => Some(revision),
+                None => {
+                    return Err(ListConfigurationRevisionsErrorModeled::BadRequestException(
+                        BadRequestException {
+                            invalid_parameter: Some("NextToken".to_string()),
+                            message: Some("The pagination token is not valid.".to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // Absent `MaxResults` pages at the largest size the model allows. The
+        // conversion is total rather than trusting the value: no caller of this
+        // handler may size an allocation from a number the boundary has not
+        // already bounded.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_RESULTS_LIMIT))
+            .unwrap_or(MAX_RESULTS_LIMIT as usize)
+            .clamp(1, MAX_RESULTS_LIMIT as usize);
+
+        // Reporting only: nothing here writes.
+        let state = state.lock();
+
+        // The revisions are listed FROM a configuration, so an endpoint that
+        // holds none for this ARN has no history to serve — a missing resource,
+        // not an empty page.
+        let Some(configuration) = state.configuration_in(&region, &input.arn) else {
+            return Err(
+                ListConfigurationRevisionsErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: Some("Arn".to_string()),
+                    message: Some(format!(
+                        "No configuration exists in {region} with the ARN {}",
+                        input.arn
+                    )),
+                })
+                .into(),
+            );
+        };
+
+        // The history is stored in revision order and only ever appended to, so
+        // the page walks it from its resume point and stops as soon as it is
+        // full.
+        let mut page: Vec<ConfigurationRevision> = Vec::with_capacity(page_size);
+        let mut last_revision: Option<i64> = None;
+        let mut more_remain = false;
+        for revision in configuration
+            .revisions
+            .iter()
+            .filter(|stored| resume_after.is_none_or(|last| stored.revision > last))
+        {
+            if page.len() == page_size {
+                more_remain = true;
+                break;
+            }
+            page.push(revision.to_configuration_revision());
+            last_revision = Some(revision.revision);
+        }
+
+        // The token is minted from the REVISION NUMBER the resume comparison
+        // uses, so the two can never disagree, and only a page that left
+        // something behind carries one: a full page that exhausted the history
+        // closes the list.
+        let next_token = if more_remain {
+            last_revision.map(|last| encode_next_token(&input.arn, last))
+        } else {
+            None
+        };
+
+        Ok(ListConfigurationRevisionsOutput {
+            next_token,
+            revisions: Some(page),
+        })
     }
 }

@@ -57,6 +57,8 @@ mod destinations;
 mod event_cursor_envelope;
 #[path = "all/export_tasks.rs"]
 mod export_tasks;
+#[path = "all/export_time_windows.rs"]
+mod export_time_windows;
 #[path = "all/field_indexes.rs"]
 mod field_indexes;
 #[path = "all/fixed_text_refusals.rs"]
@@ -95,6 +97,8 @@ mod log_group_tags;
 mod log_stream_removal;
 #[path = "all/lookup_table_enumeration.rs"]
 mod lookup_table_enumeration;
+#[path = "all/lookup_table_queries.rs"]
+mod lookup_table_queries;
 #[path = "all/lookup_table_removal.rs"]
 mod lookup_table_removal;
 #[path = "all/lookup_table_updates.rs"]

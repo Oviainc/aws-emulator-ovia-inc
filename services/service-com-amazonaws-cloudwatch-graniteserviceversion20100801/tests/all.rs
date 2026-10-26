@@ -15,6 +15,8 @@
 mod alarm_action_dispatch;
 #[path = "all/alarm_action_failures.rs"]
 mod alarm_action_failures;
+#[path = "all/alarm_action_region.rs"]
+mod alarm_action_region;
 #[path = "all/alarm_actions_switch.rs"]
 mod alarm_actions_switch;
 #[path = "all/alarm_configuration.rs"]

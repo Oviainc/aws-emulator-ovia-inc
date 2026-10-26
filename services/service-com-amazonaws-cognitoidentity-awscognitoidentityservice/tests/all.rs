@@ -29,6 +29,8 @@ mod identity_pool_roles_presence;
 mod list_identity_pools;
 #[path = "all/lookup_developer_identity.rs"]
 mod lookup_developer_identity;
+#[path = "all/open_id_token.rs"]
+mod open_id_token;
 #[path = "all/principal_tag_attribute_map.rs"]
 mod principal_tag_attribute_map;
 #[path = "all/resource_tags.rs"]

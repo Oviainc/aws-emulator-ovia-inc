@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(held) = service
                 .images
                 .iter()
-                .position(|image| image.image == input.image)
+                .position(|image| image.name(&input.service_name) == input.image)
             {
                 service.images.remove(held);
             }

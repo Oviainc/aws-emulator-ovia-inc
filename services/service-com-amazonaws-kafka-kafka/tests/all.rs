@@ -27,6 +27,8 @@ mod compatible_kafka_versions;
 mod configuration_deletion;
 #[path = "all/configuration_lifecycle.rs"]
 mod configuration_lifecycle;
+#[path = "all/configuration_revision_listing.rs"]
+mod configuration_revision_listing;
 #[path = "all/configuration_revision_properties.rs"]
 mod configuration_revision_properties;
 #[path = "all/configuration_revisions.rs"]

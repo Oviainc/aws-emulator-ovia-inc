@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // request.
             return Err(UpdateDomainNameErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some("Invalid domain name identifier specified".to_string()),
+                    message: Some(crate::state::INVALID_DOMAIN_NAME_IDENTIFIER.to_string()),
                     resource_type: ::std::option::Option::None,
                 },
             )

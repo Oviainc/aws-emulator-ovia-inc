@@ -26,6 +26,10 @@
 //!   `QueueDeletedRecently`.
 //! - "If you don't specify the FifoQueue attribute, Amazon SQS creates a standard
 //!   queue", and "A FIFO queue name must end with the .fifo suffix."
+//! - The two server-side encryption options are mutually exclusive, and a queue whose
+//!   create names neither is on the Amazon SQS owned key: which option the created
+//!   queue carries is [`crate::state::encryption::apply_encryption_choice`], and what it
+//!   reports is [`crate::state::encryption::report`].
 //!
 //! ## Shape of an operation
 //!
@@ -273,6 +277,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone())),
         );
+        // The two server-side encryption options are exclusive, and a request naming
+        // one takes the queue off the other: the queue stores the option it is on and
+        // never both at once. A request naming BOTH asks for something no queue can be.
+        if let Some(error) = state::encryption::encryption_choice_refusal(&supplied) {
+            return Err(CreateQueueErrorModeled::InvalidAttributeName(error).into());
+        }
+        state::encryption::apply_encryption_choice(&mut attributes, &supplied);
         // Two attributes can each be valid and still not hold together, so the pair is
         // judged over the set the queue would CARRY rather than over what this request
         // supplied.

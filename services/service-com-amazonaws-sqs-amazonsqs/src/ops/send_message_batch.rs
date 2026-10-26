@@ -14,7 +14,11 @@
 //! queue's `MaximumMessageSize` (`BatchRequestTooLong`) — "the maximum allowed
 //! individual message size and the maximum total payload size (the sum of the individual
 //! lengths of all of the batched messages)" are the same bound, so an oversized single
-//! entry is refused by it too.
+//! entry is refused by it too. So is a queue whose customer managed KMS key cannot be
+//! used for this caller: the key belongs to the queue, so it refuses the whole request
+//! with the `Kms*` error of its class rather than failing an entry at a time
+//! ([`crate::state::encryption::authorize_queue_key`]), and it is asked about only once
+//! the request's own shape is one AWS would act on.
 //!
 //! Past those, each entry is judged on its own against the queue, by exactly the rules
 //! `SendMessage` applies to one message — the body's character set, the FIFO members
@@ -235,7 +239,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let store = sqs::service_state(&*self.engine).ok_or_else(|| {
             SendMessageBatchErrorModeled::UnsupportedOperation(sqs::store_unavailable())
         })?;
@@ -287,6 +290,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
+
+        // The request is one AWS would act on, so now the queue's encryption key is asked
+        // about — once, because every entry goes to ONE queue: a queue encrypted with a
+        // customer managed key needs KMS to generate the data key its messages are sealed
+        // under, as this caller, and a caller the key does not permit has the whole batch
+        // refused with nothing enqueued. Asked AFTER the refusals about the request's own
+        // shape, which AWS answers without reaching the key at all.
+        sqs::encryption::authorize_queue_key(
+            &*self.engine,
+            ctx,
+            &input.queue_url,
+            sqs::encryption::GENERATE_DATA_KEY_ACTION,
+        )
+        .map_err(kms_refusal)?;
 
         let mut state = store.lock();
         let now = SystemTime::now();
@@ -492,6 +509,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(SendMessageBatchOutput { successful, failed })
     }
+}
+
+/// The KMS refusal of the queue's key, as this operation's own modelled error.
+///
+/// Each class answers with the code KMS answers it with — the `awsQueryError` codes the
+/// model carries for these shapes (`KMS.NotFoundException`, `KMS.DisabledException`,
+/// `KMS.InvalidStateException`, `KMS.InvalidKeyUsageException`,
+/// `KMS.AccessDeniedException`) — carrying the message KMS words that refusal in. The
+/// key belongs to the QUEUE, not to an entry, so it refuses the whole request rather
+/// than filling a `failed` entry per message.
+fn kms_refusal(refusal: sqs::encryption::KeyRefusal) -> SendMessageBatchError {
+    use sqs::encryption::KeyRefusal;
+    match refusal {
+        KeyRefusal::NotFound(message) => SendMessageBatchErrorModeled::KmsNotFound(KmsNotFound {
+            message: Some(message),
+        }),
+        KeyRefusal::Disabled(message) => SendMessageBatchErrorModeled::KmsDisabled(KmsDisabled {
+            message: Some(message),
+        }),
+        KeyRefusal::InvalidState(message) => {
+            SendMessageBatchErrorModeled::KmsInvalidState(KmsInvalidState {
+                message: Some(message),
+            })
+        }
+        KeyRefusal::InvalidKeyUsage(message) => {
+            SendMessageBatchErrorModeled::KmsInvalidKeyUsage(KmsInvalidKeyUsage {
+                message: Some(message),
+            })
+        }
+        KeyRefusal::AccessDenied(message) => {
+            SendMessageBatchErrorModeled::KmsAccessDenied(KmsAccessDenied {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
 }
 
 /// One batch entry's attribute maps and the bytes it retains, measured once for the

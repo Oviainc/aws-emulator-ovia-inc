@@ -33,7 +33,7 @@ const TEBIBYTE: i64 = 1024 * 1024 * 1024 * 1024;
 /// cases have shared with the caller through Resource Access Manager. A synthetic,
 /// non-routable placeholder in the same all-zero family as `engine::emulator_account_id`;
 /// no real account id appears anywhere.
-const SHARING_ACCOUNT_ID: &str = "000000000001";
+pub(crate) const SHARING_ACCOUNT_ID: &str = "000000000001";
 
 /// The Outpost [`SHARING_ACCOUNT_ID`] has shared with the caller.
 pub(crate) const SHARED_OUTPOST_ID: &str = "op-2c3d4e5f607182930";

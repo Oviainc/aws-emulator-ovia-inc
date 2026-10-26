@@ -177,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     service
                         .images
                         .iter()
-                        .map(crate::state::StoredContainerImage::view)
+                        .map(|image| image.view(&service.name))
                         .collect::<Vec<_>>()
                 })
                 .ok_or_else(|| not_found(&input.service_name))

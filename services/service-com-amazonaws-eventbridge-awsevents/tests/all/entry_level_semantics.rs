@@ -558,15 +558,29 @@ const PARSE_PROBE_VALUE: i32 = 7;
 const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 /// Run `work` on a thread sized like one of the emulator's own workers (see
-/// [`WORKER_STACK_BYTES`]), under a runtime of its own. The future is built
-/// INSIDE that thread, so nothing of the emulator has to cross a thread
-/// boundary to get there.
+/// [`WORKER_STACK_BYTES`]), under a runtime of its own.
 fn on_a_worker_sized_thread<F>(work: fn() -> F)
 where
     F: ::std::future::Future<Output = ()> + 'static,
 {
+    on_a_thread_with(WORKER_STACK_BYTES, work);
+}
+
+/// The stack a thread gets when nobody sizes it (the Rust default), which is a
+/// small fraction of [`WORKER_STACK_BYTES`]: reading a document as deep as this
+/// service publishes supplies the stack that read needs itself, so the thread a
+/// request arrives on does not have to be large for the document to be read.
+const ORDINARY_STACK_BYTES: usize = 2 * 1024 * 1024;
+
+/// Run `work` on a thread of `stack_bytes`, under a runtime of its own. The
+/// future is built INSIDE that thread, so nothing of the emulator has to cross a
+/// thread boundary to get there.
+fn on_a_thread_with<F>(stack_bytes: usize, work: fn() -> F)
+where
+    F: ::std::future::Future<Output = ()> + 'static,
+{
     ::std::thread::Builder::new()
-        .stack_size(WORKER_STACK_BYTES)
+        .stack_size(stack_bytes)
         .spawn(move || {
             ::tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -574,9 +588,9 @@ where
                 .expect("the test runtime starts")
                 .block_on(work());
         })
-        .expect("the worker-sized thread starts")
+        .expect("the sized thread starts")
         .join()
-        .expect("the worker-sized thread finishes");
+        .expect("the sized thread finishes");
 }
 
 /// An entry's `Detail` may nest JSON as deep as the operation documents —
@@ -678,6 +692,111 @@ async fn nesting_depth_rows() {
             assert_eq!(
                 last.matched_rules,
                 vec!["reaches-into-detail".to_string()],
+                "case {case:?}: expected the rule reaching into detail to match, got {:?}",
+                last.matched_rules
+            );
+            assert_eq!(
+                last.detail.as_deref(),
+                Some(detail.as_str()),
+                "case {case:?}: the routed Detail must be the published one"
+            );
+        }
+    }
+    assert_eq!(
+        routed(&emulator).len(),
+        expected_matches,
+        "expected {expected_matches} routed events, got {}",
+        routed(&emulator).len()
+    );
+}
+
+/// A `Detail` at the published nesting bound is published, parsed and matched on
+/// a thread with no more stack than an ordinary one
+/// ([`ORDINARY_STACK_BYTES`]) — reading a document that deep provides the stack
+/// its own descent needs — while a document past the bound is still refused
+/// without being read at all. The rows span the bound over objects, arrays and
+/// mixed nesting.
+#[test]
+fn the_deepest_detail_is_read_without_a_large_request_stack() {
+    on_a_thread_with(ORDINARY_STACK_BYTES, deepest_detail_rows);
+}
+
+async fn deepest_detail_rows() {
+    let emulator = emulator();
+    // The same pattern the depth table uses: it reaches one level INTO the
+    // detail, so it matches only if the document was really parsed.
+    let (status, body) = call(
+        &emulator,
+        "PutRule",
+        &json!({
+            "Name": "reaches-into-deep-detail",
+            "EventPattern": json!({
+                "detail": { PARSE_PROBE_KEY: [PARSE_PROBE_VALUE] },
+            })
+            .to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "PutRule answered {status} {body}");
+    let account = engine::emulator_account_id();
+    let (status, body) = call(
+        &emulator,
+        "PutTargets",
+        &json!({
+            "Rule": "reaches-into-deep-detail",
+            "Targets": [{
+                "Id": "queue",
+                "Arn": format!("arn:aws:sqs:{REGION}:{account}:deepest-detail"),
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "PutTargets answered {status} {body}");
+
+    // (case, nesting depth, whether the entry is ingested)
+    let depths: [(&str, usize, bool); 2] = [
+        ("exactly at the bound", DOCUMENTED_MAX_DETAIL_DEPTH, true),
+        (
+            "one level past the bound",
+            DOCUMENTED_MAX_DETAIL_DEPTH + 1,
+            false,
+        ),
+    ];
+
+    let mut expected_matches = 0usize;
+    for shape in [Shape::Objects, Shape::Arrays, Shape::Mixed] {
+        for (label, depth, accepted) in &depths {
+            let case = format!("{shape:?}: {label}");
+            let detail = nested_detail(shape, *depth);
+            let (status, body) = call(
+                &emulator,
+                "PutEvents",
+                &json!({
+                    "Entries": [{
+                        "Source": SOURCE,
+                        "DetailType": DETAIL_TYPE,
+                        "Detail": detail,
+                    }],
+                }),
+            )
+            .await;
+            if !*accepted {
+                let code = refused(&case, status, &body);
+                assert_eq!(
+                    code, MALFORMED_DETAIL,
+                    "case {case:?}: expected ErrorCode {MALFORMED_DETAIL}, got {code:?}"
+                );
+                continue;
+            }
+            ingested(&case, status, &body);
+            expected_matches += 1;
+            let log = routed(&emulator);
+            let last = log
+                .last()
+                .unwrap_or_else(|| panic!("case {case:?}: the ingested event must be recorded"));
+            assert_eq!(
+                last.matched_rules,
+                vec!["reaches-into-deep-detail".to_string()],
                 "case {case:?}: expected the rule reaching into detail to match, got {:?}",
                 last.matched_rules
             );

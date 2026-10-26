@@ -39,6 +39,22 @@ const MAX_MILLISECONDS: i64 = 14_400_000;
 /// The published ceiling of `Percentage`, the target of every `RelativeTimeRange`
 /// member (`@range(min: 0, max: 100)`).
 const MAX_PERCENTAGE: i64 = 100;
+/// The published ceiling of `RuleList` (`@length(min: 1, max: 20)`).
+const MAX_RULES: usize = 20;
+
+/// How this service words "the member you included needs one you left out": the member
+/// path the caller sent, and the companion the model documents it as co-required with.
+///
+/// Spelled out here rather than read from the handler's own formatter, so the expected
+/// wording is this test's and not the code's; `pub(crate)` so the update-side suite
+/// (`crate::call_analytics_category_update_rule_validation`) asserts the same one
+/// string rather than a second copy of it.
+pub(crate) fn missing_companion_message(member: &str, companion: &str) -> String {
+    format!(
+        "{companion} is required when {member} is specified. Correct your request and \
+         try again."
+    )
+}
 
 /// One member of the `Rule` union, with the members its filter models `@required` —
 /// the whole union, from `smithy_query(query="shape", shape="Rule")`, so a rule the
@@ -211,7 +227,11 @@ fn whole_ranges() -> Vec<(&'static str, Value)> {
 
 /// A whole rule every list in this suite pads itself with, so a row's refusal cannot be
 /// explained by the rest of the list.
-fn whole_rule() -> Value {
+///
+/// `pub(crate)` for the update-side suite
+/// (`crate::call_analytics_category_update_rule_validation`), which stocks its categories
+/// with the same whole rule.
+pub(crate) fn whole_rule() -> Value {
     json!({
         "SentimentFilter": {
             "Sentiments": ["NEGATIVE"],
@@ -233,6 +253,11 @@ fn placements(malformed: &Value) -> Vec<(&'static str, Vec<Value>)> {
             "the last of two rules",
             vec![whole_rule(), malformed.clone()],
         ),
+        ("the last of the modelled maximum of twenty", {
+            let mut rules: Vec<Value> = (0..MAX_RULES - 1).map(|_| whole_rule()).collect();
+            rules.push(malformed.clone());
+            rules
+        }),
     ]
 }
 
@@ -432,10 +457,7 @@ async fn the_refusal_names_the_missing_companion_member() {
         let message = refused.error_message(case);
         assert_eq!(
             message,
-            format!(
-                "{companion} is required when {member} is specified. Correct your request \
-                 and try again."
-            ),
+            missing_companion_message(member, companion),
             "case {case:?}: the refusal must name the member the caller sent and the \
              companion it needs, got {message:?}"
         );

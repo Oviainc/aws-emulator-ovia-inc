@@ -222,9 +222,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(CreateMembershipErrorModeled::AccessDeniedException(
                 AccessDeniedException {
-                    message: Some(st::collaboration_access_denied_message(
-                        &collaboration_id,
-                        &caller,
+                    // This operation binds no resource identifier in its URI
+                    // (`POST /memberships`): the collaboration it names travels in the
+                    // body, so the decision was taken on the action rather than on a
+                    // resource the request addressed.
+                    message: Some(st::authorization_denied_message(
+                        Self::NAME,
+                        st::UNSCOPED_RESOURCE,
                     )),
                     reason: Some(st::ACCESS_DENIED_REASON_INSUFFICIENT_PERMISSIONS.to_string()),
                 },
@@ -232,17 +236,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // One account holds at most one membership per collaboration, so a repeat join
-        // is refused on the value the request carried.
-        if store.membership_of(&record.id, &caller).is_some() {
+        // A membership is creatable only for a member the collaboration still has
+        // outstanding: an account that already holds one is ACTIVE in the collaboration,
+        // not INVITED to it, so the repeat is refused on the state that account is in.
+        if store.member_status_for(&record, &caller) != Some(st::MEMBER_STATUS_INVITED) {
             return Err(CreateMembershipErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(st::duplicate_membership_message(&caller, &record.id)),
+                    message: Some(st::membership_not_invited_message(&caller)),
                     reason: Some(st::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
                     field_list: Some(vec![ValidationExceptionField {
                         name: "collaborationIdentifier".to_string(),
-                        message: "must name a collaboration this account is not already a member of"
-                            .to_string(),
+                        message: format!(
+                            "must name a collaboration this account is {} to",
+                            st::MEMBER_STATUS_INVITED
+                        ),
                     }]),
                 },
             )
