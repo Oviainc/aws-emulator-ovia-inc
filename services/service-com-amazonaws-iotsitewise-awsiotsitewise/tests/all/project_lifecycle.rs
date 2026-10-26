@@ -171,9 +171,9 @@ fn stored_tags(engine: &engine::InMemoryEngine, id: &str) -> Option<Vec<(String,
 
 /// How many projects the store holds.
 ///
-/// `pub(crate)` because the sibling `create_project` suite counts them the same
-/// way — no project reader enumerates them — so the two share one definition
-/// rather than drifting apart.
+/// `pub(crate)` because the sibling `create_project` and `describe_project_reads`
+/// suites count them the same way — no project reader enumerates them — so they
+/// share one definition rather than drifting apart.
 pub(crate) fn stored_project_count(engine: &engine::InMemoryEngine) -> usize {
     let state = service_state(engine).expect("the iotsitewise store");
     let count = state.lock().projects.len();

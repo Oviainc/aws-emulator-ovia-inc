@@ -487,3 +487,9 @@ mod list_portals;
 #[path = "all/describe_dashboard_reports.rs"]
 mod describe_dashboard_reports;
 
+// Declared last, for the same reason the suites above it are: both stretches
+// higher up are where every concurrent iotsitewise change inserts a declaration
+// of its own. Fold it into the sorted list once the churn settles.
+#[path = "all/describe_project_reads.rs"]
+mod describe_project_reads;
+

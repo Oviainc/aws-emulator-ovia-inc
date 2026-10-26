@@ -213,7 +213,7 @@ async fn list_tags(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
 }
 
 /// The ARN form `CreateProject` documents, built here as an independent oracle.
-fn expected_project_arn(id: &str) -> String {
+pub(crate) fn expected_project_arn(id: &str) -> String {
     format!(
         "arn:aws:iotsitewise:{REGION}:{}:project/{id}",
         engine::EMULATOR_ACCOUNT_ID
