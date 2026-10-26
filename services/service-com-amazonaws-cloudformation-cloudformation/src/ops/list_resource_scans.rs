@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourceScans
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourceScans`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourceScans::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the resource scans this account and Region persists
+//! ([`crate::state::resource_scans`]), newest to oldest, for the one scan type the request
+//! names — or the documented default when it names none — one bounded page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -73,6 +67,46 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::resource_scans::{
+    StoredResourceScan, DEFAULT_MAX_RESULTS, DEFAULT_SCAN_TYPE_FILTER, MAX_RESULTS_CEILING,
+};
+
+/// One stored scan as the modelled `ResourceScanSummary`: "a summary of the resource scan",
+/// every member read off the record.
+fn resource_scan_summary(stored: &StoredResourceScan) -> ResourceScanSummary {
+    ResourceScanSummary {
+        resource_scan_id: Some(stored.resource_scan_id.clone()),
+        status: Some(stored.status.clone()),
+        status_reason: stored.status_reason.clone(),
+        start_time: Some(crate::state::timestamp(stored.start_time)),
+        // "The time that the resource scan was finished": absent for a scan that has not
+        // finished, rather than reported as its start or as now.
+        end_time: stored.end_time.map(crate::state::timestamp),
+        percentage_completed: stored.percentage_completed,
+        scan_type: Some(stored.scan_type.clone()),
+    }
+}
+
+/// How many summaries this response carries: `MaxResults` is what "the number of available
+/// results exceeds" before a `NextToken` is issued, whose "default value is 10" and whose
+/// "maximum value is 100".
+///
+/// A maximum ABOVE the published ceiling is held to it rather than refused: the model puts no
+/// range on `ResourceScannerMaxResults`, so the published ceiling is the whole of the rule.
+/// A value that is no maximum at all (zero, or a negative one) names no page a response could
+/// carry, so this operation's documented default is what serves it.
+///
+/// The ceiling applied here is the operation's own published 100, which happens to equal
+/// [`crate::state::PAGE_SIZE`] — the bound `crate::state::paginate_at_most` puts on any page.
+/// Both are applied, so a later change to that service-wide page size cannot quietly move
+/// this operation's documented maximum.
+fn page_size(max_results: Option<i32>) -> usize {
+    max_results
+        .and_then(|asked_for| usize::try_from(asked_for).ok())
+        .filter(|asked_for| *asked_for >= 1)
+        .unwrap_or(DEFAULT_MAX_RESULTS)
+        .min(MAX_RESULTS_CEILING)
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -141,18 +175,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourceScans` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourceScansErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourceScans"))
+        let region = crate::state::request_region(ctx.parts());
+        // "The scan type that you want to get summary information about. The default is
+        // FULL": the response is about ONE scan type, the request's or the documented
+        // default, so a scan of the other type is not one this read reports.
+        let scan_type = input
+            .scan_type_filter
+            .as_deref()
+            .unwrap_or(DEFAULT_SCAN_TYPE_FILTER)
+            .to_string();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no scan store to read, so this
+            // answers 501 rather than an empty, truthful-looking list.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListResourceScans",
+            ));
+        };
+
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a status transition the
+        // clock had already made due, a scan that finished while nobody was listing.
+        store.settle(::std::time::SystemTime::now());
+
+        // "List the resource scans from newest to oldest", of this Region, of the scan type
+        // the request is about.
+        let matching: Vec<ResourceScanSummary> = store
+            .resource_scans_newest_first(&region)
+            .into_iter()
+            .filter(|scan| scan.is_scan_type(&scan_type))
+            .map(resource_scan_summary)
+            .collect();
+
+        // `@paginated(inputToken: NextToken, outputToken: NextToken,
+        // items: ResourceScanSummaries, pageSize: MaxResults)`: one response carries one
+        // page, as large as the request asked for and no larger than the documented
+        // ceiling, plus the token that resumes just past it.
+        let (resource_scan_summaries, next_token) = crate::state::paginate_at_most(
+            crate::state::PageOf::ResourceScanSummaries,
+            matching,
+            input.next_token.as_deref(),
+            Some(page_size(input.max_results)),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        Ok(ListResourceScansOutput {
+            // Always present, as an empty element for an account that has never been
+            // scanned: a client reading the list sees the same shape either way.
+            resource_scan_summaries: Some(resource_scan_summaries),
+            next_token,
+        })
     }
 }

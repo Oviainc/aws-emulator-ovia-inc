@@ -86,6 +86,82 @@ pub fn error_code(body: &Value) -> String {
     raw.rsplit('#').next().unwrap_or(raw).to_string()
 }
 
+/// The tags `ListTagsForResource` reports for `arn`, as `(Key, Value)` pairs in the
+/// order the service returned them. Shared here because every tagging suite reads a
+/// plan's tags back the same way; they differ in the rules they assert.
+pub async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Vec<(String, String)> {
+    let (status, answer) = call(router, "ListTagsForResource", json!({ "ResourceARN": arn })).await;
+    assert_eq!(status, 200, "list tags for {arn}: unexpected answer {answer}");
+    answer["Tags"]
+        .as_array()
+        .unwrap_or_else(|| panic!("list tags for {arn}: no Tags list in {answer}"))
+        .iter()
+        .map(|tag| {
+            (
+                tag["Key"].as_str().unwrap_or_default().to_string(),
+                tag["Value"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Assert `answer` is the refusal a tag the service does not admit produces: HTTP 400,
+/// the `ValidationException` code, a report naming `member` — the dotted position of the
+/// offending value — and no minted resource. `offender` is the value the request
+/// carried, when the case has one: a report never echoes it.
+///
+/// Shared because every suite that drives a refused tag write asserts exactly this;
+/// they differ in the inputs they drive it with.
+pub fn assert_tag_rejection(
+    case: &str,
+    status: u16,
+    answer: &Value,
+    member: &str,
+    offender: Option<&str>,
+) {
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected 400, got {status} {answer}"
+    );
+    assert_eq!(
+        error_code(answer),
+        "ValidationException",
+        "case {case:?}: expected ValidationException, got {answer}"
+    );
+    let message = error_message(answer);
+    assert!(
+        message.contains(member),
+        "case {case:?}: the report must name {member}, got {message:?}"
+    );
+    if let Some(offender) = offender {
+        assert!(
+            !message.contains(offender),
+            "case {case:?}: the report must not echo the offending value {offender:?}, \
+             got {message:?}"
+        );
+    }
+    // A refusal answers no resource: the members a create mints are absent from it.
+    for minted in ["Id", "Arn"] {
+        assert!(
+            answer.get(minted).is_none(),
+            "case {case:?}: a refused request must mint no {minted}, got {answer}"
+        );
+    }
+}
+
+/// The `RescoreExecutionPlanSummary` items `ListRescoreExecutionPlans` reports, in the
+/// order the service returned them. Shared for the same reason [`list_tags`] is: a
+/// suite that needs the plans this emulator holds projects the members it asserts on
+/// out of these, rather than repeating the call and the `SummaryItems` walk.
+pub async fn list_plan_summaries(router: &MultiServiceRouter) -> Vec<Value> {
+    let (status, answer) = call(router, "ListRescoreExecutionPlans", json!({})).await;
+    assert_eq!(status, 200, "list plans: unexpected answer {answer}");
+    answer["SummaryItems"]
+        .as_array()
+        .unwrap_or_else(|| panic!("list plans: no SummaryItems list in {answer}"))
+        .clone()
+}
+
 /// Create a plan named `name`, carrying `tags` (`Value::Null` for a plan created with
 /// no `Tags` member at all), and return its `(Id, Arn)`. The plan is `CREATING` when
 /// this returns: creation is asynchronous, and the clock owes it `ACTIVE`.

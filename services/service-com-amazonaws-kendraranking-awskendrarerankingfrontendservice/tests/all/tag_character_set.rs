@@ -19,7 +19,10 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::harness::{call, create_plan_with_tags, emulator, error_code, error_message};
+use super::harness::{
+    assert_tag_rejection, call, create_plan_with_tags, emulator, error_message,
+    list_plan_summaries, list_tags,
+};
 
 /// Text OUTSIDE the documented set, one row per class of character. Every row holds at
 /// least one character that is not a Unicode letter, digit or white space and is none
@@ -71,54 +74,22 @@ const INSIDE_THE_SET: &[(&str, &str)] = &[
     ("a non-breaking space", "cost\u{a0}center"),
 ];
 
-/// The tags `ListTagsForResource` reports for `arn`, as `(Key, Value)` pairs.
-async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Vec<(String, String)> {
-    let (status, answer) = call(router, "ListTagsForResource", json!({ "ResourceARN": arn })).await;
-    assert_eq!(status, 200, "list tags for {arn}: unexpected answer {answer}");
-    answer["Tags"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .map(|tag| {
-            (
-                tag["Key"].as_str().unwrap_or_default().to_string(),
-                tag["Value"].as_str().unwrap_or_default().to_string(),
-            )
-        })
-        .collect()
-}
-
-/// The names `ListRescoreExecutionPlans` reports for every plan this emulator holds.
+/// The names `ListRescoreExecutionPlans` reports for every plan this emulator holds,
+/// projected out of the shared summary listing.
 async fn listed_plan_names(router: &MultiServiceRouter) -> Vec<String> {
-    let (status, answer) = call(router, "ListRescoreExecutionPlans", json!({})).await;
-    assert_eq!(status, 200, "list plans: unexpected answer {answer}");
-    answer["SummaryItems"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
+    list_plan_summaries(router)
+        .await
         .iter()
         .map(|item| item["Name"].as_str().unwrap_or_default().to_string())
         .collect()
 }
 
 /// Assert `answer` is the refusal this rule produces, and that it names `member` —
-/// the position of the offending value — without echoing the value itself.
+/// the position of the offending value. The check itself is the shared
+/// [`super::harness::assert_tag_rejection`]; this suite's rows carry the offending
+/// value in several members at once, so it is not named here.
 fn assert_refused(case: &str, status: u16, answer: &Value, member: &str) {
-    assert_eq!(
-        status, 400,
-        "case {case:?}: expected 400, got {status} {answer}"
-    );
-    assert_eq!(
-        error_code(answer),
-        "ValidationException",
-        "case {case:?}: got {answer}"
-    );
-    let message = error_message(answer);
-    assert!(
-        message.contains(member),
-        "case {case:?}: the report must name {member}, got {message:?}"
-    );
+    assert_tag_rejection(case, status, answer, member, None);
 }
 
 #[tokio::test]

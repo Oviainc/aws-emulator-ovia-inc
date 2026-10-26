@@ -39,6 +39,8 @@ mod queue_does_not_exist;
 mod queue_encryption;
 #[path = "all/queue_lifecycle.rs"]
 mod queue_lifecycle;
+#[path = "all/queue_permissions.rs"]
+mod queue_permissions;
 #[path = "all/queue_tags.rs"]
 mod queue_tags;
 #[path = "all/receive_message_attribute_names.rs"]

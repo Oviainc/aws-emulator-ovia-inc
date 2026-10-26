@@ -64,13 +64,13 @@ fn absent_template_arn() -> String {
 /// share invitation is deleted" (`CreateTemplateShare` doc) and `PENDING` is the member for
 /// exactly that (`smithy_query(query="shape", shape="ShareStatus")`). Spelled as the
 /// literal the model publishes rather than read back out of the code under test.
-const NEW_SHARE_STATUS: &str = "PENDING";
+pub(crate) const NEW_SHARE_STATUS: &str = "PENDING";
 
 /// Principals a review template can be shared WITH: "The Amazon Web Services account ID,
 /// organization ID, or organizational unit (OU) ID with which the workload, lens, profile,
 /// or review template is shared" (`SharedWith` doc, `@length(12, 2048)` and no pattern), so
 /// the rows span all three kinds rather than only an account id.
-const OTHER_PRINCIPALS: [(&str, &str); 5] = [
+pub(crate) const OTHER_PRINCIPALS: [(&str, &str); 5] = [
     ("another-account", "111122223333"),
     ("a-third-account", "444455556666"),
     ("an-account-of-nines", "999999999999"),
@@ -81,7 +81,7 @@ const OTHER_PRINCIPALS: [(&str, &str); 5] = [
 /// `POST /templates/shares/{TemplateArn}`, the wire form of `CreateTemplateShare`. The ARN
 /// is percent-encoded because it is a non-greedy `@httpLabel` carrying `:` and `/` inside
 /// ONE path segment, exactly as an SDK sends it.
-async fn create_share(
+pub(crate) async fn create_share(
     client: &Client,
     template_arn: &str,
     shared_with: &str,
@@ -99,7 +99,7 @@ async fn create_share(
 /// `GET /templates/shares/{TemplateArn}`, the wire form of `ListTemplateShares`, with every
 /// filter and paging member bound to the query string. `query` is passed as sent, empty for
 /// a request that names none.
-async fn list_shares(
+pub(crate) async fn list_shares(
     client: &Client,
     template_arn: &str,
     query: &str,
@@ -115,7 +115,7 @@ async fn list_shares(
 
 /// The `ShareId` a successful `CreateTemplateShare` answered with, checked against the
 /// modelled `^[0-9a-f]{32}$` pattern.
-fn created_share_id(answer: &super::workload_harness::Answer, case: &str) -> String {
+pub(crate) fn created_share_id(answer: &super::workload_harness::Answer, case: &str) -> String {
     assert_eq!(
         answer.status, 200,
         "case {case:?}: expected CreateTemplateShare 200, got {answer:?}"
@@ -129,7 +129,7 @@ fn created_share_id(answer: &super::workload_harness::Answer, case: &str) -> Str
 }
 
 /// The `TemplateShareSummaries` of a successful `ListTemplateShares`.
-fn summaries(answer: &super::workload_harness::Answer, case: &str) -> Vec<Value> {
+pub(crate) fn summaries(answer: &super::workload_harness::Answer, case: &str) -> Vec<Value> {
     assert_eq!(
         answer.status, 200,
         "case {case:?}: expected ListTemplateShares 200, got {answer:?}"
@@ -161,7 +161,7 @@ fn summaries(answer: &super::workload_harness::Answer, case: &str) -> Vec<Value>
 /// of a share the caller created is not the caller's to answer. The seed records exactly
 /// what `CreateTemplateShare` records (rules 1 and 2 assert that), and the READ under test
 /// still crosses the HTTP boundary.
-fn record_template_share(
+pub(crate) fn record_template_share(
     client: &Client,
     template_arn: &str,
     shared_with: &str,
@@ -197,7 +197,7 @@ fn record_template_share(
 
 /// Every share the store holds for `template_arn` — read to prove a REFUSED request
 /// recorded nothing, and that a deleted template leaves none behind.
-fn stored_share_count(client: &Client, template_arn: &str) -> usize {
+pub(crate) fn stored_share_count(client: &Client, template_arn: &str) -> usize {
     let state_handle = client.store();
     let store = state_handle.lock();
     store.template_shares_of(template_arn).len()

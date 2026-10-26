@@ -178,7 +178,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The resource is resolved first: a tagging call against an ARN this
         // region holds nothing for is refused as a miss whatever its tag map
         // contains.
-        let tags = match state.resource_tags_mut_in(&region, &input.resource_arn) {
+        let tags = match state.resource_tags_mut_in(
+            &region,
+            &input.resource_arn,
+            std::time::SystemTime::now(),
+        ) {
             Ok(tags) => tags,
             Err(crate::state::TagTargetRejected::NotAnArn) => {
                 return Err(

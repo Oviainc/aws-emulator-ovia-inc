@@ -3736,6 +3736,10 @@ pub const LISTING_APPLICATIONS: &str = "ListApplications";
 /// listing cannot resume this one. See [`paginate`].
 pub const LISTING_ENVIRONMENTS: &str = "ListEnvironments";
 
+/// The `kind` a `ListDeployments` cursor is stamped with, so a token minted by another
+/// listing cannot resume this one. See [`paginate`].
+pub const LISTING_DEPLOYMENTS: &str = "ListDeployments";
+
 /// The `kind` a `ListDeploymentStrategies` cursor is stamped with, so a token minted by
 /// another listing cannot resume this one. See [`paginate`].
 pub const LISTING_DEPLOYMENT_STRATEGIES: &str = "ListDeploymentStrategies";

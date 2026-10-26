@@ -16,13 +16,27 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # Hex codec for the opaque `NextToken` ListPipes issues and reads back.
 hex = { workspace = true }
+# `arn`: the ONE parse of a resource ARN, shared with every other service — a pipe's
+# Source, Enrichment and Target are read through it rather than split here.
+service-common = { path = "../common" }
+# The AWS SDK clients the data plane (`state::data_plane`) reaches the other services of
+# THIS emulator through, over the in-process callback (`OperationContext::callback`): the
+# source and target queues (`ReceiveMessage`/`DeleteMessage`/`SendMessage`) and the two
+# enrichment resources a pipe may name — a Lambda function (`Invoke`) and a Step
+# Functions Express workflow (`StartSyncExecution`). Only the generated clients are
+# needed: the emulator supplies the transport, so the SDK's own HTTPS stack is left out.
+aws-sdk-sqs = { version = "1", default-features = false }
+aws-sdk-lambda = { version = "1", default-features = false }
+aws-sdk-sfn = { version = "1", default-features = false }
+# A binary message attribute travels as base64 in a record envelope.
+base64 = "0.22"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -33,6 +47,11 @@ hex = { workspace = true }
 # `time` on top of the workspace features: the lifecycle test waits out the state-settle
 # span with `tokio::time::sleep` rather than parking the test runtime's worker thread.
 tokio = { workspace = true, features = ["time"] }
+# The services a pipe's source, enrichment and target live in are mounted beside pipes on
+# one engine in the data-plane tests, because a delivery is asserted where a client sees
+# it: on the target queue, with the source queue drained and the enrichment run.
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+service-com-amazonaws-sfn-awsstepfunctions = { workspace = true }
 
 [lints]
 workspace = true

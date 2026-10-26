@@ -169,10 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteVpcConnectionErrorModeled::NotFoundException(NotFoundException {
                     invalid_parameter: Some("Arn".to_string()),
-                    message: Some(format!(
-                        "No VPC connection exists in {region} with the ARN {}",
-                        input.arn
-                    )),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 })
                 .into(),
             );

@@ -20,14 +20,34 @@ pub struct ListDeploymentsInput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.appconfig#Deployments")]
+/// Carries a list of [`DeploymentSummary`], whose instants need the hand-written
+/// serializer below, so this shape's schema and serializer come from
+/// `ac_schema_and_codec!` too — a list element is written against the element shape's own
+/// `SCHEMA`, and only a hand-written parent reaches the hand-written element.
+///
+/// Member set and order from `smithy_query(query="shape", shape="Deployments")`.
 #[derive(Debug, Clone, Default)]
 pub struct ListDeploymentsOutput {
     pub items: Option<Vec<DeploymentSummary>>,
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.appconfig#DeploymentSummary")]
+ac_schema_and_codec!(
+    ListDeploymentsOutput,
+    LIST_DEPLOYMENTS_OUTPUT_SCHEMA,
+    "com.amazonaws.appconfig#Deployments",
+    "com.amazonaws.appconfig",
+    "Deployments",
+    (M_ITEMS, items, "Items", 0, opt, list_of(DeploymentSummary)),
+    (M_NEXT_TOKEN, next_token, "NextToken", 1, opt, string),
+);
+
+/// `StartedAt` and `CompletedAt` target `Iso8601DateTime` (`@timestampFormat("date-time")`),
+/// so this shape's schema and serializer come from `ac_schema_and_codec!` rather than from
+/// `#[smithy_macros::smithy(shape = ...)]` — see `types/deployment_wire.rs`.
+///
+/// Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="DeploymentSummary")`.
 #[derive(Debug, Clone, Default)]
 pub struct DeploymentSummary {
     pub deployment_number: i32,
@@ -45,4 +65,54 @@ pub struct DeploymentSummary {
     pub version_label: Option<String>,
     pub r#type: Option<String>,
 }
+
+ac_schema_and_codec!(
+    DeploymentSummary,
+    DEPLOYMENT_SUMMARY_SCHEMA,
+    "com.amazonaws.appconfig#DeploymentSummary",
+    "com.amazonaws.appconfig",
+    "DeploymentSummary",
+    (M_DEPLOYMENT_NUMBER, deployment_number, "DeploymentNumber", 0, def, integer),
+    (
+        M_CONFIGURATION_PROFILE_ID,
+        configuration_profile_id,
+        "ConfigurationProfileId",
+        1,
+        opt,
+        string
+    ),
+    (M_CONFIGURATION_NAME, configuration_name, "ConfigurationName", 2, opt, string),
+    (
+        M_CONFIGURATION_VERSION,
+        configuration_version,
+        "ConfigurationVersion",
+        3,
+        opt,
+        string
+    ),
+    (
+        M_DEPLOYMENT_DURATION_IN_MINUTES,
+        deployment_duration_in_minutes,
+        "DeploymentDurationInMinutes",
+        4,
+        def,
+        integer
+    ),
+    (M_GROWTH_TYPE, growth_type, "GrowthType", 5, opt, string),
+    (M_GROWTH_FACTOR, growth_factor, "GrowthFactor", 6, opt, float),
+    (
+        M_FINAL_BAKE_TIME_IN_MINUTES,
+        final_bake_time_in_minutes,
+        "FinalBakeTimeInMinutes",
+        7,
+        def,
+        integer
+    ),
+    (M_STATE, state, "State", 8, opt, string),
+    (M_PERCENTAGE_COMPLETE, percentage_complete, "PercentageComplete", 9, opt, float),
+    (M_STARTED_AT, started_at, "StartedAt", 10, opt, date_time),
+    (M_COMPLETED_AT, completed_at, "CompletedAt", 11, opt, date_time),
+    (M_VERSION_LABEL, version_label, "VersionLabel", 12, opt, string),
+    (M_TYPE, r#type, "Type", 13, opt, string),
+);
 
