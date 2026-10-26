@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAccountAssignmentsForPrincipal
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAccountAssignmentsForPrincipal`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: enumerates the account assignments one principal holds under one instance
+//! in this service's state (`crate::state`), narrowed by the request's
+//! `ListAccountAssignmentsFilter`. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAccountAssignmentsForPrincipal::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read, paged by `MaxResults` with a `NextToken` that resumes from the key the
+//! previous page ended on, and absent on the last page. Each listed assignment is
+//! projected from the stored `state::AccountAssignmentRecord` — the same row
+//! `CreateAccountAssignment` wrote and `ListAccountAssignments` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +177,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAccountAssignmentsForPrincipal` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAccountAssignmentsForPrincipalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAccountAssignmentsForPrincipal"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAccountAssignmentsForPrincipalErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // "Specifies an Amazon Web Services account ID number. Results are filtered to only
+        // those that match this ID number": the filter NARROWS the enumeration to one
+        // account, and a filter the caller left out narrows nothing. An account is not a
+        // resource this service holds, so a filter naming an account the principal has no
+        // assignment on selects no row rather than being refused.
+        let account_filter = input
+            .filter
+            .as_ref()
+            .and_then(|filter| filter.account_id.as_deref());
+
+        // The cursor is scoped to THIS enumeration: the operation, the instance it walks,
+        // the principal whose assignments it reports and the filter that selected the rows.
+        let scope = crate::state::cursor_account_assignments_for_principal(
+            &input.instance_arn,
+            &input.principal_type,
+            &input.principal_id,
+            account_filter,
+        );
+        // A `NextToken` this service did not issue for THIS enumeration is a bad request,
+        // not an empty page: answering an empty page would silently end a caller's
+        // enumeration early.
+        let after = crate::state::cursor_after(&scope, input.next_token.as_deref()).map_err(
+            |message| {
+                ListAccountAssignmentsForPrincipalErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message.to_string()),
+                        // The model's `ValidationExceptionReason` enum carries only KMS key
+                        // states, none of which this refusal is.
+                        reason: None,
+                    },
+                )
+            },
+        )?;
+
+        let ordered: Vec<(String, AccountAssignmentForPrincipal)> = {
+            let mut store = state.lock();
+            // A READ, except for what the CLOCK already owes the instances themselves, and
+            // the account's ambient instance if nothing has enabled one yet, so this read
+            // resolves the instance every other read at this instant resolves.
+            store.on_request(
+                &crate::state::request_region(ctx.parts()),
+                ::std::time::SystemTime::now(),
+            );
+            // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: account
+            // assignments are a feature of an organization instance ("This action is not
+            // valid for account instances of IAM Identity Center"), so on an account
+            // instance none can ever exist and the enumeration is refused rather than
+            // answered empty. An ARN this account holds no instance for is NOT this
+            // refusal — it falls through to the 404 below.
+            if store.permission_set_surface_withdrawn(&input.instance_arn) {
+                return Err(
+                    ListAccountAssignmentsForPrincipalErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
+                            ),
+                            reason: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // Assignments are enumerated UNDER an instance, so an `InstanceArn` this
+            // account holds no instance for is refused rather than answered with an empty
+            // page that would read as "this principal has access to no account".
+            if store.instance(&input.instance_arn).is_none() {
+                return Err(
+                    ListAccountAssignmentsForPrincipalErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "No instance found with the ARN {}",
+                                input.instance_arn
+                            )),
+                            // The model's `ResourceNotFoundExceptionReason` enum carries
+                            // only KMS key states, none of which this refusal is.
+                            reason: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // Exactly the stored rows granted to the principal asked for under the instance
+            // asked for, keyed and ordered by the part of an assignment's identity the
+            // request has not already fixed — the account, then the permission set.
+            let mut rows: Vec<(String, AccountAssignmentForPrincipal)> = store
+                .account_assignments
+                .iter()
+                .filter(|row| {
+                    row.instance_arn == input.instance_arn
+                        && row.principal_type == input.principal_type
+                        && row.principal_id == input.principal_id
+                        && account_filter.is_none_or(|account_id| row.account_id == account_id)
+                })
+                .map(|row| (row.principal_page_key(), row.to_principal_shape()))
+                .collect();
+            rows.sort_by(|(left, _), (right, _)| left.cmp(right));
+            rows
+        };
+
+        // `MaxResults` carries the model's own default (100) and range (1..100), already
+        // enforced before this handler runs; `page` clamps to the same ceiling.
+        let (account_assignments, next_token) =
+            crate::state::page(&scope, ordered, after.as_deref(), Some(input.max_results));
+        Ok(ListAccountAssignmentsForPrincipalOutput {
+            account_assignments: Some(account_assignments),
+            next_token,
+        })
     }
 }

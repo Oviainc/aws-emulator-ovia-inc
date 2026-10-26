@@ -21,6 +21,8 @@ mod account_assignment_delete;
 mod account_assignment_deletion_status;
 #[path = "all/account_assignment_deletion_status_list.rs"]
 mod account_assignment_deletion_status_list;
+#[path = "all/account_assignments_for_principal.rs"]
+mod account_assignments_for_principal;
 #[path = "all/account_instance_restriction.rs"]
 mod account_instance_restriction;
 #[path = "all/accounts_for_provisioned_permission_set.rs"]

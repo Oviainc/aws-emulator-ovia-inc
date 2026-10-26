@@ -22,7 +22,8 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AccessControlAttribute, AccountAssignment, AccountAssignmentOperationStatus,
+    AccessControlAttribute, AccountAssignment, AccountAssignmentForPrincipal,
+    AccountAssignmentOperationStatus,
     AccountAssignmentOperationStatusMetadata, Application,
     ApplicationProvider, AttachedManagedPolicy, AuthenticationMethod,
     CustomerManagedPolicyReference, DisplayData, EncryptionConfigurationDetails, Grant,
@@ -1953,6 +1954,29 @@ impl AccountAssignmentRecord {
     /// This record as the modeled `AccountAssignment` shape.
     pub fn to_shape(&self) -> AccountAssignment {
         AccountAssignment {
+            account_id: Some(self.account_id.clone()),
+            permission_set_arn: Some(self.permission_set_arn.clone()),
+            principal_type: Some(self.principal_type.clone()),
+            principal_id: Some(self.principal_id.clone()),
+        }
+    }
+
+    /// The record's sort/pagination key within ONE PRINCIPAL's enumeration: the request
+    /// has already fixed the instance and the (type, id) of the principal, so what remains
+    /// of the assignment's identity is the account and the permission set granted on it.
+    ///
+    /// The two parts are joined by `#`, a character neither can hold — `AccountId` is
+    /// `^\d{12}$` and `PermissionSetArn`'s pattern admits no `#` — so the key orders by
+    /// account first and by permission set within an account, and no two distinct rows
+    /// render the same key.
+    pub fn principal_page_key(&self) -> String {
+        format!("{}#{}", self.account_id, self.permission_set_arn)
+    }
+
+    /// This record as the modeled `AccountAssignmentForPrincipal` shape — the same stored
+    /// row [`Self::to_shape`] projects, reported with the members that shape declares.
+    pub fn to_principal_shape(&self) -> AccountAssignmentForPrincipal {
+        AccountAssignmentForPrincipal {
             account_id: Some(self.account_id.clone()),
             permission_set_arn: Some(self.permission_set_arn.clone()),
             principal_type: Some(self.principal_type.clone()),
@@ -3943,6 +3967,25 @@ pub fn cursor_account_assignments(
     permission_set_arn: &str,
 ) -> String {
     format!("accountAssignments|{instance_arn}|{account_id}|{permission_set_arn}")
+}
+
+/// Cursor scope of a `ListAccountAssignmentsForPrincipal` enumeration: the operation and
+/// the whole filter that selected the rows — the instance whose assignments it walks, the
+/// principal whose assignments it reports and the `ListAccountAssignmentsFilter`'s account
+/// — since the key only distinguishes rows WITHIN one such filter.
+///
+/// A filter member the caller omitted renders as an EMPTY segment, which is a scope of its
+/// own, exactly as in [`cursor_applications`].
+pub fn cursor_account_assignments_for_principal(
+    instance_arn: &str,
+    principal_type: &str,
+    principal_id: &str,
+    account_id: Option<&str>,
+) -> String {
+    format!(
+        "accountAssignmentsForPrincipal|{instance_arn}|{principal_type}|{principal_id}|{}",
+        account_id.unwrap_or_default()
+    )
 }
 
 /// Cursor scope of a `ListAccountAssignmentDeletionStatus` enumeration: the operation and
