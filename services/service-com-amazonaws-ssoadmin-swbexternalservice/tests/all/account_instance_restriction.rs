@@ -247,6 +247,12 @@ pub(crate) fn surface_calls(instance_arn: &str, variant: &Variant) -> Vec<Surfac
             }),
         },
         SurfaceCall {
+            label: format!("{}: ListAccountAssignmentCreationStatus", variant.label),
+            operation: "ListAccountAssignmentCreationStatus",
+            unknown_instance_status: 400,
+            body: json!({"InstanceArn": instance_arn}),
+        },
+        SurfaceCall {
             label: format!("{}: ListAccountAssignmentDeletionStatus", variant.label),
             operation: "ListAccountAssignmentDeletionStatus",
             unknown_instance_status: 400,

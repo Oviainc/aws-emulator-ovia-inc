@@ -3969,6 +3969,20 @@ pub fn cursor_account_assignments(
     format!("accountAssignments|{instance_arn}|{account_id}|{permission_set_arn}")
 }
 
+/// Cursor scope of a `ListAccountAssignmentCreationStatus` enumeration: the operation and
+/// the whole filter that selected the rows — the instance whose creation history it walks
+/// and the `StatusValues` it was filtered by — since the key only distinguishes rows
+/// WITHIN one such filter.
+pub fn cursor_account_assignment_creation_status(
+    instance_arn: &str,
+    status: Option<&str>,
+) -> String {
+    format!(
+        "accountAssignmentCreationStatus|{instance_arn}|{}",
+        status.unwrap_or_default()
+    )
+}
+
 /// Cursor scope of a `ListAccountAssignmentsForPrincipal` enumeration: the operation and
 /// the whole filter that selected the rows — the instance whose assignments it walks, the
 /// principal whose assignments it reports and the `ListAccountAssignmentsFilter`'s account
