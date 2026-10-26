@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateLongTermPricing
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateLongTermPricing`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateLongTermPricing::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the long-term pricing contract the request names: the auto-renew choice and the
+//! job that replaces the device ordered under the contract are written to the stored
+//! contract, and every member the request omits is left as it was, so what
+//! `ListLongTermPricing` reports afterwards carries exactly the change that was asked for.
+//!
+//! An id is resolved against the records this store holds rather than against its form: an
+//! id no `CreateLongTermPricing` minted names no contract, and a `ReplacementJob` no
+//! `CreateJob` minted names no device, so either is refused with the modelled
+//! `InvalidResourceException` rather than written.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +140,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateLongTermPricing` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateLongTermPricingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Nothing in this operation depends on the request's metadata: the contract to
+        // update and the values to write are named in the request body.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STATE_UNAVAILABLE,
+            ));
+        };
+
+        let mut store = state.lock();
+
+        // "Specifies that a device that is ordered with long-term pricing should be replaced
+        // with a new device": the member names a job of this service, reported back as "a
+        // new device that replaces a device that is ordered with long-term pricing"
+        // (`LongTermPricingListEntry$ReplacementJob`), so an id no stored job answers to
+        // names no replacement device. It is checked against what the store holds rather
+        // than against the id's form, exactly as `CreateJob` and `UpdateJob` check the ids
+        // they are given, and before anything is written so a refused update changes
+        // nothing.
+        if let Some(replacement_job) = input.replacement_job.as_deref() {
+            if !store.jobs.contains_key(replacement_job) {
+                return Err(not_found(&format!("job ID {replacement_job}"), "job"));
+            }
+        }
+
+        // The contract this update is for is such a record too — `CreateLongTermPricing` is
+        // what puts one in the store — so the same rule resolves the id this request is
+        // keyed by.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateLongTermPricing"))
+        // A partial update: `UpdateLongTermPricingRequest` models no member that clears a
+        // stored value, so a member the request omits means "leave this as it is" and only
+        // the members it supplied are written.
+        let Some(contract) = store.long_term_pricing.get_mut(&input.long_term_pricing_id) else {
+            return Err(not_found(
+                &format!("long-term pricing ID {}", input.long_term_pricing_id),
+                "longTermPricing",
+            ));
+        };
+        if let Some(auto_renew) = input.is_long_term_pricing_auto_renew {
+            contract.is_long_term_pricing_auto_renew = auto_renew;
+        }
+        if let Some(replacement_job) = input.replacement_job {
+            contract.replacement_job = Some(replacement_job);
+        }
+
+        Ok(UpdateLongTermPricingOutput {})
     }
+}
+
+/// The modelled refusal for a request naming a record this store does not hold: `resource`
+/// is the id as the request named it, and `resource_type` the kind of record it named.
+///
+/// `InvalidResourceException` is "The specified resource can't be found. Check the
+/// information you provided in your last request, and try again", which is what this
+/// operation answers for an id that resolves to no record — the wording and the
+/// `ResourceType` every other operation of this service answers an unresolvable id with.
+fn not_found(resource: &str, resource_type: &str) -> UpdateLongTermPricingError {
+    UpdateLongTermPricingErrorModeled::InvalidResourceException(InvalidResourceException {
+        message: Some(format!(
+            "The {resource} can't be found. Check the information you provided in your last \
+             request, and try again."
+        )),
+        resource_type: Some(resource_type.to_string()),
+    })
+    .into()
 }

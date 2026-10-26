@@ -270,6 +270,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A contract whose upfront payment has been taken is one the service is
             // holding to from this instant on.
             long_term_pricing_status: crate::state::LONG_TERM_PRICING_STATUS_ACTIVE.to_string(),
+            // No device has been replaced on a contract that has just been bought;
+            // `UpdateLongTermPricing` is the only call that names a replacement.
+            replacement_job: None,
         };
 
         // The ceiling is enforced again at the insertion point, which is the only place

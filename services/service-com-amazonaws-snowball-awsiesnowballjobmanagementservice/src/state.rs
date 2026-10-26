@@ -826,8 +826,9 @@ impl StoredJob {
 /// under ([`StoredJob::long_term_pricing_id`]), so the association is read off the jobs the
 /// store holds
 /// ([`ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState::jobs_billed_to_long_term_pricing`])
-/// and the two can never disagree. `ReplacementJob` is what `UpdateLongTermPricing` names,
-/// which does not associate one yet.
+/// and the two can never disagree. `ReplacementJob` is held, since nothing but
+/// `UpdateLongTermPricing` names it: it is the job a caller declared replaces the device
+/// ordered under the contract, not an association any other record carries.
 #[derive(Debug, Clone)]
 pub struct StoredLongTermPricing {
     pub long_term_pricing_id: String,
@@ -844,6 +845,10 @@ pub struct StoredLongTermPricing {
     /// `LongTermPricingType` names.
     pub long_term_pricing_end_date: SystemTime,
     pub long_term_pricing_status: String,
+    /// The job that replaces the device ordered under this contract, once
+    /// `UpdateLongTermPricing` has named one. `None` on a contract no update has named one
+    /// for, which is what a create stores.
+    pub replacement_job: Option<String>,
 }
 
 impl StoredLongTermPricing {
@@ -869,8 +874,9 @@ impl StoredLongTermPricing {
     /// active jobs on the device the long-term pricing type", so it is the newest of them
     /// whose order still has a device of its own ([`StoredJob::is_master`],
     /// [`JobState::holds_device`]) — the device the contract is paying for right now — and
-    /// `None` once none of them has one. `ReplacementJob` is what
-    /// `UpdateLongTermPricing` names, and no stored contract carries one yet.
+    /// `None` once none of them has one. `ReplacementJob` is "a new device that replaces a
+    /// device that is ordered with long-term pricing", so it is the job
+    /// `UpdateLongTermPricing` named as that replacement, and absent until one does.
     pub fn to_list_entry(&self, now: SystemTime, billed: &[&StoredJob]) -> LongTermPricingListEntry {
         let job_ids: Vec<String> = billed.iter().map(|job| job.job_id.clone()).collect();
         let current_active_job = billed
@@ -887,7 +893,7 @@ impl StoredLongTermPricing {
             )),
             long_term_pricing_type: Some(self.long_term_pricing_type.clone()),
             current_active_job,
-            replacement_job: None,
+            replacement_job: self.replacement_job.clone(),
             is_long_term_pricing_auto_renew: Some(self.is_long_term_pricing_auto_renew),
             long_term_pricing_status: Some(self.status_at(now).to_string()),
             snowball_type: Some(self.snowball_type.clone()),

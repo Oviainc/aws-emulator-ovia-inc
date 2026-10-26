@@ -136,6 +136,9 @@ fn hold_long_term_pricing<'a>(
                 long_term_pricing_start_date: start,
                 long_term_pricing_end_date: start + SEEDED_PRICING_TERM,
                 long_term_pricing_status: LONG_TERM_PRICING_STATUS_ACTIVE.to_string(),
+                // No device of a seeded contract has been replaced; only
+                // `UpdateLongTermPricing` names a replacement.
+                replacement_job: None,
             }),
             "case \"seeding long-term pricing\": expected the store to hold a contract under \
              {id:?}"

@@ -98,7 +98,7 @@ fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// One `CreateLongTermPricing` call that must succeed, returning the id it minted.
-async fn create_pricing(router: &MultiServiceRouter, body: Value, case: &str) -> String {
+pub(crate) async fn create_pricing(router: &MultiServiceRouter, body: Value, case: &str) -> String {
     let created = ok(router, "CreateLongTermPricing", body, case).await;
     let pricing_id = string(&created, "LongTermPricingId", case);
     assert_prefixed_uuid(&pricing_id, PRICING_ID_PREFIX, case);
