@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEndpoint
-//! IMPLEMENTED: looks the endpoint configuration up in `crate::state`, snapshots its
-//! variants as `ProductionVariantSummary`s and stores the endpoint in `Creating`, with
-//! the instant the clock owes it `InService`. This is the ONLY file to touch for this
-//! operation.
+//! IMPLEMENTED: looks the endpoint configuration up in `crate::state`, refuses a
+//! deployment past the account's hosting quota for an instance type its variants name,
+//! snapshots its variants as `ProductionVariantSummary`s and stores the endpoint in
+//! `Creating`, with the instant the clock owes it `InService`. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -241,6 +242,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // Launching the endpoint takes ML instances of the types its variants name, and an
+        // account may only hold as many of one type as its hosting quota for that type
+        // allows — zero, for a generation it has been granted no capacity on. A deployment
+        // past a quota is refused with the limit failure this operation models, and nothing
+        // is created: the request is evaluated before the endpoint is stored.
+        let demand = crate::state::instance_demand(
+            config
+                .production_variants
+                .iter()
+                .chain(config.shadow_production_variants.iter().flatten()),
+        );
+        if let Some(message) = store.hosting_quota_exceeded(&demand) {
+            return Err(CreateEndpointErrorModeled::ResourceLimitExceeded(ResourceLimitExceeded {
+                message: Some(message),
+            })
+            .into());
+        }
+
         // The endpoint snapshots the configuration it was created from, the way the real
         // service does: a later CreateEndpointConfig does not retroactively change it.
         let production_variants = variant_summaries(&config.production_variants);
@@ -273,6 +292,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 creation_time: now,
                 last_modified_time: now,
                 in_service_at: now + crate::state::ENDPOINT_IN_SERVICE_AFTER,
+                instance_usage: demand,
             },
         );
         drop(store);
