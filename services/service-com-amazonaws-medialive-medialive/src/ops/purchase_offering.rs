@@ -203,8 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `Start` is checked BEFORE anything is written, so a request this
         // service cannot lease from purchases nothing. The rule and the calendar
-        // arithmetic live in `state`, so `UpdateReservation` holds a renewal to
-        // the same window when its own issue lands.
+        // arithmetic live in `state`, beside the lease they bound.
         let start = crate::state::reservation_start(input.start.as_deref(), now).map_err(
             |refusal| match refusal {
                 crate::state::ReservationStartRefusal::Unreadable => bad_request(format!(

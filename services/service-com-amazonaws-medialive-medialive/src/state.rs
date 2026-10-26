@@ -418,7 +418,8 @@ pub mod reservations;
 
 pub use reservations::{
     reservation_start, reservation_state, reservation_time, NewReservation, ReservationRecord,
-    ReservationRefusal, ReservationStartRefusal, DEFAULT_AUTOMATIC_RENEWAL, MAX_RESERVATIONS,
+    ReservationRefusal, ReservationStartRefusal, ReservationUpdate, DEFAULT_AUTOMATIC_RENEWAL,
+    MAX_RESERVATIONS,
 };
 
 /// The ENGINE VERSION slice: the encoder engine versions available to this
