@@ -93,7 +93,9 @@ impl Emulator {
     }
 
     /// This service's session store, as the handlers reach it.
-    fn state(&self) -> engine::ServiceState<ComAmazonawsAppconfigdataAppconfigdataState> {
+    pub(crate) fn state(
+        &self,
+    ) -> engine::ServiceState<ComAmazonawsAppconfigdataAppconfigdataState> {
         self.engine
             .state::<ComAmazonawsAppconfigdataAppconfigdataState>()
     }

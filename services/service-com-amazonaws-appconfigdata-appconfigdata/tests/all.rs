@@ -15,5 +15,7 @@
 mod configuration_session_poll;
 #[path = "all/feature_flag_resolution.rs"]
 mod feature_flag_resolution;
+#[path = "all/next_poll_token_poll_rate.rs"]
+mod next_poll_token_poll_rate;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
