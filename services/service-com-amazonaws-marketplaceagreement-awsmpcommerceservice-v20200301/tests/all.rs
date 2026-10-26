@@ -41,6 +41,8 @@ mod idempotency_token_conflicts;
 mod inactive_agreement_refusals;
 #[path = "all/invoice_adjustments.rs"]
 mod invoice_adjustments;
+#[path = "all/invoice_line_item_listing.rs"]
+mod invoice_line_item_listing;
 #[path = "all/payment_request_approval.rs"]
 mod payment_request_approval;
 #[path = "all/payment_request_cancellation.rs"]
