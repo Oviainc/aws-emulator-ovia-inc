@@ -14,9 +14,9 @@
 //!
 //! Two refusals come before the listing, in this order:
 //!
-//! 1. the account-level Incident Manager precondition, reported as the `PageId` being
-//!    unresolvable
-//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set_for`])
+//! 1. the account-level Incident Manager precondition, reported as the ACCOUNT having no
+//!    entry in Incident Manager's registry
+//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`])
 //!    — the modelled `ValidationException` (HTTP 400), BEFORE the page is looked up;
 //! 2. a `PageId` the store does not hold — the modelled `ResourceNotFoundException` (HTTP
 //!    404), never an empty list, exactly as `ListRotationOverrides` refuses a rotation it
@@ -187,10 +187,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The account gate comes FIRST: before the pagination token is read and before the
         // page is, so a non-onboarded account is refused identically whether or not the page
-        // it named exists. The refusal is the ARN-shaped one, since this listing's whole
-        // subject is the acknowledgements under one page ARN.
+        // it named exists. The refusal is the account-level one every gated operation of
+        // this service answers with: what is missing is the account's own registry entry,
+        // not anything the request named.
         state
-            .require_active_replication_set_for(&input.page_id)
+            .require_active_replication_set()
             .map_err(account_precondition_failed)?;
 
         // A receipt is a receipt OF a page, so a page the store does not hold has nothing to

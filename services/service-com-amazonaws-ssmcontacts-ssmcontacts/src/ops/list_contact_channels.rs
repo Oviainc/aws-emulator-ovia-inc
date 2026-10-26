@@ -20,9 +20,9 @@
 //! `ValidationException` (HTTP 400) BEFORE that ARN is resolved — an un-onboarded account
 //! is never told instead that the contact it named does not exist. The gate is the
 //! service-wide one,
-//! [`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set_for`],
-//! the ARN-shaped phrasing the crate reserves for an operation addressed by one resource
-//! ARN (the form `GetContactChannel` and `DescribeEngagement` answer with).
+//! [`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`],
+//! which reports the ACCOUNT whose registry entry is missing and names no part of the
+//! request (the form every gated operation of this service answers it with).
 //!
 //! ## Shape of an operation
 //!
@@ -193,11 +193,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The account gate comes FIRST: before the token is decoded and before `ContactId`
         // is resolved, so a non-onboarded account is refused identically whether or not the
-        // contact exists, and about its account rather than about the token it carried. The
-        // refusal names the ARN the request supplied, which is what cannot be resolved
-        // without a replication set.
+        // contact exists, and about its account rather than about the token it carried — what
+        // is missing is the account's own registry entry, not anything the request named.
         state
-            .require_active_replication_set_for(&input.contact_id)
+            .require_active_replication_set()
             .map_err(account_precondition_failed)?;
 
         // The resume point: the creation sequence the previous page ended on.

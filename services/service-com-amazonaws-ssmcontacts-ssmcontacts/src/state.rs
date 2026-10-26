@@ -459,27 +459,16 @@ impl ComAmazonawsSsmcontactsSsmcontactsState {
     ///
     /// The precondition is ACCOUNT level, so a handler evaluates it BEFORE looking the
     /// named resource up: an account with no active replication set is refused whether or
-    /// not the resource it named exists. The caller renders the `Err` as the modelled
-    /// `ValidationException` (HTTP 400) its own operation declares.
+    /// not the resource it named exists. For the same reason the refusal reports the
+    /// ACCOUNT and no member of the request — there is ONE wording for this failure, shared
+    /// by every gated operation, and nothing of the request appears in it. The caller
+    /// renders the `Err` as the modelled `ValidationException` (HTTP 400) its own operation
+    /// declares.
     pub fn require_active_replication_set(&self) -> Result<(), String> {
         if self.active_replication_set().is_some() {
             return Ok(());
         }
         Err(ACCOUNT_NOT_FOUND_MESSAGE.to_string())
-    }
-
-    /// The same account-level precondition, refused with the message that names the ARN the
-    /// request supplied instead of the account.
-    ///
-    /// An operation whose whole subject is one resource ARN reports the precondition as
-    /// that ARN being unresolvable: with no replication set the account has no home region
-    /// for the resource, so the ARN resolves to nothing. The message is built FROM THE
-    /// REQUEST, which is what makes its wording a requirement rather than an example.
-    pub fn require_active_replication_set_for(&self, arn: &str) -> Result<(), String> {
-        if self.active_replication_set().is_some() {
-            return Ok(());
-        }
-        Err(invalid_resource_arn_message(arn))
     }
 
     /// The overrides of the rotation `rotation_arn` names, in creation order.
@@ -1461,17 +1450,20 @@ pub fn instant(at: &::aws_smithy_types::DateTime) -> (i64, u32) {
 /// The message the contact data plane refuses a request from an account with no active
 /// Incident Manager replication set with.
 ///
-/// The refusal's REQUIREMENT is its class — HTTP 400 with the error code
-/// `ValidationException`, not a 404 — so the text is the example AWS was recorded
-/// answering with for exactly this precondition; it names the account rather than any
-/// member of the request, because no member is at fault.
+/// HTTP 400 with the error code `ValidationException` (never a 404) and this wording are
+/// all part of the refusal: AWS words this failure class as the ACCOUNT not being found for
+/// the request, so every gated operation answers it with this one text. It names the
+/// account rather than any member of the request, because no member is at fault, and it
+/// carries no value taken from the request or from one run.
 pub const ACCOUNT_NOT_FOUND_MESSAGE: &str =
     "Invalid value provided - Account not found for the request";
 
-/// The message an operation whose subject is one resource ARN refuses that ARN with when it
-/// cannot be resolved — which, without an active replication set, is every ARN.
+/// The message an operation refuses an ARN with when that ARN names no resource of this
+/// service: it cannot be parsed into a resource identity at all.
 ///
-/// Built from the request, so the ARN it names is the one the caller supplied.
+/// Built from the request, so the ARN it names is the one the caller supplied. This is the
+/// ARN-RESOLUTION refusal, a different failure from the account-level precondition
+/// ([`ACCOUNT_NOT_FOUND_MESSAGE`]), which reports the account and names no member.
 pub fn invalid_resource_arn_message(arn: &str) -> String {
     format!("Invalid value provided - Invalid resource Arn {arn}")
 }
