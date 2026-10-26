@@ -170,14 +170,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Three of the free-form descriptors carry a documented maximum the model's own
         // `ConstrainedString` (len 0..256) does not express, so they are refused here
-        // rather than by the pre-handler constraint walk. `Description` and `Type` carry
-        // no bound beyond the modelled one, so that walk already covers them.
+        // rather than by the pre-handler constraint walk — through the one shared check
+        // `UpdateDevice` applies too. `Description` and `Type` carry no bound beyond the
+        // modelled one, so that walk already covers them.
         for (member, value) in [
             ("Vendor", &input.vendor),
             ("Model", &input.model),
             ("SerialNumber", &input.serial_number),
         ] {
-            if let Some(problem) = value.as_deref().and_then(descriptor_problem) {
+            if let Some(problem) = value
+                .as_deref()
+                .and_then(crate::state::device_descriptor_problem)
+            {
                 return Err(CreateDeviceErrorModeled::ValidationException(
                     ValidationException {
                         message: format!("{member} {problem}"),
@@ -305,6 +309,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             location: input.location,
             created_at: now,
             available_at: now + crate::state::SETTLE_DELAY,
+            // Nothing has reconfigured this device yet, so no `UPDATING` transition is
+            // outstanding on it.
+            updating_until: None,
             tags: input.tags.unwrap_or_default(),
         };
         let device = record.to_shape(now);
@@ -314,18 +321,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             device: Some(device),
         })
     }
-}
-
-/// The documented constraint on a device's `Vendor`, `Model` and `SerialNumber` that the
-/// model's `ConstrainedString` (len 0..256) does not carry: "Constraints: Maximum length
-/// of 128 characters" (`smithy_query query="doc" shape="CreateDeviceRequest"
-/// member="Vendor"`, the same sentence for `Model` and `SerialNumber`), counted in
-/// characters by [`crate::state::MAX_DEVICE_DESCRIPTOR_CHARS`].
-///
-/// Answers `None` when `value` satisfies it, otherwise the member-level reason the
-/// refusal reports.
-fn descriptor_problem(value: &str) -> Option<String> {
-    let max = crate::state::MAX_DEVICE_DESCRIPTOR_CHARS;
-    let length = value.chars().count();
-    (length > max).then(|| format!("must be at most {max} characters, but is {length}"))
 }
