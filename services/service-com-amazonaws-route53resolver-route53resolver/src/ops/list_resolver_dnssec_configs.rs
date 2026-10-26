@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResolverDnssecConfigs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResolverDnssecConfigs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResolverDnssecConfigs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -94,6 +85,8 @@
 //! * `ThrottlingException` (HTTP 400) — The request was throttled. Try again in a few
 //!   minutes.
 
+use std::collections::HashSet;
+
 #[allow(unused_imports)]
 use super::types::*;
 
@@ -170,18 +163,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResolverDnssecConfigs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResolverDnssecConfigsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The engine is reachable from `&self` (constructor-injected); this
+        // operation mints no ARN, so it takes nothing from `ctx`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListResolverDnssecConfigsErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Resolve and bound every filter BEFORE touching the store, exactly as
+        // `ListResolverEndpoints` does: a request carrying more filter terms
+        // than any query needs is refused up front rather than multiplying the
+        // scan the store lock is held for, and a name outside the catalog is
+        // refused rather than silently ignored.
+        let requested_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if requested_filters > crate::state::MAX_FILTERS {
+            return Err(
+                ListResolverDnssecConfigsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: format!(
+                            "ListResolverDnssecConfigs accepts at most {} filters",
+                            crate::state::MAX_FILTERS
+                        ),
+                        field_name: Some("Filters".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        let requested_values: usize = input
+            .filters
+            .iter()
+            .flatten()
+            .map(|filter| filter.values.as_ref().map_or(0, Vec::len))
+            .sum();
+        if requested_values > crate::state::MAX_FILTER_VALUES {
+            return Err(
+                ListResolverDnssecConfigsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: format!(
+                            "ListResolverDnssecConfigs accepts at most {} filter values in total",
+                            crate::state::MAX_FILTER_VALUES
+                        ),
+                        field_name: Some("Values".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut filters: Vec<(crate::state::DnssecConfigFilterKey, HashSet<String>)> = Vec::new();
+        for filter in input.filters.iter().flatten() {
+            let name = filter.name.clone().unwrap_or_default();
+            let Some(key) = crate::state::DnssecConfigFilterKey::parse(&name) else {
+                return Err(
+                    ListResolverDnssecConfigsErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: format!(
+                                "'{name}' is not a valid filter name for ListResolverDnssecConfigs"
+                            ),
+                            field_name: Some("Name".to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            let values = filter.values.clone().unwrap_or_default();
+            filters.push((key, values.into_iter().collect()));
+        }
+
+        // "Lists the configurations for DNSSEC validation that are associated
+        // with the current Amazon Web Services account" — and
+        // `ResolverDnssecConfigs`' doc bounds what that collection holds: "It
+        // doesn't contain disabled DNSSEC configurations for the resource."
+        // Validation off is the setting every VPC starts at, so the collection
+        // is the configurations whose reported status is not the disabled one,
+        // in the order they were first moved off it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResolverDnssecConfigs"))
+        // A pure read: the page is computed from the stored records, and the
+        // cursor is a pure function of the offset, so nothing a later caller
+        // sees changes.
+        let page = {
+            let store = state.lock();
+            let now = ::std::time::Instant::now();
+            let listed: Vec<ResolverDnssecConfig> = store
+                .dnssec_configs_in_creation_order()
+                .into_iter()
+                .filter(|record| {
+                    record.validation_status_at(now) != crate::state::DNSSEC_STATUS_DISABLED
+                })
+                // Filters combine with AND; one matches when the value the
+                // configuration presents for that member is among its values.
+                .filter(|record| {
+                    filters
+                        .iter()
+                        .all(|(key, values)| record.matches_filter(*key, values, now))
+                })
+                .map(|record| record.to_dnssec_config(now))
+                .collect();
+
+            // The cursor is scoped to this query: the collection it indexes is
+            // the FILTERED one, so a cursor minted under a different `Filters`
+            // (or under none) is not a cursor this query accepts.
+            let scope = crate::state::dnssec_config_list_scope(&filters);
+            crate::state::paginate(
+                listed,
+                &scope,
+                input.max_results,
+                input.next_token.as_deref(),
+            )
+        };
+
+        let Some(page) = page else {
+            return Err(
+                ListResolverDnssecConfigsErrorModeled::InvalidNextTokenException(
+                    InvalidNextTokenException {
+                        message: Some(
+                            "The NextToken you provided was not issued by this service for this query"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(ListResolverDnssecConfigsOutput {
+            // A page is always reported as a list, so a caller iterating it
+            // needs no special case for an account that has configured none.
+            resolver_dnssec_configs: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

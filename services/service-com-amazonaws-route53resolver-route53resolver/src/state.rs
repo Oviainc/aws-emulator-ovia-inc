@@ -1509,16 +1509,12 @@ pub const DNSSEC_STATUS_UPDATING_TO_USE_LOCAL_RESOURCE_SETTING: &str =
     "UPDATING_TO_USE_LOCAL_RESOURCE_SETTING";
 pub const DNSSEC_STATUS_USE_LOCAL_RESOURCE_SETTING: &str = "USE_LOCAL_RESOURCE_SETTING";
 
-/// `ResourceNotFoundException$ResourceType` for a configuration for DNSSEC
-/// validation: the modelled shape name of the resource, as for
-/// [`RESOURCE_TYPE_RESOLVER_ENDPOINT`].
-pub const RESOURCE_TYPE_RESOLVER_DNSSEC_CONFIG: &str = "ResolverDnssecConfig";
-
-/// The most configurations for DNSSEC validation this store holds, for the same
-/// reason as [`MAX_STORED_ENDPOINTS`]: every write operation of this service is
-/// reachable by any caller, so the store must not grow without a bound. One
-/// configuration is allocated per distinct `ResourceId`, and an update of a
-/// `ResourceId` already stored stays allowed, because it allocates nothing.
+/// The most configurations for DNSSEC validation this store holds records for,
+/// for the same reason as [`MAX_STORED_ENDPOINTS`]: every write operation of
+/// this service is reachable by any caller, so the store must not grow without
+/// a bound. One record is allocated per distinct `ResourceId` whose validation
+/// setting is moved off its default, and an update of a `ResourceId` already
+/// stored stays allowed, because it allocates nothing.
 pub const MAX_STORED_DNSSEC_CONFIGS: usize = 1_000;
 
 /// The pair of `ResolverDNSSECValidationStatus` values one requested
@@ -1545,28 +1541,21 @@ pub fn dnssec_validation_transition(validation: &str) -> Option<(&'static str, &
     }
 }
 
-/// Mint the `Id` of a configuration for DNSSEC validation from the id sequence.
+/// The `Id` of a VPC's configuration for DNSSEC validation. AWS names one
+/// `rdsc-<hex>`; every result fits `ResourceId` (length 1..64).
 ///
-/// AWS names one `rdsc-<hex>`, and the model constrains `ResourceId` only to
-/// length 1..64, so the id is recognisable as this resource's and fits the
-/// member, exactly as [`mint_endpoint_id`]'s is.
-pub fn mint_dnssec_config_id(seq: u64) -> String {
-    format!("rdsc-{:016x}", scramble(seq))
-}
-
-/// The `ResourceNotFoundException` `GetResolverDnssecConfig` answers for a VPC
-/// the store holds no configuration for DNSSEC validation under.
-///
-/// See [`resolver_rule_not_found`] on the absent `RSLVR-nnnnn` service error
-/// code: the wire error code clients match on is the shape name, and the
-/// modelled `ResourceType` says which resource was missing.
-pub fn resolver_dnssec_config_not_found(resource_id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!(
-            r#"Resolver DNSSEC configuration for resource with ID "{resource_id}" does not exist."#
-        )),
-        resource_type: Some(RESOURCE_TYPE_RESOLVER_DNSSEC_CONFIG.to_string()),
-    }
+/// Derived from the VPC id rather than taken from the id sequence, for the same
+/// reason as [`resolver_config_id`]: no operation creates a configuration for
+/// DNSSEC validation (`UpdateResolverDnssecConfig` only moves the validation
+/// setting of the one a VPC already has), so one exists for a VPC whether or not
+/// anything has ever written to it, and its id has to be a function of the VPC
+/// it belongs to. The same VPC therefore reports the same `Id` from every call,
+/// before and after an update.
+pub fn dnssec_config_id(resource_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"route53resolver/dnssec-config/v1");
+    feed_field(&mut hasher, resource_id.as_bytes());
+    format!("rdsc-{}", hex::encode(&hasher.finalize()[..8]))
 }
 
 /// One configuration for DNSSEC validation, as stored.
@@ -1574,16 +1563,29 @@ pub fn resolver_dnssec_config_not_found(resource_id: &str) -> ResourceNotFoundEx
 /// The reported `ValidationStatus` is computed from the stored status pair and
 /// the due instant, so a read never has to write to settle one — the same shape
 /// as [`ResolverEndpointRecord`].
+///
+/// A configuration for DNSSEC validation is a per-VPC singleton the service
+/// maintains itself — there is no operation that creates or deletes one — so a
+/// record exists only for a VPC whose validation setting was moved off its
+/// default; every other VPC reports the default one
+/// [`ComAmazonawsRoute53resolverRoute53resolverState::resolver_dnssec_config`]
+/// derives. `Id` and `OwnerId` are therefore the same whether the record exists
+/// or not, so a VPC's configuration does not change identity when it is updated
+/// — the same shape as [`ResolverConfigRecord`].
 #[derive(Debug, Clone)]
 pub struct ResolverDnssecConfigRecord {
     /// Position in the store's creation order, from
     /// [`ComAmazonawsRoute53resolverRoute53resolverState::id_seq`]. It is the
-    /// order the configurations are reported in, independent of the hash order
-    /// of the map that holds them; `ListResolverDnssecConfigs`, still a
-    /// scaffold, is what will read it.
+    /// order `ListResolverDnssecConfigs` reports the configurations in,
+    /// independent of the hash order of the map that holds them.
+    ///
+    /// `0` on the default configuration
+    /// [`ComAmazonawsRoute53resolverRoute53resolverState::resolver_dnssec_config`]
+    /// derives for a VPC the store holds no record for: the id sequence starts
+    /// at 1, so a stored record never carries it.
     pub seq: u64,
-    /// The emulator-minted `Id` (`rdsc-<hex>`), stable for the life of the
-    /// configuration: a later update of the same VPC keeps it.
+    /// The `Id` of this configuration, [`dnssec_config_id`] of its VPC, stable
+    /// for the life of the VPC: a later update of the same VPC keeps it.
     pub id: String,
     /// `OwnerId`: "The owner account ID of the virtual private cloud (VPC)".
     pub owner_id: String,
@@ -1618,6 +1620,76 @@ impl ResolverDnssecConfigRecord {
             validation_status: Some(self.validation_status_at(now).to_string()),
         }
     }
+
+    /// Whether this configuration satisfies one `ListResolverDnssecConfigs`
+    /// filter: does the value it presents for `key` appear in `values`?
+    pub fn matches_filter(
+        &self,
+        key: DnssecConfigFilterKey,
+        values: &HashSet<String>,
+        now: Instant,
+    ) -> bool {
+        match key {
+            DnssecConfigFilterKey::Id => values.contains(self.id.as_str()),
+            DnssecConfigFilterKey::OwnerId => values.contains(self.owner_id.as_str()),
+            DnssecConfigFilterKey::ResourceId => values.contains(self.resource_id.as_str()),
+            DnssecConfigFilterKey::ValidationStatus => values.contains(self.validation_status_at(now)),
+        }
+    }
+}
+
+/// The member a `ListResolverDnssecConfigs` filter selects on.
+///
+/// `Filter$Name`'s doc ("The valid values for `Name` depend on the action that
+/// you're including the filter in") names no catalog for this operation, so the
+/// catalog is the members the listed shape presents
+/// (`smithy_query(query="shape",shape="ResolverDnssecConfig")`): `Id`,
+/// `OwnerId`, `ResourceId`, `ValidationStatus`. A name outside it is refused
+/// rather than silently ignored, so a caller is never handed a page that does
+/// not answer the query it asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnssecConfigFilterKey {
+    Id,
+    OwnerId,
+    ResourceId,
+    ValidationStatus,
+}
+
+impl DnssecConfigFilterKey {
+    /// The canonical name of this key, used to describe a filter set in a
+    /// pagination cursor's scope.
+    pub fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Id => "Id",
+            Self::OwnerId => "OwnerId",
+            Self::ResourceId => "ResourceId",
+            Self::ValidationStatus => "ValidationStatus",
+        }
+    }
+
+    /// Resolve a wire filter name, or `None` when it is outside the catalog.
+    /// The name is folded by [`fold_filter_name`], as [`FilterKey::parse`] folds
+    /// the endpoint catalog's names.
+    pub fn parse(name: &str) -> Option<Self> {
+        match fold_filter_name(name).as_str() {
+            "ID" => Some(Self::Id),
+            "OWNERID" => Some(Self::OwnerId),
+            "RESOURCEID" => Some(Self::ResourceId),
+            "VALIDATIONSTATUS" => Some(Self::ValidationStatus),
+            _ => None,
+        }
+    }
+}
+
+/// The cursor scope of one `ListResolverDnssecConfigs` query, for the same
+/// reason and in the same shape as [`endpoint_list_scope`]'s.
+pub fn dnssec_config_list_scope(filters: &[(DnssecConfigFilterKey, HashSet<String>)]) -> String {
+    filter_list_scope(
+        "ListResolverDnssecConfigs",
+        filters
+            .iter()
+            .map(|(key, values)| (key.canonical_name(), values)),
+    )
 }
 
 /// `AutodefinedReverseFlag` values, the model's whole enum
@@ -1785,11 +1857,14 @@ pub struct ComAmazonawsRoute53resolverRoute53resolverState {
     /// `CreatorRequestId` identifies a request to ONE operation, so this map is
     /// kept apart from theirs.
     pub firewall_domain_list_creator_request_ids: HashMap<String, String>,
-    /// Every stored configuration for DNSSEC validation, keyed by the
-    /// `ResourceId` (the VPC) it configures: `UpdateResolverDnssecConfig`
-    /// updates "an existing DNSSEC validation configuration" or creates one, so
-    /// a VPC has at most one, and that id is also what
-    /// `GetResolverDnssecConfig` resolves.
+    /// The configuration for DNSSEC validation of every VPC whose validation
+    /// setting was moved off its default, keyed by that VPC's id
+    /// (`ResolverDnssecConfig$ResourceId`).
+    ///
+    /// A configuration for DNSSEC validation is a per-VPC singleton the service
+    /// maintains itself, so this map is an override table and not an inventory:
+    /// a VPC it holds no entry for still HAS a configuration, the default one
+    /// [`Self::resolver_dnssec_config`] derives.
     pub resolver_dnssec_configs: HashMap<String, ResolverDnssecConfigRecord>,
     /// The Resolver behavior configuration of every VPC whose configuration was
     /// moved off its default, keyed by that VPC's id
@@ -1918,6 +1993,41 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
     /// that this refuses writes nothing.
     pub fn can_store_another_dnssec_config(&self) -> bool {
         self.resolver_dnssec_configs.len() < MAX_STORED_DNSSEC_CONFIGS
+    }
+
+    /// The configuration for DNSSEC validation of the VPC `resource_id`, which
+    /// every VPC has: the stored record when one was written for it, and
+    /// otherwise the default configuration that VPC reports — identical
+    /// identity ([`dnssec_config_id`] of the VPC, owned by this account) with
+    /// validation off, settled.
+    ///
+    /// A pure read: a VPC with no record is NOT given one here, so reporting a
+    /// configuration never changes what a later caller sees.
+    pub fn resolver_dnssec_config(&self, resource_id: &str) -> ResolverDnssecConfigRecord {
+        self.resolver_dnssec_configs
+            .get(resource_id)
+            .cloned()
+            .unwrap_or_else(|| ResolverDnssecConfigRecord {
+                seq: 0,
+                id: dnssec_config_id(resource_id),
+                owner_id: ::engine::emulator_account_id().to_string(),
+                resource_id: resource_id.to_string(),
+                status: DNSSEC_STATUS_DISABLED.to_string(),
+                settled_status: DNSSEC_STATUS_DISABLED.to_string(),
+                settled_at: Instant::now(),
+            })
+    }
+
+    /// Every stored configuration for DNSSEC validation in creation order — the
+    /// order `ListResolverDnssecConfigs`' pages and its cursor are defined over,
+    /// for the same reason as [`Self::endpoints_in_creation_order`]: a page is
+    /// cut at an offset into this sequence, so the sequence must not depend on
+    /// the hash order of the map that holds the records.
+    pub fn dnssec_configs_in_creation_order(&self) -> Vec<&ResolverDnssecConfigRecord> {
+        let mut all: Vec<&ResolverDnssecConfigRecord> =
+            self.resolver_dnssec_configs.values().collect();
+        all.sort_by_key(|record| record.seq);
+        all
     }
 
     /// The DNS Firewall configuration of the VPC `resource_id`, which every VPC
