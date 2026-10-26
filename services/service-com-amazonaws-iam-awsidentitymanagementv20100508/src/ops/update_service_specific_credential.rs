@@ -253,8 +253,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateServiceSpecificCredentialErrorModeled::NoSuchEntityException(
                     NoSuchEntityException {
+                        // How IAM words a service-specific credential lookup that
+                        // found nothing, the same text its delete answers with: the
+                        // fixed text around the id the request asked for.
                         message: Some(format!(
-                            "The service-specific credential with id {} cannot be found.",
+                            "No such credential {} exists",
                             input.service_specific_credential_id
                         )),
                     },

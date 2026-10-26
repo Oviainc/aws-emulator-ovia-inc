@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteServiceSpecificCredential
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteServiceSpecificCredential`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteServiceSpecificCredential::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -160,18 +150,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteServiceSpecificCredential` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteServiceSpecificCredentialErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteServiceSpecificCredential"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault
+            // (`smithy_query(query="operation", operation="DeleteServiceSpecificCredential")`
+            // lists only `NoSuchEntityException`), and an engine this service was not
+            // mounted on cannot serve the operation at all — which is exactly what the
+            // scaffold's 501 states. The router builds the one engine that does carry
+            // the store, so this is unreachable there.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteServiceSpecificCredential",
+            ));
+        };
+        let now = crate::state::now();
+        // A mutation: the operation "deletes the specified service-specific credential",
+        // so the lock is held for write across the ownership check and the removal.
+        let mut store = state.lock();
+        // The expiries the clock already owes, materialised before the record is looked
+        // up, exactly as the create, the listing, the reset and the status update
+        // materialise them: a credential past its `ExpirationDate` is `Expired` at that
+        // instant whether or not anybody called. An expired credential is still one the
+        // user holds, so this call deletes it like any other.
+        store.expire_service_specific_credentials(now);
+
+        // The access key id the request was signed with: the caller's identity when the
+        // request names no user, and the acting principal the audit records below are
+        // attributed to.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+
+        // With no `UserName`, "the operation assumes the user whose credentials are
+        // used to call the operation", resolved through the same binding `GetUser`,
+        // `ListServiceSpecificCredentials`, `UpdateServiceSpecificCredential` and
+        // `ResetServiceSpecificCredential` resolve a nameless caller through. A caller
+        // whose credentials belong to no IAM user is refused rather than having an
+        // identity invented for it, and this operation models no error for a request
+        // that named no entity, so the refusal goes through the crate's generic
+        // client-input channel (HTTP 400 `ValidationException`).
+        let user_key = match &input.user_name {
+            Some(user_name) => crate::state::name_key(user_name),
+            None => match store.access_keys.get(&caller_akid) {
+                Some(record) => record.user_key.clone(),
+                None => {
+                    ::tracing::info!(
+                        audit = true,
+                        operation = "DeleteServiceSpecificCredential",
+                        outcome = "refused_no_caller_identity",
+                        caller_akid = %caller_akid,
+                        "no service-specific credential was deleted"
+                    );
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "Must specify userName when calling with non-User credentials",
+                    ));
+                }
+            },
+        };
+
+        // The credential belongs to a user the account holds. IAM entity names "are not
+        // distinguished by case", so the lookup is on the case-folded key.
+        if !store.users.contains_key(&user_key) {
+            ::tracing::info!(
+                audit = true,
+                operation = "DeleteServiceSpecificCredential",
+                outcome = "refused_no_such_user",
+                caller_akid = %caller_akid,
+                user_key = %user_key,
+                "no service-specific credential was deleted"
+            );
+            return Err(
+                DeleteServiceSpecificCredentialErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        // The name as the REQUEST spelled it; a caller that named no
+                        // user is reported by the key its signing credentials resolved
+                        // to, which is the only spelling left once the account holds no
+                        // such user.
+                        message: Some(format!(
+                            "The user with name {} cannot be found.",
+                            input.user_name.as_deref().unwrap_or(&user_key)
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A service-specific credential is reachable only through the user that holds
+        // it, so an id the account never minted and an id that belongs to a DIFFERENT
+        // user are the same answer: that user has no such credential, and nothing is
+        // removed in either case — the rule `DeleteAccessKey` applies to an access key
+        // id.
+        let held = store
+            .service_specific_credentials
+            .get(&input.service_specific_credential_id)
+            .is_some_and(|credential| crate::state::name_key(&credential.user_name) == user_key);
+        if !held {
+            ::tracing::info!(
+                audit = true,
+                operation = "DeleteServiceSpecificCredential",
+                outcome = "refused_no_such_credential",
+                caller_akid = %caller_akid,
+                user_key = %user_key,
+                service_specific_credential_id = %input.service_specific_credential_id,
+                "no service-specific credential was deleted"
+            );
+            return Err(
+                DeleteServiceSpecificCredentialErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        // How IAM words a service-specific credential lookup that
+                        // found nothing: the fixed text around the id the request
+                        // asked for.
+                        message: Some(format!(
+                            "No such credential {} exists",
+                            input.service_specific_credential_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The record leaves the account: the deleted credential is gone from the
+        // listing, stops counting against the per-service quota the create takes, and
+        // can no longer be reset or have its status moved. The id and the secret were
+        // never kept in the emulator's own credential store (the create removes the
+        // minted record again), so there is nothing else to release.
+        let removed = store
+            .service_specific_credentials
+            .remove(&input.service_specific_credential_id);
+        let service_name = removed
+            .map(|credential| credential.service_name)
+            .unwrap_or_default();
+
+        ::tracing::info!(
+            audit = true,
+            operation = "DeleteServiceSpecificCredential",
+            outcome = "deleted",
+            caller_akid = %caller_akid,
+            user_key = %user_key,
+            service_specific_credential_id = %input.service_specific_credential_id,
+            service_name = %service_name,
+            "the service-specific credential was deleted"
+        );
+
+        // The operation's output shape is `Unit`: the removal is reported by the
+        // listing, which no longer holds the record this call deleted.
+        Ok(DeleteServiceSpecificCredentialOutput)
     }
 }
