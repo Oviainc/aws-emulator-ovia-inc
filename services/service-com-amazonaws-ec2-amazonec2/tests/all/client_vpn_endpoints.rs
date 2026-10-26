@@ -425,64 +425,38 @@ async fn the_ids_narrow_the_report_to_the_endpoints_named() {
     }
 }
 
-/// A `ClientVpnEndpointId` this service cannot resolve is refused, and the refusal says
-/// WHICH of the two problems it is: a value that is not an endpoint id at all answers
-/// `InvalidClientVpnEndpointId.Malformed`, a well-formed id this account holds no endpoint
-/// for answers `InvalidClientVpnEndpointId.NotFound` — never an absent row, which would
+/// A `ClientVpnEndpointId` this account holds no endpoint for is refused
+/// `InvalidClientVpnEndpointId.NotFound` — whatever FORM the value takes, because this
+/// surface resolves the member by lookup alone — and never with an absent row, which would
 /// read as "the account holds no such endpoint" for a request that named one.
 #[tokio::test]
 async fn an_endpoint_id_that_cannot_be_resolved_is_refused() {
     let (router, engine) = super::ec2_query::emulator();
     let seeded = seed(&engine);
 
-    // Rows: the two well-formed id lengths EC2 issues (8 and 17 hex digits) and the all-zero
-    // placeholder the AWS documentation itself uses, none of which names an endpoint of this
-    // account; then values that are not endpoint ids at all — another resource's prefix, a
-    // bare prefix, a suffix of the wrong length, a non-hex suffix, an uppercase suffix, the
-    // id of a target network ASSOCIATION, and an empty value.
-    let cases: [(&str, &str); 11] = [
-        (
-            "cvpn-endpoint-0123abcd",
-            "InvalidClientVpnEndpointId.NotFound",
-        ),
-        (
-            "cvpn-endpoint-0123456789abcdef0",
-            "InvalidClientVpnEndpointId.NotFound",
-        ),
-        (
-            "cvpn-endpoint-00000000000000000",
-            "InvalidClientVpnEndpointId.NotFound",
-        ),
-        ("vpc-00000000000000001", "InvalidClientVpnEndpointId.Malformed"),
-        ("cvpn-endpoint", "InvalidClientVpnEndpointId.Malformed"),
-        ("cvpn-endpoint-", "InvalidClientVpnEndpointId.Malformed"),
-        (
-            "cvpn-endpoint-0123456789abcdef",
-            "InvalidClientVpnEndpointId.Malformed",
-        ),
-        (
-            "cvpn-endpoint-0123456789abcdefg",
-            "InvalidClientVpnEndpointId.Malformed",
-        ),
-        (
-            "cvpn-endpoint-0123456789ABCDEF0",
-            "InvalidClientVpnEndpointId.Malformed",
-        ),
-        (
-            "cvpn-assoc-00000000000000001",
-            "InvalidClientVpnEndpointId.Malformed",
-        ),
-        ("", "InvalidClientVpnEndpointId.Malformed"),
+    // Rows along what the rule generalises over — the FORM of the value: the two id lengths
+    // EC2 issues (8 and 17 hex digits), the all-zero placeholder the AWS documentation itself
+    // uses, another resource's prefix, a bare prefix, a suffix of the wrong length, a non-hex
+    // suffix, an uppercase suffix, the id of a target network ASSOCIATION, and an empty
+    // value. None of them names an endpoint of this account, so all are refused alike.
+    let cases: [&str; 11] = [
+        "cvpn-endpoint-0123abcd",
+        "cvpn-endpoint-0123456789abcdef0",
+        "cvpn-endpoint-00000000000000000",
+        "vpc-00000000000000001",
+        "cvpn-endpoint",
+        "cvpn-endpoint-",
+        "cvpn-endpoint-0123456789abcdef",
+        "cvpn-endpoint-0123456789abcdefg",
+        "cvpn-endpoint-0123456789ABCDEF0",
+        "cvpn-assoc-00000000000000001",
+        "",
     ];
-    for (endpoint_id, expected_code) in cases {
-        // The message each refusal carries, as the Client VPN surface words it: an unknown
-        // endpoint names the id the request sent, a value that is no endpoint id at all is
-        // refused as an invalid id.
-        let expected_message = if expected_code.ends_with(".NotFound") {
-            format!("Endpoint {endpoint_id} does not exist")
-        } else {
-            format!("Invalid id: '{endpoint_id}'")
-        };
+    for endpoint_id in cases {
+        let expected_code = "InvalidClientVpnEndpointId.NotFound";
+        // The message the refusal carries, as the Client VPN surface words it: it names the
+        // id the request sent.
+        let expected_message = format!("Endpoint {endpoint_id} does not exist");
         // Alone, and beside an id the account DOES hold: an unresolvable id is refused
         // either way rather than quietly dropped from the result.
         let alone = indexed(ENDPOINT_IDS_PARAM, &[endpoint_id]);

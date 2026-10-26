@@ -25,11 +25,11 @@ use super::*;
 /// (`smithy_query(query="shape",shape="ClientVpnEndpointId")` is a plain `String`), so the
 /// prefix is the one thing that says which resource an id names.
 ///
-/// An endpoint id is read by the generic [`prefixed_id_is_well_formed`] under this prefix
-/// rather than by the stricter [`issued_long_id_is_well_formed`]: AWS's own documentation
-/// uses `cvpn-endpoint-00000000000000000` as a placeholder endpoint id and answers
-/// `InvalidClientVpnEndpointId.NotFound` for it rather than `.Malformed`, so an all-zero
-/// suffix is a well-formed id that names nothing.
+/// The prefix is what an id of this kind READS as; it is not a constraint this surface
+/// enforces, because Client VPN answers one refusal
+/// ([`invalid_client_vpn_endpoint_id_not_found`]) for every value it cannot resolve — see
+/// [`require_client_vpn_endpoint`]. So nothing here refuses an id for its FORM, and the
+/// prefix serves the mint and the id spaces it keeps apart.
 pub const CLIENT_VPN_ENDPOINT_ID_PREFIX: &str = "cvpn-endpoint";
 
 /// The id prefix EC2 mints a target network association with: `cvpn-assoc-`, as the AWS
@@ -39,11 +39,6 @@ pub const CLIENT_VPN_TARGET_NETWORK_ASSOCIATION_ID_PREFIX: &str = "cvpn-assoc";
 /// `InvalidClientVpnEndpointId.NotFound` (HTTP 400): the request named a Client VPN
 /// endpoint id this account holds no endpoint for.
 pub const INVALID_CLIENT_VPN_ENDPOINT_ID_NOT_FOUND: &str = "InvalidClientVpnEndpointId.NotFound";
-
-/// `InvalidClientVpnEndpointId.Malformed` (HTTP 400): the value is not a Client VPN
-/// endpoint id at all, which EC2 answers BEFORE it looks one up — so a caller can tell "not
-/// an id of this kind" from "no such endpoint".
-pub const INVALID_CLIENT_VPN_ENDPOINT_ID_MALFORMED: &str = "InvalidClientVpnEndpointId.Malformed";
 
 /// "associating" — the state a target network association starts in
 /// (`AssociationStatusCode`), which `AssociateClientVpnTargetNetwork` answers with.
@@ -59,16 +54,31 @@ pub const ASSOCIATION_STATUS_ASSOCIATED: &str = "associated";
 /// is.
 pub const CLIENT_VPN_ENDPOINT_STATUS_PENDING_ASSOCIATE: &str = "pending-associate";
 
+/// The most characters of a refused `ClientVpnEndpointId` its message repeats back.
+///
+/// The message names the endpoint the request could not resolve, and that is the request's own
+/// bytes — `ClientVpnEndpointId` is a bare string the model puts no `@length` on, and this
+/// surface refuses a value of any form by LOOKUP rather than by its form — so the echo is
+/// bounded here the way [`MAX_ECHOED_COIP_POOL_ID_CHARS`] bounds a refused pool id's. Far
+/// above the longest endpoint id this service mints ([`CLIENT_VPN_ENDPOINT_ID_PREFIX`] plus 17
+/// digits), so a real id is always named in full.
+pub const MAX_ECHOED_CLIENT_VPN_ENDPOINT_ID_CHARS: usize = 128;
+
 /// Refuse a request that named a Client VPN endpoint id this account holds no endpoint for:
 /// HTTP 400 [`INVALID_CLIENT_VPN_ENDPOINT_ID_NOT_FOUND`], worded as the Client VPN surface
-/// words it — `Endpoint <id> does not exist`, naming the id the request sent. That is not
+/// words it — `Endpoint <id> does not exist`, naming the id the request sent, of which the
+/// first [`MAX_ECHOED_CLIENT_VPN_ENDPOINT_ID_CHARS`] characters are named. That is not
 /// the `The <kind> ID '<id>' does not exist` wording [`id_not_found`] writes for the
 /// resources whose refusal reads that way, so this one is built here rather than through it.
 pub fn invalid_client_vpn_endpoint_id_not_found<E>(id: &str) -> Scaffolded<E> {
+    let echoed: String = id
+        .chars()
+        .take(MAX_ECHOED_CLIENT_VPN_ENDPOINT_ID_CHARS)
+        .collect();
     Scaffolded::service_error(
         INVALID_CLIENT_VPN_ENDPOINT_ID_NOT_FOUND,
         400,
-        format!("Endpoint {id} does not exist"),
+        format!("Endpoint {echoed} does not exist"),
     )
 }
 
@@ -83,10 +93,10 @@ pub fn invalid_client_vpn_endpoint_id_not_found<E>(id: &str) -> Scaffolded<E> {
 /// So a value of any form that this account holds no endpoint for is answered `Endpoint <id>
 /// does not exist`.
 ///
-/// That is what the operations that MUTATE an endpoint resolve their scalar
-/// `ClientVpnEndpointId` through. [`require_known_client_vpn_endpoint`] is the reading the
-/// describes keep, where EC2 refuses an id of the wrong form in an id parameter before it
-/// looks anything up; the two are named apart here rather than one silently covering both.
+/// That is what EVERY operation taking a `ClientVpnEndpointId` resolves it through, the ones
+/// that report what hangs off an endpoint as much as the ones that mutate it:
+/// [`require_known_client_vpn_endpoint`] is this lookup for a caller that needs no endpoint
+/// back. One id, one refusal, whichever operation was called.
 pub fn require_client_vpn_endpoint<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
     id: &str,
@@ -97,26 +107,18 @@ pub fn require_client_vpn_endpoint<'store, E>(
         .ok_or_else(|| invalid_client_vpn_endpoint_id_not_found(id))
 }
 
-/// Refuse a `ClientVpnEndpointId` this service cannot resolve: a malformed one before an
-/// unknown one, the order [`require_well_formed_id`] documents.
+/// Resolve a `ClientVpnEndpointId` for an operation that only needs to know the endpoint
+/// EXISTS — the operations that REPORT what hangs off one — by the same lookup
+/// [`require_client_vpn_endpoint`] does, so an id the account holds no endpoint for is
+/// refused the one way this surface refuses it whatever form the value takes.
 ///
-/// What the operations that REPORT endpoints resolve an id through, so each of them refuses
-/// the same id the same way; the contract [`require_known_instance`] writes out for
-/// instances. An operation that mutates one endpoint resolves it through
-/// [`require_client_vpn_endpoint`] instead, which records why.
+/// It is the reading half of that function and nothing more: the two are named apart only so
+/// a reporting operation does not have to borrow an endpoint it never looks at.
 pub fn require_known_client_vpn_endpoint<E>(
     store: &ComAmazonawsEc2Amazonec2State,
     id: &str,
 ) -> Result<(), Scaffolded<E>> {
-    require_well_formed_id(
-        CLIENT_VPN_ENDPOINT_ID_PREFIX,
-        id,
-        INVALID_CLIENT_VPN_ENDPOINT_ID_MALFORMED,
-    )?;
-    if !store.client_vpn_endpoints.contains_key(id) {
-        return Err(invalid_client_vpn_endpoint_id_not_found(id));
-    }
-    Ok(())
+    require_client_vpn_endpoint::<E>(store, id).map(|_| ())
 }
 
 /// One target network association: the modelled [`crate::ops::types::TargetNetwork`] every

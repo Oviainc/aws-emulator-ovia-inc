@@ -22,7 +22,7 @@ use std::time::Duration;
 use ec2::ops::types::{ClientVpnEndpoint, TransitGatewayConfigurationDescribeEndpointStructure};
 use ec2::state::{
     ClientVpnTargetNetworkSpec as TargetNetworkSpec, ComAmazonawsEc2Amazonec2State as Ec2State,
-    TRANSITION_DELAY,
+    MAX_ECHOED_CLIENT_VPN_ENDPOINT_ID_CHARS, TRANSITION_DELAY,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -990,5 +990,132 @@ async fn the_report_pages_in_route_order_and_scopes_its_token_to_the_endpoint() 
         error_code(&body),
         "InvalidClientVpnEndpointId.NotFound",
         "an unknown endpoint: expected the not-found code, got {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The endpoint id, whatever form the value takes
+// ---------------------------------------------------------------------------
+
+/// A `ClientVpnEndpointId` this account holds no endpoint for is refused HTTP 400
+/// `InvalidClientVpnEndpointId.NotFound`, worded `Endpoint <id> does not exist`, WHATEVER FORM
+/// the value takes: the member carries no pattern
+/// (`smithy_query(query="shape",shape="ClientVpnEndpointId")` is a plain `String`) and the
+/// Client VPN surface publishes no malformed counterpart to tell "not an id of this kind" from
+/// "no such endpoint" with, so one lookup answers every value it cannot resolve. An endpoint
+/// the account DOES hold and that carries no route reports an empty set instead — the answer
+/// that must never stand in for an id that resolves to nothing — and a dry run reports the
+/// permission outcome without resolving the id at all.
+#[tokio::test]
+async fn an_endpoint_id_that_cannot_be_resolved_is_refused_as_not_found() {
+    let (router, engine) = super::ec2_query::emulator();
+    let endpoint = seed_endpoint(&engine, "the endpoint under test");
+    seed_target_networks(&engine, &endpoint, &[TARGET_SUBNET_A]);
+    let rows = add_rows();
+    add_every_row(&router, &endpoint, &rows[..1]).await;
+
+    // Rows along what the rule generalises over — the FORM of the value: both id lengths EC2
+    // issues (8 and 17 hex digits), the all-zero placeholder AWS's own documentation uses, a
+    // bare prefix, a prefix with an empty suffix, a suffix one digit short and one digit long,
+    // a non-hex suffix, an uppercase suffix, another resource's id, a target network
+    // association's id, a value carrying no resource prefix at all, and an empty value. None
+    // of them names an endpoint of this account, so each is refused the same way.
+    let cases: [&str; 13] = [
+        "cvpn-endpoint-0123abcd",
+        "cvpn-endpoint-0123456789abcdef0",
+        "cvpn-endpoint-00000000000000000",
+        "cvpn-endpoint",
+        "cvpn-endpoint-",
+        "cvpn-endpoint-0123456789abcdef",
+        "cvpn-endpoint-0123456789abcdef01",
+        "cvpn-endpoint-0123456789abcdefg",
+        "cvpn-endpoint-0123456789ABCDEF0",
+        TARGET_VPC,
+        "cvpn-assoc-00000000000000001",
+        "not-an-id-at-all",
+        "",
+    ];
+    for endpoint_id in cases {
+        let (status, body) = describe(&router, &endpoint_param(endpoint_id)).await;
+        assert_eq!(
+            status, 400,
+            "case {endpoint_id:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidClientVpnEndpointId.NotFound",
+            "case {endpoint_id:?}: expected the not-found code, got {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            format!("Endpoint {endpoint_id} does not exist"),
+            "case {endpoint_id:?}: expected the refusal to name the id the request sent, got \
+             {body}"
+        );
+
+        // The same unresolvable id under `DryRun`: the permission outcome, reported without
+        // resolving anything.
+        let mut dry = endpoint_param(endpoint_id);
+        dry.push(("DryRun".to_string(), "true".to_string()));
+        let (status, body) = describe(&router, &dry).await;
+        assert_eq!(
+            status, 412,
+            "case {endpoint_id:?} as a dry run: expected HTTP 412, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "DryRunOperation",
+            "case {endpoint_id:?} as a dry run: expected the dry-run code, got {body}"
+        );
+    }
+
+    // An id longer than the message will repeat back: the refusal names its first
+    // `MAX_ECHOED_CLIENT_VPN_ENDPOINT_ID_CHARS` characters and no more, so an arbitrarily long
+    // value cannot be reflected in full.
+    let overlong = format!("cvpn-endpoint-{}", "0".repeat(4_096));
+    let (status, body) = describe(&router, &endpoint_param(&overlong)).await;
+    let named: String = overlong
+        .chars()
+        .take(MAX_ECHOED_CLIENT_VPN_ENDPOINT_ID_CHARS)
+        .collect();
+    assert_eq!(
+        status, 400,
+        "an over-long endpoint id: expected HTTP 400, got {status} with body {body}"
+    );
+    assert_eq!(
+        error_message(&body),
+        format!("Endpoint {named} does not exist"),
+        "an over-long endpoint id: expected the echo bounded to {MAX_ECHOED_CLIENT_VPN_ENDPOINT_ID_CHARS} characters, got {body}"
+    );
+
+    // An endpoint that exists and holds no route of its own: an empty set, not a refusal.
+    let empty_endpoint = seed_endpoint(&engine, "an endpoint carrying no route");
+    let (status, body) = describe(&router, &endpoint_param(&empty_endpoint)).await;
+    assert_eq!(
+        status, 200,
+        "an endpoint with no route: expected HTTP 200, got {status} with body {body}"
+    );
+    assert!(
+        elements(&body, "destinationCidr").is_empty(),
+        "an endpoint with no route: expected an empty set, got {body}"
+    );
+
+    // And the endpoint under test still reports the route it holds, so the refusals above are
+    // about the id rather than about the operation.
+    let (status, body) = describe(&router, &endpoint_param(&endpoint)).await;
+    assert_eq!(
+        status, 200,
+        "the stored endpoint: expected HTTP 200, got {status} with body {body}"
+    );
+    assert_eq!(
+        elements(&body, "destinationCidr"),
+        vec![rows[0].destination.to_string()],
+        "the stored endpoint: expected its one route, got {body}"
+    );
+    assert_eq!(
+        stored_routes(&engine),
+        1,
+        "no refusal and no dry run writes a route, got {held} stored routes",
+        held = stored_routes(&engine)
     );
 }
