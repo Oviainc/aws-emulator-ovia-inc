@@ -172,21 +172,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `OutpostIdentifier` accepts the bare id or the full Outpost ARN; both name
         // the same stored Outpost, and `Order$OutpostId` is the bare id either way
-        // (`OutpostIdOnly`, `^op-[a-f0-9]{17}$`).
+        // (`OutpostIdOnly`, `^op-[a-f0-9]{17}$`). A bare id names an Outpost of the
+        // inventory this endpoint serves; an ARN carries a partition, a Region and an
+        // account of its own, and one that is not this endpoint's names no Outpost it
+        // holds — so there is no Outpost here to place an order on.
         let outpost_identifier = input.outpost_identifier;
-        let outpost_id = crate::state::resolve_outpost_id(&outpost_identifier).ok_or_else(|| {
-            CreateOrderErrorModeled::ValidationException(ValidationException {
-                message: Some(crate::state::outpost_identifier_pattern_report()),
+        let outpost_not_found = || {
+            CreateOrderErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::identifier_not_found(
+                    crate::state::OUTPOST_IDENTIFIER_MEMBER,
+                    &outpost_identifier,
+                )),
             })
-        })?;
-        // `QuoteIdentifier` accepts the same two forms for a quote.
+        };
+        let outpost_id = crate::state::resolve_outpost_id(&outpost_identifier, &region)
+            .ok_or_else(|| {
+                CreateOrderErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::outpost_identifier_pattern_report()),
+                })
+            })?
+            .here()
+            .ok_or_else(outpost_not_found)?
+            .to_string();
+        // `QuoteIdentifier` accepts the same two forms for a quote, and an ARN of
+        // another endpoint names no quote here either.
         let quote_identifier = crate::state::non_empty(input.quote_identifier);
         let quote_id = match quote_identifier.as_deref() {
-            Some(identifier) => Some(crate::state::resolve_quote_id(identifier).ok_or_else(|| {
-                CreateOrderErrorModeled::ValidationException(ValidationException {
-                    message: Some(crate::state::quote_identifier_pattern_report()),
-                })
-            })?),
+            Some(identifier) => Some(
+                crate::state::resolve_quote_id(identifier, &region)
+                    .ok_or_else(|| {
+                        CreateOrderErrorModeled::ValidationException(ValidationException {
+                            message: Some(crate::state::quote_identifier_pattern_report()),
+                        })
+                    })?
+                    .here()
+                    .ok_or_else(|| {
+                        CreateOrderErrorModeled::NotFoundException(NotFoundException {
+                            message: Some(crate::state::identifier_not_found(
+                                crate::state::QUOTE_IDENTIFIER_MEMBER,
+                                identifier,
+                            )),
+                        })
+                    })?
+                    .to_string(),
+            ),
             None => None,
         };
         // An order is built out of catalog items, named either directly in
@@ -219,17 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // [`crate::state::OrderRecord::site_id`]).
         let site_id = match store.outpost(&region, &outpost_id) {
             Some(record) => record.outpost.site_id.clone(),
-            None => {
-                return Err(CreateOrderErrorModeled::NotFoundException(
-                    NotFoundException {
-                        message: Some(crate::state::identifier_not_found(
-                            crate::state::OUTPOST_IDENTIFIER_MEMBER,
-                            &outpost_identifier,
-                        )),
-                    },
-                )
-                .into());
-            }
+            None => return Err(outpost_not_found().into()),
         };
         // A quote named for the order has to exist, and has to be one an order can
         // still be submitted from: the modelled `ORDER_SUBMITTED` is "An order has

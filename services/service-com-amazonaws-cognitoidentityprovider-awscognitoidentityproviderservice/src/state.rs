@@ -142,6 +142,25 @@ pub fn exclusive_auth_flow_violation(flows: &[String]) -> Option<&'static str> {
     (names_exclusive_flow && names_another_flow).then_some(EXCLUSIVE_AUTH_FLOW_MESSAGE)
 }
 
+/// The message a sign-in refused because the app client's stored
+/// `ExplicitAuthFlows` do not enable the requested flow carries.
+///
+/// `ExplicitAuthFlows` is "the authentication flows that you want your user pool
+/// client to support" (`CreateUserPoolClient.ExplicitAuthFlows` in this
+/// service's model), so a request whose `AuthFlow` the stored list does not
+/// enable asks for a flow this app client is not configured for. Amazon Cognito
+/// reports that in ONE sentence whose only variable part is the flow the request
+/// asked for — `auth_flow`, the `AuthFlowType` member as SUBMITTED, so an alias
+/// is echoed as the caller wrote it — and which says nothing else about the app
+/// client: the sentence is the same for every client id, so this refusal, which
+/// an unauthenticated caller can provoke, carries no identifier of the app
+/// client it was sent to. Every sign-in operation that checks a client's
+/// configured flows asks this one function, so the admin and the client-side
+/// paths cannot word it differently.
+pub fn auth_flow_not_enabled_message(auth_flow: &str) -> String {
+    format!("{auth_flow} flow not enabled for this client")
+}
+
 /// `UserPoolTierType` defaults to `ESSENTIALS` (`CreateUserPool.UserPoolTier`).
 const DEFAULT_USER_POOL_TIER: &str = "ESSENTIALS";
 
@@ -3959,12 +3978,29 @@ pub fn updated_branding_assets(
     stored: &[crate::ops::types::AssetType],
     customized: &[crate::ops::types::AssetType],
 ) -> Vec<crate::ops::types::AssetType> {
-    let slot = |asset: &crate::ops::types::AssetType| (asset.category.clone(), asset.color_mode.clone());
     let mut merged: Vec<crate::ops::types::AssetType> = stored.to_vec();
+    // Where each slot already sits, INDEXED rather than searched for: both lists
+    // are as long as the requests that built them, so a scan per submitted file
+    // would do work in the product of the two lengths. One lookup per submitted
+    // file keeps the merge linear in them, and the key is built once per file
+    // rather than once per comparison. The first file of a slot is the one a
+    // later request replaces, so a style that somehow holds two of one slot
+    // keeps its later one untouched.
+    let mut slot_positions: ::std::collections::HashMap<(String, String), usize> =
+        ::std::collections::HashMap::with_capacity(merged.len());
+    for (position, asset) in merged.iter().enumerate() {
+        slot_positions
+            .entry((asset.category.clone(), asset.color_mode.clone()))
+            .or_insert(position);
+    }
     for asset in customized {
-        match merged.iter_mut().find(|stored| slot(stored) == slot(asset)) {
-            Some(replaced) => *replaced = asset.clone(),
-            None => merged.push(asset.clone()),
+        let slot = (asset.category.clone(), asset.color_mode.clone());
+        match slot_positions.get(&slot) {
+            Some(&position) => merged[position] = asset.clone(),
+            None => {
+                slot_positions.insert(slot, merged.len());
+                merged.push(asset.clone());
+            }
         }
     }
     merged

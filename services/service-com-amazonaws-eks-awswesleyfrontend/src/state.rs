@@ -1628,6 +1628,36 @@ impl InsightsRefreshRecord {
     }
 }
 
+/// Which resource of a cluster an [`UpdateRecord`] is an update OF.
+///
+/// An update is always addressed through its cluster
+/// (`/clusters/{name}/updates/...`), but the resource it belongs to may be one
+/// INSIDE that cluster: `ListUpdates` and `DescribeUpdate` narrow to it with
+/// `nodegroupName`, `addonName` or `capabilityName` — "Lists the updates
+/// associated with an Amazon EKS resource" (`ListUpdates`) — so every stored
+/// update records WHICH resource it is an update of, and a listing reports only
+/// the updates of the resource the request names.
+///
+/// Every operation that mints an update today changes the cluster's own control
+/// plane, so [`UpdateScope::Cluster`] is what each of them records; the other
+/// variants are what an update of a resource inside the cluster carries, and are
+/// what the minters of those updates (`UpdateNodegroupVersion`,
+/// `UpdateNodegroupConfig`, `UpdateAddon`, `UpdateCapability`, each still a
+/// scaffold with its own gap issue) will record.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum UpdateScope {
+    /// The cluster's own control plane: the scope a request that names no node
+    /// group, add-on or capability lists.
+    #[default]
+    Cluster,
+    /// One managed node group of the cluster, by node group name.
+    Nodegroup(String),
+    /// One installed add-on of the cluster, by add-on name.
+    Addon(String),
+    /// One managed capability of the cluster, by capability name.
+    Capability(String),
+}
+
 /// One asynchronous update of a cluster, as this service stores it.
 ///
 /// Everything the modelled `Update` reports is held here, so `DescribeUpdate`
@@ -1667,6 +1697,11 @@ pub struct UpdateRecord {
     /// separate from [`Self::client_request_token`], which belongs to the call
     /// that STARTED the update.
     pub cancellation_request_token: Option<String>,
+    /// Which resource of the cluster this is an update OF — see [`UpdateScope`].
+    /// It is not reported: the modelled `Update` carries no member for it, and it
+    /// is what SELECTS the update instead (`ListUpdates$nodegroupName` and its
+    /// siblings).
+    pub scope: UpdateScope,
 }
 
 impl UpdateRecord {
@@ -1900,6 +1935,27 @@ impl ClusterRecord {
         self.updates
             .values()
             .find(|update| update.is_in_progress())
+    }
+
+    /// The ids of this cluster's updates that belong to `scope`, in the stable
+    /// order [`Self::updates`] holds them in.
+    ///
+    /// That order is update-id order, because [`Self::updates`] is keyed by the
+    /// update id: it is what `ListUpdates`'s page token resumes AFTER, so a change
+    /// of this map's type would have to keep a stable, sorted walk or that
+    /// resumption would skip ids.
+    ///
+    /// This is what `ListUpdates` pages over: the updates of the resource the
+    /// request names — the cluster's own control plane, or one node group, add-on
+    /// or capability inside it — and never another resource's.
+    pub fn update_ids_in_scope<'a>(
+        &'a self,
+        scope: &'a UpdateScope,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        self.updates
+            .values()
+            .filter(move |update| &update.scope == scope)
+            .map(|update| update.id.as_str())
     }
 
     /// The update this cluster already recorded for `client_request_token`, if
@@ -4729,6 +4785,9 @@ pub const NODEGROUPS_LISTING: &str = "node-groups";
 /// The scope `ListCertificateAuthorities`'s tokens carry, over one cluster's
 /// certificate-authority ids. See [`CLUSTERS_LISTING`].
 pub const CERTIFICATE_AUTHORITIES_LISTING: &str = "certificate-authorities";
+/// The scope `ListUpdates`'s tokens carry, over the update ids of one resource
+/// of one cluster. See [`CLUSTERS_LISTING`].
+pub const UPDATES_LISTING: &str = "updates";
 
 /// Encode a page token for `listing` that resumes AFTER `last_returned`.
 ///
@@ -5177,6 +5236,9 @@ impl CertificateAuthorityRecord {
             // writes both of these.
             cancellation: None,
             cancellation_request_token: None,
+            // The trust bundle is the cluster's own, so this is an update of the
+            // cluster rather than of a resource inside it.
+            scope: UpdateScope::Cluster,
         }
     }
 }

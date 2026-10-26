@@ -170,14 +170,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // region's inventory and of no other's, so that is where the parent is
         // resolved — and with it the assets installed on it.
         let region = crate::state::request_region(ctx.parts());
-        // `OutpostIdentifier` accepts the bare id or the full Outpost ARN; both name
-        // the same stored Outpost.
-        let outpost_id =
-            crate::state::resolve_outpost_id(&input.outpost_identifier).ok_or_else(|| {
+        // `OutpostIdentifier` accepts the bare id or the full Outpost ARN. A bare id
+        // names an Outpost of the inventory this endpoint serves; an ARN carries a
+        // partition, a Region and an account of its own, and one that is not this
+        // endpoint's names no Outpost it holds.
+        let not_found = || {
+            ListAssetsErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::identifier_not_found(
+                    crate::state::OUTPOST_IDENTIFIER_MEMBER,
+                    &input.outpost_identifier,
+                )),
+            })
+        };
+        let outpost_id = crate::state::resolve_outpost_id(&input.outpost_identifier, &region)
+            .ok_or_else(|| {
                 ListAssetsErrorModeled::ValidationException(ValidationException {
                     message: Some(crate::state::outpost_identifier_pattern_report()),
                 })
-            })?;
+            })?
+            .here()
+            .ok_or_else(not_found)?
+            .to_string();
         // The resume point the caller's token names. A token this service did not
         // issue for THIS list is a bad request, not an empty page.
         let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
@@ -203,14 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An Outpost's assets are listed OFF that Outpost, so one the store does not
         // hold is the not-found error this operation models, worded as the identifier
         // echo of the value AS SUPPLIED — not of the bare id an ARN resolved to.
-        let record = store.outpost(&region, &outpost_id).ok_or_else(|| {
-            ListAssetsErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::identifier_not_found(
-                    crate::state::OUTPOST_IDENTIFIER_MEMBER,
-                    &input.outpost_identifier,
-                )),
-            })
-        })?;
+        let record = store.outpost(&region, &outpost_id).ok_or_else(not_found)?;
         // The boundary this list pages on is an asset's POSITION in the Outpost's
         // installation order: an asset carries no creation sequence of its own, and
         // that order is the one stable order the whole list is reported in.

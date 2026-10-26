@@ -39,6 +39,8 @@ mod daemon_task_definition_deletion;
 mod daemon_task_definitions;
 #[path = "all/daemons.rs"]
 mod daemons;
+#[path = "all/delete_attributes.rs"]
+mod delete_attributes;
 #[path = "all/describe_failure_identifiers.rs"]
 mod describe_failure_identifiers;
 #[path = "all/ecs_wire.rs"]
