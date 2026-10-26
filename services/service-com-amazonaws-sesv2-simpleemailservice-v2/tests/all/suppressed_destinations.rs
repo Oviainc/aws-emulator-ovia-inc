@@ -201,15 +201,21 @@ impl Ses {
         }
     }
 
-    /// Persist one suppression-list entry.
+    /// Persist one suppression-list entry, through the one gated path a suppression
+    /// write takes, so the bound that path enforces is exercised here too.
     fn seed(&self, record: &SuppressedDestinationRecord) {
         let state = self
             .engine
             .state::<ComAmazonawsSesv2SimpleemailserviceV2State>();
         let mut store = state.lock();
-        store.suppressed_destinations.insert(
+        let stored = store.suppress_destination(
             suppression_key(record.tenant_name.as_deref(), &record.email_address),
             record.clone(),
+        );
+        assert!(
+            stored,
+            "case {:?}: expected the suppression-list entry to be stored",
+            record.email_address
         );
     }
 

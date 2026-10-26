@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateEmailIdentityCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateEmailIdentityCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateEmailIdentityCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes an identity's S/MIME certificate association, so
+//! `ListEmailIdentityCertificates` reports it as `DEPROVISIONING` and then stops
+//! reporting it at all. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +68,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::IdentityKind;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -145,18 +140,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateEmailIdentityCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateEmailIdentityCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateEmailIdentityCertificate"))
+        // Request metadata is not needed: the association is keyed by the identity and
+        // the address within the one emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DisassociateEmailIdentityCertificate without the shared emulator state",
+            ));
+        };
+
+        let identity = input.email_identity;
+        let key = crate::state::identity_key(&identity);
+        let kind = IdentityKind::of(crate::state::addr_spec(&identity));
+
+        // "If the email identity is a domain, specify the FromAddress whose certificate
+        // association you want to remove" — a domain holds one association per address,
+        // so without the address there is nothing for the call to name. On an address
+        // identity the association is the identity's own.
+        let from_address = match (kind, input.from_address) {
+            (IdentityKind::Domain, None) => {
+                return Err(DisassociateEmailIdentityCertificateErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(
+                            "FromAddress is required when EmailIdentity is a domain.".to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            // An address the identity does not cover holds no association of this
+            // identity's, so it is not refused the way the create refuses it: it is a
+            // lookup that finds nothing, which this operation's documented idempotency
+            // ("no matching certificate association ... succeeds without making any
+            // changes") answers by changing nothing.
+            (_, Some(address)) => address,
+            (IdentityKind::EmailAddress, None) => identity.clone(),
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A read of the table reports settled statuses; do the same here, so a call
+        // that follows one whose clean-up has already fallen due sees what a listing
+        // would report.
+        store.settle(now);
+        let Some(record) = store.identities.get_mut(&key) else {
+            // "Amazon SES API v2 returns a NotFoundException only when the specified
+            // email identity doesn't exist."
+            return Err(DisassociateEmailIdentityCertificateErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::email_identity_not_found(&identity)),
+                },
+            )
+            .into());
+        };
+
+        // "This operation is idempotent. If the specified email identity exists but
+        // there's no matching certificate association, the operation succeeds without
+        // making any changes." An association that already signs nothing is such a
+        // no-change case: it is already on its way out.
+        if let Some(certificate) = record
+            .certificates
+            .get_mut(&crate::state::identity_key(&from_address))
+        {
+            if certificate.signs() {
+                certificate.deactivate(now);
+            }
+        }
+        Ok(DisassociateEmailIdentityCertificateOutput {})
     }
 }

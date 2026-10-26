@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateEmailIdentityCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateEmailIdentityCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateEmailIdentityCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associates an ACM certificate with an email identity, so
+//! `ListEmailIdentityCertificates` reports the association and
+//! `DisassociateEmailIdentityCertificate` can remove it again. This is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +83,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{CertificateStatus, IdentityCertificateRecord, IdentityKind};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -160,18 +156,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateEmailIdentityCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateEmailIdentityCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateEmailIdentityCertificate"))
+        // Request metadata is not needed: the association is keyed by the identity and
+        // the address within the one emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "AssociateEmailIdentityCertificate without the shared emulator state",
+            ));
+        };
+
+        let identity = input.email_identity;
+        let key = crate::state::identity_key(&identity);
+        let kind = IdentityKind::of(crate::state::addr_spec(&identity));
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A read of the table reports settled statuses; do the same here, so the
+        // duplicate check sees the same associations a listing would report — in
+        // particular one whose clean-up has already fallen due.
+        store.settle(now);
+        let Some(record) = store.identities.get_mut(&key) else {
+            return Err(AssociateEmailIdentityCertificateErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::email_identity_not_found(&identity)),
+                },
+            )
+            .into());
+        };
+
+        // "If the email identity is a domain, you must specify a FromAddress that
+        // belongs to that domain or one of its subdomains. [...] If the email identity
+        // is an email address, FromAddress is optional. If you specify it, it must
+        // exactly match the email identity."
+        let from_address = match (kind, input.from_address) {
+            (IdentityKind::Domain, None) => {
+                return Err(bad_request(
+                    "FromAddress is required when EmailIdentity is a domain.",
+                ));
+            }
+            (IdentityKind::Domain, Some(address)) => {
+                if !crate::state::address_in_domain(&key, &crate::state::identity_key(&address)) {
+                    return Err(bad_request(format!(
+                        "FromAddress <{address}> does not belong to the domain <{identity}> or \
+                         one of its subdomains."
+                    )));
+                }
+                address
+            }
+            (IdentityKind::EmailAddress, Some(address)) => {
+                // "Exactly match" compares the mailbox the value names, which is what
+                // the identity table is keyed by: a display-name form and a differently
+                // cased domain name the same mailbox.
+                if crate::state::identity_key(&address) != key {
+                    return Err(bad_request(format!(
+                        "FromAddress <{address}> must exactly match the email identity \
+                         <{identity}>."
+                    )));
+                }
+                address
+            }
+            // "The certificate applies to messages sent from that address": with no
+            // FromAddress on an address identity, that address is the identity itself.
+            (IdentityKind::EmailAddress, None) => identity.clone(),
+        };
+
+        // "Each email address can have only one certificate association. If an
+        // association already exists for the address, this operation returns an error,
+        // unless the existing association is in the DEPROVISIONING state" — one being
+        // cleaned up is on its way out, so the address is free to take a new one.
+        let certificate_key = crate::state::identity_key(&from_address);
+        if record
+            .certificates
+            .get(&certificate_key)
+            .is_some_and(|existing| existing.status != CertificateStatus::Deprovisioning)
+        {
+            return Err(AssociateEmailIdentityCertificateErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(format!(
+                        "A certificate is already associated with sender <{from_address}> on \
+                         identity <{identity}>."
+                    )),
+                },
+            )
+            .into());
+        }
+        // One record is stored per accepted association, so an identity is capped: see
+        // `MAX_CERTIFICATES_PER_IDENTITY` for why the bound exists. This operation
+        // binds no `LimitExceededException`, so the bound is reported with the terminal
+        // input error it does bind, naming the limit it is past.
+        if !record.certificates.contains_key(&certificate_key)
+            && record.certificates.len() >= crate::state::MAX_CERTIFICATES_PER_IDENTITY
+        {
+            return Err(bad_request(format!(
+                "Email identity <{identity}> already holds the maximum of {} certificate \
+                 associations.",
+                crate::state::MAX_CERTIFICATES_PER_IDENTITY
+            )));
+        }
+
+        // The ARN names a certificate in Certificate Manager, whose records belong to
+        // that service's state rather than this one's: SES is documented to take the
+        // ARN as how the caller "identif[ies] it", and a certificate that is not ready
+        // for signing is reflected in the association's STATUS rather than refused
+        // here, so the ARN is stored as given and resolved against nothing.
+        record.certificates.insert(
+            certificate_key,
+            IdentityCertificateRecord::new(&from_address, &input.certificate_arn, now),
+        );
+        Ok(AssociateEmailIdentityCertificateOutput {})
     }
+}
+
+/// Refuse the request with this service's input error.
+fn bad_request(message: impl Into<String>) -> AssociateEmailIdentityCertificateError {
+    AssociateEmailIdentityCertificateErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }

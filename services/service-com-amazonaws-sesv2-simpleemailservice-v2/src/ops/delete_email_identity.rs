@@ -2,8 +2,9 @@
 
 //! @op DeleteEmailIdentity
 //! Removes a persisted email identity, so a later `GetEmailIdentity` answers
-//! `NotFoundException` and `ListEmailIdentities` no longer enumerates it. This is
-//! the ONLY file to touch for this operation.
+//! `NotFoundException` and `ListEmailIdentities` no longer enumerates it — once the
+//! identity holds no S/MIME certificate association. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -133,7 +134,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // No store at all, which is not a modelled SES state: answer the
             // scaffold's 501 rather than a modelled error that reads as one.
@@ -142,20 +142,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        if store
-            .identities
-            .remove(&crate::state::identity_key(&input.email_identity))
-            .is_none()
-        {
+        // A read of the table reports settled statuses; do the same here, so an
+        // association whose clean-up has already fallen due no longer holds the
+        // identity back.
+        store.settle(now);
+        let key = crate::state::identity_key(&input.email_identity);
+        let Some(record) = store.identities.get(&key) else {
             return Err(DeleteEmailIdentityErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::email_identity_not_found(&input.email_identity)),
+            })
+            .into());
+        };
+        // An identity's S/MIME certificate associations are resources held BY the
+        // identity, and deleting it would orphan the ones it still signs with, so the
+        // identity goes only once nothing signs for it: the caller disassociates
+        // first, and a disassociated association no longer holds the identity. The
+        // refusal names the identity by ARN, which identifies the resource whatever
+        // spelling the request addressed it with.
+        if record
+            .certificates
+            .values()
+            .any(crate::state::IdentityCertificateRecord::signs)
+        {
+            let arn = crate::state::identity_arn(
+                &crate::state::request_region(ctx.parts()),
+                &record.name,
+            );
+            return Err(DeleteEmailIdentityErrorModeled::BadRequestException(BadRequestException {
                 message: Some(format!(
-                    "Email identity {} does not exist.",
-                    input.email_identity
+                    "Cannot delete <{arn}> because it has certificates associated with it. \
+                     Disassociate all certificates and try again."
                 )),
             })
             .into());
         }
+        store.identities.remove(&key);
         // The outbound-message log is deliberately left alone: deleting an identity
         // stops future sends from it and does not unsend what it already sent.
         Ok(DeleteEmailIdentityOutput {})

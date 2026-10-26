@@ -186,10 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&crate::state::identity_key(&input.email_identity))
         else {
             return Err(GetEmailIdentityErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "Email identity {} does not exist.",
-                    input.email_identity
-                )),
+                message: Some(crate::state::email_identity_not_found(&input.email_identity)),
             })
             .into());
         };

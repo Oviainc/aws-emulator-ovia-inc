@@ -21,6 +21,8 @@ mod configuration_set_event_publication_surface;
 mod configuration_sets;
 #[path = "all/contact_lists.rs"]
 mod contact_lists;
+#[path = "all/email_identity_certificates.rs"]
+mod email_identity_certificates;
 #[path = "all/email_identity_configuration_set_association.rs"]
 mod email_identity_configuration_set_association;
 #[path = "all/email_identity_feedback_attributes.rs"]

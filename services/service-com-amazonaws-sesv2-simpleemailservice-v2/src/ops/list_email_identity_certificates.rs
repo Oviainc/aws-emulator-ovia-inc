@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEmailIdentityCertificates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEmailIdentityCertificates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEmailIdentityCertificates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the S/MIME certificate associations an email identity holds, a page at a
+//! time. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +79,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::IdentityCertificateRecord;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -157,18 +151,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEmailIdentityCertificates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEmailIdentityCertificatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEmailIdentityCertificates"))
+        // Request metadata is not needed: the listing covers one identity of the one
+        // emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the
+            // scaffold's 501 rather than a throttle an SDK would retry forever.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListEmailIdentityCertificates without the shared emulator state",
+            ));
+        };
+
+        // "The number of results to show in a single call [...] If the number of
+        // results is larger than the number you specified in this parameter, then the
+        // response includes a NextToken element": the model puts no bound on
+        // `MaxItems`, so only a positive count truncates a page and a non-positive one
+        // is read as no truncation.
+        let page_size = usize::try_from(input.page_size.unwrap_or_default())
+            .ok()
+            .filter(|size| *size > 0);
+
+        // The token is this operation's own: it names the last association the previous
+        // page returned, so the next page resumes strictly after it.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_tagged_page_token(
+                    crate::state::IDENTITY_CERTIFICATES_PAGE_TOKEN_TAG,
+                    token,
+                )
+                .ok_or_else(|| {
+                    bad_request(
+                        "NextToken is not a token returned by ListEmailIdentityCertificates.",
+                    )
+                })?,
+            ),
+        };
+
+        let identity = input.email_identity;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The `PROVISIONING` -> `ACTIVE` transition and the clean-up of a
+        // `DEPROVISIONING` association were owed at `now` whether or not anybody
+        // called, so materialising them here changes nothing a later caller would
+        // otherwise have seen.
+        store.settle(now);
+        let Some(record) = store.identities.get(&crate::state::identity_key(&identity)) else {
+            return Err(ListEmailIdentityCertificatesErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::email_identity_not_found(&identity)),
+                },
+            )
+            .into());
+        };
+
+        // `certificates` is ordered by storage key, so a page is a window over that
+        // order and the resume point is a position in it — which keeps a token valid
+        // even if the association it names has since been removed.
+        let stored: Vec<(&String, &IdentityCertificateRecord)> =
+            record.certificates.iter().collect();
+        let start = match resume_after.as_deref() {
+            None => 0,
+            Some(last) => stored.partition_point(|(key, _)| key.as_str() <= last),
+        };
+        let remaining = &stored[start..];
+        let page = match page_size {
+            Some(size) => &remaining[..size.min(remaining.len())],
+            None => remaining,
+        };
+
+        // "The results include certificates in all states": every stored association
+        // is reported, whatever status it currently carries.
+        let certificates: Vec<IdentityCertificate> = page
+            .iter()
+            .map(|(_, certificate)| certificate.view())
+            .collect();
+        // A token only when associations remain behind this page, so a walk terminates.
+        let next_token = (page.len() < remaining.len())
+            .then(|| {
+                page.last().map(|(key, _)| {
+                    crate::state::encode_tagged_page_token(
+                        crate::state::IDENTITY_CERTIFICATES_PAGE_TOKEN_TAG,
+                        key,
+                    )
+                })
+            })
+            .flatten();
+
+        Ok(ListEmailIdentityCertificatesOutput {
+            certificates: Some(certificates),
+            next_token,
+        })
     }
+}
+
+/// Refuse the request with this service's input error.
+fn bad_request(message: impl Into<String>) -> ListEmailIdentityCertificatesError {
+    ListEmailIdentityCertificatesErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }

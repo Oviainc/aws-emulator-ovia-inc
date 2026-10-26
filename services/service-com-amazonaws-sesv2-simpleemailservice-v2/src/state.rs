@@ -26,6 +26,25 @@ use std::time::{Duration, SystemTime};
 /// is stored on the record; nothing ever sleeps for it.
 pub const VERIFICATION_SETTLE: Duration = Duration::from_millis(500);
 
+/// How long after a certificate association is created its `PROVISIONING` ->
+/// `ACTIVE` transition becomes due, and how long after it is removed its
+/// `DEPROVISIONING` clean-up is due.
+///
+/// Both spans are CHOSEN, not documented: real SES prepares the certificate for
+/// signing (and later cleans the association up) on its own schedule, which nothing
+/// here can observe. The span is long enough that a caller which reads straight back
+/// still sees the transient state and the state rules that go with it. The due
+/// instant is stored on the record; nothing ever sleeps for it.
+pub const CERTIFICATE_SETTLE: Duration = Duration::from_millis(500);
+
+/// Certificate associations one email identity may hold.
+///
+/// A CHOSEN bound, not an AWS one: a domain identity takes one association per
+/// address in the domain, so a long-lived emulator must not grow without limit while
+/// serving them. It is far above what a client signing from a domain's addresses
+/// needs.
+pub const MAX_CERTIFICATES_PER_IDENTITY: usize = 1_000;
+
 /// Easy DKIM publishes three CNAME tokens for a domain identity.
 ///
 /// From the `DkimAttributes$Tokens` documentation: "this object contains a set of
@@ -72,6 +91,17 @@ pub const MAX_CONTACT_LISTS: usize = 1_000;
 /// CHOSEN for the same reason, and for the same growth: one record per accepted
 /// `CreateContact`.
 pub const MAX_CONTACTS_PER_LIST: usize = 10_000;
+
+/// Addresses the account's suppression lists may hold, across the account-level list
+/// and every tenant's own.
+///
+/// CHOSEN for the same reason, and for the same growth: one record per accepted
+/// suppression write, under a key the request's own address decides.
+/// [`ComAmazonawsSesv2SimpleemailserviceV2State::suppress_destination`] is the one
+/// way an entry enters the table and it refuses past this bound, so no sequence of
+/// requests can grow the table without limit. It is well above what a client
+/// exercising the suppression API needs.
+pub const MAX_SUPPRESSED_DESTINATIONS: usize = 10_000;
 
 /// How long after `CreateMultiRegionEndpoint` an endpoint's `CREATING` -> `READY`
 /// transition becomes due.
@@ -176,6 +206,13 @@ pub fn tenant_arn(region: &str, tenant_name: &str, tenant_id: &str) -> String {
     )
 }
 
+/// `arn:aws:ses:<region>:<account>:identity/<identity>` — the ARN of an email
+/// identity, which is how a refusal that must name the resource rather than the
+/// request's spelling of it names one.
+pub fn identity_arn(region: &str, identity: &str) -> String {
+    ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("identity/{identity}"))
+}
+
 /// Whether `tenant_name` satisfies the documented `TenantName` form: at most
 /// [`MAX_TENANT_NAME_CHARS`] characters, each a letter, a digit, `-` or `_`.
 pub fn tenant_name_is_well_formed(tenant_name: &str) -> bool {
@@ -261,7 +298,9 @@ pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
     /// Addresses on a suppression list, keyed by [`suppression_key`]: the list the
     /// entry belongs to (a tenant's, or the account's) and the address within it, so
     /// a tenant's list and the account-level list are separate. Ordered, so
-    /// `ListSuppressedDestinations` enumerates and pages deterministically.
+    /// `ListSuppressedDestinations` enumerates and pages deterministically. Bounded
+    /// by [`MAX_SUPPRESSED_DESTINATIONS`], which [`Self::suppress_destination`]
+    /// enforces.
     pub suppressed_destinations: BTreeMap<String, SuppressedDestinationRecord>,
     /// The outbound-message log, oldest first: one entry per accepted `SendEmail`.
     pub sent_messages: Vec<SentMessage>,
@@ -304,6 +343,28 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
         // moves past entries that no longer count.
         let charged = self.recipients_in_quota_window(now);
         self.send_counters.sent_last_24h = charged;
+    }
+
+    /// Put `record` on the suppression list `key` names, refusing a NEW entry once
+    /// the table holds [`MAX_SUPPRESSED_DESTINATIONS`].
+    ///
+    /// Every write to the table goes through here, so the ceiling cannot be bypassed:
+    /// `false` means the table was full and nothing was stored, which the calling
+    /// operation reports with the limit error its own model binds. Replacing an entry
+    /// the table already holds grows nothing, so it is always accepted — which is
+    /// what keeps a repeated suppression of one address idempotent.
+    pub fn suppress_destination(
+        &mut self,
+        key: String,
+        record: SuppressedDestinationRecord,
+    ) -> bool {
+        if !self.suppressed_destinations.contains_key(&key)
+            && self.suppressed_destinations.len() >= MAX_SUPPRESSED_DESTINATIONS
+        {
+            return false;
+        }
+        self.suppressed_destinations.insert(key, record);
+        true
     }
 
     /// The identity that authorises sending from `address`, if any.
@@ -565,6 +626,134 @@ impl DkimState {
     }
 }
 
+/// The status of one certificate association (`IdentityCertificateStatus`).
+///
+/// Only the states this emulator can reach are represented. `FAILED` is what SES
+/// reports for an association whose certificate "has passed its expiration time",
+/// which is read from the ACM certificate the association names: that certificate
+/// lives in another service's state, so nothing here produces that status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertificateStatus {
+    /// "The certificate association was created and the certificate is being
+    /// prepared for use."
+    Provisioning,
+    /// "The certificate is ready to use for signing."
+    Active,
+    /// "The certificate is no longer used for signing" — what an association that has
+    /// been disassociated carries, until SES cleans it up.
+    Inactive,
+    /// "The certificate association is being cleaned up."
+    Deprovisioning,
+}
+
+impl CertificateStatus {
+    /// The modelled enum value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Provisioning => "PROVISIONING",
+            Self::Active => "ACTIVE",
+            Self::Inactive => "INACTIVE",
+            Self::Deprovisioning => "DEPROVISIONING",
+        }
+    }
+}
+
+/// One S/MIME certificate association: the address its certificate signs for, the
+/// ACM certificate it names, and where the association is in its lifecycle.
+#[derive(Debug, Clone)]
+pub struct IdentityCertificateRecord {
+    /// `FromAddress`: the address the certificate applies to, as the request spelled
+    /// it.
+    pub from_address: String,
+    /// `CertificateArn`: the ACM certificate the association names.
+    pub certificate_arn: String,
+    /// Where the association is in its lifecycle.
+    pub status: CertificateStatus,
+    /// When this status's clock-owed transition falls due: `PROVISIONING` ->
+    /// `ACTIVE`, `INACTIVE` -> `DEPROVISIONING`, and the clean-up that removes a
+    /// `DEPROVISIONING` association.
+    pub status_due_at: SystemTime,
+}
+
+impl IdentityCertificateRecord {
+    /// A fresh association, as `AssociateEmailIdentityCertificate` stores it: "when
+    /// the association is created, the certificate begins provisioning and its status
+    /// is PROVISIONING".
+    pub fn new(from_address: &str, certificate_arn: &str, now: SystemTime) -> Self {
+        Self {
+            from_address: from_address.to_string(),
+            certificate_arn: certificate_arn.to_string(),
+            status: CertificateStatus::Provisioning,
+            status_due_at: now.checked_add(CERTIFICATE_SETTLE).unwrap_or(now),
+        }
+    }
+
+    /// Stop signing with this association, as `DisassociateEmailIdentityCertificate`
+    /// does: "after the association is removed, Amazon SES API v2 stops adding an
+    /// S/MIME signature to messages sent from that address", so the certificate "is
+    /// no longer used for signing" at once, and SES then cleans the association up.
+    pub fn deactivate(&mut self, now: SystemTime) {
+        self.status = CertificateStatus::Inactive;
+        self.status_due_at = now.checked_add(CERTIFICATE_SETTLE).unwrap_or(now);
+    }
+
+    /// Whether this association is one the identity signs with: a `PROVISIONING` one
+    /// is being prepared for signing and an `ACTIVE` one is ready for it, while a
+    /// disassociated one is on its way out and signs nothing.
+    pub fn signs(&self) -> bool {
+        matches!(
+            self.status,
+            CertificateStatus::Provisioning | CertificateStatus::Active
+        )
+    }
+
+    /// Apply every transition the clock owes this association at `now`, and report
+    /// whether the association still exists afterwards: a disassociated one is cleaned
+    /// up, and once that clean-up falls due it is gone.
+    pub fn settle(&mut self, now: SystemTime) -> bool {
+        loop {
+            if now < self.status_due_at {
+                return true;
+            }
+            match self.status {
+                // Both are states the association stays in until a request moves it,
+                // so neither owes the clock anything further.
+                CertificateStatus::Provisioning => {
+                    self.status = CertificateStatus::Active;
+                    return true;
+                }
+                CertificateStatus::Active => return true,
+                CertificateStatus::Inactive => {
+                    self.status = CertificateStatus::Deprovisioning;
+                    // Measured from the instant the clean-up was owed, not from this
+                    // call, so a store nobody read for a while settles all the way
+                    // through rather than one step per read.
+                    self.status_due_at = self
+                        .status_due_at
+                        .checked_add(CERTIFICATE_SETTLE)
+                        .unwrap_or(now);
+                }
+                CertificateStatus::Deprovisioning => return false,
+            }
+        }
+    }
+
+    /// The modelled `IdentityCertificate` view of this record.
+    pub fn view(&self) -> crate::ops::types::IdentityCertificate {
+        crate::ops::types::IdentityCertificate {
+            from_address: Some(self.from_address.clone()),
+            status: Some(self.status.as_str().to_string()),
+            certificate_arn: Some(self.certificate_arn.clone()),
+            // "The timestamp after which the certificate is no longer valid" is the
+            // validity of the ACM certificate this association names, which belongs
+            // to that service's state and not to this one: SES reads it from the
+            // certificate rather than deciding it, so no expiry is reported here
+            // rather than one being made up.
+            certificate_expiry_time: None,
+        }
+    }
+}
+
 /// One email identity.
 #[derive(Debug, Clone)]
 pub struct EmailIdentityRecord {
@@ -590,6 +779,11 @@ pub struct EmailIdentityRecord {
     pub created_at: SystemTime,
     /// When the `PENDING` -> `SUCCESS` verification transition falls due.
     pub verification_due_at: SystemTime,
+    /// The S/MIME certificate associations this identity holds, keyed by
+    /// [`identity_key`] of the address each applies to — "each email address can have
+    /// only one certificate association". Ordered, so
+    /// `ListEmailIdentityCertificates` enumerates and pages deterministically.
+    pub certificates: BTreeMap<String, IdentityCertificateRecord>,
 }
 
 impl EmailIdentityRecord {
@@ -613,6 +807,7 @@ impl EmailIdentityRecord {
             policies: BTreeMap::new(),
             created_at: now,
             verification_due_at: now.checked_add(VERIFICATION_SETTLE).unwrap_or(now),
+            certificates: BTreeMap::new(),
         }
     }
 
@@ -655,7 +850,8 @@ impl EmailIdentityRecord {
             .collect()
     }
 
-    /// Apply the verification transition if it is due at `now`.
+    /// Apply the transitions the clock owes this identity at `now`: its verification
+    /// transition, and each certificate association's own.
     pub fn settle(&mut self, now: SystemTime) {
         if self.verification_status == SesStatus::Pending && now >= self.verification_due_at {
             self.verification_status = SesStatus::Success;
@@ -664,6 +860,8 @@ impl EmailIdentityRecord {
                 self.dkim.status = SesStatus::Success;
             }
         }
+        self.certificates
+            .retain(|_, certificate| certificate.settle(now));
     }
 }
 
@@ -1763,6 +1961,21 @@ pub fn addr_spec(address: &str) -> &str {
     }
 }
 
+/// How this service words `NotFoundException` for an email identity it does not
+/// hold.
+///
+/// SES quotes the value it refuses in angle brackets here, and this is the sentence
+/// shared by the identity readers, the delete and the certificate operations, so a
+/// client sees the same wording whichever of them first tells it the identity is
+/// gone. Two operations are deliberately NOT routed through it:
+/// `PutEmailIdentityFeedbackAttributes` and
+/// `PutEmailIdentityConfigurationSetAttributes` answer an unbracketed sentence,
+/// which is what their own recorded responses carry, so each words it in its own
+/// handler.
+pub fn email_identity_not_found(identity: &str) -> String {
+    format!("Email identity <{identity}> does not exist.")
+}
+
 /// The key an identity is stored and looked up under.
 ///
 /// A domain name is case-insensitive — DNS compares labels without regard to case
@@ -1777,6 +1990,27 @@ pub fn identity_key(identity: &str) -> String {
         Some((local, domain)) => format!("{local}@{}", domain.to_lowercase()),
         None => identity.to_lowercase(),
     }
+}
+
+/// Whether `address` is an address in `domain` or in one of its subdomains.
+///
+/// Both arguments are [`identity_key`]s, so the domain parts compare the way DNS
+/// compares them. A domain covers `user@its.own.name` and `user@any.subdomain.of.it`,
+/// and nothing else — `example.com` does not cover `notexample.com`.
+pub fn address_in_domain(domain: &str, address: &str) -> bool {
+    let Some((local, address_domain)) = address.rsplit_once('@') else {
+        return false;
+    };
+    if local.is_empty() {
+        return false;
+    }
+    address_domain == domain
+        || address_domain
+            .strip_suffix(domain)
+            // The remainder is the subdomain part, so it ends at the separating dot
+            // and must carry at least one label character before it: `.example.com`
+            // names no subdomain of `example.com`.
+            .is_some_and(|parent| parent.ends_with('.') && parent.len() > 1)
 }
 
 /// The Easy DKIM CNAME tokens SES publishes for `domain`.
@@ -1819,6 +2053,9 @@ pub const CONTACT_LISTS_PAGE_TOKEN_TAG: &str = "sesv2:contact-lists:";
 
 /// The tag `ListContacts`'s own tokens carry.
 pub const CONTACTS_PAGE_TOKEN_TAG: &str = "sesv2:contacts:";
+
+/// The tag `ListEmailIdentityCertificates`'s own tokens carry.
+pub const IDENTITY_CERTIFICATES_PAGE_TOKEN_TAG: &str = "sesv2:identity-certificates:";
 
 /// The tag `ListSuppressedDestinations`'s own tokens carry.
 pub const SUPPRESSED_DESTINATIONS_PAGE_TOKEN_TAG: &str = "sesv2:suppressed-destinations:";
