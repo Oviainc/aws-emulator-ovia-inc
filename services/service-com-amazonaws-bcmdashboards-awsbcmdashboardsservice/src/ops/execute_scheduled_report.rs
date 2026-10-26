@@ -17,15 +17,25 @@
 //!   `ValidationException` (400): the model documents "The scheduled report must be in
 //!   ENABLED state. Calling this operation on a DISABLED scheduled report returns a
 //!   ValidationException."
-//! * `healthStatus` is DERIVED from the store by
-//!   `crate::state::ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState::scheduled_report_health`
-//!   — healthy exactly while the dashboard the report renders and every widget its
-//!   `widgetIds` name still resolve — and the execution is triggered only when the
-//!   configuration does resolve, so `executionTriggered` is false on an `UNHEALTHY`
-//!   report and the report's `lastExecutionAt` does not move.
+//! * `healthStatus` is DERIVED from the store and from the DELIVERY this execution makes
+//!   — `crate::state::ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState::scheduled_report_health`
+//!   answers healthy exactly while the dashboard the report renders and every widget its
+//!   `widgetIds` name still resolve, and the execution is triggered only when the
+//!   configuration does resolve, so `executionTriggered` is false on a report whose
+//!   configuration does not and the report's `lastExecutionAt` does not move. A triggered
+//!   execution then hands one notification to the account's default Amazon EventBridge
+//!   event bus (`crate::state::deliver_execution_notification`), because that delivery is
+//!   what the model defines a scheduled report by: `HealthStatus.statusCode` documents
+//!   `UNHEALTHY` as "the scheduled report is unable to deliver the notification to the
+//!   default Amazon Web Services EventBridge EventBus in your account". A notification
+//!   the bus did not take is therefore answered as `UNHEALTHY` with `INTERNAL_FAILURE`
+//!   (`crate::state::undelivered_notification_health`) rather than as a healthy
+//!   execution; the execution was still triggered, so `executionTriggered` stays true and
+//!   `lastExecutionAt` moves.
 //! * `dryRun` is a validation only: the ARN and the schedule state are still checked and
-//!   the health is still computed and returned, but nothing is written and no execution
-//!   is triggered, so `executionTriggered` is false.
+//!   the health the configuration establishes is still returned, but nothing is written,
+//!   no execution is triggered and no notification is delivered, so `executionTriggered`
+//!   is false.
 //! * A `clientToken` makes the call idempotent for
 //!   `crate::state::EXECUTION_IDEMPOTENCY_WINDOW` (the minute the model documents): a
 //!   retry presenting the same token for the same report answers the first call's
@@ -204,61 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: "the dashboard store is unavailable".to_string(),
             })
         })?;
-        let mut state = state.lock();
         let now = ::std::time::SystemTime::now();
-
-        // The report the ARN is the key of. Cloned so the health below can read the rest
-        // of the store (the dashboard the report renders) while the record is in hand.
-        let Some(record) = state.scheduled_reports.get(&input.arn).cloned() else {
-            crate::state::record_state_change(
-                ctx,
-                Self::NAME,
-                &input.arn,
-                crate::scaffolded::RESOURCE_NOT_FOUND_CODE,
-            );
-            return Err(crate::scaffolded::Scaffolded::resource_not_found(
-                &input.arn,
-                format!("Scheduled report not found: {}", input.arn),
-            ));
-        };
-
-        // "The scheduled report must be in ENABLED state. Calling this operation on a
-        // DISABLED scheduled report returns a ValidationException."
-        if record.schedule_state() != crate::state::SCHEDULE_STATE_ENABLED {
-            crate::state::record_state_change(
-                ctx,
-                Self::NAME,
-                &input.arn,
-                "ValidationException",
-            );
-            return Err(ExecuteScheduledReportErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "Member must be in {} state: scheduled report {}",
-                        crate::state::SCHEDULE_STATE_ENABLED,
-                        input.arn
-                    ),
-                },
-            )
-            .into());
-        }
-
-        // "When set to true, validates the scheduled report configuration without
-        // triggering an actual execution": a reporting path. It writes NOTHING — not the
-        // health refresh, not the idempotency record — so a dry run leaves every later
-        // caller seeing exactly what it would have seen without it — and, changing
-        // nothing, it accounts for nothing in the audit stream, as this service's
-        // reporting operations do.
-        if input.dry_run == Some(true) {
-            return Ok(ExecuteScheduledReportOutput {
-                health_status: Some(state.scheduled_report_health(&record, now)),
-                execution_triggered: Some(false),
-            });
-        }
-
-        // The idempotency records the clock has already finished with, dropped before any
-        // of them can be read as a retry.
-        state.expire_execution_tokens(now);
 
         // The idempotency key of THIS request: the report it names together with the
         // token it presented. A token suppresses a repeat of the request that carried it,
@@ -270,29 +226,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .map(|token| (input.arn.clone(), token.clone()));
 
-        if let Some(prior) = idempotency_key
-            .as_ref()
-            .and_then(|key| state.scheduled_report_executions.get(key))
+        // Everything this request can decide from the store alone is decided here, under
+        // one guard that is DROPPED before the delivery below: the delivery is an await,
+        // and a lock is not held across one.
+        let (record, configured_health) = {
+            let mut store = state.lock();
+
+            // The report the ARN is the key of. Cloned so the health below can read the
+            // rest of the store (the dashboard the report renders) while the record is in
+            // hand.
+            let Some(record) = store.scheduled_reports.get(&input.arn).cloned() else {
+                crate::state::record_state_change(
+                    ctx,
+                    Self::NAME,
+                    &input.arn,
+                    crate::scaffolded::RESOURCE_NOT_FOUND_CODE,
+                );
+                return Err(crate::scaffolded::Scaffolded::resource_not_found(
+                    &input.arn,
+                    format!("Scheduled report not found: {}", input.arn),
+                ));
+            };
+
+            // "The scheduled report must be in ENABLED state. Calling this operation on a
+            // DISABLED scheduled report returns a ValidationException."
+            if record.schedule_state() != crate::state::SCHEDULE_STATE_ENABLED {
+                crate::state::record_state_change(
+                    ctx,
+                    Self::NAME,
+                    &input.arn,
+                    "ValidationException",
+                );
+                return Err(ExecuteScheduledReportErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "Member must be in {} state: scheduled report {}",
+                            crate::state::SCHEDULE_STATE_ENABLED,
+                            input.arn
+                        ),
+                    },
+                )
+                .into());
+            }
+
+            // "When set to true, validates the scheduled report configuration without
+            // triggering an actual execution": a reporting path. No execution is
+            // triggered, so no notification is delivered and the health answered is the
+            // one the configuration establishes. It writes NOTHING — not the health
+            // refresh, not the idempotency record — so a dry run leaves every later
+            // caller seeing exactly what it would have seen without it — and, changing
+            // nothing, it accounts for nothing in the audit stream, as this service's
+            // reporting operations do.
+            if input.dry_run == Some(true) {
+                return Ok(ExecuteScheduledReportOutput {
+                    health_status: Some(store.scheduled_report_health(&record, now)),
+                    execution_triggered: Some(false),
+                });
+            }
+
+            // The idempotency records the clock has already finished with, dropped before
+            // any of them can be read as a retry.
+            store.expire_execution_tokens(now);
+
+            if let Some(prior) = idempotency_key
+                .as_ref()
+                .and_then(|key| store.scheduled_report_executions.get(key))
+            {
+                // A retry inside the documented window: the first call's outcome, and no
+                // second execution — so no second notification either. It triggers
+                // nothing and changes nothing a later caller sees, so — like the dry run
+                // — it emits no audit record; the execution it replays already emitted
+                // one.
+                return Ok(ExecuteScheduledReportOutput {
+                    health_status: Some(prior.health_status.clone()),
+                    execution_triggered: Some(prior.execution_triggered),
+                });
+            }
+
+            // The health the stored configuration establishes for this report right now,
+            // and with it whether the execution could be triggered at all: a report whose
+            // dashboard or widgets no longer resolve has nothing to render, so nothing is
+            // triggered and nothing is delivered.
+            let configured_health = store.scheduled_report_health(&record, now);
+            (record, configured_health)
+        };
+
+        let execution_triggered =
+            configured_health.status_code == crate::state::HEALTH_STATUS_HEALTHY;
+
+        // The execution itself: the notification the model defines a scheduled report by,
+        // handed to the account's default EventBridge event bus. The health this request
+        // establishes is the outcome of that delivery — `UNHEALTHY` is documented as the
+        // report "unable to deliver the notification to the default Amazon EventBridge
+        // EventBus in your account" — so a delivery nothing accepted is reported as such
+        // instead of being presented as a healthy execution.
+        let health_status = if execution_triggered
+            && !crate::state::deliver_execution_notification(ctx, &record, now).await
         {
-            // A retry inside the documented window: the first call's outcome, and no
-            // second execution. It triggers nothing and changes nothing a later caller
-            // sees, so — like the dry run — it emits no audit record; the execution it
-            // replays already emitted one.
-            return Ok(ExecuteScheduledReportOutput {
-                health_status: Some(prior.health_status.clone()),
-                execution_triggered: Some(prior.execution_triggered),
-            });
-        }
+            crate::state::undelivered_notification_health(now)
+        } else {
+            configured_health
+        };
 
-        // The health the store establishes for this report right now, and with it
-        // whether the execution could be triggered at all: a report whose dashboard or
-        // widgets no longer resolve has nothing to render, so nothing is triggered.
-        let health_status = state.scheduled_report_health(&record, now);
-        let execution_triggered = health_status.status_code == crate::state::HEALTH_STATUS_HEALTHY;
-
-        // Present: the key was read under this same lock a few lines above, and nothing
-        // between here and there can remove it.
-        if let Some(stored) = state.scheduled_reports.get_mut(&input.arn) {
+        // The writes, under a guard taken AFTER the delivery: the store was unlocked
+        // while the bus was reached, so the report is looked up again rather than
+        // assumed to still be there — a `DeleteScheduledReport` in between removes it,
+        // and this execution must not write it back.
+        let mut store = state.lock();
+        if let Some(stored) = store.scheduled_reports.get_mut(&input.arn) {
             // The health this request refreshed, which the readers project from here on.
             stored.health_status = Some(health_status.clone());
             if execution_triggered {
@@ -303,7 +344,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if let Some(key) = idempotency_key {
-            state.scheduled_report_executions.insert(
+            store.scheduled_report_executions.insert(
                 key,
                 crate::state::ScheduledReportExecution {
                     executed_at: now,

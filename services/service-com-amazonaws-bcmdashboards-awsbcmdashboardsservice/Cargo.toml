@@ -23,12 +23,25 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Hex codec for the opaque `ListDashboards` pagination cursor.
 hex = { workspace = true }
+# The AWS SDK for EventBridge, driven over the in-process callback
+# (`OperationContext::callback`): an execution of a scheduled report delivers one
+# notification onto the account's default event bus, which is the delivery the model
+# grounds the report's health in (`state::deliver_execution_notification`). Only the
+# generated client is needed — the emulator supplies the transport, so the SDK's own
+# HTTPS stack and runtime are left out.
+aws-sdk-eventbridge = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# EventBridge is mounted beside this service on one engine in the integration tests,
+# because an execution of a scheduled report delivers its notification onto the
+# account's default event bus: with no EventBridge mounted there is nothing to deliver
+# to. It claims only requests scoped to its own signing name (`events`), so no
+# bcm-dashboards request is routed any differently for its presence.
+service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 
 [lints]
 workspace = true

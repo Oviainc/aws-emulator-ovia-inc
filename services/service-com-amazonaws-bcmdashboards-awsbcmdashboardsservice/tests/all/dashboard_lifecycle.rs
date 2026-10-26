@@ -22,6 +22,36 @@ use service_com_amazonaws_bcmdashboards_awsbcmdashboardsservice::EmulatedService
 /// A router serving this one service over a fresh engine, as `build_router` does
 /// in production. Shared with the sibling audit suite.
 pub(crate) fn router() -> MultiServiceRouter {
+    emulator().0
+}
+
+/// The same router, together with the engine it was built over.
+///
+/// EventBridge is mounted BESIDE this service on that one engine, because an execution of
+/// a scheduled report delivers one notification onto the account's default event bus
+/// (`state::deliver_execution_notification`), reaching EventBridge through the in-process
+/// callback: with no EventBridge mounted there is nothing for that delivery to reach, so
+/// every execution would report the report as unable to deliver it. EventBridge claims
+/// only requests scoped to its own signing name (`events`), so no bcm-dashboards request
+/// below is routed any differently for its presence.
+///
+/// The engine is handed back so a suite can read the EventBridge store the delivery
+/// reaches — the event a client observes — exactly as the handlers reach their own.
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(
+        service_com_amazonaws_eventbridge_awsevents::EmulatedService::new(Arc::clone(&engine)),
+    );
+    (router, engine)
+}
+
+/// A router serving ONLY this service, with no EventBridge for an execution's
+/// notification to reach: the emulator a client gets when the event bus the model grounds
+/// a scheduled report's health in is not there at all.
+pub(crate) fn router_without_event_bus() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
