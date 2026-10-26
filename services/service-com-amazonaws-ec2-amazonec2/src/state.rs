@@ -2399,6 +2399,12 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// "Unique, case-sensitive identifier that you provide to ensure the idempotency of the
     /// request" (`CreateClientVpnRouteRequest$ClientToken`).
     pub client_vpn_route_client_tokens: HashMap<String, ClientVpnRouteKey>,
+    /// An `AssociateClientVpnTargetNetwork` `ClientToken` and the `AssociationId` that
+    /// request minted, so a repeat of the same request answers with that association instead
+    /// of refusing it as a duplicate — "Unique, case-sensitive identifier that you provide to
+    /// ensure the idempotency of the request"
+    /// (`AssociateClientVpnTargetNetworkRequest$ClientToken`).
+    pub client_vpn_target_network_client_tokens: HashMap<String, String>,
     /// Every Reserved Instance the account holds, by `ReservedInstancesId`, as the modelled
     /// [`crate::ops::types::ReservedInstances`] shape itself — for the same reason
     /// [`Self::vpcs`] holds [`Vpc`]s: every member a writer sets round-trips through a
@@ -3285,6 +3291,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // No endpoint, so no route table of one holds a route either.
             client_vpn_routes: BTreeMap::new(),
             client_vpn_route_client_tokens: HashMap::new(),
+            client_vpn_target_network_client_tokens: HashMap::new(),
             // A fresh account has bought nothing, so it holds no Reserved Instances.
             reserved_instances: BTreeMap::new(),
             network_insights_access_scopes: BTreeMap::new(),

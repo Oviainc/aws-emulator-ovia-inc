@@ -199,13 +199,14 @@ fn seed_associations(
             let association = guard
                 .insert_client_vpn_target_network(TargetNetworkSpec {
                     client_vpn_endpoint_id: endpoint_id.to_string(),
-                    target_network_id: row.target_network_id.to_string(),
-                    vpc_id: row.vpc_id.to_string(),
+                    target_network_id: Some(row.target_network_id.to_string()),
+                    vpc_id: Some(row.vpc_id.to_string()),
                     security_groups: row
                         .security_groups
                         .iter()
                         .map(|group| (*group).to_string())
                         .collect(),
+                    ..Default::default()
                 })
                 .unwrap_or_else(|| {
                     panic!(
@@ -360,9 +361,10 @@ async fn every_association_of_the_named_endpoint_is_reported_and_a_later_write_i
         .lock()
         .insert_client_vpn_target_network(TargetNetworkSpec {
             client_vpn_endpoint_id: seeded.endpoint.clone(),
-            target_network_id: "subnet-00000000000000009".to_string(),
-            vpc_id: "vpc-00000000000000009".to_string(),
+            target_network_id: Some("subnet-00000000000000009".to_string()),
+            vpc_id: Some("vpc-00000000000000009".to_string()),
             security_groups: Vec::new(),
+            ..Default::default()
         })
         .and_then(|association| association.association_id)
         .expect("after a later write: the store must take the association");
@@ -1116,9 +1118,10 @@ async fn a_stored_association_round_trips_through_the_describe() {
         .lock()
         .insert_client_vpn_target_network(TargetNetworkSpec {
             client_vpn_endpoint_id: endpoint.clone(),
-            target_network_id: "subnet-0000000000000000a".to_string(),
-            vpc_id: "vpc-0000000000000000a".to_string(),
+            target_network_id: Some("subnet-0000000000000000a".to_string()),
+            vpc_id: Some("vpc-0000000000000000a".to_string()),
             security_groups: vec!["sg-0000000000000000a".to_string()],
+            ..Default::default()
         })
         .expect("the store must take the association");
 

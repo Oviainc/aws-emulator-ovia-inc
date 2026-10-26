@@ -157,9 +157,10 @@ fn seed_target_networks(engine: &engine::InMemoryEngine, endpoint_id: &str, subn
         guard
             .insert_client_vpn_target_network(TargetNetworkSpec {
                 client_vpn_endpoint_id: endpoint_id.to_string(),
-                target_network_id: (*subnet).to_string(),
-                vpc_id: TARGET_VPC.to_string(),
+                target_network_id: Some((*subnet).to_string()),
+                vpc_id: Some(TARGET_VPC.to_string()),
                 security_groups: Vec::new(),
+                ..Default::default()
             })
             .unwrap_or_else(|| panic!("the store must take the association for {subnet}"));
     }

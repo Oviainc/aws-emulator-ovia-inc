@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateClientVpnTargetNetwork
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateClientVpnTargetNetwork`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: associates one target network with a stored Client VPN endpoint — the
+//! subnet of a VPC-based endpoint, or an Availability Zone of a Transit Gateway-based one —
+//! answers it `associating` (the clock owes it `associated` a transition span later), moves
+//! an endpoint that was waiting for a target network to `available`, and adds the route to
+//! the subnet's VPC that the association brings with it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateClientVpnTargetNetwork::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +154,398 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateClientVpnTargetNetwork` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateClientVpnTargetNetworkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateClientVpnTargetNetwork"))
+        use crate::state;
+
+        // "Checks whether you have the required permissions for the action, without actually
+        // making the request, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation"
+        // (`AssociateClientVpnTargetNetworkRequest$DryRun`). That is a PERMISSION check and
+        // nothing else: every caller of this emulator is permitted, so a dry run reports
+        // that outcome FIRST and neither reads nor writes anything — not the endpoint the
+        // request names and not the network it would associate.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // An Availability Zone is named per Region, so the Region the request was signed for
+        // is what the zone members below are resolved against — and it is the only thing a
+        // request says about where it is asking.
+        let region = state::request_region(ctx.parts());
+
+        // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request" (`AssociateClientVpnTargetNetworkRequest$ClientToken`). The model puts
+        // no `@length` on it and the store keeps it for the process's lifetime, so the bound
+        // this crate holds every client token to is enforced here.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {max} characters",
+                max = state::MAX_CLIENT_TOKEN_CHARS,
+            )));
+        }
+
+        // An empty value is no value: each of these members is optional, so a request that
+        // sends one empty is read the same way as one that leaves it out.
+        let requested_subnet = input.subnet_id.as_deref().filter(|value| !value.is_empty());
+        let requested_zone = input
+            .availability_zone
+            .as_deref()
+            .filter(|value| !value.is_empty());
+        let requested_zone_id = input
+            .availability_zone_id
+            .as_deref()
+            .filter(|value| !value.is_empty());
+
+        // "You cannot specify both SubnetId and AvailabilityZone"
+        // (`AssociateClientVpnTargetNetworkRequest$AvailabilityZone`) and "You cannot specify
+        // both AvailabilityZone and AvailabilityZoneId"
+        // (`AssociateClientVpnTargetNetworkRequest$AvailabilityZoneId`): one association
+        // names ONE network, so any two members that each name one cannot hold together —
+        // which covers a subnet beside a zone id for the same reason it covers a subnet
+        // beside a zone name.
+        if requested_subnet.is_some() && requested_zone.is_some() {
+            return Err(state::invalid_parameter_combination(
+                "You cannot specify both SubnetId and AvailabilityZone",
+            ));
+        }
+        if requested_subnet.is_some() && requested_zone_id.is_some() {
+            return Err(state::invalid_parameter_combination(
+                "You cannot specify both SubnetId and AvailabilityZoneId",
+            ));
+        }
+        if requested_zone.is_some() && requested_zone_id.is_some() {
+            return Err(state::invalid_parameter_combination(
+                "You cannot specify both AvailabilityZone and AvailabilityZoneId",
+            ));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock-owed moves this call is allowed to apply: each was due at its instant
+        // whether or not anybody called, so an earlier association that has reached
+        // `associated` is read as such here too.
+        store.materialize_due_transitions();
+        // The network an account has held since it existed — its default VPC and that VPC's
+        // per-zone subnets — so a subnet of it resolves whether or not anything described it
+        // first.
+        store.ensure_default_network(&region);
+
+        // "The ID of the subnet to associate with the Client VPN endpoint"
+        // (`AssociateClientVpnTargetNetworkRequest$SubnetId`), resolved by LOOKUP against the
+        // account's subnets: this surface answers ONE refusal for a value it cannot resolve,
+        // whatever that value's form — `InvalidSubnetID.Malformed`, which is what the real
+        // service answers a request naming a subnet it cannot resolve, so no id-form arm sits
+        // in front of the lookup and no second refusal tells "not a subnet id" from "no such
+        // subnet" apart. It is read BEFORE the endpoint id for the same reason: that is the
+        // refusal the recorded response carries for a request that resolves to neither.
+        let subnet = match requested_subnet {
+            None => None,
+            Some(subnet_id) => Some(
+                store
+                    .subnets
+                    .get(subnet_id)
+                    .cloned()
+                    .ok_or_else(|| state::invalid_subnet_id_malformed(subnet_id))?,
+            ),
+        };
+
+        // "The ID of the Client VPN endpoint" (`@required` AND `@clientOptional`, so an EMPTY
+        // value reaches the handler rather than being refused at the boundary): the endpoint
+        // is resolved by lookup, so an empty id and any other value this account holds no
+        // endpoint for are answered the one refusal this surface documents for an endpoint id
+        // (see `crate::state::require_client_vpn_endpoint`). Only what the association reads
+        // off the endpoint is kept, so the borrow ends here.
+        let endpoint_id = input.client_vpn_endpoint_id.as_str();
+        let endpoint = state::require_client_vpn_endpoint(&store, endpoint_id)?;
+        let endpoint_vpc = endpoint.vpc_id.clone().filter(|vpc_id| !vpc_id.is_empty());
+        let endpoint_security_groups: Vec<String> =
+            endpoint.security_group_ids.clone().unwrap_or_default();
+        // "Describes the Transit Gateway configuration for a Client VPN endpoint"
+        // (`ClientVpnEndpoint$TransitGatewayConfiguration`) — whether the endpoint reaches
+        // its target networks through a Transit Gateway rather than through a VPC is a fact
+        // of the endpoint, so it decides which member the request had to name.
+        let uses_transit_gateway = endpoint.transit_gateway_configuration.is_some();
+
+        // "A target network is a subnet in a VPC" (`AssociateClientVpnTargetNetwork`) for a
+        // VPC-based endpoint, and the Availability Zone of the Transit Gateway association
+        // for an endpoint that uses one — the network this request names, resolved before
+        // anything about the endpoint's existing associations is read.
+        let network = if uses_transit_gateway {
+            // "For Transit Gateway-based endpoints, use AvailabilityZone or
+            // AvailabilityZoneId instead" (`…Request$SubnetId`).
+            if let Some(subnet_id) = requested_subnet {
+                return Err(state::invalid_parameter_combination(format!(
+                    "The Client VPN endpoint {endpoint_id} uses a Transit Gateway, so the \
+                     subnet {subnet_id} cannot be its target network; specify \
+                     availabilityZone or availabilityZoneId instead"
+                )));
+            }
+            // Both spellings resolve through the one zone lookup, so a zone named by its
+            // name and the same zone named by its id cannot resolve two ways.
+            let zones = state::availability_zones_in_region(&region);
+            let zone = match (requested_zone, requested_zone_id) {
+                (Some(name), _) => state::availability_zone_of_region(
+                    &zones,
+                    &region,
+                    "availabilityZone",
+                    name,
+                    |zone| zone.zone_name.as_str(),
+                )?,
+                (_, Some(zone_id)) => state::availability_zone_of_region(
+                    &zones,
+                    &region,
+                    "availabilityZoneId",
+                    zone_id,
+                    |zone| zone.zone_id.as_str(),
+                )?,
+                // "Required if when associating an Availability Zone with a Client VPN
+                // endpoint that uses a Transit Gateway" (`…Request$AvailabilityZone`).
+                (None, None) => {
+                    return Err(state::missing_parameter(
+                        "The request must contain the parameter availabilityZone",
+                    ))
+                }
+            };
+            AssociatedNetwork::Zone {
+                name: zone.zone_name.clone(),
+                id: zone.zone_id.clone(),
+            }
+        } else {
+            if let Some(named_zone) = requested_zone.or(requested_zone_id) {
+                return Err(state::invalid_parameter_combination(format!(
+                    "The Client VPN endpoint {endpoint_id} does not use a Transit Gateway, \
+                     so the Availability Zone {named_zone} cannot be its target network; \
+                     specify subnetId instead"
+                )));
+            }
+            // "Required for VPC-based endpoints" (`…Request$SubnetId`).
+            let Some(subnet) = subnet else {
+                return Err(state::missing_parameter(
+                    "The request must contain the parameter subnetId",
+                ));
+            };
+            AssociatedNetwork::Subnet {
+                id: subnet.subnet_id.unwrap_or_default(),
+                vpc_id: subnet.vpc_id,
+                zone: subnet.availability_zone,
+            }
+        };
+
+        // Idempotency: one token names the one association it made, so a replay of the SAME
+        // request reports that association and writes nothing. Read before the duplicate
+        // checks below, which is what a replay would otherwise be refused by.
+        let replayed = match input.client_token.as_deref().and_then(|token| {
+            store
+                .client_vpn_target_network_client_tokens
+                .get(token)
+                .cloned()
+        }) {
+            None => None,
+            Some(association_id) => {
+                let Some(record) = store.client_vpn_target_networks.get(&association_id) else {
+                    return Err(state::internal_error(
+                        "a client token names a Client VPN target network association that \
+                         is not stored",
+                    ));
+                };
+                let association = record.view.clone();
+                // A token is only idempotent for the REQUEST it was first given with:
+                // replayed against another endpoint or another network it names an
+                // association the caller did not ask for, which EC2 refuses rather than
+                // answers.
+                if association.client_vpn_endpoint_id.as_deref() != Some(endpoint_id)
+                    || !network.is_reported_by(&association)
+                {
+                    return Err(state::idempotent_parameter_mismatch());
+                }
+                Some(association)
+            }
+        };
+        // The association that token already made, with the status it has reached by now.
+        if let Some(association) = replayed {
+            return Ok(AssociateClientVpnTargetNetworkOutput {
+                association_id: association.association_id,
+                status: association.status,
+            });
+        }
+
+        // What the association is written with, once the endpoint's existing associations
+        // have been asked whether this network can join them at all.
+        let spec = match &network {
+            AssociatedNetwork::Zone { name, id } => {
+                if store.client_vpn_endpoint_has_target_zone(endpoint_id, name) {
+                    return Err(state::client_vpn_duplicate_association(name, endpoint_id));
+                }
+                state::ClientVpnTargetNetworkSpec {
+                    client_vpn_endpoint_id: endpoint_id.to_string(),
+                    security_groups: endpoint_security_groups,
+                    availability_zones: vec![name.clone()],
+                    availability_zone_ids: vec![id.clone()],
+                    ..Default::default()
+                }
+            }
+            AssociatedNetwork::Subnet { id, vpc_id, zone } => {
+                let subnet_id = id.clone();
+                let Some(vpc_id) = vpc_id.clone() else {
+                    return Err(state::internal_error(format!(
+                        "the subnet '{subnet_id}' is in no VPC"
+                    )));
+                };
+                // "If you specified a VPC when you created the Client VPN endpoint or if you
+                // have previous subnet associations, the specified subnet must be in the same
+                // VPC" (`AssociateClientVpnTargetNetwork`) — whichever of the two pinned it.
+                let pinned = endpoint_vpc
+                    .clone()
+                    .or_else(|| store.client_vpn_endpoint_associated_vpc(endpoint_id));
+                if let Some(pinned) = pinned.filter(|pinned| pinned != &vpc_id) {
+                    return Err(state::invalid_parameter_value(format!(
+                        "The subnet {subnet_id} is in the VPC {vpc_id}, and the Client VPN \
+                         endpoint {endpoint_id} is associated with the VPC {pinned}; the \
+                         subnet must be in the same VPC"
+                    )));
+                }
+                // One association per network: a subnet that is already a target network of
+                // this endpoint would make a second association of ONE network rather than
+                // another target network.
+                if store.client_vpn_endpoint_has_target_network(endpoint_id, &subnet_id) {
+                    return Err(state::client_vpn_duplicate_association(
+                        &subnet_id,
+                        endpoint_id,
+                    ));
+                }
+                // "You can associate only one subnet in each Availability Zone"
+                // (`AssociateClientVpnTargetNetwork`).
+                if let Some(zone) = zone.as_deref() {
+                    if let Some(associated) =
+                        store.client_vpn_endpoint_subnet_in_zone(endpoint_id, zone)
+                    {
+                        return Err(state::client_vpn_duplicate_availability_zone(
+                            &subnet_id,
+                            zone,
+                            &associated,
+                            endpoint_id,
+                        ));
+                    }
+                }
+                // "The IDs of the security groups applied to the target network association"
+                // (`TargetNetwork$SecurityGroups`): the endpoint's own groups, and otherwise
+                // the default security group of the VPC the target network is in — "if no
+                // security group IDs are specified in the request, the default security group
+                // for the VPC is applied" (`CreateClientVpnEndpointRequest$SecurityGroupIds`).
+                // A VPC this store holds no default group for applies none rather than a
+                // made-up id.
+                let security_groups = if endpoint_security_groups.is_empty() {
+                    store
+                        .security_group_id_for_name(&vpc_id, state::DEFAULT_SECURITY_GROUP_NAME)
+                        .into_iter()
+                        .collect()
+                } else {
+                    endpoint_security_groups
+                };
+                // The route the association brings with it goes to the range of the VPC the
+                // target network is in, so it is read off that VPC rather than from the
+                // request.
+                let vpc_cidr_block = store
+                    .vpcs
+                    .get(&vpc_id)
+                    .and_then(|vpc| vpc.cidr_block.clone());
+                state::ClientVpnTargetNetworkSpec {
+                    client_vpn_endpoint_id: endpoint_id.to_string(),
+                    target_network_id: Some(subnet_id),
+                    vpc_id: Some(vpc_id),
+                    security_groups,
+                    vpc_cidr_block,
+                    ..Default::default()
+                }
+            }
+        };
+
+        let Some(association) = store.insert_client_vpn_target_network(spec) else {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "This emulator holds {max} Client VPN target network associations, which \
+                     is as many as it stores",
+                    max = state::MAX_STORED_RECORDS_PER_STORE,
+                ),
+            ));
+        };
+        // "available: The Client VPN endpoint has been created and a target network has been
+        // associated" (`ClientVpnEndpointStatusCode`) — true of this endpoint from here on,
+        // which is why no reporting path has this move to materialise.
+        store.mark_client_vpn_endpoint_associated(endpoint_id);
+        // The first subnet associated is what pins an endpoint created without a `VpcId` to a
+        // VPC, which is the rule the same-VPC check above reads.
+        if let Some(vpc_id) = association.vpc_id.as_deref() {
+            store.pin_client_vpn_endpoint_vpc(endpoint_id, vpc_id);
+        }
+        // The token is recorded with the association it made, so a replay of this request
+        // reports that association instead of making a second one.
+        if let Some((token, association_id)) = input
+            .client_token
+            .as_deref()
+            .zip(association.association_id.as_deref())
+        {
+            store
+                .client_vpn_target_network_client_tokens
+                .insert(token.to_string(), association_id.to_string());
+        }
+
+        // "The unique ID of the target network association" and "The current state of the
+        // target network association" (`AssociateClientVpnTargetNetworkResult`), both as the
+        // association was STORED, so this call and `DescribeClientVpnTargetNetworks` cannot
+        // drift apart.
+        Ok(AssociateClientVpnTargetNetworkOutput {
+            association_id: association.association_id,
+            status: association.status,
+        })
+    }
+}
+
+/// What one target network association joins a Client VPN endpoint to, as the request named
+/// it: the subnet of a VPC-based endpoint, or the Availability Zone of a Transit
+/// Gateway-based one.
+///
+/// The two are resolved differently — a subnet against the account's subnets, a zone against
+/// the Region's zones — and reported through different members of `TargetNetwork`, so which
+/// of them the request named is carried rather than re-derived at each later step.
+enum AssociatedNetwork {
+    /// The stored subnet `SubnetId` named, as the three facts of a subnet an association
+    /// reads: which subnet it is, the VPC it is in, and the Availability Zone it sits in.
+    Subnet {
+        /// The subnet's own `SubnetId`.
+        id: String,
+        /// The VPC the subnet is in (`Subnet$VpcId`).
+        vpc_id: Option<String>,
+        /// The Availability Zone the subnet is in (`Subnet$AvailabilityZone`).
+        zone: Option<String>,
+    },
+    /// The Availability Zone `AvailabilityZone` or `AvailabilityZoneId` named, in both of the
+    /// spellings `TargetNetwork` reports a zone association with.
+    Zone {
+        /// The zone's name (`AvailabilityZoneRecord::zone_name`).
+        name: String,
+        /// That same zone's id (`AvailabilityZoneRecord::zone_id`).
+        id: String,
+    },
+}
+
+impl AssociatedNetwork {
+    /// Is `association` an association of THIS network?
+    ///
+    /// What makes a replayed `ClientToken` idempotent rather than a request for a different
+    /// association: the token names the association it made, so a replay has to name the
+    /// network that association holds.
+    fn is_reported_by(&self, association: &TargetNetwork) -> bool {
+        match self {
+            Self::Subnet { id, .. } => association.target_network_id.as_deref() == Some(id),
+            Self::Zone { name, .. } => association
+                .availability_zones
+                .iter()
+                .flatten()
+                .any(|zone| zone == name),
+        }
     }
 }

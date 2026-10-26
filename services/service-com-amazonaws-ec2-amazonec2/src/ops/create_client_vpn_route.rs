@@ -371,6 +371,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             target_subnet,
             transit_gateway_attachment_id,
             description,
+            // "`add-route` indicates that the route was manually added using the
+            // CreateClientVpnRoute action" (`ClientVpnRoute$Origin`) — which is this call.
+            origin: state::CLIENT_VPN_ROUTE_ORIGIN_ADD_ROUTE,
         }) else {
             return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
                 "This emulator cannot store another Client VPN route",

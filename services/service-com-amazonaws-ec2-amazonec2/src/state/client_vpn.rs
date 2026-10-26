@@ -54,6 +54,56 @@ pub const ASSOCIATION_STATUS_ASSOCIATED: &str = "associated";
 /// is.
 pub const CLIENT_VPN_ENDPOINT_STATUS_PENDING_ASSOCIATE: &str = "pending-associate";
 
+/// "available" — "The Client VPN endpoint has been created and a target network has been
+/// associated" (`ClientVpnEndpointStatusCode`), which an endpoint reaches when a target
+/// network IS associated with it
+/// ([`ComAmazonawsEc2Amazonec2State::mark_client_vpn_endpoint_associated`]).
+pub const CLIENT_VPN_ENDPOINT_STATUS_AVAILABLE: &str = "available";
+
+/// `InvalidClientVpnDuplicateAssociation` (HTTP 400): the target network the request names is
+/// already associated with that Client VPN endpoint, so associating it would make a second
+/// association of one network.
+pub const INVALID_CLIENT_VPN_DUPLICATE_ASSOCIATION: &str = "InvalidClientVpnDuplicateAssociation";
+
+/// `InvalidClientVpnSubnetId.DuplicateAz` (HTTP 400): the endpoint already has a target
+/// network in that Availability Zone, and "you can associate only one subnet in each
+/// Availability Zone" (`AssociateClientVpnTargetNetwork`).
+pub const INVALID_CLIENT_VPN_SUBNET_ID_DUPLICATE_AZ: &str = "InvalidClientVpnSubnetId.DuplicateAz";
+
+/// Refuse a target network an endpoint already has: HTTP 400
+/// [`INVALID_CLIENT_VPN_DUPLICATE_ASSOCIATION`], naming the network and the endpoint.
+///
+/// `target` is the network as the association reports it — the subnet of a VPC-based
+/// endpoint, the Availability Zone of a Transit Gateway-based one — so it is a value this
+/// store resolved rather than the request's own bytes.
+pub fn client_vpn_duplicate_association<E>(target: &str, endpoint_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_CLIENT_VPN_DUPLICATE_ASSOCIATION,
+        400,
+        format!("The target network {target} is already associated with Client VPN endpoint {endpoint_id}"),
+    )
+}
+
+/// Refuse a subnet in an Availability Zone the endpoint already has a target network in:
+/// HTTP 400 [`INVALID_CLIENT_VPN_SUBNET_ID_DUPLICATE_AZ`], naming the zone and the subnet
+/// that holds it.
+pub fn client_vpn_duplicate_availability_zone<E>(
+    subnet_id: &str,
+    zone: &str,
+    associated_subnet_id: &str,
+    endpoint_id: &str,
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_CLIENT_VPN_SUBNET_ID_DUPLICATE_AZ,
+        400,
+        format!(
+            "The subnet {subnet_id} is in the Availability Zone {zone}, where the subnet \
+             {associated_subnet_id} is already associated with Client VPN endpoint \
+             {endpoint_id}"
+        ),
+    )
+}
+
 /// The most characters of a refused `ClientVpnEndpointId` its message repeats back.
 ///
 /// The message names the endpoint the request could not resolve, and that is the request's own
@@ -138,26 +188,40 @@ pub struct ClientVpnTargetNetworkRecord {
 }
 
 /// What one target network association is written with: the endpoint it associates a
-/// network with, the subnet that is the target network, the VPC that subnet is in, and the
-/// security groups applied to the association.
+/// network with, the network itself — the subnet of a VPC-based endpoint, or the
+/// Availability Zone of a Transit Gateway-based one — and the security groups applied to
+/// the association.
 ///
 /// Every member the service itself owns — the association id and the status it starts in —
 /// is derived by [`ComAmazonawsEc2Amazonec2State::insert_client_vpn_target_network`] rather
 /// than taken from a caller, so two writers cannot report one association differently.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ClientVpnTargetNetworkSpec {
     /// "The ID of the Client VPN endpoint with which the target network is associated"
     /// (`TargetNetwork$ClientVpnEndpointId`).
     pub client_vpn_endpoint_id: String,
     /// "The ID of the subnet specified as the target network"
-    /// (`TargetNetwork$TargetNetworkId`).
-    pub target_network_id: String,
+    /// (`TargetNetwork$TargetNetworkId`); `None` for the zone association of a Transit
+    /// Gateway-based endpoint, which names no subnet.
+    pub target_network_id: Option<String>,
     /// "The ID of the VPC in which the target network (subnet) is located"
-    /// (`TargetNetwork$VpcId`).
-    pub vpc_id: String,
+    /// (`TargetNetwork$VpcId`); `None` for that same zone association.
+    pub vpc_id: Option<String>,
     /// "The IDs of the security groups applied to the target network association"
     /// (`TargetNetwork$SecurityGroups`).
     pub security_groups: Vec<String>,
+    /// "The Availability Zone names for the target network association, if the Client VPN
+    /// endpoint uses a Transit Gateway" (`TargetNetwork$AvailabilityZones`) — empty for the
+    /// subnet association of a VPC-based endpoint.
+    pub availability_zones: Vec<String>,
+    /// "The Availability Zone IDs for the target network association, if the Client VPN
+    /// endpoint uses a Transit Gateway" (`TargetNetwork$AvailabilityZoneIds`), the same
+    /// zones as [`Self::availability_zones`] in their other spelling.
+    pub availability_zone_ids: Vec<String>,
+    /// The IPv4 range of the VPC the target network is in, which the association adds a
+    /// route to the endpoint's route table for ([`CLIENT_VPN_ROUTE_ORIGIN_ASSOCIATE`]);
+    /// `None` leaves the route table untouched.
+    pub vpc_cidr_block: Option<String>,
 }
 
 /// The caller-chosen bytes one stored target network association holds: the ids of the
@@ -175,11 +239,19 @@ pub fn client_vpn_target_network_payload_bytes(view: &crate::ops::types::TargetN
         .flatten()
         .map(String::len)
         .fold(0usize, usize::saturating_add);
+    let zone_bytes = view
+        .availability_zones
+        .iter()
+        .flatten()
+        .chain(view.availability_zone_ids.iter().flatten())
+        .map(String::len)
+        .fold(0usize, usize::saturating_add);
     STORED_RECORD_OVERHEAD_BYTES
         .saturating_add(view.client_vpn_endpoint_id.as_deref().map_or(0, str::len))
         .saturating_add(view.target_network_id.as_deref().map_or(0, str::len))
         .saturating_add(view.vpc_id.as_deref().map_or(0, str::len))
         .saturating_add(security_group_bytes)
+        .saturating_add(zone_bytes)
 }
 
 /// The caller-chosen bytes one stored Client VPN endpoint holds: its description, the client
@@ -252,23 +324,34 @@ impl ComAmazonawsEc2Amazonec2State {
     /// as its writer reports it — or `None` when one of the store's bounds would be crossed
     /// and NOTHING was stored.
     ///
-    /// The seam `AssociateClientVpnTargetNetwork` is to call — still a scaffold, so today
-    /// only the crate's tests seed through it; it is not dead code.
+    /// The seam `AssociateClientVpnTargetNetwork` calls.
     ///
     /// The association starts in `associating`, the state `AssociateClientVpnTargetNetwork`
     /// answers with, and the clock owes it `associated` one [`TRANSITION_DELAY`] later
     /// through [`Self::materialize_due_transitions`]: the span is never zero, so a caller
     /// describing the association straight after the call that made it still sees
     /// `associating`.
+    ///
+    /// A `spec` naming the VPC's range also adds the route to that range the association
+    /// brings with it — "`associate` indicates that the route was automatically added when
+    /// the target network was associated with the Client VPN endpoint"
+    /// (`ClientVpnRoute$Origin`) — unless the endpoint's route table already holds a route
+    /// for that destination through this subnet. Both records clear the store's bounds
+    /// TOGETHER, before either is written, so an endpoint is never left with an association
+    /// whose route is missing.
     pub fn insert_client_vpn_target_network(
         &mut self,
         spec: ClientVpnTargetNetworkSpec,
     ) -> Option<crate::ops::types::TargetNetwork> {
+        // An empty list is no list: a subnet association names no zone and a zone
+        // association names no subnet, and neither reports the other's member as an empty
+        // set.
+        let listed = |values: Vec<String>| (!values.is_empty()).then_some(values);
         let view = crate::ops::types::TargetNetwork {
             association_id: None,
-            vpc_id: Some(spec.vpc_id),
-            target_network_id: Some(spec.target_network_id),
-            client_vpn_endpoint_id: Some(spec.client_vpn_endpoint_id),
+            vpc_id: spec.vpc_id,
+            target_network_id: spec.target_network_id.clone(),
+            client_vpn_endpoint_id: Some(spec.client_vpn_endpoint_id.clone()),
             status: Some(crate::ops::types::AssociationStatus {
                 code: Some(ASSOCIATION_STATUS_ASSOCIATING.to_string()),
                 message: None,
@@ -277,11 +360,36 @@ impl ComAmazonawsEc2Amazonec2State {
             // "The Availability Zone names for the target network association, if the
             // Client VPN endpoint uses a Transit Gateway"
             // (`TargetNetwork$AvailabilityZones`) — nothing for an endpoint that does not.
-            availability_zones: None,
-            availability_zone_ids: None,
+            availability_zones: listed(spec.availability_zones),
+            availability_zone_ids: listed(spec.availability_zone_ids),
         };
-        let charge = client_vpn_target_network_payload_bytes(&view);
-        if !self.has_client_vpn_target_network_capacity() || self.would_exceed_stored_bytes(charge) {
+        // The route the association itself adds, and the key it would be held under; `None`
+        // when the request's endpoint has no VPC range to route, or when its route table
+        // already holds that path.
+        let associated_route = spec
+            .vpc_cidr_block
+            .map(|destination_cidr| {
+                client_vpn_route_record(ClientVpnRouteSpec {
+                    client_vpn_endpoint_id: spec.client_vpn_endpoint_id,
+                    destination_cidr,
+                    target_subnet: spec.target_network_id,
+                    transit_gateway_attachment_id: None,
+                    description: None,
+                    origin: CLIENT_VPN_ROUTE_ORIGIN_ASSOCIATE,
+                })
+            })
+            .filter(|(key, _)| !self.client_vpn_routes.contains_key(key));
+        // Both records' bounds, asked before the first write: a store at a ceiling stores
+        // NEITHER, so no endpoint is left holding half of what one association writes.
+        let charge = client_vpn_target_network_payload_bytes(&view).saturating_add(
+            associated_route
+                .as_ref()
+                .map_or(0, |(_, route)| client_vpn_route_payload_bytes(route)),
+        );
+        if !self.has_client_vpn_target_network_capacity()
+            || (associated_route.is_some() && !self.has_client_vpn_route_capacity())
+            || self.would_exceed_stored_bytes(charge)
+        {
             return None;
         }
         let association_id = self.next_id(CLIENT_VPN_TARGET_NETWORK_ASSOCIATION_ID_PREFIX);
@@ -289,7 +397,7 @@ impl ComAmazonawsEc2Amazonec2State {
             association_id: Some(association_id.clone()),
             ..view
         };
-        self.add_stored_bytes(charge);
+        self.add_stored_bytes(client_vpn_target_network_payload_bytes(&view));
         let stored = view.clone();
         self.client_vpn_target_networks.insert(
             association_id,
@@ -300,7 +408,119 @@ impl ComAmazonawsEc2Amazonec2State {
                 )),
             },
         );
+        if let Some((key, route)) = associated_route {
+            self.store_client_vpn_route(key, route);
+        }
         Some(stored)
+    }
+
+    /// Move a Client VPN endpoint that was waiting for a target network to `available`.
+    ///
+    /// "`pending-associate`: The Client VPN endpoint has been created but no target networks
+    /// have been associated" and "`available`: The Client VPN endpoint has been created and
+    /// a target network has been associated" (`ClientVpnEndpointStatusCode`), so the move
+    /// belongs to the operation that associates one — which is why no reporting path
+    /// materialises it. Every other status an endpoint can hold is left exactly as it is:
+    /// only the endpoint that was WAITING for a target network reaches `available` by
+    /// getting one.
+    pub fn mark_client_vpn_endpoint_associated(&mut self, endpoint_id: &str) {
+        let Some(endpoint) = self.client_vpn_endpoints.get_mut(endpoint_id) else {
+            return;
+        };
+        let waiting = endpoint
+            .status
+            .as_ref()
+            .and_then(|status| status.code.as_deref())
+            == Some(CLIENT_VPN_ENDPOINT_STATUS_PENDING_ASSOCIATE);
+        if waiting {
+            endpoint.status = Some(crate::ops::types::ClientVpnEndpointStatus {
+                code: Some(CLIENT_VPN_ENDPOINT_STATUS_AVAILABLE.to_string()),
+                message: None,
+            });
+        }
+    }
+
+    /// Record `vpc_id` as the VPC of a Client VPN endpoint that was created without one.
+    ///
+    /// "If you specified a VPC when you created the Client VPN endpoint or if you have
+    /// previous subnet associations, the specified subnet must be in the same VPC"
+    /// (`AssociateClientVpnTargetNetwork`): the first subnet associated is what pins an
+    /// endpoint created without a `VpcId` to a VPC, so that is where the endpoint's own
+    /// `VpcId` comes from. An endpoint that already names one keeps it, so this cannot move
+    /// an endpoint from one VPC to another.
+    ///
+    /// The id is a value this store minted, charged against the byte budget like every other
+    /// write onto a stored record, and it is written at most once per endpoint.
+    pub fn pin_client_vpn_endpoint_vpc(&mut self, endpoint_id: &str, vpc_id: &str) {
+        let Some(endpoint) = self.client_vpn_endpoints.get_mut(endpoint_id) else {
+            return;
+        };
+        if endpoint
+            .vpc_id
+            .as_deref()
+            .is_some_and(|held| !held.is_empty())
+        {
+            return;
+        }
+        endpoint.vpc_id = Some(vpc_id.to_string());
+        self.add_stored_bytes(vpc_id.len());
+    }
+
+    /// The VPC every target network already associated with `endpoint_id` is in, or `None`
+    /// when it has no subnet association yet.
+    ///
+    /// The "previous subnet associations" half of the same sentence
+    /// [`Self::pin_client_vpn_endpoint_vpc`] quotes: they are all in one VPC, so the first
+    /// one found answers for all of them.
+    pub fn client_vpn_endpoint_associated_vpc(&self, endpoint_id: &str) -> Option<String> {
+        self.client_vpn_target_networks.values().find_map(|record| {
+            let view = &record.view;
+            if view.client_vpn_endpoint_id.as_deref() != Some(endpoint_id) {
+                return None;
+            }
+            view.vpc_id.clone()
+        })
+    }
+
+    /// The subnet already associated with `endpoint_id` that sits in the Availability Zone
+    /// `zone_name`, or `None` when none does.
+    ///
+    /// "You can associate only one subnet in each Availability Zone"
+    /// (`AssociateClientVpnTargetNetwork`), asked of the zone each associated subnet is
+    /// stored in — so an association whose subnet this store does not hold answers for no
+    /// zone rather than for a guessed one.
+    pub fn client_vpn_endpoint_subnet_in_zone(
+        &self,
+        endpoint_id: &str,
+        zone_name: &str,
+    ) -> Option<String> {
+        self.client_vpn_target_networks.values().find_map(|record| {
+            let view = &record.view;
+            if view.client_vpn_endpoint_id.as_deref() != Some(endpoint_id) {
+                return None;
+            }
+            let subnet_id = view.target_network_id.as_deref()?;
+            let subnet = self.subnets.get(subnet_id)?;
+            (subnet.availability_zone.as_deref() == Some(zone_name))
+                .then(|| subnet_id.to_string())
+        })
+    }
+
+    /// Is the Availability Zone `zone_name` already a target network of `endpoint_id`?
+    ///
+    /// The question [`Self::client_vpn_endpoint_has_target_network`] asks of a subnet, for
+    /// the zone association of a Transit Gateway-based endpoint — which names a zone where a
+    /// VPC-based endpoint's association names a subnet.
+    pub fn client_vpn_endpoint_has_target_zone(&self, endpoint_id: &str, zone_name: &str) -> bool {
+        self.client_vpn_target_networks.values().any(|record| {
+            record.view.client_vpn_endpoint_id.as_deref() == Some(endpoint_id)
+                && record
+                    .view
+                    .availability_zones
+                    .iter()
+                    .flatten()
+                    .any(|zone| zone == zone_name)
+        })
     }
 
     /// Apply the `associating` -> `associated` move every target network association that
@@ -406,13 +626,25 @@ pub const SUBNET_ID_PREFIX: &str = "subnet";
 /// generic `Invalid id: '<id>'`.
 pub const INVALID_SUBNET_ID_MALFORMED: &str = "InvalidSubnetID.Malformed";
 
-/// Refuse a value for a subnet that is not a subnet id: HTTP 400
-/// [`INVALID_SUBNET_ID_MALFORMED`], naming the value the request sent.
+/// The most characters of a refused value for a subnet its message repeats back.
+///
+/// The message names the subnet the request could not resolve, and that is the request's own
+/// bytes — `SubnetId` is a bare string the model puts no `@length` on
+/// (`smithy_query(query="shape",shape="SubnetId")`) — so the echo is bounded here the way
+/// [`MAX_ECHOED_CLIENT_VPN_ENDPOINT_ID_CHARS`] bounds a refused endpoint id's. Far above the
+/// longest subnet id EC2 issues ([`SUBNET_ID_PREFIX`] plus 17 digits), so a real id is always
+/// named in full.
+pub const MAX_ECHOED_SUBNET_ID_CHARS: usize = 128;
+
+/// Refuse a value for a subnet that is not a subnet of the account: HTTP 400
+/// [`INVALID_SUBNET_ID_MALFORMED`], naming the value the request sent, of which the first
+/// [`MAX_ECHOED_SUBNET_ID_CHARS`] characters are named.
 pub fn invalid_subnet_id_malformed<E>(subnet_id: &str) -> Scaffolded<E> {
+    let echoed: String = subnet_id.chars().take(MAX_ECHOED_SUBNET_ID_CHARS).collect();
     Scaffolded::service_error(
         INVALID_SUBNET_ID_MALFORMED,
         400,
-        format!("The subnet ID '{subnet_id}' is malformed"),
+        format!("The subnet ID '{echoed}' is malformed"),
     )
 }
 
@@ -491,13 +723,12 @@ pub struct ClientVpnRouteRecord {
 }
 
 /// What one route is written with: the endpoint whose route table it joins, the destination
-/// it routes, what traffic for that destination leaves through, and the description the
-/// request gave it.
+/// it routes, what traffic for that destination leaves through, the description the
+/// request gave it, and what added it.
 ///
-/// Every member the service itself owns — the route's type, its origin and the status it
-/// starts in — is derived by
-/// [`ComAmazonawsEc2Amazonec2State::insert_client_vpn_route`] rather than taken from a
-/// caller, so two writers cannot report one route differently.
+/// Every member the service itself owns — the route's type and the status it starts in — is
+/// derived by [`ComAmazonawsEc2Amazonec2State::insert_client_vpn_route`] rather than taken
+/// from a caller, so two writers cannot report one route differently.
 #[derive(Debug, Clone)]
 pub struct ClientVpnRouteSpec {
     /// The endpoint whose route table takes the route.
@@ -513,6 +744,40 @@ pub struct ClientVpnRouteSpec {
     pub transit_gateway_attachment_id: Option<String>,
     /// "A brief description of the route" (`CreateClientVpnRouteRequest$Description`).
     pub description: Option<String>,
+    /// What added the route: [`CLIENT_VPN_ROUTE_ORIGIN_ADD_ROUTE`] for one a caller added,
+    /// [`CLIENT_VPN_ROUTE_ORIGIN_ASSOCIATE`] for one a target network association brought
+    /// with it (`ClientVpnRoute$Origin`). A `&'static str` so the origin is always one of
+    /// the two the model declares.
+    pub origin: &'static str,
+}
+
+/// One route as the model shapes it, beside the key it is held under: what
+/// [`ClientVpnRouteSpec`] means, with every member the service owns derived.
+///
+/// The ONE place a route is built, so the route `CreateClientVpnRoute` adds and the route a
+/// target network association brings with it cannot be shaped differently.
+fn client_vpn_route_record(
+    spec: ClientVpnRouteSpec,
+) -> (ClientVpnRouteKey, crate::ops::types::ClientVpnRoute) {
+    let key = ClientVpnRouteKey {
+        client_vpn_endpoint_id: spec.client_vpn_endpoint_id.clone(),
+        destination_cidr: spec.destination_cidr.clone(),
+        target: spec.target_subnet.clone().unwrap_or_default(),
+    };
+    let view = crate::ops::types::ClientVpnRoute {
+        client_vpn_endpoint_id: Some(spec.client_vpn_endpoint_id),
+        destination_cidr: Some(spec.destination_cidr),
+        target_subnet: spec.target_subnet,
+        r#type: Some(CLIENT_VPN_ROUTE_TYPE_NAT.to_string()),
+        origin: Some(spec.origin.to_string()),
+        status: Some(crate::ops::types::ClientVpnRouteStatus {
+            code: Some(CLIENT_VPN_ROUTE_STATUS_CREATING.to_string()),
+            message: None,
+        }),
+        description: spec.description,
+        transit_gateway_attachment_id: spec.transit_gateway_attachment_id,
+    };
+    (key, view)
 }
 
 /// The caller-chosen bytes one stored route holds: the ids of the resources it joins, the
@@ -570,42 +835,40 @@ impl ComAmazonawsEc2Amazonec2State {
     /// under beside the route as its writer reports it — or `None` when one of the store's
     /// bounds would be crossed and NOTHING was stored.
     ///
-    /// The seam `CreateClientVpnRoute` calls. Every member the service owns is derived here:
-    /// the route `Type` EC2 reports for a Client VPN route, the `add-route` `Origin` that
-    /// says a caller added it rather than a target network association, and the `creating`
-    /// status it starts in — which the clock owes `active` one [`TRANSITION_DELAY`] later
-    /// through [`Self::materialize_due_transitions`]. The span is never zero, so a caller
-    /// describing the route straight after the call that made it still sees `creating`.
+    /// The seam `CreateClientVpnRoute` calls. Every member the service owns is derived by
+    /// [`client_vpn_route_record`]: the route `Type` EC2 reports for a Client VPN route and
+    /// the `creating` status it starts in — which the clock owes `active` one
+    /// [`TRANSITION_DELAY`] later through [`Self::materialize_due_transitions`]. The span is
+    /// never zero, so a caller describing the route straight after the call that made it
+    /// still sees `creating`.
     pub fn insert_client_vpn_route(
         &mut self,
         spec: ClientVpnRouteSpec,
     ) -> Option<(ClientVpnRouteKey, crate::ops::types::ClientVpnRoute)> {
-        let key = ClientVpnRouteKey {
-            client_vpn_endpoint_id: spec.client_vpn_endpoint_id.clone(),
-            destination_cidr: spec.destination_cidr.clone(),
-            target: spec.target_subnet.clone().unwrap_or_default(),
-        };
-        let view = crate::ops::types::ClientVpnRoute {
-            client_vpn_endpoint_id: Some(spec.client_vpn_endpoint_id),
-            destination_cidr: Some(spec.destination_cidr),
-            target_subnet: spec.target_subnet,
-            r#type: Some(CLIENT_VPN_ROUTE_TYPE_NAT.to_string()),
-            origin: Some(CLIENT_VPN_ROUTE_ORIGIN_ADD_ROUTE.to_string()),
-            status: Some(crate::ops::types::ClientVpnRouteStatus {
-                code: Some(CLIENT_VPN_ROUTE_STATUS_CREATING.to_string()),
-                message: None,
-            }),
-            description: spec.description,
-            transit_gateway_attachment_id: spec.transit_gateway_attachment_id,
-        };
+        let (key, view) = client_vpn_route_record(spec);
         let charge = client_vpn_route_payload_bytes(&view);
         if !self.has_client_vpn_route_capacity() || self.would_exceed_stored_bytes(charge) {
             return None;
         }
-        self.add_stored_bytes(charge);
         let stored = view.clone();
+        self.store_client_vpn_route(key.clone(), view);
+        Some((key, stored))
+    }
+
+    /// Hold `view` under `key`, charged for and owed its `creating` -> `active` move.
+    ///
+    /// The one write of the route store, so the route a caller adds and the route a target
+    /// network association brings with it are charged and aged the same way. It asks NO
+    /// bound of its own: a caller clears the store's bounds first — which is what lets an
+    /// association clear its own and its route's together.
+    fn store_client_vpn_route(
+        &mut self,
+        key: ClientVpnRouteKey,
+        view: crate::ops::types::ClientVpnRoute,
+    ) {
+        self.add_stored_bytes(client_vpn_route_payload_bytes(&view));
         self.client_vpn_routes.insert(
-            key.clone(),
+            key,
             ClientVpnRouteRecord {
                 view,
                 pending: Some(PendingStateMove::starting_now(
@@ -613,7 +876,6 @@ impl ComAmazonawsEc2Amazonec2State {
                 )),
             },
         );
-        Some((key, stored))
     }
 
     /// Apply the `creating` -> `active` move every route that has reached its due instant by

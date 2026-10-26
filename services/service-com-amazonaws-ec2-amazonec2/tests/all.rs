@@ -93,6 +93,8 @@ mod application_status;
 mod application_status_checks;
 #[path = "all/associate_address.rs"]
 mod associate_address;
+#[path = "all/associate_client_vpn_target_network.rs"]
+mod associate_client_vpn_target_network;
 #[path = "all/associate_subnet_cidr_block.rs"]
 mod associate_subnet_cidr_block;
 #[path = "all/authorize_security_group_egress.rs"]
