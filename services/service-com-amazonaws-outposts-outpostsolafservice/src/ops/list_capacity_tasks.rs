@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCapacityTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCapacityTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCapacityTasks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports every stored capacity task of the region the request is
+//! addressed to, narrowed by the two filters the caller sent and cut into pages with
+//! the modelled `Token` the next page resumes from. A read: the only thing it writes
+//! is the capacity-task progression the clock already owed
+//! ([`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::settle_capacity_tasks`]),
+//! so it never changes what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +149,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCapacityTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCapacityTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCapacityTasks"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListCapacityTasksErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+        // This service is regional, so "the capacity tasks for your Amazon Web
+        // Services account" are the tasks of the region the request is addressed to:
+        // a task belongs to the Outpost it runs on, that Outpost belongs to one
+        // region, and a region holding no such Outpost lists none of its tasks.
+        let region = crate::state::request_region(ctx.parts());
+        // The Outpost the caller narrowed to, if any. The filter is modelled as an
+        // `OutpostIdentifier`, so it accepts the bare id or the full Outpost ARN and
+        // both name the same stored Outpost.
+        let outpost_filter = match input
+            .outpost_identifier_filter
+            .as_deref()
+            .filter(|identifier| !identifier.is_empty())
+        {
+            Some(identifier) => Some(crate::state::resolve_outpost_id(identifier).ok_or_else(
+                || {
+                    ListCapacityTasksErrorModeled::ValidationException(ValidationException {
+                        message: Some(crate::state::outpost_identifier_filter_pattern_report()),
+                    })
+                },
+            )?),
+            None => None,
+        };
+        // The resume point the caller's token names. A token this service did not
+        // issue for THIS list is a bad request, not an empty page — the rule every
+        // other list in this service applies to theirs.
+        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => Some(
+                crate::state::decode_page_token(crate::state::CAPACITY_TASK_PAGE, token)
+                    .ok_or_else(|| {
+                        ListCapacityTasksErrorModeled::ValidationException(ValidationException {
+                            message: Some(crate::state::page_token_report(Self::NAME)),
+                        })
+                    })?,
+            ),
+            None => None,
+        };
+        let size = crate::state::page_size(input.max_results);
+
+        let mut store = state.lock();
+        // Report the status each task holds NOW: every transition the clock has
+        // already made due is materialised before the records are read — exactly as
+        // `GetCapacityTask` does, so a list and a read never disagree about one
+        // task's status.
+        store.settle_capacity_tasks();
+        let (capacity_tasks, next_token) = crate::state::page(
+            crate::state::CAPACITY_TASK_PAGE,
+            store
+                .capacity_tasks_in(&region)
+                .filter(|task| {
+                    matches_filters(
+                        task,
+                        outpost_filter.as_deref(),
+                        input.capacity_task_status_filter.as_deref(),
+                    )
+                })
+                .map(|task| (task.sequence, capacity_task_summary(task))),
+            after,
+            size,
+        );
+
+        Ok(ListCapacityTasksOutput {
+            // "Lists all the capacity tasks": the ones of this region that match
+            // every filter, which may be none at all.
+            capacity_tasks: Some(capacity_tasks),
+            next_token,
+        })
+    }
+}
+
+/// Whether a stored capacity task satisfies every filter the caller sent.
+///
+/// Each filter selects on ONE member of the task, and — as this operation documents —
+/// "if you specify multiple filters, the results include only the resources that
+/// match all of the specified filters. For a filter where you can specify multiple
+/// values, the results include items that match any of the values that you specify
+/// for the filter": several filters together narrow rather than widen, an absent (or
+/// empty) filter narrows nothing, and a filter that is a LIST of values accepts a
+/// task whose value is any one of them.
+///
+/// A filter is a filter and not an identifier the request is addressed to: it
+/// narrows the list the caller is reported, so one naming an Outpost that holds no
+/// task — including one this region does not hold at all — reports no task rather
+/// than failing.
+fn matches_filters(
+    task: &crate::state::CapacityTaskRecord,
+    outpost_filter: Option<&str>,
+    status_filter: Option<&[String]>,
+) -> bool {
+    let outpost_matches = outpost_filter.is_none_or(|outpost_id| task.outpost_id == outpost_id);
+    let status_matches = match status_filter {
+        Some(accepted) if !accepted.is_empty() => accepted.contains(&task.status),
+        _ => true,
+    };
+    outpost_matches && status_matches
+}
+
+/// The `CapacityTaskSummary` a stored capacity task is reported as.
+///
+/// The modelled summary carries eight of the thirteen members the task's own read
+/// reports ([`crate::capacity_task_projection`]), each documented identically on both
+/// shapes — so a summary is the stored task's own value member for member, and a list
+/// can never say something about a task that a read of it denies. The five members a
+/// summary does not carry (`DryRun`, `Failed`, `InstancesToExclude`,
+/// `RequestedInstancePools`, `TaskActionOnBlockingInstances`) are the task's own
+/// request and outcome detail, which the model keeps on the read alone.
+fn capacity_task_summary(task: &crate::state::CapacityTaskRecord) -> CapacityTaskSummary {
+    CapacityTaskSummary {
+        capacity_task_id: Some(task.capacity_task_id.clone()),
+        outpost_id: Some(task.outpost_id.clone()),
+        order_id: task.order_id.clone(),
+        asset_id: task.asset_id.clone(),
+        capacity_task_status: Some(task.status.clone()),
+        creation_date: Some(crate::state::timestamp(task.created_at)),
+        completion_date: task.completed_at.map(crate::state::timestamp),
+        last_modified_date: Some(crate::state::timestamp(task.last_modified_at)),
     }
 }
