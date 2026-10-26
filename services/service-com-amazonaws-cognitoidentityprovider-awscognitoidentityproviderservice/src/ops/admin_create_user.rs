@@ -304,7 +304,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = pool.user_key(&input.username);
         if let Some(existing) = pool.users.get_mut(&key) {
             if !resend {
-                return Err(username_exists(&input.username));
+                return Err(username_exists());
             }
             if let Some(temporary_password) = input.temporary_password.clone() {
                 existing.password = Some(temporary_password);
@@ -401,9 +401,13 @@ fn user_not_found() -> AdminCreateUserError {
 }
 
 /// This operation's `UsernameExistsException` for a username already taken.
-fn username_exists(username: &str) -> AdminCreateUserError {
+///
+/// The wording names no username: Amazon Cognito states the account that exists
+/// with a fixed sentence, so the refusal tells a caller nothing about which
+/// usernames the pool holds beyond the one it just submitted.
+fn username_exists() -> AdminCreateUserError {
     AdminCreateUserErrorModeled::UsernameExistsException(UsernameExistsException {
-        message: Some(format!("User account already exists for {username}")),
+        message: Some("User account already exists".to_string()),
     })
     .into()
 }

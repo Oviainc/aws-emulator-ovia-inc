@@ -75,6 +75,8 @@ mod list_resource_servers;
 mod list_terms;
 #[path = "all/list_user_pools.rs"]
 mod list_user_pools;
+#[path = "all/list_users.rs"]
+mod list_users;
 #[path = "all/list_users_in_group.rs"]
 mod list_users_in_group;
 #[path = "all/managed_login_branding.rs"]

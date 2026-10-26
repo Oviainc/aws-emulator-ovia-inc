@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListUsers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListUsers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListUsers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -195,18 +186,488 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListUsers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListUsersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListUsers"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        // A read: this handler takes the lock to READ and writes nothing.
+        let guard = state.lock();
+        let pool = guard
+            .pool(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // "If the filter string is empty, `ListUsers` returns all users in the
+        // user pool" (`ListUsers.Filter`), so a filter holding nothing but space
+        // selects every stored user. Anything else has to be a search this
+        // operation can run over stored state, or the request is refused.
+        let filter_text = input.filter.as_deref().unwrap_or_default().trim();
+        let filter = if filter_text.is_empty() {
+            None
+        } else {
+            Some(UserFilter::parse(filter_text).ok_or_else(constraints_not_satisfied)?)
+        };
+
+        // The users the search selects, in ascending stored-key order — the
+        // stable order a page token indexes into.
+        let case_sensitive = pool.case_sensitive();
+        let mut keys: Vec<String> = pool
+            .users
+            .iter()
+            .filter(|(_, user)| {
+                filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.matches(user, case_sensitive))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        keys.sort();
+
+        // "Amazon Cognito returns an error if not all users in the results have
+        // set a value for the attribute you request. Attributes that you can't
+        // filter on, including custom attributes, must have a value set in every
+        // user profile before an `AttributesToGet` parameter returns results"
+        // (`ListUsers.AttributesToGet`) — so an attribute no server-side search
+        // covers ([`SEARCHABLE_ATTRIBUTES`]) is served only while every user the
+        // search SELECTS holds a value for it. The whole selection is read, not
+        // the page about to be served, so one search answers the same whatever
+        // page of it a request asks for.
+        if let Some(names) = input.attributes_to_get.as_deref() {
+            if names.iter().any(|name| {
+                !searchable(name)
+                    && keys
+                        .iter()
+                        .filter_map(|key| pool.users.get(key))
+                        .any(|user| !user.attributes.contains_key(name))
+            }) {
+                return Err(constraints_not_satisfied());
+            }
+        }
+
+        // The listing a page token belongs to: this operation, over this pool,
+        // under this search. "The pagination token is an identifier that you can
+        // present in an additional API request with the same parameters"
+        // (`ListUsers.PaginationToken`), so a token names no page of a listing
+        // that asked a different question or of another pool's.
+        let scope = format!("{}|{}|{}", Self::NAME, pool.id, filter_text);
+        let page = crate::state::page_of(
+            &scope,
+            &keys,
+            input.limit,
+            input.pagination_token.as_deref(),
+        )
+        .ok_or_else(invalid_pagination_token)?;
+
+        // Rendered from the STORED users this page serves, so an entry is what a
+        // later read of that one user sees, carrying the attributes the request
+        // asked for.
+        let users: Vec<UserType> = page
+            .keys
+            .iter()
+            .filter_map(|key| pool.users.get(key))
+            .map(|user| rendered(user, input.attributes_to_get.as_deref()))
+            .collect();
+
+        // A listing's result member is PRESENT and empty when no stored user
+        // matches, which is what a paginating client reads.
+        Ok(ListUsersOutput {
+            users: Some(users),
+            pagination_token: page.next_token,
+        })
+    }
+}
+
+/// The modelled view of `user`, holding only the attributes `attributes_to_get`
+/// names when the request named any: "a JSON array of user attribute names ...
+/// that you want Amazon Cognito to include in the response for each user. When
+/// you don't provide an `AttributesToGet` parameter, Amazon Cognito returns all
+/// attributes for each user" (`ListUsers.AttributesToGet`). Every other member
+/// is the stored user's, rendered exactly as this pool's own reader of that one
+/// user renders it. The caller has already refused a request whose
+/// `AttributesToGet` names an attribute the results cannot serve, so a name
+/// missing from one of these users is a searchable one that user leaves unset.
+fn rendered(user: &crate::state::User, attributes_to_get: Option<&[String]>) -> UserType {
+    let mut rendered = user.to_user_type();
+    if let Some(names) = attributes_to_get {
+        rendered.attributes = Some(
+            user.attribute_list()
+                .into_iter()
+                .filter(|attribute| names.iter().any(|name| name == &attribute.name))
+                .collect(),
+        );
+    }
+    rendered
+}
+
+/// Where a searchable attribute's value is read off a stored user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Searched {
+    /// The user's own username.
+    Username,
+    /// Whether sign-in is enabled for the user, which a filter names `status`
+    /// and states with the label the console gives each value.
+    Enabled,
+    /// The user's confirmation status (`UserStatusType`).
+    UserStatus,
+    /// One of the user's stored standard attributes, by name.
+    Attribute(&'static str),
+}
+
+/// The value a filter on [`Searched::Enabled`] matches for a user that can sign
+/// in, which `ListUsers.Filter` calls "`status` (called **Enabled** in the
+/// Console)".
+const ENABLED: &str = "Enabled";
+
+/// The same for a user that cannot: `AdminDisableUser` "deactivates a user and
+/// revokes all access tokens for the user" (this service's model), the state the
+/// console labels the opposite of [`ENABLED`].
+const DISABLED: &str = "Disabled";
+
+/// The standard attributes a server-side filter may search, each with where its
+/// value is read off a stored user.
+///
+/// "You can only search for the following standard attributes: `username`
+/// (case-sensitive), `email`, `phone_number`, `name`, `given_name`,
+/// `family_name`, `preferred_username`, `cognito:user_status` (called **Status**
+/// in the Console) (case-insensitive), `status` (called **Enabled** in the
+/// Console) (case-sensitive), `sub`", and "custom attributes aren't searchable"
+/// (`ListUsers.Filter`, this service's model) — so a name that is not one of
+/// these names no search this operation runs.
+const SEARCHABLE_ATTRIBUTES: [(&str, Searched); 10] = [
+    ("username", Searched::Username),
+    ("email", Searched::Attribute("email")),
+    ("phone_number", Searched::Attribute("phone_number")),
+    ("name", Searched::Attribute("name")),
+    ("given_name", Searched::Attribute("given_name")),
+    ("family_name", Searched::Attribute("family_name")),
+    ("preferred_username", Searched::Attribute("preferred_username")),
+    ("cognito:user_status", Searched::UserStatus),
+    ("status", Searched::Enabled),
+    ("sub", Searched::Attribute("sub")),
+];
+
+/// Whether `name` is one of the attributes [`SEARCHABLE_ATTRIBUTES`] covers,
+/// which is also the attribute an `AttributesToGet` may ask for without every
+/// user in the results holding a value for it.
+fn searchable(name: &str) -> bool {
+    SEARCHABLE_ATTRIBUTES
+        .iter()
+        .any(|(candidate, _)| *candidate == name)
+}
+
+impl Searched {
+    /// This user's value of the searched attribute, or `None` when the user holds
+    /// none — a user with no value set matches no filter on it.
+    fn value_of(self, user: &crate::state::User) -> Option<String> {
+        match self {
+            Self::Username => Some(user.username.clone()),
+            Self::Enabled => Some(if user.enabled { ENABLED } else { DISABLED }.to_string()),
+            Self::UserStatus => Some(user.status.as_str().to_string()),
+            Self::Attribute(name) => user.attributes.get(name).cloned(),
+        }
+    }
+
+    /// Whether values of this attribute compare ignoring case, in a pool whose
+    /// usernames are `case_sensitive`.
+    ///
+    /// `cognito:user_status` is documented "(case-insensitive)" and `username`
+    /// and `status` "(case-sensitive)" (`ListUsers.Filter`); a pool configured
+    /// case-insensitive carries that over to "both `preferred_username` and
+    /// `email` alias ..., in addition to the `username` attribute"
+    /// (`UsernameConfigurationType.CaseSensitive`), so those three follow the
+    /// pool rather than the default.
+    fn ignores_case(self, case_sensitive: bool) -> bool {
+        match self {
+            Self::UserStatus => true,
+            Self::Username
+            | Self::Attribute("preferred_username")
+            | Self::Attribute("email") => !case_sensitive,
+            _ => false,
+        }
+    }
+}
+
+/// One server-side search: which attribute, compared how, against what value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UserFilter {
+    searched: Searched,
+    /// Whether the comparison is the prefix match `^=` rather than the exact
+    /// match `=`.
+    prefix: bool,
+    value: String,
+}
+
+impl UserFilter {
+    /// The search `text` asks for, or `None` when it is not one this operation
+    /// can run — which the caller refuses with [`constraints_not_satisfied`].
+    ///
+    /// The documented form is `AttributeName Filter-Type "AttributeValue"`, where
+    /// `Filter-Type` is `=` for an exact match or `^=` for a prefix ("starts
+    /// with") match and the value is a quoted string whose own quotation marks
+    /// are escaped with a backslash. "The server-side filter matches no more than
+    /// one attribute" (`ListUsers.Filter`, this service's model), so a filter that
+    /// carries anything beyond one such comparison is not one this operation runs.
+    ///
+    /// This grammar is Amazon Cognito's own and holds exactly one comparison, so
+    /// the reading below is ONE forward pass with no recursion and no nesting to
+    /// descend, over an input `UserFilterType`'s modelled length (0..256) already
+    /// bounds before this handler runs.
+    fn parse(text: &str) -> Option<Self> {
+        let rest = text.trim_start();
+        let name_end = rest
+            .find(|character: char| {
+                character.is_whitespace() || character == '=' || character == '^'
+            })
+            .unwrap_or(rest.len());
+        let (name, rest) = rest.split_at(name_end);
+        if name.is_empty() {
+            return None;
+        }
+        let rest = rest.trim_start();
+        let (prefix, rest) = match rest.strip_prefix("^=") {
+            Some(rest) => (true, rest),
+            None => (false, rest.strip_prefix('=')?),
+        };
+        let value = quoted_value(rest.trim())?;
+        let searched = SEARCHABLE_ATTRIBUTES
+            .iter()
+            .find(|(candidate, _)| *candidate == name)
+            .map(|(_, searched)| *searched)?;
+        Some(Self {
+            searched,
+            prefix,
+            value,
+        })
+    }
+
+    /// Whether `user` is selected by this search, in a pool whose usernames are
+    /// `case_sensitive`.
+    fn matches(&self, user: &crate::state::User, case_sensitive: bool) -> bool {
+        let Some(stored) = self.searched.value_of(user) else {
+            return false;
+        };
+        let (stored, wanted) = if self.searched.ignores_case(case_sensitive) {
+            (stored.to_lowercase(), self.value.to_lowercase())
+        } else {
+            (stored, self.value.clone())
+        };
+        if self.prefix {
+            stored.starts_with(&wanted)
+        } else {
+            stored == wanted
+        }
+    }
+}
+
+/// The value a filter's quoted `AttributeValue` holds: the text between the
+/// quotation marks, with each backslash escape resolved to the character it
+/// escapes ("quotation marks within the filter string must be escaped using the
+/// backslash (`\`) character", `ListUsers.Filter`). `None` for text that is not
+/// one quoted string.
+fn quoted_value(text: &str) -> Option<String> {
+    let mut characters = text.chars();
+    if characters.next() != Some('"') {
+        return None;
+    }
+    let mut value = String::new();
+    loop {
+        match characters.next() {
+            // The quotation mark that opened the value is never closed.
+            None => return None,
+            Some('"') => break,
+            Some('\\') => value.push(characters.next()?),
+            Some(character) => value.push(character),
+        }
+    }
+    // One comparison and nothing else: whatever follows the closing quotation
+    // mark is not part of the value and names no further search.
+    characters.as_str().trim().is_empty().then_some(value)
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> ListUsersError {
+    ListUsersErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// How Amazon Cognito words input it will not accept for a member of this
+/// operation: it states that the submitted input missed the constraints on the
+/// member, naming neither the member nor the value, so the refusal reports
+/// nothing about the pool it was asked about.
+const CONSTRAINT_MESSAGE: &str = "Input fails to satisfy the constraints.";
+
+/// This operation's `InvalidParameterException` for input it will not accept:
+/// a `Filter` that is no search it can run — a comparison on an attribute no
+/// server-side search covers, or a string that is not one such comparison at
+/// all — and an `AttributesToGet` naming an attribute the selected users cannot
+/// serve. Both are a member whose submitted value missed the constraints on it,
+/// so both carry [`CONSTRAINT_MESSAGE`].
+fn constraints_not_satisfied() -> ListUsersError {
+    invalid_parameter(CONSTRAINT_MESSAGE.to_string())
+}
+
+/// This operation's `InvalidParameterException` for a `PaginationToken` that
+/// names no page of this listing.
+fn invalid_pagination_token() -> ListUsersError {
+    invalid_parameter(
+        "PaginationToken is not a pagination token this operation issued for this search"
+            .to_string(),
+    )
+}
+
+/// This operation's `InvalidParameterException` carrying `message`.
+fn invalid_parameter(message: String) -> ListUsersError {
+    ListUsersErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        // `reasonCode` is AWS's own classification of the bad parameter and this
+        // service's model documents no value for it, so nothing is invented here.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> ListUsersError {
+    ListUsersErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
+}
+
+#[cfg(test)]
+mod tests {
+    //! The filter grammar, row by row: which strings are a search this operation
+    //! runs and which are not. `tests/all/list_users.rs` asserts the search
+    //! itself over the wire, against stored users.
+
+    use super::{Searched, UserFilter};
+
+    #[test]
+    fn a_filter_reads_as_one_comparison_on_one_searchable_attribute() {
+        // (case, filter, expected searched attribute, prefix match, value)
+        let rows: &[(&str, &str, Searched, bool, &str)] = &[
+            (
+                "an exact match on a standard attribute",
+                "family_name = \"Reddy\"",
+                Searched::Attribute("family_name"),
+                false,
+                "Reddy",
+            ),
+            (
+                "a prefix match",
+                "given_name ^= \"Jon\"",
+                Searched::Attribute("given_name"),
+                true,
+                "Jon",
+            ),
+            (
+                "no space around the comparison",
+                "email=\"user@example.com\"",
+                Searched::Attribute("email"),
+                false,
+                "user@example.com",
+            ),
+            (
+                "the username itself",
+                "username = \"alice\"",
+                Searched::Username,
+                false,
+                "alice",
+            ),
+            (
+                // An attribute the issue did not cite, from the documented
+                // catalog in `SEARCHABLE_ATTRIBUTES`.
+                "the confirmation status",
+                "cognito:user_status = \"CONFIRMED\"",
+                Searched::UserStatus,
+                false,
+                "CONFIRMED",
+            ),
+            (
+                "the sign-in state the console calls Enabled",
+                "status = \"Enabled\"",
+                Searched::Enabled,
+                false,
+                "Enabled",
+            ),
+            (
+                "a value holding an escaped quotation mark",
+                "name = \"Ren\\\"ee\"",
+                Searched::Attribute("name"),
+                false,
+                "Ren\"ee",
+            ),
+            (
+                "a value holding spaces",
+                "name = \"Ada Lovelace\"",
+                Searched::Attribute("name"),
+                false,
+                "Ada Lovelace",
+            ),
+            (
+                "an empty value",
+                "preferred_username = \"\"",
+                Searched::Attribute("preferred_username"),
+                false,
+                "",
+            ),
+        ];
+
+        for (case, filter, searched, prefix, value) in rows {
+            let actual = UserFilter::parse(filter);
+            let expected = Some(UserFilter {
+                searched: *searched,
+                prefix: *prefix,
+                value: (*value).to_string(),
+            });
+            assert_eq!(
+                actual, expected,
+                "case {case:?} ({filter:?}): expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_filter_that_is_not_one_such_comparison_is_not_a_search() {
+        // (case, filter)
+        let rows: &[(&str, &str)] = &[
+            ("a bare attribute name", "username"),
+            (
+                "a comparison this operation does not accept",
+                "email ~= \"user@example.com\"",
+            ),
+            ("an unquoted value", "email = user@example.com"),
+            (
+                "a value whose quotation mark is never closed",
+                "email = \"user@example.com",
+            ),
+            (
+                "two comparisons, where the filter matches no more than one attribute",
+                "email = \"a@example.com\" and name = \"Ada\"",
+            ),
+            ("no attribute name at all", "= \"alice\""),
+            (
+                "a custom attribute, which is not searchable",
+                "custom:department = \"finance\"",
+            ),
+            (
+                "a standard attribute outside the searchable catalog",
+                "nickname = \"ada\"",
+            ),
+            (
+                "a searchable name in another case, which is not that name",
+                "Username = \"alice\"",
+            ),
+        ];
+
+        for (case, filter) in rows {
+            let actual = UserFilter::parse(filter);
+            assert!(
+                actual.is_none(),
+                "case {case:?} ({filter:?}): expected no search at all, got {actual:?}"
+            );
+        }
     }
 }
