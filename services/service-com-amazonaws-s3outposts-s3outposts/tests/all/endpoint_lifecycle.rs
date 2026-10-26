@@ -368,7 +368,7 @@ pub(crate) fn string_at(value: &Value, name: &str) -> String {
 }
 
 /// The endpoint in `answer` whose `EndpointArn` is `arn`.
-fn endpoint_with_arn(answer: &Answer, arn: &str) -> Value {
+pub(crate) fn endpoint_with_arn(answer: &Answer, arn: &str) -> Value {
     answer
         .endpoints()
         .iter()
@@ -1145,13 +1145,14 @@ async fn customer_owned_ip_without_a_coip_pool_is_refused() {
     }
 }
 
-/// `AccessType` and `CustomerOwnedIpv4Pool` name ONE network path, so a create supplies
-/// the CoIP pool exactly when the access type is the on-premises one: either member
-/// without the other is the modelled 400 that stores nothing, an accepted create reports
-/// back the pair it was given, and no endpoint the listings report ever pairs a pool with
-/// the VPC access type.
+/// `AccessType` states its requirement in ONE direction — the on-premises access type
+/// must be given the CoIP pool it allocates from — and nothing states the converse, so
+/// that single direction is the whole rule: `CustomerOwnedIp` without a pool is the
+/// modelled 400 that stores nothing, every other pairing (the pool with `Private`, with
+/// `AccessType` omitted, or with `CustomerOwnedIp`) is accepted, and an accepted create
+/// reports back exactly the pair it was given through both listings.
 #[tokio::test]
-async fn a_coip_pool_is_supplied_exactly_for_customer_owned_ip_access() {
+async fn a_coip_pool_is_required_by_customer_owned_ip_and_admitted_with_any_access_type() {
     let router = emulator();
     let outpost_id = owned_outposts(&router).await[0].clone();
 
@@ -1165,18 +1166,18 @@ async fn a_coip_pool_is_supplied_exactly_for_customer_owned_ip_access() {
     ];
 
     let cases: Vec<(&str, Option<&str>, Option<&str>, u16)> = vec![
-        ("Private with a pool", Some("Private"), Some(POOLS[0]), 400),
+        ("Private with a pool", Some("Private"), Some(POOLS[0]), 200),
         (
             "Private with another pool",
             Some("Private"),
             Some(POOLS[1]),
-            400,
+            200,
         ),
         (
             "no AccessType at all (defaults to Private) with a pool",
             None,
             Some(POOLS[2]),
-            400,
+            200,
         ),
         (
             "CustomerOwnedIp with no pool",
@@ -1222,7 +1223,8 @@ async fn a_coip_pool_is_supplied_exactly_for_customer_owned_ip_access() {
             assert_eq!(
                 answer.error_code(),
                 "ValidationException",
-                "case {case:?}: a contradictory pair must be the modelled validation failure, got {:?}",
+                "case {case:?}: the one stated requirement must be the modelled validation \
+                 failure, got {:?}",
                 answer.body
             );
             assert!(
@@ -1259,12 +1261,16 @@ async fn a_coip_pool_is_supplied_exactly_for_customer_owned_ip_access() {
             "case {case:?}: a refused create stores nothing and an accepted one stores exactly one"
         );
         for endpoint in listing.endpoints() {
-            let reports_pool = !endpoint["CustomerOwnedIpv4Pool"].is_null();
-            assert_eq!(
-                reports_pool,
-                endpoint["AccessType"] == json!("CustomerOwnedIp"),
-                "case {case:?}: a pool is reported exactly for CustomerOwnedIp access, got {endpoint:?}"
-            );
+            // The one direction the documentation states, read back over every record
+            // the listing reports: no endpoint reports the on-premises access type
+            // without the pool it allocates from.
+            if endpoint["AccessType"] == json!("CustomerOwnedIp") {
+                assert!(
+                    !endpoint["CustomerOwnedIpv4Pool"].is_null(),
+                    "case {case:?}: CustomerOwnedIp access reports the pool it was given, got \
+                     {endpoint:?}"
+                );
+            }
         }
     }
 

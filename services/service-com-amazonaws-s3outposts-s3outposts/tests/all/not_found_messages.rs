@@ -91,9 +91,9 @@ fn assert_not_found(case: &str, answer: &Answer, request_ids: &[&str]) {
 
 /// Create requests that differ in every member beyond `OutpostId`: both widths
 /// `SubnetId` / `SecurityGroupId` admit, each `EndpointAccessType` value, whether the
-/// access type is named at all and whether a CoIP pool is carried (always with the
-/// `CustomerOwnedIp` access type it belongs to, since the pair is validated before
-/// anything is resolved). The not-found answer may not vary with any of them.
+/// access type is named at all and whether a CoIP pool is carried — including a pool
+/// carried without any access type, which is admitted input and so resolves the Outpost
+/// like every other request. The not-found answer may not vary with any of them.
 fn create_variants(outpost_id: &str) -> Vec<(&'static str, Value)> {
     vec![
         ("only the required members", minimal_create(outpost_id)),
@@ -122,6 +122,25 @@ fn create_variants(outpost_id: &str) -> Vec<(&'static str, Value)> {
                 "SubnetId": "subnet-0a1b2c3d4e5f60718",
                 "SecurityGroupId": "sg-0a1b2c3d4e5f60718",
                 "AccessType": "CustomerOwnedIp",
+                "CustomerOwnedIpv4Pool": "ipv4pool-coip-0a1b2c3d4e5f60718",
+            }),
+        ),
+        (
+            "a CoIP pool with no AccessType at all",
+            json!({
+                "OutpostId": outpost_id,
+                "SubnetId": "subnet-00000000",
+                "SecurityGroupId": "sg-00000000",
+                "CustomerOwnedIpv4Pool": "ipv4pool-coip-00000000000000000",
+            }),
+        ),
+        (
+            "a CoIP pool with AccessType Private",
+            json!({
+                "OutpostId": outpost_id,
+                "SubnetId": "subnet-0a1b2c3d4e5f60718",
+                "SecurityGroupId": "sg-0a1b2c3d4e5f60718",
+                "AccessType": "Private",
                 "CustomerOwnedIpv4Pool": "ipv4pool-coip-0a1b2c3d4e5f60718",
             }),
         ),
