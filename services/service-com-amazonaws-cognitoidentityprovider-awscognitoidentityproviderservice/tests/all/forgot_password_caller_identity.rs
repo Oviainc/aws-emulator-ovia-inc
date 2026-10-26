@@ -60,8 +60,11 @@ const RESET_PASSWORD: &str = "Res3tPassw0rd!";
 /// `CreateUserPoolClient` in this test minted.
 const UNKNOWN_CLIENT_ID: &str = "noclientofanypool";
 
-/// The one sentence a `UserNotFoundException` says.
-const USER_NOT_FOUND_MESSAGE: &str = "User does not exist.";
+/// The one sentence a `UserNotFoundException` says for this operation, which resolves
+/// the user from the `Username` and the `ClientId` of the request TOGETHER (it models no
+/// `UserPoolId`), so the refusal reports that COMBINATION as unresolved rather than
+/// making a statement about the username alone.
+const USERNAME_CLIENT_NOT_FOUND_MESSAGE: &str = "Username/client id combination not found.";
 
 /// A username no request in this test registers, for the `SecretHash` of another
 /// identity.
@@ -458,7 +461,7 @@ async fn forgot_password_answers_only_the_pool_its_app_client_names() {
             hash: Hash::Absent,
             status: 404,
             error: Some("UserNotFoundException"),
-            message: Expected::Fixed(USER_NOT_FOUND_MESSAGE),
+            message: Expected::Fixed(USERNAME_CLIENT_NOT_FOUND_MESSAGE),
         },
         Row {
             case: "a client of the second pool, for a user only the first pool holds",
@@ -467,7 +470,7 @@ async fn forgot_password_answers_only_the_pool_its_app_client_names() {
             hash: Hash::Absent,
             status: 404,
             error: Some("UserNotFoundException"),
-            message: Expected::Fixed(USER_NOT_FOUND_MESSAGE),
+            message: Expected::Fixed(USERNAME_CLIENT_NOT_FOUND_MESSAGE),
         },
         Row {
             case: "a legacy client, for a user nobody registered",
@@ -476,7 +479,7 @@ async fn forgot_password_answers_only_the_pool_its_app_client_names() {
             hash: Hash::Absent,
             status: 404,
             error: Some("UserNotFoundException"),
-            message: Expected::Fixed(USER_NOT_FOUND_MESSAGE),
+            message: Expected::Fixed(USERNAME_CLIENT_NOT_FOUND_MESSAGE),
         },
         Row {
             case: "a client that suppresses existence errors, for a user nobody registered",
@@ -485,7 +488,7 @@ async fn forgot_password_answers_only_the_pool_its_app_client_names() {
             hash: Hash::Absent,
             status: 403,
             error: Some("NotAuthorizedException"),
-            message: Expected::Fixed("Username/client id combination not found."),
+            message: Expected::Fixed(USERNAME_CLIENT_NOT_FOUND_MESSAGE),
         },
         Row {
             case: "a client that suppresses existence errors, for a user of its own pool",
@@ -548,7 +551,7 @@ async fn forgot_password_answers_only_the_pool_its_app_client_names() {
             hash: Hash::OwnSecret,
             status: 404,
             error: Some("UserNotFoundException"),
-            message: Expected::Fixed(USER_NOT_FOUND_MESSAGE),
+            message: Expected::Fixed(USERNAME_CLIENT_NOT_FOUND_MESSAGE),
         },
         Row {
             case: "a secretless client, with a hash it has no secret to verify",

@@ -369,10 +369,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let created_at = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
+        // A stream whose removal has fallen due names no resource any more, so the store
+        // hands its memory back here, where the streams this account holds change and the
+        // ceilings below are counted.
+        store.drop_removed_streams(created_at);
+
         // A stream is addressed by its name inside its region, so a name the region
         // already holds a stream under is a conflict rather than a second record, and the
         // stored stream is left exactly as it was.
-        if store.stream_in(&region, &input.stream_name).is_some() {
+        if store
+            .stream_in(created_at, &region, &input.stream_name)
+            .is_some()
+        {
             drop(store);
             audit(&akid, &region, "conflict");
             return Err(CreateStreamErrorModeled::ResourceInUseException(
@@ -392,8 +400,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and because that region is the one the CALLER's credential scope names, the two
         // ceilings no request can partition are checked beside them — together they are what
         // keeps a caller from making this emulator's memory grow without end.
-        let streams_in_region = store.streams_held_in(&region);
-        let shards_in_region = store.shards_held_in(&region);
+        let streams_in_region = store.streams_held_in(created_at, &region);
+        let shards_in_region = store.shards_held_in(created_at, &region);
         if streams_in_region >= crate::state::MAX_STREAMS_PER_REGION
             || shards_in_region.saturating_add(shard_count) > crate::state::MAX_SHARDS_PER_REGION
         {
@@ -407,9 +415,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::MAX_SHARDS_PER_REGION
             )));
         }
-        if store.streams.len() >= crate::state::MAX_STREAMS_TOTAL
+        if store.streams_held(created_at) >= crate::state::MAX_STREAMS_TOTAL
             || store
-                .shards_held()
+                .shards_held(created_at)
                 .saturating_add(shard_count)
                 > crate::state::MAX_SHARDS_TOTAL
         {
@@ -460,6 +468,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             warm_throughput_mi_bps: input.warm_throughput_mi_bps,
             max_record_size_in_ki_b: input.max_record_size_in_ki_b,
             record_distribution_strategy: input.record_distribution_strategy,
+            // Nothing has deleted the stream, so no removal is owed for it.
+            deleted_at: None,
             tags: input.tags.unwrap_or_default(),
         };
 

@@ -71,7 +71,7 @@ const INCIDENT: &str = "incident-2043";
 ///
 /// The channel catalog is the one the acknowledgement suite spans the model's `ChannelType`
 /// set with, so a row asking for three channels gets one of each kind.
-async fn contact_with_channels(
+pub(crate) async fn contact_with_channels(
     emulator: &Emulator,
     alias: &str,
     channels: usize,
@@ -105,7 +105,7 @@ async fn contact_with_channels(
 
 /// A plan whose stages are `stages`: each entry is a `DurationInMinutes` and the indices into
 /// `channels` its `Targets` name.
-fn plan_of(stages: &[(i64, &[usize])], channels: &[String]) -> Value {
+pub(crate) fn plan_of(stages: &[(i64, &[usize])], channels: &[String]) -> Value {
     let rendered: Vec<Value> = stages
         .iter()
         .map(|(duration, targets)| {

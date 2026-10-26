@@ -175,7 +175,11 @@ struct Op {
 /// Every operation this service implements that addresses an existing app, with the
 /// request filled in for `app_id`. The URIs are the model's own
 /// (`smithy_query(query="digest")` http bindings); `CreateBackend` is NOT here — it is
-/// the operation that brings an app record into being, so it has no app to address.
+/// the operation that brings an app record into being, so it has no app to address, and
+/// neither is `RemoveAllBackends`, which resolves the app against the registry that mints
+/// an `AppId` (Amplify's own) as well as this service's backend records, so an app this
+/// gate refuses can still be one it serves — its own suite,
+/// `tests/all/remove_all_backends.rs`, is where both answers are pinned.
 fn operations(app_id: &str) -> Vec<Op> {
     vec![
         Op {

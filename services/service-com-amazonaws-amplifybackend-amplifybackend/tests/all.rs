@@ -21,6 +21,8 @@ mod backend_lifecycle;
 mod backend_storage;
 #[path = "all/challenge_tokens.rs"]
 mod challenge_tokens;
+#[path = "all/remove_all_backends.rs"]
+mod remove_all_backends;
 #[path = "all/s3_buckets.rs"]
 mod s3_buckets;
 #[path = "all/state_roundtrip.rs"]
