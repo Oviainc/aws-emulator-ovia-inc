@@ -2,12 +2,11 @@
 
 //! @op DescribeManagedLoginBranding
 //!
-//! Implemented for the CUSTOMIZED view, which is the stored style. The MERGED
-//! view (`ReturnMergedResources` true) is not implemented: it reports the
-//! branding options a style leaves at Amazon Cognito's defaults, and those
-//! defaults are neither in this service's model nor derivable from what a style
-//! stores, so that request answers 501 instead of the customized style under a
-//! success status.
+//! Serves both views of the stored style: the CUSTOMIZED view, which is the
+//! stored style alone, and the MERGED view (`ReturnMergedResources` true),
+//! which is the stored style over the branding options this service manages for
+//! a style that customizes none of them
+//! ([`crate::state::merged_branding_settings`]).
 //!
 //! ## Shape of an operation
 //!
@@ -166,21 +165,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(internal_error());
         };
 
-        // "When true, returns values for branding options that are unchanged
-        // from Amazon Cognito defaults. When false or when you omit this
-        // parameter, returns only values that you customized in your branding
-        // style" (this operation's `ReturnMergedResources`). The customized
-        // view is the stored style. The merged view also reports the
-        // Cognito-managed default options, which are not in this service's
-        // model and cannot be computed from what a style stores, so it is
-        // refused as not written yet rather than answered with the customized
-        // style under a success status.
-        if input.return_merged_resources {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "DescribeManagedLoginBranding with ReturnMergedResources true",
-            ));
-        }
-
         let guard = state.lock();
         let pool = guard
             .pool(&input.user_pool_id)
@@ -191,11 +175,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let branding = pool
             .managed_login_branding
             .get(&input.managed_login_branding_id)
-            .ok_or_else(|| branding_not_found(&input.managed_login_branding_id))?;
+            .ok_or_else(branding_not_found)?;
 
-        // Rendered from the STORED style: this read changes nothing.
+        // "When true, returns values for branding options that are unchanged
+        // from Amazon Cognito defaults. When false or when you omit this
+        // parameter, returns only values that you customized in your branding
+        // style" (this operation's `ReturnMergedResources`): the customized
+        // view is the stored style alone, and the merged view is the stored
+        // style over this service's default style. Both are rendered from the
+        // STORED style, so this read changes nothing.
+        let view = if input.return_merged_resources {
+            branding.to_merged_managed_login_branding_type()
+        } else {
+            branding.to_managed_login_branding_type()
+        };
         Ok(DescribeManagedLoginBrandingOutput {
-            managed_login_branding: Some(branding.to_managed_login_branding_type()),
+            managed_login_branding: Some(view),
         })
     }
 }
@@ -209,12 +204,11 @@ fn user_pool_not_found(user_pool_id: &str) -> DescribeManagedLoginBrandingError 
 }
 
 /// This operation's `ResourceNotFoundException` for a `ManagedLoginBrandingId`
-/// the named pool does not hold.
-fn branding_not_found(branding_id: &str) -> DescribeManagedLoginBrandingError {
+/// the named pool does not hold, carrying the one message every operation that
+/// reaches a style by its id answers a missing style with.
+fn branding_not_found() -> DescribeManagedLoginBrandingError {
     DescribeManagedLoginBrandingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!(
-            "Managed login branding {branding_id} does not exist."
-        )),
+        message: Some(crate::state::BRANDING_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

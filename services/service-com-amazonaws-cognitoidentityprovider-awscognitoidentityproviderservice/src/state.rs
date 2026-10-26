@@ -520,6 +520,20 @@ pub struct ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceS
     /// The passkey registrations in flight, keyed by the challenge value the
     /// credential creation options carried to the caller.
     pub web_authn_registrations: HashMap<String, WebAuthnRegistration>,
+    /// The managed login branding styles a modification is IN FLIGHT for right
+    /// now, keyed by the (`UserPoolId`, `ManagedLoginBrandingId`) pair every
+    /// handler reaches a style by, which is what makes concurrent modification
+    /// of one style observable: `ConcurrentModificationException` "is thrown if
+    /// two or more modifications are happening concurrently", so a modification
+    /// is pending for the span it takes and a second modification of the SAME
+    /// style inside that span is refused instead of silently overwriting the
+    /// first one's read-modify-write. Modifications of DIFFERENT styles never
+    /// collide.
+    ///
+    /// Entered and left by [`Self::begin_branding_modification`] /
+    /// [`Self::end_branding_modification`]: a span, never a stored status, so
+    /// nothing is left for a later caller to clean up.
+    pub modifying_branding: BTreeSet<(String, String)>,
 }
 
 impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
@@ -531,6 +545,21 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// The stored pool, mutably.
     pub fn pool_mut(&mut self, user_pool_id: &str) -> Option<&mut UserPool> {
         self.user_pools.get_mut(user_pool_id)
+    }
+
+    /// Mark a modification of the branding style `branding_id` of the pool
+    /// `user_pool_id` as in flight, answering `false` when another modification
+    /// of the SAME style already is — the caller then refuses its request with
+    /// the modelled `ConcurrentModificationException`.
+    pub fn begin_branding_modification(&mut self, user_pool_id: &str, branding_id: &str) -> bool {
+        self.modifying_branding
+            .insert((user_pool_id.to_string(), branding_id.to_string()))
+    }
+
+    /// Release the in-flight marker [`Self::begin_branding_modification`] took.
+    pub fn end_branding_modification(&mut self, user_pool_id: &str, branding_id: &str) {
+        self.modifying_branding
+            .remove(&(user_pool_id.to_string(), branding_id.to_string()));
     }
 
     /// The stored pool that holds the app client `client_id`, or `None` when no pool
@@ -3205,7 +3234,298 @@ impl ManagedLoginBranding {
             last_modified_date: Some(to_date_time(self.last_modified_date)),
         }
     }
+
+    /// The MERGED view of this style: the customized view with every branding
+    /// option this style leaves at the service's defaults filled in from
+    /// [`default_branding_settings`].
+    ///
+    /// "When true, returns values for branding options that are unchanged from
+    /// Amazon Cognito defaults. When false or when you omit this parameter,
+    /// returns only values that you customized in your branding style"
+    /// (`ReturnMergedResources` on the two readers of a style), so the merged
+    /// answer differs from the customized one in `Settings` ALONE: the default
+    /// style carries no image file, so a style's `Assets` are its own in both
+    /// views, and every other member identifies the stored style.
+    pub fn to_merged_managed_login_branding_type(
+        &self,
+    ) -> crate::ops::types::ManagedLoginBrandingType {
+        crate::ops::types::ManagedLoginBrandingType {
+            settings: Some(merged_branding_settings(self.settings.as_ref())),
+            ..self.to_managed_login_branding_type()
+        }
+    }
 }
+
+/// The branding options this service manages for a style that customizes none
+/// of them: the baseline the MERGED view of a style reports, and therefore the
+/// only `Settings` a style that takes the Cognito-provided values has.
+///
+/// The option names are the ones this API documents — `Settings` names
+/// `signUp`, `instructions`, `sessionTimerDisplay` and `languageSelector` among
+/// the components a style carries (this service's model), and the branding
+/// editor groups them under `categories`, `componentClasses` and `components` —
+/// while the VALUES are this emulator's defaults: the managed defaults are not
+/// in the model, so a style that overrides none of them reads back this
+/// document. Rendered fresh per read, so no caller can change what another
+/// caller's merged read reports.
+pub fn default_branding_settings() -> ::aws_smithy_types::Document {
+    document_from_json(&::serde_json::json!({
+        "categories": {
+            "auth": {
+                "authMethodOrder": [
+                    [
+                        { "display": "BUTTON", "type": "FEDERATED" },
+                        { "display": "INPUT", "type": "USERNAME_PASSWORD" }
+                    ]
+                ],
+                "federation": { "interfaceStyle": "BUTTON_LIST", "order": [] }
+            },
+            "form": {
+                "displayGraphics": true,
+                "instructions": { "enabled": false },
+                "languageSelector": { "enabled": false },
+                "location": { "horizontal": "CENTER", "vertical": "CENTER" },
+                "sessionTimerDisplay": "NONE"
+            },
+            "global": {
+                "colorSchemeMode": "LIGHT",
+                "pageFooter": { "enabled": false },
+                "pageHeader": { "enabled": false },
+                "spacingDensity": "REGULAR"
+            },
+            "signUp": { "acceptanceElements": [] }
+        },
+        "componentClasses": {
+            "buttons": { "borderRadius": 8 },
+            "divider": { "darkMode": { "borderColor": "232b37ff" }, "lightMode": { "borderColor": "e9ebedff" } },
+            "focusState": { "darkMode": { "borderColor": "539fe5ff" }, "lightMode": { "borderColor": "0972d3ff" } },
+            "idpButtons": { "icons": { "enabled": true } },
+            "input": { "borderRadius": 8 },
+            "inputLabel": { "darkMode": {}, "lightMode": {} },
+            "link": { "darkMode": {}, "lightMode": {} },
+            "optionControls": { "darkMode": {}, "lightMode": {} },
+            "statusIndicator": { "darkMode": {}, "lightMode": {} }
+        },
+        "components": {
+            "alert": { "borderRadius": 12 },
+            "favicon": { "enabledTypes": ["ICO", "SVG"] },
+            "form": {
+                "borderRadius": 8,
+                "borderWidth": 1,
+                "logo": {
+                    "enabled": false,
+                    "formInclusion": "IN",
+                    "location": "CENTER",
+                    "position": "TOP"
+                }
+            },
+            "idpButton": { "custom": {}, "standard": { "darkMode": {}, "lightMode": {} } },
+            "pageBackground": { "image": { "enabled": false } },
+            "pageFooter": { "logo": { "enabled": false } },
+            "pageHeader": { "logo": { "enabled": false } },
+            "pageText": { "darkMode": {}, "lightMode": {} },
+            "phoneNumberSelector": { "displayType": "TEXT" },
+            "primaryButton": { "darkMode": {}, "lightMode": {} },
+            "secondaryButton": { "darkMode": {}, "lightMode": {} }
+        }
+    }))
+}
+
+/// [`default_branding_settings`] with `customized` laid over it: every option a
+/// style customizes is the style's, and every option it leaves alone is the
+/// default. A style that customizes nothing reads back the defaults unchanged.
+///
+/// An option the style supplies REPLACES the default at that name, whatever
+/// either side holds — a merged read reports the style's own value, not a value
+/// nothing configured. Only where BOTH sides hold a JSON object are the two
+/// walked into.
+pub fn merged_branding_settings(
+    customized: Option<&::aws_smithy_types::Document>,
+) -> ::aws_smithy_types::Document {
+    let defaults = default_branding_settings();
+    match customized {
+        None => defaults,
+        Some(customized) => overlay_documents(defaults, customized),
+    }
+}
+
+/// `customized` laid over `base`, member by member: a member only `base` holds
+/// stays, a member only `customized` holds is added, and a member both hold is
+/// the customized one — except where both hold a JSON object, which is where the
+/// two are walked into.
+///
+/// Walked ITERATIVELY over an explicit worklist of the objects still being
+/// merged: BOTH sides can be a document a caller supplied (a stored style's
+/// settings under an update's), so the nesting depth is the caller's to choose
+/// and a recursive walk of it would put that depth on the stack.
+fn overlay_documents(
+    base: ::aws_smithy_types::Document,
+    customized: &::aws_smithy_types::Document,
+) -> ::aws_smithy_types::Document {
+    use ::aws_smithy_types::Document;
+    // The two objects to merge, or nothing to walk at all: anything else the
+    // customization names replaces what `base` held.
+    let (base, customized) = match (base, customized) {
+        (Document::Object(base), Document::Object(customized)) => (base, customized),
+        (_, customized) => return customized.clone(),
+    };
+
+    /// One object being merged: the members merged so far (starting as the
+    /// base's own), the customized members still to lay over them, and the name
+    /// this object is held under in the object one level up.
+    struct Pending<'a> {
+        name: Option<&'a str>,
+        merged: HashMap<String, ::aws_smithy_types::Document>,
+        remaining: Vec<(&'a String, &'a ::aws_smithy_types::Document)>,
+    }
+
+    let mut worklist = vec![Pending {
+        name: None,
+        merged: base,
+        remaining: customized.iter().collect(),
+    }];
+    loop {
+        let Some(current) = worklist.last_mut() else {
+            // Unreachable: the worklist starts non-empty and the last frame
+            // finished is returned rather than popped into nothing.
+            return Document::Object(HashMap::new());
+        };
+        match current.remaining.pop() {
+            // A member both sides hold as an object: merged one level down.
+            Some((name, Document::Object(customized))) => {
+                match current.merged.remove(name.as_str()) {
+                    Some(Document::Object(base)) => worklist.push(Pending {
+                        name: Some(name),
+                        merged: base,
+                        remaining: customized.iter().collect(),
+                    }),
+                    _ => {
+                        current
+                            .merged
+                            .insert(name.clone(), Document::Object(customized.clone()));
+                    }
+                }
+            }
+            // Every other member the customization names replaces what the base
+            // held under that name.
+            Some((name, value)) => {
+                current.merged.insert(name.clone(), value.clone());
+            }
+            // This object is merged: it belongs to the object above it, and the
+            // outermost one is the answer.
+            None => {
+                let finished = worklist.pop().expect("the frame just inspected");
+                let merged = Document::Object(finished.merged);
+                match (worklist.last_mut(), finished.name) {
+                    (Some(parent), Some(name)) => {
+                        parent.merged.insert(name.to_string(), merged);
+                    }
+                    _ => return merged,
+                }
+            }
+        }
+    }
+}
+
+/// The `aws_smithy_types::Document` a JSON value is, so a document this service
+/// builds from a JSON literal travels as the modelled `Document` type.
+///
+/// Called only on a literal this crate wrote, never on caller input: the walk is
+/// one level of recursion per nesting level, and the documents it is given nest
+/// as deeply as the source they are written in.
+pub fn document_from_json(value: &::serde_json::Value) -> ::aws_smithy_types::Document {
+    use ::aws_smithy_types::{Document, Number};
+    match value {
+        ::serde_json::Value::Null => Document::Null,
+        ::serde_json::Value::Bool(value) => Document::Bool(*value),
+        ::serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_u64() {
+                Document::Number(Number::PosInt(value))
+            } else if let Some(value) = value.as_i64() {
+                Document::Number(Number::NegInt(value))
+            } else {
+                Document::Number(Number::Float(value.as_f64().unwrap_or_default()))
+            }
+        }
+        ::serde_json::Value::String(value) => Document::String(value.clone()),
+        ::serde_json::Value::Array(items) => {
+            Document::Array(items.iter().map(document_from_json).collect())
+        }
+        ::serde_json::Value::Object(members) => Document::Object(
+            members
+                .iter()
+                .map(|(name, member)| (name.clone(), document_from_json(member)))
+                .collect(),
+        ),
+    }
+}
+
+/// `customized` laid over a style's STORED settings: "Amazon Cognito doesn't
+/// require that you pass all parameters in one request and preserves existing
+/// style settings that you don't specify", and a style larger than one request
+/// may carry is submitted as "multiple requests, each with a size smaller than
+/// the limit" (`UpdateManagedLoginBranding` in this service's model) — which
+/// only builds up one style if each request's options are laid over the stored
+/// ones instead of replacing them.
+///
+/// `None` for `customized` names no setting at all, so the stored document
+/// stands.
+pub fn updated_branding_settings(
+    stored: Option<&::aws_smithy_types::Document>,
+    customized: Option<&::aws_smithy_types::Document>,
+) -> Option<::aws_smithy_types::Document> {
+    match (stored, customized) {
+        (stored, None) => stored.cloned(),
+        (None, Some(customized)) => Some(customized.clone()),
+        (Some(stored), Some(customized)) => Some(overlay_documents(stored.clone(), customized)),
+    }
+}
+
+/// `customized` laid over a style's STORED image files, under the same
+/// preserve-what-you-did-not-specify rule as [`updated_branding_settings`].
+///
+/// An image file is the one the style shows for its category in its display
+/// mode — "The category that the image corresponds to in your managed login
+/// configuration" and "The display-mode target of the asset: light, dark, or
+/// browser-adaptive" (`AssetType` in this service's model) — so a submitted
+/// file REPLACES the stored file of that category and display mode and leaves
+/// every other one alone. The stored order is kept and a file for a pair the
+/// style did not hold is appended, so a read of several is stable.
+pub fn updated_branding_assets(
+    stored: &[crate::ops::types::AssetType],
+    customized: &[crate::ops::types::AssetType],
+) -> Vec<crate::ops::types::AssetType> {
+    let slot = |asset: &crate::ops::types::AssetType| (asset.category.clone(), asset.color_mode.clone());
+    let mut merged: Vec<crate::ops::types::AssetType> = stored.to_vec();
+    for asset in customized {
+        match merged.iter_mut().find(|stored| slot(stored) == slot(asset)) {
+            Some(replaced) => *replaced = asset.clone(),
+            None => merged.push(asset.clone()),
+        }
+    }
+    merged
+}
+
+/// AWS's refusal message for a managed login branding style this service holds
+/// none of: fixed text that names no style, because the request already carries
+/// the id that found nothing. Shared by every operation that reaches a style by
+/// its `ManagedLoginBrandingId`, so the readers and the writers cannot disagree
+/// about what a missing style is.
+pub const BRANDING_NOT_FOUND_MESSAGE: &str = "ManagedLoginBranding does not exist.";
+
+/// AWS's refusal message for an app client that has no managed login branding
+/// style assigned, naming the app client from the request.
+pub fn branding_for_client_not_found_message(client_id: &str) -> String {
+    format!("ManagedLoginBranding for client {client_id} does not exist.")
+}
+
+/// The message a modification of a branding style that another modification is
+/// already applying is refused with: "This exception is thrown if two or more
+/// modifications are happening concurrently"
+/// (`ConcurrentModificationException` in this service's model). It names no
+/// style, so every loser of a race carries this one sentence.
+pub const CONCURRENT_BRANDING_MODIFICATION_MESSAGE: &str =
+    "Only one request to modify a ManagedLoginBranding can be processed at a time";
 
 /// The `ClientId` that names a user pool's POOL-LEVEL classic hosted UI
 /// branding: "Set the default configuration for all clients with a ClientId of

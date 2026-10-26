@@ -396,28 +396,7 @@ impl CredentialCreation {
 /// The modelled `Document` for `value`, which is what the `CredentialCreationOptions`
 /// member carries on the wire.
 fn document(value: &::serde_json::Value) -> ::aws_smithy_types::Document {
-    use ::aws_smithy_types::{Document, Number};
-    match value {
-        ::serde_json::Value::Null => Document::Null,
-        ::serde_json::Value::Bool(value) => Document::Bool(*value),
-        ::serde_json::Value::Number(value) => {
-            if let Some(value) = value.as_u64() {
-                Document::Number(Number::PosInt(value))
-            } else if let Some(value) = value.as_i64() {
-                Document::Number(Number::NegInt(value))
-            } else {
-                Document::Number(Number::Float(value.as_f64().unwrap_or_default()))
-            }
-        }
-        ::serde_json::Value::String(value) => Document::String(value.clone()),
-        ::serde_json::Value::Array(items) => Document::Array(items.iter().map(document).collect()),
-        ::serde_json::Value::Object(members) => Document::Object(
-            members
-                .iter()
-                .map(|(name, member)| (name.clone(), document(member)))
-                .collect(),
-        ),
-    }
+    crate::state::document_from_json(value)
 }
 
 /// The message a token this emulator cannot resolve to a signed-in user is

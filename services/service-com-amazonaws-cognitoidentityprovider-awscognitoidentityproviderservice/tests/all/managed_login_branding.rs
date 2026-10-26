@@ -15,9 +15,10 @@
 //! client is a different resource; a request that asks for the Cognito-provided
 //! defaults and supplies customizations as well is refused; and an absent pool,
 //! app client or style id is a 404. The reader's MERGED view
-//! (`ReturnMergedResources` true) reports the options a style leaves at Amazon
-//! Cognito's defaults, which the emulator does not hold, so it answers 501
-//! rather than the customized style. Each table row names the case it asserts.
+//! (`ReturnMergedResources` true) answers the same style with the options it
+//! leaves at the service's defaults filled in, which the sibling
+//! `managed_login_branding_updates` suite covers in full. Each table row names
+//! the case it asserts.
 
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
@@ -33,7 +34,7 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 
 /// Every category `AssetCategoryType` admits, in the order the enum lists them
 /// (`smithy_query(query="shape",shape="AssetCategoryType")`) — fifteen values.
-const CATEGORIES: [&str; 15] = [
+pub(crate) const CATEGORIES: [&str; 15] = [
     "FAVICON_ICO",
     "FAVICON_SVG",
     "EMAIL_GRAPHIC",
@@ -53,18 +54,18 @@ const CATEGORIES: [&str; 15] = [
 
 /// Every display mode `ColorSchemeModeType` admits
 /// (`smithy_query(query="shape",shape="ColorSchemeModeType")`).
-const COLOR_MODES: [&str; 3] = ["LIGHT", "DARK", "DYNAMIC"];
+pub(crate) const COLOR_MODES: [&str; 3] = ["LIGHT", "DARK", "DYNAMIC"];
 
 /// Every file type `AssetExtensionType` admits
 /// (`smithy_query(query="shape",shape="AssetExtensionType")`).
-const EXTENSIONS: [&str; 5] = ["ICO", "JPEG", "PNG", "SVG", "WEBP"];
+pub(crate) const EXTENSIONS: [&str; 5] = ["ICO", "JPEG", "PNG", "SVG", "WEBP"];
 
 /// The modelled length maximum of `AssetListType`
 /// (`smithy_query(query="operation",operation="CreateManagedLoginBranding")`).
 const MAX_ASSETS: usize = 40;
 
 /// One emulator with just this service mounted.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.register_service(
@@ -75,7 +76,7 @@ fn router() -> MultiServiceRouter {
 }
 
 /// Call `operation` with `body` and return its status and JSON response body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -104,7 +105,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 }
 
 /// Call `operation`, requiring success, and return its response body.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     let (status, payload) = call(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -114,15 +115,23 @@ async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value
 }
 
 /// The `__type` of an error body, which is the wire error code.
-fn error_code(payload: &Value) -> &str {
+pub(crate) fn error_code(payload: &Value) -> &str {
     payload
         .get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
 }
 
+/// The `message` member of an error body.
+pub(crate) fn error_message(payload: &Value) -> &str {
+    payload
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("<no message>")
+}
+
 /// Create a pool and return its minted `UserPoolId`.
-async fn pool(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn pool(router: &MultiServiceRouter, name: &str) -> String {
     let created = ok(router, "CreateUserPool", &json!({ "PoolName": name })).await;
     created["UserPool"]["Id"]
         .as_str()
@@ -131,7 +140,7 @@ async fn pool(router: &MultiServiceRouter, name: &str) -> String {
 }
 
 /// Create an app client in `user_pool_id` and return its minted `ClientId`.
-async fn client(router: &MultiServiceRouter, user_pool_id: &str, name: &str) -> String {
+pub(crate) async fn client(router: &MultiServiceRouter, user_pool_id: &str, name: &str) -> String {
     let created = ok(
         router,
         "CreateUserPoolClient",
@@ -163,7 +172,7 @@ fn is_v4_uuid(candidate: &str) -> bool {
 
 /// One image asset as the wire carries it: `Bytes` is a blob, so it travels
 /// base64-encoded, and `ResourceId` is optional.
-fn asset(
+pub(crate) fn asset(
     category: &str,
     color_mode: &str,
     extension: &str,
@@ -186,7 +195,7 @@ fn asset(
 
 /// The bytes a rendered asset carries, decoded from its base64 `Bytes` member;
 /// an asset that reports no `Bytes` carries none.
-fn asset_bytes(rendered: &Value) -> Vec<u8> {
+pub(crate) fn asset_bytes(rendered: &Value) -> Vec<u8> {
     match rendered.get("Bytes").and_then(Value::as_str) {
         None => Vec::new(),
         Some(encoded) => ::aws_smithy_types::base64::decode(encoded)
@@ -477,10 +486,11 @@ async fn created_branding_styles_round_trip_through_stored_state() {
             );
         }
 
-        // The MERGED view reports the options a style leaves at Amazon
-        // Cognito's defaults, which this emulator does not hold: it says so
-        // rather than answering the customized style as if it were merged.
-        let (status, payload) = call(
+        // The MERGED view answers the same style with every branding option it
+        // leaves at the service's defaults filled in, so it carries `Settings`
+        // even for a style that customized none, and differs from the
+        // customized view in `Settings` alone.
+        let merged = ok(
             &router,
             "DescribeManagedLoginBranding",
             &json!({
@@ -490,11 +500,27 @@ async fn created_branding_styles_round_trip_through_stored_state() {
             }),
         )
         .await;
-        assert_eq!(
-            (status, error_code(&payload)),
-            (501, "NotImplemented"),
-            "case {label:?}: the merged view is not implemented, so it must not answer a success, got {status} with {payload}"
+        let merged_branding = &merged["ManagedLoginBranding"];
+        assert!(
+            merged_branding["Settings"]
+                .as_object()
+                .is_some_and(|settings| !settings.is_empty()),
+            "case {label:?}: the merged view carries the service's default branding options, got {merged}"
         );
+        for member in [
+            "ManagedLoginBrandingId",
+            "UserPoolId",
+            "UseCognitoProvidedValues",
+            "Assets",
+            "CreationDate",
+            "LastModifiedDate",
+        ] {
+            assert_eq!(
+                merged_branding.get(member),
+                branding.get(member),
+                "case {label:?}: the merged view differs from the customized one in Settings alone, got {member} as {merged_branding:?}"
+            );
+        }
 
         // And reading it again changes nothing a later caller sees.
         let again = ok(

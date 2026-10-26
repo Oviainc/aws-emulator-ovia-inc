@@ -79,6 +79,8 @@ mod list_user_pools;
 mod list_users_in_group;
 #[path = "all/managed_login_branding.rs"]
 mod managed_login_branding;
+#[path = "all/managed_login_branding_updates.rs"]
+mod managed_login_branding_updates;
 #[path = "all/log_delivery_configuration.rs"]
 mod log_delivery_configuration;
 #[path = "all/public_user_not_found_message.rs"]

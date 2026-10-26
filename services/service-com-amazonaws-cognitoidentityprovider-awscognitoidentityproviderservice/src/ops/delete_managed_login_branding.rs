@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteManagedLoginBranding
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteManagedLoginBranding`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteManagedLoginBranding::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the stored style, so the app client it was linked to has none, and
+//! serializes overlapping modifications of ONE style with
+//! `UpdateManagedLoginBranding`: whichever of the two claims the style first
+//! wins and the other is refused with the modelled
+//! `ConcurrentModificationException`, or with the not-found refusal once the
+//! style is gone.
 //!
 //! ## Shape of an operation
 //!
@@ -180,20 +178,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteManagedLoginBranding` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteManagedLoginBrandingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteManagedLoginBranding"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        // The style has to exist before anything claims it, and the claim has to
+        // be taken while the same lock is held, so two requests cannot both
+        // decide they are the one modifying it.
+        {
+            let mut guard = state.lock();
+            let pool = guard
+                .pool(&input.user_pool_id)
+                .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+            // "The ID of the user pool that contains the managed login branding
+            // style that you want to delete" (this operation's `UserPoolId`): a
+            // style lives in one pool, so an id another pool holds names nothing
+            // here.
+            if !pool
+                .managed_login_branding
+                .contains_key(&input.managed_login_branding_id)
+            {
+                return Err(branding_not_found());
+            }
+            if !guard.begin_branding_modification(
+                &input.user_pool_id,
+                &input.managed_login_branding_id,
+            ) {
+                return Err(concurrent_modification());
+            }
+        }
+        // Released however this request ends, so a refused or a panicking delete
+        // cannot leave a style no later modification may touch.
+        let _in_flight = ModificationInFlight {
+            state: state.clone(),
+            user_pool_id: input.user_pool_id.clone(),
+            branding_id: input.managed_login_branding_id.clone(),
+        };
+        // The deletion is not applied until this request publishes it below, so
+        // it yields once here: the point at which another modification of the
+        // same style observes it. A yield, not a wait — no wall-clock time
+        // passes, so a caller that makes two calls in a row never sees the span,
+        // while two that genuinely overlap do.
+        ::tokio::task::yield_now().await;
+
+        let mut guard = state.lock();
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        // "When you delete a style, you delete the branding association for an
+        // app client" (this operation): the stored style is removed, which is
+        // what leaves its app client with none.
+        pool.managed_login_branding
+            .remove(&input.managed_login_branding_id)
+            .ok_or_else(branding_not_found)?;
+        Ok(DeleteManagedLoginBrandingOutput)
     }
+}
+
+/// Holds the in-flight marker for ONE style's modification for as long as this
+/// request is applying it, and releases it however the request ends.
+struct ModificationInFlight {
+    state: ::engine::ServiceState<
+        crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState,
+    >,
+    user_pool_id: String,
+    branding_id: String,
+}
+
+impl Drop for ModificationInFlight {
+    fn drop(&mut self) {
+        self.state
+            .lock()
+            .end_branding_modification(&self.user_pool_id, &self.branding_id);
+    }
+}
+
+/// This operation's `ConcurrentModificationException` for a style another
+/// modification is already applying.
+fn concurrent_modification() -> DeleteManagedLoginBrandingError {
+    DeleteManagedLoginBrandingErrorModeled::ConcurrentModificationException(
+        ConcurrentModificationException {
+            message: Some(crate::state::CONCURRENT_BRANDING_MODIFICATION_MESSAGE.to_string()),
+        },
+    )
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> DeleteManagedLoginBrandingError {
+    DeleteManagedLoginBrandingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for a `ManagedLoginBrandingId`
+/// the named pool does not hold, carrying the one message every operation that
+/// reaches a style by its id answers a missing style with.
+fn branding_not_found() -> DeleteManagedLoginBrandingError {
+    DeleteManagedLoginBrandingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::BRANDING_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> DeleteManagedLoginBrandingError {
+    DeleteManagedLoginBrandingErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

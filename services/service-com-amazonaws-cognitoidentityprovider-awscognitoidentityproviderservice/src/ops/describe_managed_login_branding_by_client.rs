@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeManagedLoginBrandingByClient
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeManagedLoginBrandingByClient`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeManagedLoginBrandingByClient::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads the style assigned to an app client of the named pool, in the same two
+//! views `DescribeManagedLoginBranding` serves: the CUSTOMIZED view is the
+//! stored style alone, and the MERGED view (`ReturnMergedResources` true) is
+//! the stored style over the branding options this service manages for a style
+//! that customizes none of them.
 //!
 //! ## Shape of an operation
 //!
@@ -160,20 +157,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeManagedLoginBrandingByClient` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeManagedLoginBrandingByClientErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeManagedLoginBrandingByClient"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let guard = state.lock();
+        let pool = guard
+            .pool(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        // "The app client that's assigned to the branding style that you want
+        // more information about" (this operation's `ClientId`): a style is
+        // linked to one app client of the named pool, so an app client of this
+        // pool that has none names nothing to read.
+        let branding = pool
+            .branding_for_client(&input.client_id)
+            .ok_or_else(|| branding_for_client_not_found(&input.client_id))?;
+
+        // "When true, returns values for branding options that are unchanged
+        // from Amazon Cognito defaults. When false or when you omit this
+        // parameter, returns only values that you customized in your branding
+        // style" (this operation's `ReturnMergedResources`): the same two views
+        // the reader by id serves, both rendered from the STORED style, so this
+        // read changes nothing.
+        let view = if input.return_merged_resources {
+            branding.to_merged_managed_login_branding_type()
+        } else {
+            branding.to_managed_login_branding_type()
+        };
+        Ok(DescribeManagedLoginBrandingByClientOutput {
+            managed_login_branding: Some(view),
+        })
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> DescribeManagedLoginBrandingByClientError {
+    DescribeManagedLoginBrandingByClientErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(format!("User pool {user_pool_id} does not exist.")),
+        },
+    )
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for an app client with no
+/// branding style assigned, naming the app client from the request.
+fn branding_for_client_not_found(client_id: &str) -> DescribeManagedLoginBrandingByClientError {
+    DescribeManagedLoginBrandingByClientErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(crate::state::branding_for_client_not_found_message(
+                client_id,
+            )),
+        },
+    )
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> DescribeManagedLoginBrandingByClientError {
+    DescribeManagedLoginBrandingByClientErrorModeled::InternalErrorException(
+        InternalErrorException {
+            message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+        },
+    )
+    .into()
 }

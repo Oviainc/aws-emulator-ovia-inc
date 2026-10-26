@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateManagedLoginBranding
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateManagedLoginBranding`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateManagedLoginBranding::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the request's branding options to the stored style, preserving every
+//! option the request does not name, and serializes overlapping modifications
+//! of ONE style: a modification that arrives while another is applying the same
+//! style is refused with the modelled `ConcurrentModificationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -182,20 +178,209 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateManagedLoginBranding` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateManagedLoginBrandingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateManagedLoginBranding"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        // "The ID of the user pool that contains the managed login branding
+        // style that you want to update" and "The ID of the managed login
+        // branding style that you want to update" (this operation's
+        // `UserPoolId` and `ManagedLoginBrandingId`): the model marks neither
+        // required, so a request that leaves one out names no style to update
+        // and is refused for the parameter it is missing.
+        let user_pool_id = input
+            .user_pool_id
+            .as_deref()
+            .ok_or_else(|| missing_parameter("UserPoolId"))?;
+        let branding_id = input
+            .managed_login_branding_id
+            .as_deref()
+            .ok_or_else(|| missing_parameter("ManagedLoginBrandingId"))?;
+
+        // The style has to exist before anything claims it, and the claim has to
+        // be taken while the same lock is held, so two requests cannot both
+        // decide they are the one modifying it. Resolved BEFORE the request's
+        // own options are judged, so a request naming no style is answered for
+        // the style it does not name.
+        {
+            let mut guard = state.lock();
+            let pool = guard
+                .pool(user_pool_id)
+                .ok_or_else(|| user_pool_not_found(user_pool_id))?;
+            if !pool.managed_login_branding.contains_key(branding_id) {
+                return Err(branding_not_found());
+            }
+            if !guard.begin_branding_modification(user_pool_id, branding_id) {
+                return Err(concurrent_modification());
+            }
+        }
+        // Released however this request ends, so a refused or a panicking
+        // modification cannot leave a style no later one may touch.
+        let _in_flight = ModificationInFlight {
+            state: state.clone(),
+            user_pool_id: user_pool_id.to_string(),
+            branding_id: branding_id.to_string(),
+        };
+
+        // "When true, applies the default branding style options ... When you
+        // specify true for this option, you must also omit values for Settings
+        // and Assets in the request" (this operation's
+        // `UseCognitoProvidedValues`): a request that reverts the style to the
+        // service's defaults AND supplies customizations asks for two different
+        // styles at once. An `Assets` list carrying no element supplies no image
+        // file, so only a non-empty one is a value for `Assets`.
+        let supplied_assets = input.assets.as_deref().unwrap_or_default();
+        if input.use_cognito_provided_values
+            && (input.settings.is_some() || !supplied_assets.is_empty())
+        {
+            return Err(cognito_provided_values_conflict());
+        }
+
+        // "This operation has a 2-megabyte request-size limit and include the
+        // CSS settings and image assets for your app client ... If your request
+        // is larger than 2MB, separate it into multiple requests, each with a
+        // size smaller than the limit" (this operation): the limit bounds ONE
+        // request's own options, which is why a style larger than it is built
+        // up by several of them.
+        let payload = crate::state::branding_payload_bytes(input.settings.as_ref(), supplied_assets);
+        if payload > crate::state::MAX_BRANDING_PAYLOAD_BYTES {
+            return Err(payload_too_large(payload));
+        }
+
+        // The modification is not applied until this request publishes it below,
+        // so it yields once here: the point at which another modification of the
+        // same style observes it. A yield, not a wait — no wall-clock time
+        // passes, so a caller that makes two calls in a row never sees the span,
+        // while two that genuinely overlap do.
+        ::tokio::task::yield_now().await;
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        let pool = guard
+            .pool_mut(user_pool_id)
+            .ok_or_else(|| user_pool_not_found(user_pool_id))?;
+        // Re-resolved after the yield: a delete of this style may have won the
+        // race, and then there is nothing left to update.
+        let branding = pool
+            .managed_login_branding
+            .get_mut(branding_id)
+            .ok_or_else(branding_not_found)?;
+
+        if input.use_cognito_provided_values {
+            // "This option reverts to default style options that are managed by
+            // Amazon Cognito" (this operation's `UseCognitoProvidedValues`): the
+            // style keeps no customization of its own, so its merged view is the
+            // default style.
+            branding.settings = None;
+            branding.assets.clear();
+        } else {
+            // "Amazon Cognito doesn't require that you pass all parameters in
+            // one request and preserves existing style settings that you don't
+            // specify" (this operation): what the request names is applied over
+            // the stored style, and what it leaves out stays as it was.
+            branding.settings =
+                crate::state::updated_branding_settings(branding.settings.as_ref(), input.settings.as_ref());
+            branding.assets = crate::state::updated_branding_assets(&branding.assets, supplied_assets);
+        }
+        branding.use_cognito_provided_values = input.use_cognito_provided_values;
+        branding.last_modified_date = now;
+
+        // Rendered from the record this call STORED, so the response is what a
+        // later read sees.
+        Ok(UpdateManagedLoginBrandingOutput {
+            managed_login_branding: Some(branding.to_managed_login_branding_type()),
+        })
     }
+}
+
+/// Holds the in-flight marker for ONE style's modification for as long as this
+/// request is applying it, and releases it however the request ends.
+struct ModificationInFlight {
+    state: ::engine::ServiceState<
+        crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState,
+    >,
+    user_pool_id: String,
+    branding_id: String,
+}
+
+impl Drop for ModificationInFlight {
+    fn drop(&mut self) {
+        self.state
+            .lock()
+            .end_branding_modification(&self.user_pool_id, &self.branding_id);
+    }
+}
+
+/// This operation's `ConcurrentModificationException` for a style another
+/// modification is already applying.
+fn concurrent_modification() -> UpdateManagedLoginBrandingError {
+    UpdateManagedLoginBrandingErrorModeled::ConcurrentModificationException(
+        ConcurrentModificationException {
+            message: Some(crate::state::CONCURRENT_BRANDING_MODIFICATION_MESSAGE.to_string()),
+        },
+    )
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> UpdateManagedLoginBrandingError {
+    UpdateManagedLoginBrandingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for a `ManagedLoginBrandingId`
+/// the named pool does not hold, carrying the one message every operation that
+/// reaches a style by its id answers a missing style with.
+fn branding_not_found() -> UpdateManagedLoginBrandingError {
+    UpdateManagedLoginBrandingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::BRANDING_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException` for a request that leaves out a
+/// parameter it needs to name the style to update.
+fn missing_parameter(parameter: &str) -> UpdateManagedLoginBrandingError {
+    invalid_parameter(format!("Missing required parameter {parameter}"))
+}
+
+/// This operation's `InvalidParameterException` for a request that reverts the
+/// style to the service's defaults and supplies customizations as well.
+fn cognito_provided_values_conflict() -> UpdateManagedLoginBrandingError {
+    invalid_parameter("Settings and Assets must be omitted when UseCognitoProvidedValues is true.")
+}
+
+/// This operation's refusal of a request whose settings and image files exceed
+/// the documented request-size limit together.
+///
+/// The 2-megabyte limit is the model's own ("This operation has a 2-megabyte
+/// request-size limit"); which error AWS answers a request past it with is NOT
+/// stated there, and this operation models no limit error, so it is refused as
+/// the oversized parameters it carries.
+fn payload_too_large(payload: usize) -> UpdateManagedLoginBrandingError {
+    invalid_parameter(format!(
+        "Settings and Assets must not exceed {} bytes together, got {payload}.",
+        crate::state::MAX_BRANDING_PAYLOAD_BYTES
+    ))
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: impl Into<String>) -> UpdateManagedLoginBrandingError {
+    UpdateManagedLoginBrandingErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message.into()),
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> UpdateManagedLoginBrandingError {
+    UpdateManagedLoginBrandingErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }
