@@ -59,21 +59,32 @@ const NO_CONTAINER_INSTANCES: &str = "No Container Instances were found in your 
 
 /// Register a revision of `family` that is Fargate-compatible: `awsvpc` ("For Amazon
 /// ECS tasks on Fargate, the awsvpc network mode is required") plus task-level cpu and
-/// memory ("This field is required for Fargate").
+/// memory ("This field is required for Fargate"). `requires` is what the registration
+/// asks to be validated against (`requiresCompatibilities`), which is what brings a
+/// launch type no placement can name outright into the revision's compatibilities.
+async fn register_awsvpc_requiring(
+    router: &MultiServiceRouter,
+    family: &str,
+    requires: &[&str],
+    case: &str,
+) {
+    let mut request = json!({
+        "family": family,
+        "networkMode": "awsvpc",
+        "cpu": "256",
+        "memory": "512",
+        "containerDefinitions": [container("app", "public.ecr.aws/nginx/nginx:latest")],
+    });
+    if !requires.is_empty() {
+        request["requiresCompatibilities"] = json!(requires);
+    }
+    ok(router, "RegisterTaskDefinition", request, case).await;
+}
+
+/// Register a revision of `family` that is Fargate-compatible and asked to be validated
+/// against nothing in particular.
 async fn register_awsvpc(router: &MultiServiceRouter, family: &str, case: &str) {
-    ok(
-        router,
-        "RegisterTaskDefinition",
-        json!({
-            "family": family,
-            "networkMode": "awsvpc",
-            "cpu": "256",
-            "memory": "512",
-            "containerDefinitions": [container("app", "public.ecr.aws/nginx/nginx:latest")],
-        }),
-        case,
-    )
-    .await;
+    register_awsvpc_requiring(router, family, &[], case).await;
 }
 
 /// Register a revision of `family` in the default `bridge` network mode, which no
@@ -224,12 +235,23 @@ async fn a_launch_type_the_revision_was_not_validated_against_is_refused() {
     cluster_with_capacity(&router, "compat", case).await;
     register_bridge(&router, "bridgefam", case).await;
     register_awsvpc(&router, "awsvpcfam", case).await;
+    // The same `awsvpc` shape, registered asking to be validated against managed
+    // instances as well.
+    register_awsvpc_requiring(
+        &router,
+        "managedfam",
+        &["FARGATE", "MANAGED_INSTANCES"],
+        case,
+    )
+    .await;
 
     // The rule generalises over the revision's parameters and the launch type asked for.
     // The expected column is the documented compatibility of each shape: EC2 supports
     // every network mode; Fargate and managed instances need `awsvpc` (plus task-level
-    // cpu/memory for Fargate); `awsvpc` is not available to the external launch type.
-    let rows: [(&str, &str, &str, bool); 8] = [
+    // cpu/memory for Fargate); `awsvpc` is not available to the external launch type;
+    // and managed instances, which a placement cannot name outright, additionally needs
+    // the registration to have asked to be validated against it.
+    let rows: [(&str, &str, &str, bool); 9] = [
         ("bridge on EC2", "bridgefam", "EC2", true),
         ("bridge on EXTERNAL", "bridgefam", "EXTERNAL", true),
         ("bridge on FARGATE", "bridgefam", "FARGATE", false),
@@ -245,6 +267,12 @@ async fn a_launch_type_the_revision_was_not_validated_against_is_refused() {
             "awsvpc on MANAGED_INSTANCES",
             "awsvpcfam",
             "MANAGED_INSTANCES",
+            false,
+        ),
+        (
+            "awsvpc validated for managed instances",
+            "managedfam",
+            "MANAGED_INSTANCES",
             true,
         ),
         ("awsvpc on EXTERNAL", "awsvpcfam", "EXTERNAL", false),
@@ -256,7 +284,7 @@ async fn a_launch_type_the_revision_was_not_validated_against_is_refused() {
             "taskDefinition": family,
             "launchType": launch_type,
         });
-        if family == "awsvpcfam" {
+        if family != "bridgefam" {
             request["networkConfiguration"] = awsvpc_network_configuration();
         }
         if supported {

@@ -779,7 +779,12 @@ pub const DYNAMIC_HOST_PORT: i32 = 0;
 /// responses carry, so a client that reads the list positionally reads the same launch
 /// type the real service named. [`TaskDefinitionRecord::compatibilities`] filters it by
 /// what the stored revision's parameters support.
-pub const COMPATIBILITY_ORDER: [&str; 4] = ["EXTERNAL", "EC2", "MANAGED_INSTANCES", "FARGATE"];
+pub const COMPATIBILITY_ORDER: [&str; 4] = [
+    "EXTERNAL",
+    "EC2",
+    LAUNCH_TYPE_MANAGED_INSTANCES,
+    LAUNCH_TYPE_FARGATE,
+];
 
 /// The launch types `Cluster$statistics` separates a cluster's counts by, each paired
 /// with the segment its four statistic names carry (`running<segment>TasksCount`,
@@ -831,6 +836,26 @@ pub const LATEST_WINDOWS_PLATFORM_VERSION: &str = "1.0.0";
 /// The launch type whose tasks run on Fargate, and so the one the Fargate-only members
 /// (`platformFamily`, `platformVersion`) are reported for.
 pub const LAUNCH_TYPE_FARGATE: &str = "FARGATE";
+
+/// The launch type whose tasks run on capacity Amazon ECS manages for the caller, which a
+/// placement request reaches only through a capacity provider — see
+/// [`DEFAULT_VALIDATED_LAUNCH_TYPES`].
+pub const LAUNCH_TYPE_MANAGED_INSTANCES: &str = "MANAGED_INSTANCES";
+
+/// The launch types Amazon ECS validates EVERY registration against, whether or not the
+/// request named them in its `requiresCompatibilities`.
+///
+/// These are the launch types a placement request names outright: `RunTask$launchType` /
+/// `CreateService$launchType` is "The infrastructure that you run your service on", whose
+/// doc singles the remaining one out — "If you want to use Amazon ECS Managed Instances,
+/// you must use the `capacityProviderStrategy` request parameter and omit the
+/// `launchType` request parameter" — so a revision is validated against managed-instances
+/// capacity only when its registration ASKED to be
+/// (`RegisterTaskDefinition$requiresCompatibilities`: "The task launch type that Amazon
+/// ECS validates the task definition against"), and a recorded `awsvpc` revision that
+/// asked only for Fargate reports just `EC2` and `FARGATE`.
+/// [`TaskDefinitionRecord::validated_against`] is where the two sources meet.
+pub const DEFAULT_VALIDATED_LAUNCH_TYPES: [&str; 3] = ["EXTERNAL", "EC2", LAUNCH_TYPE_FARGATE];
 
 /// The capacity providers Amazon ECS manages for every account in every Region, which
 /// place tasks on Fargate: the `UpdateService$capacityProviderStrategy` doc — "When you
@@ -2181,14 +2206,19 @@ impl TaskDefinitionRecord {
     /// compatibilities`: "Amazon ECS validates the task definition parameters with
     /// those supported by the launch type."
     ///
-    /// Derived from the STORED revision and reported in [`COMPATIBILITY_ORDER`], by the
-    /// rules the model's own docs state: Fargate needs `awsvpc` ("For Amazon ECS tasks
-    /// on Fargate, the awsvpc network mode is required") plus task-level `cpu` and
-    /// `memory` ("This field is required for Fargate"); ECS Managed Instances place
-    /// tasks on AWS-managed capacity that gives each task its own network interface, so
-    /// they likewise need `awsvpc`; `awsvpc` is in turn not available to the external
-    /// (on-premises) launch type. EC2 supports every network mode, so it is always
-    /// present.
+    /// Derived from the STORED revision and reported in [`COMPATIBILITY_ORDER`]. A launch
+    /// type is reported when BOTH halves hold:
+    ///
+    /// * the revision's parameters meet that launch type's documented requirements —
+    ///   Fargate needs `awsvpc` ("For Amazon ECS tasks on Fargate, the awsvpc network
+    ///   mode is required") plus task-level `cpu` and `memory` ("This field is required
+    ///   for Fargate"); ECS Managed Instances place tasks on AWS-managed capacity that
+    ///   gives each task its own network interface, so they likewise need `awsvpc`;
+    ///   `awsvpc` is in turn not available to the external (on-premises) launch type; EC2
+    ///   supports every network mode;
+    /// * Amazon ECS validated the revision against it at all
+    ///   ([`TaskDefinitionRecord::validated_against`]) — every launch type a placement
+    ///   may name outright, plus whatever the registration asked for.
     pub fn compatibilities(&self) -> Vec<String> {
         let awsvpc = self.network_mode == NETWORK_MODE_AWSVPC;
         COMPATIBILITY_ORDER
@@ -2203,8 +2233,29 @@ impl TaskDefinitionRecord {
                 // classified deliberately rather than inheriting a neighbour's rule.
                 _ => false,
             })
+            .filter(|launch_type| self.validated_against(launch_type))
             .map(|launch_type| (*launch_type).to_string())
             .collect()
+    }
+
+    /// Whether Amazon ECS validated this revision against `launch_type` at all, before
+    /// its parameters are weighed against that launch type's requirements.
+    ///
+    /// A registration is validated against the launch types a placement can ask for
+    /// outright ([`DEFAULT_VALIDATED_LAUNCH_TYPES`]), and against the ones it asked to be
+    /// validated against itself — `requiresCompatibilities` is "The task launch type that
+    /// Amazon ECS validates the task definition against", so a stored revision whose
+    /// registration named one was validated against it. A launch type that is in neither
+    /// (managed-instances capacity, which a placement reaches only through a capacity
+    /// provider) was never validated for, so it is not reported however the revision is
+    /// shaped — and `requiresCompatibilities`, what the REQUEST asked for, is reported
+    /// separately and unchanged.
+    fn validated_against(&self, launch_type: &str) -> bool {
+        DEFAULT_VALIDATED_LAUNCH_TYPES.contains(&launch_type)
+            || self
+                .requires_compatibilities
+                .iter()
+                .any(|requested| requested == launch_type)
     }
 
     /// The container-instance attributes a task of this revision requires —

@@ -96,8 +96,10 @@ async fn all_pages(router: &MultiServiceRouter, request: Value, case: &str) -> V
 }
 
 /// Register one revision of `family` that is Fargate-compatible (`awsvpc` plus
-/// task-level cpu and memory), so a service may run it under any launch type whose
-/// capacity gives a task its own network interface.
+/// task-level cpu and memory), and that asked to be validated against the launch types
+/// the services below place it with: `requiresCompatibilities` is "The task launch type
+/// that Amazon ECS validates the task definition against", and managed-instances
+/// capacity — which no placement names outright — is validated for only on that request.
 async fn register_awsvpc_definition(router: &MultiServiceRouter, family: &str, case: &str) {
     ok(
         router,
@@ -107,6 +109,7 @@ async fn register_awsvpc_definition(router: &MultiServiceRouter, family: &str, c
             "networkMode": "awsvpc",
             "cpu": "256",
             "memory": "512",
+            "requiresCompatibilities": ["FARGATE", "MANAGED_INSTANCES"],
             "containerDefinitions": [container("web", "public.ecr.aws/nginx/nginx:latest")],
         }),
         case,

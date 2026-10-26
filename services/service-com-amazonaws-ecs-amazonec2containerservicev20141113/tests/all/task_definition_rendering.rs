@@ -13,8 +13,8 @@
 //! * `requiresAttributes` is DERIVED from the features the revision declares, one
 //!   container-agent capability per feature, deduplicated and sorted — and stays absent
 //!   when it declares none;
-//! * `compatibilities` reports the launch types the revision's parameters support, in
-//!   the order ECS reports them;
+//! * `compatibilities` reports the launch types the revision's parameters support and
+//!   that ECS validated it against, in the order ECS reports them;
 //! * `DescribeTaskDefinition` always materialises its top-level `tags` list, whose
 //!   CONTENT (not presence) follows `include`.
 //!
@@ -500,11 +500,11 @@ async fn requires_attributes_are_derived_from_the_features_the_revision_declares
 async fn compatibilities_read_back_in_the_launch_type_order_ecs_reports() {
     let router = service();
 
-    // The membership rule is tabled in `task_lifecycle`; here it is the ORDER, read
-    // back through BOTH projections. Order source: the recorded ECS responses —
-    // EXTERNAL, EC2, MANAGED_INSTANCES, FARGATE — filtered by what the revision
-    // supports (`Compatibility` enum values: EC2, FARGATE, EXTERNAL,
-    // MANAGED_INSTANCES).
+    // The membership rule is tabled in `task_lifecycle` and
+    // `task_definition_compatibility_validation`; here it is the ORDER, read back through
+    // BOTH projections. Order source: the recorded ECS responses — EXTERNAL, EC2,
+    // MANAGED_INSTANCES, FARGATE — filtered by what the revision supports
+    // (`Compatibility` enum values: EC2, FARGATE, EXTERNAL, MANAGED_INSTANCES).
     let rows: Vec<(&str, Value, Vec<&str>)> = vec![
         (
             "bridge",
@@ -514,12 +514,12 @@ async fn compatibilities_read_back_in_the_launch_type_order_ecs_reports() {
         (
             "awsvpc without task size",
             json!({ "networkMode": "awsvpc" }),
-            vec!["EC2", "MANAGED_INSTANCES"],
+            vec!["EC2"],
         ),
         (
             "awsvpc with task size",
             json!({ "networkMode": "awsvpc", "cpu": "256", "memory": "512" }),
-            vec!["EC2", "MANAGED_INSTANCES", "FARGATE"],
+            vec!["EC2", "FARGATE"],
         ),
         (
             "fargate requested",
@@ -528,6 +528,19 @@ async fn compatibilities_read_back_in_the_launch_type_order_ecs_reports() {
                 "cpu": "512",
                 "memory": "1024",
                 "requiresCompatibilities": ["FARGATE"],
+            }),
+            vec!["EC2", "FARGATE"],
+        ),
+        // The one shape that reports every launch type `awsvpc` allows, so the middle of
+        // the order is read too: a registration that asked to be validated against
+        // managed-instances capacity as well as Fargate.
+        (
+            "fargate and managed instances requested",
+            json!({
+                "networkMode": "awsvpc",
+                "cpu": "512",
+                "memory": "1024",
+                "requiresCompatibilities": ["FARGATE", "MANAGED_INSTANCES"],
             }),
             vec!["EC2", "MANAGED_INSTANCES", "FARGATE"],
         ),
