@@ -2536,15 +2536,23 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
         found
     }
 
-    /// Every subscription of this account, oldest first (ARN breaking a tie), so a
-    /// listing and its pagination token are stable across calls — see
+    /// Every subscription this account holds IN `region`, oldest first (ARN breaking a
+    /// tie), so a listing and its pagination token are stable across calls — see
     /// [`Self::subscriptions_of`], which is the one topic's.
     ///
-    /// Selects on nothing but the record's existence: a subscription whose endpoint
-    /// names a resource that is not there is still a subscription of the account, and
-    /// is listed like any other.
-    pub fn subscriptions_in_order(&self) -> Vec<&SubscriptionRecord> {
-        let mut found: Vec<&SubscriptionRecord> = self.subscriptions.values().collect();
+    /// A subscription belongs to the region of the topic it extends, which is what
+    /// [`belongs_to_region`] reads off that topic's ARN: the account-wide listing an
+    /// endpoint of `region` serves reports those and no others.
+    ///
+    /// Selects on nothing else but the record's existence: a subscription whose
+    /// endpoint names a resource that is not there — or one in another region — is
+    /// still a subscription of its topic's region, and is listed like any other.
+    pub fn subscriptions_in_region(&self, region: &str) -> Vec<&SubscriptionRecord> {
+        let mut found: Vec<&SubscriptionRecord> = self
+            .subscriptions
+            .values()
+            .filter(|sub| belongs_to_region(&sub.topic_arn, region))
+            .collect();
         found.sort_by(|a, b| {
             a.created_at
                 .cmp(&b.created_at)
@@ -2553,9 +2561,15 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
         found
     }
 
-    /// Every topic, oldest first (ARN breaking a tie) — see [`Self::subscriptions_of`].
-    pub fn topics_in_order(&self) -> Vec<&TopicRecord> {
-        let mut found: Vec<&TopicRecord> = self.topics.values().collect();
+    /// Every topic this account holds in `region`, oldest first (ARN breaking a tie) —
+    /// selected by [`belongs_to_region`] off the topic's own ARN, like
+    /// [`Self::subscriptions_in_region`].
+    pub fn topics_in_region(&self, region: &str) -> Vec<&TopicRecord> {
+        let mut found: Vec<&TopicRecord> = self
+            .topics
+            .values()
+            .filter(|topic| belongs_to_region(&topic.arn, region))
+            .collect();
         found.sort_by(|a, b| {
             a.created_at
                 .cmp(&b.created_at)
@@ -2601,12 +2615,19 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
         found
     }
 
-    /// Every platform application of this account, oldest first (the ARN breaking a
-    /// tie), so a listing and its pagination token are stable across calls — see
-    /// [`Self::subscriptions_of`].
-    pub fn platform_applications_in_order(&self) -> Vec<&PlatformApplicationRecord> {
-        let mut found: Vec<&PlatformApplicationRecord> =
-            self.platform_applications.values().collect();
+    /// Every platform application this account holds in `region`, oldest first (the
+    /// ARN breaking a tie), so a listing and its pagination token are stable across
+    /// calls — selected by [`belongs_to_region`] off the application's own ARN, like
+    /// [`Self::subscriptions_in_region`].
+    pub fn platform_applications_in_region(
+        &self,
+        region: &str,
+    ) -> Vec<&PlatformApplicationRecord> {
+        let mut found: Vec<&PlatformApplicationRecord> = self
+            .platform_applications
+            .values()
+            .filter(|application| belongs_to_region(&application.arn, region))
+            .collect();
         found.sort_by(|a, b| {
             a.created_at
                 .cmp(&b.created_at)
@@ -3054,13 +3075,21 @@ pub const INVALID_ATTRIBUTE_NAME_REFUSAL: &str = "Invalid parameter: AttributeNa
 
 /// The sentence SNS refuses a `NextToken` that is not one it minted with.
 ///
-/// `Invalid parameter:` plus the parameter as SNS names it, then `Reason:` and the
-/// reason the service states — the token is opaque, so the reason says only that the
-/// token is not usable and the sentence echoes none of the value back. Shared by
-/// every paginated listing, because the sentence does not depend on which listing the
-/// token was handed to. Recorded evidence: `ListPlatformApplications` with a token it
-/// never issued answers `400 InvalidParameter` with exactly this sentence.
-pub const INVALID_NEXT_TOKEN_REFUSAL: &str =
+/// `Invalid parameter:` plus the member the rejected value was carried in, and
+/// nothing else: the token is opaque, so the sentence states neither the value nor
+/// why it could not be used. Shared by the listings of the notification plane —
+/// topics, subscriptions and the SMS sandbox — because the sentence does not depend
+/// on which listing the token was handed to. Recorded evidence: `ListTopics`,
+/// `ListSubscriptions` and `ListSubscriptionsByTopic` with a token they never issued
+/// each answer `400 InvalidParameter` with exactly this sentence.
+pub const INVALID_NEXT_TOKEN_REFUSAL: &str = "Invalid parameter: NextToken";
+
+/// The same refusal as the MOBILE PUSH listing states it: the member, and then a
+/// `Reason:` clause saying the token cannot be used — still echoing none of the value
+/// back. Recorded evidence: `ListPlatformApplications` with a token it never issued
+/// answers `400 InvalidParameter` with exactly this sentence, where the notification
+/// plane's listings answer the bare [`INVALID_NEXT_TOKEN_REFUSAL`].
+pub const MOBILE_PUSH_INVALID_NEXT_TOKEN_REFUSAL: &str =
     "Invalid parameter: NextToken Reason: token is invalid or expired";
 
 /// The sentence SNS refuses an unacceptable topic name with.
@@ -3157,6 +3186,36 @@ pub fn arn_resource<'a>(arn: &'a str, service: &str) -> Option<&'a str> {
         }
         _ => None,
     }
+}
+
+/// The region an ARN names, or `None` when `arn` is not shaped like an ARN.
+///
+/// The fourth field of `arn:<partition>:<service>:<region>:<account-id>:<resource>` —
+/// see [`arn_resource`] for why the split is bounded at six fields.
+pub fn arn_region(arn: &str) -> Option<&str> {
+    let fields: Vec<&str> = arn.splitn(ARN_ELEMENTS, ':').collect();
+    match fields[..] {
+        ["arn", partition, service, region, account, resource]
+            if !partition.is_empty()
+                && !service.is_empty()
+                && !region.is_empty()
+                && !account.is_empty()
+                && !resource.is_empty() =>
+        {
+            Some(region)
+        }
+        _ => None,
+    }
+}
+
+/// Whether the resource `arn` names belongs to `region`.
+///
+/// SNS is a regional service: a resource lives in the region its own ARN carries, and
+/// an endpoint of one region neither reports nor reaches another region's resources.
+/// This is the one rule each account-wide listing selects the records it reports by,
+/// so the same request answered by two regional endpoints reports two disjoint sets.
+pub fn belongs_to_region(arn: &str, region: &str) -> bool {
+    arn_region(arn) == Some(region)
 }
 
 /// One page of `items` starting at `token`, plus the token of the page after it.

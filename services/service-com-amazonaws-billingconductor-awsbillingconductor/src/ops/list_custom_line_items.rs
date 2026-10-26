@@ -8,16 +8,17 @@
 //!
 //! * the BILLING PERIOD — "a list of all custom line items (FFLIs) for the given billing
 //!   period. If you don't provide a billing period, the current billing period is used" —
-//!   so an item is reported for a period its own half-open `BillingPeriodRange` covers
-//!   (`crate::state::billing_period_range_covers`), and the request's absent
-//!   `BillingPeriod` means `crate::state::current_billing_period`;
+//!   so an item is reported for a period one of its versions' half-open billing-period
+//!   ranges covers (`crate::state::billing_period_range_covers`), with the values THAT
+//!   version holds (`crate::state::CustomLineItemRecord::effective_in`), and the
+//!   request's absent `BillingPeriod` means `crate::state::current_billing_period`;
 //! * the FILTERS — each member of `ListCustomLineItemsFilter` names the values of ONE
 //!   attribute of an item, so each is an independent membership test and an absent one
 //!   filters nothing.
 //!
 //! Every reported member is derived from the stored record: `AssociationSize` from the
-//! item's associations, the charge details from the flat/percentage value it was created
-//! with, and `CurrencyCode` from the partition of its ARN.
+//! item's associations, the charge details from the flat/percentage value the version in
+//! effect carries, and `CurrencyCode` from the partition of its ARN.
 //!
 //! ## Shape of an operation
 //!
@@ -94,7 +95,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::CustomLineItemRecord;
+use crate::state::{CustomLineItemRecord, CustomLineItemVersion};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -132,7 +133,7 @@ impl From<ListCustomLineItemsErrorModeled> for ListCustomLineItemsError {
     }
 }
 
-/// Does `item` pass every filter the request set?
+/// Does the version of `item` this read reports pass every filter the request set?
 ///
 /// Each member of `ListCustomLineItemsFilter` lists the values of ONE attribute of a
 /// custom line item (its name, its billing group, its own ARN, the account it applies
@@ -141,19 +142,26 @@ impl From<ListCustomLineItemsErrorModeled> for ListCustomLineItemsError {
 /// can be (`@length(min: 0)`, every other list is `min: 1`) — names no values to
 /// restrict to and so filters nothing.
 ///
+/// The values compared are the ones of the version in effect in the billing period the
+/// read is scoped to, because they are the values this read reports.
+///
 /// The ARN-valued members are compared NORMALISED, because the `BillingGroupArn` /
 /// `CustomLineItemArn` patterns admit the full ARN and the bare resource id and both
 /// spellings name one resource.
-fn passes_filters(item: &CustomLineItemRecord, filters: &ListCustomLineItemsFilter) -> bool {
+fn passes_filters(
+    item: &CustomLineItemRecord,
+    version: &CustomLineItemVersion,
+    filters: &ListCustomLineItemsFilter,
+) -> bool {
     if let Some(names) = non_empty(filters.names.as_deref()) {
-        if !names.contains(&item.name) {
+        if !names.contains(&version.name) {
             return false;
         }
     }
     if let Some(billing_groups) = non_empty(filters.billing_groups.as_deref()) {
         if !billing_groups
             .iter()
-            .any(|arn| crate::state::normalize_billing_group_arn(arn) == item.billing_group_arn)
+            .any(|arn| crate::state::normalize_billing_group_arn(arn) == version.billing_group_arn)
         {
             return false;
         }
@@ -169,7 +177,7 @@ fn passes_filters(item: &CustomLineItemRecord, filters: &ListCustomLineItemsFilt
     if let Some(account_ids) = non_empty(filters.account_ids.as_deref()) {
         // An item created without an `AccountId` applies to no single account, so no
         // account id names it.
-        match &item.account_id {
+        match &version.account_id {
             Some(account_id) if account_ids.contains(account_id) => {}
             _ => return false,
         }
@@ -183,28 +191,34 @@ fn non_empty(values: Option<&[String]>) -> Option<&[String]> {
     values.filter(|values| !values.is_empty())
 }
 
-/// The modelled view of a stored custom line item.
+/// The modelled view of the version of a stored custom line item that applies in the
+/// billing period this read is scoped to.
 ///
 /// `ChargeDetails`, `AssociationSize` and `CurrencyCode` are DERIVED from the record
-/// rather than stored beside it, so none of them can drift from the item.
-fn element(item: &CustomLineItemRecord) -> CustomLineItemListElement {
+/// rather than stored beside it, so none of them can drift from the item. The members a
+/// write can change come from the version in effect, and the ones no write can change —
+/// the ARN and the creation time — from the record itself, so there is one copy of them.
+fn element(
+    item: &CustomLineItemRecord,
+    version: &CustomLineItemVersion,
+) -> CustomLineItemListElement {
     CustomLineItemListElement {
         arn: Some(item.arn.clone()),
-        name: Some(item.name.clone()),
-        charge_details: Some(item.charge_details()),
+        name: Some(version.name.clone()),
+        charge_details: Some(version.charge_details.clone()),
         currency_code: Some(crate::state::custom_line_item_currency_code(&item.arn).to_string()),
-        description: Some(item.description.clone()),
+        description: Some(version.description.clone()),
         // Nothing in this service's surface sets a product code — neither
         // `CreateCustomLineItem` nor `UpdateCustomLineItem` models a `ProductCode`
         // member — so it is reported absent rather than invented.
         product_code: None,
-        billing_group_arn: Some(item.billing_group_arn.clone()),
+        billing_group_arn: Some(version.billing_group_arn.clone()),
         creation_time: item.creation_time_millis,
-        last_modified_time: item.last_modified_time_millis,
-        association_size: item.association_size(),
-        account_id: item.account_id.clone(),
-        computation_rule: item.computation_rule.clone(),
-        presentation_details: item
+        last_modified_time: version.last_modified_time_millis,
+        association_size: version.association_size,
+        account_id: version.account_id.clone(),
+        computation_rule: version.computation_rule.clone(),
+        presentation_details: version
             .presentation_service
             .clone()
             .map(|service| PresentationObject { service }),
@@ -271,8 +285,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // monotonic id this service mints, so the sequence is creation order and a
         // `NextToken` names the same cut point on the next call.
         for (arn, item) in &state.custom_line_items {
-            if item.covers(&billing_period) && passes_filters(item, &filters) {
-                selected.push((arn.clone(), element(item)));
+            // The version of the item in effect in the billing period asked about is
+            // what this read reports; an item no version of which applies in that period
+            // is not reported at all.
+            let Some(version) = item.effective_in(&billing_period) else {
+                continue;
+            };
+            if passes_filters(item, &version, &filters) {
+                selected.push((arn.clone(), element(item, &version)));
             }
         }
 

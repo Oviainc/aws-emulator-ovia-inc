@@ -132,11 +132,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_SUBSCRIPTIONS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// One page of the subscriptions this account holds IN THE REGION THE REQUEST
+    /// ADDRESSES.
+    ///
+    /// A pure REPORT of persisted state: nothing here writes. The operation takes no
+    /// scoping input but the pagination token, so the regional endpoint the request
+    /// reached IS the scope of the listing.
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let region = state::request_region(ctx.parts());
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(ListSubscriptionsErrorModeled::InternalErrorException(
                 InternalErrorException {
@@ -147,13 +154,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let store = store.lock();
 
-        // Every subscription this account holds, whatever topic it is on and whatever
-        // its endpoint names: a subscription record is what this listing reports, and
+        // Every subscription of this region, whatever topic it is on and whatever its
+        // endpoint names: a subscription record is what this listing reports, and
         // nothing here resolves an endpoint to decide whether to report it. The order
         // is the one every subscription listing reports, so a page boundary falls in
         // the same place however many times the listing is read.
         let all: Vec<Subscription> = store
-            .subscriptions_in_order()
+            .subscriptions_in_region(&region)
             .into_iter()
             .map(state::listed_subscription)
             .collect();

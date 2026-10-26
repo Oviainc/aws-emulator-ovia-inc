@@ -32,6 +32,9 @@ mod fifo_topic_deduplication_attribute;
 #[path = "all/filter_policy_parse_diagnostic.rs"]
 mod filter_policy_parse_diagnostic;
 
+#[path = "all/invalid_next_token_sentence.rs"]
+mod invalid_next_token_sentence;
+
 #[path = "all/list_subscriptions.rs"]
 mod list_subscriptions;
 
@@ -58,6 +61,9 @@ mod put_data_protection_policy;
 
 #[path = "all/refusal_sentences.rs"]
 mod refusal_sentences;
+
+#[path = "all/regional_listings.rs"]
+mod regional_listings;
 
 #[path = "all/resource_tags.rs"]
 mod resource_tags;

@@ -152,9 +152,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // must be a letter. Can't end with a hyphen or contain two consecutive
         // hyphens." — the rule the identifier members share, at this member's bound.
         crate::state::check_identifier("OptionGroupName", &name, 255)
-            .map_err(CreateOptionGroupError::validation)?;
+            .map_err(CreateOptionGroupError::invalid_parameter_value)?;
         crate::state::check_option_group_engine_name(&input.engine_name)
-            .map_err(CreateOptionGroupError::validation)?;
+            .map_err(CreateOptionGroupError::invalid_parameter_value)?;
         // `MajorEngineVersion` names "the major version of the engine that this option
         // group should be associated with", so it is resolved against the SAME
         // engine-version catalogue `DescribeDBEngineVersions` reports: a major version

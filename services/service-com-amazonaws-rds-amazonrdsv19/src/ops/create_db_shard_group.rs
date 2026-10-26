@@ -214,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &identifier,
             MAX_DB_SHARD_GROUP_IDENTIFIER_LEN,
         )
-        .map_err(CreateDBShardGroupError::validation)?;
+        .map_err(CreateDBShardGroupError::invalid_parameter_value)?;
 
         // The capacity the shard group scales between, and how many standby DB data access
         // shards it carries: `ComputeRedundancy` has a published value list, and a capacity

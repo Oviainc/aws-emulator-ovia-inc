@@ -180,7 +180,7 @@ const ERROR_CASES: &[ErrorCase] = &[
             ("OptionGroupDescription", "no"),
         ],
         status: 400,
-        code: "ValidationException",
+        code: "InvalidParameterValue",
     },
     ErrorCase {
         case: "absent required member, refused at the boundary",

@@ -54,3 +54,28 @@ Cause 6: rds-engine-versions-pagination#task#3 — Code expected 'InvalidParamet
 2) Inspect fixture rds-already-exists-conflict-class step task#2: CreateOptionGroup twice with the same OptionGroupName and read the 400 XML body — ErrorResponse has no RequestId child.
 3) Inspect rds-identifier-validation-and-lowercasing task#1/task#10: CreateDBInstance / CreateOptionGroup with an identifier starting with a digit and read ErrorResponse/Error/Code — 'ValidationException' instead of 'InvalidParameterValue'.
 4) Inspect rds-engine-versions-pagination task#3: DescribeDBEngineVersions with MaxRecords=19.
+
+## Resolution
+
+Every refusal this service answers now carries ErrorResponse/RequestId (causes 1-3), and a
+handler refusal of a parameter VALUE carries the Query API common error code
+`InvalidParameterValue` rather than the framework's synthetic `ValidationException` (causes
+4-6), at every shared value validator in the crate: the identifier constraints, the
+option-group `EngineName` value list, the documented `Port` and `BackupRetentionPeriod`
+ranges, the per-operation filter-name sets, `MaxRecords` and the pagination `Marker`. The
+refusals whose wording the service owns are worded as it words them: an identifier member
+it names by its subject, the unissued `Marker`, `CreateDBSnapshot`'s absent source instance
+and `DescribeDBSnapshots`' absent snapshot. The rule is pinned end to end by
+`services/service-com-amazonaws-rds-amazonrdsv19/tests/all/parameter_refusal_codes.rs`.
+
+### Still open, carried over from cause 4
+
+One step of the `CreateDBInstance` 4xx message cluster in
+`rds-identifier-validation-and-lowercasing` still diverges on
+`$.ErrorResponse.Error.Message`. Its Code is correct (`InvalidParameterValue`), and the
+leading-digit wording this report quotes is now produced exactly — the same template closed
+the sibling `CreateOptionGroup` message cluster of that fixture — so the remaining step is a
+CreateDBInstance refusal of a different kind whose wording this report does not state. It
+was left unguessed rather than filled with an invented string: a message is a requirement,
+so it needs the recorded wording for that step, and a follow-up sweep of that fixture should
+file it with the expected text attached.

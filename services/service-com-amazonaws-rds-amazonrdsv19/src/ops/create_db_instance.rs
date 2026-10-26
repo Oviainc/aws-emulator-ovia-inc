@@ -360,15 +360,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx)
             .map_err(CreateDBInstanceError::validation)?;
 
-        // "This parameter is stored as a lowercase string" — so the identifier is
-        // folded before it is validated, stored or echoed, and every later lookup
-        // folds the same way.
+        // The constraints are checked against the value the REQUEST carried, so the
+        // refusal quotes what the caller sent rather than something derived from it;
+        // "this parameter is stored as a lowercase string", so the folded form is what is
+        // stored and echoed, and every later lookup folds the same way.
+        crate::state::check_identifier("DBInstanceIdentifier", &input.db_instance_identifier, 63)
+            .map_err(CreateDBInstanceError::invalid_parameter_value)?;
         let identifier = input.db_instance_identifier.to_ascii_lowercase();
-        crate::state::check_identifier("DBInstanceIdentifier", &identifier, 63)
-            .map_err(CreateDBInstanceError::validation)?;
 
-        // Documented constraints this operation models no error for: refused as a
-        // 400 `ValidationException` naming the member and its bound, never a 501.
+        // Documented constraints this operation models no error for: refused as a 400
+        // naming the member and its bound, never a 501. A value outside what its own
+        // member accepts carries the `InvalidParameterValue` code RDS answers that with;
+        // members that cannot hold together keep the channel this crate already words
+        // them through.
         if input.multi_az == Some(true) && input.availability_zone.is_some() {
             return Err(CreateDBInstanceError::validation(
                 "AvailabilityZone can't be specified when MultiAZ is enabled",
@@ -376,7 +380,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(port) = input.port {
             if !crate::state::PORT_RANGE.contains(&port) {
-                return Err(CreateDBInstanceError::validation(format!(
+                return Err(CreateDBInstanceError::invalid_parameter_value(format!(
                     "invalid value {port} for Port: must be a value from {} to {}",
                     crate::state::PORT_RANGE.start(),
                     crate::state::PORT_RANGE.end()
@@ -385,7 +389,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(period) = input.backup_retention_period {
             if !crate::state::BACKUP_RETENTION_RANGE.contains(&period) {
-                return Err(CreateDBInstanceError::validation(format!(
+                return Err(CreateDBInstanceError::invalid_parameter_value(format!(
                     "invalid value {period} for BackupRetentionPeriod: must be a value from {} to {}",
                     crate::state::BACKUP_RETENTION_RANGE.start(),
                     crate::state::BACKUP_RETENTION_RANGE.end()

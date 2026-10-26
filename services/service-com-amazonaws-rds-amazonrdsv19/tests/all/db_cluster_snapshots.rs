@@ -1202,7 +1202,7 @@ async fn filters_select_over_the_documented_names_and_refuse_any_other() {
             case,
             call(&router, "DescribeDBClusterSnapshots", &params).await,
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         );
     }
 }

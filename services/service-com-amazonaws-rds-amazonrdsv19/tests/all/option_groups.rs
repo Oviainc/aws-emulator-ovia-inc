@@ -547,7 +547,7 @@ async fn the_input_members_are_refused_outside_what_they_document() {
             "DescribeOptionGroups",
             vec![("EngineName", "not-an-engine".to_string())],
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         ),
         (
             "an engine outside the published value list, on a create",
@@ -559,7 +559,7 @@ async fn the_input_members_are_refused_outside_what_they_document() {
                 ("OptionGroupDescription", "unknown-engine".to_string()),
             ],
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         ),
         (
             // "OptionGroupName ... Must be 1 to 255 letters, numbers, or hyphens.
@@ -574,7 +574,7 @@ async fn the_input_members_are_refused_outside_what_they_document() {
                 ("OptionGroupDescription", "too-long".to_string()),
             ],
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         ),
         (
             "a name that does not start with a letter",
@@ -586,7 +586,7 @@ async fn the_input_members_are_refused_outside_what_they_document() {
                 ("OptionGroupDescription", "bad-first-character".to_string()),
             ],
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         ),
         (
             "a name ending with a hyphen",
@@ -598,7 +598,7 @@ async fn the_input_members_are_refused_outside_what_they_document() {
                 ("OptionGroupDescription", "trailing-hyphen".to_string()),
             ],
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         ),
         (
             "a name with two consecutive hyphens",
@@ -610,7 +610,7 @@ async fn the_input_members_are_refused_outside_what_they_document() {
                 ("OptionGroupDescription", "double-hyphen".to_string()),
             ],
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         ),
         (
             // "The option group you are trying to create already exists."

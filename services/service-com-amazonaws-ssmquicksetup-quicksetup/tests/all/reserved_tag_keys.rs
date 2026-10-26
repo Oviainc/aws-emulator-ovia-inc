@@ -16,10 +16,10 @@
 //!
 //! The tables span what the rule generalises over: the casing of the prefix, what
 //! follows it (nothing, a plain tail, a punctuated tail, a multi-byte tail), where the
-//! prefix sits in the key, how many keys one request names, and which operation carries
-//! them. Both readers a stored tag becomes visible through — `GetConfigurationManager`
-//! and `ListTagsForResource` — are checked, since a refused write must leave neither
-//! reporting a reserved key.
+//! prefix sits in the key, how many keys one request names and — when it names several —
+//! the order they travel in, and which operation carries them. Both readers a stored tag
+//! becomes visible through — `GetConfigurationManager` and `ListTagsForResource` — are
+//! checked, since a refused write must leave neither reporting a reserved key.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -612,6 +612,148 @@ async fn create_configuration_manager_refuses_a_reserved_tag_key() {
                  got {after}"
             );
         }
+    }
+}
+
+/// Every reserved key that is MORE than the reserved prefix itself, so a refusal naming
+/// one is distinguishable from the prefix every such message also states. Drawn from
+/// [`reserved_keys`], so the rows stay the ones that table spans.
+fn tailed_reserved_keys(ascii_only: bool) -> Vec<String> {
+    reserved_keys()
+        .into_iter()
+        .map(|(_, key)| key)
+        .filter(|key| !key.eq_ignore_ascii_case(RESERVED_TAG_PREFIX))
+        .filter(|key| !ascii_only || key.is_ascii())
+        .collect()
+}
+
+/// The one reserved key a refusal must name when a request carries several: the lexically
+/// first, so one request has ONE answer however the collection it travelled in is ordered
+/// or iterated.
+fn first_reserved_key(keys: &[String]) -> String {
+    keys.iter()
+        .min()
+        .expect("the reserved-key table is not empty")
+        .clone()
+}
+
+/// A refusal names exactly one of `candidates`, the expected one. The key is matched in
+/// the quoted form the service's refusals echo a value in, so a key that merely starts
+/// another key cannot pass for it.
+fn assert_names_only(case: &str, message: &str, expected: &str, candidates: &[String]) {
+    assert!(
+        message.contains(&format!("'{expected}'")),
+        "case {case:?}: the refusal must name the lexically first reserved key \
+         {expected:?}, got {message:?}"
+    );
+    for other in candidates.iter().filter(|key| key.as_str() != expected) {
+        assert!(
+            !message.contains(&format!("'{other}'")),
+            "case {case:?}: the refusal must name only {expected:?}, but it also named \
+             {other:?}: {message:?}"
+        );
+    }
+}
+
+/// How many times a request whose answer must not vary is repeated. The handlers read
+/// `Tags` from a `HashMap`, whose iteration order differs from one map to the next, so
+/// repeating the identical request is what varies the order the keys are seen in.
+const REPEATS: usize = 8;
+
+/// A create naming SEVERAL reserved keys answers the same way every time: the same 400,
+/// naming the lexically first reserved key, and still creating nothing.
+#[tokio::test]
+async fn create_configuration_manager_names_one_reserved_key_however_tags_are_iterated() {
+    let router = emulator();
+    let keys = tailed_reserved_keys(true);
+    let expected = first_reserved_key(&keys);
+    let supplied: BTreeMap<String, String> = keys
+        .iter()
+        .map(|key| (key.clone(), "mine".to_string()))
+        .collect();
+    let before = manager_count(&router, "several reserved keys in one create").await;
+
+    for attempt in 0..REPEATS {
+        let case = format!("several reserved keys in one create, attempt {attempt}");
+        let (status, answer) = create(&router, "reserved-tag-order", &supplied).await;
+        assert_reserved_refusal(&case, "Tags", &expected, status, &answer);
+        assert_names_only(&case, &error_message(&answer), &expected, &keys);
+
+        let after = manager_count(&router, &case).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: a refused create must store no manager, expected {before}, \
+             got {after}"
+        );
+    }
+}
+
+/// The same for the assignment path: one answer however the supplied map is iterated, and
+/// the stored set untouched.
+#[tokio::test]
+async fn tag_resource_names_one_reserved_key_however_tags_are_iterated() {
+    let router = emulator();
+    let stored = seeded();
+    let keys = tailed_reserved_keys(true);
+    let expected = first_reserved_key(&keys);
+    let assign: BTreeMap<String, String> = keys
+        .iter()
+        .map(|key| (key.clone(), "mine".to_string()))
+        .collect();
+    let arn = create_ok(&router, "several reserved keys in one assignment", &stored).await;
+
+    for attempt in 0..REPEATS {
+        let case = format!("several reserved keys in one assignment, attempt {attempt}");
+        let (status, answer) = tag(&router, &arn, &assign).await;
+        assert_reserved_refusal(&case, "Tags", &expected, status, &answer);
+        assert_names_only(&case, &error_message(&answer), &expected, &keys);
+
+        let left = stored_tags(&router, &case, &arn).await;
+        assert_eq!(
+            left, stored,
+            "case {case:?}: a refused assignment must store nothing, expected {stored:?}, \
+             got {left:?}"
+        );
+    }
+}
+
+/// `UntagResource$TagKeys` is an ORDERED list, so the order the caller writes it in is a
+/// real input variation: every rotation of one key list, and that list reversed, earns the
+/// same refusal naming the same key, and removes nothing.
+#[tokio::test]
+async fn untag_resource_names_one_reserved_key_however_tag_keys_are_ordered() {
+    let router = emulator();
+    let stored = seeded();
+    // A query-string list carries a multi-byte key too, which a body map's key `@pattern`
+    // would refuse before the rule under test, so this table keeps that row.
+    let keys = tailed_reserved_keys(false);
+    let expected = first_reserved_key(&keys);
+    let arn = create_ok(&router, "several reserved keys in one removal", &stored).await;
+
+    let mut orderings: Vec<Vec<String>> = (0..keys.len())
+        .map(|shift| {
+            let mut rotated = keys.clone();
+            rotated.rotate_left(shift);
+            rotated
+        })
+        .collect();
+    let mut reversed = keys.clone();
+    reversed.reverse();
+    orderings.push(reversed);
+
+    for ordering in orderings {
+        let case = format!("several reserved keys in one removal, ordered {ordering:?}");
+        let named: Vec<&str> = ordering.iter().map(String::as_str).collect();
+        let (status, answer) = untag(&router, &arn, &named).await;
+        assert_reserved_refusal(&case, "TagKeys", &expected, status, &answer);
+        assert_names_only(&case, &error_message(&answer), &expected, &keys);
+
+        let left = stored_tags(&router, &case, &arn).await;
+        assert_eq!(
+            left, stored,
+            "case {case:?}: a refused removal must remove nothing, expected {stored:?}, \
+             got {left:?}"
+        );
     }
 }
 

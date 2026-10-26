@@ -238,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.target_db_cluster_snapshot_identifier,
             63,
         )
-        .map_err(CopyDBClusterSnapshotError::validation)?;
+        .map_err(CopyDBClusterSnapshotError::invalid_parameter_value)?;
         // `TagList` carries no `@length` and the tags are STORED on the copy, so the list
         // the caller sized is bounded before any of it is kept.
         crate::state::check_tag_list(input.tags.as_ref())
