@@ -3,17 +3,21 @@
 //! @op Invoke
 //!
 //! Resolves the function and version to invoke out of [`crate::state`], refuses a
-//! request the service itself would refuse, and answers `DryRun` — the one invocation
-//! type that, as the model documents, runs no function code at all ("Validate
-//! parameter values and verify that the user or role has permission to invoke the
-//! function").
+//! request the service itself would refuse, and answers the two invocation types whose
+//! answer does not depend on the run: `DryRun`, which as the model documents runs no
+//! function code at all ("Validate parameter values and verify that the user or role
+//! has permission to invoke the function"), and `Event`, whose answer is the QUEUEING
+//! receipt — "Event – Invoke the function asynchronously […] The API response only
+//! includes a status code" — so the event is queued against the resolved version
+//! exactly as `InvokeAsync` queues one, and the accepted status is answered.
 //!
 //! Running the deployment package is NOT implemented: this emulator has no in-process
-//! runtime for a Lambda zip archive or container image, so `RequestResponse` and
-//! `Event` answer HTTP 501 rather than a payload no function produced. Everything
-//! around the run — resolving the name in each of its documented forms, the version or
-//! alias, the function's lifecycle state, the payload limits and the JSON check — is
-//! real, and happens before that 501.
+//! runtime for a Lambda zip archive or container image, so `RequestResponse` answers
+//! HTTP 501 rather than a payload no function produced, and a queued asynchronous
+//! event settles into the outcome that records it never ran. Everything around the run
+//! — resolving the name in each of its documented forms, the version or alias, the
+//! function's lifecycle state, the payload limits and the JSON check — is real, and
+//! happens before that.
 //!
 //! ## Shape of an operation
 //!
@@ -376,13 +380,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .to_string();
 
         let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let (record, version) = crate::state::resolve_function(
             &mut store,
             &input.function_name,
             input.qualifier.as_deref(),
             &region,
-            ::std::time::SystemTime::now(),
+            now,
         )
         .map_err(|failure| match failure {
             crate::state::ResolveFailure::Malformed(message) => {
@@ -483,10 +488,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        // RequestResponse and Event both mean "run the deployment package". This
-        // emulator has no in-process runtime that can, and a response body, a
-        // FunctionError or a log tail invented for a run that never happened would be
-        // indistinguishable from a real one — so the run is refused, naming the
+        if invocation_type == INVOCATION_TYPE_EVENT {
+            // "Event – Invoke the function asynchronously. […] The API response only
+            // includes a status code": an asynchronous invocation's answer says nothing
+            // about the run, because the run has not happened when it is given. What the
+            // call promises is the QUEUEING — "A success response (202 Accepted)
+            // indicates that the request is queued for invocation" — so that is what is
+            // performed and persisted here, one queue entry against the version this
+            // call resolved, through the same state as `InvokeAsync`'s. Nothing about a
+            // run is reported, because nothing has run: the entry records that outcome
+            // itself once its delivery attempt comes due
+            // (`crate::state::FunctionRecord::materialize`).
+            //
+            // `ExecutedVersion` is withheld: it is "the version of the function that
+            // executed", and no version has executed when the event is merely queued.
+            // The payload is the EMPTY one rather than no payload at all, for the reason
+            // the dry run's is (`Payload` is this operation's `@httpPayload`, so it IS
+            // the body the accepted status carries).
+            record.queue_async_invocation(&version, payload, now);
+            return Ok(InvokeOutput {
+                status_code: ACCEPTED_STATUS,
+                payload: Some(Vec::new()),
+                ..InvokeOutput::default()
+            });
+        }
+
+        // RequestResponse means "run the deployment package and answer with what it
+        // returned". This emulator has no in-process runtime that can, and a response
+        // body, a FunctionError or a log tail invented for a run that never happened
+        // would be indistinguishable from a real one — so the run is refused, naming the
         // function and version it resolved so the control-plane half is still useful.
         Err(crate::scaffolded::Scaffolded::NotImplemented(
             crate::scaffolded::NotImplemented {
@@ -514,6 +544,11 @@ const INVOCATION_TYPE_DRY_RUN: &str = "DryRun";
 /// `StatusCode` documentation states: "For the DryRun invocation type, the status code
 /// is 204."
 const DRY_RUN_STATUS: i32 = 204;
+
+/// The `StatusCode` an accepted `Event` invocation answers with, which the model's own
+/// `StatusCode` documentation states: "For the Event invocation type, this status code
+/// is 202."
+const ACCEPTED_STATUS: i32 = 202;
 
 /// "For synchronous invocations, the maximum payload size is 6 MB" (the model's own
 /// `Invoke` documentation).
