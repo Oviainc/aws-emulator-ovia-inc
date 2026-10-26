@@ -51,6 +51,8 @@ mod resource_tagging;
 mod restore_table;
 #[path = "all/service_managed_catalog.rs"]
 mod service_managed_catalog;
+#[path = "all/single_region_replication.rs"]
+mod single_region_replication;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/static_columns_require_clustering_keys.rs"]
