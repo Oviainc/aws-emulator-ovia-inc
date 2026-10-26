@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPortals
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPortals`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPortals::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: enumerates every IoT SiteWise Monitor portal the store holds, each
+//! exactly once, in one stable order, cut into pages of at most `maxResults` entries,
+//! reporting for each the values `DescribePortal` reports for it. A read, so it writes
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +144,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPortals` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPortalsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPortals"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPortalsError::Modeled(ListPortalsErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let _ = ctx;
+
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+
+        // Every portal the store holds: this operation is account-and-region wide and
+        // models no filter, so nothing is excluded.
+        let mut portals: Vec<&crate::state::PortalRecord> = store.portals.values().collect();
+        // A stable total order is what makes `nextToken` resumable: oldest first, ties
+        // broken by id so two portals created in the same instant still order
+        // deterministically.
+        portals.sort_by(|left, right| {
+            left.creation_date
+                .cmp(&right.creation_date)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        // `nextToken` is this enumeration's resume point: the id of the first portal of
+        // the next page, hex-encoded so the token matches the modelled
+        // `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this enumeration is
+        // refused rather than answered with an empty page, which would report absence
+        // as success.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                portals
+                    .iter()
+                    .position(|portal| portal.id == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..250, which the runtime validates
+        // BEFORE this handler runs, so a value that arrives here is already in range
+        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic below
+        // total. The default is the one this operation's `maxResults` documents.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+        let end = start.saturating_add(max_results).min(portals.len());
+
+        // "The token for the next set of results, or null if there are no additional
+        // results": issued only when a portal follows this page.
+        let next_token = portals
+            .get(end)
+            .map(|portal| ::hex::encode(portal.id.as_bytes()));
+        let portal_summaries = portals[start..end]
+            .iter()
+            .map(|portal| summary(portal, now))
+            .collect();
+
+        Ok(ListPortalsOutput {
+            portal_summaries: Some(portal_summaries),
+            next_token,
+        })
     }
+}
+
+/// The page size this operation's `maxResults` documents when the caller sends none.
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// One stored portal as the summary this operation reports, read straight off the
+/// record `CreatePortal` persisted and `DescribePortal` reads back, so a listed portal
+/// and a described one never disagree.
+fn summary(record: &crate::state::PortalRecord, now: ::std::time::SystemTime) -> PortalSummary {
+    PortalSummary {
+        id: record.id.clone(),
+        name: record.name.clone(),
+        description: record.description.clone(),
+        start_url: record.start_url.clone(),
+        creation_date: Some(crate::state::to_date_time(record.creation_date)),
+        last_update_date: Some(crate::state::to_date_time(record.last_update_date)),
+        role_arn: record.role_arn.clone(),
+        // Derived from the stored due instant, so this read reports the state the clock
+        // owes the portal without writing anything.
+        status: record.status(now),
+        portal_type: record.portal_type.clone(),
+    }
+}
+
+/// Decode a `nextToken` back into the portal id it resumes from.
+fn decode_token(token: &str) -> Result<String, ListPortalsError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+fn invalid_token() -> ListPortalsError {
+    ListPortalsError::Modeled(ListPortalsErrorModeled::InvalidRequestException(
+        InvalidRequestException {
+            message: "The nextToken is not a token this operation issued.".to_string(),
+        },
+    ))
 }
