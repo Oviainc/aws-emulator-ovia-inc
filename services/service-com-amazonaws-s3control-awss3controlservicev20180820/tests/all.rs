@@ -25,6 +25,8 @@ mod access_point_lifecycle;
 mod access_point_public_access_block_default;
 #[path = "all/batch_job_lifecycle.rs"]
 mod batch_job_lifecycle;
+#[path = "all/batch_job_list.rs"]
+mod batch_job_list;
 #[path = "all/batch_job_priority.rs"]
 mod batch_job_priority;
 #[path = "all/batch_job_tagging.rs"]

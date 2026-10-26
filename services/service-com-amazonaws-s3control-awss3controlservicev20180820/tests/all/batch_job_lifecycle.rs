@@ -64,12 +64,12 @@ const ACTION_DELETE_OBJECT_TAGGING: &str = "<S3DeleteObjectTagging></S3DeleteObj
 pub(crate) const ACTION_LAMBDA_INVOKE: &str =
     "<LambdaInvoke><FunctionArn>arn:aws:lambda:us-west-2:123456789012:function:transform\
      </FunctionArn><InvocationSchemaVersion>2.0</InvocationSchemaVersion></LambdaInvoke>";
-const ACTION_INITIATE_RESTORE: &str =
+pub(crate) const ACTION_INITIATE_RESTORE: &str =
     "<S3InitiateRestoreObject><ExpirationInDays>7</ExpirationInDays>\
      <GlacierJobTier>BULK</GlacierJobTier></S3InitiateRestoreObject>";
 const ACTION_LEGAL_HOLD: &str =
     "<S3PutObjectLegalHold><LegalHold><Status>ON</Status></LegalHold></S3PutObjectLegalHold>";
-const ACTION_COMPUTE_CHECKSUM: &str =
+pub(crate) const ACTION_COMPUTE_CHECKSUM: &str =
     "<S3ComputeObjectChecksum><ChecksumAlgorithm>SHA256</ChecksumAlgorithm>\
      </S3ComputeObjectChecksum>";
 const ACTION_PUT_OBJECT_ACL: &str =
@@ -158,6 +158,28 @@ impl JobCase {
     /// tagged.
     pub(crate) fn with_tags(mut self, tags: &'static [(&'static str, &'static str)]) -> Self {
         self.tags = tags;
+        self
+    }
+
+    /// The same create carrying `description`, for a suite that asserts what a
+    /// job listing reports for a job created with one.
+    pub(crate) fn with_description(mut self, description: &'static str) -> Self {
+        self.description = Some(description);
+        self
+    }
+
+    /// The same create requiring confirmation before the job runs, which is
+    /// what leaves the created job `Suspended` rather than `New` — a suite that
+    /// narrows a listing by status needs jobs in more than one status.
+    pub(crate) fn awaiting_confirmation(mut self) -> Self {
+        self.confirmation_required = Some(true);
+        self
+    }
+
+    /// The same create asking for `priority`, rendered verbatim, for a suite
+    /// that needs jobs carrying different priorities.
+    pub(crate) fn with_priority(mut self, priority: &'static str) -> Self {
+        self.priority = priority;
         self
     }
 

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one page of the jobs this service's state holds for the account the
+//! request names: every job that has not ended, plus every job that ended
+//! within the listing window, as the `JobListDescriptor` summary of the record
+//! `CreateJob` stored, narrowed to the statuses the request asks for.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +84,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::JobRecord;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -120,6 +118,98 @@ impl From<ListJobsErrorModeled> for ListJobsError {
     fn from(modeled: ListJobsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// `MaxResults`'s modelled maximum (`ListJobsRequest$MaxResults`, range
+/// 0..1000), which is also the page size a caller who names none gets.
+const MAX_PAGE_SIZE: usize = 1000;
+
+/// Where one job sits in the order this listing scans: newest first by creation
+/// instant, ties broken by job id, so the order is total and a page token names
+/// a position in it that does not move between calls.
+type ScanPosition = (::std::cmp::Reverse<(i64, u32)>, String);
+
+/// The position `job` occupies in that order.
+fn position_of(job: &JobRecord) -> ScanPosition {
+    scan_position(
+        job.creation_time.secs(),
+        job.creation_time.subsec_nanos(),
+        &job.job_id,
+    )
+}
+
+/// The position a creation instant and a job id name. Shared with the page
+/// token, so a token and a record are compared in the same order the scan uses.
+fn scan_position(secs: i64, nanos: u32, job_id: &str) -> ScanPosition {
+    (::std::cmp::Reverse((secs, nanos)), job_id.to_string())
+}
+
+/// How many jobs one page carries.
+///
+/// `MaxResults` is "the maximum number of jobs that Amazon S3 will include in
+/// the List Jobs response", modelled `@range(min: 0, max: 1000)` with a default
+/// of 0: a request that names none, or names that default, asks for no bound of
+/// its own, so the page is the whole result set up to the member's own maximum.
+fn page_size(max_results: Option<i32>) -> Result<usize, ListJobsError> {
+    match max_results {
+        None | Some(0) => Ok(MAX_PAGE_SIZE),
+        // A page size outside the modelled range cannot arrive here — the
+        // boundary validator refuses it before this handler runs — but if one
+        // ever does it is refused on both sides rather than silently widened or
+        // clamped to the maximum.
+        Some(requested) => match usize::try_from(requested) {
+            Ok(wanted) if wanted <= MAX_PAGE_SIZE => Ok(wanted),
+            _ => Err(invalid_request(format!(
+                "MaxResults must be between 0 and {MAX_PAGE_SIZE}, but the request asks \
+                 for {requested}."
+            ))),
+        },
+    }
+}
+
+/// The statuses the request narrows the listing to: "the List Jobs request
+/// returns jobs that match the statuses listed in this element"
+/// (`ListJobsRequest$JobStatuses`), so a request listing none narrows nothing.
+///
+/// Every entry has to be a `JobStatus` the model declares; one that is not
+/// matches no job's status, so it is refused rather than quietly narrowing the
+/// listing to nothing.
+fn requested_statuses(asked: Option<&Vec<String>>) -> Result<Vec<String>, ListJobsError> {
+    let asked = asked.map(Vec::as_slice).unwrap_or_default();
+    if let Some(unknown) = asked
+        .iter()
+        .find(|status| !JOB_STATUS_VALUES.contains(&status.as_str()))
+    {
+        return Err(invalid_request(format!(
+            "JobStatuses names {unknown}, which is not a job status. The job statuses \
+             are: {}.",
+            JOB_STATUS_VALUES.join(", ")
+        )));
+    }
+    Ok(asked.to_vec())
+}
+
+/// Refuse the request with the modelled `InvalidRequestException` (HTTP 400):
+/// it is well-formed against the model but asks for a listing this service
+/// cannot produce.
+fn invalid_request(message: impl Into<String>) -> ListJobsError {
+    ListJobsErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// Refuse a `NextToken` this service did not issue with the modelled
+/// `InvalidNextTokenException` (HTTP 400): it names no position in the scan, so
+/// no page can be resumed from it.
+fn invalid_next_token() -> ListJobsError {
+    ListJobsErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+        message: Some(
+            "The specified next token is not a continuation token this service issued."
+                .to_string(),
+        ),
+    })
+    .into()
 }
 
 /// The `ListJobs` operation.
@@ -156,20 +246,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListJobs"))
+        let page_size = page_size(input.max_results)?;
+        let statuses = requested_statuses(input.job_statuses.as_ref())?;
+
+        // The token is the opaque form of the position the previous page
+        // stopped at; the scan resumes strictly after it.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_job_page_token(token) {
+                Some((secs, nanos, job_id)) => Some(scan_position(secs, nanos, &job_id)),
+                None => return Err(invalid_next_token()),
+            },
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        // Materialise what the clock already owed before reporting: a job's
+        // preparation falls due at an instant, whether or not anybody asks.
+        store.materialize_due_jobs(now);
+
+        // What this account's listing covers: its own jobs, each still inside
+        // the listing window, narrowed to the statuses the request asked for.
+        let mut listed: Vec<&JobRecord> = store
+            .jobs
+            .values()
+            .filter(|job| job.account_id == input.account_id)
+            .filter(|job| job.within_listing_window(now))
+            .filter(|job| statuses.is_empty() || statuses.contains(&job.status))
+            .collect();
+        listed.sort_by_key(|job| position_of(job));
+
+        let start = match &resume_after {
+            None => 0,
+            Some(resume_after) => listed
+                .iter()
+                .position(|job| &position_of(job) > resume_after)
+                .unwrap_or(listed.len()),
+        };
+        let page: Vec<&JobRecord> = listed.iter().copied().skip(start).take(page_size).collect();
+
+        // A token is returned only when the scan stopped short of the end,
+        // which is exactly when another job follows this page.
+        let next_token = match page.last() {
+            Some(last) if start + page.len() < listed.len() => Some(
+                crate::state::encode_job_page_token(last.creation_time, &last.job_id),
+            ),
+            _ => None,
+        };
+
+        Ok(ListJobsOutput {
+            jobs: Some(page.iter().map(|job| job.list_descriptor()).collect()),
+            next_token,
+        })
     }
 }

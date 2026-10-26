@@ -12,13 +12,13 @@
 use crate::ops::types::{
     AccessGrantsLocationConfiguration, AccessPoint, AsyncOperation, AsyncRequestParameters,
     AsyncResponseDetails, CreateJobInput, CreateMultiRegionAccessPointInput2,
-    DeleteMultiRegionAccessPointInput2, Grantee, JobDescriptor, JobManifest, JobManifestGenerator,
-    JobOperation, JobReport, ListStorageLensConfigurationEntry,
+    DeleteMultiRegionAccessPointInput2, Grantee, JobDescriptor, JobListDescriptor, JobManifest,
+    JobManifestGenerator, JobOperation, JobReport, ListStorageLensConfigurationEntry,
     MultiRegionAccessPointRegionalResponse, MultiRegionAccessPointReport,
     MultiRegionAccessPointsAsyncResponse, PublicAccessBlockConfiguration, RegionReport, S3Tag,
     StorageLensConfiguration, StorageLensGroup, StorageLensTag, Tag, VpcConfiguration,
     ASYNC_OPERATION_NAME_VALUES, JOB_STATUS_VALUES, MULTI_REGION_ACCESS_POINT_STATUS_VALUES,
-    NETWORK_ORIGIN_VALUES,
+    NETWORK_ORIGIN_VALUES, OPERATION_NAME_VALUES,
 };
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -407,6 +407,15 @@ pub const SUSPENDED_AWAITING_CONFIRMATION: &str = "AwaitingConfirmation";
 /// still sees `New`.
 pub const JOB_PREPARATION: Duration = Duration::from_millis(500);
 
+/// How long after a job has ended it is still reported by a job listing.
+///
+/// `ListJobs` "lists current S3 Batch Operations jobs as well as the jobs that
+/// have ended within the last 90 days for the Amazon Web Services account
+/// making the request" — so a job that ended longer ago than this is past what
+/// a listing reports, while a job that has not ended is reported however old it
+/// is.
+pub const JOB_LISTING_WINDOW: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+
 /// How many jobs the store holds before `CreateJob` refuses another.
 ///
 /// S3 Batch Operations publishes an adjustable quota on jobs, and this emulator
@@ -512,6 +521,45 @@ impl JobRecord {
         }
     }
 
+    /// The record as the `JobListDescriptor` summary shape a job listing
+    /// returns.
+    ///
+    /// A SUMMARY of the same record [`Self::descriptor`] reports in full, so the
+    /// two cannot disagree about one job: every member `JobListDescriptor`
+    /// declares is the stored one, and `ProgressSummary` is absent for the
+    /// reason it is absent there — this emulator runs no batch tasks, so there is
+    /// no task count to report and a synthesised one would be a claim about work
+    /// nothing did.
+    pub fn list_descriptor(&self) -> JobListDescriptor {
+        JobListDescriptor {
+            job_id: Some(self.job_id.clone()),
+            description: self.description.clone(),
+            operation: job_operation_name(&self.operation),
+            priority: self.priority,
+            status: Some(self.status.clone()),
+            creation_time: Some(self.creation_time),
+            termination_date: self.termination_date,
+            progress_summary: None,
+        }
+    }
+
+    /// Whether a job listing reports this job at `now`: a job that has not ended
+    /// is always reported, and one that has ended is reported until
+    /// [`JOB_LISTING_WINDOW`] has passed since it ended.
+    pub fn within_listing_window(&self, now: SystemTime) -> bool {
+        let Some(terminated) = self.termination_date else {
+            return true;
+        };
+        let Ok(now_secs) = i64::try_from(
+            now.duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs()),
+        ) else {
+            return true;
+        };
+        let window = i64::try_from(JOB_LISTING_WINDOW.as_secs()).unwrap_or(i64::MAX);
+        now_secs.saturating_sub(terminated.secs()) <= window
+    }
+
     /// Apply the transition the clock already owed this job at `now`: a job
     /// leaves [`JOB_STATUS_NEW`] for [`JOB_STATUS_READY`] once its preparation
     /// span has passed.
@@ -535,6 +583,74 @@ impl JobRecord {
 /// nor a typo in a constant above can change what is returned.
 pub fn job_status(wanted: &'static str) -> String {
     modelled_value(JOB_STATUS_VALUES, wanted)
+}
+
+/// The actions `operation` names, by the member names `JobOperation` declares.
+///
+/// `JobOperation` is "the action that you want this job to perform on every
+/// object listed in the manifest" — ONE action, carried in one of the
+/// structure's otherwise-optional members, so this is what lets `CreateJob`
+/// refuse a request naming none or several, and what lets a job listing report
+/// the one action a stored job runs.
+///
+/// Destructured rather than field-accessed, so an action the model adds to
+/// `JobOperation` is a compile error here rather than an action silently
+/// accepted beside another.
+pub fn job_operation_names(operation: &JobOperation) -> Vec<&'static str> {
+    let JobOperation {
+        lambda_invoke,
+        s3_put_object_copy,
+        s3_put_object_acl,
+        s3_put_object_tagging,
+        s3_delete_object_tagging,
+        s3_initiate_restore_object,
+        s3_put_object_legal_hold,
+        s3_put_object_retention,
+        s3_replicate_object,
+        s3_compute_object_checksum,
+        s3_update_object_encryption,
+    } = operation;
+    [
+        ("LambdaInvoke", lambda_invoke.is_some()),
+        ("S3PutObjectCopy", s3_put_object_copy.is_some()),
+        ("S3PutObjectAcl", s3_put_object_acl.is_some()),
+        ("S3PutObjectTagging", s3_put_object_tagging.is_some()),
+        ("S3DeleteObjectTagging", s3_delete_object_tagging.is_some()),
+        (
+            "S3InitiateRestoreObject",
+            s3_initiate_restore_object.is_some(),
+        ),
+        ("S3PutObjectLegalHold", s3_put_object_legal_hold.is_some()),
+        ("S3PutObjectRetention", s3_put_object_retention.is_some()),
+        ("S3ReplicateObject", s3_replicate_object.is_some()),
+        (
+            "S3ComputeObjectChecksum",
+            s3_compute_object_checksum.is_some(),
+        ),
+        (
+            "S3UpdateObjectEncryption",
+            s3_update_object_encryption.is_some(),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, named)| *named)
+    .map(|(name, _)| name)
+    .collect()
+}
+
+/// The `OperationName` of the one action a job runs, spelled as the model's own
+/// enum carries it — the member name of the single [`job_operation_names`] entry
+/// the job's `JobOperation` names.
+///
+/// `None` when the structure names no single action, which `CreateJob` refuses
+/// to record: a listing then reports no operation rather than one of several.
+pub fn job_operation_name(operation: &JobOperation) -> Option<String> {
+    let mut named = job_operation_names(operation).into_iter();
+    let only = named.next()?;
+    named
+        .next()
+        .is_none()
+        .then(|| modelled_value(OPERATION_NAME_VALUES, only))
 }
 
 // ---------------------------------------------------------------------------
@@ -1701,6 +1817,34 @@ pub fn encode_page_token(last_name: &str) -> String {
 pub fn decode_page_token(token: &str) -> Option<String> {
     let bytes = hex::decode(token).ok()?;
     String::from_utf8(bytes).ok()
+}
+
+/// Where a job listing stopped: the position of the last job the previous page
+/// returned, in the order a listing scans ([`JobRecord::creation_time`] newest
+/// first, ties broken by job id), so the next page resumes strictly after it.
+///
+/// A position and not a cursor: the same token names the same place however many
+/// times it is presented. Carried through [`encode_page_token`], so a job
+/// listing's tokens are opaque in exactly the same way the other listings' are.
+pub fn encode_job_page_token(creation_time: ::aws_smithy_types::DateTime, job_id: &str) -> String {
+    encode_page_token(&format!(
+        "{}:{}:{job_id}",
+        creation_time.secs(),
+        creation_time.subsec_nanos()
+    ))
+}
+
+/// The position a token produced by [`encode_job_page_token`] names — the
+/// creation instant (seconds and nanoseconds since the epoch) and the job id —
+/// or `None` when it was not produced by it.
+pub fn decode_job_page_token(token: &str) -> Option<(i64, u32, String)> {
+    let decoded = decode_page_token(token)?;
+    let (secs, rest) = decoded.split_once(':')?;
+    let (nanos, job_id) = rest.split_once(':')?;
+    if job_id.is_empty() {
+        return None;
+    }
+    Some((secs.parse().ok()?, nanos.parse().ok()?, job_id.to_string()))
 }
 
 // ---------------------------------------------------------------------------

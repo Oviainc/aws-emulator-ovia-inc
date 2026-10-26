@@ -199,8 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `JobOperation` is "the action that you want this job to perform on
         // every object listed in the manifest" — ONE action, carried in one of
         // the structure's otherwise-optional members, so a request naming none
-        // or several names no one action.
-        let actions = named_actions(&input.operation);
+        // or several names no one action. The members are read through the one
+        // derivation a job listing reads them through, so the action a create
+        // accepts and the action a listing reports cannot disagree.
+        let actions = crate::state::job_operation_names(&input.operation);
         if actions.len() != 1 {
             return Err(bad_request(format!(
                 "Operation names exactly one action; the request names {}{}.",
@@ -344,49 +346,3 @@ fn bad_request(message: impl Into<String>) -> CreateJobError {
     .into()
 }
 
-/// The actions `operation` names, by the member names `JobOperation` declares.
-///
-/// Destructured rather than field-accessed, so an action the model adds to
-/// `JobOperation` is a compile error here rather than an action silently
-/// accepted beside another.
-fn named_actions(operation: &JobOperation) -> Vec<&'static str> {
-    let JobOperation {
-        lambda_invoke,
-        s3_put_object_copy,
-        s3_put_object_acl,
-        s3_put_object_tagging,
-        s3_delete_object_tagging,
-        s3_initiate_restore_object,
-        s3_put_object_legal_hold,
-        s3_put_object_retention,
-        s3_replicate_object,
-        s3_compute_object_checksum,
-        s3_update_object_encryption,
-    } = operation;
-    [
-        ("LambdaInvoke", lambda_invoke.is_some()),
-        ("S3PutObjectCopy", s3_put_object_copy.is_some()),
-        ("S3PutObjectAcl", s3_put_object_acl.is_some()),
-        ("S3PutObjectTagging", s3_put_object_tagging.is_some()),
-        ("S3DeleteObjectTagging", s3_delete_object_tagging.is_some()),
-        (
-            "S3InitiateRestoreObject",
-            s3_initiate_restore_object.is_some(),
-        ),
-        ("S3PutObjectLegalHold", s3_put_object_legal_hold.is_some()),
-        ("S3PutObjectRetention", s3_put_object_retention.is_some()),
-        ("S3ReplicateObject", s3_replicate_object.is_some()),
-        (
-            "S3ComputeObjectChecksum",
-            s3_compute_object_checksum.is_some(),
-        ),
-        (
-            "S3UpdateObjectEncryption",
-            s3_update_object_encryption.is_some(),
-        ),
-    ]
-    .into_iter()
-    .filter(|(_, named)| *named)
-    .map(|(name, _)| name)
-    .collect()
-}
