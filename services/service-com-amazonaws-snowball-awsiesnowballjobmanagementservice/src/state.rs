@@ -82,6 +82,16 @@ const EKS_ANYWHERE_SUPPORT_MATRIX: &[(&str, &[&str])] = &[
 /// the ceiling is the only thing that bounds the store.
 pub const MAX_STORED_ADDRESSES: usize = 1_000;
 
+/// The `AddressType` of an address the customer collects a device from, rather than one a
+/// device is shipped to.
+///
+/// `Address$Type` "differentiates between delivery address and pickup address in the
+/// customer account" (`smithy_query(query="shape", shape="Address")`) and is one of
+/// `shared_types::ADDRESS_TYPE_VALUES`; this is the value that names a pickup address, so
+/// it is the one `ListPickupLocations` reports locations for
+/// ([`StoredAddress::is_pickup_location`]).
+pub const ADDRESS_TYPE_CUSTOMER_PICKUP: &str = "CUST_PICKUP";
+
 /// The most jobs this store holds.
 ///
 /// Bounds the same way for `CreateJob`, which persists every supplied input against the
@@ -663,6 +673,17 @@ pub struct StoredAddress {
 }
 
 impl StoredAddress {
+    /// Whether this address is a location a customer picks a device up from, i.e. carries
+    /// [`ADDRESS_TYPE_CUSTOMER_PICKUP`] as its `AddressType`.
+    ///
+    /// Asked of the stored type rather than of anything else the record carries: the type
+    /// is the member that "differentiates between delivery address and pickup address in
+    /// the customer account", so an address typed any other way — or one carrying no type
+    /// at all — is a delivery address and not a pickup location.
+    pub fn is_pickup_location(&self) -> bool {
+        self.address_type.as_deref() == Some(ADDRESS_TYPE_CUSTOMER_PICKUP)
+    }
+
     /// This record as the modelled `Address`, including the id the service minted.
     pub fn to_modeled(&self) -> Address {
         Address {
@@ -1656,6 +1677,23 @@ pub fn page_of_clusters(
     )
 }
 
+/// One page of `addresses`, as [`page_of`] pages any listing: the `Address` list an
+/// address-listing operation reports, with the cursor its next page resumes at.
+#[allow(clippy::type_complexity)]
+pub fn page_of_addresses(
+    addresses: &[&StoredAddress],
+    next_token: Option<&str>,
+    page_size: usize,
+) -> Option<(Vec<Address>, Option<String>)> {
+    page_of(
+        addresses,
+        next_token,
+        page_size,
+        |address| address.address_id.as_str(),
+        StoredAddress::to_modeled,
+    )
+}
+
 /// One page of `images`, as [`page_of`] pages any listing: the `CompatibleImage` list
 /// `ListCompatibleImages` reports, with the cursor its next page resumes at.
 #[allow(clippy::type_complexity)]
@@ -1687,6 +1725,9 @@ pub const INVALID_NEXT_TOKEN_MESSAGE: &str =
 pub struct ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     /// Every address `CreateAddress` stored, keyed by the `AddressId` it minted.
     pub addresses: HashMap<String, StoredAddress>,
+    /// The ids in `addresses` in creation order, so an address listing pages
+    /// deterministically the way `job_order` lets `ListJobs` page over jobs.
+    pub address_order: Vec<String>,
     /// Every job `CreateJob` stored, keyed by the `JobId` it minted.
     pub jobs: HashMap<String, StoredJob>,
     /// Every cluster `CreateCluster` stored, keyed by the `ClusterId` it minted.
@@ -1750,6 +1791,7 @@ impl Default for ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     fn default() -> Self {
         Self {
             addresses: HashMap::new(),
+            address_order: Vec::new(),
             jobs: HashMap::new(),
             clusters: HashMap::new(),
             job_order: Vec::new(),
@@ -1969,10 +2011,19 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     /// [`MAX_STORED_ADDRESSES`].
     ///
     /// The ceiling is enforced HERE, at the insertion point, so a handler cannot exceed
-    /// it by forgetting to ask [`Self::can_store_another_address`] first.
+    /// it by forgetting to ask [`Self::can_store_another_address`] first. It bounds
+    /// GROWTH, so it is asked only of an address whose id the store does not hold yet.
+    ///
+    /// This is also the only place an address is recorded, so the map and the creation
+    /// order it is paged in cannot disagree about which addresses the store holds: an
+    /// address stored under an id the store already holds replaces that record and keeps
+    /// its place in the order rather than appearing in it twice.
     pub fn insert_address(&mut self, address: StoredAddress) -> bool {
-        if !self.can_store_another_address() {
-            return false;
+        if !self.addresses.contains_key(&address.address_id) {
+            if !self.can_store_another_address() {
+                return false;
+            }
+            self.address_order.push(address.address_id.clone());
         }
         self.addresses.insert(address.address_id.clone(), address);
         true
@@ -2137,6 +2188,29 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
         self.job_order
             .iter()
             .filter_map(|job_id| self.jobs.get(job_id))
+            .collect()
+    }
+
+    /// Every stored address in creation order — the order an address listing pages over.
+    ///
+    /// Every address this store holds is here: nothing in this API removes one.
+    pub fn addresses_in_creation_order(&self) -> Vec<&StoredAddress> {
+        self.address_order
+            .iter()
+            .filter_map(|address_id| self.addresses.get(address_id))
+            .collect()
+    }
+
+    /// The addresses this store holds that are pickup locations, in creation order — the
+    /// locations `ListPickupLocations` pages over.
+    ///
+    /// A pickup location is an address of the account typed as one
+    /// ([`StoredAddress::is_pickup_location`]), so a delivery address is not reported as a
+    /// place a device can be collected from.
+    pub fn pickup_locations(&self) -> Vec<&StoredAddress> {
+        self.addresses_in_creation_order()
+            .into_iter()
+            .filter(|address| address.is_pickup_location())
             .collect()
     }
 

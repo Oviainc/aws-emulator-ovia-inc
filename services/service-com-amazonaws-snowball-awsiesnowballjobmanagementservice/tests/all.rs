@@ -65,6 +65,8 @@ mod long_term_pricing_renewal;
 mod long_term_pricing_updates;
 #[path = "all/page_size_rule.rs"]
 mod page_size_rule;
+#[path = "all/pickup_locations.rs"]
+mod pickup_locations;
 #[path = "all/return_shipping_label_reports.rs"]
 mod return_shipping_label_reports;
 #[path = "all/return_shipping_labels.rs"]

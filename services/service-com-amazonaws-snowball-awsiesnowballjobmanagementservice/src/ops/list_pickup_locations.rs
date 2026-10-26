@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPickupLocations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPickupLocations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPickupLocations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A list of locations from which the customer can choose to pickup a device: the
+//! account's own addresses typed as pickup addresses, in creation order, paged the way
+//! every list operation of this service pages.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +139,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPickupLocations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPickupLocationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPickupLocations"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STATE_UNAVAILABLE,
+            ));
+        };
+
+        // The page size and the cursor codec are the ones every list operation of this
+        // service shares (`state::page_size`, `state::page_of_addresses`), so this listing
+        // cannot drift from the job, cluster and pricing listings on how `MaxResults` — and
+        // the 0 the member admits — is read, or on what a token means.
+        let page_size = crate::state::page_size(input.max_results);
+
+        // A read: this operation reports "a list of locations from which the customer can
+        // choose to pickup a device", so it reports what the store holds and changes
+        // nothing. Those locations are the account's own addresses typed as pickup
+        // addresses (`state::pickup_locations`) — `Address$Type` is the member that
+        // "differentiates between delivery address and pickup address in the customer
+        // account" — in the order they were created, so an address a device is shipped to
+        // is not reported as a place one can be collected from.
+        let store = state.lock();
+        let locations = store.pickup_locations();
+
+        // A `NextToken` here is one an earlier page of THIS listing minted, naming the
+        // location that page stopped before. One naming no pickup location this store
+        // holds — a token this service did not mint, or a cursor over another listing's
+        // records — names no resource the walk can resume from, which is the one error
+        // this operation models.
+        let Some((page, next_token)) =
+            crate::state::page_of_addresses(&locations, input.next_token.as_deref(), page_size)
+        else {
+            return Err(ListPickupLocationsErrorModeled::InvalidResourceException(
+                InvalidResourceException {
+                    message: Some(
+                        "The specified resource can't be found. Check the information you \
+                         provided in your last request, and try again."
+                            .to_string(),
+                    ),
+                    resource_type: Some("address".to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(ListPickupLocationsOutput {
+            addresses: Some(page),
+            next_token,
+        })
     }
 }
