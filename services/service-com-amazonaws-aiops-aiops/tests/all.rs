@@ -23,6 +23,8 @@ mod investigation_group_policy_delete;
 mod investigation_group_singleton;
 #[path = "all/investigation_groups.rs"]
 mod investigation_groups;
+#[path = "all/map_member_refusal_paths.rs"]
+mod map_member_refusal_paths;
 #[path = "all/regional_identifier_resolution.rs"]
 mod regional_identifier_resolution;
 #[path = "all/resource_tags.rs"]

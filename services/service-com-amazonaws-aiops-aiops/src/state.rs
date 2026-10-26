@@ -30,6 +30,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aws_smithy_schema::{Schema, ShapeType, TraitMap};
+use aws_smithy_schema_server::constraints::{
+    path, ElementConstraintsTrait, EnumTrait, LengthTrait, PatternTrait, RangeTrait,
+};
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
@@ -485,25 +489,205 @@ pub fn validation_message(member_path: &str, requirement: &str) -> String {
     validation_envelope(&[constraint_clause(member_path, requirement)])
 }
 
+// ---------------------------------------------------------------------------
+// Where a member path ends
+//
+// A clause's subject is a MEMBER PATH, and the path the constraint walk builds for a
+// violation inside a MAP steps through that entry's own key — the caller's bytes,
+// spelled exactly as sent. The wording rule above admits nothing the request sent, so
+// the path a clause states stops at the map MEMBER: a map entry is reported at the
+// member that holds it, with the requirement its value shape states, and never at a
+// key. A LIST element keeps its position (`<member>.<n>.member`), which is a fact about
+// the request's shape rather than anything it sent.
+//
+// Where the path stops is read off the MODEL, not off the text: a segment is a map step
+// when it names a member this service models as a map, so no key can be mistaken for a
+// member name or the other way round.
+// ---------------------------------------------------------------------------
+
+/// The modelled inputs a boundary refusal can name a member of: every operation input
+/// this service validates a request against (each operation's own `INPUT_SCHEMA`).
+///
+/// The refusal seam is handed a member path and no operation, so a path's segments are
+/// resolved against all of them at once; a member name names one shape across this
+/// service's inputs, so which input a path came from cannot change the answer. A map
+/// member added to any input's own members is covered the moment the model declares it;
+/// this model nests no map inside a structure or a list, and a member schema carries no
+/// members of its own to descend into, so resolution reads each input's own members.
+const REFUSABLE_INPUTS: &[&Schema] = &[
+    &crate::ops::types::CreateInvestigationGroupInput::SCHEMA,
+    &crate::ops::types::UpdateInvestigationGroupInput::SCHEMA,
+    &crate::ops::types::GetInvestigationGroupInput::SCHEMA,
+    &crate::ops::types::DeleteInvestigationGroupInput::SCHEMA,
+    &crate::ops::types::ListInvestigationGroupsInput::SCHEMA,
+    &crate::ops::types::GetInvestigationGroupPolicyInput::SCHEMA,
+    &crate::ops::types::PutInvestigationGroupPolicyInput::SCHEMA,
+    &crate::ops::types::DeleteInvestigationGroupPolicyInput::SCHEMA,
+    &crate::ops::types::TagResourceInput::SCHEMA,
+    &crate::ops::types::UntagResourceInput::SCHEMA,
+    &crate::ops::types::ListTagsForResourceInput::SCHEMA,
+];
+
+/// The character separating one step of a member path from the next.
+const PATH_SEPARATOR: char = '.';
+
+/// How a clause states what a MAP ENTRY's value had to satisfy: the requirement is the
+/// value shape's whole constraint set, bundled at the map member, because the member is
+/// the subject of the clause and one map may hold many entries that break it.
+const MAP_VALUE_REQUIREMENT_PREFIX: &str = "Map value must satisfy constraint: ";
+
+/// The member schema that `segment` names, where this service models that member as a
+/// MAP, and `None` for every other segment (a scalar or collection member's name, a
+/// list position, the collection step, or an entry key a caller chose).
+fn map_member(segment: &str) -> Option<&'static Schema> {
+    REFUSABLE_INPUTS
+        .iter()
+        .flat_map(|input| input.members().iter().copied())
+        .find(|member| {
+            matches!(member.shape_type(), ShapeType::Map)
+                // How a member is spelled in a path is the framework's own rule
+                // (`path::member`), so the lookup cannot drift from the spelling the
+                // constraint walk produced.
+                && member.member_name().map(path::member).as_deref() == Some(segment)
+        })
+}
+
+/// The map member a violation at `path` is INSIDE, as `(the path up to and including
+/// that member, that member's schema)`.
+///
+/// `None` when `path` names nothing inside a map — including a violation of the map
+/// member itself (its entry count), whose subject already is the member and whose
+/// requirement is the map's own.
+fn map_entry_step(path: &str) -> Option<(&str, &'static Schema)> {
+    let mut end = 0;
+    for segment in path.split(PATH_SEPARATOR) {
+        end += segment.len();
+        if let Some(member) = map_member(segment) {
+            // Everything after the map member is the entry: the key the caller chose,
+            // and any step from that key into the entry's value.
+            let member_path = path.get(..end)?;
+            return (end < path.len()).then_some((member_path, member));
+        }
+        end += PATH_SEPARATOR.len_utf8();
+    }
+    None
+}
+
+/// The value shape's own constraint traits, as the collection member `schema` carries
+/// them: a map value (and a list element) shares its collection member's schema, so its
+/// constraints travel beside that schema rather than on it.
+fn value_constraints(schema: &Schema) -> Option<&TraitMap> {
+    let wrapper = schema.traits()?.get(&ElementConstraintsTrait::TRAIT_ID)?;
+    let constraints = wrapper.as_any().downcast_ref::<ElementConstraintsTrait>()?;
+    Some(constraints.inner())
+}
+
+/// Every requirement the value shape of the map member `schema` states, each worded
+/// through [`requirement_text`] so a bundled requirement cannot drift from the one a
+/// scalar member's clause states.
+///
+/// The order is the one a bundle lists them in: each bound, maximum before minimum,
+/// then the value's character class or value set.
+fn map_value_requirements(schema: &Schema) -> Vec<String> {
+    let Some(traits) = value_constraints(schema) else {
+        return Vec::new();
+    };
+    let length = traits
+        .get(&LengthTrait::TRAIT_ID)
+        .and_then(|t| t.as_any().downcast_ref::<LengthTrait>());
+    let range = traits
+        .get(&RangeTrait::TRAIT_ID)
+        .and_then(|t| t.as_any().downcast_ref::<RangeTrait>());
+    let pattern = traits
+        .get(&PatternTrait::TRAIT_ID)
+        .and_then(|t| t.as_any().downcast_ref::<PatternTrait>());
+    let values = traits
+        .get(&EnumTrait::TRAIT_ID)
+        .and_then(|t| t.as_any().downcast_ref::<EnumTrait>());
+    let kinds = [
+        length.and_then(|l| l.max).map(ViolationKind::MaxLength),
+        length.and_then(|l| l.min).map(ViolationKind::MinLength),
+        range
+            .and_then(|r| r.max)
+            .map(|max| ViolationKind::MaxValue(render_bound(max))),
+        range
+            .and_then(|r| r.min)
+            .map(|min| ViolationKind::MinValue(render_bound(min))),
+        pattern.map(|p| ViolationKind::Pattern(p.regex.to_string())),
+        values.map(|v| {
+            ViolationKind::EnumValue(v.values.iter().map(|value| (*value).to_string()).collect())
+        }),
+    ];
+    kinds
+        .into_iter()
+        .flatten()
+        .map(requirement_text)
+        .collect()
+}
+
+/// A `@range` bound as a requirement states it: an integral bound without decimals.
+///
+/// [`ViolationKind`] carries a bound as the text it displays with, so a bound read back
+/// off a schema is rendered here the way the walk renders the same bound. Reached only
+/// by a map whose value shape the model gives a `@range` — none in this model does, so
+/// it is what keeps the bundle complete for a value shape of any kind rather than for
+/// the two kinds this model happens to hold.
+fn render_bound(bound: f64) -> String {
+    if bound.is_finite() && bound.fract() == 0.0 {
+        format!("{}", bound as i64)
+    } else {
+        format!("{bound}")
+    }
+}
+
+/// The one clause a violation states.
+fn violation_clause(violation: &Violation) -> String {
+    // Inside a map: the subject is the map MEMBER and the requirement is its value
+    // shape's whole constraint set, so neither the key the caller chose nor the value it
+    // sent reaches the message. A member whose value constraints the model leaves
+    // uncaptured keeps the requirement that was broken, still stated at the member.
+    // The absent-member wording has nothing to say here either way: a map holds the
+    // entries a request carried, so there is no absent position inside one.
+    if let Some((member_path, member)) = map_entry_step(&violation.path) {
+        let requirements = map_value_requirements(member);
+        let requirement = if requirements.is_empty() {
+            requirement_text(violation.kind.clone())
+        } else {
+            format!("{MAP_VALUE_REQUIREMENT_PREFIX}[{}]", requirements.join(", "))
+        };
+        return constraint_clause(member_path, &requirement);
+    }
+    let requirement = requirement_text(violation.kind.clone());
+    match violation.value {
+        // No value at that path: the member was absent from the request.
+        None => absent_member_clause(&violation.path, &requirement),
+        Some(_) => constraint_clause(&violation.path, &requirement),
+    }
+}
+
 /// The `ValidationException` message for a refusal the constraint walk made at the
 /// request boundary: one clause per violation, in the AWS envelope.
+///
+/// A clause is stated ONCE however many violations state it: two entries of one map
+/// breaking the same rule are one fact about one member, and the envelope counts the
+/// facts it states.
 ///
 /// `None` when there is nothing to state, which keeps the framework's own wording.
 pub fn validation_exception_message(violations: &[Violation]) -> Option<String> {
     if violations.is_empty() {
         return None;
     }
-    let clauses: Vec<String> = violations
-        .iter()
-        .map(|violation| {
-            let requirement = requirement_text(violation.kind.clone());
-            match violation.value {
-                // No value at that path: the member was absent from the request.
-                None => absent_member_clause(&violation.path, &requirement),
-                Some(_) => constraint_clause(&violation.path, &requirement),
-            }
-        })
-        .collect();
+    // The clauses keep the order the walk found them in, and the set is what decides
+    // whether one was already stated — a request chooses how many violations it carries,
+    // so a scan per clause would cost it the square of that.
+    let mut stated = std::collections::HashSet::with_capacity(violations.len());
+    let mut clauses: Vec<String> = Vec::with_capacity(violations.len());
+    for violation in violations {
+        let clause = violation_clause(violation);
+        if stated.insert(clause.clone()) {
+            clauses.push(clause);
+        }
+    }
     Some(validation_envelope(&clauses))
 }
 
