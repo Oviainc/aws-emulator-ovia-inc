@@ -30,3 +30,6 @@ mod tagging_api_fidelity;
 // the list is next touched for another reason.
 #[path = "all/apigateway_tagged_resource_index.rs"]
 mod apigateway_tagged_resource_index;
+
+#[path = "all/sfn_tagged_resource_index.rs"]
+mod sfn_tagged_resource_index;

@@ -314,8 +314,20 @@ pub fn tagged_resources<Eng: Send + Sync + 'static>(
         }
     }
     if let Some(state) = owner_sfn::state::service_state(engine) {
-        for machine in state.lock().state_machines.values() {
+        let mut state = state.lock();
+        // Like the secrets above, a state machine whose started deletion has
+        // fallen due was owed its removal at this instant whether or not
+        // anybody called, so it is materialised before this projection is read
+        // rather than reported as a resource the owning service no longer has.
+        state.settle(owner_sfn::state::now());
+        // BOTH resource types that service holds a tag set for are rows here —
+        // a state machine and an activity — each under the resource type its own
+        // ARN carries.
+        for machine in state.state_machines.values() {
             record(machine.arn.clone(), option_tag_pairs!(machine.tags));
+        }
+        for activity in state.activities.values() {
+            record(activity.arn.clone(), option_tag_pairs!(activity.tags));
         }
     }
     found
@@ -652,7 +664,8 @@ fn secretsmanager<Eng: Send + Sync + 'static>(
     option_tag_list!(&mut secret.tags, change, tag)
 }
 
-/// AWS Step Functions: a state machine, whose tags are the machine's own. An
+/// AWS Step Functions: a state machine or an activity, whose tags are that
+/// resource's own — the two resource types that service holds a tag set for. An
 /// execution is resolved but carries no tag set of its own.
 fn states<Eng: Send + Sync + 'static>(
     engine: &Eng,
@@ -671,8 +684,15 @@ fn states<Eng: Send + Sync + 'static>(
         return Resolution::Unowned;
     };
     let mut state = state.lock();
+    // A resolution must see the store a report of it sees: materialising a
+    // deletion the clock already owes is what keeps a state machine whose
+    // removal came due from being tagged back into existence.
+    state.settle(owner_sfn::state::now());
     if let Some(machine) = state.state_machines.get_mut(&arn.arn) {
         return option_tag_list!(&mut machine.tags, change, tag);
+    }
+    if let Some(activity) = state.activities.get_mut(&arn.arn) {
+        return option_tag_list!(&mut activity.tags, change, tag);
     }
     if state.executions.contains_key(&arn.arn) {
         return Resolution::Present { tags: None };
