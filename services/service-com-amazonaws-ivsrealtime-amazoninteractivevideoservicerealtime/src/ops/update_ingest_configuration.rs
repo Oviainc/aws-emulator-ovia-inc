@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateIngestConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateIngestConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateIngestConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +82,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::ResponseHeaderPolicy;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -103,11 +95,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivsrealtime-amazoninter
 // here — hence the `UpdateIngestConfigurationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivsrealtime#UpdateIngestConfiguration")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivsrealtime#UpdateIngestConfiguration",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum UpdateIngestConfigurationErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
+    // Widened in through `extra_errors`: the SERVICE models `InternalServerException`
+    // (HTTP 500) though `UpdateIngestConfiguration` does not list it, and it is the only
+    // honest answer if the shared engine cannot hand back this service's store.
+    InternalServerException(InternalServerException),
     PendingVerification(PendingVerification),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
@@ -164,18 +163,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateIngestConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateIngestConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateIngestConfiguration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::store_unavailable(
+                UpdateIngestConfigurationErrorModeled::InternalServerException,
+            )
+        })?;
+        let mut store = state.lock();
+
+        // An update of a configuration this store does not hold is the modelled
+        // `ResourceNotFoundException` (HTTP 404), the same answer `GetIngestConfiguration`
+        // and `DeleteIngestConfiguration` give for an ARN nothing answers for.
+        let record = store
+            .ingest_configurations
+            .get(&input.arn)
+            .ok_or_else(|| {
+                crate::state::resource_not_found(
+                    UpdateIngestConfigurationErrorModeled::ResourceNotFoundException,
+                    &input.arn,
+                )
+            })?
+            .clone();
+
+        // The association the request asks for, resolved through the ONE seam a create and
+        // an update share (`crate::state::resolved_stage_association`): a stage this
+        // account holds, or the empty ARN the model's own reading of "no stage" is. A
+        // well-formed ARN no stage answers for is the modelled `ValidationException`
+        // (HTTP 400) rather than a persisted association nothing can serve, and it is
+        // refused before the record is touched, so a refused update changes nothing.
+        let stage_arn =
+            crate::state::resolved_stage_association(&store, Self::NAME, input.stage_arn)
+                .map_err(|message| {
+                    crate::state::validation_failed(
+                        UpdateIngestConfigurationErrorModeled::ValidationException,
+                        message,
+                    )
+                })?;
+
+        // "An IngestConfiguration that is active cannot be updated": active is exactly
+        // what a read of it reports as `ACTIVE` — a publisher broadcasting with it right
+        // now (`crate::state::ingest_configuration_publishers`, the lookup
+        // `DeleteIngestConfiguration` refuses over too) — so the refusal and the state a
+        // caller just read are one fact and not two.
+        if let Some(publisher) =
+            crate::state::ingest_configuration_publishers(&store, &record).first()
+        {
+            return Err(crate::state::conflict(
+                UpdateIngestConfigurationErrorModeled::ConflictException,
+                crate::state::ingest_configuration_publishing_message(
+                    &input.arn,
+                    &publisher.participant_id,
+                    &record.stage_arn,
+                ),
+            ));
+        }
+
+        // "Only the stage ARN attached to the IngestConfiguration can be updated": the
+        // association is the one member this operation writes. Everything else the
+        // configuration carries — its ingest protocol, the ingest key and participant id
+        // minted for it, its redundant ingest and the backup credentials minted with it,
+        // its name, user id, attributes and tags — is left exactly as stored, so a
+        // publisher that cached the key keeps working across a move between stages. The
+        // request's `redundantIngest` is therefore not persisted either: it carries a
+        // modelled default, so an omitted member is indistinguishable from `false` on the
+        // wire, and honouring it would turn a stage move into a change of the ingest paths
+        // this operation documents itself as leaving alone.
+        let updated = store.ingest_configurations.get_mut(&input.arn).ok_or_else(|| {
+            crate::state::resource_not_found(
+                UpdateIngestConfigurationErrorModeled::ResourceNotFoundException,
+                &input.arn,
+            )
+        })?;
+        updated.stage_arn = stage_arn;
+
+        // The configuration as it now stands, read back out of the store the way
+        // `GetIngestConfiguration` reports it, so this answer and the next read are the
+        // same computation over the same record. Beside it, the CORS/security restriction
+        // headers this output shape binds (`crate::state::ResponseHeaderPolicy`): the
+        // endpoint's answer policy, carried by every response of this service.
+        let record = store.ingest_configurations.get(&input.arn).ok_or_else(|| {
+            crate::state::resource_not_found(
+                UpdateIngestConfigurationErrorModeled::ResourceNotFoundException,
+                &input.arn,
+            )
+        })?;
+        Ok(UpdateIngestConfigurationOutput {
+            ingest_configuration: Some(record.to_ingest_configuration(&store)),
+            ..Default::default()
+        }
+        .with_response_header_policy())
     }
 }
