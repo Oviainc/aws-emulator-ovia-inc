@@ -1054,12 +1054,14 @@ async fn the_identifier_is_folded_to_lowercase_and_matched_folded() {
 // ---------------------------------------------------------------------------
 
 /// One row of the refusal table: a request that breaks a documented constraint the
-/// operation models no error for, and the member the refusal must name.
+/// operation models no error for, the wire `<Code>` it is refused with, and the text the
+/// refusal must carry.
 struct RefusedCase {
     case: &'static str,
     identifier: &'static str,
     extra: Params,
-    member: &'static str,
+    code: &'static str,
+    says: &'static str,
 }
 
 /// One row of the not-found table: an operation named a resource that is not stored.
@@ -1105,68 +1107,82 @@ async fn documented_constraints_are_refused_at_their_bounds() {
     }
 
     // Refused: one step past each bound, and every identifier shape the
-    // `DBInstanceIdentifier` constraints rule out. None of these has a modelled
-    // error, so each is a 400 `ValidationException` naming the member.
+    // `DBInstanceIdentifier` constraints rule out. None of these has a modelled error. A
+    // value outside what its own member accepts carries the Query API's
+    // `InvalidParameterValue`; the one row that is a parameter COMBINATION rather than a
+    // value keeps the channel this service words it through. A refusal of the instance
+    // identifier is worded by its subject ("Invalid database identifier:  <value>"), the
+    // others name their member.
     let refused: &[RefusedCase] = &[
         RefusedCase {
             case: "one below the lowest Port",
             identifier: "emu-bad-port-lo",
             extra: params!["Port" => 1149].to_vec(),
-            member: "Port",
+            code: "InvalidParameterValue",
+            says: "Port",
         },
         RefusedCase {
             case: "one above the highest Port",
             identifier: "emu-bad-port-hi",
             extra: params!["Port" => 65536].to_vec(),
-            member: "Port",
+            code: "InvalidParameterValue",
+            says: "Port",
         },
         RefusedCase {
             case: "one below the lowest BackupRetentionPeriod",
             identifier: "emu-bad-backup-lo",
             extra: params!["BackupRetentionPeriod" => -1].to_vec(),
-            member: "BackupRetentionPeriod",
+            code: "InvalidParameterValue",
+            says: "BackupRetentionPeriod",
         },
         RefusedCase {
             case: "one above the highest BackupRetentionPeriod",
             identifier: "emu-bad-backup-hi",
             extra: params!["BackupRetentionPeriod" => 36].to_vec(),
-            member: "BackupRetentionPeriod",
+            code: "InvalidParameterValue",
+            says: "BackupRetentionPeriod",
         },
         RefusedCase {
             case: "an AvailabilityZone with Multi-AZ",
             identifier: "emu-bad-multi-az",
             extra: params!["MultiAZ" => true, "AvailabilityZone" => "us-west-2a"].to_vec(),
-            member: "AvailabilityZone",
+            code: "ValidationException",
+            says: "AvailabilityZone",
         },
         RefusedCase {
             case: "an identifier that does not start with a letter",
             identifier: "1-emu-bad",
             extra: Vec::new(),
-            member: "DBInstanceIdentifier",
+            code: "InvalidParameterValue",
+            says: "Invalid database identifier:  1-emu-bad",
         },
         RefusedCase {
             case: "an identifier ending with a hyphen",
             identifier: "emu-bad-",
             extra: Vec::new(),
-            member: "DBInstanceIdentifier",
+            code: "InvalidParameterValue",
+            says: "Invalid database identifier:  emu-bad-",
         },
         RefusedCase {
             case: "an identifier with two consecutive hyphens",
             identifier: "emu--bad",
             extra: Vec::new(),
-            member: "DBInstanceIdentifier",
+            code: "InvalidParameterValue",
+            says: "Invalid database identifier:  emu--bad",
         },
         RefusedCase {
             case: "an identifier with a character outside the alphabet",
             identifier: "emu_bad",
             extra: Vec::new(),
-            member: "DBInstanceIdentifier",
+            code: "InvalidParameterValue",
+            says: "Invalid database identifier:  emu_bad",
         },
         RefusedCase {
             case: "an identifier with a multi-byte character",
             identifier: "emu-café",
             extra: Vec::new(),
-            member: "DBInstanceIdentifier",
+            code: "InvalidParameterValue",
+            says: "Invalid database identifier:  emu-café",
         },
     ];
     for row in refused {
@@ -1181,14 +1197,14 @@ async fn documented_constraints_are_refused_at_their_bounds() {
             )
             .await,
             400,
-            "ValidationException",
+            row.code,
         );
         let message = text(&body, "Message");
         assert!(
-            message.contains(row.member),
-            "case {:?}: the refusal must name {}, got {message:?}",
+            message.contains(row.says),
+            "case {:?}: the refusal must say {:?}, got {message:?}",
             row.case,
-            row.member
+            row.says
         );
     }
 
@@ -1203,11 +1219,12 @@ async fn documented_constraints_are_refused_at_their_bounds() {
         "an identifier one over the length bound",
         create_instance(&router, &over_bound, "postgres", "db.t3.micro", &[]).await,
         400,
-        "ValidationException",
+        "InvalidParameterValue",
     );
-    assert!(
-        text(&body, "Message").contains("63"),
-        "the refusal must name the documented length bound, got {:?}",
+    assert_eq!(
+        text(&body, "Message"),
+        format!("Invalid database identifier:  {over_bound}"),
+        "the refusal must carry the value it rejected, got {:?}",
         text(&body, "Message")
     );
 }
@@ -1559,7 +1576,7 @@ async fn modify_renames_an_instance_and_refuses_a_name_already_taken() {
         )
         .await,
         400,
-        "ValidationException",
+        "InvalidParameterValue",
     );
 
     let renamed = expect_ok(
@@ -1903,7 +1920,7 @@ async fn a_snapshot_copies_the_source_instance_and_reads_back() {
         )
         .await,
         400,
-        "ValidationException",
+        "InvalidParameterValue",
     );
     assert!(
         text(&body, "Message").contains("not-a-filter"),
@@ -2031,7 +2048,7 @@ async fn instance_filters_select_by_every_documented_name() {
         )
         .await,
         400,
-        "ValidationException",
+        "InvalidParameterValue",
     );
     assert!(
         text(&body, "Message").contains("db-instance-name"),
@@ -2072,8 +2089,10 @@ async fn delete_removes_the_instance_and_can_take_a_final_snapshot() {
     )
     .await;
 
-    // The documented parameter combinations this operation models no error for.
-    let refusals: &[(&str, Params)] = &[
+    // The documented parameter combinations this operation models no error for, and the
+    // one row that is a VALUE outside what `FinalDBSnapshotIdentifier` accepts, which the
+    // Query API's `InvalidParameterValue` reports.
+    let refusals: &[(&str, Params, &str)] = &[
         (
             "both skip and a final snapshot identifier",
             params![
@@ -2082,10 +2101,12 @@ async fn delete_removes_the_instance_and_can_take_a_final_snapshot() {
                 "FinalDBSnapshotIdentifier" => "emu-del-skip-final",
             ]
             .to_vec(),
+            "ValidationException",
         ),
         (
             "neither skip nor a final snapshot identifier",
             params!["DBInstanceIdentifier" => "emu-del-skip"].to_vec(),
+            "ValidationException",
         ),
         (
             "a final snapshot identifier the constraints rule out",
@@ -2094,15 +2115,11 @@ async fn delete_removes_the_instance_and_can_take_a_final_snapshot() {
                 "FinalDBSnapshotIdentifier" => "1-bad-final",
             ]
             .to_vec(),
+            "InvalidParameterValue",
         ),
     ];
-    for (case, params) in refusals {
-        let body = expect_error(
-            case,
-            call(&router, "DeleteDBInstance", params).await,
-            400,
-            "ValidationException",
-        );
+    for (case, params, code) in refusals {
+        let body = expect_error(case, call(&router, "DeleteDBInstance", params).await, 400, code);
         assert!(
             text(&body, "Message").contains("FinalDBSnapshotIdentifier"),
             "case {case:?}: the refusal must name the member, got {:?}",

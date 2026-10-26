@@ -154,9 +154,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::request_region(ctx).map_err(CreateDBSnapshotError::validation)?;
         let snapshot_identifier = input.db_snapshot_identifier;
         crate::state::check_identifier("DBSnapshotIdentifier", &snapshot_identifier, 255)
-            .map_err(CreateDBSnapshotError::validation)?;
-        // The source instance's identifier "is stored as a lowercase string", so the
-        // lookup folds the same way the stored key does.
+            .map_err(CreateDBSnapshotError::invalid_parameter_value)?;
+        // `DBInstanceIdentifier` names the source instance, and it carries the same
+        // documented constraints as everywhere else, so a value outside them is refused
+        // for the parameter rather than reported as an instance that does not exist: the
+        // caller cannot tell "you sent a value this member does not accept" from "no such
+        // instance" otherwise. Checked against the value the REQUEST carried; the lookup
+        // then folds it, because the source instance's identifier "is stored as a
+        // lowercase string" and the stored key folds the same way.
+        crate::state::check_identifier("DBInstanceIdentifier", &input.db_instance_identifier, 63)
+            .map_err(CreateDBSnapshotError::invalid_parameter_value)?;
         let source_identifier = input.db_instance_identifier.to_ascii_lowercase();
 
         // No store means this service was mounted on an engine it has no state in,
@@ -188,7 +195,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 CreateDBSnapshotError::from(CreateDBSnapshotErrorModeled::DBInstanceNotFoundFault(
                     DBInstanceNotFoundFault {
-                        message: Some(format!("DBInstance {source_identifier} not found.")),
+                        // The identifier the REQUEST carried, not the folded form the
+                        // store is keyed by: the caller has to recognise the value it
+                        // sent.
+                        message: Some(format!(
+                            "DBInstance not found: {}",
+                            input.db_instance_identifier
+                        )),
                     },
                 ))
             })?;

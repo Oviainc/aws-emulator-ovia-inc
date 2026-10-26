@@ -4551,14 +4551,56 @@ pub fn default_option_group_name(engine: &str, major_engine_version: &str) -> St
     )
 }
 
+/// How Amazon RDS names the SUBJECT an identifier member carries when it refuses that
+/// member's value.
+///
+/// RDS words such a refusal `Invalid <subject>:  <value>` — it names what the parameter
+/// is rather than the member, and it carries no reason, so the one text answers whichever
+/// of the member's constraints the value broke. The subject is the service's own wording
+/// rather than anything the model states, so it is given here only for the members whose
+/// refusal this emulator words that way; every other member keeps the wording
+/// [`check_identifier`] builds below, which names the member and the constraint it broke.
+///
+/// The two spaces after the colon are part of that wording, not a typo.
+fn identifier_subject(member: &str) -> Option<&'static str> {
+    match member {
+        // The identifier of a DB instance, whether `CreateDBInstance` is naming the one to
+        // create or `ModifyDBInstance` the one to rename to.
+        "DBInstanceIdentifier" | "NewDBInstanceIdentifier" => Some("database identifier"),
+        // The name of an option group, on create and on modify alike.
+        "OptionGroupName" => Some("option group name"),
+        _ => None,
+    }
+}
+
 /// Refuse an identifier that breaks the constraints its member documents.
 ///
 /// `DBInstanceIdentifier` and `DBSnapshotIdentifier` share one rule, differing only
 /// in the length bound (63 and 255): "Must contain from 1 to N letters, numbers, or
 /// hyphens. First character must be a letter. Can't end with a hyphen or contain two
-/// consecutive hyphens." Returns the message to refuse the request with, naming the
-/// member and the constraint it broke.
+/// consecutive hyphens." Returns the message to refuse the request with — the wording
+/// [`identifier_subject`] gives for the members RDS words by their subject, and otherwise
+/// one naming the member and the constraint it broke.
+///
+/// The CALLER answers this with `InvalidParameterValue`: a value outside the constraints
+/// its own member publishes is exactly what that Query API common error reports, and the
+/// error code is what a client branches on.
 pub fn check_identifier(member: &str, value: &str, max_len: usize) -> Result<(), String> {
+    check_identifier_constraints(member, value, max_len).map_err(|named| {
+        match identifier_subject(member) {
+            Some(subject) => format!("Invalid {subject}:  {value}"),
+            None => named,
+        }
+    })
+}
+
+/// The constraint walk behind [`check_identifier`], whose message names the member and the
+/// constraint the value broke.
+fn check_identifier_constraints(
+    member: &str,
+    value: &str,
+    max_len: usize,
+) -> Result<(), String> {
     // The alphabet comes first: a value outside it is reported as the wrong alphabet
     // rather than measured against the length bound, which for a multi-byte character
     // would name a count the caller never typed.
@@ -4744,6 +4786,13 @@ pub struct Page<T> {
     pub next_marker: Option<String>,
 }
 
+/// The refusal Amazon RDS answers a `Marker` no prior page issued with. Fixed text: the
+/// service names neither the token nor the member, so there is nothing of the request in
+/// it.
+pub const INVALID_MARKER: &str =
+    "Invalid marker. Please use the marker returned from a prior request or omit the \
+     marker parameter.";
+
 /// Take the page of `records` that starts at `marker` and holds at most
 /// `page_size` items. `records` must be ordered by its key.
 ///
@@ -4764,12 +4813,10 @@ pub fn paginate<T>(
         Some(marker) => records
             .iter()
             .position(|(key, _)| key.as_str() == marker)
-            .ok_or_else(|| {
-                format!(
-                    "invalid value '{marker}' for Marker: it was not returned by a prior \
-                     request; omit Marker to start at the first page"
-                )
-            })?,
+            // The wording Amazon RDS answers a marker it never issued with: it carries no
+            // variable part at all — not even the token — and tells the caller the two
+            // ways to ask again.
+            .ok_or_else(|| INVALID_MARKER.to_string())?,
     };
     let end = start.saturating_add(page_size).min(records.len());
     let next_marker = records.get(end).map(|(key, _)| key.clone());

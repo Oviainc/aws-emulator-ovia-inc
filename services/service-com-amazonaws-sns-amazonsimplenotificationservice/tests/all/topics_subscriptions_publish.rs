@@ -272,18 +272,16 @@ async fn create_topic_is_idempotent_and_its_arn_carries_the_requests_region() {
         );
     }
 
-    let listed = sns.call("ListTopics", &[]).await;
-    let arns = listed.elements("TopicArn");
-    assert_eq!(
-        arns.len(),
-        regions.len(),
-        "expected one topic per region and no duplicates, got {arns:?}"
-    );
+    // The three topics are three independent resources, one per region, and each
+    // region's own listing reports its own and no other's — the regional scope
+    // `regional_listings.rs` covers over every account-wide listing.
     for region in regions {
-        let expected = format!("arn:aws:sns:{region}:000000000000:bootstrap-topic");
-        assert!(
-            arns.contains(&expected),
-            "case {region:?}: ListTopics must list {expected}, got {arns:?}"
+        let listed = sns.call_in_region(region, "ListTopics", &[]).await;
+        let arns = listed.elements("TopicArn");
+        assert_eq!(
+            arns,
+            vec![format!("arn:aws:sns:{region}:000000000000:bootstrap-topic")],
+            "case {region:?}: ListTopics must list that region's topic alone, got {arns:?}"
         );
     }
 }

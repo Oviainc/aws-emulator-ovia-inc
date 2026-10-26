@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMultiRegionEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMultiRegionEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMultiRegionEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the multi-region endpoint (global-endpoint) the request names, when its
+//! primary region is the Region the call executes in, and reports the status it
+//! carries right after the request. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +144,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMultiRegionEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMultiRegionEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMultiRegionEndpoint"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteMultiRegionEndpoint without the shared emulator state",
+            ));
+        };
+
+        // "Only multi-region endpoints whose primary region is the AWS-Region where
+        // operation is executed can be deleted": an endpoint created in another Region
+        // is not this call's to delete, so it is not found here.
+        let region = crate::state::request_region(ctx.parts());
+        let name = input.endpoint_name;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The provisioning transition and the completion of any earlier deletion were
+        // both already due at `now`; settling them before this one keeps what this call
+        // answers from depending on who read first.
+        store.settle(now);
+        let key = (region, name);
+        let Some(record) = store.multi_region_endpoints.get_mut(&key) else {
+            return Err(DeleteMultiRegionEndpointErrorModeled::NotFoundException(
+                crate::state::multi_region_endpoint_not_found_to_delete(),
+            )
+            .into());
+        };
+        // A deletion of this endpoint that is still running is the one case that is
+        // neither a fresh deletion nor absence: this call would modify a resource
+        // another one is already tearing down, so it collides with that one, naming
+        // the status the resource is in.
+        if record.deletion_in_flight(now) {
+            return Err(
+                DeleteMultiRegionEndpointErrorModeled::ConcurrentModificationException(
+                    ConcurrentModificationException {
+                        message: Some(crate::state::unable_to_delete_while_deprovisioning()),
+                    },
+                )
+                .into(),
+            );
+        }
+        record.start_deletion(now);
+
+        Ok(DeleteMultiRegionEndpointOutput {
+            // "A status of the multi-region endpoint right after the delete request":
+            // the resource is being deleted as requested, and stops existing once the
+            // deletion completes.
+            status: Some(record.status.as_str().to_string()),
+        })
     }
 }

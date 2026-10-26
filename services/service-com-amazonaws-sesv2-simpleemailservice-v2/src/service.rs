@@ -39,11 +39,17 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! `override_protocol` is the sixth seam, and this service takes it for one thing the
+//! generic renderer cannot express: an error document whose `message` member is present
+//! and `null` when the code carries no message. See [`wire`].
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+pub mod wire;
 
 /// This service's endpoint prefix, as its model gives it
 /// (`smithy_query(query="service_info")`: `awsService.endpointPrefix` `email`) — the name
@@ -58,6 +64,10 @@ pub const ENDPOINT_PREFIX: &str = "email";
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// This service's wire protocol: the model's own `restJson1`, with the error
+    /// document of [`wire`]. Built once here because [`Service::override_protocol`]
+    /// hands back a borrow of it.
+    protocol: wire::NullMessageRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -67,6 +77,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            protocol: wire::NullMessageRestJson::new(),
         }
     }
 }
@@ -159,5 +170,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model's own restJson1 codec, with the ONE difference the generic
+        // renderer cannot express: a modelled exception's `message` member is present
+        // in the error document even when the code carries no message, as JSON `null`
+        // rather than dropped (see `wire`). Borrowed from the field built in `new`,
+        // never constructed per request.
+        //
+        // This seam drives the MODELLED sequence only. A framework-level refusal (a
+        // `BadRequestException` for a value outside the model's bounds) still renders
+        // in the generated entry's envelope, which is correct: that message is built
+        // from the request and is never absent.
+        Some(&self.protocol)
     }
 }

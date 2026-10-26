@@ -150,7 +150,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The rule `OptionGroupName` shares with the other identifier members, at the
         // bound `CreateOptionGroupMessage$OptionGroupName` publishes for a group name.
         crate::state::check_identifier("OptionGroupName", &name, 255)
-            .map_err(ModifyOptionGroupError::validation)?;
+            .map_err(ModifyOptionGroupError::invalid_parameter_value)?;
 
         let to_include = input.options_to_include.unwrap_or_default();
         let to_remove = input.options_to_remove.unwrap_or_default();

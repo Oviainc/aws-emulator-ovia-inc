@@ -244,23 +244,41 @@ pub const MISSING_LEGAL_ADDRESS_JURISDICTION: &str =
 /// The jurisdictions this emulator stores a SUPPLEMENTAL TRN for.
 ///
 /// `PutSupplementalTaxRegistration` accepts an entry only for a country in this
-/// set and refuses every other one with the modelled `ValidationException`,
-/// because the real service does: it supports supplemental registration in a
-/// bounded set of jurisdictions and answers a 400 for the rest.
+/// set and refuses every other one with the modelled `ValidationException`
+/// ([`SUPPLEMENTAL_COUNTRY_NOT_SUPPORTED`]), because the real service does:
+/// supplemental registration is supported in a bounded set of jurisdictions and
+/// the rest take a 400.
 ///
-/// WHERE THIS LIST COMES FROM: not the model. The model constrains
-/// `SupplementalTaxRegistrationEntry$address$countryCode` to any two letters and
-/// the operation's whole documentation is "Stores supplemental tax registration
-/// for a single account", so the model names no jurisdiction; `VAT` is the one
-/// `SupplementalTaxRegistrationType` value. The boundary is therefore the
-/// emulator's own, and it holds the jurisdiction observed to clear country
-/// validation (Switzerland — a Swiss VAT/MWST number is held with the Swiss
-/// authority alongside the account's primary TRN). The alternative — accepting
-/// every country — would report a supplemental registration AWS refuses, which
-/// is the worse answer of the two: a refusal is a modelled outcome a client
-/// handles, a fabricated success is not. A later fixer whose recording shows
-/// another jurisdiction accepted adds its row here, and nothing else changes.
+/// WHERE THIS LIST COMES FROM: OBSERVED BEHAVIOUR, not the model. The model is
+/// silent — it constrains `SupplementalTaxRegistrationEntry$address$countryCode`
+/// to any two letters, makes `VAT` the one `SupplementalTaxRegistrationType`,
+/// and the operation's whole documentation is "Stores supplemental tax
+/// registration for a single account" — so model silence is the reason the
+/// boundary cannot be read off the model, NOT evidence that there is none. The
+/// evidence that there is one, and what it is, is the recorded unit
+/// `taxsettings.supplemental-tax-registration-unsupported-country-rejected`: an
+/// entry for France and one for the United Kingdom are each refused 400
+/// `ValidationException` with that message, while a Swiss entry clears country
+/// validation and fails only on account state (a `ConflictException`). So this
+/// set holds every jurisdiction with positive evidence of being admitted —
+/// Switzerland, whose VAT/MWST number is held with the Swiss authority
+/// alongside the account's primary TRN — and a country with neither kind of
+/// evidence takes the refusal the observed ones take.
+///
+/// That asymmetry is deliberate: a refusal is a modelled outcome a client
+/// handles, while reporting a stored registration for a jurisdiction the service
+/// refuses is a fabricated success, and the recording shows the refusal reaches
+/// countries (the United Kingdom among them) that no model constraint excludes.
+/// A later fixer holding a recording of another jurisdiction ADMITTED adds its
+/// row here, and nothing else changes.
 pub const SUPPLEMENTAL_TRN_COUNTRIES: &[(&str, &str)] = &[("CH", "Switzerland")];
+
+/// How a supplemental TRN for a jurisdiction outside
+/// [`SUPPLEMENTAL_TRN_COUNTRIES`] is refused, worded as the observed refusal of
+/// that class words it. The sentence names no country and no registration, so
+/// nothing of one request leaks into another's answer.
+pub const SUPPLEMENTAL_COUNTRY_NOT_SUPPORTED: &str =
+    "Tax registration for country is not supported.";
 
 /// The jurisdictions whose stored tax registration this API cannot remove,
 /// paired with the country's name as the refusal states it.
@@ -2456,7 +2474,7 @@ pub fn check_supplemental_jurisdiction(
     Err(validation(
         ERROR_CODE_FIELD_VALIDATION_FAILED,
         "taxRegistrationEntry.address.countryCode",
-        "Tax registration for country is not supported.",
+        SUPPLEMENTAL_COUNTRY_NOT_SUPPORTED,
     ))
 }
 

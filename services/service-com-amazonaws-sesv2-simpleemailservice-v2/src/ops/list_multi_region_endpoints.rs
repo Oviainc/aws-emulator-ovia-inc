@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMultiRegionEndpoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMultiRegionEndpoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMultiRegionEndpoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a page of the multi-region endpoints (global-endpoints) whose primary
+//! region is the Region the call executes in. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +145,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMultiRegionEndpoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMultiRegionEndpointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMultiRegionEndpoints"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a throttle an SDK would retry forever.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListMultiRegionEndpoints without the shared emulator state",
+            ));
+        };
+
+        // "Only multi-region endpoints whose primary region is the AWS-Region where
+        // operation is executed will be listed."
+        let region = crate::state::request_region(ctx.parts());
+
+        // "The number of results to show in a single call... If the number of results
+        // is larger than the number you specified in this parameter, then the response
+        // includes a NextToken element." The model bounds `PageSize` at 1..1000, so the
+        // boundary validator has already refused anything outside that; only an absent
+        // size means "no truncation".
+        let page_size = input
+            .page_size
+            .and_then(|size| usize::try_from(size).ok())
+            .filter(|size| *size > 0);
+
+        // The token is this listing's own: it names the last endpoint the previous page
+        // returned, so the next page resumes strictly after it.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_tagged_page_token(
+                    crate::state::MULTI_REGION_ENDPOINTS_PAGE_TOKEN_TAG,
+                    token,
+                )
+                .ok_or_else(|| {
+                    bad_request(
+                        "NextToken is not a token returned by ListMultiRegionEndpoints.",
+                    )
+                })?,
+            ),
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Reporting only: every provisioning transition this materialises was already
+        // due at `now`, so a listing shows what a read of the same endpoint shows.
+        store.settle(now);
+        // The table is keyed by region and then name, so the endpoints of one region are
+        // a contiguous run in name order. The run is walked from the resume POSITION
+        // rather than looked up by key, so a token stays valid even if the endpoint it
+        // names has since been deleted, and the page comes straight off the records.
+        let from = match resume_after.as_deref() {
+            // Strictly after the last endpoint the previous page returned.
+            Some(last) => ::std::ops::Bound::Excluded((region.clone(), last.to_string())),
+            None => ::std::ops::Bound::Included((region.clone(), String::new())),
+        };
+        let mut remaining = store
+            .multi_region_endpoints
+            .range((from, ::std::ops::Bound::Unbounded))
+            .take_while(|((primary_region, _), _)| *primary_region == region)
+            .map(|(_, record)| record)
+            .peekable();
+
+        let mut multi_region_endpoints: Vec<MultiRegionEndpoint> = Vec::new();
+        while page_size.is_none_or(|size| multi_region_endpoints.len() < size) {
+            let Some(record) = remaining.next() else { break };
+            multi_region_endpoints.push(record.summary());
+        }
+        // A token only while endpoints remain behind this page, so a walk terminates.
+        let next_token = remaining
+            .peek()
+            .is_some()
+            .then(|| {
+                multi_region_endpoints.last().map(|endpoint| {
+                    crate::state::encode_tagged_page_token(
+                        crate::state::MULTI_REGION_ENDPOINTS_PAGE_TOKEN_TAG,
+                        endpoint.endpoint_name.as_deref().unwrap_or_default(),
+                    )
+                })
+            })
+            .flatten();
+
+        Ok(ListMultiRegionEndpointsOutput {
+            multi_region_endpoints: Some(multi_region_endpoints),
+            next_token,
+        })
     }
+}
+
+/// Refuse the request with this operation's input error.
+fn bad_request(message: impl Into<String>) -> ListMultiRegionEndpointsError {
+    ListMultiRegionEndpointsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }
