@@ -136,3 +136,5 @@ mod delete_remediation_exceptions;
 mod select_aggregate_resource_config;
 #[path = "all/recorded_refusal_wording.rs"]
 mod recorded_refusal_wording;
+#[path = "all/put_remediation_exceptions.rs"]
+mod put_remediation_exceptions;

@@ -2018,6 +2018,16 @@ impl RemediationConfigurationEntry {
 /// what `RemediationExceptionResourceKey` names a resource by.
 pub type RemediationExceptionKey = (String, String, String);
 
+/// The most remediation exceptions ONE Config rule holds
+/// ([`ComAmazonawsConfigserviceStarlingdoveserviceState::put_remediation_exception`]
+/// enforces it).
+///
+/// Config publishes no quota for them, and one call adds one exception per resource key
+/// it names, at most a hundred of them (`PutRemediationExceptionsRequest$ResourceKeys`,
+/// length 1..100), so one call's worth is what one rule holds. Without a bound,
+/// repeated calls naming new resources would grow this process's memory without end.
+pub const REMEDIATION_EXCEPTIONS_PER_RULE: usize = 100;
+
 /// One persisted remediation exception: one resource Config does not remediate under
 /// one rule ("An object that represents the details about the remediation exception …
 /// the rule name, an explanation of an exception, the time when the exception will be
@@ -3128,12 +3138,12 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// removed between pages. Config holds at most one exception per rule and resource,
     /// so writing another for the same pair revises it in place.
     ///
-    /// `PutRemediationExceptions`, the operation that WRITES one, is still a scaffold
-    /// with a stub issue of its own, so the bound on how far this map can grow is the
-    /// one that writer will enforce — the quota Config publishes for remediation
-    /// exceptions. `DeleteRemediationExceptions` only REMOVES from it, as does the
-    /// expiry each entry carries ([`RemediationExceptionEntry::expired_by`]), so no call
-    /// served today grows it at all.
+    /// BOUNDED at [`REMEDIATION_EXCEPTIONS_PER_RULE`] entries per rule the account HOLDS,
+    /// of which it holds at most [`CONFIG_RULES_QUOTA`], so this map holds at most the
+    /// product of the two however many rule names a caller invents: write it through
+    /// [`Self::put_remediation_exception`], the ONE place it grows, which refuses both.
+    /// `DeleteRemediationExceptions` only REMOVES from it, as does the expiry an entry
+    /// carries ([`RemediationExceptionEntry::expired_by`]).
     pub remediation_exceptions: BTreeMap<RemediationExceptionKey, RemediationExceptionEntry>,
     /// Remediation executions `StartRemediationExecution` invoked, keyed by
     /// [`RemediationExecutionKey`] — the rule they remediate and the resource they ran
@@ -3528,6 +3538,44 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
             .collect();
         counts.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
         counts
+    }
+
+    /// Write `entry` as the remediation exception its rule holds for its resource, and
+    /// answer whether it was written.
+    ///
+    /// Config holds at most one exception per rule and resource ("This API adds a new
+    /// exception or updates an existing exception for a specified resource with a
+    /// specified Config rule"), so an entry for a pair the rule already holds REVISES
+    /// that one in place rather than adding another.
+    ///
+    /// This is the ONE place [`Self::remediation_exceptions`] GROWS, so the store cannot
+    /// grow this process's state without end, and `false` reports every case it refused
+    /// to grow for: an entry whose rule this account does not hold — so the exceptions
+    /// held are bounded by the [`CONFIG_RULES_QUOTA`] rules it may hold, not by the rule
+    /// names a caller can invent — and a NEW resource once that rule already holds
+    /// [`REMEDIATION_EXCEPTIONS_PER_RULE`] of them. Revising an exception the rule
+    /// already holds is always written — it adds no entry.
+    pub fn put_remediation_exception(&mut self, entry: RemediationExceptionEntry) -> bool {
+        if !self.config_rules.contains_key(&entry.config_rule_name) {
+            return false;
+        }
+        let key = entry.key();
+        if !self.remediation_exceptions.contains_key(&key)
+            && self.remediation_exceptions_held(&entry.config_rule_name)
+                >= REMEDIATION_EXCEPTIONS_PER_RULE
+        {
+            return false;
+        }
+        self.remediation_exceptions.insert(key, entry);
+        true
+    }
+
+    /// How many remediation exceptions the rule `config_rule_name` holds.
+    pub fn remediation_exceptions_held(&self, config_rule_name: &str) -> usize {
+        self.remediation_exceptions
+            .values()
+            .filter(|entry| entry.config_rule_name == config_rule_name)
+            .count()
     }
 
     /// Drop every remediation exception the clock has already taken past the instant it
@@ -5184,6 +5232,19 @@ pub fn encode_remediation_execution_token(resume_at: &(String, String)) -> Strin
 /// The resource key a `NextToken` resumes at, or `None` when the token is malformed —
 /// i.e. not something [`encode_remediation_execution_token`] produced.
 pub fn decode_remediation_execution_token(token: &str) -> Option<(String, String)> {
+    let mut fields = decode_length_prefixed_token(token, 2)?.into_iter();
+    Some((fields.next()?, fields.next()?))
+}
+
+/// Encode the resource key a `DescribeRemediationExceptions` page should resume at as an
+/// opaque `NextToken`.
+pub fn encode_remediation_exception_token(resume_at: &(String, String)) -> String {
+    encode_length_prefixed_token(&[&resume_at.0, &resume_at.1])
+}
+
+/// The resource key a `NextToken` resumes at, or `None` when the token is malformed —
+/// i.e. not something [`encode_remediation_exception_token`] produced.
+pub fn decode_remediation_exception_token(token: &str) -> Option<(String, String)> {
     let mut fields = decode_length_prefixed_token(token, 2)?.into_iter();
     Some((fields.next()?, fields.next()?))
 }
