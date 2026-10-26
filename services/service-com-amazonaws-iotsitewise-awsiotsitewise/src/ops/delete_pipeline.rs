@@ -157,6 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let key = crate::state::pipeline_key(&input.workspace_name, &input.pipeline_name);
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // A pipeline is identified by its workspace and its own name, so the lookup is
         // scoped to the workspace the request names and an absence there is the
@@ -178,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // delete as surely as one that is running. The precondition is evaluated
         // BEFORE anything is removed, so a refused delete leaves the pipeline, its
         // versions and its executions exactly as they were.
-        let active = store.active_pipeline_execution_count(&workspace, &name);
+        let active = store.active_pipeline_execution_count(&workspace, &name, now);
         if active > 0 {
             return Err(DeletePipelineError::Modeled(
                 DeletePipelineErrorModeled::ConflictingOperationException(

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelPipelineExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelPipelineExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelPipelineExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the handler below RECORDS a cancellation on the stored pipeline
+//! execution the request's `workspaceName`, `pipelineName` and
+//! `pipelineExecutionId` together name, and answers the state that leaves it in.
+//! The execution reports `CANCELLING` while the cancellation is in flight and
+//! `CANCELLED` from the instant it falls due, so nothing sleeps and no reader is
+//! told the execution is still waiting to run. A repeat cancel records no second
+//! cancellation and reports the state the execution stands in, and an execution
+//! whose run reached a terminal state is the modelled conflict.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +168,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelPipelineExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelPipelineExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelPipelineExecution"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            internal_failure("the IoT SiteWise store is unavailable".to_string())
+        })?;
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // The resources the path names are resolved OUTSIDE IN, as this service's
+        // other handlers resolve the resource a path names before the one inside
+        // it, so a request that names none of them reports the outermost absence.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            ));
+        }
+        // The pipeline's ARN is what the conflict refusal below names, so it is
+        // read from the stored pipeline rather than rebuilt.
+        let pipeline_arn = store
+            .pipelines
+            .get(&crate::state::pipeline_key(
+                &input.workspace_name,
+                &input.pipeline_name,
+            ))
+            .map(|pipeline| pipeline.arn.clone())
+            .ok_or_else(|| not_found(crate::state::RESOURCE_PIPELINE, &input.pipeline_name))?;
+
+        // An execution is identified by its id, and the record names the pipeline
+        // it belongs to: an id scoped to another workspace or pipeline names an
+        // execution this request does not address, which is an absence rather than
+        // another execution's cancellation.
+        let execution = store
+            .pipeline_executions
+            .get_mut(&input.pipeline_execution_id)
+            .filter(|execution| {
+                execution.workspace_name == input.workspace_name
+                    && execution.pipeline_name == input.pipeline_name
+            })
+            .ok_or_else(|| {
+                not_found(
+                    crate::state::RESOURCE_PIPELINE_EXECUTION,
+                    &input.pipeline_execution_id,
+                )
+            })?;
+
+        if execution.is_cancelable() {
+            // "If the execution is not in a terminal state … it transitions to
+            // CANCELLING and asynchronously to CANCELLED": the cancellation is
+            // RECORDED here, and from here the rest of the execution's lifecycle
+            // is owed by the clock from the instant it was recorded.
+            execution.record_cancel(input.reason.clone(), now);
+        } else if execution.cancel_requested_at.is_none() {
+            // "Calling it on a terminal execution (SUCCEEDED or FAILED) returns a
+            // conflict error" — an execution whose run is over cannot be
+            // cancelled, which is a refusal rather than a success that cancelled
+            // nothing.
+            let addressed = execution.id.clone();
+            let reached = execution.state(now).to_string();
+            return Err(conflict(
+                format!(
+                    "The pipeline execution {addressed} is in the {reached} state; only an \
+                     execution that has not reached a terminal state can be cancelled."
+                ),
+                addressed,
+                pipeline_arn,
+            ));
+        }
+        // Otherwise a cancel was already recorded: "This operation is idempotent:
+        // calling it on an execution that is already CANCELLING or CANCELLED
+        // returns success with the current state", so the repeat records no second
+        // cancellation and keeps the reason and the due instant the first one left.
+
+        Ok(CancelPipelineExecutionOutput {
+            // "The current execution state of the pipeline", derived from the
+            // record exactly as every reader of an execution derives it, so this
+            // response and a read that follows it cannot disagree.
+            state: execution.state(now).to_string(),
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` for the resource of `kind` the request
+/// named: a workspace this service does not hold, a pipeline that workspace does
+/// not hold, or an execution that pipeline does not hold. An execution is
+/// addressed only inside its pipeline, so the last is also what a cancel naming
+/// an execution of ANOTHER pipeline or workspace answers.
+fn not_found(kind: &str, identifier: &str) -> CancelPipelineExecutionError {
+    CancelPipelineExecutionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::not_found_message(kind, identifier),
+    })
+    .into()
+}
+
+/// HTTP 409 `ConflictingOperationException` naming the execution the
+/// cancellation could not be applied to and the pipeline it belongs to.
+fn conflict(
+    message: String,
+    pipeline_execution_id: String,
+    pipeline_arn: String,
+) -> CancelPipelineExecutionError {
+    CancelPipelineExecutionErrorModeled::ConflictingOperationException(
+        ConflictingOperationException {
+            message,
+            resource_id: pipeline_execution_id,
+            resource_arn: pipeline_arn,
+        },
+    )
+    .into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> CancelPipelineExecutionError {
+    CancelPipelineExecutionErrorModeled::InternalFailureException(InternalFailureException {
+        message,
+    })
+    .into()
 }

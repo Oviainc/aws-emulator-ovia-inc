@@ -8,7 +8,9 @@
 //! override maps the start request carried, and the per-compute-node execution
 //! details `StartPipelineExecution` resolved — paginating the compute nodes with
 //! `maxResults` / `nextToken`, as the operation's `@paginated` trait declares.
-//! Reporting only: it writes nothing.
+//! Its status is DERIVED from the record: an execution a cancel was recorded on
+//! reports that cancellation in flight and then complete, as the clock makes each
+//! due. Reporting only: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -193,6 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let _ = ctx;
+        let now = ::std::time::SystemTime::now();
 
         let store = state.lock();
 
@@ -258,9 +261,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             pipeline_name: execution.pipeline_name.clone(),
             workspace_name: execution.workspace_name.clone(),
             pipeline_version: execution.pipeline_version.clone(),
-            status: execution.status(),
+            status: execution.status(now),
             start_time: execution.start_time.map(crate::state::to_date_time),
-            end_time: execution.end_time.map(crate::state::to_date_time),
+            end_time: execution.ended_at(now).map(crate::state::to_date_time),
             request_environment_variables: execution.request_environment_variables.clone(),
             request_mount_overrides: execution.request_mount_overrides.clone(),
             execution_priority: Some(execution.execution_priority),

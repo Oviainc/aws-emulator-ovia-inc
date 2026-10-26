@@ -333,7 +333,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             workspace_name: pipeline.workspace_name.clone(),
             pipeline_name: pipeline.name.clone(),
             pipeline_version: pipeline.version_label(),
-            state: crate::state::EXECUTION_STATE_NOT_STARTED.to_string(),
+            run_state: crate::state::EXECUTION_STATE_NOT_STARTED.to_string(),
             execution_priority: input
                 .execution_priority
                 .unwrap_or(crate::state::DEFAULT_EXECUTION_PRIORITY),
@@ -343,6 +343,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing ran, so neither instant is known.
             start_time: None,
             end_time: None,
+            // Nothing has cancelled it.
+            cancel_requested_at: None,
+            cancel_reason: None,
             compute_nodes,
             client_token: input.client_token.clone(),
         };

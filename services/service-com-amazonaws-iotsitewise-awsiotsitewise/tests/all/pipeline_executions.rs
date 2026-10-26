@@ -71,7 +71,7 @@ type MountCase = (
 /// One `ComputeNode` of a pipeline's `computations`, as the table rows below
 /// declare it.
 #[derive(Debug, Clone)]
-struct Node {
+pub(crate) struct Node {
     name: &'static str,
     task: &'static str,
     depends_on: Vec<&'static str>,
@@ -81,7 +81,7 @@ struct Node {
 
 impl Node {
     /// A node with no dependencies and no environment variables of its own.
-    fn new(name: &'static str, task: &'static str) -> Self {
+    pub(crate) fn new(name: &'static str, task: &'static str) -> Self {
         Self {
             name,
             task,
@@ -91,7 +91,7 @@ impl Node {
     }
 
     /// The same, waiting on `depends_on`.
-    fn after(name: &'static str, task: &'static str, depends_on: &[&'static str]) -> Self {
+    pub(crate) fn after(name: &'static str, task: &'static str, depends_on: &[&'static str]) -> Self {
         Self {
             name,
             task,
@@ -148,7 +148,7 @@ fn mount(name: &str, relative_path: &str) -> Value {
 
 /// Create a workspace with the service's default encryption and assert it was
 /// accepted.
-async fn create_workspace(router: &MultiServiceRouter, name: &str) -> Value {
+pub(crate) async fn create_workspace(router: &MultiServiceRouter, name: &str) -> Value {
     let (status, body) = call(
         router,
         "POST",
@@ -164,7 +164,7 @@ async fn create_workspace(router: &MultiServiceRouter, name: &str) -> Value {
 }
 
 /// Create a task carrying `environment` and `mounts`, and assert it was accepted.
-async fn create_task(
+pub(crate) async fn create_task(
     router: &MultiServiceRouter,
     workspace: &str,
     task: &str,
@@ -200,7 +200,7 @@ async fn create_task(
 
 /// Create a pipeline out of `nodes`, returning the raw `(status, body)` so a
 /// suite can assert a refusal too.
-async fn create_pipeline(
+pub(crate) async fn create_pipeline(
     router: &MultiServiceRouter,
     workspace: &str,
     pipeline: &str,
@@ -224,7 +224,7 @@ async fn create_pipeline(
 
 /// Start an execution of `pipeline` with `body`, returning the raw
 /// `(status, body)`.
-async fn start_execution(
+pub(crate) async fn start_execution(
     router: &MultiServiceRouter,
     workspace: &str,
     pipeline: &str,
@@ -240,7 +240,11 @@ async fn start_execution(
 }
 
 /// Start an execution with no overrides at all and return its id.
-async fn start_plain(router: &MultiServiceRouter, workspace: &str, pipeline: &str) -> String {
+pub(crate) async fn start_plain(
+    router: &MultiServiceRouter,
+    workspace: &str,
+    pipeline: &str,
+) -> String {
     let (status, body) = start_execution(router, workspace, pipeline, json!({})).await;
     assert_eq!(status, 202, "start execution: got {status} {body}");
     let id = body["pipelineExecutionId"]
@@ -255,7 +259,7 @@ async fn start_plain(router: &MultiServiceRouter, workspace: &str, pipeline: &st
 }
 
 /// Describe an execution, appending `query` (already in `?a=b` form) to the URI.
-async fn describe_execution(
+pub(crate) async fn describe_execution(
     router: &MultiServiceRouter,
     workspace: &str,
     pipeline: &str,

@@ -105,7 +105,7 @@ use crate::ops::types::{
     ExecutionEnvironmentVariables, ExecutionStatus, ExecutionSummary, ExportErrorReportLocation,
     ExpressionVariable, File, GatewayCapabilitySummary, GatewayPlatform, HierarchyMapping, Identity,
     ImageLocation, JobConfiguration, LoggingOptions, Mount, MountOverrides, MultiLayerStorage,
-    PipelineExecutionStatus, PortalStatus,
+    PipelineExecutionStateDetails, PipelineExecutionStatus, PortalStatus,
     PortalTypeEntry, ProcessingInput, PropertyMapping, PropertyType, QueryStatistics, QuerySummary,
     ResolveTo, Resource, ResourceStatus, RetentionPeriod, SearchFilters, TargetResource,
     TaskConfiguration, TimeInNanos, TrimSettings, Variant, WarmTierRetentionPeriod,
@@ -493,6 +493,17 @@ pub const ENCRYPTION_TYPE_KMS_BASED: &str = "KMS_BASED_ENCRYPTION";
 /// that has not begun reports. Both enums declare it
 /// (`smithy_query(query="shape", shape="PipelineExecutionState,ComputeNodeExecutionState")`).
 pub const EXECUTION_STATE_NOT_STARTED: &str = "NOT_STARTED";
+
+/// The `PipelineExecutionState` an execution a cancel was recorded on reports
+/// until that cancellation has taken effect: the value the enum carries for a
+/// cancel in flight, which `CancelPipelineExecution` documents as the state such
+/// an execution "transitions to" before it goes "asynchronously to CANCELLED".
+pub const EXECUTION_STATE_CANCELLING: &str = "CANCELLING";
+
+/// The `PipelineExecutionState` a cancelled execution reports once its
+/// cancellation has taken effect. Terminal, and one of
+/// [`EXECUTION_TERMINAL_STATES`].
+pub const EXECUTION_STATE_CANCELLED: &str = "CANCELLED";
 
 /// The `PipelineExecutionState` values an execution STAYS in once it reaches
 /// one: the states in which the execution is over and nothing it does can move
@@ -1692,6 +1703,11 @@ impl ComputeNodeExecutionRecord {
 /// does hold is everything the request and the stored pipeline determine — the
 /// pipeline version it ran against, the DAG order, and the environment and mounts
 /// resolved per node.
+///
+/// A cancellation IS something a call does to an execution, so it is recorded
+/// here ([`Self::cancel_requested_at`]) and the state it takes the execution to
+/// is derived from the clock ([`Self::state`]) rather than stored, the way every
+/// other owed transition in this store is.
 #[derive(Debug, Clone)]
 pub struct PipelineExecutionRecord {
     pub id: String,
@@ -1699,8 +1715,12 @@ pub struct PipelineExecutionRecord {
     pub pipeline_name: String,
     /// The `version` the pipeline carried when the execution was accepted.
     pub pipeline_version: String,
-    /// A `PipelineExecutionState` value.
-    pub state: String,
+    /// The `PipelineExecutionState` the execution's own RUN has reached.
+    /// Nothing runs here, so it stays [`EXECUTION_STATE_NOT_STARTED`]; a cancel
+    /// is held separately in [`Self::cancel_requested_at`], so what
+    /// [`Self::state`] reports is derived from both rather than overwritten by
+    /// either.
+    pub run_state: String,
     /// The priority the execution runs at: the one the request named, or
     /// [`DEFAULT_EXECUTION_PRIORITY`].
     pub execution_priority: i32,
@@ -1713,6 +1733,16 @@ pub struct PipelineExecutionRecord {
     pub accepted_at: SystemTime,
     pub start_time: Option<SystemTime>,
     pub end_time: Option<SystemTime>,
+    /// When a cancel was recorded on this execution, if one was. A cancel is
+    /// recorded only on an execution whose run has not reached a terminal
+    /// state, and from that instant the rest of the execution's lifecycle is
+    /// owed by the clock rather than by any call.
+    pub cancel_requested_at: Option<SystemTime>,
+    /// The `reason` the recorded cancel carried, if it carried one: "A message
+    /// describing why the pipeline execution is being cancelled", which
+    /// `CancelPipelineExecution` documents "is returned in the stateDetails
+    /// field when you describe the execution".
+    pub cancel_reason: Option<String>,
     /// The compute nodes, in the DAG order
     /// [`compute_node_execution_order`] put them in.
     pub compute_nodes: Vec<ComputeNodeExecutionRecord>,
@@ -1724,20 +1754,92 @@ pub struct PipelineExecutionRecord {
 }
 
 impl PipelineExecutionRecord {
-    /// The execution's status.
-    pub fn status(&self) -> PipelineExecutionStatus {
-        PipelineExecutionStatus {
-            state: self.state.clone(),
-            state_details: None,
+    /// The execution's `PipelineExecutionState` at `now`.
+    ///
+    /// An execution a cancel was recorded on reports
+    /// [`EXECUTION_STATE_CANCELLING`] until that cancellation takes effect and
+    /// [`EXECUTION_STATE_CANCELLED`] from then on; otherwise it reports the
+    /// state its own run has reached. DERIVED rather than stored, because the
+    /// second half of the cancellation is owed by the clock and not by any
+    /// call, so two readers of one execution cannot disagree about where it has
+    /// got to and a read can never move it on.
+    pub fn state(&self, now: SystemTime) -> &str {
+        match self.cancel_requested_at {
+            Some(_) if self.cancelled_at(now).is_some() => EXECUTION_STATE_CANCELLED,
+            Some(_) => EXECUTION_STATE_CANCELLING,
+            None => self.run_state.as_str(),
         }
     }
 
-    /// Whether this execution is still ACTIVE: in a `PipelineExecutionState`
-    /// that is not one of [`EXECUTION_TERMINAL_STATES`], so the execution has
-    /// not finished. An execution waiting to begin counts as active — it has
-    /// not completed either.
-    pub fn is_active(&self) -> bool {
-        !EXECUTION_TERMINAL_STATES.contains(&self.state.as_str())
+    /// The instant the recorded cancellation took effect, and `None` until it
+    /// has — or when no cancel was recorded at all. The transition falls due
+    /// [`ACTIVATION_DELAY`] after the cancel was recorded, the span this
+    /// service owes every other transition it settles, and the instant is
+    /// DERIVED from the recorded one rather than slept for.
+    pub fn cancelled_at(&self, now: SystemTime) -> Option<SystemTime> {
+        let due = self.cancel_requested_at? + ACTIVATION_DELAY;
+        (now >= due).then_some(due)
+    }
+
+    /// The execution's status at `now`: the state [`Self::state`] derives, and
+    /// beside it the `stateDetails` — "additional information about the current
+    /// execution status. Populated when the execution has terminated", whose
+    /// `message` for a cancelled execution "is the reason you supplied when
+    /// calling CancelPipelineExecution". So the details appear with the terminal
+    /// state the cancellation reaches, and only when the cancel carried a
+    /// reason; the `code` and the per-step entries beside it are a FAILED
+    /// execution's ("present when the execution failed"), which a cancelled one
+    /// is not.
+    pub fn status(&self, now: SystemTime) -> PipelineExecutionStatus {
+        let state = self.state(now).to_string();
+        let state_details = self
+            .cancel_reason
+            .clone()
+            .filter(|_| EXECUTION_TERMINAL_STATES.contains(&state.as_str()))
+            .map(|message| PipelineExecutionStateDetails {
+                code: None,
+                message,
+                details: None,
+            });
+        PipelineExecutionStatus {
+            state,
+            state_details,
+        }
+    }
+
+    /// When the execution ended, and `None` while it has not: the instant its
+    /// run finished, or the instant a recorded cancellation took effect, since
+    /// that is when a cancelled execution reached the state it stays in.
+    pub fn ended_at(&self, now: SystemTime) -> Option<SystemTime> {
+        self.end_time.or_else(|| self.cancelled_at(now))
+    }
+
+    /// Whether this execution is still ACTIVE at `now`: in a
+    /// `PipelineExecutionState` that is not one of
+    /// [`EXECUTION_TERMINAL_STATES`], so the execution has not finished. An
+    /// execution waiting to begin counts as active — it has not completed
+    /// either — and one whose cancellation is still in flight does too.
+    pub fn is_active(&self, now: SystemTime) -> bool {
+        !EXECUTION_TERMINAL_STATES.contains(&self.state(now))
+    }
+
+    /// Whether a cancel may still be RECORDED on this execution: one whose run
+    /// has not reached a terminal state. An execution a cancel was already
+    /// recorded on is not cancelled again — the repeat is a no-op reporting the
+    /// state it stands in — and one whose run ended cannot be cancelled at all.
+    pub fn is_cancelable(&self) -> bool {
+        self.cancel_requested_at.is_none()
+            && !EXECUTION_TERMINAL_STATES.contains(&self.run_state.as_str())
+    }
+
+    /// Record a cancellation on this execution at `now`, carrying the `reason`
+    /// the request supplied. The due instant of the `CANCELLING` ->
+    /// `CANCELLED` transition is STORED (as the instant it is owed from), never
+    /// slept on, so the caller's own call returns immediately and the transient
+    /// state is still what a read taken straight afterwards observes.
+    pub fn record_cancel(&mut self, reason: Option<String>, now: SystemTime) {
+        self.cancel_requested_at = Some(now);
+        self.cancel_reason = reason;
     }
 }
 
@@ -4486,13 +4588,14 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         &self,
         workspace_name: &str,
         pipeline_name: &str,
+        now: SystemTime,
     ) -> usize {
         self.pipeline_executions
             .values()
             .filter(|execution| {
                 execution.workspace_name == workspace_name
                     && execution.pipeline_name == pipeline_name
-                    && execution.is_active()
+                    && execution.is_active(now)
             })
             .count()
     }
