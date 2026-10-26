@@ -240,6 +240,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `DomainNameConfiguration$DomainNameStatus` says "the domain can be
             // updated".
             migration_due_at: None,
+            // A domain name is created with no base path mapped: `CreateApiMapping` is
+            // what adds one.
+            api_mappings: ::std::collections::BTreeMap::new(),
+            api_mapping_id_seed: 0,
         };
 
         // Taking the entry back gives the STORED record, so what the caller is told is

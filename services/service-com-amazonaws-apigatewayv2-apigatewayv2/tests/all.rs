@@ -17,6 +17,8 @@ mod api_endpoint_scheme;
 mod api_import;
 #[path = "all/api_lifecycle.rs"]
 mod api_lifecycle;
+#[path = "all/api_mapping_lifecycle.rs"]
+mod api_mapping_lifecycle;
 #[path = "all/api_reimport.rs"]
 mod api_reimport;
 #[path = "all/api_update.rs"]

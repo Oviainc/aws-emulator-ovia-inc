@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApiMapping
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApiMapping`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApiMapping::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -151,18 +141,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApiMapping` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApiMappingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApiMapping"))
+        let _ = ctx;
+        // The mapping key is the base path requests are matched on, so its form is
+        // checked before anything is looked up: the rule is the key's alone and does not
+        // depend on the store. An absent key is the root mapping of the domain.
+        let requested_key = input.api_mapping_key.clone();
+        if let Err(message) =
+            crate::state::validate_api_mapping_key(requested_key.as_deref().unwrap_or(""))
+        {
+            return Err(bad_request(&message));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateApiMapping",
+            ));
+        };
+        let mut store = state.lock();
+        // Split the guard into field borrows, so the domain name can be held mutably
+        // while the api it maps to is read: the two stores are disjoint fields of one
+        // state struct, and neither lookup has to be repeated.
+        let store = &mut *store;
+
+        // The domain name is the resource this mapping is created UNDER (it is the
+        // operation's `@httpLabel`), so the name the path addresses is resolved first: a
+        // name the account does not hold is reported as the missing resource it is,
+        // before any member of the body is weighed against the store.
+        let Some(domain) = store.domain_names.get_mut(&input.domain_name) else {
+            return Err(not_found(crate::state::INVALID_DOMAIN_NAME_IDENTIFIER));
+        };
+
+        // A mapping routes to one stage of one api, so both are resolved before anything
+        // is stored: a mapping is never kept against an api or a stage that does not
+        // exist.
+        let Some(api) = store.apis.get(&input.api_id) else {
+            return Err(not_found(&format!(
+                "Invalid API identifier specified {}:{}",
+                ::engine::emulator_account_id(),
+                input.api_id
+            )));
+        };
+        // `Stage` names a stage of that api by its `StageName`. A value that names none
+        // of them — including the empty string, which the shape's undeclared length
+        // window lets through the boundary validator — is not a usable stage reference,
+        // which is incomplete-or-incorrect input rather than a missing resource.
+        if !api.stages.contains_key(&input.stage) {
+            return Err(bad_request(crate::state::INVALID_STAGE_IDENTIFIER));
+        }
+
+        // One base path of one domain name resolves to exactly one api stage, so a
+        // second mapping for a base path the domain name already maps would make
+        // routing on it ambiguous: that is a conflict "with the current state of a
+        // service resource associated with the request".
+        let base_path = requested_key.as_deref().unwrap_or("");
+        if domain.api_mapping_for_key(base_path).is_some() {
+            return Err(CreateApiMappingErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "An API mapping already exists for the domain name {} with the \
+                         specified API mapping key.",
+                        domain.domain_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Bound the growth a caller drives. `TooManyRequestsException` is the modelled
+        // error for "a limit has been exceeded" and carries the limit's name.
+        if domain.api_mappings.len() >= crate::state::MAX_API_MAPPINGS_PER_DOMAIN {
+            return Err(CreateApiMappingErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    limit_type: Some("ApiMapping".to_string()),
+                    message: Some(format!(
+                        "The maximum number of API mappings ({}) for this domain name has \
+                         been reached.",
+                        crate::state::MAX_API_MAPPINGS_PER_DOMAIN
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let api_mapping_id = domain.mint_api_mapping_id();
+        let record = crate::state::ApiMapping {
+            api_mapping_id: api_mapping_id.clone(),
+            api_id: input.api_id,
+            api_mapping_key: requested_key,
+            stage: input.stage,
+        };
+
+        // Project the STORED record, so what the caller is told is what a later
+        // GetApiMapping reports.
+        let stored = domain
+            .api_mappings
+            .entry(api_mapping_id)
+            .or_insert(record)
+            .to_wire();
+        Ok(CreateApiMappingOutput {
+            api_id: Some(stored.api_id),
+            api_mapping_id: stored.api_mapping_id,
+            api_mapping_key: stored.api_mapping_key,
+            stage: Some(stored.stage),
+        })
     }
+}
+
+/// This operation's refusal of a request it models no more specific error for: the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect"), whose message names the constraint that was not met.
+fn bad_request(message: &str) -> CreateApiMappingError {
+    CreateApiMappingErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's refusal of a request naming a resource the account does not hold:
+/// the modelled `NotFoundException` ("The resource specified in the request was not
+/// found").
+fn not_found(message: &str) -> CreateApiMappingError {
+    CreateApiMappingErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.to_string()),
+        resource_type: ::std::option::Option::None,
+    })
+    .into()
 }
