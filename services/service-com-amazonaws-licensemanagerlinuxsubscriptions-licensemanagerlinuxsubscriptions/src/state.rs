@@ -817,7 +817,16 @@ pub fn validate_filters(filters: &[Filter], valid_names: &[&str]) -> Result<(), 
 /// none when the resource leaves it unset. A list member satisfies the filter when any of
 /// its values does, which is what makes `NotEqual` mean "no value of this member equals
 /// any value I named".
+///
+/// Every operator compares the values the member HOLDS against the values the filter
+/// names, so a resource holding none of them satisfies no filter at all: there is nothing
+/// on it to equal, to differ from, or to contain what was named. `Equal` and `NotEqual`
+/// therefore partition the resources that hold the addressed member, and neither reaches
+/// one that leaves it unset.
 pub fn filter_selects(filter: &Filter, member_values: &[String]) -> bool {
+    if member_values.is_empty() {
+        return false;
+    }
     let values = filter.values.as_deref().unwrap_or_default();
     let equals = member_values.iter().any(|held| values.contains(held));
     match filter.operator.as_deref().unwrap_or(OPERATOR_EQUAL) {

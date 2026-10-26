@@ -16,6 +16,10 @@
 //! * a `Filter` selects on the member its `Name` addresses, with the comparison its
 //!   `Operator` names (`Equal`, `NotEqual`, `Contains`, and equality when absent), and
 //!   several filters select what satisfies all of them;
+//! * a filter compares against the values the addressed member HOLDS, so an instance that
+//!   holds none of them — an unset scalar member, an empty list member — satisfies no
+//!   filter whatever its operator, and `Equal`/`NotEqual` partition exactly the instances
+//!   that do hold the member;
 //! * `MaxResults`/`NextToken` page each list exactly once over every element, with no
 //!   token on the last page, and a cursor minted for one selection is not honoured for
 //!   another;
@@ -595,6 +599,212 @@ async fn an_instance_filter_selects_on_the_member_it_names() {
         vec!["i-0a1".to_string(), "i-0b2".to_string()],
         "case {case:?}: expected the running us-west instances, got {listed:?}"
     );
+}
+
+/// Every `Filter$Name` this list documents, with the `Instance` member it addresses.
+///
+/// The names are the model's documentation for
+/// `ListLinuxSubscriptionInstancesRequest$Filters` ("you can specify one of the following
+/// values for the `Name` key"); the member each addresses is the `Instance` member of that
+/// name — note that the `AmiID` filter addresses `Instance$AmiId`, and that `ProductCode`
+/// addresses a LIST member (`Instance$ProductCode`), so a record can hold several values
+/// for it or none.
+const FILTERED_MEMBERS: &[(&str, &str)] = &[
+    ("AccountID", "AccountID"),
+    ("AmiID", "AmiId"),
+    ("DualSubscription", "DualSubscription"),
+    ("InstanceID", "InstanceID"),
+    ("InstanceType", "InstanceType"),
+    ("ProductCode", "ProductCode"),
+    ("Region", "Region"),
+    ("Status", "Status"),
+    ("UsageOperation", "UsageOperation"),
+];
+
+/// One filter case: the `Filter$Name`, its `Operator` (`None` is an absent one), its
+/// `Values`, and the instance ids the filter must select, in instance-id order.
+type FilterCase = (
+    &'static str,
+    Option<&'static str>,
+    &'static [&'static str],
+    &'static [&'static str],
+);
+
+/// Build one filtered `ListLinuxSubscriptionInstances` request body. `operator` of `None`
+/// leaves `Operator` out, which is the equality an absent operator means.
+fn instance_filter(name: &str, operator: Option<&str>, values: &[&str]) -> Value {
+    let mut filter = json!({ "Name": name, "Values": values });
+    if let Some(operator) = operator {
+        filter["Operator"] = json!(operator);
+    }
+    json!({ "Filters": [filter] })
+}
+
+/// What the entry for one instance holds for the `Instance` member `name`: the string it
+/// carries, every element of the list member `ProductCode`, and nothing at all for a
+/// member the entry does not report.
+fn held_values(entry: &Value, name: &str) -> Vec<String> {
+    match entry.get(name) {
+        Some(Value::String(value)) => vec![value.clone()],
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn a_filter_cannot_select_an_instance_whose_member_holds_nothing() {
+    let h = harness();
+    discover(&h, DISCOVERED);
+
+    // (the filter's Name, its Operator — `None` is an absent one, its Values, the
+    // instance ids it selects in instance-id order). Only the records that HOLD a value
+    // for the addressed member can be selected, whatever the operator: `i-0d4` is the
+    // only record carrying a `DualSubscription` of "Yes" and the only one whose AMI
+    // reported no product code at all, while `i-0b2`, `i-0c3`, `i-0e5` and `i-0f6` hold
+    // no `DualSubscription`.
+    let cases: &[FilterCase] = &[
+        // A record holding nothing for the member is out of every answer, including the
+        // negated one — the defect this pins: it used to be in all of them.
+        ("DualSubscription", Some("NotEqual"), &["Yes"], &["i-0a1"]),
+        ("DualSubscription", Some("NotEqual"), &["No"], &["i-0d4"]),
+        ("DualSubscription", Some("NotEqual"), &["Yes", "No"], &[]),
+        (
+            "DualSubscription",
+            Some("NotEqual"),
+            &["neither-value"],
+            &["i-0a1", "i-0d4"],
+        ),
+        ("DualSubscription", Some("Contains"), &["o"], &["i-0a1"]),
+        ("DualSubscription", Some("Equal"), &["No"], &["i-0a1"]),
+        ("DualSubscription", None, &["No"], &["i-0a1"]),
+        // The same for the list member: an instance whose AMI reported no product code
+        // holds no value, so it differs from nothing.
+        (
+            "ProductCode",
+            Some("NotEqual"),
+            &["pc-rhel"],
+            &["i-0e5", "i-0f6"],
+        ),
+        (
+            "ProductCode",
+            Some("NotEqual"),
+            &["no-such-code"],
+            &["i-0a1", "i-0b2", "i-0c3", "i-0e5", "i-0f6"],
+        ),
+        (
+            "ProductCode",
+            Some("Contains"),
+            &["pc-"],
+            &["i-0a1", "i-0b2", "i-0c3", "i-0e5", "i-0f6"],
+        ),
+        (
+            "ProductCode",
+            Some("Equal"),
+            &["pc-rhel"],
+            &["i-0a1", "i-0b2", "i-0c3"],
+        ),
+        // A member every record holds is unaffected: a negated filter there still selects
+        // every record whose value differs.
+        (
+            "Status",
+            Some("NotEqual"),
+            &["running"],
+            &["i-0c3", "i-0f6"],
+        ),
+        (
+            "Region",
+            Some("NotEqual"),
+            &["us-west-2"],
+            &["i-0b2", "i-0d4", "i-0e5", "i-0f6"],
+        ),
+    ];
+
+    for (name, operator, values, expected) in cases {
+        let case = &format!("{name} {operator:?} {values:?}");
+        let reply = call(&h, INSTANCES, &instance_filter(name, *operator, values)).await;
+        let listed = instance_ids(&reply, case);
+        assert_eq!(
+            listed, *expected,
+            "case {case:?}: expected {expected:?}, got {listed:?}"
+        );
+        // Whatever an answer holds was selected on a value the client can see in it.
+        for entry in entries(&reply, "Instances", case) {
+            let held = held_values(entry, member_of(name));
+            assert!(
+                !held.is_empty(),
+                "case {case:?}: {entry:?} was selected on a member it reports no value for"
+            );
+        }
+    }
+}
+
+/// The `Instance` member the filter `name` addresses, from [`FILTERED_MEMBERS`].
+fn member_of(name: &str) -> &'static str {
+    FILTERED_MEMBERS
+        .iter()
+        .find(|(filter_name, _)| *filter_name == name)
+        .map(|(_, member)| *member)
+        .unwrap_or_else(|| panic!("{name} is a documented Filter$Name"))
+}
+
+#[tokio::test]
+async fn equal_and_not_equal_partition_the_instances_that_hold_the_member() {
+    let h = harness();
+    discover(&h, DISCOVERED);
+
+    let unfiltered = call(&h, INSTANCES, &json!({})).await;
+    let all = entries(&unfiltered, "Instances", "every discovered instance").clone();
+
+    // Asserted for EVERY documented filter name, not only the two whose members a record
+    // can leave unset: for one set of values, the instances `Equal` selects and the ones
+    // `NotEqual` selects are disjoint, and together they are exactly the instances that
+    // hold a value for the addressed member.
+    for (name, member_name) in FILTERED_MEMBERS {
+        let holders: Vec<String> = all
+            .iter()
+            .filter(|entry| !held_values(entry, member_name).is_empty())
+            .map(|entry| member(entry, "InstanceID", "holders"))
+            .collect();
+
+        // One value some instance holds, and one no instance holds: the two sides of the
+        // partition are non-trivial for the first and the whole of it for the second.
+        let held = all
+            .iter()
+            .find_map(|entry| held_values(entry, member_name).into_iter().next())
+            .unwrap_or_else(|| panic!("{member_name} is held by some discovered instance"));
+        for values in [vec![held.as_str()], vec!["no-instance-holds-this-value"]] {
+            let case = &format!("{name} partition on {values:?}");
+            let mut equal = instance_ids(
+                &call(&h, INSTANCES, &instance_filter(name, Some("Equal"), &values)).await,
+                case,
+            );
+            let not_equal = instance_ids(
+                &call(
+                    &h,
+                    INSTANCES,
+                    &instance_filter(name, Some("NotEqual"), &values),
+                )
+                .await,
+                case,
+            );
+            let overlap: Vec<&String> = equal.iter().filter(|id| not_equal.contains(id)).collect();
+            assert!(
+                overlap.is_empty(),
+                "case {case:?}: {overlap:?} are selected by both Equal and NotEqual"
+            );
+            equal.extend(not_equal);
+            equal.sort();
+            assert_eq!(
+                equal, holders,
+                "case {case:?}: Equal and NotEqual together must select exactly the \
+                 instances holding {member_name}, expected {holders:?}, got {equal:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

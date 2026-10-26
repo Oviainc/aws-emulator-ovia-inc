@@ -217,7 +217,8 @@ const FILTER_NAMES: &[&str] = &[
 
 /// What the member a filter `Name` addresses holds on `record`: one value for a scalar
 /// member, every value for the list member `ProductCode`, and none for a member the
-/// record leaves unset (which no filter can then select on).
+/// record leaves unset (which no filter can then select on, whatever its `Operator`:
+/// [`crate::state::filter_selects`] compares against the values a record HOLDS).
 ///
 /// Only a name in [`FILTER_NAMES`] reaches here, so an unknown one holds nothing.
 fn filtered_member(record: &crate::state::DiscoveredInstanceRecord, name: &str) -> Vec<String> {
