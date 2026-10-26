@@ -578,11 +578,14 @@ async fn an_undecodable_next_token_cannot_be_parsed() {
 async fn a_scaffolded_operation_still_answers_501_for_a_valid_request() {
     let client = Client::new();
     for (case, method, path, body) in [
+        // `ListNotifications` — the LENS notifications of a workload — is still a scaffold
+        // with its own issue; `ListProfileNotifications`, which this row used to name, is
+        // implemented and exercised by `super::profile_notifications`.
         (
-            "ListProfileNotifications",
-            "GET",
-            "/profileNotifications?MaxResults=10".to_string(),
-            None,
+            "ListNotifications",
+            "POST",
+            "/notifications".to_string(),
+            Some(json!({ "MaxResults": 10 })),
         ),
     ] {
         let answer = client.send(method, &path, body).await;
