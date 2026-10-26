@@ -73,6 +73,14 @@
 //! [`kafka_version_order`]), for the same reason: it is the single list every
 //! version-aware operation answers from.
 //!
+//! A cluster's resource-based policy is held ON that cluster record, as a
+//! [`ClusterPolicy`]: `PutClusterPolicy` attaches or replaces it through
+//! [`Cluster::put_policy`], `GetClusterPolicy` reports the stored document and
+//! its version, and `DeleteClusterPolicy` takes it off through
+//! [`Cluster::take_policy`] — one stored document, so the writer and both
+//! readers cannot disagree, and a cluster that leaves the registry takes its
+//! policy with it.
+//!
 //! The multi-VPC (PrivateLink) connection registry lives here too:
 //! `CreateVpcConnection` mints a [`VpcConnection`] with
 //! [`VpcConnection::requested`] and `DescribeVpcConnection` reports that same
@@ -887,6 +895,29 @@ pub struct Cluster {
     /// detail a reader reports comes off the record rather than from the kind's
     /// name.
     pub serverless: Option<ServerlessConfig>,
+    /// The resource-based policy attached to this cluster, or `None` while it
+    /// has none. A policy is a sub-resource of exactly one cluster — the model
+    /// addresses it as `/v1/clusters/{ClusterArn}/policy` — so it is stored on
+    /// the cluster record and disappears when the cluster does.
+    pub policy: Option<ClusterPolicy>,
+}
+
+/// The resource-based policy a cluster carries: the document a caller attached
+/// and which revision of the policy it is, so the `CurrentVersion` every reader
+/// reports is derived from the stored policy rather than echoed from a request.
+#[derive(Debug, Clone)]
+pub struct ClusterPolicy {
+    /// The policy document exactly as submitted — the service stores a policy,
+    /// it does not rewrite one.
+    pub document: String,
+    /// Which revision of this cluster's policy the stored document is: 1 for the
+    /// first one attached, the next for each one that replaces it.
+    pub revision: u64,
+    /// The `CurrentVersion` token of [`Self::revision`], minted the same way a
+    /// cluster's version token is but over the policy's own address, so a policy
+    /// version and a cluster version are never the same token and the policy's
+    /// changes exactly when the document does.
+    pub current_version: String,
 }
 
 /// The configuration of a serverless cluster: the VPCs its clients reach it
@@ -1164,6 +1195,15 @@ pub const MAX_SERVER_PROPERTIES_BYTES: usize = 256 * 1024;
 pub fn server_properties_too_large(body: &[u8]) -> bool {
     body.len() > MAX_SERVER_PROPERTIES_BYTES
 }
+
+/// How many bytes of policy document one cluster's resource-based policy may
+/// hold.
+///
+/// CHOSEN as a process-safety backstop, not an AWS quota: the modelled member is
+/// a string with no length constraint, so without a ceiling one call could store
+/// an arbitrarily large document. Sized far past any realistic resource-based
+/// policy, which holds at most a few dozen short statements.
+pub const MAX_CLUSTER_POLICY_BYTES: usize = 256 * 1024;
 
 /// Why an append to a configuration's revision history was refused. Decided on
 /// the one append path ([`ConfigurationRecord::append_revision`]) rather than by
@@ -3457,6 +3497,9 @@ impl Cluster {
             // A provisioned cluster carries no serverless configuration: the
             // per-kind detail is stored for the kind the record IS.
             serverless: None,
+            // A cluster is created with no resource-based policy; only
+            // `PutClusterPolicy` attaches one.
+            policy: None,
         }
     }
 
@@ -3542,6 +3585,9 @@ impl Cluster {
             revision: 1,
             pending_update: None,
             serverless: Some(config),
+            // Created with no resource-based policy, exactly as a provisioned
+            // cluster is.
+            policy: None,
         }
     }
 
@@ -3549,6 +3595,40 @@ impl Cluster {
     /// subject is the broker nodes tests before it reports or reconfigures them.
     pub fn is_serverless(&self) -> bool {
         self.cluster_type == CLUSTER_TYPE_SERVERLESS
+    }
+
+    /// Attach `document` as this cluster's resource-based policy, replacing any
+    /// policy it already carries, and hand back the stored record.
+    ///
+    /// Each attachment is the next revision of the cluster's policy, so the
+    /// `CurrentVersion` the writer answers with and every later reader reports
+    /// changes exactly when the stored document does.
+    pub fn put_policy(&mut self, document: String) -> &ClusterPolicy {
+        let revision = self
+            .policy
+            .as_ref()
+            .map_or(1, |policy| policy.revision.saturating_add(1));
+        // The token is minted over the policy's own address rather than the
+        // cluster's, so a policy version is never a token the cluster itself
+        // reports as its `CurrentVersion`.
+        let current_version = current_version_token(&format!("{}/policy", self.arn), revision);
+        self.policy.insert(ClusterPolicy {
+            document,
+            revision,
+            current_version,
+        })
+    }
+
+    /// Take this cluster's resource-based policy off the record, handing back
+    /// what was removed — `None` when the cluster carried none, which is what
+    /// makes a delete of an absent policy a not-found rather than a silent
+    /// success.
+    ///
+    /// The revision history goes with it: a policy attached after this one is
+    /// the first revision of a new policy, as it is on a cluster that never had
+    /// one.
+    pub fn take_policy(&mut self) -> Option<ClusterPolicy> {
+        self.policy.take()
     }
 
     /// The one bootstrap string a serverless cluster has, or `None` for a

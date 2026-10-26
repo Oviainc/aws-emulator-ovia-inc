@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteClusterPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteClusterPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteClusterPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes the resource-based policy off the cluster an ARN names, so every later
+//! reader answers as if the cluster never carried one. The policy is stored on
+//! the cluster record ([`crate::state::ClusterPolicy`]), which is why a cluster
+//! this endpoint's region does not hold and a cluster that carries no policy are
+//! both the one `NotFoundException` this operation models: either way the policy
+//! the request addresses does not exist.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +134,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteClusterPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteClusterPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteClusterPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteClusterPolicyErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some("the kafka service state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+        // The same split of the two client errors every cluster-addressed
+        // operation of this service draws: a value that is not a cluster ARN at
+        // all is a request the service cannot act on, and `NotFoundException` is
+        // reserved for a well-formed ARN whose policy it cannot find.
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(
+                DeleteClusterPolicyErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "{} is not a valid Amazon MSK cluster ARN.",
+                        input.cluster_arn
+                    )),
+                })
+                .into(),
+            );
+        }
+        let mut state = state.lock();
+        // Resolved through the settling lookup, as every operation that reaches
+        // a cluster does: the one write that lookup makes materialises the
+        // transition the clock already owed THIS cluster.
+        let removed = state
+            .settled_cluster_in_mut(&region, &input.cluster_arn, std::time::SystemTime::now())
+            .and_then(crate::state::Cluster::take_policy);
+        if removed.is_none() {
+            return Err(
+                DeleteClusterPolicyErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+        // The response models no member: that the policy is gone is what the
+        // readers report from the record, not something this reply carries.
+        Ok(DeleteClusterPolicyOutput {})
     }
 }

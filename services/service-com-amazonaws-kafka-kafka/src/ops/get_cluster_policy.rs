@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetClusterPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetClusterPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the resource-based policy stored on the cluster an ARN names, with
+//! the version that policy is at. REPORTING ONLY: the single write it makes is
+//! the one the settling lookup owes the cluster itself.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetClusterPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A cluster this endpoint's region does not hold and a cluster that carries no
+//! policy are both the one `NotFoundException` this operation models (either way
+//! the policy the request addresses does not exist), which is the same line
+//! `DeleteClusterPolicy` draws, so the reader and the delete agree about which
+//! policies exist.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +141,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetClusterPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetClusterPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetClusterPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetClusterPolicyErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        // A value that is not a cluster ARN at all is a request the service
+        // cannot act on; `NotFoundException` is reserved for a well-formed ARN
+        // whose policy it cannot find.
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(
+                GetClusterPolicyErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "{} is not a valid Amazon MSK cluster ARN.",
+                        input.cluster_arn
+                    )),
+                })
+                .into(),
+            );
+        }
+        let mut state = state.lock();
+        // Reporting only: the one write this makes materialises the transition
+        // the clock already owed THIS cluster, which was due at the same instant
+        // whether or not anybody called.
+        let stored = state
+            .settled_cluster_in(&region, &input.cluster_arn, std::time::SystemTime::now())
+            .and_then(|cluster| cluster.policy.clone());
+        let Some(policy) = stored else {
+            return Err(
+                GetClusterPolicyErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        };
+        Ok(GetClusterPolicyOutput {
+            current_version: Some(policy.current_version),
+            policy: Some(policy.document),
+        })
     }
 }

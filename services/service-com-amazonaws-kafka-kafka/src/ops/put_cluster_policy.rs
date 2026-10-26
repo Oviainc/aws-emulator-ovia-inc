@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutClusterPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutClusterPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Attaches a resource-based policy to the cluster an ARN names, replacing the
+//! policy it already carries, and answers with the version of the policy it
+//! stored. The document is held on the cluster record
+//! ([`crate::state::ClusterPolicy`]), so `GetClusterPolicy` reports the stored
+//! one and `DeleteClusterPolicy` takes that same one off.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutClusterPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This operation models no `NotFoundException`, so a cluster this endpoint's
+//! region does not hold is refused with the `BadRequestException` it does model,
+//! naming the parameter at fault.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +141,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutClusterPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutClusterPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutClusterPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutClusterPolicyErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        // Every check that depends on the request alone runs before the state
+        // lock is taken: a value that is not a cluster ARN, a document larger
+        // than this emulator stores, and a policy that is not a policy document
+        // at all — a resource-based policy is a JSON document, so a body that
+        // does not parse as a JSON object is not one. The document is parsed by
+        // `serde_json`, which bounds its own nesting depth, rather than by a
+        // hand-rolled walk over caller text.
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(
+                PutClusterPolicyErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "{} is not a valid Amazon MSK cluster ARN.",
+                        input.cluster_arn
+                    )),
+                })
+                .into(),
+            );
+        }
+        // `Policy` is stored verbatim as the cluster's policy, so the document
+        // this emulator will keep for one cluster is bounded here. Checked
+        // before the document is parsed, and before the lock: it depends on the
+        // request alone.
+        if input.policy.len() > crate::state::MAX_CLUSTER_POLICY_BYTES {
+            return Err(
+                PutClusterPolicyErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("Policy".to_string()),
+                    message: Some(format!(
+                        "Policy must be at most {} bytes.",
+                        crate::state::MAX_CLUSTER_POLICY_BYTES
+                    )),
+                })
+                .into(),
+            );
+        }
+        if !serde_json::from_str::<serde_json::Value>(&input.policy)
+            .is_ok_and(|document| document.is_object())
+        {
+            return Err(
+                PutClusterPolicyErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("Policy".to_string()),
+                    message: Some(crate::state::BAD_REQUEST_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        let mut state = state.lock();
+        // Resolved through the settling lookup, as every operation that reaches
+        // a cluster does. This operation models no `NotFoundException`, so an
+        // ARN this endpoint's region holds no cluster for — absent, or belonging
+        // to another region — is refused as a bad parameter, in the words the
+        // other cluster-addressed operations that model none use.
+        let Some(cluster) = state.settled_cluster_in_mut(
+            &region,
+            &input.cluster_arn,
+            std::time::SystemTime::now(),
+        ) else {
+            return Err(
+                PutClusterPolicyErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "No cluster exists in {region} with the ARN {}",
+                        input.cluster_arn
+                    )),
+                })
+                .into(),
+            );
+        };
+
+        // A quoted version must be the one the stored policy is actually at; a
+        // stale one means the caller is replacing a policy it has not read the
+        // latest version of. A request that quotes none replaces whatever is
+        // there, which is what makes the first attachment need no version.
+        if let Some(requested) = input.current_version.as_deref() {
+            let stored = cluster
+                .policy
+                .as_ref()
+                .map(|policy| policy.current_version.clone());
+            if stored.as_deref() != Some(requested) {
+                let message = match stored {
+                    Some(stored) => format!(
+                        "The cluster policy's current version is {stored}, not {requested}."
+                    ),
+                    None => format!(
+                        "The cluster carries no policy, so there is no version {requested} \
+                         to replace."
+                    ),
+                };
+                return Err(
+                    PutClusterPolicyErrorModeled::BadRequestException(BadRequestException {
+                        invalid_parameter: Some("CurrentVersion".to_string()),
+                        message: Some(message),
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        // The version answered here is the stored policy's own, so the caller
+        // can quote it back on the next replacement.
+        let stored = cluster.put_policy(input.policy);
+        Ok(PutClusterPolicyOutput {
+            current_version: Some(stored.current_version.clone()),
+        })
     }
 }
