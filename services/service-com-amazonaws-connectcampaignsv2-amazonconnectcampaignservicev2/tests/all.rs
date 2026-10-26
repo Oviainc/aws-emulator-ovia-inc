@@ -75,3 +75,5 @@ mod state_roundtrip;
 mod tag_key_refusal;
 #[path = "all/tag_key_rules.rs"]
 mod tag_key_rules;
+#[path = "all/tag_removal.rs"]
+mod tag_removal;

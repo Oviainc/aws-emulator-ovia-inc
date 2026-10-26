@@ -28,7 +28,11 @@ use service_com_amazonaws_s3_amazons3::service::wire::UNWRAPPED_XML_OUTPUT_OPERA
 use super::bucket_lifecycle::{create_bucket, router, send, Answer};
 
 /// `GET /<bucket>?location` — `GetBucketLocation`.
-async fn get_bucket_location(router: &MultiServiceRouter, bucket: &str) -> Answer {
+///
+/// `pub(crate)` so the suite that pins the global bucket namespace
+/// ([`super::bucket_name_namespace`]) reads a bucket's Region back through this one
+/// request rather than standing up a second one.
+pub(crate) async fn get_bucket_location(router: &MultiServiceRouter, bucket: &str) -> Answer {
     send(router, "GET", &format!("/{bucket}?location"), &[], "").await
 }
 
@@ -37,7 +41,10 @@ async fn get_bucket_location(router: &MultiServiceRouter, bucket: &str) -> Answe
 ///
 /// The text is the root's DIRECT text only: a value nested one element deeper leaves it
 /// empty, which is the difference this suite is about.
-fn root_element(answer: &Answer) -> (String, String) {
+///
+/// `pub(crate)` for the same reason as [`get_bucket_location`]: the namespace suite reads
+/// the Region out of the same unwrapped document through this one reader.
+pub(crate) fn root_element(answer: &Answer) -> (String, String) {
     let body = String::from_utf8_lossy(&answer.body).to_string();
     let mut reader = Reader::from_str(&body);
     let mut name = String::new();

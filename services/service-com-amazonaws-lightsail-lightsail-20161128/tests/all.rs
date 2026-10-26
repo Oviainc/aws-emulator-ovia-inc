@@ -19,6 +19,8 @@ mod active_names;
 mod add_on_disable;
 #[path = "all/alarm_configuration.rs"]
 mod alarm_configuration;
+#[path = "all/alarm_state_test.rs"]
+mod alarm_state_test;
 #[path = "all/auto_snapshots.rs"]
 mod auto_snapshots;
 #[path = "all/blueprint_catalog.rs"]

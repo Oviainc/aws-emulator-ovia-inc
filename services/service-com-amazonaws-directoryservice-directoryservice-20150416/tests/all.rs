@@ -47,6 +47,8 @@ mod microsoft_ad;
 mod request_id_header;
 #[path = "all/shared_directories.rs"]
 mod shared_directories;
+#[path = "all/snapshot_deletion.rs"]
+mod snapshot_deletion;
 #[path = "all/snapshots.rs"]
 mod snapshots;
 #[path = "all/state_roundtrip.rs"]

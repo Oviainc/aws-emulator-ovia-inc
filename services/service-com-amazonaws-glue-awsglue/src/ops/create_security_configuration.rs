@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSecurityConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSecurityConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSecurityConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers a named set of encryption properties in this account's per-account security
+//! configuration namespace
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::security_configurations`]): the whole
+//! definition comes from the request, the name must be free, and the create answers with
+//! the name it stored and the instant it stored it at. `GetSecurityConfiguration` reads
+//! the record back.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +152,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSecurityConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSecurityConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSecurityConfiguration"))
+        // Security configurations live in one per-account namespace, so nothing here
+        // depends on the request's Region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(
+                CreateSecurityConfigurationErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some(
+                            "the Glue security configuration store is unavailable".into(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The creation instant is read before the store is locked, so the timestamp a
+        // record carries is the instant the create was served.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // "The name for the new security configuration": the name is the whole address of
+        // the record, so a create under a name already stored is refused rather than
+        // overwriting the configuration a job or crawler already refers to.
+        if store.security_configurations.contains_key(&input.name) {
+            return Err(
+                CreateSecurityConfigurationErrorModeled::AlreadyExistsException(
+                    AlreadyExistsException {
+                        message: Some(
+                            crate::state::messages::SECURITY_CONFIGURATION_ALREADY_EXISTS
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The store is resident memory and this create is reachable by any caller, so the
+        // number of records one process will hold is bounded. Past the ceiling the request
+        // is refused with the operation's own modelled limit error.
+        if !store.can_store_security_configuration() {
+            return Err(
+                CreateSecurityConfigurationErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} security \
+                             configurations",
+                            crate::state::MAX_SECURITY_CONFIGURATIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let entry = crate::state::SecurityConfigurationEntry::from_create_input(&input, now);
+        // The timestamp the response reports is the STORED one, so it is the same instant
+        // every later read of this record reports.
+        let created_timestamp = crate::state::to_date_time(entry.created_at);
+        store
+            .security_configurations
+            .insert(input.name.clone(), entry);
+        ::tracing::info!(
+            operation = "CreateSecurityConfiguration",
+            security_configuration = %input.name,
+            "created a Glue security configuration"
+        );
+
+        // "The name assigned to the new security configuration" and "the time at which the
+        // new security configuration was created" — both read off the record just stored.
+        Ok(CreateSecurityConfigurationOutput {
+            name: Some(input.name),
+            created_timestamp: Some(created_timestamp),
+        })
     }
 }

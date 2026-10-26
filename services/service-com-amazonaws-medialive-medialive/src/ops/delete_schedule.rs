@@ -154,22 +154,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle(now);
 
-        // The channel is resolved through the LIVE lookup, for the reason
-        // `BatchUpdateSchedule` states: a channel whose delete this service has
-        // accepted owns no schedule a caller may still clear, so the mutation is
-        // answered with this operation's modelled `NotFoundException` (404).
-        let deleted = state
-            .channels
-            .get(&input.channel_id)
-            .is_some_and(crate::state::ChannelRecord::is_delete_accepted);
-        let channel = state.live_channel_mut(&input.channel_id).ok_or_else(|| {
-            let message = if deleted {
-                crate::state::already_deleted_message(&format!("Channel {}", input.channel_id))
-            } else {
-                crate::state::not_found_message("Channel", &input.channel_id)
-            };
+        // The channel is resolved through the shared channel-mutation guard, for
+        // the reason `BatchUpdateSchedule` states: a channel whose delete this
+        // service has accepted owns no schedule a caller may still clear, so the
+        // mutation is answered with this operation's modelled
+        // `NotFoundException` (404).
+        let channel = state.mutable_channel(&input.channel_id).map_err(|dead| {
             DeleteScheduleErrorModeled::NotFoundException(NotFoundException {
-                message: Some(message),
+                message: Some(dead.message),
             })
         })?;
 

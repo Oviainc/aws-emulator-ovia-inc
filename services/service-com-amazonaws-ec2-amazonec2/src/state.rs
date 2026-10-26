@@ -3821,6 +3821,15 @@ impl ComAmazonawsEc2Amazonec2State {
     /// per-direction rule quota; a writer whose request may exceed it asks
     /// [`Self::has_security_group_rule_capacity`] first and refuses the whole request
     /// rather than storing a group with fewer rules than it asked for.
+    ///
+    /// A permission of `spec` that the store has no room for is a VALUE here, never an
+    /// assertion: the store's own ceiling ([`MAX_SECURITY_GROUP_RULES`]) is reachable from
+    /// request traffic, and an assertion on a path a request reaches is a panic rather than
+    /// an invariant. What keeps a shortfall from reading as success is that the group's
+    /// aggregate `IpPermissions` members are recomputed from the rules the store HOLDS
+    /// ([`Self::resync_security_group_permissions`]), so the group can never report a rule
+    /// that was not stored, and `DescribeSecurityGroupRules` and `DescribeSecurityGroups`
+    /// still answer the same set.
     pub fn insert_security_group(&mut self, spec: SecurityGroupSpec) -> String {
         let group_id = self.next_id("sg");
         let region = spec.region.clone();
@@ -3849,7 +3858,7 @@ impl ComAmazonawsEc2Amazonec2State {
             // `CreateSecurityGroup` takes no rules from the request — so their bytes are not
             // charged to the caller-chosen budget, the same terms the group's own name and
             // description are stored on.
-            let minted = self.insert_security_group_rules(
+            self.insert_security_group_rules(
                 &group_id,
                 false,
                 permission,
@@ -3859,32 +3868,9 @@ impl ComAmazonawsEc2Amazonec2State {
                 false,
                 &region,
             );
-            // Those defaults always fit the published per-direction quota, so a permission
-            // dropped here would be a group stored with fewer rules than its spec named —
-            // the one thing the empty answer of `insert_security_group_rules` could hide.
-            // Asserted rather than returned, because a writer whose permissions may not fit
-            // asks `has_security_group_rule_capacity` and refuses the whole request instead
-            // of reaching here.
-            debug_assert_eq!(
-                minted.len(),
-                ip_permission_grant_count(permission),
-                "every grant of an inbound permission a group is created with mints a rule"
-            );
         }
         for permission in &spec.ip_permissions_egress {
-            let minted = self.insert_security_group_rules(
-                &group_id,
-                true,
-                permission,
-                &[],
-                false,
-                &region,
-            );
-            debug_assert_eq!(
-                minted.len(),
-                ip_permission_grant_count(permission),
-                "every grant of an outbound permission a group is created with mints a rule"
-            );
+            self.insert_security_group_rules(&group_id, true, permission, &[], false, &region);
         }
         group_id
     }
@@ -9681,6 +9667,29 @@ pub fn invalid_id_parameter_value<E>(
 ) -> crate::scaffolded::Scaffolded<E> {
     invalid_parameter_value(format!(
         "Value ({value}) for parameter {parameter} is invalid. Expected: '{prefix}-...'."
+    ))
+}
+
+/// The request member an EC2 operation whose `Filters` are checked at the PARAMETER layer
+/// names in that refusal: the member of the request, singular, as that layer spells it.
+const FILTER_PARAMETER: &str = "Filter";
+
+/// Refuse a `Filters` entry naming a filter the operation does not document, the way the
+/// operations that check their request members at the PARAMETER layer do: HTTP 400
+/// `InvalidParameterValue`, with that layer's one wording for every value it rejects —
+/// "Value (<value>) for parameter <member> is invalid. <why>" — carrying the name the
+/// request sent.
+///
+/// Like a malformed id ([`invalid_id_parameter_value`]), an unrecognised filter name is
+/// answered two ways by EC2 and WHICH one is a fact of the operation rather than of the
+/// name: the describes that resolve their own filters answer `The filter '<name>' is
+/// invalid`, while an operation whose `Filters` member is validated as a request parameter
+/// answers this one. The parameter layer appends a reason after the period, and a name that
+/// is simply not one of the operation's has none to add, so the message ends with that
+/// separating space and nothing after it.
+pub fn invalid_filter_parameter_value<E>(name: &str) -> crate::scaffolded::Scaffolded<E> {
+    invalid_parameter_value(format!(
+        "Value ({name}) for parameter {FILTER_PARAMETER} is invalid. "
     ))
 }
 

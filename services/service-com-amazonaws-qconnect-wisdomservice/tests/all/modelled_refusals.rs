@@ -179,12 +179,17 @@ async fn every_refusal_answers_its_own_status_code_and_fixed_text() {
     );
 
     // The label forms a request can name a resource by: each must answer the same way.
+    // The third element says whether the label names a resource identity of THIS account
+    // at all — the two ARNs of another account and another partition do not, which is
+    // what the one path that decides authorization before resolving anything
+    // (`CreateSession`) keys on.
     let absent_labels = [
-        ("bare uuid", ABSENT_UUID.to_string()),
-        ("this account's arn", assistant_arn(ABSENT_UUID)),
+        ("bare uuid", ABSENT_UUID.to_string(), true),
+        ("this account's arn", assistant_arn(ABSENT_UUID), true),
         (
             "another account's arn for a live id",
             format!("arn:aws:wisdom:{REGION}:123456789012:assistant/{assistant_id}"),
+            false,
         ),
         (
             "another partition's arn for a live id",
@@ -192,6 +197,7 @@ async fn every_refusal_answers_its_own_status_code_and_fixed_text() {
                 "arn:aws-cn:wisdom:{REGION}:{account}:assistant/{assistant_id}",
                 account = engine::EMULATOR_ACCOUNT_ID
             ),
+            false,
         ),
     ];
 
@@ -200,9 +206,19 @@ async fn every_refusal_answers_its_own_status_code_and_fixed_text() {
         error_type: "ResourceNotFoundException",
         message: MESSAGE_ASSISTANT_NOT_FOUND,
     };
+    let unauthorized = Expected {
+        status: 401,
+        error_type: "UnauthorizedException",
+        message: MESSAGE_UNAUTHORIZED,
+    };
 
-    for (form, label) in &absent_labels {
+    for (form, label, names_this_account) in &absent_labels {
         let encoded = encode_label(label);
+        let create_session_expected = if *names_this_account {
+            &not_found_assistant
+        } else {
+            &unauthorized
+        };
         let rows: Vec<(String, Reply, &Expected)> = vec![
             (
                 format!("GetAssistant/{form}"),
@@ -243,9 +259,11 @@ async fn every_refusal_answers_its_own_status_code_and_fixed_text() {
                 &not_found_assistant,
             ),
             (
-                // The session create path authorizes the caller against the parent
-                // assistant before resolving it, so a parent it cannot resolve is the
-                // modelled `UnauthorizedException`.
+                // The session create path decides authorization against the label in its
+                // path before resolving anything: a label that names no resource
+                // identity of this account is refused for permissions, while one that
+                // could name an assistant of this account is resolved and reported
+                // absent like every other read of a missing assistant.
                 format!("CreateSession under an absent assistant/{form}"),
                 emulator
                     .send(
@@ -254,11 +272,7 @@ async fn every_refusal_answers_its_own_status_code_and_fixed_text() {
                         Some(json!({ "name": "orphan" })),
                     )
                     .await,
-                &Expected {
-                    status: 401,
-                    error_type: "UnauthorizedException",
-                    message: MESSAGE_UNAUTHORIZED,
-                },
+                create_session_expected,
             ),
             (
                 format!("GetKnowledgeBase/{form}"),

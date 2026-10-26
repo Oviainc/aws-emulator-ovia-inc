@@ -273,6 +273,12 @@ mod chime_app_instance_admin_authorization;
 // while this span of the sorted list is untouched by those appends.
 #[path = "all/mediaconvert_input_probe.rs"]
 mod mediaconvert_input_probe;
+// Declared HERE, in this quiet span of the sorted list, rather than appended at the end of
+// this file or beside the other `cloudformation_*` suites in the `c` span: both of those are
+// where every concurrently landing suite puts its line, so a declaration there conflicts
+// with all of them.
+#[path = "all/cloudformation_ec2_network_identifiers.rs"]
+mod cloudformation_ec2_network_identifiers;
 #[path = "all/partnercentral_channel_target_routing.rs"]
 mod partnercentral_channel_target_routing;
 #[path = "all/personalize_signing_name_routing.rs"]

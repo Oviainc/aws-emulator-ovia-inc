@@ -81,6 +81,8 @@ mod resource_policies;
 mod schema_registry;
 #[path = "all/search_tables.rs"]
 mod search_tables;
+#[path = "all/security_configurations.rs"]
+mod security_configurations;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/store_capacity.rs"]

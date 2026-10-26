@@ -293,14 +293,17 @@ async fn a_declared_but_unimplemented_elbv2_action_is_reached_not_refused_as_unk
             )],
         ),
         (
-            "AddTags",
+            // `AddTags` was this row until it was implemented (its own stub issue is
+            // closed); `RemoveTags`, the other tagging write over the same
+            // `ResourceArns` input, is the stub that stands in for the same shape of
+            // answer.
+            "RemoveTags",
             &[
                 (
                     "ResourceArns.member.1",
                     "arn:aws:elasticloadbalancing:us-west-2:000000000000:targetgroup/t/0",
                 ),
-                ("Tags.member.1.Key", "team"),
-                ("Tags.member.1.Value", "platform"),
+                ("TagKeys.member.1", "team"),
             ],
         ),
     ];

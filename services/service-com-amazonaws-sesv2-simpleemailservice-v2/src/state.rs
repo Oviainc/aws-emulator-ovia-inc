@@ -169,6 +169,15 @@ pub const MAX_CONFIGURATION_SETS: usize = 10_000;
 /// letters, numbers, hyphens (-) and underscores (_) only."
 pub const MAX_CONFIGURATION_SET_NAME_LEN: usize = 64;
 
+/// Event destinations one configuration set may hold.
+///
+/// A CHOSEN bound, not an AWS one: a destination is created by a request, so a
+/// long-lived emulator must not grow without limit while serving them. It is far
+/// above what a client publishing a set's events to its destinations needs, and
+/// `CreateConfigurationSetEventDestination` refuses past it with the
+/// `LimitExceededException` its model binds.
+pub const MAX_EVENT_DESTINATIONS_PER_SET: usize = 1_000;
+
 /// Per-service state for com-amazonaws-sesv2-simpleemailservice-v2. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
@@ -817,6 +826,12 @@ pub struct ConfigurationSetRecord {
     pub message_security_options: Option<crate::ops::types::MessageSecurityOptions>,
     /// Tags, in the order they were supplied.
     pub tags: Vec<(String, String)>,
+    /// The event destinations this set publishes its events to, keyed by the
+    /// `EventDestinationName` they were created with — a name that "identifies the
+    /// event destination within the configuration set", so it is keyed exactly as
+    /// supplied and unique only within this set. Ordered, so a read enumerates them
+    /// deterministically.
+    pub event_destinations: BTreeMap<String, EventDestinationRecord>,
     /// When the set was created.
     pub created_at: SystemTime,
     /// When the set's reputation metrics were last given a fresh start.
@@ -854,6 +869,9 @@ impl ConfigurationSetRecord {
             vdm_options: None,
             message_security_options: None,
             tags: Vec::new(),
+            // A set publishes events only where a caller attaches a destination to
+            // it, so a newly created set has none.
+            event_destinations: BTreeMap::new(),
             created_at: now,
             last_fresh_start: now,
         }
@@ -898,6 +916,79 @@ impl ConfigurationSetRecord {
             })
             .collect()
     }
+}
+
+/// One event destination of a configuration set: where the events a send through
+/// that set produces are published to, and which of them are.
+#[derive(Debug, Clone)]
+pub struct EventDestinationRecord {
+    /// The `EventDestinationName` this record is keyed by, as the request spelled it.
+    pub name: String,
+    /// `EventDestinationDefinition$Enabled`: whether SES publishes to this
+    /// destination at all.
+    pub enabled: bool,
+    /// `EventDestinationDefinition$MatchingEventTypes`, in the order supplied: the
+    /// event types this destination receives. A definition that named none receives
+    /// nothing, which is an empty list rather than an absent member — `EventDestination`
+    /// models the member as required.
+    pub matching_event_types: Vec<String>,
+    /// The Kinesis Data Firehose stream this destination publishes to, when it is one.
+    pub kinesis_firehose_destination: Option<crate::ops::types::KinesisFirehoseDestination>,
+    /// The CloudWatch dimensions this destination publishes, when it is one.
+    pub cloud_watch_destination: Option<crate::ops::types::CloudWatchDestination>,
+    /// The SNS topic this destination publishes to, when it is one.
+    pub sns_destination: Option<crate::ops::types::SnsDestination>,
+    /// The EventBridge event bus this destination publishes to, when it is one.
+    pub event_bridge_destination: Option<crate::ops::types::EventBridgeDestination>,
+    /// The Pinpoint application this destination publishes to, when it is one.
+    pub pinpoint_destination: Option<crate::ops::types::PinpointDestination>,
+}
+
+impl EventDestinationRecord {
+    /// The destination `name` as the definition in a create or update request
+    /// describes it.
+    pub fn new(name: &str, definition: crate::ops::types::EventDestinationDefinition) -> Self {
+        Self {
+            name: name.to_string(),
+            enabled: definition.enabled,
+            matching_event_types: definition.matching_event_types.unwrap_or_default(),
+            kinesis_firehose_destination: definition.kinesis_firehose_destination,
+            cloud_watch_destination: definition.cloud_watch_destination,
+            sns_destination: definition.sns_destination,
+            event_bridge_destination: definition.event_bridge_destination,
+            pinpoint_destination: definition.pinpoint_destination,
+        }
+    }
+
+    /// The modelled `EventDestination` view of this record.
+    ///
+    /// One projection shared by every operation that reports a set's event
+    /// destinations, so a create and the read after it cannot disagree.
+    pub fn view(&self) -> crate::ops::types::EventDestination {
+        crate::ops::types::EventDestination {
+            name: self.name.clone(),
+            enabled: self.enabled,
+            matching_event_types: self.matching_event_types.clone(),
+            kinesis_firehose_destination: self.kinesis_firehose_destination.clone(),
+            cloud_watch_destination: self.cloud_watch_destination.clone(),
+            sns_destination: self.sns_destination.clone(),
+            event_bridge_destination: self.event_bridge_destination.clone(),
+            pinpoint_destination: self.pinpoint_destination.clone(),
+        }
+    }
+}
+
+/// How this service words `AlreadyExistsException` for an event-destination name a
+/// configuration set already holds, stated once for every operation that attaches
+/// one.
+pub fn event_destination_already_exists(
+    configuration_set_name: &str,
+    event_destination_name: &str,
+) -> String {
+    format!(
+        "Event destination {event_destination_name} already exists in configuration set \
+         {configuration_set_name}."
+    )
 }
 
 /// The `TlsPolicy` value a configuration set holds when the caller configured none.

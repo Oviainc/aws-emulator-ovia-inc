@@ -13,7 +13,8 @@
 //!   not assigned to is reported as absent;
 //! * role credentials are minted by the emulator, stored, and expire in the future;
 //! * `Logout` invalidates the session in state, so every later call is unauthorized;
-//! * an unusable token is 401 and an unreadable request is 400, on every operation.
+//! * an unusable token is 401, and an authenticated but unreadable request is 400, on
+//!   every operation.
 
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
@@ -795,9 +796,10 @@ enum Expect {
     RefusedByTheCodec,
 }
 
-/// RULE: a request this service cannot read is 400 `InvalidRequestException` — an
-/// absent required parameter, a `maxResults` outside the modeled 1..100 range, or a
-/// `nextToken` it did not issue.
+/// RULE: a request from an AUTHENTICATED caller that this service cannot read is 400
+/// `InvalidRequestException` — an absent required parameter, a `maxResults` outside the
+/// modeled 1..100 range, or a `nextToken` it did not issue. (A request presenting no
+/// usable session never gets this far: it is 401, whatever else it carries.)
 #[tokio::test]
 async fn an_unreadable_request_is_an_invalid_request() {
     let portal = Portal::new();
@@ -851,27 +853,18 @@ async fn an_unreadable_request_is_an_invalid_request() {
         }
     }
 
-    // Absent required members: one row for every (route, `@required` http-bound member)
-    // pair this service's model declares — the access-token header on all four routes,
-    // plus the account id and role name their query strings carry. A request omitting
-    // one matches no route at all, so this is also the guard that the service's
+    // Absent required members, for an AUTHENTICATED caller: one row for every (route,
+    // `@required` http-bound member) pair this service's model declares except the
+    // access-token header, which is the caller's credential and not a parameter — a
+    // request that presents no session is unauthenticated whatever else it omits, which
+    // `bearer_token_gate.rs` pins over every route. A request omitting a parameter
+    // matches no route at all, so this is also the guard that the service's
     // required-member table still agrees with the model.
     let absent: &[(&str, &str, Option<&str>)] = &[
-        ("ListAccounts without a token", "/assignment/accounts", None),
-        (
-            "ListAccountRoles without a token",
-            "/assignment/roles?account_id=111111111111",
-            None,
-        ),
         (
             "ListAccountRoles without an account",
             "/assignment/roles",
             Some("tok-live"),
-        ),
-        (
-            "GetRoleCredentials without a token",
-            "/federation/credentials?account_id=111111111111&role_name=ReadOnly",
-            None,
         ),
         (
             "GetRoleCredentials without an account",
@@ -894,16 +887,6 @@ async fn an_unreadable_request_is_an_invalid_request() {
             body_text(&response)
         );
     }
-
-    // The same rule on the one route that is not a GET.
-    let logout = portal.logout(None).await;
-    assert_eq!(
-        (logout.status(), error_code(&logout).as_str()),
-        (StatusCode::BAD_REQUEST, "InvalidRequestException"),
-        "case \"Logout without a token\": expected 400 InvalidRequestException, got {} {:?}",
-        logout.status(),
-        body_text(&logout)
-    );
 
     // Cursors this service did not issue for THIS listing: not hex, hex of something
     // else, a cursor for the other listing, and a cursor issued to another session.

@@ -44,6 +44,8 @@ mod eip_ec2_propagation;
 mod entitlement_connector;
 #[path = "all/entitlements.rs"]
 mod entitlements;
+#[path = "all/environment_deletion_cascade.rs"]
+mod environment_deletion_cascade;
 #[path = "all/environment_deletion_hosts.rs"]
 mod environment_deletion_hosts;
 #[path = "all/environment_health_checks.rs"]

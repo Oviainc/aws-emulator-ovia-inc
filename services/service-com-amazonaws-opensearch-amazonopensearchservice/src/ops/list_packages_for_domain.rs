@@ -192,9 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // status they are then in.
         store.settle_packages(now);
         if let Some(domain) = store.settled_mut(&input.domain_name, now) {
-            for association in domain.package_associations.values_mut() {
-                association.settle(now);
-            }
+            domain.settle_package_associations(now);
         }
 
         // The set belongs to the domain, so a name the store holds no domain for has no

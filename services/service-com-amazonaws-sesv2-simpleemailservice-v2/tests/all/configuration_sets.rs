@@ -29,8 +29,11 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// One answered request: the status, the error shape when there was one, and the parsed
 /// body.
-struct Reply {
-    status: u16,
+///
+/// Shared with the sibling suites of this test target, so every case reads a reply the
+/// same way.
+pub(crate) struct Reply {
+    pub(crate) status: u16,
     error_type: Option<String>,
     body: Value,
 }
@@ -40,7 +43,7 @@ impl Reply {
     ///
     /// restJson1 resolves the error shape from `x-amzn-errortype`; the JSON body's
     /// `__type` carries the same name, so either is read.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         let raw = self
             .error_type
             .as_deref()
@@ -51,7 +54,7 @@ impl Reply {
     }
 
     /// The message the error carried, for an assertion that wants to show it.
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         self.body
             .get("message")
             .or_else(|| self.body.get("Message"))
@@ -80,13 +83,13 @@ impl Reply {
     }
 
     /// A member of the body, or `Value::Null` when absent.
-    fn member(&self, member: &str) -> Value {
+    pub(crate) fn member(&self, member: &str) -> Value {
         self.body.get(member).cloned().unwrap_or(Value::Null)
     }
 
     /// Whether the body carries no members at all: what an operation whose output shape
     /// declares none answers with.
-    fn is_empty_body(&self) -> bool {
+    pub(crate) fn is_empty_body(&self) -> bool {
         match &self.body {
             Value::Null => true,
             Value::Object(members) => members.is_empty(),
@@ -96,12 +99,15 @@ impl Reply {
 }
 
 /// The emulated service behind its router.
-struct Ses {
+///
+/// Shared with the sibling suites of this test target, so every case drives the same
+/// wire path.
+pub(crate) struct Ses {
     router: MultiServiceRouter,
 }
 
 impl Ses {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These cases exercise handler behaviour, not SigV4.
@@ -110,7 +116,7 @@ impl Ses {
         Self { router }
     }
 
-    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
+    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
         let payload = match &body {
             Some(value) => bytes::Bytes::from(serde_json::to_vec(value).expect("serialize body")),
             None => bytes::Bytes::new(),
@@ -148,12 +154,12 @@ impl Ses {
         }
     }
 
-    async fn create_set(&self, body: Value) -> Reply {
+    pub(crate) async fn create_set(&self, body: Value) -> Reply {
         self.call("POST", "/v2/email/configuration-sets", Some(body))
             .await
     }
 
-    async fn get_set(&self, name: &str) -> Reply {
+    pub(crate) async fn get_set(&self, name: &str) -> Reply {
         self.call("GET", &format!("/v2/email/configuration-sets/{name}"), None)
             .await
     }

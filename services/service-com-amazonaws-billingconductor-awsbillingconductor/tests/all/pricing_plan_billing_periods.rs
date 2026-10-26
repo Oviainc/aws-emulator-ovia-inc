@@ -43,7 +43,7 @@ fn current_period() -> String {
 }
 
 /// Update a pricing plan through the wire.
-async fn update_plan(em: &Emulator, case: &str, plan: &str, changes: &Value) {
+pub(crate) async fn update_plan(em: &Emulator, case: &str, plan: &str, changes: &Value) {
     let mut body = changes.clone();
     body["Arn"] = json!(plan);
     let (status, answer) = em.put(UPDATE_PATH, &body).await;
@@ -56,7 +56,12 @@ async fn update_plan(em: &Emulator, case: &str, plan: &str, changes: &Value) {
 /// The `PricingPlanListElement` `ListPricingPlans` reports for ONE plan in `period`
 /// (`None` names no period at all), or `None` when the listing does not report the plan
 /// for that period at all.
-async fn element_in(em: &Emulator, case: &str, plan: &str, period: Option<&str>) -> Option<Value> {
+pub(crate) async fn element_in(
+    em: &Emulator,
+    case: &str,
+    plan: &str,
+    period: Option<&str>,
+) -> Option<Value> {
     let mut body = json!({"Filters": {"Arns": [plan]}});
     if let Some(period) = period {
         body["BillingPeriod"] = json!(period);

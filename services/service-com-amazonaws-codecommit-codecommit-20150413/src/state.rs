@@ -508,10 +508,24 @@ pub const INVALID_ACTOR_ARN_MESSAGE: &str =
     "The Amazon Resource Name (ARN) is not valid. Make sure that you have provided the full ARN \
      for the user who initiated the change for the pull request, and then try again.";
 
+/// `InvalidAuthorArnException`'s message: the sentence the model documents for
+/// that shape — the failure, then what to provide instead — naming nothing from
+/// the request. The one place this crate words that code, exactly as
+/// [`INVALID_ACTOR_ARN_MESSAGE`] is the one place it words the actor's.
+pub const INVALID_AUTHOR_ARN_MESSAGE: &str =
+    "The Amazon Resource Name (ARN) is not valid. Make sure that you have provided the full ARN \
+     for the author of the pull request, and then try again.";
+
 /// `InvalidPullRequestEventTypeException`'s message: likewise the shape's own
 /// documented sentence, worded here once for every operation that raises the
 /// code.
 pub const INVALID_PULL_REQUEST_EVENT_TYPE_MESSAGE: &str = "The pull request event type is not valid.";
+
+/// `InvalidPullRequestStatusException`'s message: likewise the shape's own
+/// documented sentence, which states the two values the status admits (see
+/// [`PULL_REQUEST_STATUS_OPEN`] and [`PULL_REQUEST_STATUS_CLOSED`]).
+pub const INVALID_PULL_REQUEST_STATUS_MESSAGE: &str =
+    "The pull request status is not valid. The only valid values are OPEN and CLOSED.";
 
 /// The message AWS returns with `RepositoryDoesNotExistException`: the requested
 /// repository name, then `" for "`, then the account the lookup ran in.

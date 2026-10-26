@@ -12,6 +12,7 @@
 //!    input POSITION that failed and the value submitted there
 //!    (`Value '<value>' at '<member path>'`), EXCEPT at a position whose value ACM
 //!    withholds — a resource identifier (`…Arn`), a request token (`…Token`), a
+//!    position on the TAG surface, a
 //!    value the validating walk holds no submitted text for (a collection's element
 //!    count, a value past its echo cap), and a clause collapsed onto a COLLECTION
 //!    member, whose submitted scalar is an element rather than the position named —
@@ -51,8 +52,9 @@ enum Subject<'a> {
     /// The value as submitted, which is what every position states but the few ACM
     /// withholds.
     Echoed(&'a str),
-    /// The withholding form, for a resource identifier, a request token, or a value
-    /// the validating walk holds no submitted text for.
+    /// The withholding form, for a resource identifier, a request token, a position
+    /// on the tag surface, or a value the validating walk holds no submitted text
+    /// for.
     Withheld,
 }
 
@@ -366,6 +368,10 @@ fn cases() -> Vec<Case<'static>> {
             )],
             withheld: vec![],
         },
+        // A member of a list element, reported at its nested path — and on the TAG
+        // surface, whose text ACM withholds wherever it is reached, so the clause
+        // names the nested position alone. [`crate::tag_surface_refusal_subject`]
+        // is that rule's own suite.
         Case {
             what: "a member of a list element, reported at its nested path",
             operation: "AddTagsToCertificate",
@@ -373,9 +379,9 @@ fn cases() -> Vec<Case<'static>> {
                 "CertificateArn": arn,
                 "Tags": [{ "Key": "{not-a-legal-key}", "Value": "ok" }],
             }),
-            subject: Subject::Echoed("{not-a-legal-key}"),
+            subject: Subject::Withheld,
             clauses: vec![("tags.1.member.key", pattern_requirement(TAG_KEY_PATTERN))],
-            withheld: vec![],
+            withheld: vec!["{not-a-legal-key}"],
         },
         Case {
             what: "a list ELEMENT outside its enum value set",

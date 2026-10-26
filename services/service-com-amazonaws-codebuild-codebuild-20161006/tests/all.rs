@@ -21,6 +21,8 @@ mod command_execution_lifecycle;
 mod delete_report_group;
 #[path = "all/fleet_lifecycle.rs"]
 mod fleet_lifecycle;
+#[path = "all/list_build_batches.rs"]
+mod list_build_batches;
 #[path = "all/list_builds.rs"]
 mod list_builds;
 #[path = "all/list_sandboxes.rs"]

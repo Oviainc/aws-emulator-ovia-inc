@@ -196,15 +196,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle(now);
 
-        let channel = state.channels.get_mut(&input.channel_id).ok_or_else(|| {
+        let channel = state.mutable_channel(&input.channel_id).map_err(|dead| {
             RestartChannelPipelinesErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::not_found_message("Channel", &input.channel_id)),
+                message: Some(dead.message),
             })
         })?;
 
         // "Restart pipelines in one channel that is currently running": a channel
         // that is not running has no pipelines to restart, so every other state is
-        // a conflict rather than a no-op.
+        // a conflict rather than a no-op. A channel whose delete has been accepted
+        // never reaches here: the guard above answers it as not found.
         if channel.state != crate::state::channel_state::RUNNING {
             return Err(RestartChannelPipelinesErrorModeled::ConflictException(
                 ConflictException {
