@@ -47,6 +47,8 @@ mod get_catalog_item;
 mod get_order_reporting;
 #[path = "all/get_site_address_reporting.rs"]
 mod get_site_address_reporting;
+#[path = "all/identifier_arn_identity.rs"]
+mod identifier_arn_identity;
 #[path = "all/order_cancellation.rs"]
 mod order_cancellation;
 #[path = "all/order_lifecycle.rs"]

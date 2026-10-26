@@ -93,6 +93,61 @@ impl IdentityPool {
     }
 }
 
+/// Why a pool does not serve the basic (classic) authentication flow, whose entry point is
+/// `GetOpenIdToken`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassicFlowRefusal {
+    /// The pool's `AllowClassicFlow` disables the flow.
+    Disabled,
+    /// The pool's roles are chosen by a ROLE MAPPING, which only the enhanced flow
+    /// resolves.
+    RoleMappings,
+}
+
+impl ClassicFlowRefusal {
+    /// How AWS words this refusal: a fixed sentence per reason, naming what about the pool
+    /// closes the flow and pointing the caller at the flow that pool does serve. Neither
+    /// carries a part taken from the request or from stored state — what is wrong is the
+    /// flow the call is in, not any value it carried.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Disabled => "Basic (classic) flow is not enabled, please use enhanced flow.",
+            Self::RoleMappings => {
+                "Basic (classic) flow is not supported with RoleMappings, please use enhanced \
+                 flow."
+            }
+        }
+    }
+}
+
+/// Why `pool`, configured with `roles`, does not serve the basic (classic) authentication
+/// flow — and `None` when it does.
+///
+/// Two things close that flow, and both are the pool's own stored configuration:
+///
+/// * `AllowClassicFlow` "enables or disables the Basic (Classic) authentication flow"
+///   (`smithy_query(query="doc",shape="CreateIdentityPoolInput",member="AllowClassicFlow")`),
+///   so a pool that stored `false` for it forbids the flow outright;
+/// * a ROLE MAPPING picks the role for an identity from the claims of the token the exchange
+///   presents, which the SERVICE does as it vends — the enhanced flow. In the basic flow the
+///   client assumes a role of its own choosing, so a token minted for it would bypass the
+///   mapping altogether, and a pool whose roles are mapped does not serve that flow.
+///
+/// A pool that stored no value for the flag has made no such choice, and this service
+/// reports exactly what was stored, so the absent flag alone does not close the flow.
+pub fn classic_flow_refusal(
+    pool: &IdentityPool,
+    roles: Option<&IdentityPoolRoles>,
+) -> Option<ClassicFlowRefusal> {
+    if pool.allow_classic_flow == Some(false) {
+        return Some(ClassicFlowRefusal::Disabled);
+    }
+    if roles.is_some_and(IdentityPoolRoles::has_role_mappings) {
+        return Some(ClassicFlowRefusal::RoleMappings);
+    }
+    None
+}
+
 /// Whether `provider_name` names an Amazon Cognito user pool: the
 /// `cognito-idp.<region>.amazonaws.com/<UserPoolId>` form `GetId.Logins` publishes for
 /// one ("Amazon Cognito user pool: `cognito-idp.<region>.amazonaws.com/<YOUR_USER_POOL_ID>`",
@@ -277,6 +332,17 @@ pub struct IdentityPoolRoles {
 }
 
 impl IdentityPoolRoles {
+    /// Whether this configuration maps any identity provider to a role.
+    ///
+    /// A role MAPPING is resolved by the service as it vends — it reads the claims of the
+    /// token the exchange presents and picks the role its rules name — so it is a
+    /// configuration only the enhanced flow can honour.
+    pub fn has_role_mappings(&self) -> bool {
+        self.role_mappings
+            .as_ref()
+            .is_some_and(|role_mappings| !role_mappings.is_empty())
+    }
+
     /// The role a vend assumes when the request names no `CustomRoleArn`: this pool's
     /// `authenticated` role for a request that presented a login, its `unauthenticated`
     /// role for one that did not. `None` when the pool configured no role for that flow,
@@ -352,6 +418,12 @@ pub struct IssuedOpenIdToken {
     pub identity_pool_id: String,
     pub issued_at: SystemTime,
     pub expiration: SystemTime,
+    /// The `Logins` provider names the ISSUING call presented: what authenticated the
+    /// identity this token names, which is what the token's own `amr` claim is built from
+    /// ([`authentication_methods`]). Empty for an issuance made with no login at all — an
+    /// unauthenticated one — so the methods of such a token are the unauthenticated method
+    /// alone.
+    pub authenticated_by: Vec<String>,
     /// The `PrincipalTags` the issuing call carried, ordered so a read reports the same
     /// map twice. `None` when the caller sent none, so nothing invents an empty map.
     pub principal_tags: Option<BTreeMap<String, String>>,
@@ -711,6 +783,46 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
             .iter()
             .filter(|(provider, _)| provider.as_str() == COGNITO_IDENTITY_LOGIN_PROVIDER)
             .find_map(|(_, token)| self.resolve_login_token(token, now).err())
+    }
+
+    /// The authentication methods an exchange presenting `logins` is made under: the values
+    /// the `...:amr` condition key publishes to the trust policy the exchange is decided
+    /// against ([`web_identity_condition_context`]).
+    ///
+    /// What authenticated the user is what the LOGIN says, not the name it is handed over
+    /// under. An entry made under this service's own provider name carries a token this
+    /// service MINTED, so the providers that authenticated the identity are the ones that
+    /// token's issuance recorded — the very values its `amr` claim carries
+    /// ([`open_id_token`]) — which is what tells a developer-authenticated login apart from
+    /// a user-pool one at the exchange. An entry of any other provider is itself the
+    /// provider that authenticated the user, and a token this service cannot resolve adds no
+    /// method beyond the name it was presented under.
+    pub fn exchange_authentication_methods(
+        &self,
+        logins: &HashMap<String, String>,
+        now: SystemTime,
+    ) -> Vec<String> {
+        let mut presented: Vec<(&String, &String)> = logins.iter().collect();
+        presented.sort();
+        let mut providers: Vec<String> = Vec::new();
+        for (provider, login) in presented {
+            let recorded = (provider.as_str() == COGNITO_IDENTITY_LOGIN_PROVIDER)
+                .then(|| self.resolve_login_token(login, now).ok())
+                .flatten()
+                .map(|issued| issued.authenticated_by.clone())
+                .unwrap_or_default();
+            if recorded.is_empty() {
+                providers.push(provider.clone());
+            } else {
+                providers.extend(recorded);
+            }
+        }
+        providers.sort();
+        providers.dedup();
+        let mut methods = authentication_methods(&providers);
+        methods.sort();
+        methods.dedup();
+        methods
     }
 
     /// Mint an `IdentityPoolId` in `region` that no stored pool already uses.
@@ -1179,13 +1291,15 @@ pub fn resolve_role<Eng: Send + Sync + 'static>(
 /// `Condition` to be decided against: the pool the session is vended for, the identity it
 /// is vended to, and the authentication methods the exchange was made under.
 ///
-/// `providers` are the `Logins` provider names the request presented, which is what makes
-/// the exchange an authenticated one. Nothing is invented: every pair comes from the
-/// request and from the stored identity it names.
+/// `methods` are those authentication methods
+/// ([`ComAmazonawsCognitoidentityAwscognitoidentityserviceState::exchange_authentication_methods`]),
+/// which is what makes the exchange an authenticated or an unauthenticated one. Nothing is
+/// invented: every pair comes from the request, from the stored identity it names and from
+/// the issuance of the token it presents.
 pub fn web_identity_condition_context(
     identity_pool_id: &str,
     identity_id: &str,
-    providers: &[String],
+    methods: &[String],
 ) -> Vec<(String, String)> {
     let mut context = vec![
         (
@@ -1195,9 +1309,9 @@ pub fn web_identity_condition_context(
         (SUBJECT_CONDITION_KEY.to_string(), identity_id.to_string()),
     ];
     context.extend(
-        authentication_methods(providers)
-            .into_iter()
-            .map(|method| (AUTHENTICATION_METHODS_CONDITION_KEY.to_string(), method)),
+        methods
+            .iter()
+            .map(|method| (AUTHENTICATION_METHODS_CONDITION_KEY.to_string(), method.clone())),
     );
     context
 }
@@ -1780,6 +1894,7 @@ pub fn record_issued_web_identity<Eng: Send + Sync + 'static>(
             issuer: OIDC_TOKEN_ISSUER.to_string(),
             audience: issued.identity_pool_id.clone(),
             subject: issued.identity_id.clone(),
+            authentication_methods: authentication_methods(&issued.authenticated_by),
             expires_at: issued.expiration,
         },
         now,

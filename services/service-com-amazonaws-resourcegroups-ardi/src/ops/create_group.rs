@@ -218,16 +218,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  but not both",
             ));
         }
-        // Modelled on `GroupConfigurationItem$Type`: "Each item must have a unique
-        // value for type." The list's own 0..2 length and each `Type`'s pattern are
-        // modelled constraints, already refused before this handler runs.
+        // The service-configuration rules this service decides in one place, so
+        // every operation that takes a `Configuration` refuses the same documents
+        // ([`crate::state::check_configuration`]).
         if let Some(items) = input.configuration.as_ref() {
-            if let Some(duplicate) = first_duplicate_type(items) {
-                return Err(bad_request(format!(
-                    "Configuration is not valid: each configuration item must have a \
-                     unique Type, and {duplicate} appears more than once",
-                )));
-            }
+            crate::state::check_configuration(items).map_err(bad_request)?;
         }
         // The group service configuration can declare the group an APPLICATION
         // group, which is the one kind of group that carries an application
@@ -339,6 +334,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A `Configuration` that carries no item configures nothing, so the
             // group is stored exactly as one that sent none.
             configuration: input.configuration.filter(|items| !items.is_empty()),
+            // A group that was just created has no configuration update in
+            // flight: the configuration a create stores is already in effect.
+            pending_configuration: None,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             members: Vec::new(),
             // Nothing has been grouped or ungrouped in a group that was just
@@ -376,16 +374,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         Ok(output)
     }
-}
-
-/// The first configuration item `Type` that appears twice in `items`, or `None`
-/// when every item's `Type` is distinct.
-fn first_duplicate_type(items: &[GroupConfigurationItem]) -> Option<&str> {
-    items
-        .iter()
-        .enumerate()
-        .find(|(at, item)| items[..*at].iter().any(|earlier| earlier.r#type == item.r#type))
-        .map(|(_, item)| item.r#type.as_str())
 }
 
 /// A `BadRequestException` (HTTP 400) — the modelled refusal for a request whose

@@ -49,6 +49,8 @@ mod primary_email_update_self_reaffirmation;
 mod region_opt_in;
 #[path = "all/region_opt_in_listing.rs"]
 mod region_opt_in_listing;
+#[path = "all/region_opt_target_rule.rs"]
+mod region_opt_target_rule;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/unknown_account_refusal.rs"]
