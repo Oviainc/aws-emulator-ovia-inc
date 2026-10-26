@@ -223,6 +223,12 @@ fn probes(cluster: &str) -> Vec<Probe> {
             String::new(),
         ),
         probe(
+            "ListUpdates",
+            "GET",
+            format!("/clusters/{label}/updates"),
+            String::new(),
+        ),
+        probe(
             "CancelUpdate",
             "POST",
             format!("/clusters/{label}/updates/{UPDATE_ID}/cancel-update"),

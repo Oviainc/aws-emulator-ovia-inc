@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetImageBlockPublicAccessState
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetImageBlockPublicAccessState`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Reports the account's *block public access for AMIs* setting in the Region
+//! the request was signed for: the state it is in and who manages it. A pure read — the
+//! setting is one word per Region in [`crate::state::ComAmazonawsEc2Amazonec2State`] with no
+//! clock-owed move, so two calls in a row report the same thing and this handler writes
+//! nothing. A `DryRun` request is refused before the setting is read, so it reports nothing
+//! at all.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetImageBlockPublicAccessState::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +140,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetImageBlockPublicAccessState` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetImageBlockPublicAccessStateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetImageBlockPublicAccessState"))
+        use crate::state;
+
+        // This request carries nothing else to validate — `DryRun` is its only member — so
+        // the flag's question ("would this request have succeeded?") is answered ahead of
+        // the read: a dry run reports nothing about the account's setting. "If you have the
+        // required permissions, the error response is DryRunOperation" (`DryRun`).
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "block public access for AMIs at the account level in the specified Amazon Web
+        // Services Region": the Region this request was signed for is which setting it asks
+        // about, so a Region nothing has enabled it in reports its own state.
+        let region = state::request_region(ctx.parts());
+
+        let store = state::require_service_state(&*self.engine)?;
+        // A REPORTING operation: the state is read out of the store and nothing is written
+        // back, so this call cannot change what a later caller sees.
+        let reported = store.lock().image_block_public_access_state(&region);
+
+        Ok(GetImageBlockPublicAccessStateOutput {
+            image_block_public_access_state: Some(reported.to_string()),
+            // "account - The state is managed by the account" (`ManagedBy`). The enum's
+            // other member, `declarative-policy`, names a state set OUTSIDE EC2 that
+            // "can't be modified by the account", and no operation of this API can put the
+            // setting into it — so every state this emulator holds is the account's own.
+            managed_by: Some(state::MANAGED_BY_ACCOUNT.to_string()),
+        })
     }
 }

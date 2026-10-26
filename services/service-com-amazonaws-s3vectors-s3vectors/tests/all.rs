@@ -13,8 +13,12 @@
 // points it into `tests/all/`.
 #[path = "all/bucket_policy.rs"]
 mod bucket_policy;
+#[path = "all/bucket_policy_enforcement.rs"]
+mod bucket_policy_enforcement;
 #[path = "all/policy_not_found_message.rs"]
 mod policy_not_found_message;
+#[path = "all/query_candidate_slots.rs"]
+mod query_candidate_slots;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/resource_tagging.rs"]
@@ -23,5 +27,7 @@ mod resource_tagging;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_write_conflict.rs"]
+mod tag_write_conflict;
 #[path = "all/vector_lifecycle.rs"]
 mod vector_lifecycle;
