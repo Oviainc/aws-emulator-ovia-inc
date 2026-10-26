@@ -15,7 +15,8 @@
 //! The metrics side of a monitor hangs off that same record: the extended-metrics
 //! destinations `PutRumMetricsDestination` creates, and under each of them the metric
 //! definitions `BatchCreateRumMetricDefinitions` creates,
-//! `BatchGetRumMetricDefinitions` reports and `UpdateRumMetricDefinition` replaces. Both
+//! `BatchGetRumMetricDefinitions` reports, `UpdateRumMetricDefinition` replaces and
+//! `BatchDeleteRumMetricDefinitions` removes. Both
 //! are keyed through the one [`metric_destination_key`], so no two of those operations can
 //! disagree about which destination a request names.
 
@@ -164,11 +165,15 @@ pub const MAX_METRIC_DESTINATIONS_PER_APP_MONITOR: usize = 100;
 /// models.
 pub const MAX_METRIC_DEFINITIONS_PER_DESTINATION: usize = 2000;
 
-/// The most metric definitions one `BatchCreateRumMetricDefinitions` call may name.
+/// The most metric definitions one batch call may name — the same bound for the batch that
+/// creates them and the batch that deletes them.
 ///
 /// Also AWS's own: "The maximum number of metric definitions that you can specify in one
-/// BatchCreateRumMetricDefinitions operation is 200." `MetricDefinitionsRequest` carries
-/// no modelled length, so the handler is what refuses a longer list.
+/// BatchCreateRumMetricDefinitions operation is 200", and, for the delete, "The maximum
+/// number of metric definitions that you can specify in one
+/// BatchDeleteRumMetricDefinitions operation is 200." Neither
+/// `MetricDefinitionsRequest` nor `MetricDefinitionIds` carries a modelled length, so the
+/// handler is what refuses a longer list.
 pub const MAX_METRIC_DEFINITIONS_PER_BATCH: usize = 200;
 
 /// The namespace RUM publishes EXTENDED metrics to.
@@ -758,6 +763,24 @@ impl AppMonitorRecord {
         self.metric_definitions
             .get_mut(&metric_destination_key(destination, destination_arn))?
             .get_mut(metric_definition_id)
+    }
+
+    /// Remove the ONE definition the `(Destination, DestinationArn, MetricDefinitionId)`
+    /// triple names, for the caller that DELETES it
+    /// (`BatchDeleteRumMetricDefinitions`). `None` when that destination holds no
+    /// definition under that id, which the caller reports as that id's own error while the
+    /// rest of the batch is still deleted. Keyed through the same
+    /// [`metric_destination_key`] the create and the read use, so a delete cannot address a
+    /// different destination from the one a create stored the definition under.
+    pub fn remove_metric_definition(
+        &mut self,
+        destination: &str,
+        destination_arn: Option<&str>,
+        metric_definition_id: &str,
+    ) -> Option<MetricDefinitionRecord> {
+        self.metric_definitions
+            .get_mut(&metric_destination_key(destination, destination_arn))?
+            .remove(metric_definition_id)
     }
 
     /// Store `record` as a definition of that destination, under the id it carries.

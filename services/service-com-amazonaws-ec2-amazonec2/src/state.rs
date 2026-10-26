@@ -557,7 +557,12 @@
 //! that due instant is a fact the modelled [`IpamPool`] carries no member for, so it lives
 //! beside the pool under the same id in
 //! [`ComAmazonawsEc2Amazonec2State::ipam_pool_create_complete_at`], the way a `pending`
-//! VPC's does.
+//! VPC's does. A scope `CreateIpamScope` creates is the same story one level up: it is
+//! answered in the non-terminal `create-in-progress` `IpamScopeState` and its due instant
+//! lives in [`ComAmazonawsEc2Amazonec2State::ipam_scope_create_complete_at`] — the two
+//! DEFAULT scopes an IPAM comes up with are not listed there, because the one entry
+//! [`ComAmazonawsEc2Amazonec2State::ipam_create_complete_at`] holds for the IPAM already
+//! covers them.
 //!
 //! ## Network Access Scopes and their analyses
 //!
@@ -2160,21 +2165,21 @@ pub struct ComAmazonawsEc2Amazonec2State {
     default_vpc_ids: BTreeMap<String, String>,
     /// Every association between a local gateway route table and a virtual interface group
     /// the account holds, by `LocalGatewayRouteTableVirtualInterfaceGroupAssociationId`, as
-    /// the modelled `LocalGatewayRouteTableVirtualInterfaceGroupAssociation` shape itself —
-    /// so a member a writer sets round-trips through
+    /// the modelled `LocalGatewayRouteTableVirtualInterfaceGroupAssociation` shape beside the
+    /// move the clock owes it
+    /// ([`LocalGatewayRouteTableVirtualInterfaceGroupAssociationRecord`]) — so a member a
+    /// writer sets round-trips through
     /// `DescribeLocalGatewayRouteTableVirtualInterfaceGroupAssociations` without a
-    /// field-by-field copy, the way the VPC and subnet stores hold their shapes. Ordered by
-    /// id, which is the order that describe reports and pages over.
+    /// field-by-field copy, the way the VPC association store beside it holds its own shape.
+    /// Ordered by id, which is the order that describe reports and pages over.
     ///
     /// Starts EMPTY, unlike the stores above it: a local gateway and the route tables and
     /// virtual interface groups on it exist only on an Outpost, which no EC2 call creates,
     /// so an account without one has no association to report.
     /// [`Self::insert_local_gateway_route_table_virtual_interface_group_association`] is the
     /// one way an association is stored.
-    pub local_gateway_route_table_virtual_interface_group_associations: BTreeMap<
-        String,
-        crate::ops::types::LocalGatewayRouteTableVirtualInterfaceGroupAssociation,
-    >,
+    pub local_gateway_route_table_virtual_interface_group_associations:
+        BTreeMap<String, LocalGatewayRouteTableVirtualInterfaceGroupAssociationRecord>,
     /// Every association between a local gateway route table and a VPC the account holds, by
     /// `LocalGatewayRouteTableVpcAssociationId`, as the modelled
     /// [`crate::ops::types::LocalGatewayRouteTableVpcAssociation`] shape beside the move the
@@ -2814,10 +2819,25 @@ pub struct ComAmazonawsEc2Amazonec2State {
     ///
     /// A fresh account holds none: a scope belongs to an IPAM, so the two default scopes of
     /// an IPAM are written by [`Self::insert_ipam`] when `CreateIpam` creates it, and
-    /// `CreateIpamScope` (still a scaffold) is what would add a further one. Until an IPAM
+    /// `CreateIpamScope` adds a further one through
+    /// [`Self::insert_created_ipam_scope`]. Until an IPAM
     /// exists, every scope id a request names answers [`INVALID_IPAM_SCOPE_ID_NOT_FOUND`] —
     /// exactly as the real service does for a scope that does not exist.
     pub ipam_scopes: BTreeMap<String, IpamScope>,
+    /// When a `create-in-progress` IPAM scope's move to `create-complete` falls due, by
+    /// `IpamScopeId` — the fact the modelled [`IpamScope`] shape carries no member for,
+    /// stored beside the scope for the same reason, and on the same monotonic clock, as
+    /// [`Self::ipam_pool_create_complete_at`].
+    ///
+    /// Only a scope `CreateIpamScope` created is listed: the two DEFAULT scopes of an IPAM
+    /// are completed by the ONE entry [`Self::ipam_create_complete_at`] holds for that
+    /// IPAM, which covers everything that create made at once.
+    pub ipam_scope_create_complete_at: BTreeMap<String, Instant>,
+    /// A `CreateIpamScope` `ClientToken` and the `IpamScopeId` that call minted, so a replay
+    /// of the same request answers with that scope instead of creating a second one: "a
+    /// unique, case-sensitive identifier that you provide to ensure the idempotency of the
+    /// request" (`CreateIpamScopeRequest$ClientToken`).
+    pub ipam_scope_client_tokens: HashMap<String, String>,
     /// When a `create-in-progress` IPAM pool's move to `create-complete` falls due, by
     /// `IpamPoolId` — the fact the modelled [`IpamPool`] shape carries no member for, stored
     /// beside the pool under the same id the way [`Self::vpc_available_at`] holds a
@@ -3128,6 +3148,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             asn_association_moves: BTreeMap::new(),
             ipam_policies: BTreeMap::new(),
             ipam_scopes: BTreeMap::new(),
+            ipam_scope_create_complete_at: BTreeMap::new(),
+            ipam_scope_client_tokens: HashMap::new(),
             ipam_pool_create_complete_at: BTreeMap::new(),
             ipam_pool_client_tokens: HashMap::new(),
             ipam_internet_registry_associations: BTreeMap::new(),
@@ -5623,8 +5645,9 @@ impl ComAmazonawsEc2Amazonec2State {
     /// calls. So is a NAT gateway address an association left `associating` reaching
     /// `succeeded` ([`NatGatewayAddressTransition`]), and a `running` Network Access Scope
     /// analysis reaching its terminal `AnalysisStatus`. So is an `associating` local gateway
-    /// route table / VPC association reaching `associated`, and a Client VPN target network
-    /// association moving `associating` -> `associated`.
+    /// route table / VPC association reaching `associated`, an `associating` local gateway
+    /// route table / virtual interface group association reaching it too, and a Client VPN
+    /// target network association moving `associating` -> `associated`.
     pub fn materialize_due_transitions(&mut self) {
         let now = Instant::now();
         // The one clock-owed REMOVAL: a recycled AMI whose retention period has run out was
@@ -5752,6 +5775,23 @@ impl ComAmazonawsEc2Amazonec2State {
             // The transition is applied once; nothing is owed on this pool any more.
             false
         });
+        // An IPAM scope `CreateIpamScope` answered as `create-in-progress` reaches
+        // `create-complete` once its due instant has passed, whether or not anybody called —
+        // the same contract as the pool above. The two default scopes of an IPAM are not
+        // listed here: `complete_ipam_creation` moves them with the IPAM they came up with.
+        let ipam_scopes = &mut self.ipam_scopes;
+        self.ipam_scope_create_complete_at.retain(|scope_id, due_at| {
+            if now < *due_at {
+                return true;
+            }
+            if let Some(scope) = ipam_scopes.get_mut(scope_id) {
+                if scope.state.as_deref() == Some(IPAM_STATE_CREATE_IN_PROGRESS) {
+                    scope.state = Some(IPAM_STATE_CREATE_COMPLETE.to_string());
+                }
+            }
+            // The transition is applied once; nothing is owed on this scope any more.
+            false
+        });
         // A Verified Access endpoint `CreateVerifiedAccessEndpoint` answered as `pending`
         // reaches `active` once its due instant has passed, whether or not anybody called —
         // the same contract as a `pending` VPC's move above, and the reason the endpoint's
@@ -5797,6 +5837,22 @@ impl ComAmazonawsEc2Amazonec2State {
         // `associating` reaches `associated` once its due instant has passed, whether or not
         // anybody called — the same contract as the `pending` VPC above.
         for record in self.local_gateway_route_table_vpc_associations.values_mut() {
+            let due = record
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.due_by(now))
+                .map(str::to_string);
+            if let Some(state) = due {
+                record.view.state = Some(state);
+                record.pending = None;
+            }
+        }
+        // An association `CreateLocalGatewayRouteTableVirtualInterfaceGroupAssociation`
+        // answered as `associating` reaches `associated` the same way, on the same clock.
+        for record in self
+            .local_gateway_route_table_virtual_interface_group_associations
+            .values_mut()
+        {
             let due = record
                 .pending
                 .as_ref()
@@ -6969,7 +7025,7 @@ impl ComAmazonawsEc2Amazonec2State {
             ipam_scopes,
             ipams,
             launch_templates => template,
-            local_gateway_route_table_virtual_interface_group_associations,
+            local_gateway_route_table_virtual_interface_group_associations => view,
             local_gateway_route_table_vpc_associations => view,
             local_gateway_route_tables => view,
             nat_gateways,
@@ -9652,13 +9708,19 @@ pub const MAX_LOCAL_GATEWAY_VIF_GROUP_ASSOCIATIONS: usize = 4096;
 /// hold, in the `<Resource>LimitExceeded` family this service's other quotas are refused
 /// with ([`SECONDARY_NETWORK_LIMIT_EXCEEDED`]).
 ///
-/// No operation of this emulator writes this store yet — the operation that associates a
-/// virtual interface group with a local gateway route table is still a scaffold — so this
-/// code has no call site: it is the refusal the first writer must answer when
+/// The refusal
+/// `CreateLocalGatewayRouteTableVirtualInterfaceGroupAssociation` answers when
 /// [`ComAmazonawsEc2Amazonec2State::insert_local_gateway_route_table_virtual_interface_group_association`]
 /// hands it `None`.
 pub const LOCAL_GATEWAY_VIF_GROUP_ASSOCIATION_LIMIT_EXCEEDED: &str =
     "LocalGatewayRouteTableVirtualInterfaceGroupAssociationLimitExceeded";
+
+/// The one resource type a `TagSpecifications` entry on a create of a local gateway route
+/// table / virtual interface group association may name: `ResourceType`'s
+/// `local-gateway-route-table-virtual-interface-group-association` member
+/// (`smithy_query(query="shape",shape="ResourceType")`).
+pub const RESOURCE_TYPE_LOCAL_GATEWAY_VIF_GROUP_ASSOCIATION: &str =
+    "local-gateway-route-table-virtual-interface-group-association";
 
 /// The ARN resource path of a local gateway route table:
 /// `arn:aws:ec2:<region>:<account>:local-gateway-route-table/<id>`, the form
@@ -9673,13 +9735,32 @@ pub fn local_gateway_route_table_arn(region: &str, route_table_id: &str) -> Stri
     )
 }
 
+/// One association between a local gateway route table and a virtual interface group: the
+/// modelled shape every operation that reports one answers with, plus the move the clock
+/// owes it.
+///
+/// The modelled shape itself rather than a parallel record, for the reason
+/// [`LocalGatewayRouteTableVpcAssociationRecord`] holds one: a member a writer sets
+/// round-trips through
+/// `DescribeLocalGatewayRouteTableVirtualInterfaceGroupAssociations` without a
+/// field-by-field copy that can silently drop one. The pending move lives beside it because
+/// the shape carries no member for when the association's next state falls due.
+#[derive(Debug, Clone)]
+pub struct LocalGatewayRouteTableVirtualInterfaceGroupAssociationRecord {
+    /// The association as the model shapes it, carrying the state reached so far.
+    pub view: crate::ops::types::LocalGatewayRouteTableVirtualInterfaceGroupAssociation,
+    /// The move an association still `associating` owes; `None` for one in a state the clock
+    /// owes nothing on.
+    pub pending: Option<PendingStateMove>,
+}
+
 /// What one association between a local gateway route table and a virtual interface group
-/// is written with: the two resources it joins, the local gateway they belong to, the
-/// Region whose ARN namespace the route table's ARN names, the association's state, and
+/// is written with: the two resources it joins, the local gateway they belong to, the ARN
+/// the route table itself reports, the state it starts in, the state the clock owes it, and
 /// its tags.
 ///
-/// Every member the service itself owns — the association id, the route table ARN built
-/// from the Region and the route table id, and the owning account — is derived by
+/// Every member the service itself owns — the association id and the owning account — is
+/// derived by
 /// [`ComAmazonawsEc2Amazonec2State::insert_local_gateway_route_table_virtual_interface_group_association`]
 /// rather than taken from the caller, so two writers cannot report one association
 /// differently.
@@ -9687,24 +9768,31 @@ pub fn local_gateway_route_table_arn(region: &str, route_table_id: &str) -> Stri
 pub struct LocalGatewayRouteTableVirtualInterfaceGroupAssociationSpec {
     /// "The ID of the local gateway route table" the association is made in.
     pub local_gateway_route_table_id: String,
+    /// "The Amazon Resource Name (ARN) of the local gateway route table for the virtual
+    /// interface group", as the route table itself reports it
+    /// ([`local_gateway_route_table_arn`]).
+    pub local_gateway_route_table_arn: String,
     /// "The ID of the virtual interface group" the route table is associated with.
     pub local_gateway_virtual_interface_group_id: String,
     /// "The ID of the local gateway" both belong to.
     pub local_gateway_id: String,
-    /// The Region the route table's ARN names.
-    pub region: String,
     /// "The state of the association"
     /// (`LocalGatewayRouteTableVirtualInterfaceGroupAssociation$State`), which the model
     /// leaves an unconstrained string.
     pub state: String,
+    /// The state the clock owes this association, [`TRANSITION_DELAY`] from the write;
+    /// `None` for one written in a state nothing is owed on.
+    pub becomes: Option<String>,
     /// "The tags assigned to the association".
     pub tags: Vec<Tag>,
 }
 
-/// The caller-chosen bytes one stored association holds: its tags, the state a writer pinned
-/// on it (`$State`, which the model leaves an unconstrained string) and the ids of the
-/// resources it joins. Everything else on the record — the association id, the route table
-/// ARN, the owning account — is derived by this module, so it is fixed-size.
+/// The bytes one stored association holds beyond its fixed-size members: its tags, the state
+/// a writer pinned on it (`$State`, which the model leaves an unconstrained string), the ids
+/// of the resources it joins and the route table ARN it carries (derived from the route
+/// table, but stored per association, so charged per association). Everything else on the
+/// record — the association id, the owning account — is derived by this module, so it is
+/// fixed-size.
 ///
 /// The ONE definition of that charge, the way [`capacity_block_payload_bytes`] and
 /// [`host_payload_bytes`] are for their own stores:
@@ -9716,6 +9804,7 @@ pub fn local_gateway_vif_group_association_payload_bytes(
     tag_list_bytes(&spec.tags)
         .saturating_add(spec.state.len())
         .saturating_add(spec.local_gateway_route_table_id.len())
+        .saturating_add(spec.local_gateway_route_table_arn.len())
         .saturating_add(spec.local_gateway_virtual_interface_group_id.len())
         .saturating_add(spec.local_gateway_id.len())
 }
@@ -9748,6 +9837,11 @@ impl ComAmazonawsEc2Amazonec2State {
     /// written through would grow the process's heap for as long as a caller keeps asking.
     /// A caller that gets `None` must refuse the request with
     /// [`LOCAL_GATEWAY_VIF_GROUP_ASSOCIATION_LIMIT_EXCEEDED`].
+    ///
+    /// The state the clock owes the association is RECORDED, never slept for:
+    /// [`Self::materialize_due_transitions`] applies it once [`TRANSITION_DELAY`] has passed,
+    /// so a caller asking straight after the write still sees the transient state the
+    /// association starts in.
     pub fn insert_local_gateway_route_table_virtual_interface_group_association(
         &mut self,
         spec: LocalGatewayRouteTableVirtualInterfaceGroupAssociationSpec,
@@ -9759,8 +9853,8 @@ impl ComAmazonawsEc2Amazonec2State {
             return None;
         }
         let association_id = self.next_id(LOCAL_GATEWAY_VIF_GROUP_ASSOCIATION_ID_PREFIX);
-        let association =
-            crate::ops::types::LocalGatewayRouteTableVirtualInterfaceGroupAssociation {
+        let record = LocalGatewayRouteTableVirtualInterfaceGroupAssociationRecord {
+            view: crate::ops::types::LocalGatewayRouteTableVirtualInterfaceGroupAssociation {
                 local_gateway_route_table_virtual_interface_group_association_id: Some(
                     association_id.clone(),
                 ),
@@ -9768,19 +9862,44 @@ impl ComAmazonawsEc2Amazonec2State {
                     spec.local_gateway_virtual_interface_group_id,
                 ),
                 local_gateway_id: Some(spec.local_gateway_id),
-                local_gateway_route_table_arn: Some(local_gateway_route_table_arn(
-                    &spec.region,
-                    &spec.local_gateway_route_table_id,
-                )),
+                local_gateway_route_table_arn: Some(spec.local_gateway_route_table_arn),
                 local_gateway_route_table_id: Some(spec.local_gateway_route_table_id),
                 owner_id: Some(::engine::emulator_account_id().to_string()),
                 state: Some(spec.state),
                 tags: Some(spec.tags),
-            };
+            },
+            pending: spec.becomes.map(PendingStateMove::starting_now),
+        };
         self.add_stored_bytes(payload_bytes);
         self.local_gateway_route_table_virtual_interface_group_associations
-            .insert(association_id.clone(), association);
+            .insert(association_id.clone(), record);
         Some(association_id)
+    }
+
+    /// The id of the association that already joins `route_table_id` and
+    /// `virtual_interface_group_id`, if the account holds one.
+    ///
+    /// An association IS the pair it joins, so this is what a writer asks before making a
+    /// second one: without it the store would hold two association ids for one fact — the
+    /// contract [`Self::local_gateway_route_table_vpc_association_of`] writes out for the
+    /// VPC associations beside these. The scan is bounded by the store's own ceiling
+    /// ([`MAX_LOCAL_GATEWAY_VIF_GROUP_ASSOCIATIONS`]).
+    pub fn local_gateway_route_table_virtual_interface_group_association_of(
+        &self,
+        route_table_id: &str,
+        virtual_interface_group_id: &str,
+    ) -> Option<&str> {
+        self.local_gateway_route_table_virtual_interface_group_associations
+            .iter()
+            .find(|(_, record)| {
+                record.view.local_gateway_route_table_id.as_deref() == Some(route_table_id)
+                    && record
+                        .view
+                        .local_gateway_virtual_interface_group_id
+                        .as_deref()
+                        == Some(virtual_interface_group_id)
+            })
+            .map(|(association_id, _)| association_id.as_str())
     }
 }
 
@@ -10516,6 +10635,88 @@ pub fn local_gateway_virtual_interface_group_arn(region: &str, group_id: &str) -
         region,
         &format!("local-gateway-virtual-interface-group/{group_id}"),
     )
+}
+
+/// The `ResourceType` enum member a local gateway virtual interface group is tagged and
+/// named under: `local-gateway-virtual-interface-group`
+/// (`smithy_query(query="shape",shape="ResourceType")`), which is also the resource path
+/// [`local_gateway_virtual_interface_group_arn`] builds its ARNs under. The resource's one
+/// spelling, so the refusals that name it cannot drift from it.
+pub const RESOURCE_TYPE_LOCAL_GATEWAY_VIRTUAL_INTERFACE_GROUP: &str =
+    "local-gateway-virtual-interface-group";
+
+/// `InvalidLocalGatewayVirtualInterfaceGroupID.Malformed` (HTTP 400): the request named
+/// something that is not a local gateway virtual interface group id at all, so there is
+/// nothing to look up — the `Invalid<Kind>.Malformed` code EC2 answers before it looks an
+/// id up, as [`INVALID_LOCAL_GATEWAY_ROUTE_TABLE_ID_MALFORMED`] is for the route table.
+pub const INVALID_LOCAL_GATEWAY_VIF_GROUP_ID_MALFORMED: &str =
+    "InvalidLocalGatewayVirtualInterfaceGroupID.Malformed";
+
+/// `InvalidLocalGatewayVirtualInterfaceGroupID.NotFound` (HTTP 400): the request named a
+/// well-formed virtual interface group id this account holds no group for. The code AWS
+/// answers, as the recorded wire corpus behind
+/// `issues/…-ec2-createlocalgatewayvirtualinterface-stub.md` shows.
+pub const INVALID_LOCAL_GATEWAY_VIF_GROUP_ID_NOT_FOUND: &str =
+    "InvalidLocalGatewayVirtualInterfaceGroupID.NotFound";
+
+/// Whether `id` is a well-formed local gateway virtual interface group id — one EC2 could
+/// have issued.
+///
+/// `<prefix>-<8 or 17 lowercase hex digits>`, read by the one generic id reader
+/// ([`prefixed_id_is_well_formed`]) under this resource's own prefix
+/// ([`LOCAL_GATEWAY_VIF_GROUP_ID_PREFIX`], whose doc carries the evidence for it). An
+/// association's own id (`lgw-vif-grp-assoc-…`) therefore reads as malformed here rather
+/// than as a group id, its suffix not being hexadecimal.
+pub fn local_gateway_virtual_interface_group_id_is_well_formed(id: &str) -> bool {
+    prefixed_id_is_well_formed(LOCAL_GATEWAY_VIF_GROUP_ID_PREFIX, id)
+}
+
+/// Refuse something that is not a local gateway virtual interface group id at all: HTTP 400
+/// [`INVALID_LOCAL_GATEWAY_VIF_GROUP_ID_MALFORMED`], worded the way AWS words a malformed
+/// id of this resource and built from the request's own value.
+pub fn invalid_local_gateway_virtual_interface_group_id_malformed<E>(id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_LOCAL_GATEWAY_VIF_GROUP_ID_MALFORMED,
+        400,
+        format!("The {RESOURCE_TYPE_LOCAL_GATEWAY_VIRTUAL_INTERFACE_GROUP} ID '{id}' is malformed"),
+    )
+}
+
+/// Refuse a well-formed virtual interface group id this account holds no group for: HTTP
+/// 400 [`INVALID_LOCAL_GATEWAY_VIF_GROUP_ID_NOT_FOUND`], worded the way AWS words it ("The
+/// local-gateway-virtual-interface-group ID '…' does not exist").
+pub fn invalid_local_gateway_virtual_interface_group_id_not_found<E>(id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_LOCAL_GATEWAY_VIF_GROUP_ID_NOT_FOUND,
+        400,
+        format!(
+            "The {RESOURCE_TYPE_LOCAL_GATEWAY_VIRTUAL_INTERFACE_GROUP} ID '{id}' does not exist"
+        ),
+    )
+}
+
+/// Refuse a `LocalGatewayVirtualInterfaceGroupId` this service cannot resolve: a malformed
+/// one before an unknown one, the order [`require_well_formed_id`] documents.
+///
+/// The ONE place a virtual interface group id is resolved, so every operation that takes one
+/// refuses the same id the same way; the contract
+/// [`require_known_local_gateway_route_table`] writes out for the route tables these groups
+/// are associated with.
+pub fn require_known_local_gateway_virtual_interface_group<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    id: &str,
+) -> Result<(), Scaffolded<E>> {
+    if !local_gateway_virtual_interface_group_id_is_well_formed(id) {
+        return Err(invalid_local_gateway_virtual_interface_group_id_malformed(
+            id,
+        ));
+    }
+    if !store.local_gateway_virtual_interface_groups.contains_key(id) {
+        return Err(invalid_local_gateway_virtual_interface_group_id_not_found(
+            id,
+        ));
+    }
+    Ok(())
 }
 
 /// What one local gateway virtual interface group is written with: the local gateway it
@@ -23038,12 +23239,10 @@ impl ComAmazonawsEc2Amazonec2State {
         let scope_id = self.next_id(IPAM_SCOPE_ID_PREFIX);
         view.ipam_scope_id = Some(scope_id.clone());
         // "The Amazon Resource Name (ARN) of the scope" (`IpamScope$IpamScopeArn`): an EC2
-        // ARN in the IPAM's own Region, under this resource's modelled type.
-        view.ipam_scope_arn = Some(::engine::emulator_arn(
-            "ec2",
-            view.ipam_region.as_deref().unwrap_or(DEFAULT_REGION),
-            &format!("{RESOURCE_TYPE_IPAM_SCOPE}/{scope_id}"),
-        ));
+        // IPAM-family ARN under this resource's modelled type, whose Region segment is empty
+        // for the reason [`ipam_resource_arn`] records — the scope's Region is reported in
+        // `IpamScope$IpamRegion` instead.
+        view.ipam_scope_arn = Some(ipam_resource_arn(RESOURCE_TYPE_IPAM_SCOPE, &scope_id));
         // "The Amazon Web Services account ID of the owner of the scope"
         // (`IpamScope$OwnerId`): this emulator serves one account.
         view.owner_id = Some(::engine::emulator_account_id().to_string());
@@ -23057,6 +23256,71 @@ impl ComAmazonawsEc2Amazonec2State {
         );
         self.ipam_scopes.insert(scope_id.clone(), view);
         Some(scope_id)
+    }
+
+    /// Store an IPAM scope a create has just made in the IPAM `ipam_id` names, and answer
+    /// the `IpamScopeId` it was given — or `None` when the store is at its ceiling and
+    /// nothing was stored.
+    ///
+    /// The ONE way a CREATED scope is stored, the counterpart of
+    /// [`Self::insert_creating_ipam_pool`] for the container a pool lives in: the scope is
+    /// answered in the non-terminal `create-in-progress` state, so the clock owes it
+    /// [`IPAM_STATE_CREATE_COMPLETE`] one [`TRANSITION_DELAY`] later
+    /// ([`Self::ipam_scope_create_complete_at`], applied by
+    /// [`Self::materialize_due_transitions`]); `client_token` names the scope from here on so
+    /// a replay of the same request answers it instead of creating a second one; the IPAM's
+    /// own count of the scopes in it is recounted; and every caller-chosen byte the record
+    /// retains — the external authority's resource identifier and the token beside what
+    /// [`Self::insert_ipam_scope`] already charges — is charged to the store's budget.
+    pub fn insert_created_ipam_scope(
+        &mut self,
+        ipam_id: &str,
+        client_token: Option<&str>,
+        mut view: IpamScope,
+    ) -> Option<String> {
+        view.state = Some(IPAM_STATE_CREATE_IN_PROGRESS.to_string());
+        // "Defines if the scope is the default scope or not" (`IpamScope$IsDefault`): only
+        // the two scopes an IPAM comes up with are default ones, so a scope a caller asked
+        // for is not.
+        view.is_default = Some(false);
+        let retained = client_token.unwrap_or_default().len()
+            + view
+                .external_authority_configuration
+                .as_ref()
+                .and_then(|configuration| configuration.external_resource_identifier.as_deref())
+                .unwrap_or_default()
+                .len();
+        let scope_id = self.insert_ipam_scope(view)?;
+        self.add_stored_bytes(retained);
+        self.ipam_scope_create_complete_at
+            .insert(scope_id.clone(), Instant::now() + TRANSITION_DELAY);
+        if let Some(token) = client_token {
+            self.ipam_scope_client_tokens
+                .insert(token.to_string(), scope_id.clone());
+        }
+        self.recount_ipam_scopes(ipam_id);
+        Some(scope_id)
+    }
+
+    /// Set the IPAM's `ScopeCount` to the number of scopes the store now holds in it.
+    ///
+    /// "The number of scopes in the IPAM" (`Ipam$ScopeCount`) is DERIVED from the scopes
+    /// themselves, so it is recounted from them rather than incremented — the same contract
+    /// [`Self::recount_ipam_scope_pools`] has for a scope's pool count. A scope names its
+    /// IPAM by `IpamArn` (the modelled [`IpamScope`] carries no IPAM id at all), which is
+    /// what the scopes of this IPAM are counted by.
+    fn recount_ipam_scopes(&mut self, ipam_id: &str) {
+        let Some(ipam_arn) = self.ipams.get(ipam_id).and_then(|ipam| ipam.ipam_arn.clone()) else {
+            return;
+        };
+        let scopes = self
+            .ipam_scopes
+            .values()
+            .filter(|scope| scope.ipam_arn.as_deref() == Some(ipam_arn.as_str()))
+            .count();
+        if let Some(ipam) = self.ipams.get_mut(ipam_id) {
+            ipam.scope_count = i32::try_from(scopes).ok();
+        }
     }
 
     /// Store an IPAM pool a create has just made in the scope `scope_id` names, and answer
@@ -23216,6 +23480,11 @@ pub const IPAM_LIMIT_EXCEEDED: &str = "IpamLimitExceeded";
 /// `InvalidIpamId.NotFound`: the request named an IPAM id this account holds no IPAM for.
 pub const INVALID_IPAM_ID_NOT_FOUND: &str = "InvalidIpamId.NotFound";
 
+/// `InvalidIpamId.Malformed`: the request named something that is not an IPAM id at all, so
+/// there is nothing to look up — the counterpart of [`INVALID_IPAM_SCOPE_ID_MALFORMED`] for
+/// the IPAM itself.
+pub const INVALID_IPAM_ID_MALFORMED: &str = "InvalidIpamId.Malformed";
+
 /// Refuse a create that would take the store past [`MAX_IPAMS`]: HTTP 400
 /// `IpamLimitExceeded`.
 pub fn ipam_limit_exceeded<E>() -> Scaffolded<E> {
@@ -23228,11 +23497,17 @@ pub fn ipam_limit_exceeded<E>() -> Scaffolded<E> {
 
 /// Refuse a request that named an IPAM the account holds none of: HTTP 400
 /// `InvalidIpamId.NotFound`.
+///
+/// The wording is this resource's own — "The IPAM (…) does not exist.", the sentence AWS
+/// answers a request naming an IPAM that does not exist with, built from the id the REQUEST
+/// named. The parenthesised id is why this resource does not go through [`id_not_found`],
+/// whose sentence quotes the id instead; [`invalid_ipam_scope_id_not_found`] words the
+/// scope's own refusal the same way.
 pub fn invalid_ipam_id_not_found<E>(ipam_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_IPAM_ID_NOT_FOUND,
         400,
-        format!("The IPAM ID '{ipam_id}' does not exist"),
+        format!("The IPAM ({ipam_id}) does not exist."),
     )
 }
 

@@ -841,6 +841,12 @@ async fn publish_delivers_every_message_to_each_confirmed_subscription() {
                 ("MessageStructure", "json"),
             ],
         ),
+        // The member names the structure SNS reads the body under; a value naming no
+        // structure it defines leaves the body one message for every protocol.
+        (
+            "a message structure SNS defines nothing for",
+            vec![("Message", "hello"), ("MessageStructure", "xml")],
+        ),
     ];
 
     let mut ids = HashSet::new();
@@ -929,7 +935,7 @@ async fn publish_delivers_every_message_to_each_confirmed_subscription() {
 type Refusal<'a> = (&'a str, Vec<(&'a str, &'a str)>, u16, &'a str);
 
 /// Publish refuses what it cannot deliver: no destination at all, a topic that is not
-/// in the store, a message structure other than `json`, a `json` body with no
+/// in the store, a `json` body that is not a JSON object, a `json` body with no
 /// `default` member, and a subject outside the documented rule.
 #[tokio::test]
 async fn publish_refuses_a_request_it_cannot_deliver() {
@@ -964,16 +970,6 @@ async fn publish_refuses_a_request_it_cannot_deliver() {
             "InvalidParameter",
         ),
         (
-            "an unsupported message structure",
-            vec![
-                ("Message", "m"),
-                ("TopicArn", topic.as_str()),
-                ("MessageStructure", "xml"),
-            ],
-            400,
-            "InvalidParameter",
-        ),
-        (
             "json structure that is not JSON",
             vec![
                 ("Message", "not json"),
@@ -994,9 +990,19 @@ async fn publish_refuses_a_request_it_cannot_deliver() {
             "InvalidParameter",
         ),
         (
-            "json structure with a non-string member",
+            "json structure whose default member names no body",
             vec![
-                ("Message", r#"{"default":"d","https":7}"#),
+                ("Message", r#"{"default":{"body":"d"}}"#),
+                ("TopicArn", topic.as_str()),
+                ("MessageStructure", "json"),
+            ],
+            400,
+            "InvalidParameter",
+        ),
+        (
+            "json structure whose default member is a list",
+            vec![
+                ("Message", r#"{"default":["d"]}"#),
                 ("TopicArn", topic.as_str()),
                 ("MessageStructure", "json"),
             ],

@@ -361,12 +361,14 @@ async fn an_evaluation_config_cannot_record_is_refused_by_what_is_wrong_with_it(
     emulator.ok("PutConfigRule", &managed_rule("managed")).await;
 
     // Rows differ along WHICH part of the request Config cannot record: the rule
-    // (absent, or not a process check — both the same refusal, which is what
-    // `NoSuchConfigRuleException` documents on this path: "Verify that the rule is an
-    // Config Process Check rule, that the rule name is correct"), the resource the
-    // evaluation names (its type and its id), and the verdict it carries. The DELIVERED
-    // evaluation is checked before the rule is resolved, so a request that is wrong in
-    // both is answered for its body.
+    // (absent — `NoSuchConfigRuleException` — or existing but not a process check, which
+    // is a rule of the wrong KIND for this call and so a bad parameter value: RECORDED
+    // behaviour, asserted by the recorded unit itself as "the rule exists, so the refusal
+    // is about its type, not NoSuchConfigRuleException, which is reserved for a rule name
+    // that does not exist at all"), the resource the evaluation names (its type and its
+    // id), and the verdict it carries. The RULE is resolved before the delivered
+    // evaluation is judged, so a request that is wrong in both is answered for the rule
+    // it named.
     let cases: [(&str, Value, &str); 8] = [
         (
             "a rule no rule answers to",
@@ -376,7 +378,7 @@ async fn an_evaluation_config_cannot_record_is_refused_by_what_is_wrong_with_it(
         (
             "an existing rule that is not a process check",
             external_evaluation("managed", COMPLIANT),
-            "NoSuchConfigRuleException",
+            "InvalidParameterValueException",
         ),
         (
             "a resource type that is not the account",
@@ -438,7 +440,7 @@ async fn an_evaluation_config_cannot_record_is_refused_by_what_is_wrong_with_it(
                     "OrderingTimestamp": ORDERING_TIMESTAMP,
                 },
             }),
-            "InvalidParameterValueException",
+            "NoSuchConfigRuleException",
         ),
     ];
 

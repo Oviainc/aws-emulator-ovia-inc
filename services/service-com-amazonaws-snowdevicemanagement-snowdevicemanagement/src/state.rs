@@ -714,6 +714,15 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
             .filter(|device| device.region == region)
     }
 
+    /// The device `managed_device_id` names in `region`, to change: the mutable
+    /// counterpart of [`Self::device_in`], so a write lands in the Region the read
+    /// resolved it in.
+    pub fn device_in_mut(&mut self, region: &str, managed_device_id: &str) -> Option<&mut Device> {
+        self.devices
+            .get_mut(managed_device_id)
+            .filter(|device| device.region == region)
+    }
+
     /// How many tasks are still in flight in `region`: the consumption
     /// [`IN_FLIGHT_TASK_QUOTA`] bounds.
     ///
@@ -971,15 +980,28 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
     }
 
     /// The tags held on the device or task a tagging operation's `resourceArn`
-    /// resolved to ([`parse_tagged_resource_arn`]), or `None` when this account holds
-    /// no such record.
+    /// resolved to ([`parse_tagged_resource_arn`]), or `None` when the Region the
+    /// request was signed for holds no such record.
     ///
-    /// The lookup is by the id the ARN carries — the key each record is stored under —
-    /// so a tag read and `UntagResource` address exactly the same record.
-    pub fn tags_of(&self, resource: &TaggedResource) -> Option<HashMap<String, String>> {
+    /// `region` is the Region of the endpoint the request reached. A record of this
+    /// service belongs to ONE Region and is invisible in every other one, so an ARN
+    /// whose Region field is not `region` addresses nothing here however familiar the
+    /// id it carries looks — and a record that does live in `region` is resolved by
+    /// the same regional lookup every id-addressed operation uses ([`Self::device_in`],
+    /// [`Self::task_in`]). That makes a tag read and the two tag writes address exactly
+    /// the same record, and it makes them address the same record the describe
+    /// operations do.
+    pub fn tags_of(
+        &self,
+        region: &str,
+        resource: &TaggedResource,
+    ) -> Option<HashMap<String, String>> {
+        if resource.region != region {
+            return None;
+        }
         match resource.kind {
-            TaggedResourceKind::Device => self.devices.get(&resource.id).map(Device::tag_map),
-            TaggedResourceKind::Task => self.tasks.get(&resource.id).map(Task::tag_map),
+            TaggedResourceKind::Device => self.device_in(region, &resource.id).map(Device::tag_map),
+            TaggedResourceKind::Task => self.task_in(region, &resource.id).map(Task::tag_map),
         }
     }
 
@@ -987,18 +1009,27 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
     /// resolved to, to CHANGE: the mutable counterpart of [`Self::tags_of`], so a
     /// tag write lands on exactly the record a tag read reports.
     ///
-    /// This is the one place the kind/id → stored-tags resolution lives for the
+    /// This is the one place the region/kind/id → stored-tags resolution lives for the
     /// write paths: `TagResource` and `UntagResource` both go through it, so the
     /// two cannot resolve a `resourceArn` differently from each other or from the
-    /// read path. `None` means this account holds no such record, which is the
-    /// tagging APIs' not-found class ([`TAGGING_NOT_FOUND_MESSAGE`]).
-    pub fn tags_of_mut(&mut self, resource: &TaggedResource) -> Option<&mut BTreeMap<String, String>> {
+    /// read path. `None` means the Region the request was signed for holds no such
+    /// record, which is the tagging APIs' not-found class
+    /// ([`TAGGING_NOT_FOUND_MESSAGE`]).
+    pub fn tags_of_mut(
+        &mut self,
+        region: &str,
+        resource: &TaggedResource,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        if resource.region != region {
+            return None;
+        }
         match resource.kind {
             TaggedResourceKind::Device => self
-                .devices
-                .get_mut(&resource.id)
+                .device_in_mut(region, &resource.id)
                 .map(|device| &mut device.tags),
-            TaggedResourceKind::Task => self.tasks.get_mut(&resource.id).map(|task| &mut task.tags),
+            TaggedResourceKind::Task => self
+                .task_in_mut(region, &resource.id)
+                .map(|task| &mut task.tags),
         }
     }
 
@@ -1621,9 +1652,12 @@ impl TaggedResourceKind {
     }
 }
 
-/// The resource a well-formed `resourceArn` addresses: its kind and its id.
+/// The resource a well-formed `resourceArn` addresses: its Region, its kind and its
+/// id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaggedResource {
+    /// The Region the ARN's Region field names — which Region's records it addresses.
+    pub region: String,
     pub kind: TaggedResourceKind,
     pub id: String,
 }
@@ -1650,9 +1684,10 @@ pub enum ArnRefusal {
 /// or `…:task/<id>`, with a 12-digit account and an id inside the modelled
 /// `@length(min: 1, max: 64)`. Anything else never named a resource of this
 /// service — [`ArnRefusal::Malformed`]. A well-formed ARN for another account is
-/// [`ArnRefusal::ForeignAccount`]; one for this account resolves to the id a
-/// caller's record is keyed by, whatever region the ARN names, because a device id
-/// and a task id are unique across the account's regions.
+/// [`ArnRefusal::ForeignAccount`]; one for this account resolves to the Region, the
+/// kind and the id it names. The Region is carried because a record of this service
+/// belongs to one Region, so which Region an ARN names is part of what it addresses
+/// ([`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::tags_of`]).
 pub fn parse_tagged_resource_arn(resource_arn: &str) -> Result<TaggedResource, ArnRefusal> {
     let malformed = || ArnRefusal::Malformed(INVALID_RESOURCE_ARN_MESSAGE.to_string());
 
@@ -1695,6 +1730,7 @@ pub fn parse_tagged_resource_arn(resource_arn: &str) -> Result<TaggedResource, A
     }
 
     Ok(TaggedResource {
+        region: region.to_string(),
         kind,
         id: id.to_string(),
     })

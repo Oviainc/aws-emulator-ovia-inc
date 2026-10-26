@@ -10,7 +10,9 @@
 //! detective evaluation mode, the `OrderingTimestamp` the caller delivered and the
 //! annotation it carried, and rolled up into the rule's own compliance by
 //! `DescribeComplianceByConfigRule`. The write refuses a rule this account does not
-//! hold or that is not a process check (`NoSuchConfigRuleException`), and a resource
+//! hold (`NoSuchConfigRuleException`), a rule that EXISTS but is not a process check
+//! (`InvalidParameterValueException` — the refusal is about the rule's kind, not its
+//! existence), and a resource
 //! type, resource id, compliance type or ordering timestamp the member does not accept
 //! (`InvalidParameterValueException`), persisting nothing when it refuses — and the
 //! modelled lengths are refused at the request boundary before it runs at all.
@@ -549,7 +551,13 @@ async fn the_write_refuses_a_rule_and_an_evaluation_it_cannot_record() {
     // resource type it evaluates, the account the resource id names (malformed, and
     // well formed but not the account this store serves), the compliance type it
     // carries, and whether its ordering timestamp names an instant at all.
-    let cases: [(&str, Value, &str); 17] = [
+    //
+    // A rule this account does not hold is `NoSuchConfigRuleException`; a rule that
+    // EXISTS and is not a process check is `InvalidParameterValueException`, which is
+    // RECORDED behaviour — the recorded unit asserts it as "the rule exists, so the
+    // refusal is about its type, not NoSuchConfigRuleException, which is reserved for a
+    // rule name that does not exist at all".
+    let cases: [(&str, Value, &str); 18] = [
         (
             "a rule this account does not hold",
             delivery(
@@ -584,7 +592,7 @@ async fn the_write_refuses_a_rule_and_an_evaluation_it_cannot_record() {
                 1_700_000_000.0,
                 None,
             ),
-            "NoSuchConfigRuleException",
+            "InvalidParameterValueException",
         ),
         (
             "a Custom Lambda rule",
@@ -596,7 +604,7 @@ async fn the_write_refuses_a_rule_and_an_evaluation_it_cannot_record() {
                 1_700_000_000.0,
                 None,
             ),
-            "NoSuchConfigRuleException",
+            "InvalidParameterValueException",
         ),
         (
             "a Custom Policy rule",
@@ -608,7 +616,7 @@ async fn the_write_refuses_a_rule_and_an_evaluation_it_cannot_record() {
                 1_700_000_000.0,
                 None,
             ),
-            "NoSuchConfigRuleException",
+            "InvalidParameterValueException",
         ),
         (
             "a resource type that is not the account one",
@@ -753,6 +761,20 @@ async fn the_write_refuses_a_rule_and_an_evaluation_it_cannot_record() {
                 None,
             ),
             "InvalidParameterValueException",
+        ),
+        (
+            // The RULE is resolved before any value of the delivered evaluation is
+            // judged, so a request that is wrong in BOTH is answered for the rule.
+            "a rule this account does not hold AND an unplaceable ordering timestamp",
+            delivery(
+                "no-such-rule",
+                ACCOUNT_RESOURCE_TYPE,
+                &account,
+                ACCEPTED_COMPLIANCE_TYPES[0],
+                -1e30,
+                None,
+            ),
+            "NoSuchConfigRuleException",
         ),
     ];
 

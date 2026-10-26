@@ -235,13 +235,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // What SNS holds is the MEANING of the value, in the form it reports back, so
+        // every rule below judges — and the record then takes — the canonical form.
+        let stored = input
+            .attribute_value
+            .as_deref()
+            .map(|value| state::stored_subscription_attribute_value(&input.attribute_name, value));
+
         // Measured on the map the write WOULD leave the record holding, so repeating the
         // call with ever larger values cannot grow one subscription past the ceiling.
         if let Some(refusal) = state::attribute_write_refusal(
             state::SUBSCRIPTION_RECORD,
             &subscription.attributes,
             &input.attribute_name,
-            input.attribute_value.as_deref(),
+            stored.as_deref(),
         ) {
             return Err(invalid_parameter(refusal));
         }
@@ -249,7 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The filter policy and its scope constrain each other, so the pair the write
         // WOULD leave is judged — whichever of the two this request carried.
         let mut would_hold = subscription.attributes.clone();
-        match input.attribute_value.as_deref() {
+        match stored.as_deref() {
             Some(value) => {
                 would_hold.insert(input.attribute_name.clone(), value.to_string());
             }
@@ -264,7 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The new value for the attribute" (`AttributeValue` doc) — and a request that
         // carries none clears the attribute, so the subscription reports what SNS
         // reports for one that was never given it.
-        match input.attribute_value {
+        match stored {
             Some(value) => {
                 subscription.attributes.insert(input.attribute_name, value);
             }

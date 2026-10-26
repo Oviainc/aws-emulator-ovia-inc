@@ -262,11 +262,7 @@ pub fn to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
 /// application at all. A source that names BOTH is refused before this is reached —
 /// see [`validate_application_source`].
 pub fn application_source_key(source: &ApplicationSource) -> Option<String> {
-    if let Some(arn) = source
-        .cloud_formation_stack_arn
-        .as_deref()
-        .filter(|arn| !arn.is_empty())
-    {
+    if let Some(arn) = named_stack_arn(source) {
         return Some(format!("stack:{arn}"));
     }
     let filters = source.tag_filters.as_ref()?;
@@ -295,12 +291,18 @@ fn names_tag_filters(source: &ApplicationSource) -> bool {
         .is_some_and(|filters| !filters.is_empty())
 }
 
-/// Whether a `CloudFormationStackARN` is present and non-empty.
-fn names_stack(source: &ApplicationSource) -> bool {
+/// The CloudFormation stack ARN an `ApplicationSource` names, or `None` when it names
+/// no stack.
+///
+/// A `CloudFormationStackARN` that is absent, or present but empty, names nothing. This
+/// is the single place that decides what "names a stack" means, so the identity key
+/// ([`application_source_key`]), the exclusivity rule that key feeds and the ARN-format
+/// check in [`validate_application_source`] cannot disagree about one source.
+fn named_stack_arn(source: &ApplicationSource) -> Option<&str> {
     source
         .cloud_formation_stack_arn
         .as_deref()
-        .is_some_and(|arn| !arn.is_empty())
+        .filter(|arn| !arn.is_empty())
 }
 
 /// Whether `arn` is the Amazon Resource Name of a CloudFormation stack.
@@ -344,16 +346,13 @@ fn is_cloud_formation_stack_arn(arn: &str) -> bool {
 /// both is contradictory, and a stack is named by its ARN. `Err` carries the refusal
 /// message naming the member at fault.
 pub fn validate_application_source(source: &ApplicationSource) -> Result<String, String> {
-    if let Some(arn) = source
-        .cloud_formation_stack_arn
-        .as_deref()
-        .filter(|arn| !arn.is_empty())
-    {
+    let stack_arn = named_stack_arn(source);
+    if let Some(arn) = stack_arn {
         if !is_cloud_formation_stack_arn(arn) {
             return Err(format!("Invalid CloudFormation stack ARN: {arn}"));
         }
     }
-    match (names_stack(source), names_tag_filters(source)) {
+    match (stack_arn.is_some(), names_tag_filters(source)) {
         (true, true) => Err(
             "ApplicationSource must specify either CloudFormationStackARN or TagFilters, not both"
                 .to_string(),

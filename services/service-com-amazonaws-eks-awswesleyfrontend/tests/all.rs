@@ -29,6 +29,8 @@ mod capability_lifecycle;
 mod certificate_authority;
 #[path = "all/certificate_authority_activation.rs"]
 mod certificate_authority_activation;
+#[path = "all/certificate_authority_listing.rs"]
+mod certificate_authority_listing;
 #[path = "all/child_create_resolves_the_cluster_first.rs"]
 mod child_create_resolves_the_cluster_first;
 #[path = "all/cluster_config_update.rs"]

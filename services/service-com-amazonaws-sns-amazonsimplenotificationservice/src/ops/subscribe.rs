@@ -458,6 +458,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // What SNS holds is the MEANING of each value, in the form it reports back, so a
+        // subscription reads the same whichever call carried the attribute.
+        let attributes: ::std::collections::HashMap<String, String> = attributes
+            .into_iter()
+            .map(|(name, value)| {
+                let stored = state::stored_subscription_attribute_value(&name, &value);
+                (name, stored)
+            })
+            .collect();
 
         let (arn, pending_confirmation) = match existing {
             Some((arn, pending_confirmation)) => {

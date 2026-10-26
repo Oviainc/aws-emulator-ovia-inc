@@ -119,13 +119,25 @@ type ProjectionCase<'a> = (
 /// A filter policy document, as the `FilterPolicy` attribute carries one.
 const FILTER_POLICY: &str = r#"{"kind":["alert"]}"#;
 
-/// A delivery policy that overrides one member of SNS's own, as a subscription's
-/// `DeliveryPolicy` attribute carries one.
-const SUBSCRIPTION_DELIVERY_POLICY: &str =
-    r#"{"http":{"defaultHealthyRetryPolicy":{"numRetries":7}}}"#;
+/// A delivery policy that overrides one retry member, as a subscription's
+/// `DeliveryPolicy` attribute carries one: the retry policy at the top level.
+const SUBSCRIPTION_DELIVERY_POLICY: &str = r#"{"healthyRetryPolicy":{"numRetries":7}}"#;
 
 /// A dead-letter queue, as the `RedrivePolicy` attribute names one.
 const REDRIVE_POLICY: &str = r#"{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq"}"#;
+
+/// The members of a `healthyRetryPolicy`, as the retry policy of a delivery policy
+/// document carries them (SNS Developer Guide, "Amazon SNS message delivery retries"):
+/// SNS reports the policy WHOLE, however few of them a caller named.
+const RETRY_POLICY_MEMBERS: &[&str] = &[
+    "backoffFunction",
+    "maxDelayTarget",
+    "minDelayTarget",
+    "numMaxDelayRetries",
+    "numMinDelayRetries",
+    "numNoDelayRetries",
+    "numRetries",
+];
 
 /// `GetSubscriptionAttributes` reports ONE entry per property of the subscription its
 /// ARN names, each key paired with its own value: the ARN, the topic, the protocol and
@@ -148,6 +160,7 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
             false,
             &[
                 "ConfirmationWasAuthenticated",
+                "EffectiveDeliveryPolicy",
                 "Endpoint",
                 "Owner",
                 "PendingConfirmation",
@@ -166,6 +179,7 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
             false,
             &[
                 "ConfirmationWasAuthenticated",
+                "EffectiveDeliveryPolicy",
                 "Endpoint",
                 "FilterPolicy",
                 // A filter policy is applied under a scope, so the documented default
@@ -188,6 +202,7 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
             false,
             &[
                 "ConfirmationWasAuthenticated",
+                "EffectiveDeliveryPolicy",
                 "Endpoint",
                 "Owner",
                 "PendingConfirmation",
@@ -206,8 +221,8 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
             true,
             &[
                 "ConfirmationWasAuthenticated",
-                // A delivery policy governs delivery to HTTP/S endpoints, so only a
-                // subscription over one of those protocols has an effective policy.
+                // Every subscription delivers under an effective policy: the account
+                // system defaults with the topic's and its own laid over them.
                 "EffectiveDeliveryPolicy",
                 "Endpoint",
                 "Owner",
@@ -239,14 +254,16 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
             ],
         ),
         (
-            "an email subscription awaiting confirmation",
-            "sub-attrs-email-pending",
-            "email",
-            "first.last+tag@mail.example.co.uk",
-            &[],
-            true,
+            "an sqs subscription with its own delivery policy",
+            "sub-attrs-sqs-policy",
+            "sqs",
+            "arn:aws:sqs:us-east-1:000000000000:retried",
+            &[("DeliveryPolicy", SUBSCRIPTION_DELIVERY_POLICY)],
+            false,
             &[
                 "ConfirmationWasAuthenticated",
+                "DeliveryPolicy",
+                "EffectiveDeliveryPolicy",
                 "Endpoint",
                 "Owner",
                 "PendingConfirmation",
@@ -257,17 +274,40 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
             ],
         ),
         (
-            "a firehose subscription with the role it writes under",
+            "an email subscription awaiting confirmation",
+            "sub-attrs-email-pending",
+            "email",
+            "first.last+tag@mail.example.co.uk",
+            &[],
+            true,
+            &[
+                "ConfirmationWasAuthenticated",
+                "EffectiveDeliveryPolicy",
+                "Endpoint",
+                "Owner",
+                "PendingConfirmation",
+                "Protocol",
+                "RawMessageDelivery",
+                "SubscriptionArn",
+                "TopicArn",
+            ],
+        ),
+        (
+            "a firehose subscription with the role it writes under and raw delivery",
             "sub-attrs-firehose-role",
             "firehose",
             "arn:aws:firehose:us-east-1:000000000000:deliverystream/events",
-            &[(
-                "SubscriptionRoleArn",
-                "arn:aws:iam::000000000000:role/sns-firehose",
-            )],
+            &[
+                (
+                    "SubscriptionRoleArn",
+                    "arn:aws:iam::000000000000:role/sns-firehose",
+                ),
+                ("RawMessageDelivery", "true"),
+            ],
             false,
             &[
                 "ConfirmationWasAuthenticated",
+                "EffectiveDeliveryPolicy",
                 "Endpoint",
                 "Owner",
                 "PendingConfirmation",
@@ -287,6 +327,7 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
             false,
             &[
                 "ConfirmationWasAuthenticated",
+                "EffectiveDeliveryPolicy",
                 "Endpoint",
                 "Owner",
                 "PendingConfirmation",
@@ -355,11 +396,33 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
             "case {case:?}: RawMessageDelivery must be {raw_expected:?}, got {held:?}"
         );
 
-        // Every attribute the caller set round-trips verbatim.
+        // Every attribute the caller set round-trips in the form SNS reports it: a
+        // document it normalizes reads back with the members it filled in, and
+        // everything else verbatim.
         for (name, value) in *configured {
+            let reported = held.get(*name).cloned().unwrap_or_default();
+            if *name == "DeliveryPolicy" {
+                let document = json_of(case, name, &reported);
+                assert_eq!(
+                    document.pointer("/healthyRetryPolicy/numRetries"),
+                    json_of(case, name, value).pointer("/healthyRetryPolicy/numRetries"),
+                    "case {case:?}: {name} must keep the retry member the subscription \
+                     was given, got {document}"
+                );
+                for member in RETRY_POLICY_MEMBERS {
+                    assert!(
+                        document
+                            .pointer(&format!("/healthyRetryPolicy/{member}"))
+                            .is_some(),
+                        "case {case:?}: {name} must read back with {member} filled in, \
+                         got {document}"
+                    );
+                }
+                continue;
+            }
             assert_eq!(
-                held.get(*name).map(String::as_str),
-                Some(*value),
+                reported.as_str(),
+                *value,
                 "case {case:?}: {name} must report the value the subscription was given, \
                  got {held:?}"
             );
@@ -374,13 +437,15 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
         }
         if let Some(effective) = held.get("EffectiveDeliveryPolicy") {
             let document = json_of(case, "EffectiveDeliveryPolicy", effective);
-            assert!(
-                document
-                    .pointer("/http/defaultHealthyRetryPolicy/numRetries")
-                    .is_some(),
-                "case {case:?}: EffectiveDeliveryPolicy must be a delivery policy \
-                 document, got {document}"
-            );
+            for member in RETRY_POLICY_MEMBERS {
+                assert!(
+                    document
+                        .pointer(&format!("/healthyRetryPolicy/{member}"))
+                        .is_some(),
+                    "case {case:?}: EffectiveDeliveryPolicy must state the whole retry \
+                     policy; {member} is missing from {document}"
+                );
+            }
         }
 
         // A read must not change what a later read sees.
@@ -398,9 +463,11 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
 /// the subscription holds, and the `numRetries` a delivery is actually run under.
 type EffectivePolicyCase<'a> = (&'a str, Option<&'a str>, Option<&'a str>, i64);
 
-/// The `EffectiveDeliveryPolicy` of a subscription is SNS's system defaults with the
-/// TOPIC's delivery policy and then the SUBSCRIPTION's own laid over them — unless the
-/// topic's policy disables subscription overrides, which is what that member means.
+/// The `EffectiveDeliveryPolicy` of a subscription is SNS's account system defaults
+/// with the TOPIC's delivery policy and then the SUBSCRIPTION's own laid over them —
+/// unless the topic's policy disables subscription overrides, which is what that member
+/// means. It is reported in the subscription's own document shape, with the retry policy
+/// at the top level.
 ///
 /// The system default `numRetries` of 3 is SNS's documented default for a topic no
 /// caller has given a delivery policy (SNS Developer Guide, "Amazon SNS message
@@ -419,13 +486,13 @@ async fn the_effective_delivery_policy_composes_the_topic_and_subscription_polic
         (
             "only the subscription sets one",
             None,
-            Some(r#"{"http":{"defaultHealthyRetryPolicy":{"numRetries":9}}}"#),
+            Some(r#"{"healthyRetryPolicy":{"numRetries":9}}"#),
             9,
         ),
         (
             "the subscription overrides the topic",
             Some(r#"{"http":{"defaultHealthyRetryPolicy":{"numRetries":7}}}"#),
-            Some(r#"{"http":{"defaultHealthyRetryPolicy":{"numRetries":9}}}"#),
+            Some(r#"{"healthyRetryPolicy":{"numRetries":9}}"#),
             9,
         ),
         (
@@ -434,7 +501,7 @@ async fn the_effective_delivery_policy_composes_the_topic_and_subscription_polic
                 r#"{"http":{"defaultHealthyRetryPolicy":{"numRetries":7},
                    "disableSubscriptionOverrides":true}}"#,
             ),
-            Some(r#"{"http":{"defaultHealthyRetryPolicy":{"numRetries":9}}}"#),
+            Some(r#"{"healthyRetryPolicy":{"numRetries":9}}"#),
             7,
         ),
     ];
@@ -465,7 +532,7 @@ async fn the_effective_delivery_policy_composes_the_topic_and_subscription_polic
             .unwrap_or_default();
         let document = json_of(case, "EffectiveDeliveryPolicy", &effective);
         let retries = document
-            .pointer("/http/defaultHealthyRetryPolicy/numRetries")
+            .pointer("/healthyRetryPolicy/numRetries")
             .and_then(serde_json::Value::as_i64);
         assert_eq!(
             retries,

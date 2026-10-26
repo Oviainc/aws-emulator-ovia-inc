@@ -23,8 +23,8 @@
 //!   `ResourcePolicyNotFoundException` (HTTP 404), the one 404 this surface models;
 //! * a policy document with syntax errors, or without a usable principal, is refused
 //!   with `ResourcePolicyNotValidException`;
-//! * a write to a resource CloudTrail is still loading is refused with
-//!   `ConflictException` until the clock settles it;
+//! * a write to a resource another operation is modifying is refused with
+//!   `ConflictException`, while the dashboard a create has just returned is served;
 //! * a `ResourceArn` outside the modelled `@length`/`@pattern` constraints is refused
 //!   as a validation error before any policy is read or written.
 //!
@@ -821,17 +821,16 @@ async fn a_policy_document_that_is_not_a_policy_is_refused() {
     );
 }
 
-/// RULE: a write to a resource CloudTrail is still loading is refused with
-/// `ConflictException` ("the specified resource is not ready for an operation … before
-/// CloudTrail has time to fully load the resource") until the clock settles it; the
-/// read of a resource with no policy is unaffected, because `GetResourcePolicy`
-/// models no such conflict.
+/// RULE: the dashboard `CreateDashboard` has returned is ready, so a policy attaches
+/// to it the moment the create answers — no wait, and no `ConflictException`, which is
+/// left for a resource another operation is modifying (the event-data-store table
+/// above covers that refusal).
 #[tokio::test]
-async fn a_write_to_a_resource_that_is_still_loading_is_refused() {
+async fn a_write_to_a_dashboard_the_create_just_returned_is_served() {
     let emulator = Emulator::new();
 
     let created = emulator
-        .call("CreateDashboard", &json!({"Name": "still-loading"}))
+        .call("CreateDashboard", &json!({"Name": "just-created"}))
         .await;
     let resource_arn = created
         .expect_ok("create the dashboard")
@@ -840,19 +839,24 @@ async fn a_write_to_a_resource_that_is_still_loading_is_refused() {
         .expect("CreateDashboard reported an ARN")
         .to_string();
 
-    put(&emulator, &resource_arn, &valid_policy())
-        .await
-        .expect_error("a dashboard still loading", 409, "ConflictException");
-    // Reading the policy of a resource still loading is still a read: it reports
-    // that no policy is attached.
-    get(&emulator, &resource_arn).await.expect_error(
-        "reading a dashboard still loading",
-        404,
-        "ResourcePolicyNotFoundException",
+    // Attached with no wait: the create has returned, so the dashboard is ready.
+    expect_policy(
+        "the dashboard the create just returned",
+        &put(&emulator, &resource_arn, &valid_policy()).await,
+        &resource_arn,
+        &valid_policy(),
+    );
+    expect_policy(
+        "read back from the dashboard the create just returned",
+        &get(&emulator, &resource_arn).await,
+        &resource_arn,
+        &valid_policy(),
     );
 
+    // And the same dashboard answers the same way once the status it reports while
+    // CloudTrail loads it has settled: the readiness of a stored dashboard does not
+    // depend on the clock.
     sleep(past_settle());
-
     expect_policy(
         "once the dashboard has finished loading",
         &put(&emulator, &resource_arn, &valid_policy()).await,

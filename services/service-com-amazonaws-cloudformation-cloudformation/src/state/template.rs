@@ -451,6 +451,13 @@ pub struct DeclaredParameter {
     pub no_echo: bool,
     /// `Description`: "A string of up to 4000 characters that describes the parameter".
     pub description: Option<String>,
+    /// `AllowedValues`: "An array containing the list of values allowed for the parameter",
+    /// each as the text the declaration spells it with. It is the one constraint a client
+    /// reading a template is told about — "although other constraints might be defined in
+    /// the stack template, CloudFormation returns only the AllowedValues property"
+    /// (`ParameterConstraints`) — and is EMPTY for a declaration that permits any value of
+    /// its type.
+    pub allowed_values: Vec<String>,
 }
 
 /// A template body, as this service reads it.
@@ -459,6 +466,17 @@ pub struct Template {
     /// The template's own `Description`, which is where CloudFormation takes
     /// `Stack$Description` from.
     pub description: Option<String>,
+    /// `AWSTemplateFormatVersion`: "the CloudFormation template version that the template
+    /// conforms to", as the text the template spells it with. `None` for a template that
+    /// declares none, which the reader is not free to invent a version for — "if you don't
+    /// specify a value, CloudFormation assumes the latest template format version", and
+    /// which version that is, is CloudFormation's to know rather than the template's to
+    /// state.
+    pub format_version: Option<String>,
+    /// The `Metadata` section: "objects that provide additional information about the
+    /// template", as the template spells them. `Value::Null` for a template that declares
+    /// no such section.
+    pub metadata: Value,
     /// The `Parameters` section: one entry per declared parameter, in the order the
     /// reader walked the section. The SINGLE record of what a template declares as a
     /// parameter — [`Self::parameter_defaults`] and [`Self::parameter_types`] are views
@@ -554,6 +572,24 @@ pub struct RequiredCapabilities {
     /// Capabilities response element" — `None` when there are no capabilities to
     /// explain.
     pub reason: Option<String>,
+}
+
+/// "A list of all the template resource types that are defined in the template": the type
+/// of each declared resource, without repetition, in the order the template's resources are
+/// held in (`super::declared_template` sorts them by logical id, so one body yields one
+/// order however the workspace was built).
+///
+/// A view of the declarations, like [`Template::parameter_types`], rather than a second
+/// record of them: `GetTemplateSummary` reports it, and anything else that needs the set of
+/// types a template defines reads it here.
+pub fn declared_resource_types(template: &Template) -> Vec<String> {
+    let mut types: Vec<String> = Vec::new();
+    for resource in &template.resources {
+        if !types.contains(&resource.resource_type) {
+            types.push(resource.resource_type.clone());
+        }
+    }
+    types
 }
 
 /// What a template has to be acknowledged for: the IAM resources it declares.
@@ -658,11 +694,32 @@ pub fn insufficient_capabilities_message(missing: &[String]) -> String {
 /// [`guard_yaml_body`] puts on an untrusted document, and for one past a documented
 /// per-template quota — a caller may put anything in `TemplateBody`, and a body this
 /// reader will not read declares no resources and no outputs rather than a subset of them.
+/// [`NOT_WELL_FORMED`] is how every operation refuses such a body.
 pub fn parse(body: &str) -> Option<Template> {
     let mut document = document(body)?;
     super::sam::expand(&mut document);
     template_of(&document)
 }
+
+/// How a body [`parse`] will not read AT ALL is refused — the ONE wording for it, so the
+/// same body is not refused two different sentences by two operations.
+///
+/// "CloudFormation first checks if the template is valid JSON. If it isn't, CloudFormation
+/// checks if the template is valid YAML. If both these checks fail, CloudFormation returns
+/// a template validation error", and the error it returns for a body it cannot read as a
+/// template is a `Template format error` saying the body is not well-formed. The same
+/// verdict covers a body past the bounds this reader puts on an untrusted document: a body
+/// it will not read is not a template it read part of.
+pub const NOT_WELL_FORMED: &str = "Template format error: not well-formed.";
+
+/// How a body that declares no resource is refused, likewise worded once.
+///
+/// "Resources (required): Specifies the stack resources and their properties" is the one
+/// section a template cannot leave out, and an entry carrying no `Type` ("Type: required")
+/// declares no resource — so a body whose `Resources` section is missing, empty or untyped
+/// is refused rather than read as a template declaring nothing.
+pub const NO_RESOURCES_DECLARED: &str =
+    "Template format error: At least one Resources member must be defined.";
 
 /// The documented per-template quota this body is past, worded as the refusal, or `None`
 /// when it is within every one of them.
@@ -801,8 +858,21 @@ fn template_of(document: &Value) -> Option<Template> {
             .filter(|conditions| conditions.is_object())
             .cloned()
             .unwrap_or(Value::Null),
+        // "The optional Metadata section … objects that provide additional information
+        // about the template": a section read as the document it is, like `Mappings` and
+        // `Conditions`, rather than a declaration list.
+        metadata: document
+            .get("Metadata")
+            .filter(|metadata| metadata.is_object())
+            .cloned()
+            .unwrap_or(Value::Null),
         ..Template::default()
     };
+    // The version the template STATES, in whatever scalar spelling it states it (a JSON
+    // body quotes it; a YAML one may not).
+    template.format_version = document
+        .get("AWSTemplateFormatVersion")
+        .and_then(scalar_text);
     template.description = document
         .get("Description")
         .and_then(Value::as_str)
@@ -829,6 +899,14 @@ fn template_of(document: &Value) -> Option<Template> {
                     .and_then(Value::as_str)
                     .filter(|description| !description.is_empty())
                     .map(ToString::to_string),
+                // Every value the declaration permits, each as the text it spells it with:
+                // a numeric allowed value is reported as text for the same reason a
+                // numeric `Default` is.
+                allowed_values: declaration
+                    .get("AllowedValues")
+                    .and_then(Value::as_array)
+                    .map(|values| values.iter().filter_map(scalar_text).collect())
+                    .unwrap_or_default(),
             });
         }
     }

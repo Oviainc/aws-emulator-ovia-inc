@@ -3,7 +3,7 @@
 //! An `s3RecordingConfig`'s bucket, resolved against the emulator's OWN S3.
 //!
 //! The RULE under test: Ground Station resolves the bucket an `s3RecordingConfig` names
-//! before it will store the config, and refuses ONLY when the bucket does not exist — a
+//! before it will store the config, and refuses ONLY when that bucket cannot be resolved — a
 //! bucket the account actually holds is accepted (HTTP 200, `configType` `s3-recording`)
 //! and reads back, while a `bucketArn` naming no bucket is refused with
 //! `InvalidParameterException` (HTTP 431). The same holds of an update.
@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_groundstation_groundstation::state::RECORDING_BUCKET_DOES_NOT_EXIST;
+use service_com_amazonaws_groundstation_groundstation::state::UNRESOLVABLE_RECORDING_BUCKET;
 use service_com_amazonaws_groundstation_groundstation::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -28,7 +28,11 @@ const S3_AUTH: &str = "AWS4-HMAC-SHA256 Credential=AKIDTESTS3/20260101/us-east-1
 
 /// A router holding Ground Station AND S3 over one shared engine, with no bucket and no
 /// config in it yet.
-fn harness_with_object_storage() -> MultiServiceRouter {
+///
+/// `pub(crate)` here and on the three helpers below: the sibling suite
+/// `tests/all/recording_bucket_refusal_message.rs` resolves buckets through the same two
+/// front doors, so this plumbing is written once rather than stood up twice.
+pub(crate) fn harness_with_object_storage() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -44,7 +48,7 @@ fn harness_with_object_storage() -> MultiServiceRouter {
 ///
 /// No `LocationConstraint`, so the bucket lands in `us-east-1`, the region the Ground
 /// Station requests in this suite are signed for.
-async fn create_bucket(router: &MultiServiceRouter, bucket: &str) -> u16 {
+pub(crate) async fn create_bucket(router: &MultiServiceRouter, bucket: &str) -> u16 {
     let request = http::Request::builder()
         .method("PUT")
         .uri(format!("https://s3.{REGION}.amazonaws.com/{bucket}"))
@@ -57,7 +61,7 @@ async fn create_bucket(router: &MultiServiceRouter, bucket: &str) -> u16 {
 }
 
 /// An `s3RecordingConfig` recording to `bucket_arn`.
-fn recording_config(bucket_arn: &str) -> Value {
+pub(crate) fn recording_config(bucket_arn: &str) -> Value {
     json!({"s3RecordingConfig": {
         "bucketArn": bucket_arn,
         "roleArn": "arn:aws:iam::000000000000:role/GroundStationS3Role",
@@ -66,7 +70,7 @@ fn recording_config(bucket_arn: &str) -> Value {
 }
 
 /// `POST /config`.
-async fn create(router: &MultiServiceRouter, name: &str, config_data: &Value) -> Reply {
+pub(crate) async fn create(router: &MultiServiceRouter, name: &str, config_data: &Value) -> Reply {
     send(
         router,
         "POST",
@@ -178,7 +182,7 @@ async fn a_recording_config_is_refused_only_for_a_bucket_that_does_not_exist() {
         );
         assert_eq!(
             reply.string("message"),
-            RECORDING_BUCKET_DOES_NOT_EXIST,
+            UNRESOLVABLE_RECORDING_BUCKET,
             "case {case}: wrong refusal text, got {}",
             reply.body
         );
@@ -217,7 +221,7 @@ async fn a_recording_config_is_refused_only_for_a_bucket_that_does_not_exist() {
     );
     assert_eq!(
         refused.string("message"),
-        RECORDING_BUCKET_DOES_NOT_EXIST,
+        UNRESOLVABLE_RECORDING_BUCKET,
         "case update-to-an-absent-bucket: wrong refusal text, got {}",
         refused.body
     );

@@ -218,6 +218,9 @@ mod network_update;
 #[path = "all/networks.rs"]
 mod networks;
 
+#[path = "all/node_creation_cluster_phase.rs"]
+mod node_creation_cluster_phase;
+
 #[path = "all/node_lifecycle.rs"]
 mod node_lifecycle;
 

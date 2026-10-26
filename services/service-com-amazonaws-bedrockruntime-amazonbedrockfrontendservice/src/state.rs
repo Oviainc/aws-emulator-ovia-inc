@@ -717,6 +717,255 @@ pub const ASYNC_INVOKE_FAILURE_MESSAGE: &str =
 pub const ASYNC_INVOKE_UNSUPPORTED_MESSAGE: &str =
     "The provided model doesn't support async inference.";
 
+/// The service's message for an invocation ARN it cannot read as naming one of
+/// its asynchronous invocations.
+pub const INVALID_ASYNC_INVOKE_ARN_MESSAGE: &str = "The provided Async Invoke arn is not valid";
+
+/// The service's message for a readable resource ARN that names a region other
+/// than the one the request was made in: each region serves its own
+/// invocations, so an ARN of another region names nothing this endpoint can
+/// report on.
+pub const FOREIGN_REGION_RESOURCE_ARN_MESSAGE: &str =
+    "The provided ARN is invalid for the service region";
+
+/// The service's message for an invocation ARN that is readable, is this
+/// account's and this region's, and names no invocation this service holds.
+///
+/// The placeholder is part of the service's own fixed text, not a slot for the
+/// requested ARN: the recorded refusal carries the template UNFILLED (the
+/// behavioural check `bedrock-runtime.cross-account-async-invoke-not-visible`
+/// asserts the message verbatim, braces included), and a client reads the ARN it
+/// asked about from its own request.
+pub const ASYNC_INVOKE_NOT_FOUND_MESSAGE: &str = "jobArn: {} is not found.";
+
+/// The service's message for a resource ARN whose account field is not the
+/// caller's own: the ARN is readable, so the refusal is an authorization one
+/// (`AccessDeniedException`, HTTP 403) and not an input one.
+pub const CROSS_ACCOUNT_RESOURCE_ARN_MESSAGE: &str =
+    "The provided resource ARN is from a different account.";
+
+/// The longest resource ARN a caller may name, in characters: the `@length`
+/// maximum every ARN shape of this model carries
+/// (`smithy_query(query="shape",shape="InvocationArn")`). A value past it is not
+/// a readable reference.
+pub const MAX_RESOURCE_ARN_LENGTH: usize = 2048;
+
+/// Why a resource ARN cannot be resolved for the caller that named it.
+///
+/// The variants are the ORDER the resolution runs in, which is what decides
+/// which refusal a caller sees when more than one holds: an ARN is read as this
+/// service's resource, placed in a region, attributed to an account, read for
+/// the invocation id it names, and only then looked up. Each variant carries the
+/// status and code its refusal is answered with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArnRejection {
+    /// Not readable as an ARN of this service's resource, or not naming an
+    /// invocation id of the form this service mints: `ValidationException`,
+    /// HTTP 400.
+    Unreadable,
+    /// Readable, but naming another region: `ValidationException`, HTTP 400.
+    ForeignRegion,
+    /// Readable and in region, but owned by another account:
+    /// `AccessDeniedException`, HTTP 403.
+    ForeignAccount,
+}
+
+impl ArnRejection {
+    /// The service's own sentence for this rejection.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Unreadable => INVALID_ASYNC_INVOKE_ARN_MESSAGE,
+            Self::ForeignRegion => FOREIGN_REGION_RESOURCE_ARN_MESSAGE,
+            Self::ForeignAccount => CROSS_ACCOUNT_RESOURCE_ARN_MESSAGE,
+        }
+    }
+}
+
+/// Resolve `value` as an invocation ARN this endpoint may report on, for a
+/// request served in `region`.
+///
+/// `Ok(())` says the ARN is one this endpoint owns the records for — whether or
+/// not a record exists, which is the CALLER's next question and this service's
+/// store's answer. The rungs are tried in the order [`ArnRejection`] documents,
+/// so a reference that is wrong in more than one way is reported on the first
+/// rule it breaks, and an ARN is never attributed to an account before it has
+/// been read as this service's.
+///
+/// The invocation ID is read LAST, after the region and the owner: an ARN whose
+/// id is not of the minted form is still placed and attributed first, which is
+/// what lets a reference belonging to another account be refused as that rather
+/// than as a bad id.
+pub fn resolve_invocation_arn(value: &str, region: &str) -> Result<(), ArnRejection> {
+    if value.chars().count() > MAX_RESOURCE_ARN_LENGTH {
+        return Err(ArnRejection::Unreadable);
+    }
+    let arn = ::service_common::arn::parse(value).ok_or(ArnRejection::Unreadable)?;
+    // The resource this operation reads is an async invocation of THIS service,
+    // so an ARN of another service, or of another of this service's resources,
+    // is not a reference it can read. `resource_id_of_type` is the shared reader
+    // of a `<type>/<id>` (or `<type>:<id>`) resource field.
+    let invocation_id = (arn.vendor == ASYNC_INVOKE_ARN_VENDOR)
+        .then(|| ::service_common::arn::resource_id_of_type(value, ASYNC_INVOKE_ARN_RESOURCE_TYPE))
+        .flatten()
+        .ok_or(ArnRejection::Unreadable)?;
+    if arn.region != region {
+        return Err(ArnRejection::ForeignRegion);
+    }
+    if arn.account != ::engine::emulator_account_id() {
+        return Err(ArnRejection::ForeignAccount);
+    }
+    // The id the modelled `InvocationArn` admits, which is also the only form
+    // `mint_invocation_id` produces: an id outside it names no invocation this
+    // service could hold, so the reference is unreadable rather than absent.
+    if !is_minted_invocation_id(invocation_id) {
+        return Err(ArnRejection::Unreadable);
+    }
+    Ok(())
+}
+
+/// Whether `id` is an invocation id of the form this service mints: the twelve
+/// lowercase alphanumerics the modelled `InvocationArn` `@pattern` admits after
+/// `async-invoke/` (`smithy_query(query="shape",shape="InvocationArn")`), which
+/// is what [`ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState::mint_invocation_id`]
+/// produces.
+fn is_minted_invocation_id(id: &str) -> bool {
+    id.len() == INVOCATION_ID_LENGTH
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+/// How many characters an invocation id carries.
+const INVOCATION_ID_LENGTH: usize = 12;
+
+/// The ARN vendor (service namespace) field every resource of this service
+/// carries: the model's `arnNamespace`
+/// (`smithy_query(query="service_info")`), which is the control plane's
+/// namespace and not this data plane's endpoint prefix.
+const ASYNC_INVOKE_ARN_VENDOR: &str = "bedrock";
+
+/// The resource type an invocation ARN addresses
+/// (`smithy_query(query="shape",shape="InvocationArn")`).
+const ASYNC_INVOKE_ARN_RESOURCE_TYPE: &str = "async-invoke";
+
+/// The service's message for a guardrail REFERENCE it cannot read as naming a
+/// guardrail.
+///
+/// Carried by the `guardrailIdentifier` an `ApplyGuardrail` request names in its
+/// URI and the one an `InvokeModel` / `InvokeModelWithResponseStream` request
+/// names in its `X-Amzn-Bedrock-GuardrailIdentifier` header — the wording those
+/// operations' own member documentation describes for a guardrail the request
+/// enables but states wrongly, and what the recorded refusal of an unreadable
+/// identifier carries (`bedrock-runtime-apply-guardrail-error-paths#task#1`).
+pub const GUARDRAIL_REFERENCE_FORMAT_MESSAGE: &str =
+    "Guardrail was enabled but input is in incorrect format.";
+
+/// The service's message for a request it refuses without naming a member of it:
+/// the refusal a value outside what the service can read gets where the service
+/// states no reference wording of its own. Recorded for an unreadable guardrail
+/// VERSION (`bedrock-runtime-apply-guardrail-error-paths#task#2`).
+pub const INVALID_REQUEST_MESSAGE: &str = "The provided request is not valid";
+
+/// The GUARDRAIL REFERENCE members a request names outside its body, in the
+/// order the service reads them, each with the service's own wording for a value
+/// it cannot read.
+///
+/// Bedrock refuses a guardrail reference it cannot read in its own words for that
+/// reference rather than with the per-member constraint envelope a BODY member
+/// outside its constraints gets. The two entries are the `guardrailIdentifier`
+/// and `guardrailVersion` of
+/// `/guardrail/{guardrailIdentifier}/version/{guardrailVersion}/apply` and of
+/// `InvokeModel`'s and `InvokeModelWithResponseStream`'s guardrail headers
+/// (`smithy_query(query="digest")`), which carry the same two member paths and
+/// the same wording. No BODY member of this service is reached by either path:
+/// `Converse` and `ConverseStream` carry their guardrail reference nested under
+/// `guardrailConfig`, so a refusal there names
+/// `guardrailConfig.guardrailIdentifier` and keeps the envelope.
+///
+/// The ORDER is what decides a request that is wrong in both: the resource is
+/// read before the qualifier that selects one of its versions, so a request whose
+/// IDENTIFIER cannot be read is refused on the guardrail, and only a request
+/// naming a readable guardrail is refused on the version it asked for.
+///
+/// `modelId` is NOT here, and neither is `invocationArn`. The first is a BODY
+/// member of `StartAsyncInvoke` as well as the label of five inference URIs, and
+/// this seam cannot tell the two apart — it is handed the violation, not the
+/// operation — so a `modelId` outside its constraints keeps the per-member
+/// envelope on both surfaces. The second is resolved by its own operation
+/// ([`resolve_invocation_arn`]) rather than at the boundary, because its REGION
+/// and its OWNER are answered before its form is.
+pub const RESOURCE_REFERENCES: [(&str, &str); 2] = [
+    ("guardrailIdentifier", GUARDRAIL_REFERENCE_FORMAT_MESSAGE),
+    ("guardrailVersion", INVALID_REQUEST_MESSAGE),
+];
+
+/// The order this service lists its CONTENT-FILTER CATEGORIES in wherever it
+/// names more than one of them — the value set a refusal of the category member
+/// quotes.
+///
+/// It is the service's own order and not a model artefact: the model's two enums
+/// over the same five categories
+/// (`smithy_query(query="shape",shape="GuardrailChecksContentFilterCategory,\
+/// GuardrailContentFilterType")`) declare them in two different orders, and in
+/// neither of these, so the order a message carries has to be stated once here
+/// rather than taken from either. The recorded refusal that names the category
+/// member states this order (`bedrock-runtime-guardrail-checks-inline#task#2`).
+/// The MEMBERSHIP is the model's: the five values are exactly
+/// `GUARDRAIL_CHECKS_CONTENT_FILTER_CATEGORY_VALUES`, which the crate's own test
+/// pins.
+pub const CONTENT_FILTER_CATEGORY_ORDER: [&str; 5] =
+    ["INSULTS", "HATE", "MISCONDUCT", "SEXUAL", "VIOLENCE"];
+
+/// The order this service lists the ROLES a message may carry in — the value set
+/// a refusal of the role member quotes.
+///
+/// The model declares the same three in another order
+/// (`smithy_query(query="shape",shape="GuardrailChecksRole")`), and the recorded
+/// refusal that names the role member states this one
+/// (`bedrock-runtime-invoke-guardrail-checks-error-paths#task#2`), so, as with
+/// the categories above, the order is stated here and the MEMBERSHIP stays the
+/// model's.
+pub const MESSAGE_ROLE_ORDER: [&str; 3] = ["user", "system", "assistant"];
+
+/// Every MEMBER this service quotes a value set for in an order of its own, as
+/// (the member path's leading segments, its trailing segments, the order).
+///
+/// A row is selected by BOTH the member path and the value set that arrived, and
+/// it has to be both: this seam is handed the violation rather than the
+/// operation, so the path alone would also match the same member of another
+/// operation (`Converse` and `ConverseStream` bind a `messages` list whose role
+/// enum is `ConversationRole`), and the set alone would match any enum anywhere
+/// in this service holding the same strings. A member this service states no
+/// order for keeps the order it arrived in — the model's — because inventing one
+/// would change a message this service does not own. The paths are the
+/// framework's own member paths, whose collection step is `<n>.member`.
+const SERVICE_VALUE_ORDERS: [(&str, &str, &[&str]); 2] = [
+    (
+        "checks.contentFilter.categories",
+        "member.category",
+        &CONTENT_FILTER_CATEGORY_ORDER,
+    ),
+    ("messages", "member.role", &MESSAGE_ROLE_ORDER),
+];
+
+/// The order this service quotes the value set of the member at `path` in, when
+/// `values` is that member's own set, or `None` for anything else.
+#[must_use]
+pub fn service_value_order(path: &str, values: &[String]) -> Option<Vec<String>> {
+    SERVICE_VALUE_ORDERS
+        .iter()
+        .find(|(prefix, suffix, ordered)| {
+            path.starts_with(prefix)
+                && path.ends_with(suffix)
+                && values.len() == ordered.len()
+                && ordered
+                    .iter()
+                    .all(|value| values.iter().any(|carried| carried == value))
+        })
+        .map(|(_, _, ordered)| ordered.iter().map(|value| (*value).to_string()).collect())
+}
+
 /// The ids `StartAsyncInvoke` serves: the video generation models, which are the
 /// models AWS publishes asynchronous invocation for ("Use asynchronous
 /// invocation for video generation" in the Amazon Bedrock User Guide).

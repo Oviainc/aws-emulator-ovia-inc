@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRemediationExceptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRemediationExceptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRemediationExceptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Clears the remediation exceptions one Config rule holds for the resources the
+//! request names, so auto-remediation is no longer blocked for them ("Remediation
+//! exceptions blocks auto-remediation until the exception is cleared").
+//!
+//! The rule this handler applies: a resource key the rule holds an exception for is
+//! DELETED, a key it holds none for cannot be deleted and comes back in `FailedBatches`,
+//! and a request in which NO named key names an exception that exists is refused 400
+//! `NoSuchRemediationExceptionException` — the operation's only modelled error, and the
+//! only answer that tells a caller its delete removed nothing at all.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +146,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRemediationExceptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRemediationExceptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRemediationExceptions"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // An exception the clock has already taken past its expiration time is gone
+        // whether or not anybody deleted it, so the deletions the clock owes are
+        // materialised before this request decides what it can delete.
+        store.expire_remediation_exceptions(now);
+
+        let mut deleted = 0usize;
+        let mut failed: Vec<RemediationExceptionResourceKey> = Vec::new();
+        for key in input.resource_keys {
+            // Both members of the key are optional in the model, so a key that omits
+            // one names no resource and therefore no exception: it fails the same way a
+            // key naming a resource the rule holds no exception for does.
+            let stored = (
+                input.config_rule_name.clone(),
+                key.resource_type.clone().unwrap_or_default(),
+                key.resource_id.clone().unwrap_or_default(),
+            );
+            if store.remediation_exceptions.remove(&stored).is_some() {
+                deleted += 1;
+            } else {
+                failed.push(key);
+            }
+        }
+
+        // "You tried to delete a remediation exception that does not exist": a request
+        // that removed nothing at all deleted no exception, so it is refused rather
+        // than answered with a 200 that reports every key as failed.
+        if deleted == 0 {
+            return Err(
+                DeleteRemediationExceptionsErrorModeled::NoSuchRemediationExceptionException(
+                    NoSuchRemediationExceptionException {
+                        message: Some(
+                            crate::state::NO_SUCH_REMEDIATION_EXCEPTION_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Each object in the batch consists of a list of failed items and failure
+        // messages": the keys this call could not delete, in one batch carrying the
+        // reason they could not be — and no batch at all when every key was deleted.
+        let failed_batches = if failed.is_empty() {
+            Vec::new()
+        } else {
+            vec![FailedDeleteRemediationExceptionsBatch {
+                failure_message: Some(
+                    crate::state::NO_SUCH_REMEDIATION_EXCEPTION_MESSAGE.to_string(),
+                ),
+                failed_items: Some(failed),
+            }]
+        };
+
+        Ok(DeleteRemediationExceptionsOutput {
+            failed_batches: Some(failed_batches),
+        })
     }
 }

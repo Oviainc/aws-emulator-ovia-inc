@@ -198,3 +198,5 @@ mod request_validator_create_api_refusal;
 mod delete_domain_name;
 #[path = "all/stage_export_documentation.rs"]
 mod stage_export_documentation;
+#[path = "all/update_domain_name.rs"]
+mod update_domain_name;

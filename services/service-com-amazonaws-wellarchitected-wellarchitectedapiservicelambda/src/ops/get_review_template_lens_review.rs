@@ -199,7 +199,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetReviewTemplateLensReviewOutput {
             // The template as STORED, which is the resource this lens review belongs to.
             template_arn: Some(template.template_arn.clone()),
-            lens_review: Some(template.to_lens_review(&input.lens_alias, &reviewed)),
+            lens_review: Some(template.to_lens_review(
+                &input.lens_alias,
+                &reviewed,
+                // The content of the lenses this template applies, resolved from the whole
+                // lens catalog, so a review of a custom lens reports the pillars and
+                // question roll-up its imported document defines.
+                &store.reviewed_lens_content(&template.lenses),
+            )),
         })
     }
 }

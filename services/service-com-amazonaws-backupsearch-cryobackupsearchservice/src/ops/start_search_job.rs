@@ -237,17 +237,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The tags this job would be stored with have to satisfy what a tag entry of this
-        // service must: the characters `Tags` documents, and the caps bounding one
-        // record. So a create cannot mint a job carrying a tag a write would be refused
-        // for, nor grow a stored job without bound.
+        // The tags this job would be stored with have to pass the admission rule every
+        // write of a tag in this service passes (`crate::state::check_tag_map`): the
+        // characters `Tags` documents, and the caps bounding one record. So a create
+        // cannot mint a job carrying a tag a write would be refused for, nor grow a
+        // stored job without bound. A create merges into nothing, so the count checked is
+        // the one the request carries.
         let tags = input.tags.clone().unwrap_or_default();
-        for (key, value) in &tags {
-            crate::state::check_tag_entry(key, value)
-                .map_err(crate::scaffolded::Scaffolded::validation)?;
-        }
-        crate::state::check_tag_count(tags.len())
-            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        crate::state::check_tag_map(&tags, None)?;
 
         // This store holds its jobs for the life of the process and only this operation
         // adds one, so it is capped: past the cap the service's own quota error is the

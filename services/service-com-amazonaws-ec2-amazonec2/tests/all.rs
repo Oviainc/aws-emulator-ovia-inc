@@ -17,6 +17,12 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// Associating a virtual interface group with a local gateway route table, and reading the
+// association back. Declared beside `prefix_lists` for the reason the note above gives: the
+// sorted region AND the tail of this file are where every new ec2 suite inserts its lines,
+// and these two lines lost several serialized squash merges to the tail.
+#[path = "all/create_local_gateway_route_table_virtual_interface_group_association.rs"]
+mod create_local_gateway_route_table_virtual_interface_group_association;
 // The virtual private gateway slice: create, read back, delete. Declared here rather than in
 // sorted position for the reason given above — the sorted neighbourhood is the contended
 // region of this file, and this suite lost several serialized squash merges to it.
@@ -219,6 +225,9 @@ mod ipam_internet_registry_associations;
 mod ipam_policies;
 #[path = "all/ipam_pools.rs"]
 mod ipam_pools;
+// Creating one further IPAM scope in an IPAM, and reading the account's scopes back.
+#[path = "all/ipam_scopes.rs"]
+mod ipam_scopes;
 #[path = "all/ipam_routing_policy_registrations.rs"]
 mod ipam_routing_policy_registrations;
 #[path = "all/launch_templates.rs"]

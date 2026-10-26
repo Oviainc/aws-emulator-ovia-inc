@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePackageScope
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePackageScope`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePackageScope::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Rewrites the set of other users a stored [`crate::state::Package`] is shared with —
+//! the `AllowListedUserList` that `DescribePackages` reports it through — so the scope
+//! this call answers with and a later read of the package cannot disagree.
+//!
+//! Sharing a package is open only to an account entitled to vend packages
+//! ([`crate::state::ComAmazonawsOpensearchAmazonopensearchserviceState::package_vending_entitled`]);
+//! an account without that standing is refused every scope update.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +84,26 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{package_not_found, Package, PACKAGE_SCOPE_QUOTA};
+
+/// `PackageScopeOperationEnum`'s `ADD`: the users named are GRANTED access beside the
+/// ones the package is already shared with.
+///
+/// This and the two below are that enum's whole value set
+/// (`smithy_query(query="shape",shape="PackageScopeOperationEnum")`).
+const OPERATION_ADD: &str = "ADD";
+
+/// `PackageScopeOperationEnum`'s `OVERRIDE`: the scope BECOMES the users named.
+const OPERATION_OVERRIDE: &str = "OVERRIDE";
+
+/// `PackageScopeOperationEnum`'s `REMOVE`: the users named lose access.
+const OPERATION_REMOVE: &str = "REMOVE";
+
+/// The refusal an account that may not vend packages gets, whatever scope change it
+/// asks for: it is not the request that is wrong but the account's standing, so the
+/// message says so without naming a member of the request.
+const NOT_AUTHORIZED: &str = "You are not authorized to perform this operation.";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -157,18 +176,188 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePackageScope` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePackageScopeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePackageScope"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+
+        // The request's own list is bounded FIRST, before any per-element work and
+        // before the store is locked: `PackageUserList` carries no modelled length, so
+        // a request may name more users than any package's scope can hold, and nothing
+        // of such a request needs looking at. Bounding it here is what keeps the work
+        // done under the lock proportional to the bound rather than to the request —
+        // which is why this one refusal precedes resolving the package, where every
+        // check below is judged on the resolved record.
+        if input.package_user_list.len() > PACKAGE_SCOPE_QUOTA {
+            return Err(UpdatePackageScopeErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "PackageUserList names {} users, more than the {PACKAGE_SCOPE_QUOTA} a \
+                         package can be shared with.",
+                        input.package_user_list.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // The scope lives ON the package record, so the record is first brought to the
+        // status the clock already owed it at this instant: a package whose copy has
+        // fallen due is updated — and answered — in the status it is then in.
+        store.settle_packages(now);
+
+        // Read before the record is borrowed, and judged after it is resolved: an id
+        // that names no package of this account is refused as not found whatever the
+        // account's standing.
+        let entitled = store.package_vending_entitled;
+
+        let package = store.packages.get_mut(&input.package_id).ok_or_else(|| {
+            UpdatePackageScopeErrorModeled::ResourceNotFoundException(package_not_found(
+                &input.package_id,
+            ))
+        })?;
+
+        // A package is shared with another user only by an account that may vend
+        // packages at all. That entitlement belongs to the ACCOUNT rather than to any
+        // one package, so an account without it is refused every scope update of every
+        // package it holds, whatever users the request names.
+        if !entitled {
+            return Err(UpdatePackageScopeErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(NOT_AUTHORIZED.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The scope is the set of OTHER users "allowed to view and associate the
+        // package", and whether a package may "be made available for use by other
+        // users" at all is what its vending options decide: `PackageVendingOptions`'s
+        // own documentation, as
+        // `smithy_query(query="shape",shape="PackageVendingOptions")` carries it, is
+        // "configuration options for determining whether a package can be made
+        // available for use by other users", and `VendingEnabled` "indicates whether
+        // the package vending feature is enabled, allowing the package to be used by
+        // other users". A package whose vending is not enabled can hold no such user,
+        // so a call that asks to change its scope asks for access that package cannot
+        // grant — refused, with the stored scope left exactly as it was, rather than
+        // persisting a grant no read would honour.
+        if !vending_enabled(package) {
+            return Err(UpdatePackageScopeErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Package vending is not enabled for package {}.",
+                        package.package_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The three operations are the three ways one set is changed by another:
+        // union, replacement and difference. Anything else names no change this
+        // service can make — the model's enum admits only those three, so the boundary
+        // validator has already refused it, and this is the refusal for a value that
+        // somehow got past it.
+        let scope = updated_scope(
+            &package.allow_listed_users,
+            &input.operation,
+            &input.package_user_list,
+        )
+        .ok_or_else(|| {
+            UpdatePackageScopeErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "Operation {} is not a package scope operation.",
+                    input.operation
+                )),
+            })
+        })?;
+
+        // A package's scope is bounded: past the bound a grant is refused rather than
+        // stored, so a caller naming fresh accounts cannot grow the record — or the
+        // list every read of the package answers with — without end. The request's own
+        // list is already within the bound; this is the second half of the same bound,
+        // on a union that would carry the STORED scope past it, so a request that names
+        // users the package already has, or withdraws access, is never the call that
+        // trips it.
+        if scope.len() > PACKAGE_SCOPE_QUOTA {
+            return Err(UpdatePackageScopeErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Package {} cannot be shared with more than {PACKAGE_SCOPE_QUOTA} users.",
+                        package.package_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `LastUpdatedAt` is "when the package was last updated": stamped only where
+        // this call actually changed the record, so a call that asks for a scope the
+        // package already has leaves the package exactly as it was.
+        if scope != package.allow_listed_users {
+            package.allow_listed_users = scope;
+            package.updated_at = now;
+        }
+
+        // "List of users who have access to the package after the scope update": the
+        // STORED scope, which is also what `DescribePackages` reports as the package's
+        // `AllowListedUserList`.
+        Ok(UpdatePackageScopeOutput {
+            package_id: Some(package.package_id.clone()),
+            operation: Some(input.operation),
+            package_user_list: Some(package.allow_listed_users.clone()),
+        })
     }
+}
+
+/// Whether `package` may be used by users other than its owner, which is what
+/// `PackageVendingOptions$VendingEnabled` ("indicates whether the package vending
+/// feature is enabled, allowing the package to be used by other users") says. A
+/// package created without vending options carries no such permission.
+fn vending_enabled(package: &Package) -> bool {
+    package
+        .vending_options
+        .as_ref()
+        .is_some_and(|options| options.vending_enabled)
+}
+
+/// The scope `operation` leaves a package with, from the scope it `has` and the users
+/// the request `named`, or `None` where `operation` is outside
+/// `PackageScopeOperationEnum`.
+///
+/// A scope is a SET of users — a user either has access or does not — so every
+/// operation yields a list without repeats, and the order is the order access was
+/// granted in, which is what lets two reads of one package report one scope.
+fn updated_scope(has: &[String], operation: &str, named: &[String]) -> Option<Vec<String>> {
+    match operation {
+        OPERATION_ADD => Some(distinct(has.iter().chain(named))),
+        OPERATION_OVERRIDE => Some(distinct(named.iter())),
+        OPERATION_REMOVE => {
+            let withdrawn: ::std::collections::BTreeSet<&String> = named.iter().collect();
+            Some(distinct(
+                has.iter().filter(|user| !withdrawn.contains(*user)),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// `users` in the order given, with every repeat after the first dropped.
+///
+/// Membership is decided through an ordered set, so the cost is one lookup per user
+/// rather than a scan of everything kept so far.
+fn distinct<'user>(users: impl Iterator<Item = &'user String>) -> Vec<String> {
+    let mut seen: ::std::collections::BTreeSet<&'user String> =
+        ::std::collections::BTreeSet::new();
+    let mut distinct: Vec<String> = Vec::new();
+    for user in users {
+        if seen.insert(user) {
+            distinct.push(user.clone());
+        }
+    }
+    distinct
 }

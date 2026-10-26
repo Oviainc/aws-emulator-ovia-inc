@@ -361,19 +361,10 @@ fn supports(
         // networking asset hosts no instance, so it supports no instance type.
         Hardware::Asset(None) => false,
         Hardware::Asset(Some(compute)) => {
-            let in_recorded_family = match compute.instance_families.as_deref() {
-                Some(families) if !families.is_empty() => families
-                    .iter()
-                    .any(|family| instance_family(entry) == Some(family.as_str())),
-                // An asset that recorded no instance family narrows nothing: the
-                // emulator does not claim its hardware is limited to families nothing
-                // recorded.
-                _ => true,
-            };
-            let within_vcpu_ceiling = compute
-                .max_vcpus
-                .is_none_or(|max| entry.vcp_us.is_none_or(|vcpus| vcpus <= max));
-            in_recorded_family && within_vcpu_ceiling
+            // Whether one piece of compute hardware runs an instance type is the rule
+            // `crate::state::compute_runs` states, and the same one the dry-run
+            // capacity verdict reads about the pools a capacity task requests.
+            crate::state::compute_runs(compute, instance_family(entry), entry.vcp_us)
         }
     }
 }
@@ -384,5 +375,5 @@ fn instance_family(entry: &DetailedInstanceTypeItem) -> Option<&str> {
     entry
         .instance_type
         .as_deref()
-        .and_then(|instance_type| instance_type.split('.').next())
+        .and_then(crate::state::instance_type_family)
 }

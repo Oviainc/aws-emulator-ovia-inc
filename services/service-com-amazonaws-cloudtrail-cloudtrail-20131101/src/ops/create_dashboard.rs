@@ -13,6 +13,8 @@
 //! * a custom dashboard carries at most ten widgets;
 //! * a refresh schedule's frequency is one the model publishes, and its time of day
 //!   is a UTC `HH:MM` defaulting to `00:00`;
+//! * termination protection is the request's, and is ON for a request that states
+//!   nothing;
 //! * a name already taken in the caller's Region is a conflict, never an overwrite;
 //! * a new dashboard is `CREATING` and the clock settles it into `CREATED`.
 //!
@@ -385,8 +387,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect(),
             refresh_schedule,
             // "If termination protection is enabled, you cannot delete the
-            // dashboard" — off unless the request turns it on.
-            termination_protection_enabled: input.termination_protection_enabled.unwrap_or(false),
+            // dashboard" — CloudTrail protects a new dashboard unless the request
+            // opts out, so a request that states nothing takes
+            // `crate::state::DASHBOARD_TERMINATION_PROTECTION_DEFAULT`.
+            termination_protection_enabled: input
+                .termination_protection_enabled
+                .unwrap_or(crate::state::DASHBOARD_TERMINATION_PROTECTION_DEFAULT),
             tags,
             created_at: now,
             updated_at: now,

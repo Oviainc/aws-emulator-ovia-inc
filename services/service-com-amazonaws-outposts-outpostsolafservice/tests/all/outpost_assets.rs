@@ -78,7 +78,7 @@ pub(crate) fn asset(
 /// The `ComputeAttributes` of one recorded asset. Every member is optional, so a row
 /// can record a server whose host id, state, instance families, per-type capacities
 /// or vCPU count were never recorded.
-fn compute(
+pub(crate) fn compute(
     host_id: Option<&str>,
     state: Option<&str>,
     families: Option<&[&str]>,

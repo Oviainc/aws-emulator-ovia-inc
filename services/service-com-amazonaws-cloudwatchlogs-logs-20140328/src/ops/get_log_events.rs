@@ -170,26 +170,110 @@ impl From<GetLogEventsErrorModeled> for GetLogEventsError {
 /// another paginated operation is refused rather than misread.
 const CURSOR_KIND: &str = "GetLogEvents";
 
-/// Where a page resumes from: a position in the stream's event order plus the
-/// direction to walk, and the time window the scan was started with.
+/// The envelope prefix of a cursor that scans towards newer events.
+const FORWARD_DIRECTION: &str = "f";
+/// The envelope prefix of a cursor that scans towards older events.
+const BACKWARD_DIRECTION: &str = "b";
+/// The sentinel a cursor carries once its scan has reached the end of the stream in
+/// its own direction.
+const END_OF_STREAM_SENTINEL: &str = "/s";
+/// The cursor body the service answers with when a page has no position to resume
+/// from: the zero of a cursor body's width.
+const NO_POSITION_BODY: &str = "00000000000000000000000000000000000000000000000000000000";
+
+/// One `nextForwardToken` / `nextBackwardToken`: the direction the cursor scans in, the
+/// opaque body carrying its position, and whether that scan has reached the end of the
+/// stream. The direction and the end-of-stream sentinel ride in the envelope
+/// (`f/<body>`, `b/<body>`, with a trailing `/s`), so a client can tell a forward cursor
+/// from a backward one — and an exhausted one from a resumable one — without reading the
+/// body, which stays this service's own business.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Token {
+    forward: bool,
+    body: String,
+    end_of_stream: bool,
+}
+
+impl Token {
+    /// Render this token in the service's direction-prefixed envelope.
+    fn render(&self) -> String {
+        let direction = if self.forward {
+            FORWARD_DIRECTION
+        } else {
+            BACKWARD_DIRECTION
+        };
+        let sentinel = if self.end_of_stream {
+            END_OF_STREAM_SENTINEL
+        } else {
+            ""
+        };
+        format!("{direction}/{}{sentinel}", self.body)
+    }
+
+    /// Read a token a client handed back. `None` for anything that is not in the
+    /// envelope at all, which is refused as an invalid `nextToken`; a token whose BODY
+    /// this store cannot place is still a token, and is answered as an exhausted scan.
+    fn parse(token: &str) -> Option<Self> {
+        let (direction, rest) = token.split_once('/')?;
+        let forward = match direction {
+            FORWARD_DIRECTION => true,
+            BACKWARD_DIRECTION => false,
+            _ => return None,
+        };
+        let (body, end_of_stream) = match rest.strip_suffix(END_OF_STREAM_SENTINEL) {
+            Some(body) => (body, true),
+            None => (rest, false),
+        };
+        if body.is_empty() || body.contains('/') {
+            return None;
+        }
+        Some(Self {
+            forward,
+            body: body.to_string(),
+            end_of_stream,
+        })
+    }
+
+    /// The pair of cursors a page hands back: one body per direction, each marked with
+    /// the sentinel when its own scan has nothing left to walk.
+    fn pair(forward: (&str, bool), backward: (&str, bool)) -> (String, String) {
+        (
+            Self {
+                forward: true,
+                body: forward.0.to_string(),
+                end_of_stream: forward.1,
+            }
+            .render(),
+            Self {
+                forward: false,
+                body: backward.0.to_string(),
+                end_of_stream: backward.1,
+            }
+            .render(),
+        )
+    }
+}
+
+/// Where a page resumes from: a position in the stream's event order, plus the scan the
+/// cursor belongs to (the stream, and the time window the scan was started with). The
+/// direction travels in the token's envelope rather than in this body, so the forward
+/// and the backward cursor of one page differ in both their envelope and their position.
 #[derive(Debug, Clone)]
 struct Cursor {
     log_group_name: String,
     log_stream_name: String,
-    forward: bool,
     at: crate::state::EventKey,
     start_time: Option<i64>,
     end_time: Option<i64>,
 }
 
 impl Cursor {
-    /// Render this cursor as the opaque `nextForwardToken` / `nextBackwardToken`.
+    /// Render this cursor as the opaque body of a token.
     fn encode(&self) -> String {
         crate::state::encode_token(&::serde_json::json!({
             "kind": CURSOR_KIND,
             "logGroupName": self.log_group_name,
             "logStreamName": self.log_stream_name,
-            "forward": self.forward,
             "timestamp": self.at.timestamp,
             "seq": self.at.seq,
             "startTime": self.start_time,
@@ -197,16 +281,15 @@ impl Cursor {
         }))
     }
 
-    /// Read back a cursor this operation minted. `None` for anything else.
-    fn decode(token: &str) -> Option<Self> {
-        let value = crate::state::decode_token(token)?;
+    /// Read back a cursor body this operation minted. `None` for anything else.
+    fn decode(body: &str) -> Option<Self> {
+        let value = crate::state::decode_token(body)?;
         if value.get("kind")?.as_str()? != CURSOR_KIND {
             return None;
         }
         Some(Self {
             log_group_name: value.get("logGroupName")?.as_str()?.to_string(),
             log_stream_name: value.get("logStreamName")?.as_str()?.to_string(),
-            forward: value.get("forward")?.as_bool()?,
             at: crate::state::EventKey {
                 timestamp: value.get("timestamp")?.as_i64()?,
                 seq: value.get("seq")?.as_u64()?,
@@ -298,18 +381,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A `nextToken` carries the scan it belongs to: the stream and the time
-        // window. A continuation that names a different stream, or contradicts the
-        // window, is refused rather than answered over a different set of events.
-        let cursor = match input.next_token.as_deref() {
+        // A `nextToken` carries the scan it belongs to: the direction, in its envelope,
+        // and the stream and time window, in its body. A continuation that names a
+        // different stream, or contradicts the window, is refused rather than answered
+        // over a different set of events.
+        let inbound = match input.next_token.as_deref() {
             Some(token) => {
-                let Some(cursor) = Cursor::decode(token) else {
+                let Some(token) = Token::parse(token) else {
                     return Err(GetLogEventsErrorModeled::InvalidParameterException(
                         InvalidParameterException {
                             message: Some("nextToken is not a valid token".to_string()),
                         },
                     )
                     .into());
+                };
+                Some(token)
+            }
+            None => None,
+        };
+        let cursor = match &inbound {
+            Some(token) => {
+                let Some(cursor) = Cursor::decode(&token.body) else {
+                    // A cursor in the service's envelope whose body this store cannot
+                    // place carries no position to resume from, so the scan it names has
+                    // nothing left to walk: an exhausted cursor is a successful empty
+                    // page, which hands the same cursor back in both directions.
+                    let (next_forward_token, next_backward_token) = Token::pair(
+                        (token.body.as_str(), true),
+                        (token.body.as_str(), true),
+                    );
+                    return Ok(GetLogEventsOutput {
+                        events: Some(Vec::new()),
+                        next_forward_token: Some(next_forward_token),
+                        next_backward_token: Some(next_backward_token),
+                    });
                 };
                 if cursor.log_group_name != log_group_name
                     || cursor.log_stream_name != input.log_stream_name
@@ -370,12 +475,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(0)
             .max(1);
 
-        // Events are always returned oldest-first within a page; `startFromHead`
-        // chooses which end of the stream the first page is taken from ("If the value
-        // is true, the earliest log events are returned first. If the value is false,
-        // the latest log events are returned first. The default value is false.").
+        // Events are always returned oldest-first within a page; a continuation walks
+        // the way its cursor's envelope says, and `startFromHead` chooses which end of
+        // the stream the FIRST page is taken from ("If the value is true, the earliest
+        // log events are returned first. If the value is false, the latest log events
+        // are returned first. The default value is false.").
+        let scanning_forward = inbound.as_ref().is_none_or(|token| token.forward);
         let (first, last) = match &cursor {
-            Some(cursor) if cursor.forward => {
+            Some(cursor) if scanning_forward => {
                 let from = matching.partition_point(|event| event.key() <= cursor.at);
                 (from, from.saturating_add(limit).min(total))
             }
@@ -388,13 +495,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let page = &matching[first..last];
 
-        // "The returned tokens are never null": a page that exhausted the scan hands
+        // "The returned tokens are never null": each direction's cursor sits at the end
+        // of the page it resumes from, and carries the end-of-stream sentinel when the
+        // window holds nothing further that way. A page that exhausted the scan hands
         // back the token it was called with, which is how a client sees it is done.
         let forward_at = if let Some(event) = page.last() {
             event.key()
         } else {
             match &cursor {
-                Some(cursor) if cursor.forward => cursor.at,
+                Some(cursor) if scanning_forward => cursor.at,
                 _ => crate::state::EventKey::BEFORE_ALL,
             }
         };
@@ -402,25 +511,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             event.key()
         } else {
             match &cursor {
-                Some(cursor) if !cursor.forward => cursor.at,
+                Some(cursor) if !scanning_forward => cursor.at,
                 _ => crate::state::EventKey::AFTER_ALL,
             }
         };
-        let template = Cursor {
-            log_group_name,
-            log_stream_name: input.log_stream_name.clone(),
-            forward: true,
-            at: forward_at,
-            start_time,
-            end_time,
+        let body_at = |at: crate::state::EventKey| {
+            Cursor {
+                log_group_name: log_group_name.clone(),
+                log_stream_name: input.log_stream_name.clone(),
+                at,
+                start_time,
+                end_time,
+            }
+            .encode()
         };
-        let next_forward_token = template.encode();
-        let next_backward_token = Cursor {
-            forward: false,
-            at: backward_at,
-            ..template
-        }
-        .encode();
+        let forward_exhausted =
+            matching.partition_point(|event| event.key() <= forward_at) == total;
+        let backward_exhausted = matching.partition_point(|event| event.key() < backward_at) == 0;
+        let (next_forward_token, next_backward_token) = if page.is_empty() && cursor.is_none() {
+            // Nothing in the window and no cursor to resume: there is no position to
+            // hand back, so both cursors are the zero position, already at the end.
+            Token::pair((NO_POSITION_BODY, true), (NO_POSITION_BODY, true))
+        } else {
+            Token::pair(
+                (body_at(forward_at).as_str(), forward_exhausted),
+                (body_at(backward_at).as_str(), backward_exhausted),
+            )
+        };
 
         Ok(GetLogEventsOutput {
             events: Some(

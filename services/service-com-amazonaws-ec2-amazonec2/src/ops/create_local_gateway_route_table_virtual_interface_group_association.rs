@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLocalGatewayRouteTableVirtualInterfaceGroupAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLocalGatewayRouteTableVirtualInterfaceGroupAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLocalGatewayRouteTableVirtualInterfaceGroupAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associates a virtual interface group the account holds with a local gateway route table
+//! the account holds, storing the association in [`crate::state`] and answering it in the
+//! non-terminal `associating` state the clock owes `associated`. A `DryRun` asks about
+//! permission rather than about the resources named, so it is answered before either is
+//! resolved; the route table is then resolved FIRST, so a request naming one the account
+//! holds no route table for is answered `InvalidLocalGatewayRouteTableID.NotFound` whatever
+//! virtual interface group it named (or `.Malformed`, for an id that is not a local gateway
+//! route table id at all), and a group the account holds none of is answered
+//! `InvalidLocalGatewayVirtualInterfaceGroupID.NotFound` the same way. The request's own
+//! form — a required parameter given empty, and a `TagSpecifications` entry naming another
+//! resource type — is read before either resource is resolved, since neither reading depends
+//! on what the store holds.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +144,197 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLocalGatewayRouteTableVirtualInterfaceGroupAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLocalGatewayRouteTableVirtualInterfaceGroupAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLocalGatewayRouteTableVirtualInterfaceGroupAssociation"))
+        use crate::state;
+
+        // `ctx` carries request metadata only; every fact this association reports comes
+        // from the request or from the two resources it joins in the store the engine on
+        // `self` holds.
+        let _ = ctx;
+
+        // "The ID of the local gateway route table" and the id of the virtual interface
+        // group are both `@required`, but modelled `clientOptional`, so a request that left
+        // either out reaches this handler as an empty string rather than being refused by
+        // the boundary validator. A parameter the request did not carry is EC2's
+        // `MissingParameter`, and it is answered before the `DryRun` below: the flag asks
+        // whether this caller MAY make the request, which is not a question about a request
+        // that is not yet well-formed.
+        for (parameter, value) in [
+            (
+                "LocalGatewayRouteTableId",
+                input.local_gateway_route_table_id.as_str(),
+            ),
+            (
+                "LocalGatewayVirtualInterfaceGroupId",
+                input.local_gateway_virtual_interface_group_id.as_str(),
+            ),
+        ] {
+            if value.is_empty() {
+                return Err(state::missing_parameter(format!(
+                    "The request must contain the parameter {parameter}"
+                )));
+            }
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks about PERMISSION, not about the
+        // resources the request names, so it is answered BEFORE either of them is resolved
+        // — the order `CreateLocalGatewayRouteTableVpcAssociation` answers its own dry run
+        // in. Every caller of this emulator is permitted, and nothing is written on this
+        // path.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "The tags assigned to the local gateway route table virtual interface group
+        // association" (`TagSpecifications`), refusing a specification that names any
+        // resource type but the one this action creates. The shared helper also bounds the
+        // tag count, each key and value, a key given twice and the reserved `aws:` prefix.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_LOCAL_GATEWAY_VIF_GROUP_ASSOCIATION,
+            Self::NAME,
+        )?;
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+
+        // "The ID of the local gateway route table" (`LocalGatewayRouteTableId`) is resolved
+        // FIRST: the association is made IN a route table, so an id that names no route
+        // table of the account leaves nothing for the virtual interface group to be
+        // associated with — the answer the recorded corpus behind this operation's issue
+        // shows EC2 giving a request that names neither resource. The crate's one resolver
+        // for this id refuses a malformed one before an unknown one; an account without an
+        // Outpost holds no local gateway route table at all, so `.NotFound` is the answer
+        // every well-formed id gets until one has been stored.
+        state::require_known_local_gateway_route_table(&store, &input.local_gateway_route_table_id)?;
+        // "The ID of the virtual interface group" is resolved through the crate's one
+        // resolver for that id, which refuses an id that is not one of this kind at all
+        // before an id the account holds no group for.
+        state::require_known_local_gateway_virtual_interface_group(
+            &store,
+            &input.local_gateway_virtual_interface_group_id,
+        )?;
+
+        // "The Amazon Resource Name (ARN) of the local gateway route table for the virtual
+        // interface group" and "The ID of the local gateway" are facts of the ROUTE TABLE,
+        // so they are read off the stored record rather than rebuilt here or taken from the
+        // request. The store's own insert always sets both, so a record missing either is a
+        // broken invariant rather than something to report as an empty member.
+        let table_view = store
+            .local_gateway_route_tables
+            .get(&input.local_gateway_route_table_id)
+            .map(|record| record.view.clone());
+        let (Some(local_gateway_route_table_arn), Some(local_gateway_id)) = table_view
+            .map(|view| (view.local_gateway_route_table_arn, view.local_gateway_id))
+            .unwrap_or_default()
+        else {
+            return Err(state::internal_error(format!(
+                "the local gateway route table '{route_table_id}' carries no ARN or no local \
+                 gateway",
+                route_table_id = input.local_gateway_route_table_id,
+            )));
+        };
+
+        // A route table and a virtual interface group are both resources OF a local gateway,
+        // and the association reports the ONE local gateway it is on, so a pair sitting on
+        // two different local gateways is not an association this service can report: the
+        // parameter that cannot be accepted is the group the request named, so it is refused
+        // with EC2's `InvalidParameterValue` — the code and the order
+        // `CreateLocalGatewayRouteTableVpcAssociation` refuses a pair it cannot accept with.
+        // The group's own local gateway is read off the stored record, which the store's
+        // insert always sets, so a record missing it is a broken invariant rather than an
+        // empty id to name in a refusal.
+        let Some(group_local_gateway_id) = store
+            .local_gateway_virtual_interface_groups
+            .get(&input.local_gateway_virtual_interface_group_id)
+            .and_then(|group| group.local_gateway_id.clone())
+        else {
+            return Err(state::internal_error(format!(
+                "the local gateway virtual interface group '{group_id}' carries no local \
+                 gateway",
+                group_id = input.local_gateway_virtual_interface_group_id,
+            )));
+        };
+        if group_local_gateway_id != local_gateway_id {
+            return Err(state::invalid_parameter_value(format!(
+                "The virtual interface group '{group_id}' is on local gateway \
+                 '{group_local_gateway_id}' and the local gateway route table \
+                 '{route_table_id}' is on local gateway '{local_gateway_id}'",
+                group_id = input.local_gateway_virtual_interface_group_id,
+                route_table_id = input.local_gateway_route_table_id,
+            )));
+        }
+
+        // An association IS the (route table, virtual interface group) pair it joins, so a
+        // second one for the same pair would give one fact two association ids. The
+        // parameter that cannot be accepted is the one the request named, so it is refused
+        // with EC2's `InvalidParameterValue`, naming the association the account already
+        // holds.
+        if let Some(existing) = store
+            .local_gateway_route_table_virtual_interface_group_association_of(
+                &input.local_gateway_route_table_id,
+                &input.local_gateway_virtual_interface_group_id,
+            )
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "The virtual interface group '{group_id}' is already associated with local \
+                 gateway route table '{route_table_id}' by association '{existing}'",
+                group_id = input.local_gateway_virtual_interface_group_id,
+                route_table_id = input.local_gateway_route_table_id,
+            )));
+        }
+
+        // The record itself: the association id, the owning account and the state come from
+        // the store, never from the request. A new association starts in the TRANSIENT
+        // `associating` state with the clock owing it `associated` one TRANSITION_DELAY
+        // later, so a caller asking straight after this call still sees `associating`.
+        let Some(association_id) = store
+            .insert_local_gateway_route_table_virtual_interface_group_association(
+                state::LocalGatewayRouteTableVirtualInterfaceGroupAssociationSpec {
+                    local_gateway_route_table_id: input.local_gateway_route_table_id.clone(),
+                    local_gateway_route_table_arn,
+                    local_gateway_virtual_interface_group_id: input
+                        .local_gateway_virtual_interface_group_id
+                        .clone(),
+                    local_gateway_id,
+                    state: state::LOCAL_GATEWAY_ASSOCIATION_STATE_ASSOCIATING.to_string(),
+                    becomes: Some(state::LOCAL_GATEWAY_ASSOCIATION_STATE_ASSOCIATED.to_string()),
+                    tags,
+                },
+            )
+        else {
+            return Err(crate::scaffolded::Scaffolded::service_error(
+                state::LOCAL_GATEWAY_VIF_GROUP_ASSOCIATION_LIMIT_EXCEEDED,
+                400,
+                format!(
+                    "This emulator stores at most {max} local gateway route table virtual \
+                     interface group associations and at most {bytes} bytes of caller-supplied \
+                     data, and this request would take it past one of the two",
+                    max = state::MAX_LOCAL_GATEWAY_VIF_GROUP_ASSOCIATIONS,
+                    bytes = state::MAX_STORED_BYTES,
+                ),
+            ));
+        };
+
+        // The answer is the record as it was STORED, so this operation and
+        // `DescribeLocalGatewayRouteTableVirtualInterfaceGroupAssociations` cannot report
+        // one association differently.
+        let Some(association) = store
+            .local_gateway_route_table_virtual_interface_group_associations
+            .get(&association_id)
+            .map(|record| record.view.clone())
+        else {
+            return Err(state::internal_error(format!(
+                "the local gateway route table virtual interface group association \
+                 '{association_id}' could not be read back"
+            )));
+        };
+        Ok(
+            CreateLocalGatewayRouteTableVirtualInterfaceGroupAssociationOutput {
+                local_gateway_route_table_virtual_interface_group_association: Some(association),
+            },
+        )
     }
 }

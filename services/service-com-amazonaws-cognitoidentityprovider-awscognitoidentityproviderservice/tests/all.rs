@@ -41,6 +41,8 @@ mod describe_terms_by_client;
 mod device_remembering;
 #[path = "all/error_message_wording.rs"]
 mod error_message_wording;
+#[path = "all/explicit_auth_flows.rs"]
+mod explicit_auth_flows;
 #[path = "all/get_identity_provider_by_identifier.rs"]
 mod get_identity_provider_by_identifier;
 #[path = "all/group_lifecycle.rs"]

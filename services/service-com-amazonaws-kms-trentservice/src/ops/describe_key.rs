@@ -7,7 +7,9 @@
 //!
 //! A reporting operation: it writes nothing, so the metadata it returns is exactly
 //! what `CreateKey` returned plus whatever later `DisableKey` / `EnableKey` /
-//! `ScheduleKeyDeletion` call changed.
+//! `ScheduleKeyDeletion` call changed — with the ONE exception the operation's own
+//! documentation names, a predefined `alias/aws/<service-name>` alias with no key id,
+//! which this call associates with an Amazon Web Services managed key (see `handle`).
 //!
 //! ## Shape of an operation
 //!
@@ -187,23 +189,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx);
-        let state = state.lock();
+        let mut state = state.lock();
         match state.resolve(&region, &input.key_id) {
-            crate::state::KeyRef::Found(key) => Ok(DescribeKeyOutput {
-                key_metadata: Some(key.metadata()),
-            }),
-            crate::state::KeyRef::MalformedArn => {
-                Err(DescribeKeyErrorModeled::InvalidArnException(InvalidArnException {
-                    message: Some(crate::state::invalid_arn_message(&input.key_id)),
-                })
-                .into())
+            crate::state::KeyRef::Found(key) => {
+                return Ok(DescribeKeyOutput {
+                    key_metadata: Some(key.metadata()),
+                });
             }
-            crate::state::KeyRef::NotFound => {
-                Err(DescribeKeyErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
-                })
-                .into())
+            crate::state::KeyRef::MalformedArn => {
+                return Err(DescribeKeyErrorModeled::InvalidArnException(
+                    InvalidArnException {
+                        message: Some(crate::state::invalid_arn_message(&input.key_id)),
+                    },
+                )
+                .into());
+            }
+            // Nothing is associated with this identifier yet, which for ONE class of
+            // identifier is not a missing resource — see below.
+            crate::state::KeyRef::NotFound => {}
+        }
+
+        // "In general, DescribeKey is a non-mutating operation. It returns data about
+        // KMS keys, but doesn't change them. However, Amazon Web Services services use
+        // DescribeKey to create Amazon Web Services managed keys from a predefined
+        // Amazon Web Services alias with no key ID"; "if you specify a predefined
+        // Amazon Web Services alias (an Amazon Web Services alias with no key ID), KMS
+        // associates the alias with an Amazon Web Services managed key and returns its
+        // KeyId and Arn in the response"
+        // (`smithy_query(query="doc",shape="DescribeKeyRequest",member="KeyId")`). So a
+        // predefined alias of THIS endpoint resolves rather than being not found, and
+        // the first call that names it is the one that associates it with a key; every
+        // later call — by that alias name, its alias ARN, the key id or the key ARN —
+        // reports the same key.
+        if let Some(alias_name) = crate::state::alias_named_by(&region, &input.key_id) {
+            if let Some(key) = state.associate_predefined_aws_alias(&region, &alias_name) {
+                return Ok(DescribeKeyOutput {
+                    key_metadata: Some(key.metadata()),
+                });
             }
         }
+
+        Err(
+            DescribeKeyErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
+            })
+            .into(),
+        )
     }
 }

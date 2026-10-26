@@ -2380,6 +2380,16 @@ pub const DASHBOARD_STATUS_CREATING: &str = "CREATING";
 /// See [`DASHBOARD_STATUS_CREATING`]: a dashboard that has finished loading.
 pub const DASHBOARD_STATUS_CREATED: &str = "CREATED";
 
+/// Whether a dashboard created without a `TerminationProtectionEnabled` member is
+/// protected from deletion.
+///
+/// CloudTrail protects a new dashboard unless the caller opts out: a create that
+/// states nothing is answered — and read back — with the protection ON, which is what
+/// the recorded create of a dashboard carrying no such member reports. A request that
+/// states the member keeps the value it stated, in either direction, and
+/// `UpdateDashboard` is what changes it afterwards.
+pub const DASHBOARD_TERMINATION_PROTECTION_DEFAULT: bool = true;
+
 /// From the `CreateDashboard` model doc: "You can add up to 10 widgets to a custom
 /// dashboard." The check both dashboard writers apply is
 /// [`widget_query::widgets_beyond_dashboard_limit_message`].
@@ -3058,15 +3068,15 @@ impl PolicyResourceRejection {
 /// The refusal text for `ResourcePolicyNotFoundException`: a resource that exists
 /// and carries no resource-based policy.
 ///
-/// One sentence for every operation that looks a policy up — the read that reports
-/// one and the delete that detaches one — so the two cannot word the same miss
-/// differently. Built from the request: it names the resource the ARN resolved to.
-pub fn resource_policy_not_found_message(resource_arn: &str) -> String {
-    format!("No resource policy is attached to {resource_arn}")
-}
+/// A FIXED service sentence — the recorded refusal names neither the resource nor
+/// anything else from the request — and the one sentence every operation that looks a
+/// policy up answers with, the read that reports one and the delete that detaches one
+/// alike, so the two cannot word the same miss differently.
+pub const RESOURCE_POLICY_NOT_FOUND_MESSAGE: &str =
+    "There is no policy attached to the given resource.";
 
-/// The refusal text for `ConflictException`: a resource CloudTrail has not finished
-/// loading, which no resource-policy WRITE can change.
+/// The refusal text for `ConflictException`: a resource another operation is
+/// modifying, which no resource-policy WRITE can change.
 ///
 /// From the model doc for the error — "the specified resource is not ready for an
 /// operation … If this exception occurs, wait a few minutes, and then try the
@@ -3084,10 +3094,11 @@ pub struct PolicyResource {
     /// The canonical ARN of the resource, which is the registry key its policy is
     /// stored under and the ARN the operation reports back.
     pub arn: String,
-    /// Whether the resource has finished loading. A resource CloudTrail is still
-    /// loading is what `ConflictException` ("the specified resource is not ready for
-    /// an operation … before CloudTrail has time to fully load the resource")
-    /// refuses a WRITE to; a read reports its policy regardless.
+    /// Whether the resource can take a policy WRITE. A resource another operation is
+    /// modifying — an event data store on its way out — is what `ConflictException`
+    /// ("the specified resource is not ready for an operation … because another
+    /// operation is modifying the resource") refuses a write to; a read reports its
+    /// policy regardless. A resource whose create has returned is ready.
     pub ready: bool,
 }
 
@@ -3123,13 +3134,18 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
 
         let ready = match parsed.kind {
             // Through the dashboard registry's own reader, so the key shape and the
-            // transition the clock owes (`CREATING -> CREATED`, due at `settles_at`
-            // whether or not anybody addressed the dashboard) are stated once. The
-            // ARN's own Region is the Region the identifier is read in, and its
-            // resource id is the dashboard's name.
+            // transition the clock owes are stated once. The ARN's own Region is the
+            // Region the identifier is read in, and its resource id is the
+            // dashboard's name.
+            //
+            // A stored dashboard is READY, whatever `DashboardStatus` it reports: a
+            // dashboard `CreateDashboard` has returned takes a resource-based policy
+            // straight away, which is what the recorded attach made against a
+            // just-created dashboard shows. The status a dashboard reports while it
+            // finishes loading refuses nothing.
             ResourceKind::Dashboard => self
                 .resolve_dashboard_mut(&parsed.id, &parsed.region, now)
-                .map(|record| record.status != DASHBOARD_STATUS_CREATING),
+                .map(|_| true),
             // An event data store id is unique across Regions, and a store is
             // reachable only from the Region it lives in — so an ARN pinning
             // another Region names no store.
@@ -3173,13 +3189,22 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
 /// resource rather than to an identity — a `Principal` (or `NotPrincipal`).
 const POLICY_EFFECTS: [&str; 2] = ["Allow", "Deny"];
 
-/// Check a caller-supplied resource-based policy document.
+/// The refusal text for `ResourcePolicyNotValidException`.
 ///
-/// `Err` carries the refusal text for `ResourcePolicyNotValidException`, which the
-/// model documents for a policy that "has syntax errors, or contains a principal
-/// that is not valid" — so the syntax of the JSON policy document and the presence
-/// of a usable principal are what this checks, each named in the message so a caller
-/// can fix the request from it alone.
+/// A FIXED service sentence: the recorded refusal of a document that is not a policy
+/// states nothing from the request in it — not the part of the grammar the document
+/// broke and not the document itself — so every way a document can fail this check is
+/// answered with these words.
+pub const RESOURCE_POLICY_NOT_VALID_MESSAGE: &str = "The given resource policy is not valid.";
+
+/// Whether a caller-supplied resource-based policy document IS a policy.
+///
+/// `false` is the refusal `ResourcePolicyNotValidException` covers, which the model
+/// documents for a policy that "has syntax errors, or contains a principal that is
+/// not valid" — so the syntax of the JSON policy document and the presence of a
+/// usable principal are what this checks. The refusal itself states one fixed
+/// sentence ([`RESOURCE_POLICY_NOT_VALID_MESSAGE`]), so what each rule rejects is
+/// recorded in the comments here rather than in a message.
 ///
 /// MIGRATION NOTE: the GRAMMAR this walks is one IAM rule, and three other services
 /// already walk it against their own recorded wording —
@@ -3193,80 +3218,52 @@ const POLICY_EFFECTS: [&str; 2] = ["Allow", "Deny"];
 /// its caller and that every copy — this one included — then calls. Until that lands
 /// the document is still parsed by `serde_json` rather than by a hand-rolled parser,
 /// and only the element checks live here.
-pub fn validate_resource_policy(document: &str) -> Result<(), String> {
-    let parsed: ::serde_json::Value = ::serde_json::from_str(document)
-        .map_err(|error| format!("The resource policy is not valid JSON: {error}"))?;
+pub fn is_valid_resource_policy(document: &str) -> bool {
+    // A document that does not parse has the "syntax errors" the model names.
+    let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(document) else {
+        return false;
+    };
+    // A policy document is a JSON object carrying a Statement element.
     let Some(members) = parsed.as_object() else {
-        return Err(
-            "The resource policy must be a JSON object carrying a Statement element".to_string(),
-        );
+        return false;
     };
 
-    let statement = members.get("Statement").ok_or_else(|| {
-        "The resource policy carries no Statement element: a policy document states at least \
-         one statement"
-            .to_string()
-    })?;
+    let Some(statement) = members.get("Statement") else {
+        return false;
+    };
     let statements: Vec<&::serde_json::Value> = match statement {
-        // The Statement element is a statement or an array of statements.
+        // The Statement element is a statement or an array of statements, and
+        // nothing else.
         ::serde_json::Value::Array(items) => items.iter().collect(),
         ::serde_json::Value::Object(_) => vec![statement],
-        _ => {
-            return Err(
-                "The resource policy's Statement element must be a statement or an array of \
-                 statements"
-                    .to_string(),
-            )
-        }
+        _ => return false,
     };
+    // A policy document states at least one statement.
     if statements.is_empty() {
-        return Err(
-            "The resource policy's Statement element is empty: a policy document states at \
-             least one statement"
-                .to_string(),
-        );
+        return false;
     }
 
-    for (index, statement) in statements.iter().enumerate() {
-        // 1-based, so the message counts statements the way a caller reads them.
-        let position = index + 1;
+    statements.iter().all(|statement| {
         let Some(elements) = statement.as_object() else {
-            return Err(format!(
-                "Statement {position} of the resource policy is not a JSON object"
-            ));
+            return false;
         };
 
+        // Each statement states an Effect the grammar admits, …
         let effect = elements.get("Effect").and_then(::serde_json::Value::as_str);
         if !effect.is_some_and(|effect| POLICY_EFFECTS.contains(&effect)) {
-            return Err(format!(
-                "Statement {position} of the resource policy must state an Effect of {} or {}",
-                POLICY_EFFECTS[0], POLICY_EFFECTS[1]
-            ));
+            return false;
         }
+        // … an Action or a NotAction, …
         if !elements.contains_key("Action") && !elements.contains_key("NotAction") {
-            return Err(format!(
-                "Statement {position} of the resource policy states no Action or NotAction"
-            ));
+            return false;
         }
-        let principal = elements
+        // … and — because this is a policy attached TO a resource — a Principal (or
+        // NotPrincipal) naming somebody the policy can grant to.
+        elements
             .get("Principal")
-            .or_else(|| elements.get("NotPrincipal"));
-        let Some(principal) = principal else {
-            return Err(format!(
-                "Statement {position} of the resource policy states no Principal: a \
-                 resource-based policy names the principal it grants access to"
-            ));
-        };
-        if !is_valid_principal(principal) {
-            return Err(format!(
-                "Statement {position} of the resource policy contains a principal that is not \
-                 valid: a Principal is `*`, or a map of principal type to one or more \
-                 non-empty identifiers"
-            ));
-        }
-    }
-
-    Ok(())
+            .or_else(|| elements.get("NotPrincipal"))
+            .is_some_and(is_valid_principal)
+    })
 }
 
 /// Whether a statement's `Principal` element names a principal at all: the `*`
