@@ -45,46 +45,49 @@ use super::error_contract::{call, create_api, router, Answer};
 
 /// The region the shared harness signs for; the service reads it off the credential
 /// scope, so it must appear in every ARN it mints.
-const REGION: &str = "eu-west-1";
+pub(crate) const REGION: &str = "eu-west-1";
 
 /// The account id every emulated ARN carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The number of characters an AppSync opaque id has.
-const ID_LEN: usize = 26;
+pub(crate) const ID_LEN: usize = 26;
 
 /// The only `functionVersion` AppSync supports: "Currently, the supported value is
 /// 2018-05-29" (`CreateFunctionRequest$functionVersion`).
-const FUNCTION_VERSION: &str = "2018-05-29";
+pub(crate) const FUNCTION_VERSION: &str = "2018-05-29";
 
 /// The only runtime AppSync supports, as `AppSyncRuntime` requires both its members:
 /// `name` "the only allowed value is APPSYNC_JS" and `runtimeVersion` "the only
 /// allowed version is 1.0.0".
-const RUNTIME: (&str, &str) = ("APPSYNC_JS", "1.0.0");
+pub(crate) const RUNTIME: (&str, &str) = ("APPSYNC_JS", "1.0.0");
 
 /// The published bounds of `maxBatchSize` (`MaxBatchSize`, range 0..2000) plus a value
 /// between them. Source: `smithy_query(query="shape", shape="MaxBatchSize")`.
-const MAX_BATCH_SIZES: &[i64] = &[0, 1, 2_000];
+pub(crate) const MAX_BATCH_SIZES: &[i64] = &[0, 1, 2_000];
 
 /// One row of the round-trip table: a function to create.
+///
+/// Shared with the `UpdateFunction` suite, which takes the same member set and so
+/// describes a function with the same rows.
 #[derive(Debug, Clone)]
-struct Row {
+pub(crate) struct Row {
     /// What the row exercises, named in every assertion of it.
-    label: &'static str,
-    name: &'static str,
-    description: Option<&'static str>,
-    request_template: Option<&'static str>,
-    response_template: Option<&'static str>,
-    function_version: Option<&'static str>,
-    code: Option<&'static str>,
-    runtime: Option<(&'static str, &'static str)>,
-    sync_config: Option<Value>,
-    max_batch_size: Option<i64>,
+    pub(crate) label: &'static str,
+    pub(crate) name: &'static str,
+    pub(crate) description: Option<&'static str>,
+    pub(crate) request_template: Option<&'static str>,
+    pub(crate) response_template: Option<&'static str>,
+    pub(crate) function_version: Option<&'static str>,
+    pub(crate) code: Option<&'static str>,
+    pub(crate) runtime: Option<(&'static str, &'static str)>,
+    pub(crate) sync_config: Option<Value>,
+    pub(crate) max_batch_size: Option<i64>,
 }
 
 impl Row {
     /// A row with every optional member unset, which each row below fills in.
-    fn bare(label: &'static str, name: &'static str) -> Self {
+    pub(crate) fn bare(label: &'static str, name: &'static str) -> Self {
         Self {
             label,
             name,
@@ -108,7 +111,7 @@ impl Row {
 /// Source for the value sets: `smithy_query(query="shape",
 /// shape="FunctionConfiguration,AppSyncRuntime,SyncConfig,ConflictHandlerType,
 /// ConflictDetectionType,MaxBatchSize")`.
-fn rows() -> Vec<Row> {
+pub(crate) fn rows() -> Vec<Row> {
     vec![
         Row {
             // The smallest VTL function: one template and the template version.
@@ -170,8 +173,9 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// `row` as a `CreateFunction` request body against `data_source`.
-fn request_body(row: &Row, data_source: &str) -> Value {
+/// `row` as a `CreateFunction` (or `UpdateFunction`) request body against
+/// `data_source`: both operations take the same member set.
+pub(crate) fn request_body(row: &Row, data_source: &str) -> Value {
     let mut body = json!({"name": row.name, "dataSourceName": data_source});
     let object = body.as_object_mut().expect("the body is an object");
     if let Some(description) = row.description {
@@ -205,7 +209,11 @@ fn request_body(row: &Row, data_source: &str) -> Value {
 }
 
 /// Create one data source the functions can resolve against, and return its name.
-async fn create_data_source(router: &MultiServiceRouter, api_id: &str, name: &str) -> String {
+pub(crate) async fn create_data_source(
+    router: &MultiServiceRouter,
+    api_id: &str,
+    name: &str,
+) -> String {
     let answer = call(
         router,
         "POST",
@@ -221,7 +229,7 @@ async fn create_data_source(router: &MultiServiceRouter, api_id: &str, name: &st
 }
 
 /// Create one function from `row` under `api_id` and return the answer.
-async fn create_function(
+pub(crate) async fn create_function(
     router: &MultiServiceRouter,
     api_id: &str,
     data_source: &str,
@@ -237,7 +245,11 @@ async fn create_function(
 }
 
 /// Read one function back by its id.
-async fn get_function(router: &MultiServiceRouter, api_id: &str, function_id: &str) -> Answer {
+pub(crate) async fn get_function(
+    router: &MultiServiceRouter,
+    api_id: &str,
+    function_id: &str,
+) -> Answer {
     call(
         router,
         "GET",
@@ -248,7 +260,13 @@ async fn get_function(router: &MultiServiceRouter, api_id: &str, function_id: &s
 }
 
 /// Assert `function` reports exactly what `row` asked for, under `api_id`.
-fn assert_projects(row: &Row, api_id: &str, data_source: &str, function: &Value, source: &str) {
+pub(crate) fn assert_projects(
+    row: &Row,
+    api_id: &str,
+    data_source: &str,
+    function: &Value,
+    source: &str,
+) {
     let case = format!("{} ({source})", row.label);
 
     // The id is opaque and addressable: it is one of this service's own ids, and
