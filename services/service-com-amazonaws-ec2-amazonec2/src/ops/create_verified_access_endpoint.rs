@@ -385,6 +385,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 invalid_verified_access_group_id_not_found(&input.verified_access_group_id)
             })?
+            .view
             .verified_access_instance_id
             .clone();
 
