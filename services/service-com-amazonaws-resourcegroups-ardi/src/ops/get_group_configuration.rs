@@ -2,7 +2,9 @@
 
 //! @op GetGroupConfiguration
 //!
-//! Reports the service configuration stored on a group in [`crate::state`]. An identifier
+//! Reports the service configuration stored on a group in [`crate::state`], and the
+//! configuration update `PutGroupConfiguration` has in flight while one is: the one in
+//! effect, the proposed one, and the status of the attempt. An identifier
 //! that names no stored group is 404 `NotFoundException`; a group that holds no service
 //! configuration has none to report, which is a 400 `BadRequestException`.
 //!
