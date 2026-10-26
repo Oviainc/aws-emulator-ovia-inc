@@ -26,8 +26,9 @@ use service_com_amazonaws_iam_awsidentitymanagementv20100508::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 // `router_with_engine` is the shared harness's router whose engine the test also
-// holds: this suite seeds the versions `CreatePolicyVersion` will write once that
-// operation is implemented (it is still a scaffolded 501, with its own stub issue).
+// holds: this suite seeds the version sets it reads over — including the sparse
+// numbering a run of creates and deletes leaves behind — directly in the service's
+// own store, so a listing case needs no fixed order of writes to arrange.
 use crate::user_lifecycle::{account_id, call, element, elements, error_code, router_with_engine};
 
 /// The document a policy this account creates carries — an IAM JSON policy, the form
@@ -94,12 +95,12 @@ fn version_number(version_id: &str) -> u64 {
 /// beside the `v1` its `CreatePolicy` minted, and make `default_version_id` the
 /// policy's default.
 ///
-/// This is the state a `CreatePolicyVersion` ("creates a new version of the
-/// specified managed policy") plus a `SetDefaultPolicyVersion` will write once those
-/// operations are implemented — both are still scaffolded 501s with their own stub
-/// issues, so the versions are written into the service's OWN store here rather than
-/// into a second copy. Answers every version identifier the policy then carries, in
-/// the order the listing must report them: ascending by version number.
+/// This is the state a run of `CreatePolicyVersion` ("creates a new version of the
+/// specified managed policy") plus a `SetDefaultPolicyVersion` leaves behind, written
+/// into the service's OWN store here rather than into a second copy, so a listing case
+/// can be arranged at any version numbers — `SetDefaultPolicyVersion` is still a
+/// scaffolded 501 with its own stub issue. Answers every version identifier the policy
+/// then carries, in the order the listing must report them: ascending by version number.
 fn seed_versions(
     engine: &engine::InMemoryEngine,
     policy_name: &str,

@@ -161,6 +161,15 @@ pub const MAX_POLICIES_PER_ACCOUNT: usize = 1_500;
 /// ([`managed_policy_characters`]) skips whitespace too.
 pub const MAX_MANAGED_POLICY_CHARACTERS: usize = 6_144;
 
+/// How many versions one managed policy may carry. `CreatePolicyVersion`'s
+/// documentation: "A managed policy can have up to five versions. If the policy has
+/// five versions, you must delete an existing version using DeletePolicyVersion
+/// before you create a new version." A create past it is refused with
+/// `LimitExceededException`, whose documentation says "the error message describes
+/// the limit exceeded", and it is what stops one policy's version map growing
+/// without end.
+pub const MAX_POLICY_VERSIONS: usize = 5;
+
 /// How many IAM users one account may hold. AWS's "IAM and STS quotas" page gives
 /// the quota "Users in an account: 5,000", and a create past it is refused with
 /// `LimitExceededException`, whose documentation says "the error message describes
@@ -672,6 +681,30 @@ pub struct ManagedPolicy {
     pub policy: Policy,
     /// The policy's versions, keyed by `PolicyVersion$VersionId` (`v1`, `v2`, …).
     pub versions: BTreeMap<String, PolicyVersion>,
+}
+
+impl ManagedPolicy {
+    /// The identifier the NEXT version of this policy carries: `v` followed by one
+    /// past the greatest version number the policy holds
+    /// ([`policy_version_number`]).
+    ///
+    /// Version identifiers are assigned in sequence — the first one a policy carries
+    /// is [`FIRST_POLICY_VERSION_ID`], which is what this answers for a policy
+    /// holding no version — so the number is also the creation order every reader of
+    /// a policy's versions enumerates them in
+    /// ([`policy_version_page_key`]). Taking it one past the GREATEST held number,
+    /// rather than from the count, is what keeps a new version from reusing the
+    /// identifier of one the policy still carries after an earlier version was
+    /// deleted.
+    pub fn next_version_id(&self) -> String {
+        let highest = self
+            .versions
+            .keys()
+            .map(|version_id| policy_version_number(version_id))
+            .max()
+            .unwrap_or(0);
+        format!("v{}", highest + 1)
+    }
 }
 
 /// One instance profile the account holds.
@@ -2062,15 +2095,27 @@ pub fn policy_versions_marker_scope(policy_arn: &str) -> String {
 /// enumeration order, which is what lets a reader resume strictly after the key a
 /// `Marker` names even when the version it named has since been deleted.
 pub fn policy_version_page_key(version_id: &str) -> String {
-    let digits: String = version_id
+    let number = policy_version_number(version_id);
+    format!("{number:0width$}:{version_id}", width = POLICY_VERSION_KEY_DIGITS)
+}
+
+/// The NUMBER a policy version identifier carries: the digit run after the leading
+/// `v` of `policyVersionIdType`'s pattern `^v[1-9][0-9]*(\.[A-Za-z0-9-]*)?$`.
+///
+/// ONE reading of an identifier's number, shared by the enumeration order
+/// ([`policy_version_page_key`]) and by the minting of the next identifier
+/// ([`ManagedPolicy::next_version_id`]), so a version created is numbered in the
+/// space the readers order by. An identifier the pattern admits always carries a
+/// number; one that somehow does not counts as 0, so it sorts first rather than
+/// being dropped from the order.
+pub fn policy_version_number(version_id: &str) -> u64 {
+    version_id
         .trim_start_matches('v')
         .chars()
         .take_while(char::is_ascii_digit)
-        .collect();
-    // An identifier the model's pattern admits always carries a number; one that
-    // somehow does not sorts first rather than being dropped from the order.
-    let number: u64 = digits.parse().unwrap_or(0);
-    format!("{number:0width$}:{version_id}", width = POLICY_VERSION_KEY_DIGITS)
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0)
 }
 
 /// How many digits [`policy_version_page_key`] pads a version number to: enough

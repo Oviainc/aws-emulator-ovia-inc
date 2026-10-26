@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePolicyVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePolicyVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePolicyVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a new version of a managed policy the ACCOUNT holds, from the document the
+//! request carries, and optionally makes that version the policy's default. Every
+//! refusal is the modelled one for what the request got wrong: the shape of the
+//! `PolicyArn`, the content of the document, the absence of the policy that ARN names,
+//! or the policy already carrying its full complement of versions.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +170,193 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePolicyVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePolicyVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePolicyVersion"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreatePolicyVersionErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `arnType` constrains only the length, so a value that is not a
+        // managed-policy ARN at all is an "invalid … value … supplied for an input
+        // parameter" — a different refusal from an ARN naming a policy that is not
+        // held. The form is checked through the one definition of the ARN grammar this
+        // crate holds, the same one every operation taking a `PolicyArn` reads one with.
+        if crate::state::parse_policy_arn(&input.policy_arn).is_none() {
+            return Err(CreatePolicyVersionErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!("ARN {} is not valid.", input.policy_arn)),
+                },
+            )
+            .into());
+        }
+
+        // This operation creates a version of a managed policy the ACCOUNT holds: an
+        // ARN in AWS's own managed-policy namespace names a policy AWS owns and an
+        // account cannot change, so such an ARN is an out-of-range value for this
+        // parameter rather than a missing entity — the same rule, and the same refusal,
+        // `DeletePolicy` and `UntagPolicy` apply to a change of an AWS-owned policy. The
+        // refusal does not depend on whether this emulator's catalog carries that entry,
+        // because no entry of it could take a new version either.
+        if crate::state::is_aws_managed_policy_arn(&input.policy_arn) {
+            return Err(CreatePolicyVersionErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Policy {} is an AWS managed policy, which cannot be modified.",
+                        input.policy_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The request was rejected because the policy document was malformed" — the
+        // content of a managed policy version must be an IAM JSON policy, not merely a
+        // non-empty string, which is all `policyDocumentType`'s own pattern asks for.
+        // The rule, and its wording, are the shared ones every operation taking a policy
+        // document applies.
+        if !crate::state::is_policy_document(&input.policy_document) {
+            return Err(
+                CreatePolicyVersionErrorModeled::MalformedPolicyDocumentException(
+                    MalformedPolicyDocumentException {
+                        message: Some(
+                            "Syntax errors in policy: PolicyDocument must be a JSON object \
+                             carrying a Statement element"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A managed policy's document is bounded well below `policyDocumentType`'s own
+        // 131072-character ceiling, and the bound is the policy's, not the create's: a
+        // version whose document is past the quota is refused rather than stored, exactly
+        // as the document `CreatePolicy` was given would be.
+        let characters = crate::state::managed_policy_characters(&input.policy_document);
+        if characters > crate::state::MAX_MANAGED_POLICY_CHARACTERS {
+            return Err(CreatePolicyVersionErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Maximum policy size of {} characters exceeded for policy {}",
+                        crate::state::MAX_MANAGED_POLICY_CHARACTERS,
+                        input.policy_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any version is written, and before the STORE is consulted for
+        // the policy — so a caller that may not add a version to a policy learns that it
+        // may not, never whether the account holds that policy. (The refusals above are
+        // about the ARN and the document the request itself supplied, which the caller
+        // already knows.) The decision is made on the ARN the request addresses, while the
+        // refusal NAMES the entity that ARN identifies.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::CREATE_POLICY_VERSION,
+            &input.policy_arn,
+            &format!("policy {}", input.policy_arn),
+        )?;
+
+        // The write is addressed exactly as a read of the same ARN is, so it reaches the
+        // one record `GetPolicy` reports; an ARN the account holds no policy under
+        // "referenced a resource entity that does not exist", through the one wording
+        // `crate::state` holds for a missing managed policy, which every operation taking
+        // a `PolicyArn` answers with.
+        let Some(held) = store.policy_by_arn_mut(&input.policy_arn) else {
+            return Err(CreatePolicyVersionErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(crate::state::policy_not_found(&input.policy_arn)),
+                },
+            )
+            .into());
+        };
+
+        // "A managed policy can have up to five versions. If the policy has five
+        // versions, you must delete an existing version using DeletePolicyVersion before
+        // you create a new version": past the quota the create is refused, and the
+        // message describes the limit exceeded.
+        if held.versions.len() >= crate::state::MAX_POLICY_VERSIONS {
+            return Err(CreatePolicyVersionErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "A managed policy can have up to {} versions. Before you create a new \
+                         version, you must delete an existing version.",
+                        crate::state::MAX_POLICY_VERSIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The identifier is minted from the versions the policy already carries, so it
+        // collides with none of them and numbers this version after them.
+        let version_id = held.next_version_id();
+        let created = crate::state::now();
+
+        // "When this parameter is true, the new policy version becomes the operative
+        // version. That is, it becomes the version that is in effect for the IAM users,
+        // groups, and roles that the policy is attached to" — and exactly one version is
+        // the operative one, so the version that was default stops being it. An absent
+        // `SetAsDefault` is its modelled default of false, which leaves the policy's
+        // default where it stands.
+        if input.set_as_default {
+            for version in held.versions.values_mut() {
+                version.is_default_version = false;
+            }
+            held.policy.default_version_id = Some(version_id.clone());
+        }
+
+        let version = PolicyVersion {
+            // Held as the plain JSON text the request carried, which is how this crate
+            // holds every policy document, and handed back verbatim by the readers.
+            document: Some(input.policy_document),
+            version_id: Some(version_id.clone()),
+            is_default_version: input.set_as_default,
+            create_date: Some(created),
+        };
+        held.versions.insert(version_id.clone(), version.clone());
+
+        // `Policy$UpdateDate`: "when a policy has more than one version, this field
+        // contains the date and time when the most recent policy version was created",
+        // which is this call.
+        held.policy.update_date = Some(created);
+
+        // Audit record for the change: the acting principal, the operation and what it
+        // wrote to which policy, so a state-changing call leaves a local record — the
+        // same shape `UntagPolicy` and the credential operations in this crate emit. The
+        // document itself is not recorded, only the version it became.
+        ::tracing::info!(
+            audit = true,
+            operation = "CreatePolicyVersion",
+            outcome = "created",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            policy_arn = %input.policy_arn,
+            version_id = %version_id,
+            set_as_default = input.set_as_default,
+            "a version was added to a managed policy"
+        );
+
+        // "The policy document is returned in the response to the GetPolicyVersion and
+        // GetAccountAuthorizationDetails operations. It is not returned in the response
+        // to the CreatePolicyVersion or ListPolicyVersions operations"
+        // (`PolicyVersion$Document`), so the response reports the version's identity,
+        // default flag and creation instant and withholds its content — which
+        // `GetPolicyVersion` serves from the record just stored.
+        Ok(CreatePolicyVersionOutput {
+            policy_version: Some(PolicyVersion {
+                document: None,
+                ..version
+            }),
+        })
     }
 }

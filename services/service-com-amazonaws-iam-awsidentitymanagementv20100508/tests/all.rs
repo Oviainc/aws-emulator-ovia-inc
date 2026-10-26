@@ -85,6 +85,8 @@ mod policy_tag_listing;
 mod policy_tag_removal;
 #[path = "all/policy_tags.rs"]
 mod policy_tags;
+#[path = "all/policy_version_creation.rs"]
+mod policy_version_creation;
 #[path = "all/policy_version_listing.rs"]
 mod policy_version_listing;
 #[path = "all/principal_policy_context_keys.rs"]

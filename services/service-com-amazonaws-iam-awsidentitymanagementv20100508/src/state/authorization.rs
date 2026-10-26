@@ -88,6 +88,9 @@ pub const LIST_POLICY_TAGS: &str = "iam:ListPolicyTags";
 /// `iam:UntagPolicy`.
 pub const UNTAG_POLICY: &str = "iam:UntagPolicy";
 
+/// `iam:CreatePolicyVersion`.
+pub const CREATE_POLICY_VERSION: &str = "iam:CreatePolicyVersion";
+
 /// `iam:GetAccountAuthorizationDetails`.
 pub const GET_ACCOUNT_AUTHORIZATION_DETAILS: &str = "iam:GetAccountAuthorizationDetails";
 
