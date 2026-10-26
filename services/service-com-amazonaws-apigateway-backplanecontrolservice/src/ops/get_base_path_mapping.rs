@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBasePathMapping
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBasePathMapping`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBasePathMapping::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stored `BasePathMapping` the request's `basePath` names under
+//! the custom `DomainName` it addresses. Reads only.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +76,23 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::BasePathMappingEntry;
+
+impl From<&BasePathMappingEntry> for GetBasePathMappingOutput {
+    /// The `BasePathMapping` body for a stored mapping. `GetBasePathMapping` and
+    /// `CreateBasePathMapping` share the `BasePathMapping` shape but the scaffold renders
+    /// it as two Rust types, so this mirrors the `CreateBasePathMappingOutput` conversion
+    /// member for member rather than rendering the record a second way.
+    fn from(entry: &BasePathMappingEntry) -> Self {
+        let body = CreateBasePathMappingOutput::from(entry);
+        Self {
+            base_path: body.base_path,
+            rest_api_id: body.rest_api_id,
+            stage: body.stage,
+        }
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -154,18 +164,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBasePathMapping` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBasePathMappingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBasePathMapping"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let store = state.lock();
+
+        // A base path mapping is a record OF a custom domain name, so it is reached
+        // through that record: the domain name is resolved by the two members
+        // `GetDomainName` resolves one by (a `domainNameId` is "supported only for private
+        // custom domain names", and a private one needs it because several may carry one
+        // name), and a `domainName` no stored record answers to is that record's own
+        // missing-resource refusal rather than the mapping's.
+        let domain_key =
+            crate::state::domain_name_key(&input.domain_name, input.domain_name_id.as_deref());
+        let domain = store.domain_names.get(&domain_key).ok_or_else(|| {
+            GetBasePathMappingErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_DOMAIN_NAME.to_string()),
+            })
+        })?;
+
+        // The `basePath` label addresses ONE mapping of that domain name, under the
+        // spelling the record was stored with: `(none)` is the base path a caller reaches
+        // by naming the domain name and nothing after it, which is what the member
+        // documents and what `CreateBasePathMapping` stored. A base path the domain name
+        // carries no mapping for resolves to nothing, which is the modelled
+        // `NotFoundException`.
+        let base_path = crate::state::base_path_key(Some(&input.base_path));
+        let mapping = domain.base_path_mappings.get(&base_path).ok_or_else(|| {
+            GetBasePathMappingErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_BASE_PATH_MAPPING.to_string()),
+            })
+        })?;
+        Ok(GetBasePathMappingOutput::from(mapping))
     }
 }

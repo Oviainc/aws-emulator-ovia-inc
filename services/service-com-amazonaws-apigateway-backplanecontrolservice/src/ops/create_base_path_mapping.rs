@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBasePathMapping
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBasePathMapping`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBasePathMapping::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores a `BasePathMapping` under the custom `DomainName` the request
+//! addresses, mapping its base path at the named REST API (and the stage of it the request
+//! names), and reports the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +85,26 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{bound_chars, BasePathMappingEntry};
+
+impl From<&BasePathMappingEntry> for CreateBasePathMappingOutput {
+    /// The `BasePathMapping` body for a stored mapping — the one place this crate renders
+    /// that shape, so `CreateBasePathMapping` and `GetBasePathMapping` cannot report a
+    /// record differently.
+    fn from(entry: &BasePathMappingEntry) -> Self {
+        Self {
+            // Always reported: a stored mapping always has a base path, because an absent
+            // one is stored as the spelling API Gateway documents for it (see
+            // `crate::state::base_path_key`).
+            base_path: Some(entry.base_path.clone()),
+            rest_api_id: Some(entry.rest_api_id.clone()),
+            // Absent for a mapping that names no stage, which is what distinguishes it
+            // from one whose stage is named.
+            stage: entry.stage.clone(),
+        }
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -164,18 +178,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBasePathMapping` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBasePathMappingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBasePathMapping"))
+        let bad_request = |message: String| -> Self::Error {
+            CreateBasePathMappingErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Nothing caller-sized reaches the store unchecked, and it is checked before the
+        // store lock is taken at all.
+        if let Some(base_path) = &input.base_path {
+            bound_chars("basePath", base_path, crate::state::MAX_PATH_CHARS).map_err(bad_request)?;
+        }
+        if let Some(stage) = &input.stage {
+            bound_chars("stage", stage, crate::state::MAX_STAGE_NAME_CHARS).map_err(bad_request)?;
+        }
+
+        // An absent or empty `basePath` is the base path API Gateway spells `(none)`, the
+        // one a caller reaches by naming the domain name and nothing after it; see
+        // `crate::state::base_path_key`.
+        let base_path = crate::state::base_path_key(input.base_path.as_deref());
+        // A `stage` of `(none)` names NO stage — "Specify '(none)' if you want callers to
+        // explicitly specify the stage name after any base path name" — so it is not
+        // resolved against the API's stages, and an empty one is no stage at all.
+        let stage = input.stage.filter(|stage| !stage.is_empty());
+        let named_stage = stage
+            .as_deref()
+            .filter(|stage| *stage != crate::state::NONE_BASE_PATH)
+            .map(str::to_owned);
+
+        let mut store = state.lock();
+
+        // The mapping is a record OF a custom domain name, addressed by the same two
+        // members `GetDomainName` resolves one by, so a request naming no stored domain
+        // name has nothing to create a mapping under.
+        let domain_key =
+            crate::state::domain_name_key(&input.domain_name, input.domain_name_id.as_deref());
+        if !store.domain_names.contains_key(&domain_key) {
+            return Err(CreateBasePathMappingErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::NO_SUCH_DOMAIN_NAME.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "The string identifier of the associated RestApi": the mapping sends calls on
+        // this base path to that API, so the identifier must resolve to a stored API — and
+        // one that resolves to none is this operation's BAD REQUEST, the classification
+        // `crate::state::INVALID_REST_API_IDENTIFIER` is the sentence for, rather than the
+        // missing record the domain name's own refusal reports.
+        let api = store
+            .rest_apis
+            .get(&input.rest_api_id)
+            .ok_or_else(|| bad_request(crate::state::INVALID_REST_API_IDENTIFIER.to_string()))?;
+        // "The name of the API's stage that you want to use for this mapping": a stage of
+        // THAT API, so a name no stage of it answers to is refused the same way, and a
+        // stored mapping never points at a stage that does not exist.
+        if let Some(stage) = &named_stage {
+            if !api.stages.contains_key(stage) {
+                return Err(bad_request(crate::state::NO_SUCH_STAGE.to_string()));
+            }
+        }
+
+        let sequence = store.next_sequence();
+        let domain = store
+            .domain_names
+            .get_mut(&domain_key)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Bound the growth a caller drives, at API Gateway's published quota.
+        if domain.base_path_mappings.len() >= crate::state::MAX_BASE_PATH_MAPPINGS_PER_DOMAIN_NAME {
+            return Err(CreateBasePathMappingErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    retry_after_seconds: None,
+                    message: Some(crate::state::quota_reached(
+                        "Base Path Mappings",
+                        "Domain Name",
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The base path "must be unique for all of the mappings" of the domain name, so a
+        // second create of one base path is the modelled conflict rather than a silent
+        // replacement of the mapping the first one stored: the lookup and the insert share
+        // ONE hold of the store lock, which is what makes two concurrent creates of one
+        // base path resolve to one success and one conflict.
+        if domain.base_path_mappings.contains_key(&base_path) {
+            return Err(CreateBasePathMappingErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::BASE_PATH_MAPPING_ALREADY_EXISTS.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let entry = BasePathMappingEntry {
+            base_path: base_path.clone(),
+            rest_api_id: input.rest_api_id.clone(),
+            stage,
+            sequence,
+        };
+        // Reading the record back means what the caller is told is what a later
+        // `GetBasePathMapping` will report.
+        domain.base_path_mappings.insert(base_path.clone(), entry);
+        let stored = domain
+            .base_path_mappings
+            .get(&base_path)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let output = CreateBasePathMappingOutput::from(stored);
+        // Everything below is owned, so the store lock is released before the record is
+        // formatted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            domain_name = ?domain_key,
+            base_path = ?base_path,
+            outcome = "created",
+            "base path mapping created",
+        );
+        Ok(output)
     }
 }

@@ -548,6 +548,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_default()
                 .into_iter()
                 .collect::<::std::collections::BTreeMap<String, String>>(),
+            // A domain name a caller has just created carries no base path mappings:
+            // every one is `CreateBasePathMapping`'s own call against this record.
+            base_path_mappings: ::std::collections::BTreeMap::new(),
             sequence,
         };
 

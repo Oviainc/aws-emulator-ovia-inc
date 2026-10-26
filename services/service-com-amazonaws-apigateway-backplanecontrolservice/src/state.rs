@@ -7,7 +7,8 @@
 //! with), the `Method`s put on those resources, the API's `Stage`s and the gateway
 //! responses a developer has customized on it — beside the
 //! account's `ApiKey`, `VpcLink`, `UsagePlan` and custom `DomainName` records and the
-//! domain name access associations created against those domain names. Every
+//! base path mappings and domain name access associations created against those domain
+//! names. Every
 //! handler in `src/ops/` computes its response from these records; nothing is synthesised
 //! per request.
 //!
@@ -822,6 +823,18 @@ pub struct DomainNameEntry {
     pub policy: Option<String>,
     pub routing_mode: Option<String>,
     pub tags: BTreeMap<String, String>,
+    /// The `BasePathMapping`s created against this domain name, keyed by the base path
+    /// each one answers to — [`base_path_key`], which is also the `basePath` path label
+    /// `GetBasePathMapping` addresses one by.
+    ///
+    /// A base path mapping is a record OF the domain name it was created against (it is
+    /// created, read, listed and deleted under `/domainnames/{domainName}`), and the base
+    /// path "must be unique for all of the mappings across a single API" of that domain
+    /// name, so the mappings live INSIDE the record rather than in a second map beside the
+    /// domain names: the key is unique exactly where the uniqueness rule applies, and a
+    /// deleted domain name takes its mappings with it instead of leaving orphans a later
+    /// create of the same name would inherit.
+    pub base_path_mappings: BTreeMap<String, BasePathMappingEntry>,
     /// This domain name's creation rank, from
     /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
     /// listing can report creation order rather than key order.
@@ -860,6 +873,53 @@ impl DomainNameEntry {
         domain_name_key(&self.domain_name, self.domain_name_id.as_deref())
     }
 }
+
+/// One stored `BasePathMapping`: the base path of a custom domain name, and the REST API
+/// (and, when the mapping names one, the stage of it) that a call arriving on that base
+/// path is served by.
+///
+/// The record stores only what it OWNS — the three members `BasePathMapping` models. The
+/// API's and the stage's own records are NOT copied here: the mapping names them by
+/// identifier, which is what it is, and two copies of one stage is how a reader ends up
+/// reporting a stale one.
+#[derive(Debug, Clone, Default)]
+pub struct BasePathMappingEntry {
+    /// The base path this mapping answers to, which is also its key in
+    /// [`DomainNameEntry::base_path_mappings`]; never empty, because an absent base path
+    /// is stored as [`NONE_BASE_PATH`]. See [`base_path_key`].
+    pub base_path: String,
+    /// "The string identifier of the associated RestApi" — the id of a stored
+    /// [`RestApiEntry`] at the time the mapping was created.
+    pub rest_api_id: String,
+    /// "The name of the associated stage": a stage of that API, or `None` for a mapping
+    /// created without one, which is what distinguishes a mapping that names no stage
+    /// from one that names a stage called something.
+    pub stage: Option<String>,
+    /// This mapping's creation rank, from
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
+    /// listing can report creation order rather than base-path order.
+    pub sequence: u64,
+}
+
+/// The base path a `BasePathMapping` is stored and addressed under, from the (possibly
+/// absent) `basePath` a request carried.
+///
+/// API Gateway spells the EMPTY base path — the mapping a caller reaches by naming the
+/// domain name and nothing after it — as the literal `(none)`: `basePath` is documented
+/// as "Specify '(none)' if you do not want callers to specify any base path name after
+/// the domain name", which is the spelling both the create and the read take and so the
+/// one a stored record must carry. An absent or empty `basePath` is therefore the same
+/// request as one naming `(none)`, and a mapping created either way is addressable both
+/// ways; anything else the request names is the base path itself, kept as given.
+pub fn base_path_key(base_path: Option<&str>) -> String {
+    match base_path {
+        Some(base_path) if !base_path.is_empty() => base_path.to_string(),
+        _ => NONE_BASE_PATH.to_string(),
+    }
+}
+
+/// How API Gateway spells the empty base path; see [`base_path_key`].
+pub const NONE_BASE_PATH: &str = "(none)";
 
 /// The key a stored [`DomainNameEntry`] is addressed by, and the cursor a
 /// `GetDomainNames` page hands back.
@@ -1364,6 +1424,9 @@ pub const MAX_USAGE_PLAN_KEYS_PER_PLAN: usize = MAX_API_KEYS;
 /// API Gateway's default quota "Custom domain names (regional or edge-optimized) per
 /// account per Region: 120".
 pub const MAX_DOMAIN_NAMES: usize = 120;
+
+/// API Gateway's default quota "Base path mappings per domain name: 200".
+pub const MAX_BASE_PATH_MAPPINGS_PER_DOMAIN_NAME: usize = 200;
 
 /// Emulator resource guard, NOT an AWS quota: the most domain name access associations
 /// this emulator stores for one account. API Gateway publishes no quota for them, so the
@@ -3020,6 +3083,19 @@ pub const NO_SUCH_USAGE_PLAN: &str = "Invalid Usage Plan ID specified";
 /// identifier messages above. Shared by every operation that resolves a domain name, so
 /// all of them say the same thing about the same failure.
 pub const NO_SUCH_DOMAIN_NAME: &str = "Invalid domain name identifier specified";
+
+/// The `NotFoundException` message for a `basePath` the addressed custom domain name
+/// carries no mapping for, in the shape of the sibling identifier messages above. Shared
+/// by every operation that resolves a base path mapping, so all of them say the same thing
+/// about the same failure.
+pub const NO_SUCH_BASE_PATH_MAPPING: &str = "Invalid base path mapping identifier specified";
+
+/// The `ConflictException` message for a base path the addressed custom domain name
+/// already carries a mapping for: the base path "must be unique for all of the mappings
+/// across a single API" of the domain name, so the second create of one base path is
+/// refused rather than replacing the mapping the first one stored (replacing it is
+/// `UpdateBasePathMapping`'s own call).
+pub const BASE_PATH_MAPPING_ALREADY_EXISTS: &str = "Base path already exists for this domain name";
 
 /// The `NotFoundException` message for a domain name access association ARN that names no
 /// stored association, in the shape of the sibling identifier messages above. Shared by

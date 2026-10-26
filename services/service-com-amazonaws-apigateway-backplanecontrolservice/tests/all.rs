@@ -212,3 +212,5 @@ mod update_api_key_patch_path_refusal;
 mod delete_request_validator;
 #[path = "all/invalid_security_policy.rs"]
 mod invalid_security_policy;
+#[path = "all/base_path_mapping.rs"]
+mod base_path_mapping;
