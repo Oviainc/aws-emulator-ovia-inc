@@ -626,6 +626,15 @@ pub const VPC_ENDPOINT_STATUS_UPDATING: &str = "UPDATING";
 /// being torn down.
 pub const VPC_ENDPOINT_STATUS_DELETING: &str = "DELETING";
 
+/// The words the service names a change in flight on a service-managed VPC endpoint
+/// by, in the conflict refusal a second writer gets: the lifecycle verb for each
+/// transient `VpcEndpointStatus`, lower-case as the refusal states it.
+pub const VPC_ENDPOINT_CHANGE_CREATE: &str = "create";
+/// The verb for [`VPC_ENDPOINT_STATUS_UPDATING`]. See [`VPC_ENDPOINT_CHANGE_CREATE`].
+pub const VPC_ENDPOINT_CHANGE_UPDATE: &str = "update";
+/// The verb for [`VPC_ENDPOINT_STATUS_DELETING`]. See [`VPC_ENDPOINT_CHANGE_CREATE`].
+pub const VPC_ENDPOINT_CHANGE_DELETE: &str = "delete";
+
 /// `VpcEndpointErrorCode`'s `ENDPOINT_NOT_FOUND` value — the code
 /// `DescribeVpcEndpoints` reports IN ITS PAYLOAD for an id that names no endpoint,
 /// rather than refusing the whole call: that read reports on a LIST of ids, so one
@@ -746,6 +755,33 @@ impl VpcEndpointRecord {
         self.owed.is_some()
     }
 
+    /// How the service names the change that has not landed on this endpoint yet, or
+    /// `None` where nothing is in flight.
+    ///
+    /// The endpoint's own status IS that change — it is the status the service leaves an
+    /// endpoint in while the change is applied — so the word comes from the status
+    /// rather than from a second record of what the last writer asked for, and from the
+    /// stored state rather than from the request now being refused: what the refused
+    /// caller has to wait for is the change ALREADY under way, whichever call started it.
+    pub fn change_in_flight(&self) -> Option<&'static str> {
+        if !self.in_flight() {
+            return None;
+        }
+        Some(match self.status.as_str() {
+            VPC_ENDPOINT_STATUS_CREATING => VPC_ENDPOINT_CHANGE_CREATE,
+            VPC_ENDPOINT_STATUS_UPDATING => VPC_ENDPOINT_CHANGE_UPDATE,
+            // The release takes the record out of the store and leaves no move owed on
+            // it, so no endpoint this mapping is asked about is being torn down today;
+            // the arm is here because the mapping is about the STATUS and is answered
+            // the same way whichever status the record carries.
+            VPC_ENDPOINT_STATUS_DELETING => VPC_ENDPOINT_CHANGE_DELETE,
+            // A move owed from any OTHER status: the three above are every status this
+            // store leaves an endpoint in while a change is applied, so this is the
+            // surprising case, and a modification of the endpoint is what it reports.
+            _ => VPC_ENDPOINT_CHANGE_UPDATE,
+        })
+    }
+
     /// Apply the subnets and security groups `options` names to this endpoint and
     /// leave it in the status that change starts.
     ///
@@ -854,13 +890,14 @@ pub fn vpc_endpoint_not_found() -> ResourceNotFoundException {
 /// The service applies one change to an endpoint at a time, so a writer that arrives
 /// while another is still in flight is refused rather than overtaking it — the same
 /// rule [`concurrent_package_operation`] states for a domain's package associations.
-/// The endpoint is what the two callers are contending over, so the sentence names it
-/// and nothing else of the request.
-pub fn vpc_endpoint_being_modified(vpc_endpoint_id: &str) -> ConflictException {
+/// The sentence states the change ALREADY in progress on the endpoint
+/// ([`VpcEndpointRecord::change_in_flight`]) and carries no value of the request: what
+/// the refused caller has to wait for is that change, and the endpoint is the one it
+/// already named.
+pub fn vpc_endpoint_being_modified(change_in_flight: &str) -> ConflictException {
     ConflictException {
         message: Some(format!(
-            "Operation not allowed. A concurrent operation is in progress for VPC endpoint \
-             {vpc_endpoint_id}."
+            "A {change_in_flight} operation is already in progress for this VPC endpoint."
         )),
     }
 }

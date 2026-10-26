@@ -185,10 +185,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // endpoint has not landed yet is refused, so of two writers exactly one applies
         // and the endpoint settles with that one's options rather than with a merge of
         // both. The condition is read AFTER the settling above, so an endpoint whose
-        // change has merely fallen due is idle again and this request is served.
-        if endpoint.in_flight() {
+        // change has merely fallen due is idle again and this request is served. The
+        // refusal states the change ALREADY under way, which is what the refused caller
+        // waits for, whichever call started it.
+        if let Some(change_in_flight) = endpoint.change_in_flight() {
             return Err(UpdateVpcEndpointErrorModeled::ConflictException(
-                vpc_endpoint_being_modified(&input.vpc_endpoint_id),
+                vpc_endpoint_being_modified(change_in_flight),
             )
             .into());
         }

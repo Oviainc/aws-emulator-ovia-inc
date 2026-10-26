@@ -19,21 +19,29 @@
 //! * the endpoint rests in `UPDATING` the instant the call returns and the clock owes it
 //!   `ACTIVE` once the span has passed, with no call having asked for the move;
 //! * a change that arrives while another change to the SAME endpoint has not landed yet
-//!   is refused with the modelled `ConflictException` (HTTP 409) naming that endpoint —
-//!   whether the change in flight is an update or the create that minted it — so two
-//!   racing writers settle on exactly one winner's options rather than a merge, and the
-//!   refused request succeeds unchanged once the endpoint is idle again;
+//!   is refused with the modelled `ConflictException` (HTTP 409) stating the change
+//!   already in progress — whether that is an update or the create that minted the
+//!   endpoint — so two racing writers settle on exactly one winner's options rather than
+//!   a merge, and the refused request succeeds unchanged once the endpoint is idle again;
 //! * an id that names no endpoint of this account is refused with the modelled
 //!   `ResourceNotFoundException`, and nothing is changed.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    ENDPOINT_INACCESSIBLE, VPC_ENDPOINT_STATUS_ACTIVE, VPC_ENDPOINT_STATUS_CREATING,
-    VPC_ENDPOINT_STATUS_UPDATING,
+    ENDPOINT_INACCESSIBLE, VPC_ENDPOINT_CHANGE_CREATE, VPC_ENDPOINT_CHANGE_UPDATE,
+    VPC_ENDPOINT_STATUS_ACTIVE, VPC_ENDPOINT_STATUS_CREATING, VPC_ENDPOINT_STATUS_UPDATING,
 };
 
 use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
 use super::vpc_endpoints::{create_endpoint, describe_endpoints, member, minted, vpc_domain};
+
+/// The sentence the service refuses a change with while another change to the SAME
+/// endpoint has not landed: fixed text stating the change already under way, and no
+/// value of the request beside it. Spelled out here rather than taken from the crate, so
+/// that a change to either part fails this suite.
+fn conflict_message(change_in_flight: &str) -> String {
+    format!("A {change_in_flight} operation is already in progress for this VPC endpoint.")
+}
 
 /// `UpdateVpcEndpoint`: `POST /2021-01-01/opensearch/vpcEndpoints/update`.
 async fn update_endpoint(emulator: &Emulator, id: &str, vpc_options: &Value) -> Answer {
@@ -277,10 +285,11 @@ async fn a_change_arriving_while_another_is_in_flight_is_refused_and_changes_not
             "case {case}: expected ConflictException, got {:?}",
             lost.body
         );
-        let message = lost.body["message"].as_str().unwrap_or_default().to_owned();
-        assert!(
-            message.contains(&id),
-            "case {case}: the refusal names the endpoint it is about, got {message:?}"
+        assert_eq!(
+            lost.body["message"].as_str(),
+            Some(conflict_message(VPC_ENDPOINT_CHANGE_UPDATE).as_str()),
+            "case {case}: the refusal states the update already in progress, got {:?}",
+            lost.body
         );
 
         // The refused request changed nothing: the endpoint still carries the winner's
@@ -338,6 +347,13 @@ async fn a_change_to_an_endpoint_whose_create_has_not_landed_is_refused() {
         error_code(&answer),
         "ConflictException",
         "case an endpoint still being provisioned: expected ConflictException, got {:?}",
+        answer.body
+    );
+    assert_eq!(
+        answer.body["message"].as_str(),
+        Some(conflict_message(VPC_ENDPOINT_CHANGE_CREATE).as_str()),
+        "case an endpoint still being provisioned: the refusal states the create already in \
+         progress, got {:?}",
         answer.body
     );
     let case = "an endpoint still being provisioned";
@@ -407,6 +423,83 @@ async fn two_racing_writers_settle_on_exactly_one_winner() {
         "case two concurrent updates: the endpoint carries exactly the winner's security groups, \
          got {settled:?}"
     );
+}
+
+#[tokio::test]
+async fn the_conflict_refusal_states_the_change_already_in_progress() {
+    let emulator = Emulator::new();
+
+    // One row per change an endpoint can have in flight when the next writer arrives,
+    // and per way that writer differs: the create that minted the endpoint, and updates
+    // of each of the two members `VpcOptions` carries. The refused request itself is
+    // varied too, so the sentence cannot be coming from what it asked for.
+    let rows: Vec<(&str, Option<Value>, Value, &str)> = vec![
+        (
+            "the create that minted the endpoint has not landed",
+            None,
+            json!({ "SecurityGroupIds": ["sg-0111000000000000a"] }),
+            VPC_ENDPOINT_CHANGE_CREATE,
+        ),
+        (
+            "an update of the subnets has not landed",
+            Some(json!({ "SubnetIds": ["subnet-0222000000000001"] })),
+            json!({ "SubnetIds": ["subnet-0222000000000002"] }),
+            VPC_ENDPOINT_CHANGE_UPDATE,
+        ),
+        (
+            "an update of the security groups has not landed",
+            Some(json!({ "SecurityGroupIds": ["sg-0333000000000001"] })),
+            json!({
+                "SubnetIds": ["subnet-0333000000000001"],
+                "SecurityGroupIds": ["sg-0333000000000002"],
+                "EgressEnabled": false,
+            }),
+            VPC_ENDPOINT_CHANGE_UPDATE,
+        ),
+    ];
+
+    for (index, (case, in_flight, refused, change)) in rows.into_iter().enumerate() {
+        let domain = format!("endpoint-conflict-word-{index}");
+        let id = match &in_flight {
+            // Nothing waits for the create: it is the change in flight.
+            None => creating_endpoint(&emulator, &domain).await,
+            Some(options) => {
+                let id = active_endpoint(&emulator, &domain).await;
+                let won = update_endpoint(&emulator, &id, options).await;
+                assert_eq!(
+                    won.status, 200,
+                    "case {case}: expected the first writer to win with 200, got {} with {:?}",
+                    won.status, won.body
+                );
+                id
+            }
+        };
+
+        let answer = update_endpoint(&emulator, &id, &refused).await;
+        assert_eq!(
+            answer.status, 409,
+            "case {case}: expected 409, got {} with {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            error_code(&answer),
+            "ConflictException",
+            "case {case}: expected ConflictException, got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            answer.body["message"].as_str(),
+            Some(conflict_message(change).as_str()),
+            "case {case}: expected the refusal to state the {change} already in progress, got \
+             {:?}",
+            answer.body
+        );
+        let message = answer.body["message"].as_str().unwrap_or_default().to_owned();
+        assert!(
+            !message.contains(&id),
+            "case {case}: the refusal carries no value of the request, got {message:?}"
+        );
+    }
 }
 
 #[tokio::test]
