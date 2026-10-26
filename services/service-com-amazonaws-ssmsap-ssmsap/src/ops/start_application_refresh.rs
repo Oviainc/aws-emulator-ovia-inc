@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartApplicationRefresh
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartApplicationRefresh`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartApplicationRefresh::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Refreshes the stored application: its `DiscoveryStatus` becomes `REGISTERING` now and
+//! `SUCCESS` one [`crate::state::TRANSITION_SPAN`] later, and the `OperationId` returned
+//! names a persisted `START_APPLICATION_REFRESH` operation record that `GetOperation`
+//! reads back. A refresh re-runs the application's discovery rather than its SAP system,
+//! so the `Status` the application is in is the one it keeps.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +142,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartApplicationRefresh` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartApplicationRefreshErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartApplicationRefresh"))
+        // The Region this request was signed for: a control call reaches an application
+        // registered at THIS regional endpoint and no others.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartApplicationRefreshErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.settle(now);
+
+        let Some(mut application) = state
+            .region(&region)
+            .applications
+            .get(&input.application_id)
+            .cloned()
+        else {
+            return Err(
+                StartApplicationRefreshErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::application_not_found_message(
+                        &input.application_id,
+                    )),
+                )
+                .into(),
+            );
+        };
+
+        // A change the clock still owes this application is an operation already under
+        // way on it, which is what `ConflictException` reports.
+        if application.pending.is_some() {
+            return Err(StartApplicationRefreshErrorModeled::ConflictException(
+                crate::state::conflict(format!(
+                    "Application {} is {} and cannot be refreshed until that completes",
+                    application.id, application.status
+                )),
+            )
+            .into());
+        }
+
+        // A refresh re-runs the application's DISCOVERY, which is what
+        // `Application$DiscoveryStatus` reports the latest result of: the application is
+        // discovering again now and reaches the next discovery result one
+        // `TRANSITION_SPAN` from now, materialised for every reader at that instant by
+        // `crate::state::StoredApplication::settle` without anything sleeping. The SAP
+        // system itself is neither started nor stopped, so the `Status` the application
+        // is in is left exactly as it was.
+        application.discovery_status = crate::state::DISCOVERY_STATUS_REGISTERING.to_string();
+        application.last_updated = now;
+        application.pending = Some(crate::state::PendingTransition {
+            due_at: now + crate::state::TRANSITION_SPAN,
+            change: crate::state::PendingChange::Status {
+                status: application.status.clone(),
+                // The emulator discovers nothing on the registered instances, so what a
+                // refresh re-discovers is the registration this store already holds: the
+                // discovery the clock owes this application succeeds, exactly as the one
+                // its registration started did.
+                discovery_status: crate::state::DISCOVERY_STATUS_SUCCESS.to_string(),
+            },
+        });
+
+        // The application was just found in this Region, so reaching for the partition
+        // to write mints nothing.
+        let region_state = state.region_entry(&region);
+        let operation_id = region_state.record_operation(
+            crate::state::OPERATION_TYPE_START_APPLICATION_REFRESH,
+            &application,
+            // `StartApplicationRefresh` carries no parameter beyond the application it
+            // names, which the record already reports as `ResourceId`/`ResourceArn`.
+            ::std::collections::HashMap::new(),
+            now,
+        );
+        region_state
+            .applications
+            .insert(input.application_id, application);
+
+        Ok(StartApplicationRefreshOutput {
+            operation_id: Some(operation_id),
+        })
     }
 }
