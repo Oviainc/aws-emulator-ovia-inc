@@ -448,6 +448,12 @@ pub const UNSUPPORTED_TENANT_RESOURCE: &str = "Provided ARN is not in SES resour
 /// the handler is what refuses a key the enum does not name.
 pub const LIST_TENANT_RESOURCES_FILTER_KEYS: [&str; 1] = ["RESOURCE_TYPE"];
 
+/// Every `ListTenantsFilterKey` the model binds, in the order the enum lists them:
+/// "TENANT_NAME_CONTAINS — filter by a substring of the tenant name" and
+/// "SENDING_STATUS — filter by sending status". The filter arrives as a map of plain
+/// strings, so the handler is what refuses a key the enum does not name.
+pub const LIST_TENANTS_FILTER_KEYS: [&str; 2] = ["TENANT_NAME_CONTAINS", "SENDING_STATUS"];
+
 /// Configuration sets the account may hold: SES's documented quota is 10,000
 /// configuration sets per account per Region, and `CreateConfigurationSet` refuses
 /// past it with the `LimitExceededException` its model binds.
@@ -1349,6 +1355,25 @@ impl TenantRecord {
             // asked for.
             sending_status: Some(self.aggregate_sending_status()),
             suppression_attributes: Some(self.suppression_attributes()),
+        }
+    }
+
+    /// The modelled `TenantInfo` view of this record, as `ListTenants` reports it:
+    /// "basic information about each tenant, such as tenant name, ID, ARN, and
+    /// creation timestamp".
+    ///
+    /// Every member it carries is the one [`Self::view`] reports under the same
+    /// name, read off the same stored record, so a listing and a read of one tenant
+    /// cannot disagree about it; `TenantInfo` simply carries no tags and no
+    /// suppression attributes.
+    pub fn info_view(&self) -> crate::ops::types::TenantInfo {
+        let full = self.view();
+        crate::ops::types::TenantInfo {
+            tenant_name: full.tenant_name,
+            tenant_id: full.tenant_id,
+            tenant_arn: full.tenant_arn,
+            created_timestamp: full.created_timestamp,
+            sending_status: full.sending_status,
         }
     }
 
@@ -2461,6 +2486,9 @@ pub const RESOURCE_TENANTS_PAGE_TOKEN_TAG: &str = "sesv2:resource-tenants:";
 
 /// The tag `ListTenantResources`'s own tokens carry.
 pub const TENANT_RESOURCES_PAGE_TOKEN_TAG: &str = "sesv2:tenant-resources:";
+
+/// The tag `ListTenants`'s own tokens carry.
+pub const TENANTS_PAGE_TOKEN_TAG: &str = "sesv2:tenants:";
 
 /// Encode a `NextToken` that resumes the listing tagged `tag` after `last_returned`.
 ///

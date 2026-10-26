@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTenants
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTenants`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTenants::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tenants the account holds, read off the records `CreateTenant` stored,
+//! narrowed by the filter the request carried and paged by its `PageSize` and
+//! `NextToken`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +143,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTenants` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTenantsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTenants"))
+        // The listing is the account's whole tenant table, so no request metadata is
+        // needed — the same reading the rest of the tenant surface takes.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a throttle an SDK would retry forever.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListTenants without the shared emulator state",
+            ));
+        };
+
+        let filter = TenantFilter::from_request(input.filter.unwrap_or_default())?;
+
+        // "The number of results to show in a single call": `PageSize` targets
+        // `MaxItems`, on which the model puts no bound, so only a positive count
+        // truncates a page; a non-positive one is read as no truncation, which keeps a
+        // caller that sends 0 from being stuck on an empty page forever. The same
+        // reading as this service's other listings.
+        let page_size = usize::try_from(input.page_size.unwrap_or_default())
+            .ok()
+            .filter(|size| *size > 0);
+
+        // The token is this operation's own: it names the last tenant the previous page
+        // reported, so the next page resumes strictly after it.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_tagged_page_token(crate::state::TENANTS_PAGE_TOKEN_TAG, token)
+                    .ok_or_else(|| bad_request(crate::state::invalid_next_token()))?,
+            ),
+        };
+
+        // Reporting only: nothing here writes, so a read leaves every later caller
+        // seeing exactly what it saw.
+        let matching: Vec<TenantInfo> = {
+            let store = state.lock();
+            // The tenant table is keyed by `TenantName`, so it enumerates in name order
+            // whatever order the tenants were created in; the filter narrows the
+            // sequence a page is a window over, so a token is a position in the NARROWED
+            // listing.
+            store
+                .tenants
+                .values()
+                .map(crate::state::TenantRecord::info_view)
+                .filter(|tenant| filter.matches(tenant))
+                .collect()
+        };
+
+        let start = match resume_after.as_deref() {
+            None => 0,
+            Some(last) => matching
+                .partition_point(|tenant| tenant.tenant_name.as_deref().unwrap_or_default() <= last),
+        };
+        let remaining = &matching[start..];
+        let page = match page_size {
+            Some(size) => &remaining[..size.min(remaining.len())],
+            None => remaining,
+        };
+        // A token only when tenants remain behind this page, so a walk terminates.
+        let next_token = (page.len() < remaining.len())
+            .then(|| {
+                page.last()
+                    .and_then(|tenant| tenant.tenant_name.as_deref())
+                    .map(|name| {
+                        crate::state::encode_tagged_page_token(
+                            crate::state::TENANTS_PAGE_TOKEN_TAG,
+                            name,
+                        )
+                    })
+            })
+            .flatten();
+
+        Ok(ListTenantsOutput {
+            tenants: Some(page.to_vec()),
+            next_token,
+        })
     }
+}
+
+/// The `ListTenantsFilter` a request carried, resolved to the tenant members it
+/// constrains.
+///
+/// `ListTenantsFilterKey` names two keys and each constrains ONE member of a listed
+/// tenant: `TENANT_NAME_CONTAINS` a substring of its name and `SENDING_STATUS` its
+/// sending status. A filter naming both keeps only the tenants that satisfy both.
+#[derive(Debug, Default)]
+struct TenantFilter {
+    /// `TENANT_NAME_CONTAINS`: any substring of a `TenantName`, whose only constraint
+    /// is the modelled length of a filter value.
+    name_contains: Option<String>,
+    /// `SENDING_STATUS`, a `SendingStatus`, compared against the status the tenant
+    /// reports — which is its reputation entity's aggregate status, the one
+    /// `TenantInfo$SendingStatus` carries.
+    sending_status: Option<String>,
+}
+
+impl TenantFilter {
+    /// Read the filter map, refusing a key the enum does not name and a value outside
+    /// the enum the key filters on.
+    ///
+    /// The filter arrives as a map of plain strings, so both are the handler's to
+    /// check: the modelled constraints a boundary validator can enforce are already
+    /// enforced by the time this runs, and an enum member is not one of them. Read in
+    /// key order, so a filter naming several unmodelled keys is refused the same way
+    /// every time.
+    fn from_request(
+        filter: ::std::collections::HashMap<String, String>,
+    ) -> Result<Self, ListTenantsError> {
+        let mut entries: Vec<(String, String)> = filter.into_iter().collect();
+        entries.sort();
+        let mut resolved = Self::default();
+        for (key, value) in entries {
+            let key = crate::state::modelled_enum_value(
+                "Filter key",
+                key,
+                &crate::state::LIST_TENANTS_FILTER_KEYS,
+            )
+            .map_err(bad_request)?;
+            match key.as_str() {
+                "SENDING_STATUS" => {
+                    resolved.sending_status = Some(
+                        crate::state::modelled_enum_value(
+                            "SENDING_STATUS filter value",
+                            value,
+                            &crate::state::SENDING_STATUSES,
+                        )
+                        .map_err(bad_request)?,
+                    );
+                }
+                // The only key the check above leaves, which filters on a free-form
+                // substring. Named rather than taken as a fallthrough, so a key added
+                // to the enum without a branch here is a compile-time-visible gap
+                // instead of a silent name filter.
+                "TENANT_NAME_CONTAINS" => resolved.name_contains = Some(value),
+                other => {
+                    return Err(bad_request(format!(
+                        "Filter key {other} is not one of {}.",
+                        crate::state::LIST_TENANTS_FILTER_KEYS.join(", ")
+                    )));
+                }
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// Whether `tenant` satisfies every key this filter named.
+    fn matches(&self, tenant: &TenantInfo) -> bool {
+        self.name_contains.as_deref().is_none_or(|needle| {
+            tenant
+                .tenant_name
+                .as_deref()
+                .is_some_and(|name| name.contains(needle))
+        }) && self
+            .sending_status
+            .as_deref()
+            .is_none_or(|wanted| tenant.sending_status.as_deref() == Some(wanted))
+    }
+}
+
+/// Refuse the request with this operation's input error.
+fn bad_request(message: impl Into<String>) -> ListTenantsError {
+    ListTenantsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }
