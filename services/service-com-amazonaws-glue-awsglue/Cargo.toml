@@ -21,6 +21,9 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The content digest a resource policy's `PolicyHash` is derived from, hex-rendered.
+sha2 = { workspace = true }
+hex = { workspace = true }
 # The `Expression` filter of `GetTables` is a regular expression, matched here by the
 # regex crate rather than by a hand-rolled matcher.
 regex = "1.13"
@@ -32,10 +35,6 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true
