@@ -23,7 +23,10 @@
 //! with the stack, and "CloudFormation deletes all other change sets associated with the
 //! stack because they aren't valid for the updated stack". A change set whose creation has
 //! not completed, or that has already been executed, is refused with the modelled
-//! `InvalidChangeSetStatusException`.
+//! `InvalidChangeSetStatusException`, and a request whose `ClientRequestToken` an operation
+//! on the stack already claimed with the modelled `TokenAlreadyExistsException` — whichever
+//! operation claimed it, as in `UpdateStack`: this execution changes the stack, and a
+//! change set that has already been executed is refused on its own status anyway.
 //!
 //! ## Shape of an operation
 //!
@@ -294,6 +297,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::stack_does_not_exist(&stack_id),
                 ));
             };
+            // "A unique identifier for this ExecuteChangeSet request": a token an operation
+            // on this stack already claimed names THAT operation, so presenting it for the
+            // one this execution starts is the duplicate submission the modelled
+            // `TokenAlreadyExistsException` refuses, before the change set is applied.
+            if let Some(message) = crate::state::reused_client_request_token(
+                stack,
+                input.client_request_token.as_deref(),
+            ) {
+                return Err(
+                    ExecuteChangeSetErrorModeled::TokenAlreadyExistsException(
+                        TokenAlreadyExistsException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
             if stack.pending.is_some() {
                 return Err(
                     ExecuteChangeSetErrorModeled::InvalidChangeSetStatusException(

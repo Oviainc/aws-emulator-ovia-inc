@@ -14,7 +14,13 @@
 //! leaves the stack in `UPDATE_FAILED` with that service's own refusal as the reason. A
 //! template that declares a transform the request has not acknowledged with
 //! `CAPABILITY_AUTO_EXPAND` is refused with the modelled
-//! `InsufficientCapabilitiesException`.
+//! `InsufficientCapabilitiesException`. A request whose `ClientRequestToken` an operation
+//! on that stack already claimed is refused with the modelled
+//! `TokenAlreadyExistsException`, before the stack is touched and whatever status it is in
+//! — a claimed token is refused here whichever operation claimed it, including this
+//! update's own: unlike a create, which is identified by the stack name it would mint and
+//! so can answer that stack again, an update that already ran left the stack changed, and
+//! this service has no record of the answer it gave to re-answer with.
 //!
 //! The template is PROCESSED before it is deployed, exactly as a create's is: an
 //! `Fn::Transform` naming `AWS::Include` is the Amazon S3 object its `Location` names,
@@ -409,6 +415,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !previous.is_live() {
                 return Err(not_found());
             }
+            // "A unique identifier for this UpdateStack request": a token an operation on
+            // this stack already claimed names THAT operation, so presenting it for this
+            // one is the duplicate submission the modelled `TokenAlreadyExistsException`
+            // refuses — weighed before the stack's own status is, since a duplicate
+            // submission is a bad request whatever the stack is doing.
+            if let Some(message) = crate::state::reused_client_request_token(
+                previous,
+                input.client_request_token.as_deref(),
+            ) {
+                return Err(UpdateStackErrorModeled::TokenAlreadyExistsException(
+                    TokenAlreadyExistsException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
             // An operation still in flight on this stack, or a stack a `CREATE` change set
             // created that nothing has executed yet (it has no template and no resources to
             // update — the change set is what brings it into existence): neither can take an
@@ -574,6 +596,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::stack_does_not_exist(&input.stack_name),
                     )
                 })?;
+            // Re-asserted under the WRITING lock, like the preconditions below: between
+            // the read and here another request may have claimed this very token for an
+            // operation of its own, and only one of the two may have it.
+            if let Some(message) = crate::state::reused_client_request_token(
+                stack,
+                input.client_request_token.as_deref(),
+            ) {
+                return Err(UpdateStackErrorModeled::TokenAlreadyExistsException(
+                    TokenAlreadyExistsException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
             if stack.pending.is_some() || stack.status == status::REVIEW_IN_PROGRESS {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
                     crate::state::stack_cannot_be_updated(&stack.stack_id, &stack.status),

@@ -4,7 +4,12 @@
 //! IMPLEMENTED: starts the stored stack's deletion — `DELETE_IN_PROGRESS` now, then
 //! `DELETE_COMPLETE` with a `DeletionTime` once the clock makes it due, which takes the
 //! stack out of the live set and deletes the resources it provisioned, each with its own
-//! events. A stack with termination protection enabled is refused.
+//! events. A stack with termination protection enabled is refused, and so is a request
+//! whose `ClientRequestToken` an operation on that stack already claimed (the modelled
+//! `TokenAlreadyExistsException`) — including a delete's own token, as in `UpdateStack`,
+//! and whatever the stack is doing; the one token answered rather than refused is the
+//! DELETION IN FLIGHT's own, which is the caller who really is repeating the request and
+//! gets the no-op success a delete already under way has always answered.
 //!
 //! Deleting a stack also DELETES THE RESOURCES it created, newest first, through the
 //! services that own them ([`crate::state::provisioning`]); a resource one of those
@@ -239,6 +244,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(crate::scaffolded::Scaffolded::not_implemented(
                     "DeleteStack with RetainResources",
                 ));
+            }
+            // "A unique identifier for this DeleteStack request": a token an operation on
+            // this stack already claimed names THAT operation, so presenting it for this
+            // deletion is the duplicate submission the modelled
+            // `TokenAlreadyExistsException` refuses, before anything is deleted — weighed
+            // BEFORE the in-flight shortcut below, so a token belonging to another of the
+            // stack's operations is refused whatever the stack is doing. The one token the
+            // shortcut answers for is the DELETION IN FLIGHT's own: that request really is
+            // the retry the member is documented for, and the no-op success below is the
+            // answer it already got.
+            let retries_the_deletion = previous.status == status::DELETE_IN_PROGRESS
+                && input
+                    .client_request_token
+                    .as_deref()
+                    .and_then(|token| previous.client_request_token_claim(token))
+                    .is_some_and(|claimed| claimed.opened == status::DELETE_IN_PROGRESS);
+            if !retries_the_deletion {
+                if let Some(message) = crate::state::reused_client_request_token(
+                    previous,
+                    input.client_request_token.as_deref(),
+                ) {
+                    return Err(DeleteStackErrorModeled::TokenAlreadyExistsException(
+                        TokenAlreadyExistsException {
+                            message: Some(message),
+                        },
+                    )
+                    .into());
+                }
             }
             // A deletion already in flight: the request asks for what is already
             // happening, so it does not start a second one.

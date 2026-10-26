@@ -49,6 +49,8 @@
 //! one [`timeline`] step per resource transition the operation in flight recorded, which
 //! is retired with that operation,
 //! [`MAX_SIGNALS_PER_STACK`] recorded resource signals per stack (oldest-first),
+//! [`MAX_CLIENT_REQUEST_TOKENS_PER_STACK`] client request tokens remembered per stack
+//! (oldest-first),
 //! [`TEMPLATE_BODY_MAX_BYTES`] per stored template body (the documented `TemplateBody`
 //! maximum, which the model carries no `@length` for), [`MAX_CHANGE_SETS_PER_STACK`]
 //! change sets per stack and [`MAX_CHANGE_SETS`] across the store (past either
@@ -489,6 +491,17 @@ pub const MAX_EVENT_PROPERTIES_BYTES_PER_STACK: usize = 256 * 1024;
 /// signals any creation policy waits for.
 pub const MAX_SIGNALS_PER_STACK: usize = 1_000;
 
+/// The most client request tokens one stack remembers, oldest evicted first.
+///
+/// A token is what names ONE operation on a stack, so the number of DISTINCT tokens a
+/// stack can be sent is as unbounded as the number of operations a client drives against
+/// it, and the store bounds what it keeps. Chosen: far more operations than one stack takes
+/// in a session, so a token a client could plausibly retry under is still remembered.
+/// Eviction trades the refusal away with the record — a token reclaimed after this many
+/// later operations is new to the stack again — which is the deliberate cost of keeping
+/// one stack's memory bounded however many operations it is sent.
+pub const MAX_CLIENT_REQUEST_TOKENS_PER_STACK: usize = 1_000;
+
 /// The most bytes of template body this service stores.
 ///
 /// `CreateStackInput$TemplateBody`: "Structure that contains the template body with a
@@ -576,6 +589,36 @@ pub fn validate_resource_types(template_body: &str) -> Result<(), String> {
         Some(template) => resource_types::refuse_unrecognized(&template),
         None => Ok(()),
     }
+}
+
+/// The message CloudFormation answers when a mutating stack operation presents a
+/// `ClientRequestToken` an operation on that stack already claimed — the
+/// `TokenAlreadyExistsException` refusal ("A client request token already exists").
+///
+/// Worded once and built from the token the request sent, so the operations that enforce
+/// the rule cannot drift apart.
+pub fn token_already_exists_message(client_request_token: &str) -> String {
+    format!(
+        "The client request token {client_request_token} has already been used for this \
+         stack. Retry the request with a different client request token"
+    )
+}
+
+/// `Some(message)` when `client_request_token` is one an operation on `stack` already
+/// claimed, which is the `TokenAlreadyExistsException` refusal that request owes;
+/// `None` for a token new to this stack, and for a request that sent none.
+///
+/// The rule every mutating stack operation is held to, before the stack is touched: the
+/// token "a unique identifier for this request" names identifies ONE operation on ONE stack
+/// ([`StoredStack::client_request_token_claim`] is what remembers which), so presenting it
+/// for a second operation is the duplicate submission the modelled error names.
+pub fn reused_client_request_token(
+    stack: &StoredStack,
+    client_request_token: Option<&str>,
+) -> Option<String> {
+    let token = client_request_token?;
+    stack.client_request_token_claim(token)?;
+    Some(token_already_exists_message(token))
 }
 
 /// `None` when `capabilities` — the request's own `Capabilities` — acknowledges everything
@@ -1045,6 +1088,27 @@ pub struct PendingDeployment {
     pub dependencies: BTreeMap<String, BTreeSet<String>>,
 }
 
+/// One client request token an operation on a stack was started under, with the operation
+/// that claimed it.
+///
+/// `ClientRequestToken` is "a unique identifier for this request", and the modelled
+/// `TokenAlreadyExistsException` ("A client request token already exists") is what a second
+/// operation presenting one already claimed is refused with — so a stack has to remember
+/// which of its operations claimed which token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredRequestToken {
+    pub token: String,
+    /// The `*_IN_PROGRESS` status of the operation that claimed the token, which is what
+    /// says WHICH operation it names: a repeat of that same operation under it is the retry
+    /// the member is documented for, and any other operation presenting it is refused. Set
+    /// by the FIRST operation to claim the token and never rewritten.
+    pub opened: String,
+    /// The id of the operation that claimed it, as the call that started that operation
+    /// answered: a retry under this token re-answers that same operation rather than
+    /// minting a second one.
+    pub operation_id: Option<String>,
+}
+
 /// One stack, as this emulator persists it.
 #[derive(Debug, Clone)]
 pub struct StoredStack {
@@ -1153,6 +1217,13 @@ pub struct StoredStack {
     pub last_updated_time: Option<SystemTime>,
     pub deletion_time: Option<SystemTime>,
     pub client_request_token: Option<String>,
+    /// The client request tokens the operations on this stack have been started under, in
+    /// the order they claimed one and bounded at
+    /// [`MAX_CLIENT_REQUEST_TOKENS_PER_STACK`] (oldest-first). The field above is the
+    /// token of the operation in force, which the stack's events carry; this is the whole
+    /// set the token-uniqueness rule is checked against
+    /// ([`reused_client_request_token`]).
+    pub client_request_tokens: ::std::collections::VecDeque<StoredRequestToken>,
     pub events: ::std::collections::VecDeque<StoredEvent>,
     /// The bytes of caller-sized `ResourceProperties` the event log is holding right now,
     /// kept alongside it so [`StoredStack::push_event`] can honour
@@ -1243,6 +1314,7 @@ impl StoredStack {
             last_updated_time: None,
             deletion_time: None,
             client_request_token: None,
+            client_request_tokens: ::std::collections::VecDeque::new(),
             events: ::std::collections::VecDeque::new(),
             retained_event_properties_bytes: 0,
             signals: ::std::collections::VecDeque::new(),
@@ -1952,6 +2024,49 @@ impl StoredStack {
         true
     }
 
+    /// Remember a client request token one of this stack's operations was started under:
+    /// the token, and the `*_IN_PROGRESS` status of the operation that claimed it.
+    ///
+    /// Bounded at [`MAX_CLIENT_REQUEST_TOKENS_PER_STACK`], oldest reclaimed first, since a
+    /// client chooses how many operations it drives against one stack. A token names ONE
+    /// operation, so the FIRST operation to claim it keeps it: an operation this service
+    /// opens under the token already in force (the rollback of a failed create, say)
+    /// leaves the claim with the operation the caller sent it for.
+    fn claim_client_request_token(
+        &mut self,
+        token: &str,
+        in_progress: &str,
+        operation_id: Option<&str>,
+    ) {
+        if self
+            .client_request_tokens
+            .iter()
+            .any(|claimed| claimed.token == token)
+        {
+            return;
+        }
+        while self.client_request_tokens.len() >= MAX_CLIENT_REQUEST_TOKENS_PER_STACK {
+            self.client_request_tokens.pop_front();
+        }
+        self.client_request_tokens.push_back(StoredRequestToken {
+            token: token.to_string(),
+            opened: in_progress.to_string(),
+            operation_id: operation_id.map(str::to_string),
+        });
+    }
+
+    /// The claim an operation of this stack already made on `token`, or `None` for a token
+    /// new to it.
+    ///
+    /// What the token-uniqueness rule is read through: `Some` is a token already used for
+    /// this stack, and the operation it names is what tells a retry of that same operation
+    /// from a second one presenting its token.
+    pub fn client_request_token_claim(&self, token: &str) -> Option<&StoredRequestToken> {
+        self.client_request_tokens
+            .iter()
+            .find(|claimed| claimed.token == token)
+    }
+
     /// Record the operation now acting on this stack, which is the one
     /// `Stack$LastOperations` reports until the next one starts.
     pub fn record_operation(&mut self, operation_type: &str, operation_id: &str) {
@@ -2115,6 +2230,13 @@ impl StoredStack {
                 operation_id: id,
                 operation_type: operation_type.to_string(),
             });
+        }
+        // "A unique identifier for this request": the token this operation runs under is
+        // remembered against the stack, so a later operation presenting it is the
+        // duplicate submission `TokenAlreadyExistsException` names and a repeat of THIS
+        // operation under it is the retry the member is documented for.
+        if let Some(token) = client_request_token.as_deref() {
+            self.claim_client_request_token(token, in_progress, operation_id.as_deref());
         }
         self.record_event(
             now,

@@ -53,12 +53,19 @@
 //! stack then fails and rolls back carrying the transform's own reason, with nothing
 //! provisioned.
 //!
-//! Two gaps are deliberate, so a test author can see them: `ClientRequestToken` is stored
-//! as the operation's token but not checked for reuse, so the modelled
-//! `TokenAlreadyExistsException` is never answered; and a `TemplateBody` that is neither
-//! JSON nor YAML is stored rather than refused with a template-format `ValidationError`
-//! (the create it opens then ends in the modelled `CREATE_FAILED`, because this service
-//! cannot deploy a template it cannot read).
+//! `ClientRequestToken` names the operation this create starts, and the stack remembers
+//! it: a create repeating the stack's name under the token that already created it is the
+//! RETRY that member is documented for, and it answers that stack's id again instead of
+//! `AlreadyExistsException` — nothing is created twice. A retry is settled by the NAME and
+//! the TOKEN alone: the body it carries is deliberately not compared with the create the
+//! token claimed, because the token is what identifies the request ("a unique identifier
+//! for this `CreateStack` request"), so a retry under a token already claimed by one of
+//! that stack's OTHER operations is not a retry at all and is refused with the modelled
+//! `TokenAlreadyExistsException`. One gap is deliberate, so a test
+//! author can see it: a `TemplateBody` that is neither JSON nor YAML is stored rather than
+//! refused with a template-format `ValidationError` (the create it opens then ends in the
+//! modelled `CREATE_FAILED`, because this service cannot deploy a template it cannot
+//! read).
 //!
 //! A template whose `Resources` section declares a resource type CloudFormation does not
 //! recognise IS refused, with HTTP 400 `ValidationError` naming those types, before the
@@ -543,10 +550,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // — unique among the LIVE stacks OF THAT REGION: the same name in another
             // Region is another stack and both coexist, and a name is free again once its
             // stack's deletion has completed.
-            if store
+            if let Some(live) = store
                 .live_stacks(&region)
-                .any(|live| live.stack_name == input.stack_name)
+                .find(|live| live.stack_name == input.stack_name)
             {
+                // "Specify this token if you plan to retry requests so that CloudFormation
+                // knows that you're not attempting to create a stack with the same name":
+                // a create repeating the name AND the token the create of that live stack
+                // claimed is that retry, so it re-answers the stack that create made —
+                // nothing is created a second time — rather than refusing the name.
+                let retried = input
+                    .client_request_token
+                    .as_deref()
+                    .and_then(|token| live.client_request_token_claim(token))
+                    .filter(|claimed| claimed.opened == status::CREATE_IN_PROGRESS);
+                if let Some(claimed) = retried {
+                    return Ok(CreateStackOutput {
+                        stack_id: Some(live.stack_id.clone()),
+                        operation_id: claimed.operation_id.clone(),
+                    });
+                }
+                // Not that retry, but a token one of the stack's OTHER operations already
+                // claimed: a second operation under a token that names another is the
+                // duplicate submission the modelled `TokenAlreadyExistsException` refuses,
+                // whichever operation presents it.
+                if let Some(message) = crate::state::reused_client_request_token(
+                    live,
+                    input.client_request_token.as_deref(),
+                ) {
+                    return Err(CreateStackErrorModeled::TokenAlreadyExistsException(
+                        TokenAlreadyExistsException {
+                            message: Some(message),
+                        },
+                    )
+                    .into());
+                }
                 return Err(CreateStackErrorModeled::AlreadyExistsException(
                     AlreadyExistsException {
                         message: Some(format!("Stack [{}] already exists", input.stack_name)),

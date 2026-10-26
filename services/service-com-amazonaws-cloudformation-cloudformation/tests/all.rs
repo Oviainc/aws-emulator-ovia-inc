@@ -27,6 +27,8 @@ mod change_set_hooks;
 mod change_set_lifecycle;
 #[path = "all/change_set_preview.rs"]
 mod change_set_preview;
+#[path = "all/client_request_tokens.rs"]
+mod client_request_tokens;
 #[path = "all/cognito_resource_types.rs"]
 mod cognito_resource_types;
 #[path = "all/content_delivery_stack_outputs.rs"]
