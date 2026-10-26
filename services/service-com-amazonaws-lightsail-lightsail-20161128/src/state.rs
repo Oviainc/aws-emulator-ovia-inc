@@ -770,6 +770,10 @@ pub const OPERATION_TYPE_ENABLE_ADD_ON: &str = "EnableAddOn";
 /// The `operationType` the log entry of a `SetIpAddressType` call carries, the
 /// modelled `OperationType` enum's own `SetIpAddressType` member.
 pub const OPERATION_TYPE_SET_IP_ADDRESS_TYPE: &str = "SetIpAddressType";
+/// The `operationType` the log entry of a `SetResourceAccessForBucket` call
+/// carries, the modelled `OperationType` enum's own `SetResourceAccessForBucket`
+/// member.
+pub const OPERATION_TYPE_SET_RESOURCE_ACCESS_FOR_BUCKET: &str = "SetResourceAccessForBucket";
 /// The `operationType` the log entry of an `UpdateInstanceMetadataOptions` call
 /// carries, the modelled `OperationType` enum's own
 /// `UpdateInstanceMetadataOptions` member.
@@ -1591,6 +1595,17 @@ pub const OBJECT_VERSIONING_NEVER_ENABLED: &str = "NeverEnabled";
 /// permission a bucket has until `UpdateBucket` widens it.
 pub const ACCESS_TYPE_PRIVATE: &str = "private";
 
+/// The `SetResourceAccessForBucket$access` value that gives a Lightsail resource
+/// access to a bucket, from that member's own documentation: "`allow` - Allows
+/// access to the bucket and its objects."
+pub const RESOURCE_BUCKET_ACCESS_ALLOW: &str = "allow";
+
+/// The `SetResourceAccessForBucket$access` value that takes that access away
+/// again, from that member's own documentation: "`deny` - Denies access to the
+/// bucket and its objects. Use this setting to remove access for a resource
+/// previously set to allow."
+pub const RESOURCE_BUCKET_ACCESS_DENY: &str = "deny";
+
 /// The `AccountLevelBpaSync$status` this emulator reports, from that member's own
 /// documentation: "`NeverSynced` - Synchronization has not yet happened." Nothing
 /// here fetches an Amazon S3 account-level block-public-access configuration, so
@@ -2078,6 +2093,38 @@ impl StoredBucket {
             cors: include_cors.then(|| BucketCorsConfig {
                 rules: Some(self.cors_rules.clone()),
             }),
+        }
+    }
+
+    /// Give the resource `name` of kind `resource_type` access to this bucket
+    /// (`allow`), or take that access away again (`deny`).
+    ///
+    /// A resource either receives access or it does not, so this is a SET keyed
+    /// on the resource's name: a grant to a resource that already has access
+    /// adds no second entry, and a revoke of one that has none removes nothing.
+    /// `SetResourceAccessForBucket$access` documents `deny` as exactly that
+    /// inverse — "use this setting to remove access for a resource previously
+    /// set to allow" — so one call of each kind is enough to reach either state
+    /// and repeating it changes nothing. Entries are kept in the order access
+    /// was given, so every read reports the same sequence; the set is bounded by
+    /// the resources this store holds, since a name appears in it at most once.
+    pub fn set_resource_access(&mut self, name: &str, resource_type: &str, allow: bool) {
+        let held = self
+            .resources_receiving_access
+            .iter()
+            .position(|resource| resource.name.as_deref() == Some(name));
+        match (allow, held) {
+            (true, None) => self
+                .resources_receiving_access
+                .push(ResourceReceivingAccess {
+                    name: Some(name.to_string()),
+                    resource_type: Some(resource_type.to_string()),
+                }),
+            (false, Some(index)) => {
+                self.resources_receiving_access.remove(index);
+            }
+            // Already in the state the request asks for: nothing to change.
+            (true, Some(_)) | (false, None) => {}
         }
     }
 }
@@ -15434,6 +15481,35 @@ mod tests {
             held,
             cases.iter().map(|(_, name)| (*name).to_string()).collect::<Vec<_>>(),
             "case the whole registry: expected the images in registration order"
+        );
+    }
+
+    /// RULE: the access settings this store names are the modelled
+    /// `ResourceBucketAccess` enum's own members, so the generated value list
+    /// stays the one source for what the wire accepts and these constants only
+    /// say which member each one is.
+    #[test]
+    fn each_named_bucket_access_setting_is_a_member_of_the_modelled_enum() {
+        let generated = crate::ops::types::RESOURCE_BUCKET_ACCESS_VALUES;
+        for (case, named) in [
+            ("the setting that grants access", RESOURCE_BUCKET_ACCESS_ALLOW),
+            ("the setting that revokes it", RESOURCE_BUCKET_ACCESS_DENY),
+        ] {
+            assert!(
+                generated.contains(&named),
+                "case {case}: expected {named:?} to be one of the modelled values \
+                 {generated:?}"
+            );
+        }
+        assert_ne!(
+            RESOURCE_BUCKET_ACCESS_ALLOW, RESOURCE_BUCKET_ACCESS_DENY,
+            "case the two settings: expected them to name different members"
+        );
+        assert_eq!(
+            generated.len(),
+            2,
+            "case the modelled enum: expected the two members these constants cover, got \
+             {generated:?}"
         );
     }
 }

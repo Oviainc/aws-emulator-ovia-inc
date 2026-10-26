@@ -45,6 +45,8 @@ mod bucket_lifecycle;
 mod bucket_metric_data;
 #[path = "all/bucket_object_data_plane.rs"]
 mod bucket_object_data_plane;
+#[path = "all/bucket_resource_access.rs"]
+mod bucket_resource_access;
 #[path = "all/bundle_catalog.rs"]
 mod bundle_catalog;
 #[path = "all/certificate_request.rs"]

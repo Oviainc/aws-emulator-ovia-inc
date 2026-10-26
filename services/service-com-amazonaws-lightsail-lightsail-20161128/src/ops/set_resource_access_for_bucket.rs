@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetResourceAccessForBucket
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetResourceAccessForBucket`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Records on the bucket's own record which Lightsail instances receive access to it:
+//! `allow` adds the instance the request names to that set, `deny` removes it, and the
+//! call answers the operation-log entry the change wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetResourceAccessForBucket::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The set is what `GetBuckets` reports as `resourcesReceivingAccess` when the caller
+//! asks for the connected resources, and what `DeleteBucket` counts when it refuses to
+//! delete a bucket resources were granted access to without `forceDelete`. A bucket and
+//! an instance are both resources of ONE Region, so both are resolved in the Region the
+//! request is made in.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +167,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetResourceAccessForBucket` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetResourceAccessForBucketErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetResourceAccessForBucket"))
+        // A bucket is a REGIONAL resource — `GetBuckets` reports "all of your
+        // buckets in the Amazon Web Services Region where the request is made" —
+        // and this operation supports "setting access for Lightsail instances in
+        // the same Amazon Web Services Region", so the region the request is
+        // signed for is what both names are resolved in.
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_ms();
+
+        // `access` targets the modelled `ResourceBucketAccess` enum, whose two
+        // values say which way this call runs: `allow` gives the resource access
+        // to the bucket and its objects, `deny` takes it away again. A value
+        // outside that enum is a modelled constraint, so the centralized walk
+        // already refused it before this body ran; the last arm is therefore a
+        // defensive refusal rather than the one a client meets, and it stays a
+        // refusal — never a default direction for the write.
+        let allow = match input.access.as_str() {
+            crate::state::RESOURCE_BUCKET_ACCESS_ALLOW => true,
+            crate::state::RESOURCE_BUCKET_ACCESS_DENY => false,
+            other => {
+                return Err(invalid(format!(
+                    "access '{other}' is not an access setting this service accepts; use one \
+                     of: {}",
+                    RESOURCE_BUCKET_ACCESS_VALUES.join(", ")
+                )));
+            }
+        };
+
+        // `bucketName`, `resourceName` and `access` are modelled `@required`
+        // members carrying the modelled length and pattern, so the centralized
+        // walk refused anything outside them before this body ran. What is left
+        // is what the model cannot express: both resources have to be ones this
+        // account holds in this Region, and the instance has to be in a state
+        // Lightsail sets bucket access for. Each is checked BEFORE the write, so
+        // a refused request changes nothing.
+        crate::state::with_state(&*self.engine, |store| {
+            // The bucket first: it is the resource this operation acts on, and
+            // the one its operation-log entry is written against. Its own
+            // location is where that entry is located.
+            let location = store
+                .bucket(&region, &input.bucket_name)
+                .ok_or_else(|| not_found(crate::state::RESOURCE_TYPE_BUCKET, &input.bucket_name))?
+                .location
+                .clone();
+
+            // "The name of the Lightsail instance for which to set bucket
+            // access": the resource is an INSTANCE, so a name that does not
+            // address one of this Region's instances addresses nothing this call
+            // can grant access to. An instance is held by name alone, so its own
+            // location is what decides whether it is in this Region.
+            let instance = store
+                .instance(&input.resource_name)
+                .filter(|instance| instance.location.region_name == region)
+                .ok_or_else(|| {
+                    not_found(crate::state::RESOURCE_TYPE_INSTANCE, &input.resource_name)
+                })?;
+            let instance_state = instance.state;
+            // From the member's own documentation: "The instance must be in a
+            // running or stopped state." An instance still coming up or going
+            // down is neither.
+            if instance_state != crate::state::RUNNING && instance_state != crate::state::STOPPED {
+                return Err(invalid(format!(
+                    "The instance {} is {}: bucket access can be set only for an instance \
+                     in a running or stopped state.",
+                    input.resource_name, instance_state.name
+                )));
+            }
+
+            let Some(bucket) = store.bucket_mut(&region, &input.bucket_name) else {
+                // Unreachable: the bucket was read above under this same lock.
+                return Err(not_found(
+                    crate::state::RESOURCE_TYPE_BUCKET,
+                    &input.bucket_name,
+                ));
+            };
+            // The grant lives on the BUCKET's record — it is what the bucket
+            // reports as `resourcesReceivingAccess` and what a delete counts —
+            // and a resource either has access or it does not, so the same call
+            // made twice leaves the same one entry.
+            bucket.set_resource_access(
+                &input.resource_name,
+                crate::state::RESOURCE_TYPE_INSTANCE,
+                allow,
+            );
+
+            // `operations` is a list because other Lightsail calls act on
+            // several resources at once; this one changes exactly one bucket's
+            // access, so it answers exactly one entry. The entry names the
+            // BUCKET, whose record carries the change, and is terminal because
+            // the access is set as this call returns: there is nothing for the
+            // clock to settle later.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_SET_RESOURCE_ACCESS_FOR_BUCKET,
+                crate::state::RESOURCE_TYPE_BUCKET,
+                &input.bucket_name,
+                &location,
+                None,
+            );
+            Ok(SetResourceAccessForBucketOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> SetResourceAccessForBucketError {
+    SetResourceAccessForBucketErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// No resource of that type and name is stored in this Region: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the requested
+/// name.
+fn not_found(resource_type: &str, name: &str) -> SetResourceAccessForBucketError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(resource_type, name)
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> SetResourceAccessForBucketError {
+    SetResourceAccessForBucketErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail bucket store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
