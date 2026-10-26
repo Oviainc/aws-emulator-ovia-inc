@@ -433,6 +433,18 @@ impl Client {
         self.send("GET", &uri, None).await
     }
 
+    /// `UpdateProfile`: `PATCH /profiles/{ProfileArn}`. The ARN is a non-greedy
+    /// `@httpLabel`, so it travels percent-encoded in one path segment, exactly as an SDK
+    /// sends it.
+    pub(crate) async fn update_profile(&self, profile_arn: &str, body: Value) -> Answer {
+        self.send(
+            "PATCH",
+            &format!("/profiles/{}", encode_path_segment(profile_arn)),
+            Some(body),
+        )
+        .await
+    }
+
     /// `DeleteProfile`: `DELETE /profiles/{ProfileArn}?ClientRequestToken=…`. The ARN is a
     /// non-greedy `@httpLabel` and the token an `@httpQuery` member, so both travel
     /// percent-encoded exactly as an SDK sends them.
@@ -563,12 +575,13 @@ impl Client {
     /// Move the stored profile `profile_arn` to `profile_version`, as a revision of that
     /// profile would.
     ///
-    /// Minting a profile's next version belongs to `UpdateProfile`, still a stub with its
-    /// own issue, so a suite that needs a profile whose latest version is AHEAD of the
-    /// version a workload's association pinned — associating pins the version the profile
-    /// is at — seeds that revision here, exactly as the suites above seed a stored answer
-    /// whose writer is a stub. The operation under test and the reads of its result still
-    /// cross the HTTP boundary.
+    /// Minting a profile's next version follows the service's own counter
+    /// (`UpdateProfile` moves a profile to it), so a suite that needs a profile whose
+    /// latest version is AHEAD of the version a workload's association pinned — associating
+    /// pins the version the profile is at — at a version spelling of its own choosing seeds
+    /// that revision here, exactly as the suites above seed a stored answer whose writer is
+    /// a stub. The operation under test and the reads of its result still cross the HTTP
+    /// boundary.
     pub(crate) fn revise_profile_version(&self, profile_arn: &str, profile_version: &str) {
         let state = self.store();
         let mut store = state.lock();
@@ -856,6 +869,20 @@ pub(crate) fn age_workload(client: &Client, workload_id: &str, age: Duration) {
         .get_mut(workload_id)
         .expect("the workload under test must exist");
     workload.updated_at = SystemTime::now() - age;
+}
+
+/// Move the stored profile's `UpdatedAt` back by `age`, so a write the handler makes to it
+/// is observable whatever the clock's granularity between two in-process requests — and so
+/// a write it must NOT make cannot hide behind that granularity either. Only the SEED
+/// reaches state directly; the write under test is the handler's.
+pub(crate) fn age_profile(client: &Client, profile_arn: &str, age: Duration) {
+    let state = client.store();
+    let mut store = state.lock();
+    let profile = store
+        .profiles
+        .get_mut(profile_arn)
+        .expect("the profile under test must exist");
+    profile.updated_at = SystemTime::now() - age;
 }
 
 /// The refusal a lookup that resolved nothing gets: 404 `ResourceNotFoundException`, with
