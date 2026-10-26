@@ -107,7 +107,7 @@ const CLUSTER_METADATA_MEMBERS: &[&str] = &[
 /// A long-term pricing id in the modelled `LongTermPricingId` form —
 /// `^LTPID[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`
 /// (`smithy_query(query="shape", shape="LongTermPricingId")`) — distinguished by `seed`.
-fn long_term_pricing_id(seed: usize) -> String {
+pub(crate) fn long_term_pricing_id(seed: usize) -> String {
     format!("LTPID{seed:08x}-0000-0000-0000-{seed:012x}")
 }
 

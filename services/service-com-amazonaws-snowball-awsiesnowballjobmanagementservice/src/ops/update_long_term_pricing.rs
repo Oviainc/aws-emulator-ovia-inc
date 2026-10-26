@@ -151,6 +151,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // Before anything is written, the change the clock had already made due: a contract
+        // whose term had reached its end was renewed for another term, or expired, at that
+        // boundary — so an update that switches automatic renewal now lands on the term the
+        // contract is actually running rather than on a lapsed one.
+        store.settle_long_term_pricing_terms(::std::time::SystemTime::now());
+
         // "Specifies that a device that is ordered with long-term pricing should be replaced
         // with a new device": the member names a job of this service, reported back as "a
         // new device that replaces a device that is ordered with long-term pricing"

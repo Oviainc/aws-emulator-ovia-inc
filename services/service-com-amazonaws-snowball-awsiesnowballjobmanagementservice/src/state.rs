@@ -842,7 +842,10 @@ pub struct StoredLongTermPricing {
     /// The instant the contract was created, which is the instant its term starts.
     pub long_term_pricing_start_date: SystemTime,
     /// The instant the term bought ends: the start plus the whole calendar months
-    /// `LongTermPricingType` names.
+    /// `LongTermPricingType` names. A contract that renews itself has it moved on by another
+    /// whole term each time the clock reaches it
+    /// ([`StoredLongTermPricing::settle_term_at`]), so it is always the end of the term the
+    /// contract is currently running.
     pub long_term_pricing_end_date: SystemTime,
     pub long_term_pricing_status: String,
     /// The job that replaces the device ordered under this contract, once
@@ -852,16 +855,85 @@ pub struct StoredLongTermPricing {
 }
 
 impl StoredLongTermPricing {
+    /// The term this contract was bought for, in whole calendar months: the term its
+    /// `LongTermPricingType` names, read from the one table that pairs the two
+    /// ([`crate::ops::create_long_term_pricing::LONG_TERM_PRICING_TERM_MONTHS`]), so the
+    /// length a renewal runs for cannot drift from the length the create measured the first
+    /// term with. `None` for a stored type that table does not carry, which no accepted
+    /// create can produce.
+    pub fn term_months(&self) -> Option<u32> {
+        crate::ops::create_long_term_pricing::LONG_TERM_PRICING_TERM_MONTHS
+            .iter()
+            .find(|(pricing_type, _)| *pricing_type == self.long_term_pricing_type)
+            .map(|(_, months)| *months)
+    }
+
+    /// The instant the term this contract is currently running ends, at `now`.
+    ///
+    /// A contract bought with automatic renewal is renewed for another whole term each time
+    /// it reaches that instant, so the term it is running at `now` is the first one whose end
+    /// is still ahead: each renewal runs the term's calendar months on from the end of the
+    /// one before, and a contract nobody looked at for several terms is that many terms on.
+    /// A contract bought without automatic renewal, and one the service has already stopped
+    /// holding to ([`LONG_TERM_PRICING_STATUS_EXPIRED`]), keeps the end date it holds: it has
+    /// no further term to run.
+    ///
+    /// The walk over the boundaries always terminates, and in a step count nothing a caller
+    /// sends can grow: every step moves the end on by a whole calendar month at least, and
+    /// stops at the first instant after `now`, so it takes one step per term that has run out
+    /// since the contract was bought — and a bought contract's term ends in the future, with
+    /// each boundary the clock passes written back by [`Self::settle_term_at`].
+    pub fn end_date_at(&self, now: SystemTime) -> SystemTime {
+        let mut end = self.long_term_pricing_end_date;
+        if !self.is_long_term_pricing_auto_renew
+            || self.long_term_pricing_status == LONG_TERM_PRICING_STATUS_EXPIRED
+        {
+            return end;
+        }
+        let Some(months) = self.term_months() else {
+            return end;
+        };
+        // Renewal happens "before the long-term pricing contract expires", so a term is
+        // renewed at the instant it would otherwise run out, not after it has.
+        while end <= now {
+            match crate::ops::create_long_term_pricing::plus_calendar_months(end, months) {
+                Some(renewed) if renewed > end => end = renewed,
+                // A term naming no later instant — a zero-length one, or one ending outside
+                // the range a timestamp can represent — has no boundary to renew to.
+                _ => return end,
+            }
+        }
+        end
+    }
+
     /// This contract's `LongTermPricingStatus` at `now`: the status it was stored with while
-    /// the term it was bought for still has time to run, and
-    /// [`LONG_TERM_PRICING_STATUS_EXPIRED`] from its end date on — a change the clock owes
-    /// rather than one a call makes, so it is derived at each read instead of being written.
+    /// the term it is running ([`Self::end_date_at`]) still has time to run, and
+    /// [`LONG_TERM_PRICING_STATUS_EXPIRED`] from the end of its last term on — a change the
+    /// clock owes rather than one a call makes, so it is derived rather than asked for.
+    ///
+    /// A contract that renews itself therefore never reaches that point: the clock's due
+    /// change at its end date is a renewal, not an expiry.
     pub fn status_at(&self, now: SystemTime) -> &str {
-        if now < self.long_term_pricing_end_date {
+        if now < self.end_date_at(now) {
             &self.long_term_pricing_status
         } else {
             LONG_TERM_PRICING_STATUS_EXPIRED
         }
+    }
+
+    /// Write onto this record the change its term boundary has already made due at `now`:
+    /// the renewal of a contract bought with automatic renewal, and the expiry of one bought
+    /// without.
+    ///
+    /// Both were owed at that boundary whether or not anybody called, so materialising them
+    /// reports exactly what [`Self::end_date_at`] and [`Self::status_at`] derive — one rule,
+    /// one implementation. Persisting them is what makes the decision at the boundary rather
+    /// than at each later read: a contract renewed for another term keeps that term even if
+    /// automatic renewal is switched off inside it, and one whose last term has run out is
+    /// not revived by switching automatic renewal on afterwards.
+    pub fn settle_term_at(&mut self, now: SystemTime) {
+        self.long_term_pricing_end_date = self.end_date_at(now);
+        self.long_term_pricing_status = self.status_at(now).to_string();
     }
 
     /// This record as the modelled `LongTermPricingListEntry` `ListLongTermPricing` pages
@@ -886,7 +958,7 @@ impl StoredLongTermPricing {
         LongTermPricingListEntry {
             long_term_pricing_id: Some(self.long_term_pricing_id.clone()),
             long_term_pricing_end_date: Some(::aws_smithy_types::DateTime::from(
-                self.long_term_pricing_end_date,
+                self.end_date_at(now),
             )),
             long_term_pricing_start_date: Some(::aws_smithy_types::DateTime::from(
                 self.long_term_pricing_start_date,
@@ -1747,6 +1819,19 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
             }
         }
         images
+    }
+
+    /// Write onto every contract this store holds the change its term boundary has already
+    /// made due at `now` ([`StoredLongTermPricing::settle_term_at`]): a contract bought with
+    /// automatic renewal is renewed for another term, one bought without is expired.
+    ///
+    /// Asked by every operation that takes this store before it reads or writes a contract,
+    /// so what a caller is told and what a later call writes are both about the term the
+    /// clock has the contract in.
+    pub fn settle_long_term_pricing_terms(&mut self, now: SystemTime) {
+        for contract in self.long_term_pricing.values_mut() {
+            contract.settle_term_at(now);
+        }
     }
 
     /// Whether this store holds the long-term pricing contract `long_term_pricing_id`

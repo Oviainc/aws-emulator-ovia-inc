@@ -73,7 +73,7 @@ const CLOCK_SKEW_SECONDS: f64 = 300.0;
 
 /// The term `pricing_type` names, in whole calendar months, read from the crate's own table
 /// rather than restated here.
-fn term_months(pricing_type: &str) -> Option<u32> {
+pub(crate) fn term_months(pricing_type: &str) -> Option<u32> {
     LONG_TERM_PRICING_TERM_MONTHS
         .iter()
         .find(|(name, _)| *name == pricing_type)
@@ -294,7 +294,7 @@ async fn place_orders(
 
 /// The entries of one `ListLongTermPricing` answer, reading an answer that reports no
 /// contract as an empty listing: a store holding none has no entry to report.
-fn entries(listed: &Value) -> Vec<Value> {
+pub(crate) fn entries(listed: &Value) -> Vec<Value> {
     listed
         .get("LongTermPricingEntries")
         .and_then(Value::as_array)
@@ -304,7 +304,7 @@ fn entries(listed: &Value) -> Vec<Value> {
 
 /// A timestamp member of an entry, as the protocol puts an instant on the wire: epoch
 /// seconds.
-fn epoch_seconds(entry: &Value, member: &str, case: &str) -> f64 {
+pub(crate) fn epoch_seconds(entry: &Value, member: &str, case: &str) -> f64 {
     entry
         .get(member)
         .and_then(Value::as_f64)

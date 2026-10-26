@@ -154,10 +154,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = crate::state::page_size(input.max_results);
 
         // A read: this operation "Lists all long-term pricing types", so it reports what the
-        // store holds and writes nothing. The status and the jobs each entry carries are
-        // derived from that state at the instant of the call.
-        let store = state.lock();
+        // store holds and decides nothing of its own. The status and the jobs each entry
+        // carries are derived from that state at the instant of the call.
+        //
+        // The one thing it writes is the change the clock had already made due before the
+        // call: a contract whose term has reached its end has either been renewed for another
+        // term or expired by then, whichever its auto-renew choice says, and that was owed at
+        // that boundary whether or not anybody called. Materialising it here is what makes
+        // the listing report the term the contract is actually running.
+        let mut store = state.lock();
         let now = ::std::time::SystemTime::now();
+        store.settle_long_term_pricing_terms(now);
         let records = store.long_term_pricing_in_creation_order();
 
         let Some((page, next_token)) = crate::state::page_of_long_term_pricing(
