@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLoggingConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLoggingConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLoggingConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads back the logging configuration of the web ACL its `ResourceArn` names,
+//! under the `LogScope` the request addresses. A web ACL with none there is
+//! `WAFNonexistentItemException` (HTTP 400). This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +158,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLoggingConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLoggingConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLoggingConfiguration"))
+        // A read: `ctx` carries only request metadata, which this operation does not
+        // need — the configuration is addressed by the `ResourceArn` the request
+        // names — and nothing here writes to the store.
+        let _ = ctx;
+
+        // The malformed-ARN parameter failure, as every operation here that takes an
+        // ARN reports it.
+        if !crate::state::is_wafv2_resource_arn(&input.resource_arn) {
+            return Err(
+                GetLoggingConfigurationErrorModeled::WAFInvalidParameterException(
+                    crate::state::invalid_arn_exception(&input.resource_arn),
+                )
+                .into(),
+            );
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetLoggingConfigurationErrorModeled::WAFInternalErrorException(
+                    WAFInternalErrorException {
+                        message: Some("the wafv2 store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let state = state.lock();
+
+        // The configuration this operation "returns the LoggingConfiguration for the
+        // specified web ACL" exists only when one was put in front of that web ACL
+        // under the `LogScope` the request addresses; every other case — an ARN of
+        // another resource kind, a web ACL that was never created, a web ACL with no
+        // logging configuration, or one whose configuration belongs to another log
+        // scope — names a resource that doesn't exist.
+        let Some(configuration) = state
+            .logging_configuration(&input.resource_arn, input.log_scope.as_deref())
+            .cloned()
+        else {
+            return Err(
+                GetLoggingConfigurationErrorModeled::WAFNonexistentItemException(
+                    crate::state::nonexistent_item_exception(),
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetLoggingConfigurationOutput {
+            logging_configuration: Some(configuration),
+        })
     }
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLoggingConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLoggingConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLoggingConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the logging configurations of the web ACLs in `Scope`, a page at a time,
+//! for the `LogScope` the request addresses. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +166,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLoggingConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLoggingConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLoggingConfigurations"))
+        // A read: `ctx` carries only request metadata, which this operation does not
+        // need, and nothing here writes to the store.
+        let _ = ctx;
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(
+                ListLoggingConfigurationsErrorModeled::WAFInvalidParameterException(
+                    crate::state::invalid_parameter_exception(
+                        crate::state::FIELD_SCOPE_VALUE,
+                        &input.scope,
+                        "the scope names the namespace the web ACLs live in, and is one of CLOUDFRONT or REGIONAL",
+                    ),
+                )
+                .into(),
+            );
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListLoggingConfigurationsErrorModeled::WAFInternalErrorException(
+                    WAFInternalErrorException {
+                        message: Some("the wafv2 store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let state = state.lock();
+
+        // A logging configuration belongs to a web ACL, so a listing of a SCOPE
+        // reports the configurations of the web ACLs that live in it — and only those
+        // owned by the `LogScope` the request addresses, which defaults to the
+        // customer-managed one the way every other logging operation's does. Ordered
+        // by the web ACL's ARN, which is the configuration's own address, so a marker
+        // names the same position on every call.
+        let log_scope = input
+            .log_scope
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_LOG_SCOPE);
+        let mut configurations: Vec<&LoggingConfiguration> = state
+            .logging_configurations
+            .iter()
+            .filter(|((_, stored_scope), _)| stored_scope == log_scope)
+            .filter_map(|((resource_arn, _), configuration)| {
+                let entry = state.web_acl_by_arn(resource_arn)?;
+                (entry.scope == input.scope).then_some(configuration)
+            })
+            .collect();
+        configurations.sort_by(|left, right| left.resource_arn.cmp(&right.resource_arn));
+
+        // `NextMarker` is the address of the last configuration of the previous page,
+        // so this page starts at the first one after it.
+        if let Some(marker) = input.next_marker.as_deref() {
+            configurations.retain(|configuration| configuration.resource_arn.as_str() > marker);
+        }
+
+        // Absent `Limit`, a page holds as many as the model's `PaginationLimit` range
+        // allows; a `Limit` outside that range is refused rather than clamped. That
+        // reading of the range is `crate::state::page_size`, shared with every other
+        // paginated operation of this service.
+        let page_size = crate::state::page_size(input.limit, "configurations")
+            .map_err(ListLoggingConfigurationsErrorModeled::WAFInvalidParameterException)?;
+        configurations.truncate(page_size);
+
+        // Every non-empty page carries a `NextMarker` — the address of its LAST entry
+        // even when the page is not full, so a client resumes from it and learns it
+        // reached the end from the empty page that follows.
+        let next_marker = configurations
+            .last()
+            .map(|configuration| configuration.resource_arn.clone());
+        let logging_configurations = configurations.into_iter().cloned().collect();
+
+        Ok(ListLoggingConfigurationsOutput {
+            logging_configurations: Some(logging_configurations),
+            next_marker,
+        })
     }
 }

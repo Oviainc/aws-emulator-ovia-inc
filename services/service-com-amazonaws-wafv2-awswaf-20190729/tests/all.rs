@@ -17,6 +17,8 @@ mod api_key_listing;
 mod api_key_minting;
 #[path = "all/available_managed_rule_groups.rs"]
 mod available_managed_rule_groups;
+#[path = "all/challenge_immunity.rs"]
+mod challenge_immunity;
 #[path = "all/check_capacity.rs"]
 mod check_capacity;
 #[path = "all/exception_messages.rs"]
@@ -35,6 +37,8 @@ mod ip_set_mutations;
 mod list_resources_for_web_acl;
 #[path = "all/list_rule_groups.rs"]
 mod list_rule_groups;
+#[path = "all/logging_configuration.rs"]
+mod logging_configuration;
 #[path = "all/managed_products.rs"]
 mod managed_products;
 #[path = "all/managed_rule_group_description.rs"]
@@ -45,12 +49,16 @@ mod managed_rule_group_version_expiry;
 mod managed_rule_group_versions;
 #[path = "all/managed_rule_groups.rs"]
 mod managed_rule_groups;
+#[path = "all/managed_rule_sets.rs"]
+mod managed_rule_sets;
 #[path = "all/parameter_validation.rs"]
 mod parameter_validation;
 #[path = "all/permission_policy.rs"]
 mod permission_policy;
 #[path = "all/rate_based_statement_managed_keys.rs"]
 mod rate_based_statement_managed_keys;
+#[path = "all/referenced_resource_deletes.rs"]
+mod referenced_resource_deletes;
 #[path = "all/regex_pattern_set_lifecycle.rs"]
 mod regex_pattern_set_lifecycle;
 #[path = "all/regex_pattern_set_listing.rs"]
@@ -59,6 +67,8 @@ mod regex_pattern_set_listing;
 mod regex_pattern_set_updates;
 #[path = "all/response_members.rs"]
 mod response_members;
+#[path = "all/rule_evaluation_order.rs"]
+mod rule_evaluation_order;
 #[path = "all/rule_group_lifecycle.rs"]
 mod rule_group_lifecycle;
 #[path = "all/rule_group_updates.rs"]
