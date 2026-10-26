@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteWorkspace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteWorkspace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteWorkspace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -158,20 +149,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteWorkspace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteWorkspaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteWorkspaceError::Modeled(DeleteWorkspaceErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+
+        let mut store = state.lock();
+
+        // A workspace is identified by its name in this account and region, so a name
+        // this store holds no workspace under is the modelled 404 rather than a silent
+        // success — which is also what a retry carrying the `clientToken` of a delete
+        // that already landed gets, because this store keeps no token -> answer mapping
+        // to replay from, exactly as `DeleteProject` and the creates in this crate
+        // leave it to the idempotency issue.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(&input.workspace_name));
+        }
+
+        // "Before you delete a workspace, you must delete all resources contained in or
+        // associated with the workspace": the delete is refused while the workspace
+        // still holds a resource a caller addresses on its own. This is a TERMINAL
+        // request error — the caller has to delete those resources first, and no retry
+        // of this call can succeed — so it is `InvalidRequestException` (400) and not
+        // the retryable `ConflictingOperationException` (409), which states a transient
+        // conflict between two operations on one resource; the same rule, and the same
+        // mapping, as `DeleteAsset` and `DeleteAssetModel` give a delete whose resource
+        // is still depended on. The precondition is evaluated BEFORE anything is
+        // removed, so a refused delete leaves the workspace and its contents exactly as
+        // they were.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteWorkspace"))
+        // The doc sentence names "datasets, time series, pipelines, and tasks"; a TIME
+        // SERIES is not among the contents counted here because this store holds none
+        // inside a workspace — `DeleteTimeSeries` scoped to one resolves to nothing —
+        // and the workspace-keyed video streams a capture source holds are ingested
+        // data rather than a resource a caller creates and deletes one at a time, so
+        // they go with the workspace instead of blocking it forever.
+        let contents = store.workspace_contents(&input.workspace_name);
+        if !contents.is_empty() {
+            return Err(DeleteWorkspaceError::Modeled(
+                DeleteWorkspaceErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: format!(
+                        "The workspace {} had {} when delete was called. Delete all \
+                         resources contained in or associated with the workspace before \
+                         deleting it.",
+                        input.workspace_name,
+                        contained(&contents)
+                    ),
+                }),
+            ));
+        }
+
+        // The workspace and everything keyed off it go away, so no later read can still
+        // see it: a describe of the workspace, or of a query, a search or a job that
+        // ran in it, resolves to nothing, and its tags stop resolving by ARN.
+        store.forget_workspace(&input.workspace_name);
+
+        Ok(DeleteWorkspaceOutput {
+            // "The status of the workspace after the deletion request, which is
+            // DELETING when the operation returns" — the lifecycle state this
+            // service's other deletes report for a resource the accepted call removed.
+            workspace_status: WorkspaceStatus {
+                state: crate::state::STATE_DELETING.to_string(),
+                error: None,
+            },
+        })
     }
+}
+
+/// The contents of a workspace as the refusal above names them: every kind that
+/// still holds something, with how many it holds, in the one order
+/// [`crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState::workspace_contents`]
+/// reports them, so one store state always states one message.
+fn contained(contents: &[(&'static str, usize)]) -> String {
+    contents
+        .iter()
+        .map(|(kind, held)| {
+            let plural = if *held == 1 { "" } else { "s" };
+            format!("{held} {kind}{plural}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the workspace the request addressed.
+fn not_found(workspace_name: &str) -> DeleteWorkspaceError {
+    DeleteWorkspaceError::Modeled(DeleteWorkspaceErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(
+                crate::state::RESOURCE_WORKSPACE,
+                workspace_name,
+            ),
+        },
+    ))
 }

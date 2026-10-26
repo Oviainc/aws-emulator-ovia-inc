@@ -590,18 +590,40 @@ async fn an_environment_that_has_reached_deleted_holds_no_new_entitlement() {
         json!(environment),
         "case a DELETED environment: resourceId must echo the requested id, got {body}"
     );
-    // And nothing was stored for it.
-    let listed = list_every_page(
+    // And nothing was stored for it. The list cannot be the read-back here: the
+    // environment's deletion took its connectors with it, so the handle this list
+    // resolves through is gone and the list is refused — the store itself is what shows
+    // the refused create persisted nothing.
+    let (status, body) = call(
         &router,
-        "a DELETED environment",
-        &environment,
-        &connector,
-        None,
+        "ListVmEntitlements",
+        &list_request(&environment, &connector),
     )
     .await;
+    assert_eq!(
+        status, 400,
+        "case a DELETED environment: a list through a connector that went away with the \
+         environment is refused, got {status} {body}"
+    );
     assert!(
-        listed.is_empty(),
-        "case a DELETED environment: the refused create must persist nothing, got {listed:?}"
+        error_type(&body).contains("ResourceNotFoundException"),
+        "case a DELETED environment: expected a ResourceNotFoundException, got {}",
+        error_type(&body)
+    );
+    let store = service_com_amazonaws_evs_amazonelasticvmwareservice::state::service_state(
+        &*router.engine,
+    )
+    .expect("the in-memory engine carries this service's store");
+    let stored = store
+        .lock()
+        .environments
+        .get(&environment)
+        .map(|stored| stored.entitlements.len())
+        .unwrap_or_default();
+    assert_eq!(
+        stored, 0,
+        "case a DELETED environment: the refused create must persist nothing, got \
+         {stored} entitlement record(s)"
     );
 }
 

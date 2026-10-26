@@ -243,9 +243,10 @@ async fn every_stopped_resource_is_started_and_reported_in_the_state_it_reached(
 
 /// Rule: a resource `BatchStart` cannot start is reported in `Failed` with the
 /// error code the single-resource start of that resource answers with — an id
-/// the account does not hold is `NotFoundException`, and a resource whose state
-/// is not the stopped one a start acts from is `ConflictException` — and the
-/// resource is left exactly as it was.
+/// the account does not hold and one whose delete it has accepted are both
+/// `NotFoundException`, and a resource that still exists whose state is not the
+/// stopped one a start acts from is `ConflictException` — and the resource is
+/// left exactly as it was.
 ///
 /// The rows span the states this service can put a channel and a multiplex in
 /// other than the stopped `IDLE`, both request members, and the two shapes an
@@ -293,9 +294,9 @@ async fn every_resource_a_start_cannot_touch_is_reported_as_its_own_failure() {
             "deleting channel",
             "channelIds",
             "deleting channel",
-            "ConflictException",
+            "NotFoundException",
             Some("DELETING"),
-            "Channel {id} is in state DELETING and can only be started from IDLE",
+            "Channel {id} already deleted",
         ),
         (
             "unknown multiplex",

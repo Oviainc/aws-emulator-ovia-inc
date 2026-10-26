@@ -165,10 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DeleteStudioErrorModeled::InvalidRequestException(
                 InvalidRequestException {
                     error_code: None,
-                    message: Some(format!(
-                        "Studio id '{}' is not valid or does not exist.",
-                        input.studio_id
-                    )),
+                    message: Some(crate::state::unknown_studio_message()),
                 },
             )
             .into());

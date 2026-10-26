@@ -240,8 +240,10 @@ enum Outcome {
 /// answers with, which on this service is the modelled exception's shape name
 /// (`smithy_query(query="operation", operation="StopChannel")`).
 mod failure_code {
-    /// No resource of that kind has that id — `NotFoundException` (404), which
-    /// both single-resource stops in this service model.
+    /// Neither an existing resource nor one a caller may still act on —
+    /// `NotFoundException` (404), which both single-resource stops in this
+    /// service model: no resource of that kind has that id, or the one it had
+    /// has been deleted.
     pub const NOT_FOUND: &str = "NotFoundException";
     /// The resource exists but its current state does not allow a stop —
     /// `ConflictException` (409), which `StopChannel` answers for a channel that
@@ -260,11 +262,11 @@ fn not_found(resource_type: &str, id: &str) -> Outcome {
     })
 }
 
-/// A failed entry for a resource that exists: it carries the resource's own ARN
-/// beside the code and the message of the refusal.
-fn refused(id: &str, arn: &str, code: &str, message: String) -> Outcome {
+/// A failed entry for a resource whose record the account still holds: it
+/// carries that record's own ARN beside the code and the message of the refusal.
+fn refused(id: &str, arn: Option<String>, code: &str, message: String) -> Outcome {
     Outcome::Failed(BatchFailedResultModel {
-        arn: Some(arn.to_string()),
+        arn,
         code: Some(code.to_string()),
         id: Some(id.to_string()),
         message: Some(message),
@@ -289,22 +291,31 @@ fn accepted(
     }))
 }
 
-/// One channel's stop, under exactly `StopChannel`'s rule: a channel stops from
-/// `RUNNING` only — every other state (still creating, still starting, already
-/// stopping, idle, deleting, deleted) is refused — and an accepted stop puts it
-/// in `STOPPING`, owing the stopped `IDLE` the clock then makes due.
+/// One channel's stop, under exactly `StopChannel`'s rule: an id whose delete
+/// has been accepted names no channel to stop and is reported NOT FOUND, and a
+/// channel that still exists stops from `RUNNING` only — every other state
+/// (still creating, still starting, already stopping, idle) is a conflict —
+/// while an accepted stop puts it in `STOPPING`, owing the stopped `IDLE` the
+/// clock then makes due.
 fn stop_channel(
     state: &mut State,
     id: &str,
     now: ::std::time::SystemTime,
 ) -> Result<Outcome, BatchStopError> {
-    let Some(channel) = state.channels.get_mut(id) else {
-        return Ok(not_found("Channel", id));
+    // The id is resolved through the shared channel guard FIRST, so a channel
+    // whose delete has been accepted is reported with the NOT-FOUND code
+    // `StopChannel` answers for it rather than with a state conflict. The guard
+    // hands back the tombstone's own ARN for the entry to name.
+    let channel = match state.mutable_channel(id) {
+        Ok(channel) => channel,
+        Err(dead) => {
+            return Ok(refused(id, dead.arn, failure_code::NOT_FOUND, dead.message));
+        }
     };
     if channel.state != crate::state::channel_state::RUNNING {
         return Ok(refused(
             id,
-            &channel.arn,
+            Some(channel.arn.clone()),
             failure_code::CONFLICT,
             crate::state::channel_not_running_message(id, &channel.state),
         ));

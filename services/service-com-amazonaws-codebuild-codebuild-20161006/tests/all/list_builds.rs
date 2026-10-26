@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_codebuild_codebuild_20161006::state;
 
 use crate::project_build_lifecycle::{
-    call, create_project, emulator, error_type, start_build, PAST_THE_SETTLE_SPAN,
+    call, create_project, emulator, error_type, listed_ids, start_build, PAST_THE_SETTLE_SPAN,
 };
 
 /// Start `count` builds of `project`, which must already exist, and hand back their ids.
@@ -37,24 +37,6 @@ async fn start_builds(
         );
     }
     ids
-}
-
-/// The `ids` member of a `ListBuilds` answer, as strings.
-///
-/// A non-string entry is a defect rather than something to paper over, so it panics
-/// instead of mapping to a placeholder.
-fn listed_ids(body: &Value) -> Vec<String> {
-    match body["ids"].as_array() {
-        None => Vec::new(),
-        Some(ids) => ids
-            .iter()
-            .map(|id| {
-                id.as_str()
-                    .unwrap_or_else(|| panic!("every entry of ids must be a string, got {id}"))
-                    .to_string()
-            })
-            .collect(),
-    }
 }
 
 /// Every build of every project, in the direction the request asked for.

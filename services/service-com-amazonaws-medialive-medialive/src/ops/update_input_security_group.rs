@@ -188,33 +188,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle(now);
 
         let Some(group) = state
-            .live_input_security_group(&input.input_security_group_id)
-            .map(|group| group.id.clone())
-            .and_then(|id| state.input_security_groups.get_mut(&id))
+            .input_security_groups
+            .get_mut(&input.input_security_group_id)
         else {
-            // Absent and already deleted are ONE refusal, for the reason
-            // `UpdateInput` states: a deleted group's record stays readable in
-            // the terminal `DELETED` state, but the id names no group a caller
-            // may still change, so the mutation is answered with this
-            // operation's modelled `NotFoundException` (404) and nothing is
-            // written.
-            let message = if state
-                .input_security_groups
-                .contains_key(&input.input_security_group_id)
-            {
-                crate::state::already_deleted_message(&format!(
-                    "Input security group {}",
-                    input.input_security_group_id
-                ))
-            } else {
-                format!(
-                    "Input security group not found: {}",
-                    input.input_security_group_id
-                )
-            };
+            // The ONLY refusal this resolution has: an id this account never
+            // held. A group's delete is a SOFT delete — it drops the group from
+            // `ListInputSecurityGroups` and leaves it addressable through
+            // `DescribeInputSecurityGroup` in the terminal `DELETED` state — and
+            // a group that is still addressable is still mutable, so the
+            // tombstone is updated here like any other group rather than
+            // answered with a 404 no AWS path produces for it.
             return Err(UpdateInputSecurityGroupErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(message),
+                    message: Some(format!(
+                        "Input security group not found: {}",
+                        input.input_security_group_id
+                    )),
                 },
             )
             .into());

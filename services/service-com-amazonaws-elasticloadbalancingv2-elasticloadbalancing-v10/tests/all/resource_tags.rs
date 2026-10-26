@@ -30,10 +30,10 @@ use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
 /// One tag set to persist and read back.
-type TagSet = (String, Vec<(String, String)>);
+pub(crate) type TagSet = (String, Vec<(String, String)>);
 
 /// One reported `TagDescription`: the resource ARN, and its tags sorted by key.
-type Described = (String, Vec<(String, String)>);
+pub(crate) type Described = (String, Vec<(String, String)>);
 
 /// One row of the multi-ARN table: the case name, the ARNs the call names and the
 /// descriptions it must then report, in order.
@@ -46,7 +46,7 @@ type MultiArnCase = (&'static str, Vec<String>, Vec<Described>);
 /// and how long they are. The length and character bounds are the model's own for the
 /// `Tag` shape (`smithy_query(query="shape",shape="Tag")`: `Key` length 1..128, `Value`
 /// length 0..256, both matching `^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`).
-fn tag_sets() -> Vec<TagSet> {
+pub(crate) fn tag_sets() -> Vec<TagSet> {
     let owned = |case: &str, tags: &[(&str, &str)]| {
         (
             case.to_string(),
@@ -85,7 +85,7 @@ fn tag_sets() -> Vec<TagSet> {
 }
 
 /// The form fields that ask a create to persist `tags`.
-fn tag_fields(tags: &[(String, String)]) -> Vec<(String, String)> {
+pub(crate) fn tag_fields(tags: &[(String, String)]) -> Vec<(String, String)> {
     let mut fields = Vec::new();
     for (index, (key, value)) in tags.iter().enumerate() {
         let member = index + 1;
@@ -189,7 +189,7 @@ fn seed_tagged_trust_store(
 }
 
 /// `DescribeTags` over `arns`.
-async fn describe_tags(router: &MultiServiceRouter, arns: &[String]) -> Reply {
+pub(crate) async fn describe_tags(router: &MultiServiceRouter, arns: &[String]) -> Reply {
     let mut form = action("DescribeTags");
     for (index, arn) in arns.iter().enumerate() {
         form.push(p(&format!("ResourceArns.member.{}", index + 1), arn));
@@ -199,7 +199,7 @@ async fn describe_tags(router: &MultiServiceRouter, arns: &[String]) -> Reply {
 
 /// What the reply reported: one entry per `TagDescription`, its ARN and its tags sorted
 /// by key, in the order the reply listed the descriptions.
-fn reported(reply: &Reply) -> Vec<Described> {
+pub(crate) fn reported(reply: &Reply) -> Vec<Described> {
     members(&reply.body, "TagDescriptions")
         .iter()
         .map(|description| {
@@ -221,14 +221,14 @@ fn reported(reply: &Reply) -> Vec<Described> {
 }
 
 /// `tags` sorted by key, which is the order a reported description is compared in.
-fn sorted(tags: &[(String, String)]) -> Vec<(String, String)> {
+pub(crate) fn sorted(tags: &[(String, String)]) -> Vec<(String, String)> {
     let mut sorted = tags.to_vec();
     sorted.sort();
     sorted
 }
 
 /// An ARN of this service that no resource in the store carries.
-fn absent_arn(resource: &str) -> String {
+pub(crate) fn absent_arn(resource: &str) -> String {
     format!(
         "arn:aws:elasticloadbalancing:{REGION}:{}:{resource}",
         account()

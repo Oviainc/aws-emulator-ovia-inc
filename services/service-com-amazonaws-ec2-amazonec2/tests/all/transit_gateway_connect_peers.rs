@@ -34,7 +34,7 @@ use ec2::state::{
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{call, elements, error_code, filters, indexed};
+use super::ec2_query::{call, elements, error_code, error_message, filters, indexed};
 use super::wire::{Param, child, child_text, document, is_long_id, param};
 
 /// The Region every call here is signed for.
@@ -1189,6 +1189,80 @@ async fn the_describe_pages_in_id_order() {
     assert!(
         super::ec2_query::element(&body, "nextToken").is_none(),
         "case {case:?}: the last page must carry no token, got body {body}"
+    );
+}
+
+/// A filter name this operation does not document is refused with the wording the layer that
+/// checks this request's members gives every value it rejects — `Value (<name>) for parameter
+/// Filter is invalid. `, naming the member and the name the REQUEST sent, with nothing after
+/// the period for a name that has no further reason to give — under EC2's
+/// `InvalidParameterValue`.
+///
+/// The rows span a name that does not exist at all, a filter ANOTHER describe documents, this
+/// operation's own names in the wrong case (filter names are case-sensitive), the tag filters
+/// this operation documents none of, and an empty name. Each name the operation DOES document
+/// is then served, so what is refused is membership of the catalog rather than filtering as
+/// such.
+#[tokio::test]
+async fn an_undocumented_filter_is_refused_with_the_parameter_wording() {
+    let fixture = Fixture::new(TRANSIT_GATEWAY_ATTACHMENT_STATE_AVAILABLE).await;
+    let ids = create_peers(&fixture, 1).await;
+
+    for name in [
+        "transit-gateway-connect-peer-state",
+        "transit-gateway-id",
+        "state ",
+        "State",
+        "Transit-Gateway-Attachment-Id",
+        "tag:Name",
+        "tag-key",
+        "",
+    ] {
+        let case = format!("the filter {name:?}");
+        let (status, body) =
+            describe_peers(&fixture.router, &filters(&[(name, &["anything"])])).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidParameterValue",
+            "case {case:?}: expected InvalidParameterValue, got body {body}"
+        );
+        let message = error_message(&body);
+        assert_eq!(
+            message,
+            format!("Value ({name}) for parameter Filter is invalid. "),
+            "case {case:?}: expected the refused value named in the parameter wording, \
+             got {message:?}"
+        );
+    }
+
+    // The names the operation documents, from
+    // `DescribeTransitGatewayConnectPeersRequest$Filters`:
+    //
+    // smithy_query(query="doc",shape="DescribeTransitGatewayConnectPeersRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+    for name in [
+        "state",
+        "transit-gateway-attachment-id",
+        "transit-gateway-connect-peer-id",
+    ] {
+        let case = format!("the documented filter {name:?}");
+        let (status, body) =
+            describe_peers(&fixture.router, &filters(&[(name, &["anything"])])).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a documented filter must be served, got {status} with body {body}"
+        );
+    }
+
+    // Every refusal above left the store as it was: the stored peer is still reported.
+    let (_, body) = describe_peers(&fixture.router, &[]).await;
+    assert_eq!(
+        elements(&body, "transitGatewayConnectPeerId"),
+        ids,
+        "a refused describe must leave the store as it was, got body {body}"
     );
 }
 

@@ -61,19 +61,19 @@ const CREATE_PLAN_PATH: &str = "/create-pricing-plan";
 /// One per group, because a group's primary account is one of its OWN linked accounts and
 /// an account belongs to at most one billing group — so no two groups of one family can
 /// name the same primary account.
-fn primary_account_id(index: usize) -> String {
+pub(crate) fn primary_account_id(index: usize) -> String {
     format!("{:012}", 999900000000_u64 + index as u64)
 }
 
 /// The billing period the service calls current, read from the same clock it answers
 /// from so an expectation holds whatever month the suite runs in.
-fn current_period() -> String {
+pub(crate) fn current_period() -> String {
     service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period()
 }
 
 /// A live emulator holding only this service, with the engine kept so a row can backdate
 /// a group the wire could only create now.
-struct Emulator {
+pub(crate) struct Emulator {
     engine: Arc<engine::InMemoryEngine>,
     router: MultiServiceRouter,
 }
@@ -83,7 +83,7 @@ impl Emulator {
     /// organization's PAYER account — the world in which this payer-account-only control
     /// plane is reachable at all (see `tests/all/payer_account_gate.rs` for the denial
     /// every other caller gets).
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         engine
             .state::<BillingConductorState>()
@@ -96,7 +96,7 @@ impl Emulator {
 
     /// POST a JSON body to one of this service's routes and return the status plus the
     /// parsed response body.
-    async fn post(&self, path: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn post(&self, path: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri(format!(
@@ -126,7 +126,7 @@ impl Emulator {
 
     /// Create a pricing plan and answer the ARN the service minted — a billing group's
     /// computation preference must name a plan that exists.
-    async fn create_plan(&self, name: &str) -> String {
+    pub(crate) async fn create_plan(&self, name: &str) -> String {
         let (status, body) = self.post(CREATE_PLAN_PATH, &json!({"Name": name})).await;
         assert_eq!(
             status, 200,
@@ -146,7 +146,13 @@ impl Emulator {
     /// serves as a group's main account is an account of that group. The members of
     /// `extra`'s own `AccountGrouping` are laid over the default grouping one by one, so a
     /// row naming `AutoAssociate` keeps that membership.
-    async fn create_group(&self, name: &str, plan: &str, primary: &str, extra: &Value) -> String {
+    pub(crate) async fn create_group(
+        &self,
+        name: &str,
+        plan: &str,
+        primary: &str,
+        extra: &Value,
+    ) -> String {
         let mut body = json!({
             "Name": name,
             "PrimaryAccountId": primary,
@@ -174,7 +180,7 @@ impl Emulator {
     }
 
     /// `UpdateBillingGroup`: apply `changes` to the group, through the real wire.
-    async fn update_group(&self, case: &str, group: &str, changes: &Value) {
+    pub(crate) async fn update_group(&self, case: &str, group: &str, changes: &Value) {
         let mut body = changes.clone();
         body["Arn"] = json!(group);
         let (status, answer) = self.post(UPDATE_GROUP_PATH, &body).await;
@@ -188,7 +194,7 @@ impl Emulator {
     /// that billing period: the way a world where a group already existed in a closed
     /// period is set up, which no request can ask for (a create happens now). The group's
     /// only generation starts there too, since nothing has superseded it yet.
-    fn created_in(&self, group: &str, period: &str) {
+    pub(crate) fn created_in(&self, group: &str, period: &str) {
         let at = period_start_millis(period);
         let state = self.engine.state::<BillingConductorState>();
         let mut state = state.lock();
@@ -204,7 +210,7 @@ impl Emulator {
     /// group as it stands had been made in that billing period: how a world whose
     /// generations started in DIFFERENT periods is set up, which no request can ask for
     /// (a write happens now).
-    fn generation_started_in(&self, group: &str, period: &str) {
+    pub(crate) fn generation_started_in(&self, group: &str, period: &str) {
         let at = period_start_millis(period);
         let state = self.engine.state::<BillingConductorState>();
         let mut state = state.lock();
@@ -231,7 +237,12 @@ impl Emulator {
     /// The `BillingGroupListElement` `ListBillingGroups` reports for ONE group in
     /// `period` (`None` names no period at all), or `None` when the listing does not
     /// report the group for that period at all.
-    async fn element_in(&self, case: &str, group: &str, period: Option<&str>) -> Option<Value> {
+    pub(crate) async fn element_in(
+        &self,
+        case: &str,
+        group: &str,
+        period: Option<&str>,
+    ) -> Option<Value> {
         let mut body = json!({"Filters": {"Arns": [group]}});
         if let Some(period) = period {
             body["BillingPeriod"] = json!(period);
@@ -256,7 +267,7 @@ impl Emulator {
 }
 
 /// Assert that `element` reports every member `expected` names with the value it names.
-fn assert_members(case: &str, element: &Value, expected: &Value) {
+pub(crate) fn assert_members(case: &str, element: &Value, expected: &Value) {
     let members = expected
         .as_object()
         .expect("an expectation is a map of member to value");

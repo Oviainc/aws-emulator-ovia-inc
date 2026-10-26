@@ -48,6 +48,15 @@
 //! (`CustomEntityType$Name`), and every operation that addresses one names it by name
 //! alone, with no `CatalogId` member.
 //!
+//! SECURITY CONFIGURATIONS — the sets of encryption properties
+//! `CreateSecurityConfiguration` registers — sit in such a per-account namespace too
+//! ([`ComAmazonawsGlueAwsglueState::security_configurations`]), keyed by configuration
+//! name, because every operation that addresses one (`GetSecurityConfiguration`,
+//! `DeleteSecurityConfiguration`) names it by `Name` alone and no `CatalogId`. This is
+//! a DIFFERENT resource from [`Catalog::encryption_settings`] above: those settings are
+//! the catalog's own, while a security configuration is a named record a job, crawler or
+//! development endpoint refers to.
+//!
 //! FORM TYPES — the metadata schemas `PutFormType` registers — sit in such a per-account
 //! namespace too, keyed by form type name, because a put names its form type by `Name`
 //! alone and no `CatalogId`. They are ADDRESSED by the identifier a client holds for one —
@@ -111,15 +120,17 @@ use crate::ops::types::{
     CodeGenConfigurationNode, Column, ColumnStatisticsTaskRun, Connection, ConnectionInput,
     ConnectionPasswordEncryption, ConnectionsList, Crawler, CrawlerTargets, CreateCrawlerInput,
     CreateCustomEntityTypeInput, CreateGlossaryInput, CreateGlossaryTermInput, CreateJobInput,
-    CustomEntityType,
+    CreateSecurityConfigurationInput, CustomEntityType,
     DataCatalogEncryptionSettings, DataLakePrincipal, Database, DatabaseIdentifier, DatabaseInput,
-    EncryptionAtRest, ErrorDetail, ExecutionProperty, FederatedDatabase, FederatedTable, Job,
+    EncryptionAtRest, EncryptionConfiguration, ErrorDetail, ExecutionProperty, FederatedDatabase,
+    FederatedTable, Job,
     CreateUsageProfileInput,
     JobCommand, JobRun, JobUpdate, LakeFormationConfiguration, LineageConfiguration,
     NotificationProperty, Partition, PartitionInput, PrincipalPermissions, ProfileConfiguration,
     RLSProperties,
     RecrawlPolicy, RegistryId, Schedule,
-    SchemaChangePolicy, SchemaId, SourceControlDetails, StartColumnStatisticsTaskRunInput,
+    SchemaChangePolicy, SchemaId, SecurityConfiguration, SourceControlDetails,
+    StartColumnStatisticsTaskRunInput,
     StartJobRunInput, StorageDescriptor, Table, TableIdentifier, TableInput, TableVersion,
     UpdateCrawlerInput,
 };
@@ -235,6 +246,11 @@ pub const MAX_JOBS: usize = 1_000;
 /// [`MAX_CRAWLERS`]. A create past it is refused with `CreateCustomEntityType`'s own
 /// modelled `ResourceNumberLimitExceededException`.
 pub const MAX_CUSTOM_ENTITY_TYPES: usize = 1_000;
+
+/// Ceiling on the security configurations this emulator will hold, for the same reason as
+/// [`MAX_CRAWLERS`]. A create past it is refused with `CreateSecurityConfiguration`'s own
+/// modelled `ResourceNumberLimitExceededException`.
+pub const MAX_SECURITY_CONFIGURATIONS: usize = 1_000;
 
 /// Ceiling on the form types this emulator will hold, for the same reason as
 /// [`MAX_CRAWLERS`]: `PutFormType` writes a record any caller can reach, and each one
@@ -551,6 +567,15 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// so `ListCustomEntityTypes` has one deterministic order to page over. The key is
     /// the name exactly as sent — the model documents no case fold for it.
     pub custom_entity_types: BTreeMap<String, CustomEntityTypeEntry>,
+    /// Every security configuration this emulator holds, keyed by its name.
+    ///
+    /// Per account, like crawlers and custom entity types: `GetSecurityConfiguration`,
+    /// `DeleteSecurityConfiguration` and `GetSecurityConfigurations` address a security
+    /// configuration by name alone, with no `CatalogId` member, so the namespace is per
+    /// account and the name a create sends is the whole address. Ordered, so
+    /// `GetSecurityConfigurations` has one deterministic order to page over. The key is
+    /// the name exactly as sent — the model documents no case fold for `NameString`.
+    pub security_configurations: BTreeMap<String, SecurityConfigurationEntry>,
     /// Every metadata form type this emulator holds, keyed by `FormTypeName`.
     ///
     /// Per account, like crawlers and job definitions: `PutFormType` names a form type by
@@ -1035,6 +1060,12 @@ impl ComAmazonawsGlueAwsglueState {
     /// [`MAX_CUSTOM_ENTITY_TYPES`].
     pub fn can_store_custom_entity_type(&self) -> bool {
         self.custom_entity_types.len() < MAX_CUSTOM_ENTITY_TYPES
+    }
+
+    /// Whether the store can hold another security configuration, i.e. is below
+    /// [`MAX_SECURITY_CONFIGURATIONS`].
+    pub fn can_store_security_configuration(&self) -> bool {
+        self.security_configurations.len() < MAX_SECURITY_CONFIGURATIONS
     }
 
     /// Whether the store can hold another usage profile, i.e. is below
@@ -2312,6 +2343,51 @@ impl CustomEntityTypeEntry {
             name: self.name.clone(),
             regex_string: self.regex_string.clone(),
             context_words: self.context_words.clone(),
+        }
+    }
+}
+
+/// A stored security configuration: the set of encryption properties
+/// `CreateSecurityConfiguration` registers for Glue to encrypt data at rest with.
+///
+/// Every member of the modelled `SecurityConfiguration` shape is held here and nothing
+/// else: the model gives a security configuration no id, status or owner. The name and the
+/// encryption configuration come from the request; the creation instant is the one
+/// server-set member, recorded when the create stored the record and never changed
+/// afterwards, because the model exposes no update for this resource.
+#[derive(Debug, Clone)]
+pub struct SecurityConfigurationEntry {
+    /// The configuration's name, which is also its key in
+    /// [`ComAmazonawsGlueAwsglueState::security_configurations`].
+    pub name: String,
+    /// "The time at which this security configuration was created", the instant the create
+    /// was served, so every later read of this record reports the same timestamp.
+    pub created_at: SystemTime,
+    /// "The encryption configuration associated with this security configuration", stored
+    /// exactly as the create sent it: a read reports the properties the client wrote and
+    /// nothing the server invented.
+    pub encryption_configuration: EncryptionConfiguration,
+}
+
+impl SecurityConfigurationEntry {
+    /// Build a stored security configuration from a `CreateSecurityConfiguration` request
+    /// served at `now`. The definition comes from the request; the creation instant is the
+    /// clock's.
+    pub fn from_create_input(input: &CreateSecurityConfigurationInput, now: SystemTime) -> Self {
+        Self {
+            name: input.name.clone(),
+            created_at: now,
+            encryption_configuration: input.encryption_configuration.clone(),
+        }
+    }
+
+    /// Rebuild the modelled `SecurityConfiguration` shape from what is stored, so a
+    /// listing reports the same configuration a single read does.
+    pub fn to_security_configuration(&self) -> SecurityConfiguration {
+        SecurityConfiguration {
+            name: Some(self.name.clone()),
+            created_time_stamp: Some(to_date_time(self.created_at)),
+            encryption_configuration: Some(self.encryption_configuration.clone()),
         }
     }
 }
@@ -4636,6 +4712,12 @@ pub mod messages {
     pub fn partition_not_found(values: &[String]) -> String {
         format!("Partition [{}] not found.", values.join(", "))
     }
+
+    /// `CreateSecurityConfiguration` for a name already taken. NOT recorded: inferred
+    /// from the recorded `CreateDatabase` duplicate, like [`CRAWLER_ALREADY_EXISTS`] —
+    /// 400, `AlreadyExistsException`, and no disclosure of the requested name.
+    pub const SECURITY_CONFIGURATION_ALREADY_EXISTS: &str =
+        "Security configuration already exists.";
 
     /// A resource-policy read or delete (`GetResourcePolicy`, `DeleteResourcePolicy`) for
     /// a resource that carries no policy. RECORDED constant: the refusal names neither

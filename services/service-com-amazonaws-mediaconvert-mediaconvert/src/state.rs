@@ -773,6 +773,32 @@ pub fn check_concurrent_jobs(
     Ok(())
 }
 
+/// The concurrency a queue reports after a call that may state `ConcurrentJobs`, may hand
+/// the queue a reservation plan, or may do neither.
+///
+/// `Queue$ConcurrentJobs` is "the maximum number of jobs your queue can process
+/// concurrently", and for a RESERVED queue the model points the caller at the plan rather
+/// than at the member: "For reserved queues, specify the number of jobs you can process
+/// concurrently in your reservation plan instead" on a create, and "For reserved queues,
+/// update your reservation plan instead in order to increase your yearly commitment" on an
+/// update. So the slot count a plan reserves IS the concurrency of the queue it is stored
+/// on, which makes the rule one rule for every call that stores a plan: a call that stores
+/// one and states no `ConcurrentJobs` takes the queue's concurrency from that plan's
+/// `ReservedSlots`, so the two members of one projected `Queue` can never disagree.
+///
+/// A call that STATES the member takes the value it entered (the allocation
+/// [`check_concurrent_jobs`] measured), and a call that does neither keeps `stored` — the
+/// value an earlier call persisted, or [`DEFAULT_CONCURRENT_JOBS`] on a create.
+pub fn concurrent_jobs_for(
+    requested: Option<i32>,
+    settings: Option<&ReservationPlanSettings>,
+    stored: i32,
+) -> i32 {
+    requested
+        .or_else(|| settings.map(|settings| settings.reserved_slots))
+        .unwrap_or(stored)
+}
+
 /// How this service refuses a concurrency that is not a number of jobs.
 fn negative_concurrent_jobs_message(requested: i32) -> String {
     format!("You specified {requested} for ConcurrentJobs. ConcurrentJobs must not be negative.")

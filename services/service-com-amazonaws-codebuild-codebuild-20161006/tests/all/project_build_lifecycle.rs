@@ -121,6 +121,25 @@ pub(crate) fn error_type(body: &Value) -> String {
     body["__type"].as_str().unwrap_or_default().to_string()
 }
 
+/// The `ids` member of a list answer, as strings — the shape every `List*` operation of
+/// this service that reports ids uses, so the suites covering them share one reader.
+///
+/// A non-string entry is a defect rather than something to paper over, so it panics
+/// instead of mapping to a placeholder.
+pub(crate) fn listed_ids(body: &Value) -> Vec<String> {
+    match body["ids"].as_array() {
+        None => Vec::new(),
+        Some(ids) => ids
+            .iter()
+            .map(|id| {
+                id.as_str()
+                    .unwrap_or_else(|| panic!("every entry of ids must be a string, got {id}"))
+                    .to_string()
+            })
+            .collect(),
+    }
+}
+
 pub(crate) fn expected_arn(resource: &str) -> String {
     format!(
         "arn:aws:codebuild:{REGION}:{}:{resource}",

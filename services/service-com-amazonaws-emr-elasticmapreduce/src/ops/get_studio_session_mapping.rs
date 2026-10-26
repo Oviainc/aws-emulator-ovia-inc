@@ -178,10 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         if !store.studios.contains_key(&input.studio_id) {
-            return Err(refuse(format!(
-                "Studio id '{}' is not valid or does not exist.",
-                input.studio_id
-            )));
+            return Err(refuse(crate::state::unknown_studio_message()));
         }
 
         let key =

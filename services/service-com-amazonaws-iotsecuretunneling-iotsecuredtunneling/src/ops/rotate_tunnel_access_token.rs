@@ -9,11 +9,23 @@
 //!
 //! Rotation reissues the credentials of a LIVE tunnel, so it is refused on a
 //! tunnel that is not `OPEN` — one `CloseTunnel` closed, or one the expiry sweep
-//! closed — with HTTP 400 `ValidationException`, before any token is minted or
-//! stored. A `destinationConfig` configures the destination end, so it is refused
-//! the same way when the requested `clientMode` does not rotate that end, and
-//! when its `services` list names more streams than a tunnel is multiplexed
-//! over ([`crate::state::MAX_SERVICES_PER_TUNNEL`]).
+//! closed — before any token is minted or stored. A `destinationConfig`
+//! configures the destination end, so it is refused the same way when the
+//! requested `clientMode` does not rotate that end, and when its `services` list
+//! names more streams than a tunnel is multiplexed over
+//! ([`crate::state::MAX_SERVICES_PER_TUNNEL`]).
+//!
+//! Those three refusals concern a request whose SHAPE the service accepts, and
+//! AWS answers them with HTTP 400 and the wire error code `ValidationException`
+//! — a code this model declares on no operation, which is why it comes from
+//! [`crate::scaffolded::Scaffolded::validation`] and not from the generated
+//! error enum. The operation's one MODELLED error, `ResourceNotFoundException`
+//! (404), answers the OTHER class and only it: a `tunnelId` this Region's
+//! endpoint holds no record for. The two are not interchangeable — a closed
+//! tunnel is still readable through `DescribeTunnel`, so answering it as a
+//! missing resource would tell a client the record is gone. The whole mapping of
+//! refusal class to status, code and message is pinned by
+//! `tests/all/rotate_refusal_error_contract.rs`.
 //!
 //! ## Shape of an operation
 //!
@@ -212,9 +224,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Credentials are only reissued for a tunnel that is still live: a closed
         // tunnel can never be connected to, so AWS refuses to mint a client access
-        // token for one. The tunnel is still describable, hence a refusal rather
-        // than the not-found error, and the check runs before any token is minted
-        // or stored so a refused call leaves the record exactly as it was.
+        // token for one. The record is still describable, so this is the
+        // request-time refusal (400 `ValidationException`) and NOT the modelled
+        // not-found error, which says the endpoint holds no such tunnel; the check
+        // runs before any token is minted or stored, so a refused call leaves the
+        // record exactly as it was.
         if tunnel.status != crate::state::TunnelStatus::Open {
             // The wording ("is close.") is AWS's own for this refusal; what the
             // request determines is the tunnel it names.

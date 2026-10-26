@@ -160,12 +160,17 @@ async fn every_bound_action_dispatches_at_the_models_api_version() {
     let mut load_balancer_attributes = action("DescribeLoadBalancerAttributes");
     load_balancer_attributes.push(p("LoadBalancerArn", &lb_arn));
 
-    // A bound action whose operation is still a scaffold stub, so the dispatched answer
-    // is the 501 channel.
+    // A write that stores something on a resource an earlier row created.
     let mut tagging = action("AddTags");
     tagging.push(p("ResourceArns.member.1", &lb_arn));
     tagging.push(p("Tags.member.1.Key", "team"));
     tagging.push(p("Tags.member.1.Value", "dispatch"));
+
+    // A bound action whose operation is still a scaffold stub, so the dispatched answer
+    // is the 501 channel.
+    let mut untagging = action("RemoveTags");
+    untagging.push(p("ResourceArns.member.1", &lb_arn));
+    untagging.push(p("TagKeys.member.1", "team"));
 
     let bound: Vec<DispatchCase> = vec![
         ("CreateListener", listener, 200),
@@ -186,11 +191,14 @@ async fn every_bound_action_dispatches_at_the_models_api_version() {
             load_balancer_attributes,
             200,
         ),
+        // A tag write, which stores the tags it was given on the load balancer the
+        // first row created.
+        ("AddTags", tagging, 200),
         // Bound and still a scaffold: the 501 `NotImplemented` channel is also a
         // DISPATCHED answer — the request reached the operation — and is what a stub
         // must answer until its own issue implements it. What it must never be is
         // `InvalidAction`, which would tell the caller this API has no such action.
-        ("AddTags", tagging, 501),
+        ("RemoveTags", untagging, 501),
         // Implemented, and answering with its OWN refusal: `DescribeRules` is
         // documented "You must specify either a listener or rules", so a request
         // naming neither is that operation's 400 rather than a routing failure.
