@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyInstanceGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyInstanceGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyInstanceGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes the size and the configurations of the instance groups a cluster carries: each
+//! submitted modification is applied to that group's persisted record — the new target
+//! instance count, a new configuration specification (merged into the one it holds or
+//! replacing it) and the shrink policy to customise its shrink operations — where
+//! `ListInstanceGroups` reads them back. A group whose instances are up is `RESIZING` or
+//! `RECONFIGURING` until the clock makes the change due, and goes on reporting the
+//! instances it already runs until then.
+//!
+//! "The call will either succeed or fail atomically" (this operation's doc), so every
+//! modification is checked before any of them is persisted: a cluster the service holds
+//! no record for, one that is shutting down or gone, a group that cluster does not carry,
+//! a negative target, a resize of the group that runs the primary node, a configuration
+//! specification past what a group may hold, and an Amazon EC2 instance id that names no
+//! instance of the group are all REFUSED (400 `ValidationException`) with the store left
+//! exactly as it was. A managed scaling policy's compute limits bound what the CLUSTER
+//! scales itself to rather than what a caller asks a group for, so a target outside them
+//! is applied like any other.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +163,193 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyInstanceGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyInstanceGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state::{
+            cluster_state, instance_group_type, reconfiguration_type, InstanceGroupRecord,
+            MAX_INSTANCE_GROUPS_PER_CLUSTER, MAX_INSTANCE_GROUP_CONFIGURATIONS,
+        };
+
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let modifications = input.instance_groups.unwrap_or_default();
+        // "Instance groups to change" (`ModifyInstanceGroups$InstanceGroups` doc): a
+        // request that names none changes nothing, and nothing is what it is answered
+        // with.
+        if modifications.is_empty() {
+            return Ok(ModifyInstanceGroupsOutput);
+        }
+        // Bounded before the store is touched: a cluster carries at most
+        // `MAX_INSTANCE_GROUPS_PER_CLUSTER` groups, so a longer list cannot name that
+        // many distinct groups of one cluster, and the walk below is capped by the same
+        // number.
+        if modifications.len() > MAX_INSTANCE_GROUPS_PER_CLUSTER {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "InstanceGroups names {} modifications; a cluster carries at most \
+                 {MAX_INSTANCE_GROUPS_PER_CLUSTER} instance groups",
+                modifications.len()
+            )));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ModifyInstanceGroupsErrorModeled::InternalServerError(
+                InternalServerError {},
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // "The ID of the cluster to which the instance group belongs"
+        // (`ModifyInstanceGroups$ClusterId` doc) — a member the model leaves optional,
+        // because an instance group id already names the one cluster that carries it. A
+        // request that omits it is resolved through the first group it names.
+        let cluster_id = match input
+            .cluster_id
+            .as_deref()
+            .filter(|cluster_id| !cluster_id.is_empty())
+        {
+            Some(cluster_id) => cluster_id.to_string(),
+            None => {
+                let named = modifications
+                    .first()
+                    .map(|modification| modification.instance_group_id.clone())
+                    .unwrap_or_default();
+                match store
+                    .clusters
+                    .iter()
+                    .find(|(_, cluster)| cluster.groups.iter().any(|group| group.id == named))
+                {
+                    Some((cluster_id, _)) => cluster_id.clone(),
+                    None => {
+                        return Err(crate::scaffolded::Scaffolded::validation(
+                            crate::state::unknown_instance_group_message(&named),
+                        ))
+                    }
+                }
+            }
+        };
+
+        // A modification changes group state, so every transition the clock already made
+        // due is materialised before this one is recorded.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyInstanceGroups"))
+        // This operation models no client error, so a request it must refuse is answered
+        // with the 400 `ValidationException` channel rather than a 501 or an empty 200.
+        let Some(cluster) = store.cluster_mut(&cluster_id, now) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::unknown_cluster_message(&cluster_id),
+            ));
+        };
+
+        // A cluster on its way out has no capacity left to change: its groups are headed
+        // for `ENDED` whatever this call asks for.
+        let cluster_state_now = cluster.status.state.clone();
+        if cluster.is_terminal() || cluster_state_now == cluster_state::TERMINATING {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "A job flow that is shutting down, terminated, or finished may not be \
+                 modified: '{cluster_id}' is {cluster_state_now}"
+            )));
+        }
+
+        // "The call will either succeed or fail atomically" (this operation's doc): every
+        // modification is applied to a COPY of the cluster's groups, and the copy becomes
+        // what the cluster carries only once all of them hold. A refused request leaves
+        // the stored groups untouched.
+        let mut groups: Vec<InstanceGroupRecord> = cluster.groups.clone();
+        for modification in &modifications {
+            let Some(group) = groups
+                .iter_mut()
+                .find(|group| group.id == modification.instance_group_id)
+            else {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::unknown_instance_group_message(&modification.instance_group_id),
+                ));
+            };
+
+            // "The Amazon EC2 InstanceIds to terminate" — this emulator launches no
+            // Amazon EC2 instances, so an id named here belongs to no instance of the
+            // group, and terminating it is refused rather than answered as done.
+            if let Some(instance_id) = modification
+                .ec2_instance_ids_to_terminate
+                .iter()
+                .flatten()
+                .next()
+            {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::unknown_ec2_instance_message(instance_id),
+                ));
+            }
+
+            // "Policy for customizing shrink operations" (`InstanceGroupModifyConfig$
+            // ShrinkPolicy` doc): the submitted policy is what the group carries from
+            // here on, and what a later read of it reports.
+            if let Some(shrink_policy) = modification.shrink_policy.as_ref() {
+                group.shrink_policy = Some(shrink_policy.clone());
+            }
+
+            // "A list of new or modified configurations to apply for an instance group"
+            // (`InstanceGroupModifyConfig$Configurations` doc).
+            if let Some(configurations) = modification.configurations.as_ref() {
+                let merge = modification.reconfiguration_type.as_deref()
+                    == Some(reconfiguration_type::MERGE);
+                // Bounded: the submitted tree, plus everything a MERGE keeps of what the
+                // group already holds, is what every later read of the group reports.
+                let held = if merge {
+                    crate::state::configuration_entries(
+                        group.config.configurations.as_deref().unwrap_or_default(),
+                        MAX_INSTANCE_GROUP_CONFIGURATIONS,
+                    )
+                } else {
+                    0
+                };
+                let submitted = crate::state::configuration_entries(
+                    configurations,
+                    MAX_INSTANCE_GROUP_CONFIGURATIONS,
+                );
+                if held.saturating_add(submitted) > MAX_INSTANCE_GROUP_CONFIGURATIONS {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "Configurations would leave instance group '{}' holding more \
+                         than the {MAX_INSTANCE_GROUP_CONFIGURATIONS} configurations an \
+                         instance group may hold",
+                        modification.instance_group_id
+                    )));
+                }
+                group.begin_reconfiguration(configurations.clone(), merge, now);
+            }
+
+            // "Target size for the instance group" (`InstanceGroupModifyConfig$
+            // InstanceCount` doc). The model types it as a plain integer, so a target no
+            // group could reach is refused here rather than at the boundary.
+            if let Some(target) = modification.instance_count {
+                if target < 0 {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "InstanceCount {target} is below 0"
+                    )));
+                }
+                // "The master node cannot be scaled after initial configuration."
+                // (`ComputeLimits` doc, Smithy model.) The role of a group IS its type,
+                // so the group that runs the primary node keeps the size it launched
+                // with, and only a request that would change it is refused.
+                if target != group.config.instance_count
+                    && group.config.instance_role == instance_group_type::MASTER
+                {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "Instance group '{}' is of type {}, which cannot be scaled \
+                         after initial configuration",
+                        modification.instance_group_id,
+                        instance_group_type::MASTER,
+                    )));
+                }
+                // "The managed scaling ACTIVITY of a cluster can not be above or below
+                // these limits" (`ComputeLimits` doc, Smithy model): the compute limits
+                // of a managed scaling policy bound what the cluster scales itself to,
+                // not what a caller instructs a group to hold, so the target is applied
+                // whatever those boundaries say and the policy is left as it is.
+                group.begin_resize(target, now);
+            }
+        }
+
+        cluster.groups = groups;
+        drop(store);
+
+        Ok(ModifyInstanceGroupsOutput)
     }
 }

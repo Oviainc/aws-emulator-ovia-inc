@@ -290,20 +290,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // "This name must be unique within the Amazon Web Services account and Region."
-        // (`PutLogAlarmInput$AlarmName`) — one name names ONE alarm, so a name a metric or
-        // composite alarm already holds is a conflict with the current state of that alarm
-        // rather than a second alarm under the same name.
-        if let Some(kind) = store
+        // (`PutLogAlarmInput$AlarmName`) — one name names ONE alarm, so a name an alarm of
+        // another kind already holds is not a name this call may take. It is a parameter
+        // this request cannot carry rather than a conflict with the state of the alarm
+        // already there, so it is refused with the service's own `ValidationError`
+        // (HTTP 400), exactly as the metric-alarm and composite-alarm writers refuse a name
+        // another kind of alarm holds — and the alarm already there is left untouched.
+        if store
             .alarm_kind(&input.alarm_name)
-            .filter(|kind| *kind != crate::state::ALARM_TYPE_LOG)
+            .is_some_and(|kind| kind != crate::state::ALARM_TYPE_LOG)
         {
-            return Err(PutLogAlarmErrorModeled::ResourceConflict(ResourceConflict {
-                message: Some(format!(
-                    "a {kind} named {} already exists in this Region",
-                    input.alarm_name
-                )),
-            })
-            .into());
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "AlarmName [{}] is already used by another alarm of a different type",
+                input.alarm_name
+            )));
         }
 
         // "If you call this operation with the name of an existing log alarm, the operation

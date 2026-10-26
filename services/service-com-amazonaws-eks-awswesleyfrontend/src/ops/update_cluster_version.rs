@@ -187,6 +187,21 @@ fn is_version_update_type(update_type: &str) -> bool {
     update_type == UPDATE_TYPE_VERSION || update_type == UPDATE_TYPE_VERSION_ROLLBACK
 }
 
+/// The `UpdateType` a request asking for `requested` on a cluster running `current`
+/// would mint: a cluster moves one minor version per update, forward as an upgrade
+/// and backward as the rollback of one, so the DIRECTION decides the type. A request
+/// this operation goes on to refuse names no move at all, and is reported as the
+/// upgrade it reads as.
+fn attempted_update_type(requested: &str, current: Option<&str>) -> &'static str {
+    match (
+        kubernetes_minor_version(requested),
+        current.and_then(kubernetes_minor_version),
+    ) {
+        (Some(target), Some(current)) if target < current => UPDATE_TYPE_VERSION_ROLLBACK,
+        _ => UPDATE_TYPE_VERSION,
+    }
+}
+
 /// The `UpdateClusterVersion` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -274,17 +289,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // One update at a time per cluster: while another is running the cluster is in
-        // use, which is exactly what `ResourceInUseException` reports.
+        // use, which is exactly what `ResourceInUseException` reports, worded by
+        // [`crate::state::update_in_progress`] for the update type this call would have
+        // minted.
         if let Some(in_flight) = record.in_flight_update() {
+            let attempted = attempted_update_type(&input.version, record.version.as_deref());
             return Err(
-                UpdateClusterVersionErrorModeled::ResourceInUseException(ResourceInUseException {
-                    cluster_name: Some(cluster_name.clone()),
-                    message: Some(format!(
-                        "Cluster {cluster_name} already has update {} in progress",
-                        in_flight.id
-                    )),
-                    ..Default::default()
-                })
+                UpdateClusterVersionErrorModeled::ResourceInUseException(
+                    crate::state::update_in_progress(attempted, &cluster_name, in_flight),
+                )
                 .into(),
             );
         }
@@ -405,11 +418,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             ));
         }
-        let update_type = if target > current {
-            UPDATE_TYPE_VERSION
-        } else {
-            UPDATE_TYPE_VERSION_ROLLBACK
-        };
+        let update_type = attempted_update_type(&input.version, Some(&current_version));
 
         // "If your cluster has managed node groups attached to it, all of your node
         // groups' Kubernetes versions must match the cluster's Kubernetes version in order

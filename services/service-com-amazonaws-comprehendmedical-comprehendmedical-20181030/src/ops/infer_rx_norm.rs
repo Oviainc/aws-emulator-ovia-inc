@@ -1,22 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op InferRxNorm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `InferRxNorm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`InferRxNorm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. The ontology linking runs in-process: the submitted text is tokenized,
+//! every medication the lexicon below names is placed from the characters the text itself
+//! carries, the prescription written around each mention becomes its attributes, the
+//! context around it licenses its traits, and each mention is linked to the RxNorm
+//! concepts its lexicon entry lists. Nothing is matched out of a particular request, and
+//! no value is carried over from one call to the next.
 //!
-//! ## Shape of an operation
+//! No maintained crates.io crate ships a clinical-text model that can be loaded
+//! in-process without an external runtime, so the engine here is rule- and
+//! lexicon-based — the same class of engine as `crate::ops::infer_icd10_cm` and
+//! `crate::ops::infer_snomedct` — and the rule each table applies is stated on that
+//! table.
 //!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `InferRxNorm::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! The generic half of that pass is NOT written twice: tokenization, spans, lexicon
+//! matching, the context cues, the character-offset conversion and the confidence weights
+//! are reached from [`crate::ops::infer_icd10_cm`], which states them once for every
+//! ontology-linking operation of this service. What lives here is what is RxNorm's own —
+//! the medication lexicon, the vocabularies a prescription (a "sig") is written in, and
+//! the mapping onto the modelled RxNorm shapes.
+//!
+//! The operation holds NO state: the answer is a function of the submitted text alone,
+//! so repeating the call returns the same entities and nothing a later caller reads is
+//! changed by calling it.
 //!
 //! ## Reaching this service's state
 //!
@@ -91,6 +99,855 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::OnceLock;
+
+// The generic clinical-text pass, stated once for every ontology-linking operation of
+// this service. See the module docs of `infer_icd10_cm` for why it lives there.
+use crate::ops::infer_icd10_cm::{
+    character_offset, character_starts, cue_precedes, cue_trait_names, first_family_cues, is_count,
+    lexicon_matches, term_confidence, tokenize, Span, Token, CONCEPT_CANDIDATE_LIMIT,
+    CONCEPT_RANK_DECAY, RELATIONSHIP_DISTANCE_PENALTY, WEIGHT_CUE, WEIGHT_MODIFIER, WEIGHT_PATTERN,
+    WEIGHT_RELATIONSHIP,
+};
+// Two more rules of that pass that the SNOMED CT operation states: the distance between
+// two spans, and the cue vocabulary behind the `PAST_HISTORY` trait that both ontologies'
+// trait enums carry.
+use crate::ops::infer_snomedct::{token_distance, PAST_HISTORY_CUES};
+
+/// The version this emulator reports for the model behind the ontology linking.
+///
+/// The modelled `ModelVersion` member documents the SHAPE of the value ("in the format
+/// n.n.n"), not a particular version, so one constant is the single source for every
+/// response this operation serves.
+const MODEL_VERSION: &str = "0.1.0";
+
+// The modelled enum values this pass can produce, named once so no rule below can
+// invent a value outside the enum: `RxNormEntityCategory`, `RxNormEntityType`,
+// `RxNormAttributeType` and `RxNormTraitName` (see `super::types::RX_NORM_*_VALUES`,
+// generated from the model).
+const CATEGORY_MEDICATION: &str = "MEDICATION";
+const TYPE_BRAND_NAME: &str = "BRAND_NAME";
+const TYPE_GENERIC_NAME: &str = "GENERIC_NAME";
+const TRAIT_PAST_HISTORY: &str = "PAST_HISTORY";
+const ATTRIBUTE_DOSAGE: &str = "DOSAGE";
+const ATTRIBUTE_DURATION: &str = "DURATION";
+const ATTRIBUTE_FORM: &str = "FORM";
+const ATTRIBUTE_FREQUENCY: &str = "FREQUENCY";
+const ATTRIBUTE_RATE: &str = "RATE";
+const ATTRIBUTE_ROUTE_OR_MODE: &str = "ROUTE_OR_MODE";
+const ATTRIBUTE_STRENGTH: &str = "STRENGTH";
+
+/// How low the confidence that an attribute belongs to its medication can fall.
+///
+/// A prescription is written in the same clause as the medication it is for, and this
+/// pass reports an attribute only on the mention of its own clause, so a part of the
+/// prescription standing far from the name is still part of it: the relationship
+/// confidence falls off with the distance and stops falling here rather than reaching
+/// zero, which would report a relationship the pass does not believe in at all.
+const RELATIONSHIP_SCORE_FLOOR: f32 = 0.10;
+
+/// One lexicon entry: a written form of a medication, whether that form is the brand or
+/// the generic name, and the RxNorm concepts a mention of it could refer to.
+///
+/// `term` is the written form already normalized the way the shared tokenizer normalizes
+/// the submitted text — lowercase tokens separated by single spaces — so a mention
+/// written with different case, spacing or hyphenation still matches it.
+///
+/// Each concept is a pair of the RxNorm concept unique identifier (RxCUI) and the name
+/// RxNorm gives that concept, which is what the modelled `RxNormConcept$Code` and
+/// `RxNormConcept$Description` report. Source: the ingredient and brand-name concepts of
+/// the RxNorm release published by the US National Library of Medicine. The list is
+/// ordered most-likely-first: the concept the written form names, then the concepts the
+/// same mention could be refined to (a brand name names its brand concept, then the
+/// ingredient the brand delivers).
+#[derive(Debug)]
+struct Medication {
+    term: &'static str,
+    entity_type: &'static str,
+    concepts: &'static [(&'static str, &'static str)],
+}
+
+const MEDICATIONS: &[Medication] = &[
+    // Analgesics and anti-inflammatories.
+    Medication { term: "acetaminophen", entity_type: TYPE_GENERIC_NAME, concepts: &[("161", "acetaminophen")] },
+    Medication { term: "paracetamol", entity_type: TYPE_GENERIC_NAME, concepts: &[("161", "acetaminophen")] },
+    Medication { term: "ibuprofen", entity_type: TYPE_GENERIC_NAME, concepts: &[("5640", "ibuprofen")] },
+    Medication { term: "naproxen", entity_type: TYPE_GENERIC_NAME, concepts: &[("7258", "naproxen")] },
+    Medication { term: "aspirin", entity_type: TYPE_GENERIC_NAME, concepts: &[("1191", "aspirin")] },
+    Medication { term: "asa", entity_type: TYPE_GENERIC_NAME, concepts: &[("1191", "aspirin")] },
+    Medication { term: "acetylsalicylic acid", entity_type: TYPE_GENERIC_NAME, concepts: &[("1191", "aspirin")] },
+    Medication { term: "morphine", entity_type: TYPE_GENERIC_NAME, concepts: &[("7052", "morphine")] },
+    Medication { term: "oxycodone", entity_type: TYPE_GENERIC_NAME, concepts: &[("7804", "oxycodone")] },
+    Medication { term: "hydrocodone", entity_type: TYPE_GENERIC_NAME, concepts: &[("5489", "hydrocodone")] },
+    Medication { term: "tramadol", entity_type: TYPE_GENERIC_NAME, concepts: &[("10689", "tramadol")] },
+    Medication { term: "fentanyl", entity_type: TYPE_GENERIC_NAME, concepts: &[("4337", "fentanyl")] },
+    Medication { term: "codeine", entity_type: TYPE_GENERIC_NAME, concepts: &[("2670", "codeine")] },
+    // Diabetes.
+    Medication { term: "metformin", entity_type: TYPE_GENERIC_NAME, concepts: &[("6809", "metformin")] },
+    Medication { term: "metformin hcl", entity_type: TYPE_GENERIC_NAME, concepts: &[("6809", "metformin")] },
+    Medication { term: "metformin hydrochloride", entity_type: TYPE_GENERIC_NAME, concepts: &[("6809", "metformin")] },
+    Medication { term: "insulin", entity_type: TYPE_GENERIC_NAME, concepts: &[("5856", "insulin")] },
+    Medication { term: "insulin glargine", entity_type: TYPE_GENERIC_NAME, concepts: &[("274783", "insulin glargine"), ("5856", "insulin")] },
+    Medication { term: "insulin lispro", entity_type: TYPE_GENERIC_NAME, concepts: &[("86009", "insulin lispro"), ("5856", "insulin")] },
+    Medication { term: "glipizide", entity_type: TYPE_GENERIC_NAME, concepts: &[("4821", "glipizide")] },
+    Medication { term: "glyburide", entity_type: TYPE_GENERIC_NAME, concepts: &[("4815", "glyburide")] },
+    Medication { term: "sitagliptin", entity_type: TYPE_GENERIC_NAME, concepts: &[("593411", "sitagliptin")] },
+    Medication { term: "semaglutide", entity_type: TYPE_GENERIC_NAME, concepts: &[("1991302", "semaglutide")] },
+    Medication { term: "empagliflozin", entity_type: TYPE_GENERIC_NAME, concepts: &[("1545653", "empagliflozin")] },
+    Medication { term: "pioglitazone", entity_type: TYPE_GENERIC_NAME, concepts: &[("33738", "pioglitazone")] },
+    // Cardiovascular.
+    Medication { term: "lisinopril", entity_type: TYPE_GENERIC_NAME, concepts: &[("29046", "lisinopril")] },
+    Medication { term: "ramipril", entity_type: TYPE_GENERIC_NAME, concepts: &[("35296", "ramipril")] },
+    Medication { term: "losartan", entity_type: TYPE_GENERIC_NAME, concepts: &[("52175", "losartan")] },
+    Medication { term: "valsartan", entity_type: TYPE_GENERIC_NAME, concepts: &[("69749", "valsartan")] },
+    Medication { term: "amlodipine", entity_type: TYPE_GENERIC_NAME, concepts: &[("17767", "amlodipine")] },
+    Medication { term: "diltiazem", entity_type: TYPE_GENERIC_NAME, concepts: &[("3443", "diltiazem")] },
+    Medication { term: "verapamil", entity_type: TYPE_GENERIC_NAME, concepts: &[("11170", "verapamil")] },
+    Medication { term: "atenolol", entity_type: TYPE_GENERIC_NAME, concepts: &[("1202", "atenolol")] },
+    Medication { term: "metoprolol", entity_type: TYPE_GENERIC_NAME, concepts: &[("6918", "metoprolol")] },
+    Medication { term: "metoprolol tartrate", entity_type: TYPE_GENERIC_NAME, concepts: &[("6918", "metoprolol")] },
+    Medication { term: "metoprolol succinate", entity_type: TYPE_GENERIC_NAME, concepts: &[("6918", "metoprolol")] },
+    Medication { term: "carvedilol", entity_type: TYPE_GENERIC_NAME, concepts: &[("20352", "carvedilol")] },
+    Medication { term: "hydralazine", entity_type: TYPE_GENERIC_NAME, concepts: &[("5470", "hydralazine")] },
+    Medication { term: "clonidine", entity_type: TYPE_GENERIC_NAME, concepts: &[("2599", "clonidine")] },
+    Medication { term: "digoxin", entity_type: TYPE_GENERIC_NAME, concepts: &[("3407", "digoxin")] },
+    Medication { term: "hydrochlorothiazide", entity_type: TYPE_GENERIC_NAME, concepts: &[("5487", "hydrochlorothiazide")] },
+    Medication { term: "hctz", entity_type: TYPE_GENERIC_NAME, concepts: &[("5487", "hydrochlorothiazide")] },
+    Medication { term: "furosemide", entity_type: TYPE_GENERIC_NAME, concepts: &[("4603", "furosemide")] },
+    Medication { term: "spironolactone", entity_type: TYPE_GENERIC_NAME, concepts: &[("9997", "spironolactone")] },
+    Medication { term: "atorvastatin", entity_type: TYPE_GENERIC_NAME, concepts: &[("83367", "atorvastatin")] },
+    Medication { term: "simvastatin", entity_type: TYPE_GENERIC_NAME, concepts: &[("36567", "simvastatin")] },
+    Medication { term: "rosuvastatin", entity_type: TYPE_GENERIC_NAME, concepts: &[("301542", "rosuvastatin")] },
+    Medication { term: "warfarin", entity_type: TYPE_GENERIC_NAME, concepts: &[("11289", "warfarin")] },
+    Medication { term: "clopidogrel", entity_type: TYPE_GENERIC_NAME, concepts: &[("32968", "clopidogrel")] },
+    Medication { term: "apixaban", entity_type: TYPE_GENERIC_NAME, concepts: &[("1364430", "apixaban")] },
+    Medication { term: "rivaroxaban", entity_type: TYPE_GENERIC_NAME, concepts: &[("1114195", "rivaroxaban")] },
+    Medication { term: "heparin", entity_type: TYPE_GENERIC_NAME, concepts: &[("5224", "heparin")] },
+    Medication { term: "enoxaparin", entity_type: TYPE_GENERIC_NAME, concepts: &[("67108", "enoxaparin")] },
+    // Respiratory and allergy.
+    Medication { term: "albuterol", entity_type: TYPE_GENERIC_NAME, concepts: &[("435", "albuterol")] },
+    Medication { term: "salbutamol", entity_type: TYPE_GENERIC_NAME, concepts: &[("435", "albuterol")] },
+    Medication { term: "montelukast", entity_type: TYPE_GENERIC_NAME, concepts: &[("88249", "montelukast")] },
+    Medication { term: "fluticasone", entity_type: TYPE_GENERIC_NAME, concepts: &[("41126", "fluticasone")] },
+    Medication { term: "cetirizine", entity_type: TYPE_GENERIC_NAME, concepts: &[("20610", "cetirizine")] },
+    Medication { term: "loratadine", entity_type: TYPE_GENERIC_NAME, concepts: &[("28889", "loratadine")] },
+    Medication { term: "diphenhydramine", entity_type: TYPE_GENERIC_NAME, concepts: &[("3498", "diphenhydramine")] },
+    Medication { term: "prednisone", entity_type: TYPE_GENERIC_NAME, concepts: &[("8640", "prednisone")] },
+    Medication { term: "prednisolone", entity_type: TYPE_GENERIC_NAME, concepts: &[("8638", "prednisolone")] },
+    // Anti-infectives.
+    Medication { term: "amoxicillin", entity_type: TYPE_GENERIC_NAME, concepts: &[("723", "amoxicillin")] },
+    Medication { term: "azithromycin", entity_type: TYPE_GENERIC_NAME, concepts: &[("18631", "azithromycin")] },
+    Medication { term: "clarithromycin", entity_type: TYPE_GENERIC_NAME, concepts: &[("21212", "clarithromycin")] },
+    Medication { term: "ciprofloxacin", entity_type: TYPE_GENERIC_NAME, concepts: &[("2551", "ciprofloxacin")] },
+    Medication { term: "levofloxacin", entity_type: TYPE_GENERIC_NAME, concepts: &[("82122", "levofloxacin")] },
+    Medication { term: "doxycycline", entity_type: TYPE_GENERIC_NAME, concepts: &[("3640", "doxycycline")] },
+    Medication { term: "cephalexin", entity_type: TYPE_GENERIC_NAME, concepts: &[("2231", "cephalexin")] },
+    Medication { term: "ceftriaxone", entity_type: TYPE_GENERIC_NAME, concepts: &[("2193", "ceftriaxone")] },
+    Medication { term: "metronidazole", entity_type: TYPE_GENERIC_NAME, concepts: &[("6922", "metronidazole")] },
+    Medication { term: "vancomycin", entity_type: TYPE_GENERIC_NAME, concepts: &[("11124", "vancomycin")] },
+    // Gastrointestinal.
+    Medication { term: "omeprazole", entity_type: TYPE_GENERIC_NAME, concepts: &[("7646", "omeprazole")] },
+    Medication { term: "pantoprazole", entity_type: TYPE_GENERIC_NAME, concepts: &[("40790", "pantoprazole")] },
+    Medication { term: "famotidine", entity_type: TYPE_GENERIC_NAME, concepts: &[("4278", "famotidine")] },
+    Medication { term: "ranitidine", entity_type: TYPE_GENERIC_NAME, concepts: &[("9143", "ranitidine")] },
+    Medication { term: "ondansetron", entity_type: TYPE_GENERIC_NAME, concepts: &[("26225", "ondansetron")] },
+    // Endocrine and metabolic.
+    Medication { term: "levothyroxine", entity_type: TYPE_GENERIC_NAME, concepts: &[("10582", "levothyroxine")] },
+    Medication { term: "allopurinol", entity_type: TYPE_GENERIC_NAME, concepts: &[("519", "allopurinol")] },
+    Medication { term: "potassium chloride", entity_type: TYPE_GENERIC_NAME, concepts: &[("8591", "potassium chloride")] },
+    Medication { term: "folic acid", entity_type: TYPE_GENERIC_NAME, concepts: &[("4511", "folic acid")] },
+    // Neurology and psychiatry.
+    Medication { term: "gabapentin", entity_type: TYPE_GENERIC_NAME, concepts: &[("25480", "gabapentin")] },
+    Medication { term: "pregabalin", entity_type: TYPE_GENERIC_NAME, concepts: &[("187832", "pregabalin")] },
+    Medication { term: "duloxetine", entity_type: TYPE_GENERIC_NAME, concepts: &[("72625", "duloxetine")] },
+    Medication { term: "sertraline", entity_type: TYPE_GENERIC_NAME, concepts: &[("36437", "sertraline")] },
+    Medication { term: "fluoxetine", entity_type: TYPE_GENERIC_NAME, concepts: &[("4493", "fluoxetine")] },
+    Medication { term: "citalopram", entity_type: TYPE_GENERIC_NAME, concepts: &[("2556", "citalopram")] },
+    Medication { term: "escitalopram", entity_type: TYPE_GENERIC_NAME, concepts: &[("321988", "escitalopram")] },
+    Medication { term: "trazodone", entity_type: TYPE_GENERIC_NAME, concepts: &[("10737", "trazodone")] },
+    Medication { term: "amitriptyline", entity_type: TYPE_GENERIC_NAME, concepts: &[("704", "amitriptyline")] },
+    Medication { term: "alprazolam", entity_type: TYPE_GENERIC_NAME, concepts: &[("596", "alprazolam")] },
+    Medication { term: "lorazepam", entity_type: TYPE_GENERIC_NAME, concepts: &[("6470", "lorazepam")] },
+    Medication { term: "diazepam", entity_type: TYPE_GENERIC_NAME, concepts: &[("3322", "diazepam")] },
+    Medication { term: "zolpidem", entity_type: TYPE_GENERIC_NAME, concepts: &[("39786", "zolpidem")] },
+    Medication { term: "levetiracetam", entity_type: TYPE_GENERIC_NAME, concepts: &[("114477", "levetiracetam")] },
+    Medication { term: "lamotrigine", entity_type: TYPE_GENERIC_NAME, concepts: &[("28439", "lamotrigine")] },
+    Medication { term: "topiramate", entity_type: TYPE_GENERIC_NAME, concepts: &[("38404", "topiramate")] },
+    Medication { term: "phenytoin", entity_type: TYPE_GENERIC_NAME, concepts: &[("8183", "phenytoin")] },
+    // Genitourinary and immunology.
+    Medication { term: "tamsulosin", entity_type: TYPE_GENERIC_NAME, concepts: &[("77492", "tamsulosin")] },
+    Medication { term: "finasteride", entity_type: TYPE_GENERIC_NAME, concepts: &[("25025", "finasteride")] },
+    Medication { term: "sildenafil", entity_type: TYPE_GENERIC_NAME, concepts: &[("136411", "sildenafil")] },
+    Medication { term: "methotrexate", entity_type: TYPE_GENERIC_NAME, concepts: &[("6851", "methotrexate")] },
+    Medication { term: "hydroxychloroquine", entity_type: TYPE_GENERIC_NAME, concepts: &[("5521", "hydroxychloroquine")] },
+    // Brand names, each linked to its own brand concept and then to the ingredient it
+    // delivers.
+    Medication { term: "tylenol", entity_type: TYPE_BRAND_NAME, concepts: &[("202433", "Tylenol"), ("161", "acetaminophen")] },
+    Medication { term: "advil", entity_type: TYPE_BRAND_NAME, concepts: &[("153010", "Advil"), ("5640", "ibuprofen")] },
+    Medication { term: "motrin", entity_type: TYPE_BRAND_NAME, concepts: &[("203167", "Motrin"), ("5640", "ibuprofen")] },
+    Medication { term: "glucophage", entity_type: TYPE_BRAND_NAME, concepts: &[("203584", "Glucophage"), ("6809", "metformin")] },
+    Medication { term: "lipitor", entity_type: TYPE_BRAND_NAME, concepts: &[("153165", "Lipitor"), ("83367", "atorvastatin")] },
+    Medication { term: "zocor", entity_type: TYPE_BRAND_NAME, concepts: &[("196503", "Zocor"), ("36567", "simvastatin")] },
+    Medication { term: "crestor", entity_type: TYPE_BRAND_NAME, concepts: &[("358793", "Crestor"), ("301542", "rosuvastatin")] },
+    Medication { term: "norvasc", entity_type: TYPE_BRAND_NAME, concepts: &[("202982", "Norvasc"), ("17767", "amlodipine")] },
+    Medication { term: "lasix", entity_type: TYPE_BRAND_NAME, concepts: &[("202991", "Lasix"), ("4603", "furosemide")] },
+    Medication { term: "synthroid", entity_type: TYPE_BRAND_NAME, concepts: &[("209223", "Synthroid"), ("10582", "levothyroxine")] },
+    Medication { term: "prilosec", entity_type: TYPE_BRAND_NAME, concepts: &[("203345", "Prilosec"), ("7646", "omeprazole")] },
+    Medication { term: "protonix", entity_type: TYPE_BRAND_NAME, concepts: &[("261624", "Protonix"), ("40790", "pantoprazole")] },
+    Medication { term: "coumadin", entity_type: TYPE_BRAND_NAME, concepts: &[("202421", "Coumadin"), ("11289", "warfarin")] },
+    Medication { term: "plavix", entity_type: TYPE_BRAND_NAME, concepts: &[("174742", "Plavix"), ("32968", "clopidogrel")] },
+    Medication { term: "eliquis", entity_type: TYPE_BRAND_NAME, concepts: &[("1364445", "Eliquis"), ("1364430", "apixaban")] },
+    Medication { term: "xarelto", entity_type: TYPE_BRAND_NAME, concepts: &[("1114198", "Xarelto"), ("1114195", "rivaroxaban")] },
+    Medication { term: "lantus", entity_type: TYPE_BRAND_NAME, concepts: &[("261551", "Lantus"), ("274783", "insulin glargine")] },
+    Medication { term: "humalog", entity_type: TYPE_BRAND_NAME, concepts: &[("242120", "Humalog"), ("86009", "insulin lispro")] },
+    Medication { term: "januvia", entity_type: TYPE_BRAND_NAME, concepts: &[("665032", "Januvia"), ("593411", "sitagliptin")] },
+    Medication { term: "ozempic", entity_type: TYPE_BRAND_NAME, concepts: &[("1991306", "Ozempic"), ("1991302", "semaglutide")] },
+    Medication { term: "ventolin", entity_type: TYPE_BRAND_NAME, concepts: &[("236719", "Ventolin"), ("435", "albuterol")] },
+    Medication { term: "singulair", entity_type: TYPE_BRAND_NAME, concepts: &[("203578", "Singulair"), ("88249", "montelukast")] },
+    Medication { term: "flonase", entity_type: TYPE_BRAND_NAME, concepts: &[("221148", "Flonase"), ("41126", "fluticasone")] },
+    Medication { term: "zithromax", entity_type: TYPE_BRAND_NAME, concepts: &[("203761", "Zithromax"), ("18631", "azithromycin")] },
+    Medication { term: "cipro", entity_type: TYPE_BRAND_NAME, concepts: &[("203563", "Cipro"), ("2551", "ciprofloxacin")] },
+    Medication { term: "zoloft", entity_type: TYPE_BRAND_NAME, concepts: &[("202363", "Zoloft"), ("36437", "sertraline")] },
+    Medication { term: "prozac", entity_type: TYPE_BRAND_NAME, concepts: &[("58827", "Prozac"), ("4493", "fluoxetine")] },
+];
+
+/// The units a medication's strength is measured in, as single alphanumeric runs: the
+/// tokenizer splits on everything else, so "mg/mL" arrives as "mg" and "ml" and the two
+/// runs of one written unit are re-joined by [`measured_amount`].
+///
+/// Source: the mass, volume and activity units a prescription states a medication's
+/// strength in, which is what the modelled `STRENGTH` attribute reports.
+const STRENGTH_UNITS: &[&str] = &[
+    "mg", "mgs", "milligram", "milligrams", "mcg", "microgram", "micrograms", "ug", "g", "gm",
+    "gram", "grams", "kg", "ng", "ml", "mls", "milliliter", "milliliters", "l", "liter", "liters",
+    "cc", "iu", "meq", "mmol", "mol", "percent",
+];
+
+/// The time units a prescription is written with, including the abbreviations a sig uses
+/// — which is why this vocabulary is this operation's own rather than the time-expression
+/// units of the shared pass. An amount measured PER one of these is the rate the
+/// medication is given at; a count OF one of them is how long it is given for.
+const SIG_TIME_UNITS: &[&str] = &[
+    "hour", "hours", "hr", "hrs", "h", "minute", "minutes", "min", "mins", "second", "seconds",
+    "sec", "day", "days", "d", "night", "nights", "week", "weeks", "wk", "wks", "month", "months",
+    "mo", "year", "years", "yr", "yrs",
+];
+
+/// The parts of a day a dosing interval can name ("every morning").
+const DAY_PARTS: &[&str] = &[
+    "morning", "afternoon", "evening", "night", "bedtime", "noon", "meal", "meals",
+];
+
+/// Words that introduce how long a medication is taken for ("for 10 days", "x 2 weeks").
+const DURATION_INTRODUCERS: &[&str] = &["for", "x", "over", "during"];
+
+/// The units a DOSE is counted in that are not themselves a form of the medication.
+const DOSE_COUNT_UNITS: &[&str] = &["unit", "units", "u", "puff", "puffs", "dose", "doses"];
+
+/// The forms a medication takes, which is what the modelled `FORM` attribute reports. A
+/// count of them is the amount ordered, which is what `DOSAGE` reports.
+///
+/// Source: the dose forms RxNorm names a clinical drug with (tablet, capsule, solution,
+/// cream, injection, …) as a patient record writes them.
+const DOSE_FORMS: &[&str] = &[
+    "tablet",
+    "tablets",
+    "tab",
+    "tabs",
+    "capsule",
+    "capsules",
+    "cap",
+    "caps",
+    "pill",
+    "pills",
+    "patch",
+    "patches",
+    "injection",
+    "injections",
+    "solution",
+    "suspension",
+    "syrup",
+    "elixir",
+    "cream",
+    "ointment",
+    "gel",
+    "lotion",
+    "powder",
+    "liquid",
+    "inhaler",
+    "nebulizer",
+    "suppository",
+    "suppositories",
+    "lozenge",
+    "lozenges",
+    "vial",
+    "vials",
+    "ampule",
+    "ampules",
+    "syringe",
+    "syringes",
+    "spray",
+    "sprays",
+    "drop",
+    "drops",
+];
+
+/// How often a medication is taken, which is what the modelled `FREQUENCY` attribute
+/// reports. Source: the frequency words and the Latin dosing abbreviations a prescription
+/// is written with ("bid", "tid", "qid", "qhs", "prn").
+const FREQUENCY_TERMS: &[&str] = &[
+    "daily",
+    "nightly",
+    "hourly",
+    "weekly",
+    "monthly",
+    "bid",
+    "tid",
+    "qid",
+    "qd",
+    "qod",
+    "qhs",
+    "qam",
+    "qpm",
+    "prn",
+    "hs",
+    "once daily",
+    "twice daily",
+    "two times daily",
+    "three times daily",
+    "four times daily",
+    "once a day",
+    "twice a day",
+    "three times a day",
+    "four times a day",
+    "once per day",
+    "twice per day",
+    "three times per day",
+    "per day",
+    "at bedtime",
+    "at night",
+    "in the morning",
+    "in the evening",
+    "each morning",
+    "each evening",
+    "each night",
+    "as needed",
+    "with meals",
+    "with food",
+    "before meals",
+    "after meals",
+    "at breakfast",
+    "at lunch",
+    "at dinner",
+    "on alternate days",
+];
+
+/// How the medication enters the body, which is what the modelled `ROUTE_OR_MODE`
+/// attribute reports. Source: the route words and the Latin route abbreviations a
+/// prescription is written with ("po", "iv", "im", "sl", "pr").
+const ROUTE_TERMS: &[&str] = &[
+    "po",
+    "by mouth",
+    "per os",
+    "oral",
+    "orally",
+    "iv",
+    "iv push",
+    "intravenous",
+    "intravenously",
+    "im",
+    "intramuscular",
+    "intramuscularly",
+    "sq",
+    "subq",
+    "sc",
+    "subcutaneous",
+    "subcutaneously",
+    "sl",
+    "sublingual",
+    "sublingually",
+    "pr",
+    "per rectum",
+    "rectal",
+    "rectally",
+    "topical",
+    "topically",
+    "inhaled",
+    "inhalation",
+    "by inhalation",
+    "nebulized",
+    "intranasal",
+    "nasal",
+    "nasally",
+    "transdermal",
+    "ophthalmic",
+    "otic",
+    "buccal",
+    "epidural",
+    "intrathecal",
+];
+
+/// One attribute of a medication mention: a stretch of the prescription written around
+/// it, and which modelled attribute type reports that stretch.
+#[derive(Debug)]
+struct Attribute {
+    span: Span,
+    attribute_type: &'static str,
+    /// Confidence that the stretch of text is what this attribute type reports.
+    score: f32,
+    /// Tokens between the attribute and the mention, which is what the relationship
+    /// confidence falls off with.
+    distance: usize,
+}
+
+/// One medication entity the pass placed: the stretch of text naming it, its lexicon
+/// entry, and the parts of the prescription read as belonging to it.
+#[derive(Debug)]
+struct Entity {
+    span: Span,
+    medication: &'static Medication,
+    attributes: Vec<Attribute>,
+}
+
+/// The medication lexicon, indexed by written form, with the longest form it holds.
+struct Lexicon {
+    terms: HashMap<&'static str, &'static Medication>,
+    max_tokens: usize,
+}
+
+/// The lexicon, built once per process rather than per request.
+fn lexicon() -> &'static Lexicon {
+    static LEXICON: OnceLock<Lexicon> = OnceLock::new();
+    LEXICON.get_or_init(|| {
+        let mut terms = HashMap::with_capacity(MEDICATIONS.len());
+        let mut max_tokens = 1;
+        for medication in MEDICATIONS {
+            max_tokens = max_tokens.max(medication.term.split(' ').count());
+            terms.insert(medication.term, medication);
+        }
+        Lexicon { terms, max_tokens }
+    })
+}
+
+/// The written forms of the sig vocabularies that no number places — a frequency, a
+/// route, a form — each mapped to the modelled attribute type that reports it.
+struct Vocabulary {
+    terms: HashMap<&'static str, &'static str>,
+    max_tokens: usize,
+}
+
+/// The sig vocabularies, built once per process rather than per request.
+fn vocabulary() -> &'static Vocabulary {
+    static VOCABULARY: OnceLock<Vocabulary> = OnceLock::new();
+    VOCABULARY.get_or_init(|| {
+        let mut terms = HashMap::new();
+        let mut max_tokens = 1;
+        for (table, attribute_type) in [
+            (FREQUENCY_TERMS, ATTRIBUTE_FREQUENCY),
+            (ROUTE_TERMS, ATTRIBUTE_ROUTE_OR_MODE),
+            (DOSE_FORMS, ATTRIBUTE_FORM),
+        ] {
+            for term in table {
+                max_tokens = max_tokens.max(term.split(' ').count());
+                terms.insert(*term, attribute_type);
+            }
+        }
+        Vocabulary { terms, max_tokens }
+    })
+}
+
+/// Whether the token at `index` is still available to a rule: inside the text, not
+/// already placed by another rule, and in the clause the rule is reading.
+fn open(tokens: &[Token], covered: &[bool], index: usize, clause: usize) -> bool {
+    index < tokens.len() && !covered[index] && tokens[index].clause == clause
+}
+
+/// A token written as a number joined to its unit in one run ("500mg"), split into the
+/// number and the unit. `None` when the token is not written that way.
+fn split_number_unit(word: &str) -> Option<(&str, &str)> {
+    let split = word.find(|character: char| character.is_ascii_alphabetic())?;
+    if split == 0 {
+        return None;
+    }
+    let (number, unit) = word.split_at(split);
+    let numeric = number.chars().any(|character| character.is_ascii_digit())
+        && number
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '.');
+    let alphabetic = unit.chars().all(|character| character.is_ascii_alphabetic());
+    (numeric && alphabetic).then_some((number, unit))
+}
+
+/// Whether a word names a unit a sig measures something in: a strength unit, a unit a
+/// dose is counted in, or a time unit — any of which can stand on either side of a
+/// per-unit chain ("mg/mL", "units/hr", "mcg/kg/min").
+fn is_sig_unit(word: &str) -> bool {
+    STRENGTH_UNITS.contains(&word)
+        || DOSE_COUNT_UNITS.contains(&word)
+        || SIG_TIME_UNITS.contains(&word)
+}
+
+/// The measured amount written at `index` — a number and the unit it is measured in,
+/// including a per-unit chain ("10 mg/mL", "100 mL/hr", "5 mcg/kg/min") — and which
+/// modelled attribute type reports it.
+///
+/// An amount measured per unit of TIME is how fast the medication is given, which is what
+/// `RATE` reports; any other measured amount is the medication's own strength. A count of
+/// the units a dose is counted in is neither — it is the amount taken at once, which
+/// [`dose`] reports — so this rule answers `None` for it unless a time unit makes it a
+/// rate ("20 units" against "1000 units/hr").
+fn measured_amount(
+    text: &str,
+    tokens: &[Token],
+    covered: &[bool],
+    index: usize,
+) -> Option<(Range<usize>, &'static str)> {
+    let clause = tokens[index].clause;
+    let (mut end, first_unit) = match split_number_unit(tokens[index].lower.as_str()) {
+        // "500mg": the number and its unit written as one run.
+        Some((_, unit)) if is_sig_unit(unit) => (index + 1, unit),
+        Some(_) => return None,
+        None => {
+            if !is_count(&tokens[index]) || !open(tokens, covered, index + 1, clause) {
+                return None;
+            }
+            let unit = tokens[index + 1].lower.as_str();
+            if !is_sig_unit(unit) {
+                return None;
+            }
+            (index + 2, unit)
+        }
+    };
+    let mut unit = first_unit;
+    loop {
+        // "mg/mL": a single separator in the text joins two runs of one written unit.
+        if open(tokens, covered, end, clause)
+            && matches!(&text[tokens[end - 1].end..tokens[end].start], "/" | "-")
+            && is_sig_unit(tokens[end].lower.as_str())
+        {
+            unit = tokens[end].lower.as_str();
+            end += 1;
+            continue;
+        }
+        // "100 mL per hour": the same per-unit chain written out in words.
+        if open(tokens, covered, end, clause)
+            && tokens[end].lower == "per"
+            && open(tokens, covered, end + 1, clause)
+            && is_sig_unit(tokens[end + 1].lower.as_str())
+        {
+            unit = tokens[end + 1].lower.as_str();
+            end += 2;
+            continue;
+        }
+        break;
+    }
+    if SIG_TIME_UNITS.contains(&unit) {
+        return Some((index..end, ATTRIBUTE_RATE));
+    }
+    STRENGTH_UNITS
+        .contains(&first_unit)
+        .then_some((index..end, ATTRIBUTE_STRENGTH))
+}
+
+/// How long the medication is taken, written at `index`: a count of a time unit, with or
+/// without the word a sig introduces it by ("for 10 days", "x 2 weeks", "3 days").
+fn duration(tokens: &[Token], covered: &[bool], index: usize) -> Option<Range<usize>> {
+    let clause = tokens[index].clause;
+    let count = if DURATION_INTRODUCERS.contains(&tokens[index].lower.as_str()) {
+        if !open(tokens, covered, index + 1, clause) {
+            return None;
+        }
+        index + 1
+    } else {
+        index
+    };
+    if !is_count(&tokens[count]) {
+        return None;
+    }
+    let unit = count + 1;
+    (open(tokens, covered, unit, clause) && SIG_TIME_UNITS.contains(&tokens[unit].lower.as_str()))
+        .then(|| index..unit + 1)
+}
+
+/// Whether a token is a prescription's abbreviated dosing interval: `q` followed by the
+/// number of hours and `h` ("q8h", "q12h").
+fn abbreviated_interval(word: &str) -> bool {
+    word.strip_prefix('q')
+        .and_then(|rest| rest.strip_suffix('h'))
+        .is_some_and(|hours| {
+            !hours.is_empty() && hours.chars().all(|character| character.is_ascii_digit())
+        })
+}
+
+/// The dosing interval written at `index`: "every 8 hours", "every other day", "every
+/// morning", or the abbreviated form a prescription writes it in ("q8h").
+fn interval(tokens: &[Token], covered: &[bool], index: usize) -> Option<Range<usize>> {
+    let clause = tokens[index].clause;
+    if abbreviated_interval(tokens[index].lower.as_str()) {
+        return Some(index..index + 1);
+    }
+    if tokens[index].lower != "every" || !open(tokens, covered, index + 1, clause) {
+        return None;
+    }
+    let next = tokens[index + 1].lower.as_str();
+    let third_is_time = open(tokens, covered, index + 2, clause)
+        && SIG_TIME_UNITS.contains(&tokens[index + 2].lower.as_str());
+    // "every other day", "every 8 hours".
+    if third_is_time && (next == "other" || is_count(&tokens[index + 1])) {
+        return Some(index..index + 3);
+    }
+    // "every day", "every morning".
+    (SIG_TIME_UNITS.contains(&next) || DAY_PARTS.contains(&next)).then(|| index..index + 2)
+}
+
+/// The amount taken at once, written at `index`: a count of dose forms ("1 tablet", "two
+/// puffs") or of the units a dose is counted in ("20 units").
+fn dose(tokens: &[Token], covered: &[bool], index: usize) -> Option<Range<usize>> {
+    let clause = tokens[index].clause;
+    if !is_count(&tokens[index]) || !open(tokens, covered, index + 1, clause) {
+        return None;
+    }
+    let next = tokens[index + 1].lower.as_str();
+    (DOSE_FORMS.contains(&next) || DOSE_COUNT_UNITS.contains(&next)).then(|| index..index + 2)
+}
+
+/// Every part of a prescription a NUMBER or a closed form places, left to right: how long
+/// it is taken for, how often, how much at once, and the amount it is measured in.
+///
+/// The tokens of a match are marked covered, so the vocabulary pass never reads one of
+/// them again, and the rules are tried most-specific-first at each token: a count of a
+/// time unit is a duration rather than a strength, and the count of an interval belongs to
+/// the interval rather than to a duration of its own.
+fn measured_patterns(
+    text: &str,
+    tokens: &[Token],
+    covered: &mut [bool],
+) -> Vec<(Span, &'static str, f32)> {
+    let mut placed = Vec::new();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        if covered[index] {
+            index += 1;
+            continue;
+        }
+        let found = duration(tokens, covered, index)
+            .map(|range| (range, ATTRIBUTE_DURATION))
+            .or_else(|| interval(tokens, covered, index).map(|range| (range, ATTRIBUTE_FREQUENCY)))
+            .or_else(|| measured_amount(text, tokens, covered, index))
+            .or_else(|| dose(tokens, covered, index).map(|range| (range, ATTRIBUTE_DOSAGE)));
+        match found {
+            Some((range, attribute_type)) => {
+                for taken in &mut covered[range.clone()] {
+                    *taken = true;
+                }
+                index = range.end;
+                placed.push((Span::of(tokens, range), attribute_type, WEIGHT_PATTERN));
+            }
+            None => index += 1,
+        }
+    }
+    placed
+}
+
+/// Every sig vocabulary match in the tokens nothing else has placed — a frequency, a
+/// route or a dose form — with the modelled attribute type that reports it.
+fn vocabulary_matches(tokens: &[Token], covered: &mut [bool]) -> Vec<(Span, &'static str, f32)> {
+    let vocabulary = vocabulary();
+    lexicon_matches(tokens, covered, vocabulary.max_tokens, |phrase| {
+        vocabulary.terms.contains_key(phrase)
+    })
+    .into_iter()
+    .filter_map(|(span, phrase)| {
+        vocabulary
+            .terms
+            .get(phrase.as_str())
+            .map(|attribute_type| (span, *attribute_type, WEIGHT_MODIFIER))
+    })
+    .collect()
+}
+
+/// The medication mention of `span`'s own clause that a part of a prescription belongs
+/// to, or `None` when its clause names no medication.
+///
+/// A prescription is written AFTER the medication it is for, so a part belongs to the
+/// nearest medication named before it in its clause, and to the nearest one named after
+/// it only when none precedes it ("1 tablet of Tylenol", where the dose is written in
+/// front of the name).
+fn nearest_mention(tokens: &[Token], entities: &[Entity], span: &Span) -> Option<usize> {
+    let in_clause = |entity: &&Entity| {
+        tokens[entity.span.tokens.start].clause == tokens[span.tokens.start].clause
+    };
+    let nearest = |preceding: bool| {
+        entities
+            .iter()
+            .enumerate()
+            .filter(|(_, entity)| in_clause(entity))
+            .filter(|(_, entity)| (entity.span.tokens.end <= span.tokens.start) == preceding)
+            .map(|(index, entity)| (token_distance(&entity.span, span), index))
+            .min()
+            .map(|(_, index)| index)
+    };
+    nearest(true).or_else(|| nearest(false))
+}
+
+/// The traits the words around `span` license, as the modelled RxNorm trait shape.
+///
+/// The shared context cues answer with the trait names of the clinical-text pass as a
+/// whole, of which this ontology's `RxNormTraitName` enum holds only `NEGATION`: a
+/// medication a relative takes, or one named as a hypothetical, is not a trait this
+/// operation reports, so a name outside the enum is dropped rather than invented. A
+/// medication named as something the patient used to take carries `PAST_HISTORY`.
+fn span_traits(
+    tokens: &[Token],
+    span: &Span,
+    family_cues: &HashMap<usize, usize>,
+) -> Vec<RxNormTrait> {
+    let mut names: Vec<&'static str> = cue_trait_names(tokens, span, family_cues)
+        .into_iter()
+        .filter(|name| RX_NORM_TRAIT_NAME_VALUES.contains(name))
+        .collect();
+    if cue_precedes(tokens, span, PAST_HISTORY_CUES) {
+        names.push(TRAIT_PAST_HISTORY);
+    }
+    names
+        .into_iter()
+        .map(|name| RxNormTrait {
+            name: Some(name.to_string()),
+            score: Some(WEIGHT_CUE),
+        })
+        .collect()
+}
+
+/// The RxNorm concepts a lexicon entry is linked to, most likely first.
+///
+/// The candidates of one entry are ordered most-likely-first, and the modelled
+/// `RxNormConcept$Score` reports the likelihood of the match, so each successive candidate
+/// reports a fixed share of the one in front of it and the list is strictly descending.
+fn concepts(entry: &'static [(&'static str, &'static str)], score: f32) -> Vec<RxNormConcept> {
+    entry
+        .iter()
+        .take(CONCEPT_CANDIDATE_LIMIT)
+        .enumerate()
+        .map(|(rank, (code, description))| RxNormConcept {
+            code: Some((*code).to_string()),
+            description: Some((*description).to_string()),
+            score: Some(score * CONCEPT_RANK_DECAY.powi(i32::try_from(rank).unwrap_or(i32::MAX))),
+        })
+        .collect()
+}
+
+/// The RxNorm entities the submitted text carries.
+///
+/// The answer is a function of `text` alone: every mention is placed from the text's own
+/// characters, so the same text always yields the same entities and no value from any
+/// other request can appear. `BeginOffset`/`EndOffset` are 0-based CHARACTER offsets, as
+/// the modelled members document, so an entity's `Text` is exactly the characters they
+/// delimit.
+pub fn infer_rx_norm(text: &str) -> Vec<RxNormEntity> {
+    let tokens = tokenize(text);
+    let mut covered = vec![false; tokens.len()];
+    let family_cues = first_family_cues(&tokens);
+    let lexicon = lexicon();
+
+    // Every medication mention, in document order. The matcher marks the tokens it
+    // placed, so a mention never overlaps another and no sig rule below re-reads one.
+    let mut entities: Vec<Entity> =
+        lexicon_matches(&tokens, &mut covered, lexicon.max_tokens, |phrase| {
+            lexicon.terms.contains_key(phrase)
+        })
+        .into_iter()
+        .filter_map(|(span, phrase)| {
+            lexicon
+                .terms
+                .get(phrase.as_str())
+                .map(|medication| Entity {
+                    span,
+                    medication,
+                    attributes: Vec::new(),
+                })
+        })
+        .collect();
+
+    // An attribute is reported on the medication it belongs to and nowhere else, so a
+    // text naming no medication reports nothing at all.
+    if entities.is_empty() {
+        return Vec::new();
+    }
+
+    // The parts of a prescription, placed from the text and attached to the medication
+    // each one belongs to. A part written in a clause that names no medication belongs to
+    // no mention and is not reported.
+    let mut parts = measured_patterns(text, &tokens, &mut covered);
+    parts.extend(vocabulary_matches(&tokens, &mut covered));
+    parts.sort_by_key(|(span, _, _)| span.start);
+    for (span, attribute_type, score) in parts {
+        if let Some(owner) = nearest_mention(&tokens, &entities, &span) {
+            let distance = token_distance(&entities[owner].span, &span);
+            entities[owner].attributes.push(Attribute {
+                span,
+                attribute_type,
+                score,
+                distance,
+            });
+        }
+    }
+
+    // Character offsets, as both modelled offset members document, from the byte offsets
+    // the pass works in.
+    let starts = character_starts(text);
+
+    // `Id` is a monotonically increasing id unique within this response: every entity and
+    // every attribute takes the next one, in the order they are written.
+    let next_id = std::cell::Cell::new(0i32);
+    let mint_id = || {
+        let id = next_id.get();
+        next_id.set(id + 1);
+        id
+    };
+    let mut reported = Vec::with_capacity(entities.len());
+    for entity in entities {
+        let score = term_confidence(entity.medication.term.split(' ').count());
+        let id = mint_id();
+        let traits = span_traits(&tokens, &entity.span, &family_cues);
+        let mut attributes = entity.attributes;
+        attributes.sort_by_key(|attribute| attribute.span.start);
+        let attributes = attributes
+            .into_iter()
+            .map(|attribute| {
+                let attribute_id = mint_id();
+                let relationship_score = (WEIGHT_RELATIONSHIP
+                    - RELATIONSHIP_DISTANCE_PENALTY * attribute.distance as f32)
+                    .clamp(RELATIONSHIP_SCORE_FLOOR, WEIGHT_RELATIONSHIP);
+                RxNormAttribute {
+                    r#type: Some(attribute.attribute_type.to_string()),
+                    score: Some(attribute.score),
+                    relationship_score: Some(relationship_score),
+                    id: Some(attribute_id),
+                    begin_offset: Some(character_offset(&starts, attribute.span.start)),
+                    end_offset: Some(character_offset(&starts, attribute.span.end)),
+                    text: Some(text[attribute.span.start..attribute.span.end].to_string()),
+                    traits: Some(span_traits(&tokens, &attribute.span, &family_cues)),
+                }
+            })
+            .collect();
+        reported.push(RxNormEntity {
+            id: Some(id),
+            text: Some(text[entity.span.start..entity.span.end].to_string()),
+            category: Some(CATEGORY_MEDICATION.to_string()),
+            r#type: Some(entity.medication.entity_type.to_string()),
+            score: Some(score),
+            begin_offset: Some(character_offset(&starts, entity.span.start)),
+            end_offset: Some(character_offset(&starts, entity.span.end)),
+            attributes: Some(attributes),
+            traits: Some(traits),
+            rx_norm_concepts: Some(concepts(entity.medication.concepts, score)),
+        });
+    }
+    reported
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -164,18 +1021,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `InferRxNorm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(InferRxNormErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("InferRxNorm"))
+        // Ontology linking holds NO state: the answer is a function of the submitted
+        // text alone, so repeating the call returns the same entities and nothing a
+        // later caller reads is changed by calling it.
+        let _ = (ctx, &self.engine);
+
+        // `Text` carries the modelled 1..10000 length, which the boundary validator
+        // enforces before this handler runs — reaching here means the text is present,
+        // non-empty and within the size limit — and it arrives as a Rust `String`, so
+        // it is valid UTF-8 and the modelled `InvalidEncodingException` is unreachable.
+        let entities = infer_rx_norm(input.text.as_str());
+
+        Ok(InferRxNormOutput {
+            entities,
+            // Every entity of the submitted text is in this one response: nothing was
+            // truncated, so there is no page for the caller to resume from.
+            pagination_token: None,
+            model_version: Some(MODEL_VERSION.to_string()),
+        })
     }
 }

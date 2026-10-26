@@ -6491,6 +6491,18 @@ pub mod input_authentication_type {
 /// operation has to write it into existence.
 pub const DEFAULT_USER_ID: &str = "default";
 
+/// How ElastiCache words a `DefaultUserRequired` refusal — "You must add default
+/// user to a user group."
+///
+/// One sentence for the whole error class, shared by every call that would leave
+/// a user group without the built-in user ([`DEFAULT_USER_ID`]): it carries no
+/// request-supplied value and no stored one, so there is nothing to interpolate
+/// and no caller-visible wording to diverge between handlers. The HTTP status
+/// (400) and the awsQuery code (`DefaultUserRequired`) are the modelled part of
+/// the contract; this is the wording AWS was recorded answering with.
+pub const DEFAULT_USER_REQUIRED_MESSAGE: &str =
+    "Redis user group needs to contain a user with the user name default.";
+
 /// The access string that built-in user carries: every key (`~*`), every pub/sub
 /// channel (`&*`) and every command (`+@all`), in the Valkey / Redis OSS ACL
 /// syntax `User$AccessString` is written in.

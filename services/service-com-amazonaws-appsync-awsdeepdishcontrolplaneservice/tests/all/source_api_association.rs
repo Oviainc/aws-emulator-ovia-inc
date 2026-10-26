@@ -396,12 +396,12 @@ async fn an_association_is_persisted_as_the_request_configured_it() {
             again.error_type,
             again.body
         );
-        // The model states this error's own text, so it is the text the refusal
-        // carries — request-independent, naming nothing of the call that met it.
+        // The conflict is scoped to the Merged API whose associations are being
+        // updated, so the refusal names it.
         assert_eq!(
             again.body["message"].as_str(),
-            Some(state::CONCURRENT_MODIFICATION_MESSAGE),
-            "case {:?}: expected the modelled concurrent-modification text, got {:?}",
+            Some(state::associations_being_updated_message(&merged.id).as_str()),
+            "case {:?}: expected the association-scoped concurrent-modification text, got {:?}",
             case.label,
             again.body["message"]
         );
@@ -538,8 +538,8 @@ async fn racing_callers_leave_exactly_one_association() {
         );
         assert_eq!(
             loser.body["message"].as_str(),
-            Some(state::CONCURRENT_MODIFICATION_MESSAGE),
-            "case race: expected the modelled concurrent-modification text, got {:?}",
+            Some(state::associations_being_updated_message(&merged.id).as_str()),
+            "case race: expected the association-scoped concurrent-modification text, got {:?}",
             loser.body["message"]
         );
     }

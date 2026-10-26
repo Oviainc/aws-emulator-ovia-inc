@@ -253,18 +253,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // One update at a time per cluster: while another is running the cluster is
-        // in use, which is exactly what `ResourceInUseException` reports.
+        // in use, which is exactly what `ResourceInUseException` reports, worded by
+        // [`crate::state::update_in_progress`] for the update type this call would
+        // have minted.
         if let Some(in_flight) = cluster.in_flight_update() {
             return Err(
                 CreateCertificateAuthorityErrorModeled::ResourceInUseException(
-                    ResourceInUseException {
-                        cluster_name: Some(cluster_name.clone()),
-                        message: Some(format!(
-                            "Cluster {cluster_name} already has update {} in progress",
-                            in_flight.id
-                        )),
-                        ..Default::default()
-                    },
+                    crate::state::update_in_progress(
+                        state::UPDATE_TYPE_CERTIFICATE_AUTHORITY,
+                        &cluster_name,
+                        in_flight,
+                    ),
                 )
                 .into(),
             );

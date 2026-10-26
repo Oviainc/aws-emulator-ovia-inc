@@ -13,7 +13,11 @@
 //! `areAllComponentsReturned` / `areAllPropertiesReturned` reporting whether it
 //! had to be. A component's `compositeComponents` are the composite components
 //! stored inside it, keyed by their own name and each carrying the
-//! `componentPath` its create addressed it by.
+//! `componentPath` its create addressed it by. A component's SCHEMA is resolved
+//! against the component type it instantiates: every property and property
+//! group that type (or a type it extends) defines is reported on the component,
+//! marked `isInherited` unless the entity declared it inline, and `definedIn`
+//! names the component type the inherited definition set came from.
 //! The `status.error` structure and the `description` string are
 //! reported PRESENT-but-empty for an entity that carries no error and no
 //! description, rather than omitted. An unknown workspace or entity is a
@@ -238,7 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // empty string when its create named none), so the member is
             // reported on every read.
             description: Some(entity.description.clone()),
-            components: Some(components_response(entity, &status)),
+            components: Some(components_response(workspace, entity, &status)),
             parent_entity_id: entity.parent_entity_id.clone(),
             has_child_entities: workspace.has_child_entities(&entity.entity_id),
             creation_date_time: crate::state::timestamp(entity.creation_date_time),
@@ -263,8 +267,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// components a truncated response carries is deterministic.
 ///
 /// A component has no lifecycle of its own in this slice, so it reports the
-/// entity's own status.
+/// entity's own status. Its SCHEMA, by contrast, is not the entity's alone:
+/// naming a `componentTypeId` is what gives a component that type's properties
+/// and property groups, so each one is resolved against `workspace` — the
+/// component's own declaration where it has one, else the inherited one — and
+/// reported with the flags that say so.
 fn components_response(
+    workspace: &crate::state::Workspace,
     entity: &crate::state::Entity,
     status: &Status,
 ) -> ::std::collections::HashMap<String, ComponentResponse> {
@@ -288,49 +297,58 @@ fn components_response(
                     .map(|composite| {
                         (
                             composite.component_name.clone(),
-                            composite_component_summary(composite, status),
+                            composite_component_summary(workspace, composite, status),
                         )
                     })
                     .collect();
             let are_all_composite_components_returned =
                 composite_components.len() == component.composite_components.len();
+            // Every property the component HAS — the ones it declared inline
+            // and the ones the component type it instantiates gives it — in
+            // name order, so a truncated map carries the same properties on
+            // every read.
+            let property_names = workspace
+                .component_property_names(component.component_type_id.as_deref(), &component.properties);
+            let are_all_properties_returned =
+                property_names.len() <= crate::state::MAX_PROPERTIES_RETURNED;
+            let properties: ::std::collections::HashMap<String, PropertyResponse> = property_names
+                .into_iter()
+                .take(crate::state::MAX_PROPERTIES_RETURNED)
+                .map(|property_name| {
+                    let response = property_response(
+                        workspace,
+                        component.component_type_id.as_deref(),
+                        &component.properties,
+                        &property_name,
+                    );
+                    (property_name, response)
+                })
+                .collect();
+            let property_groups: ::std::collections::HashMap<
+                String,
+                ComponentPropertyGroupResponse,
+            > = crate::state::component_property_groups_response(
+                workspace,
+                component.component_type_id.as_deref(),
+                &component.property_groups,
+            );
             let response = ComponentResponse {
                 component_name: Some(component.component_name.clone()),
                 description: component.description.clone(),
                 component_type_id: component.component_type_id.clone(),
                 status: Some(status.clone()),
-                // `definedIn` names the component type a component is defined
-                // in; component types are a later slice, so every definition
-                // here is the entity-local one and nothing is inherited.
-                defined_in: None,
-                properties: Some(
-                    component
-                        .properties
-                        .iter()
-                        .take(crate::state::MAX_PROPERTIES_RETURNED)
-                        .map(|(property_name, property)| {
-                            (property_name.clone(), property_response(property))
-                        })
-                        .collect(),
-                ),
-                property_groups: Some(
-                    component
-                        .property_groups
-                        .iter()
-                        .map(|(group_name, group)| {
-                            (
-                                group_name.clone(),
-                                crate::state::component_property_group_response(group),
-                            )
-                        })
-                        .collect(),
-                ),
+                // "The name of the property definition set": the component type
+                // the inherited part of this component's schema came from, so a
+                // caller reading a definition it never declared can see where it
+                // is defined. Absent when nothing was resolved.
+                defined_in: workspace
+                    .component_defined_in(component.component_type_id.as_deref()),
+                properties: Some(properties),
+                property_groups: Some(property_groups),
                 sync_source: None,
                 // "The maximum number of properties returned is 800" — the
                 // flag's own documentation, applied to the map above.
-                are_all_properties_returned: Some(
-                    component.properties.len() <= crate::state::MAX_PROPERTIES_RETURNED,
-                ),
+                are_all_properties_returned: Some(are_all_properties_returned),
                 composite_components: Some(composite_components),
                 // Nothing is truncated here: unlike `areAllComponentsReturned`
                 // ("the maximum number of components returned is 30") and
@@ -353,54 +371,61 @@ fn components_response(
 /// top-level component down; the map it is reported in is keyed by its own
 /// `Name`, which is why the path travels on the summary. A composite component
 /// has no lifecycle of its own — like the component that holds it, it reports
-/// the entity's status — and `definedIn` is left absent for the same reason the
-/// holding component's is: no inheritance from a component type is resolved
-/// here.
+/// the entity's status — and its property groups and `definedIn` are resolved
+/// against the component type it instantiates exactly as the holding
+/// component's are.
 fn composite_component_summary(
+    workspace: &crate::state::Workspace,
     composite: &crate::state::CompositeComponentRecord,
     status: &Status,
 ) -> ComponentSummary {
     ComponentSummary {
         component_name: composite.component_name.clone(),
         component_type_id: composite.component_type_id.clone(),
-        defined_in: None,
+        defined_in: workspace.component_defined_in(Some(&composite.component_type_id)),
         description: composite.description.clone(),
-        property_groups: Some(
-            composite
-                .property_groups
-                .iter()
-                .map(|(group_name, group)| {
-                    (
-                        group_name.clone(),
-                        crate::state::component_property_group_response(group),
-                    )
-                })
-                .collect(),
-        ),
+        property_groups: Some(crate::state::component_property_groups_response(
+            workspace,
+            Some(&composite.component_type_id),
+            &composite.property_groups,
+        )),
         status: status.clone(),
         sync_source: None,
         component_path: Some(composite.component_path.clone()),
     }
 }
 
-/// One stored property as the modelled `PropertyResponse`.
+/// One property of a component as the modelled `PropertyResponse`.
 ///
-/// The definition is projected by [`crate::state::property_definition_response`],
-/// the one conversion every reader of a stored definition shares, so an entity's
-/// properties and a component type's property definitions report a definition
-/// the same way; `areAllPropertyValuesReturned` is decided by
-/// [`crate::state::all_property_values_returned`], the one rule every reader of
-/// a property's value answers that flag with.
-fn property_response(property: &crate::state::PropertyRecord) -> PropertyResponse {
+/// Every member is read through the projection its kind of reader shares, so one
+/// property says the same thing here as it does through `ListProperties` and
+/// `GetPropertyValue`: the definition that gives the property its meaning —
+/// the component's own where it declared one, else the one it inherits from the
+/// component type it instantiates, marked `isInherited` when it is the latter
+/// ([`crate::state::property_definition_is_inherited`]) — the value the
+/// property reads as ([`crate::state::latest_property_value`]), and whether
+/// every value of a list- or map-typed one was reported
+/// ([`crate::state::all_property_values_returned`]).
+fn property_response(
+    workspace: &crate::state::Workspace,
+    component_type_id: Option<&str>,
+    properties: &::std::collections::BTreeMap<String, crate::state::PropertyRecord>,
+    property_name: &str,
+) -> PropertyResponse {
+    let definition =
+        workspace.effective_property_definition(component_type_id, properties, property_name);
+    let value = crate::state::latest_property_value(properties.get(property_name), definition);
     PropertyResponse {
-        definition: property
-            .definition
-            .as_ref()
-            .and_then(crate::state::property_definition_response),
-        value: property.value.clone(),
+        definition: definition.and_then(|definition| {
+            crate::state::property_definition_response(
+                definition,
+                crate::state::property_definition_is_inherited(properties, property_name),
+            )
+        }),
         are_all_property_values_returned: Some(crate::state::all_property_values_returned(
-            property.value.as_ref(),
+            value.as_ref(),
         )),
+        value,
     }
 }
 

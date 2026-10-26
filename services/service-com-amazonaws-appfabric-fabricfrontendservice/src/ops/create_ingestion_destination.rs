@@ -196,7 +196,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name, prefix and stream name length bounds), so the boundary validator
         // has already refused a malformed configuration before this handler runs.
 
-        let region = crate::state::request_region(ctx);
+        // The Region this call was SIGNED for. It scopes the idempotency token
+        // below (each Region is its own endpoint, so a token spent elsewhere is
+        // not a retry of this request) but it is NOT what the created
+        // destination's ARN carries: see `owning_region`.
+        let signed_region = crate::state::request_region(ctx);
 
         let mut store = state.lock();
         let Some(bundle_key) = store.bundle_key(&input.app_bundle_identifier) else {
@@ -211,11 +215,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // validation on its write path: an ingestion that does not exist is
         // HTTP 400 `ValidationException`, not the HTTP 404 the reporting path
         // answers for the same identifier.
-        let Some(ingestion_arn) = store
+        let Some((ingestion_arn, owning_region)) = store
             .app_bundles
             .get(&bundle_key)
-            .and_then(|bundle| bundle.resolve_ingestion(&input.ingestion_identifier))
-            .map(|ingestion| ingestion.arn.clone())
+            .and_then(|bundle| {
+                bundle
+                    .resolve_ingestion(&input.ingestion_identifier)
+                    // The parent's ARN and the Region the chain this
+                    // destination hangs off lives in, read TOGETHER out of the
+                    // stored records: an ARN names where its resource lives,
+                    // and a resource nested under another lives wherever that
+                    // parent does.
+                    .map(|ingestion| (ingestion.arn.clone(), bundle.region.clone()))
+            })
         else {
             return Err(CreateIngestionDestinationErrorModeled::ValidationException(
                 crate::state::ingestion_does_not_exist(),
@@ -251,7 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Region is its own endpoint with its own resources, so a token spent in
         // another Region is not a retry of this request.
         if let Some(token) = input.client_token.as_deref() {
-            let key = crate::state::client_token_key(&region, Self::NAME, token);
+            let key = crate::state::client_token_key(&signed_region, Self::NAME, token);
             if let Some(spent) = store.client_tokens.get(&key).cloned() {
                 if spent.fingerprint != fingerprint {
                     return Err(CreateIngestionDestinationErrorModeled::ConflictException(
@@ -306,9 +318,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         // A destination's ARN nests under the ingestion that owns it, which nests
-        // under its app bundle — AppFabric's own resource chain.
+        // under its app bundle — AppFabric's own resource chain. It therefore
+        // carries the Region that chain lives in, not the Region this create
+        // call happened to be signed for: an ARN nested under a parent ARN
+        // names a resource of that parent, so the two can never disagree about
+        // where the resource lives.
         let arn = crate::state::appfabric_arn(
-            &region,
+            &owning_region,
             &format!(
                 "appbundle/{bundle_key}/ingestion/{}/ingestiondestination/{id}",
                 ingestion.id
@@ -340,7 +356,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if let Some(token) = input.client_token.as_deref() {
             store.remember_client_token(
-                crate::state::client_token_key(&region, Self::NAME, token),
+                crate::state::client_token_key(&signed_region, Self::NAME, token),
                 arn,
                 fingerprint,
             );

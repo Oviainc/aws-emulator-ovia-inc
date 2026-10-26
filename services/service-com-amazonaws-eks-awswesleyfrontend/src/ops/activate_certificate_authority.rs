@@ -269,10 +269,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        // The certificate authority the request names is what this operation is
-        // about, so ITS state is judged before the cluster's: the two refusals a
-        // caller meets in a rotation — a successor whose trust distribution has not
-        // finished, and a CA that is already the signer — are facts about the CA.
+        // One update at a time per cluster: while another is running the cluster can
+        // take no update at all, so that is judged BEFORE anything about the named
+        // certificate authority's own state. The append that puts a successor on the
+        // cluster is itself an asynchronous update, so a rotation's own next step
+        // arrives while that update is in flight, and what such a caller has to do is
+        // wait for THAT update (`DescribeUpdate` on the id below) and retry — not
+        // conclude anything about the CA it named.
+        if let Some(in_flight) = cluster.in_flight_update() {
+            return Err(
+                ActivateCertificateAuthorityErrorModeled::ResourceInUseException(
+                    crate::state::update_in_progress(
+                        UPDATE_TYPE_CERTIFICATE_AUTHORITY,
+                        &cluster_name,
+                        in_flight,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // Rotating the signer of a control plane that is still being created — or is
+        // being deleted, or has failed — is work the cluster cannot take either. This
+        // operation models no `InvalidRequestException`, and a cluster busy with its
+        // own lifecycle is in use, so that is what it reports, naming the status.
+        if cluster.status != STATUS_ACTIVE {
+            return Err(in_use(
+                &cluster_name,
+                format!(
+                    "Cluster {cluster_name} is in {} status; it must be {STATUS_ACTIVE} to \
+                     activate a certificate authority",
+                    cluster.status
+                ),
+            ));
+        }
+
+        // With the cluster idle, the state of the certificate authority the request
+        // names is what decides: the two refusals a caller meets in a rotation — a
+        // successor whose trust distribution has not finished, and a CA that is
+        // already the signer — are facts about the CA.
         //
         // "Activates a SUCCESSOR certificate authority": the CA this promotes is one
         // that is not signing. The CA that already signs for the cluster — or that a
@@ -323,33 +358,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
-        }
-
-        // One update at a time per cluster: while another is running the cluster is
-        // in use, which is exactly what `ResourceInUseException` reports.
-        if let Some(in_flight) = cluster.in_flight_update() {
-            return Err(in_use(
-                &cluster_name,
-                format!(
-                    "Cluster {cluster_name} already has update {} in progress",
-                    in_flight.id
-                ),
-            ));
-        }
-
-        // Rotating the signer of a control plane that is still being created — or is
-        // being deleted, or has failed — is work the cluster cannot take. This
-        // operation models no `InvalidRequestException`, and a cluster busy with its
-        // own lifecycle is in use, so that is what it reports, naming the status.
-        if cluster.status != STATUS_ACTIVE {
-            return Err(in_use(
-                &cluster_name,
-                format!(
-                    "Cluster {cluster_name} is in {} status; it must be {STATUS_ACTIVE} to \
-                     activate a certificate authority",
-                    cluster.status
-                ),
-            ));
         }
 
         // The promotion is asynchronous, so it is owed at the same instant the update

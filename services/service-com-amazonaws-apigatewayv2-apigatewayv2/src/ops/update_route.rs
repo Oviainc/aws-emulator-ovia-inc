@@ -200,11 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(api) = store.apis.get_mut(&input.api_id) else {
             return Err(UpdateRouteErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "Invalid API identifier specified {}:{}",
-                    ::engine::emulator_account_id(),
-                    input.api_id
-                )),
+                message: Some(crate::state::invalid_api_identifier_message(&input.api_id)),
                 resource_type: ::std::option::Option::None,
             })
             .into());
@@ -252,10 +248,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(existing) = api.routes.get(&input.route_id) else {
             return Err(UpdateRouteErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "Invalid Route identifier specified {}:{}",
-                    ::engine::emulator_account_id(),
-                    input.route_id
+                message: Some(crate::state::invalid_identifier_message(
+                    crate::state::ROUTE_RESOURCE,
                 )),
                 resource_type: ::std::option::Option::None,
             })
@@ -382,10 +376,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(crate::state::Route::to_wire)
         else {
             return Err(UpdateRouteErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "Invalid Route identifier specified {}:{}",
-                    ::engine::emulator_account_id(),
-                    input.route_id
+                message: Some(crate::state::invalid_identifier_message(
+                    crate::state::ROUTE_RESOURCE,
                 )),
                 resource_type: ::std::option::Option::None,
             })

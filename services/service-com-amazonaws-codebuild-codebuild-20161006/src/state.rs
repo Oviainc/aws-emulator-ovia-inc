@@ -470,20 +470,24 @@ pub const REPORT_GROUP_NOT_FOUND_MESSAGE: &str = "Report group does not exist";
 /// a request names, carried by the modelled `ResourceNotFoundException`.
 ///
 /// Fixed text, under [`SANDBOX_NOT_FOUND_MESSAGE`]'s rule: the absent thing is the
-/// POLICY rather than the resource, and the sentence names no ARN.
-pub const RESOURCE_POLICY_NOT_FOUND_MESSAGE: &str = "Resource policy does not exist";
+/// POLICY rather than the resource, and the sentence names no ARN — the words
+/// `Resource ARN` are part of the sentence CodeBuild emits, not a substitution for the
+/// value the request sent.
+pub const RESOURCE_POLICY_NOT_FOUND_MESSAGE: &str = "Resource ARN resource policy does not exist";
 
 /// What CodeBuild states as the reason a value is not the ARN of a resource it can
 /// attach a resource-based policy to, carried by the modelled `InvalidInputException`.
 ///
-/// Fixed text, under [`SANDBOX_NOT_FOUND_MESSAGE`]'s rule: it does not echo the value
-/// the request sent back to the caller.
-pub const INVALID_RESOURCE_ARN_MESSAGE: &str = "Invalid resource ARN";
+/// Fixed text, under [`SANDBOX_NOT_FOUND_MESSAGE`]'s rule: `Resource ARN` names the
+/// member at fault rather than quoting the value the request sent, so the sentence is
+/// the same for every rejected value.
+pub const INVALID_RESOURCE_ARN_MESSAGE: &str = "Resource ARN is invalid";
 
 /// What CodeBuild states as the reason a resource policy is not a policy document,
 /// carried by the modelled `InvalidInputException`. Fixed text, for the same reason
-/// [`INVALID_RESOURCE_ARN_MESSAGE`] is.
-pub const INVALID_POLICY_DOCUMENT_MESSAGE: &str = "Invalid policy document";
+/// [`INVALID_RESOURCE_ARN_MESSAGE`] is: neither the submitted document, which is the
+/// caller's own text, nor a parser position reaches the wire.
+pub const INVALID_POLICY_DOCUMENT_MESSAGE: &str = "Problem parsing given policy";
 
 /// The outcome of a phase that ran to completion, from `StatusType`.
 const PHASE_SUCCEEDED: &str = "SUCCEEDED";
@@ -803,6 +807,128 @@ impl PolicyTarget {
             Self::ReportGroup => REPORT_GROUP_NOT_FOUND_MESSAGE,
         }
     }
+
+    /// The resource-type token CodeBuild names this kind of resource by when it refuses
+    /// a policy for it: the service namespace and the resource type the ARN's resource
+    /// segment carries (`project/` -> `codebuild:Project`, `report-group/` ->
+    /// `codebuild:ReportGroup`).
+    pub fn policy_resource_type(self) -> &'static str {
+        match self {
+            Self::Project => "codebuild:Project",
+            Self::ReportGroup => "codebuild:ReportGroup",
+        }
+    }
+
+    /// The actions a resource-based policy on this kind of resource may grant.
+    ///
+    /// Sharing a CodeBuild resource gives a consumer READ access to it and nothing
+    /// more — a consumer of a shared report group "cannot edit a report group or its
+    /// reports", and a consumer of a shared project can view the project and its builds
+    /// but not change either — so each kind has a fixed set of read-only consumer
+    /// actions, and a policy containing any other action is not a policy CodeBuild
+    /// stores. The two sets are the ones the CodeBuild user guide's sharing-permission
+    /// pages list for each kind (`report-groups-sharing-perms.html` and
+    /// `project-sharing-perms.html`); the model types `policy` only as a
+    /// `NonEmptyString`, so the sets are recorded behaviour rather than modelled.
+    pub fn shareable_actions(self) -> &'static [&'static str] {
+        match self {
+            Self::Project => &[
+                "codebuild:BatchGetProjects",
+                "codebuild:BatchGetBuilds",
+                "codebuild:ListBuildsForProject",
+            ],
+            Self::ReportGroup => &[
+                "codebuild:BatchGetReportGroups",
+                "codebuild:BatchGetReports",
+                "codebuild:ListReportsForReportGroup",
+                "codebuild:DescribeTestCases",
+            ],
+        }
+    }
+
+    /// Whether a policy on this kind of resource may contain `action`.
+    ///
+    /// Compared without case, the way an IAM action name is read: the action is the
+    /// named operation whatever case it is written in, so case alone can neither admit
+    /// nor refuse a grant.
+    pub fn shares_action(self, action: &str) -> bool {
+        self.shareable_actions()
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(action))
+    }
+}
+
+/// Whether `document` contains an action a resource policy on `target` may not grant —
+/// the question [`unshareable_action_message`] is the refusal for.
+///
+/// The question is CONTAINMENT, as CodeBuild's refusal words it ("Input policy
+/// containing action that is not allowed …"): every action named by any statement of
+/// the document has to be one of [`PolicyTarget::shareable_actions`], whatever effect
+/// the statement declares it under. A statement's `Action` is a single action or a list
+/// of them, and the document's `Statement` is a single statement or a list of them, so
+/// both forms are walked; a member name is matched without case, the way a policy
+/// document's element names are read, so no casing of `Action` escapes the check. An
+/// action that is not a string at all is no action of this service and so is not one a
+/// policy may contain.
+///
+/// A document that does not parse is [`is_policy_document`]'s refusal rather than this
+/// one, and a statement naming no action contains no action to refuse.
+pub fn policy_contains_unshareable_action(document: &str, target: PolicyTarget) -> bool {
+    let Ok(::serde_json::Value::Object(parsed)) =
+        ::serde_json::from_str::<::serde_json::Value>(document)
+    else {
+        return false;
+    };
+    let Some(statements) = policy_member(&parsed, "Statement") else {
+        return false;
+    };
+    listed(statements).into_iter().any(|statement| {
+        statement
+            .as_object()
+            .and_then(|statement| policy_member(statement, "Action"))
+            .is_some_and(|actions| {
+                listed(actions)
+                    .into_iter()
+                    .any(|action| !target.shares_action(action.as_str().unwrap_or_default()))
+            })
+    })
+}
+
+/// What CodeBuild states as the reason a proposed policy contains an action the kind of
+/// resource it is written for cannot be shared with, carried by the modelled
+/// `InvalidInputException`.
+///
+/// The only variable part is the resource-type token, which comes from the TYPE of the
+/// ARN the request named ([`PolicyTarget::policy_resource_type`]); nothing of the
+/// submitted document — the caller's own text — reaches the wire. Recorded behaviour:
+/// the model states no message for the error.
+pub fn unshareable_action_message(target: PolicyTarget) -> String {
+    format!(
+        "Proposed policy was not valid: InvalidPolicy: Input policy containing action \
+         that is not allowed for resource type {}",
+        target.policy_resource_type()
+    )
+}
+
+/// The member of a policy document object named `name`, matched WITHOUT case: a policy
+/// document's element names are read as names rather than as exact bytes.
+fn policy_member<'doc>(
+    object: &'doc ::serde_json::Map<String, ::serde_json::Value>,
+    name: &str,
+) -> Option<&'doc ::serde_json::Value> {
+    object
+        .iter()
+        .find(|(member, _)| member.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value)
+}
+
+/// The entries of a policy-document member that is either one value or a list of them:
+/// a `Statement` and an `Action` are both written either way.
+fn listed(value: &::serde_json::Value) -> Vec<&::serde_json::Value> {
+    match value {
+        ::serde_json::Value::Array(entries) => entries.iter().collect(),
+        single => vec![single],
+    }
 }
 
 /// Whether `document` is a JSON-formatted policy document.
@@ -814,13 +940,12 @@ impl PolicyTarget {
 /// verbatim rather than re-serialized, so a reader hands back exactly the text the
 /// caller wrote.
 ///
-/// Deliberately the JSON question and not the policy GRAMMAR: no member of the
-/// document is modelled, so which statement members a grant must carry, and which
-/// actions and principals CodeBuild accepts in one, is text this emulator would have
-/// to invent a refusal for. Taking a syntactically valid object that grants nothing is
-/// the honest answer here — the document is reported back exactly as given, so a caller
-/// can still see what it stored — while anything that is not a JSON document at all is
-/// refused.
+/// The JSON question only: which statement members a grant must carry, and which
+/// principals CodeBuild accepts in one, is not a rule any record of this service's
+/// behaviour fixes, so a syntactically valid object that grants nothing is taken — the
+/// document is reported back exactly as given, so a caller can still see what it
+/// stored. The one GRAMMAR rule that is recorded, the set of actions a policy on each
+/// resource kind may contain, is [`policy_contains_unshareable_action`].
 pub fn is_policy_document(document: &str) -> bool {
     matches!(
         ::serde_json::from_str::<::serde_json::Value>(document),
@@ -2336,6 +2461,9 @@ pub enum AuditOutcome {
     NotFound,
     /// A resource-based policy was stored against a resource's ARN.
     ResourcePolicyStored,
+    /// A resource-based policy was removed from a resource's ARN, which unshares that
+    /// resource.
+    ResourcePolicyDeleted,
 }
 
 impl AuditOutcome {
@@ -2354,6 +2482,7 @@ impl AuditOutcome {
             Self::ProjectDeleted => "project-deleted",
             Self::NotFound => "not-found",
             Self::ResourcePolicyStored => "resource-policy-stored",
+            Self::ResourcePolicyDeleted => "resource-policy-deleted",
         }
     }
 }

@@ -1014,6 +1014,17 @@
 //! to `included` apply to the instance", and no two operations can disagree about one
 //! instance's status.
 //!
+//! ## Instance status FEEDBACK is collected, and reports nothing back
+//!
+//! [`ComAmazonawsEc2Amazonec2State::instance_status_reports`] holds, per `InstanceId`, the
+//! status reports a caller submitted about that instance — see
+//! [`instance_status_reports`], the submodule that owns this slice. They are COLLECTED and
+//! never projected into any describe: "Amazon EC2 collects this information to improve the
+//! accuracy of status checks. Use of this action does not change the value returned by
+//! DescribeInstanceStatus" (`ReportInstanceStatus`), so the feedback store is write-only
+//! as far as the API surface goes, and submitting a report moves no instance and changes
+//! no status any reader reports.
+//!
 //! ## EBS encryption by default: a setting of a Region, not a resource
 //!
 //! EBS encryption by default has no resource and no id: it is one boolean "for your
@@ -2545,6 +2556,13 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// entry has had no application status check reported for it, which is exactly the
     /// `not-applicable` instance-level status `DescribeApplicationStatus` answers with.
     pub application_status: BTreeMap<String, InstanceApplicationStatusRecord>,
+    /// The status reports callers have submitted about each instance, by `InstanceId`, in
+    /// the order they were submitted — see [`instance_status_reports`], the submodule that
+    /// owns this slice, and the module docs. Starts EMPTY, and an instance with no entry is
+    /// one nobody has reported on; nothing projects these into a describe, because
+    /// submitting one "does not change the value returned by DescribeInstanceStatus"
+    /// (`ReportInstanceStatus`).
+    pub instance_status_reports: BTreeMap<String, Vec<InstanceStatusReport>>,
     /// The CONFIGURATION of every application status check the account holds, by
     /// `ApplicationStatusCheckId` — see [`application_status_checks`], the submodule that
     /// owns this slice. Ordered by id in a [`BTreeMap`], the arrangement every other store
@@ -3095,6 +3113,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             interruptible_allocation_client_tokens: HashMap::new(),
             capacity_reservation_client_tokens: HashMap::new(),
             application_status: BTreeMap::new(),
+            instance_status_reports: BTreeMap::new(),
             application_status_checks: BTreeMap::new(),
             fast_launch_images: BTreeMap::new(),
             store_image_tasks: BTreeMap::new(),
@@ -14514,6 +14533,17 @@ impl ComAmazonawsEc2Amazonec2State {
 /// `crate::state::<name>`, which is where each handler names it.
 pub mod application_status_checks;
 pub use application_status_checks::*;
+
+// ---------------------------------------------------------------------------
+// Instance status reports: the feedback `ReportInstanceStatus` collects
+// ---------------------------------------------------------------------------
+
+/// This service's instance status FEEDBACK slice: the record one submitted report is
+/// stored as, what it is charged and how many of them this store holds. A SUBMODULE for
+/// the same reason [`application_status_checks`] is one; `pub use` keeps every name
+/// reachable as `crate::state::<name>`, which is where the handler names it.
+pub mod instance_status_reports;
+pub use instance_status_reports::*;
 
 // ---------------------------------------------------------------------------
 // Pagination tokens
