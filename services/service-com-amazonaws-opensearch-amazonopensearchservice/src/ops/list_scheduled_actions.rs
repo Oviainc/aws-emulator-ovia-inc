@@ -83,15 +83,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{invalid_pagination_token, ScheduledChange};
+use crate::state::{invalid_pagination_token, max_results_out_of_range, ScheduledChange};
 
-/// The largest page this operation answers with, and the page size a request that
-/// names none gets: `MaxResults` is `@range(max: 100)`, so 100 results is the most
-/// any request can ask for.
-const MAX_PAGE: usize = 100;
-
-/// [`MAX_PAGE`] as the modelled member's own type, for the bound check below.
+/// The largest page this operation answers with, as the modelled member's own type:
+/// `MaxResults` is `@range(max: 100)`, so 100 results is the most any request can ask
+/// for, and a request that names no page size gets that many.
 const MAX_PAGE_SIZE: i32 = 100;
+
+/// [`MAX_PAGE_SIZE`] as a count of results, for the page the slice below takes —
+/// derived from the one bound rather than written twice, so the two cannot drift.
+const MAX_PAGE: usize = MAX_PAGE_SIZE as usize;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -177,12 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // page size sent) stays the unbounded case below.
         if input.max_results < 0 || input.max_results > MAX_PAGE_SIZE {
             return Err(ListScheduledActionsErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "MaxResults must be between 0 and {MAX_PAGE_SIZE}: {}",
-                        input.max_results
-                    )),
-                },
+                max_results_out_of_range(input.max_results, MAX_PAGE_SIZE),
             )
             .into());
         }

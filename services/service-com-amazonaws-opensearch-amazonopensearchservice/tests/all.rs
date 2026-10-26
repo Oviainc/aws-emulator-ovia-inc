@@ -25,6 +25,8 @@ mod data_source_create_rules;
 mod data_source_registry;
 #[path = "all/default_application_setting.rs"]
 mod default_application_setting;
+#[path = "all/domain_auto_tunes.rs"]
+mod domain_auto_tunes;
 #[path = "all/domain_batch_describe.rs"]
 mod domain_batch_describe;
 #[path = "all/domain_health.rs"]

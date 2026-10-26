@@ -31,6 +31,7 @@ use crate::ops::types::{
     AccessPoliciesStatus, AdditionalLimit,
     AdvancedOptionsStatus, AdvancedSecurityOptions, AdvancedSecurityOptionsInput,
     AdvancedSecurityOptionsStatus, AuthorizedPrincipal,
+    AutoTune, AutoTuneDetails,
     AutoTuneOptions, AutoTuneOptionsInput, AutoTuneOptionsOutput,
     AutoTuneOptionsStatus, AutoTuneStatus, AutomatedSnapshotPauseOptions,
     AutomatedSnapshotPauseOptionsStatus, AutomatedSnapshotPauseRequestOptions,
@@ -58,7 +59,8 @@ use crate::ops::types::{
     PackageVendingOptions,
     RecurringCharge, ReservedInstance,
     ReservedInstanceOffering, ResourceAlreadyExistsException, ResourceNotFoundException,
-    RollbackServiceSoftwareOptions, SAMLOptionsOutput, ScheduledAction, ServiceSoftwareOptions,
+    RollbackServiceSoftwareOptions, SAMLOptionsOutput, ScheduledAction,
+    ScheduledAutoTuneDetails, ServiceSoftwareOptions,
     SnapshotOptions,
     SnapshotOptionsStatus, SoftwareUpdateOptions, SoftwareUpdateOptionsStatus, StorageType,
     StorageTypeLimit, Tag, UpgradeHistory, UpgradeStepItem, UseCaseStatus,
@@ -66,7 +68,7 @@ use crate::ops::types::{
     VpcEndpoint, VpcEndpointError, VpcEndpointSummary,
     INBOUND_CONNECTION_STATUS_CODE_VALUES,
     OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES, RESERVED_INSTANCE_PAYMENT_OPTION_VALUES,
-    SCHEDULE_AT_VALUES,
+    SCHEDULED_AUTO_TUNE_ACTION_TYPE_VALUES, SCHEDULE_AT_VALUES,
     VOLUME_TYPE_VALUES,
 };
 
@@ -2034,8 +2036,9 @@ impl UpgradeRun {
 ///
 /// A scheduled action is a record with an identity of its own — an action id, a type,
 /// a severity and the instant it is to happen — rather than a projection of some
-/// other record: `ListScheduledActions` reports it and `UpdateScheduledAction`
-/// reschedules it, so this is the ONE copy both reach. The operations that SCHEDULE
+/// other record: `ListScheduledActions` reports it, `DescribeDomainAutoTunes` reports
+/// the Auto-Tune ones among them and `UpdateScheduledAction` reschedules it, so this
+/// is the ONE copy all of them reach. The operations that SCHEDULE
 /// one (`StartServiceSoftwareUpdate` for a service software update, and the Auto-Tune
 /// side of `UpdateDomainConfig` for a blue/green enhancement) are still scaffold
 /// stubs, so today the only writer is whatever puts a record here directly.
@@ -2087,6 +2090,42 @@ impl ScheduledChange {
             status: Some(self.status.clone()),
             mandatory: Some(self.mandatory),
             cancellable: Some(self.cancellable),
+        }
+    }
+
+    /// Whether this scheduled change is an Auto-Tune optimization of the domain.
+    ///
+    /// `ScheduledAutoTuneDetails$ActionType` is a `ScheduledAutoTuneActionType`, a
+    /// SUBSET of the `ActionType` a scheduled change carries: a change of a type
+    /// outside that subset (a service software update) has no `AutoTune` form at all,
+    /// so it belongs to the scheduled-action listing and not to the Auto-Tune one.
+    /// The subset is the model's own enum, as generated into
+    /// [`SCHEDULED_AUTO_TUNE_ACTION_TYPE_VALUES`], so no second list of it is kept
+    /// here.
+    pub fn is_auto_tune(&self) -> bool {
+        SCHEDULED_AUTO_TUNE_ACTION_TYPE_VALUES.contains(&self.action_type.as_str())
+    }
+
+    /// This record as `AutoTune` — the ONE projection of an Auto-Tune optimization, so
+    /// the Auto-Tune report and the scheduled-action listing cannot describe the same
+    /// change differently.
+    ///
+    /// `AutoTuneType` admits only `SCHEDULED_ACTION`, and the detail container carries
+    /// the stored instant as `Date` ("the date and time when the Auto-Tune action is
+    /// scheduled for the domain"), the stored type and severity, and the stored
+    /// description as `Action` ("a description of the Auto-Tune action") — absent for
+    /// a change stored without one.
+    pub fn to_auto_tune(&self) -> AutoTune {
+        AutoTune {
+            auto_tune_type: Some(AUTO_TUNE_TYPE_SCHEDULED_ACTION.to_string()),
+            auto_tune_details: Some(AutoTuneDetails {
+                scheduled_auto_tune_details: Some(ScheduledAutoTuneDetails {
+                    date: Some(datetime(self.scheduled_at)),
+                    action_type: Some(self.action_type.clone()),
+                    action: self.description.clone(),
+                    severity: Some(self.severity.clone()),
+                }),
+            }),
         }
     }
 
@@ -2272,6 +2311,10 @@ pub fn scheduled_action_under_way(action_id: &str, status: &str) -> ConflictExce
         )),
     }
 }
+
+/// `AutoTuneType`'s only value: every Auto-Tune optimization this service reports is
+/// a scheduled action.
+pub const AUTO_TUNE_TYPE_SCHEDULED_ACTION: &str = "SCHEDULED_ACTION";
 
 /// One field of an insight's DETAILED view, as this emulator persists it.
 ///

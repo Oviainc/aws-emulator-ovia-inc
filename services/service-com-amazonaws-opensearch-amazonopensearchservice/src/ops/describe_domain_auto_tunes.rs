@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDomainAutoTunes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDomainAutoTunes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDomainAutoTunes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Auto-Tune optimizations of one domain, from the scheduled changes that
+//! domain holds ([`crate::state::ScheduledChange`]) — the ones whose action type is an
+//! Auto-Tune one, each as a `SCHEDULED_ACTION` `AutoTune` — a page of them per call,
+//! in the order they are scheduled to happen, resumed by the token the previous page
+//! handed out. It only REPORTS: the records it answers with are written by the calls
+//! that schedule a change, never by a read of them.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +82,17 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{invalid_next_token, max_results_out_of_range, ScheduledChange};
+
+/// The largest page this operation answers with, as the modelled member's own type:
+/// `MaxResults` is `@range(max: 100)`, so 100 results is the most any request can ask
+/// for, and a request that names no page size gets that many.
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// [`MAX_PAGE_SIZE`] as a count of results, for the page the slice below takes —
+/// derived from the one bound rather than written twice, so the two cannot drift.
+const MAX_PAGE: usize = MAX_PAGE_SIZE as usize;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -155,18 +164,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDomainAutoTunes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDomainAutoTunesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // `MaxResults` is `@range(max: 100)`, so a larger page size is a malformed
+        // request; the boundary validator refuses it before this handler runs, and the
+        // check is repeated here so the rule holds however the request reached us. A
+        // NEGATIVE page size is malformed for the same reason — it is not a page size
+        // at all — so it is refused rather than reinterpreted, while `@default(0)` (no
+        // page size sent) stays the unbounded case below.
+        if input.max_results < 0 || input.max_results > MAX_PAGE_SIZE {
+            return Err(DescribeDomainAutoTunesErrorModeled::ValidationException(
+                max_results_out_of_range(input.max_results, MAX_PAGE_SIZE),
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // "Name of the domain that you want Auto-Tune details about": the optimizations
+        // belong to the domain the request names, so a name the account holds no domain
+        // under has none to report. Settling that domain is the only write this report
+        // makes, and it writes only what the clock already owed it at this instant had
+        // nobody called.
+        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
+            DescribeDomainAutoTunesErrorModeled::ResourceNotFoundException(
+                crate::state::domain_not_found(&input.domain_name),
+            )
+        })?;
+
+        // "The list of setting adjustments that Auto-Tune has made to the domain": the
+        // Auto-Tune optimizations of a domain are the scheduled changes of an Auto-Tune
+        // action type ([`ScheduledChange::is_auto_tune`]) — a service software update is
+        // a scheduled change too, and has no `AutoTune` form to be reported in.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDomainAutoTunes"))
+        // The instant each adjustment is scheduled for is what orders the report: the
+        // next one due is reported first, and the action id breaks a tie, so two reads
+        // report the same order — which is what lets a token name a place in the set.
+        let mut tunes: Vec<&ScheduledChange> = domain
+            .scheduled_actions
+            .values()
+            .filter(|change| change.is_auto_tune())
+            .collect();
+        tunes.sort_by(|left, right| {
+            left.scheduled_at
+                .cmp(&right.scheduled_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        // The token names the adjustment the next page starts AT, so a caller resumes
+        // exactly where the previous page stopped rather than at an offset a newly
+        // scheduled or applied change would have shifted. It is only ever a value this
+        // operation handed out, so one that names no Auto-Tune adjustment of this domain
+        // — one this service never minted, one whose change has since been applied, or
+        // one carried over from another domain's report — is refused. This operation
+        // models no `InvalidPaginationTokenException`, so the refusal is its
+        // `ValidationException`.
+        let start = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            None => 0,
+            Some(token) => tunes
+                .iter()
+                .position(|change| change.id == token)
+                .ok_or_else(|| {
+                    DescribeDomainAutoTunesErrorModeled::ValidationException(invalid_next_token())
+                })?,
+        };
+
+        // "An optional parameter that specifies the maximum number of results to
+        // return": `MaxResults` is `@default(0)`, so a request that asks for no
+        // particular page size reaches here as zero and gets the largest page the model
+        // allows rather than an empty one.
+        let page_size = match usize::try_from(input.max_results) {
+            Ok(0) | Err(_) => MAX_PAGE,
+            Ok(size) => size.min(MAX_PAGE),
+        };
+        let end = start.saturating_add(page_size).min(tunes.len());
+
+        Ok(DescribeDomainAutoTunesOutput {
+            auto_tunes: Some(
+                tunes[start..end]
+                    .iter()
+                    .map(|change| change.to_auto_tune())
+                    .collect(),
+            ),
+            // "When nextToken is returned, there are more results available": the token
+            // is the next adjustment in the set, and there is none once this page ended
+            // the set.
+            next_token: tunes.get(end).map(|change| change.id.clone()),
+        })
     }
 }
