@@ -2189,6 +2189,37 @@ pub struct SandboxPhoneNumberRecord {
     pub created_at: SystemTime,
 }
 
+/// Whether an account that has just started using SNS for SMS is in the SMS sandbox:
+/// "When you start using Amazon SNS to send SMS messages, your Amazon Web Services
+/// account is in the SMS sandbox" (`GetSMSSandboxAccountStatus` doc), so a freshly
+/// booted emulator serves an account that is in it.
+pub const IN_SMS_SANDBOX_AT_ACCOUNT_START: bool = true;
+
+/// The calling account's SMS sandbox membership, which
+/// `GetSMSSandboxAccountStatus` reports.
+///
+/// Membership is ACCOUNT state, not a property of any one destination number: the
+/// sandbox "provides a safe environment for you to try Amazon SNS features", and
+/// while an account is in it SMS messages reach only verified destination numbers.
+/// No SNS operation moves an account out of it — leaving the sandbox is a separate,
+/// unmodelled request for production access — so nothing a caller does to the
+/// destination numbers in [`ComAmazonawsSnsAmazonsimplenotificationserviceState::sandbox_phone_numbers`]
+/// changes it, and the record an account starts with is
+/// [`IN_SMS_SANDBOX_AT_ACCOUNT_START`].
+#[derive(Debug, Clone, Copy)]
+pub struct SmsSandboxAccountRecord {
+    /// Whether the calling account is in the SMS sandbox.
+    pub is_in_sandbox: bool,
+}
+
+impl Default for SmsSandboxAccountRecord {
+    fn default() -> Self {
+        Self {
+            is_in_sandbox: IN_SMS_SANDBOX_AT_ACCOUNT_START,
+        }
+    }
+}
+
 // =============================================================================
 // Phone numbers: the E.164 rule and the SMS opt-out list
 // =============================================================================
@@ -2478,6 +2509,11 @@ pub struct ComAmazonawsSnsAmazonsimplenotificationserviceState {
     /// phone number itself: the sandbox holds one record per destination number. At
     /// most [`MAX_RECORDS_PER_STORE`].
     pub sandbox_phone_numbers: HashMap<String, SandboxPhoneNumberRecord>,
+    /// Whether the calling account is in the SMS sandbox, which
+    /// `GetSMSSandboxAccountStatus` reports. NOT caller-grown and not caller-moved:
+    /// the account starts in the sandbox and no SNS operation takes it out, so this
+    /// record is one value rather than a store.
+    pub sms_sandbox_account: SmsSandboxAccountRecord,
     /// The calling account's mobile-push platform applications, keyed by their ARN.
     /// At most [`MAX_RECORDS_PER_STORE`]: an operation that registers one must refuse
     /// a request that would cross that ceiling, as the topic and subscription stores

@@ -39,7 +39,10 @@ const MAX_OTP_LEN: usize = 8;
 const VERIFICATION_CODE: &str = "VerificationException";
 
 /// One verification call.
-async fn verify(sns: &Sns, number: &str, one_time_password: &str) -> Answer {
+///
+/// `pub(crate)` so a sibling suite that needs a VERIFIED destination number drives
+/// the verification the same way rather than writing a second call site.
+pub(crate) async fn verify(sns: &Sns, number: &str, one_time_password: &str) -> Answer {
     sns.call(
         "VerifySMSSandboxPhoneNumber",
         &[
@@ -52,7 +55,10 @@ async fn verify(sns: &Sns, number: &str, one_time_password: &str) -> Answer {
 
 /// The code the create call delivered to `number`, read from the record it was
 /// delivered to — the emulator's stand-in for the SMS carrier.
-fn delivered_code(sns: &Sns, number: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite reads the delivered code out of the SAME record
+/// rather than writing a second read of it.
+pub(crate) fn delivered_code(sns: &Sns, number: &str) -> String {
     let state = sns.state();
     let state = state.lock();
     state
