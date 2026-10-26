@@ -14,7 +14,9 @@
 //! Every caller-driven store is BOUNDED, because every request reaching this
 //! emulator can grow one of them: the identity list at [`MAX_IDENTITIES`]
 //! entries, each identity's sending-authorization policies at
-//! [`MAX_IDENTITY_POLICIES`] documents of [`MAX_POLICY_BYTES`], and the send log
+//! [`MAX_IDENTITY_POLICIES`] documents of [`MAX_POLICY_BYTES`], the configuration
+//! sets at [`MAX_CONFIGURATION_SETS`], the receipt rule sets at
+//! [`MAX_RECEIPT_RULE_SETS`], and the send log
 //! at the account's own 24-hour quota, with the window's expiry applied on
 //! append ([`ComAmazonawsSesSimpleemailserviceState::log_sent_message`]) and
 //! [`MAX_SENT_LOG_ENTRIES`] as the backstop. The text one log entry keeps is
@@ -55,6 +57,12 @@ pub const SANDBOX_MAX_SEND_RATE: f64 = 1.0;
 /// input grow this store without end.
 pub const MAX_IDENTITIES: usize = 10_000;
 
+/// The configuration sets one account may hold, and so the ceiling on the
+/// configuration-set store: SES documents a limit of 10,000 configuration sets
+/// per account per Region, and a create past it is refused rather than letting
+/// caller input grow this store without end.
+pub const MAX_CONFIGURATION_SETS: usize = 10_000;
+
 /// The entries the send log may hold at once.
 ///
 /// The 24-hour quota is the real ceiling — a day's accepted sends are at most
@@ -62,6 +70,19 @@ pub const MAX_IDENTITIES: usize = 10_000;
 /// append, so this is the backstop that still bounds the store if the stored
 /// quota is raised later.
 pub const MAX_SENT_LOG_ENTRIES: usize = 1_000;
+
+/// The receipt rule sets one account may hold, and so the ceiling on the rule-set
+/// store: SES documents a limit of 20 receipt rule sets per AWS account, and a
+/// create or clone past it is refused with the modelled `LimitExceeded` rather
+/// than letting caller input grow this store without end.
+pub const MAX_RECEIPT_RULE_SETS: usize = 20;
+
+/// The characters a receipt rule set name may carry.
+///
+/// From the model's own `ReceiptRuleSetName` documentation (e.g.
+/// `CreateReceiptRuleSetRequest$RuleSetName`): the name must "Contain 64
+/// characters or fewer".
+pub const MAX_RECEIPT_RULE_SET_NAME: usize = 64;
 
 /// The email templates one account may hold, and so the ceiling on the template
 /// store: SES documents a limit of 10,000 email templates per account, and a
@@ -265,6 +286,22 @@ pub struct ConfigurationSet {
     pub sending_enabled: bool,
 }
 
+/// A receipt rule set: a named, ordered collection of receipt rules.
+///
+/// The rules are kept as the modelled [`crate::ops::types::ReceiptRule`] shape,
+/// so a rule a caller wrote is reported back unchanged by every reader instead
+/// of being projected through a second copy of the same structure.
+#[derive(Debug, Clone)]
+pub struct ReceiptRuleSet {
+    /// The set's name, which is its key in the store.
+    pub name: String,
+    /// When the set was created, reported as
+    /// `ReceiptRuleSetMetadata$CreatedTimestamp`.
+    pub created_at: SystemTime,
+    /// The set's rules, in the order SES applies them.
+    pub rules: Vec<crate::ops::types::ReceiptRule>,
+}
+
 /// Per-service state for com-amazonaws-ses-simpleemailservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSesSimpleemailserviceState {
@@ -277,8 +314,14 @@ pub struct ComAmazonawsSesSimpleemailserviceState {
     pub sent_messages: Vec<SentMessage>,
     /// The account's sending settings.
     pub account: AccountSettings,
-    /// The configuration sets, keyed by name.
+    /// The configuration sets, keyed by name. Grown ONLY through
+    /// [`Self::add_configuration_set`], which is where its ceiling
+    /// ([`MAX_CONFIGURATION_SETS`]) is applied; a handler that inserted here
+    /// directly would let caller input grow this store without end.
     pub configuration_sets: BTreeMap<String, ConfigurationSet>,
+    /// The receipt rule sets, keyed by name. A `BTreeMap` so every listing is in
+    /// one stable (lexicographic) order. Bounded at [`MAX_RECEIPT_RULE_SETS`].
+    pub receipt_rule_sets: BTreeMap<String, ReceiptRuleSet>,
     /// The email templates, keyed by name. A `BTreeMap` so every listing is in
     /// one stable (lexicographic) order, which is what makes `ListTemplates`'
     /// pagination resumable. Bounded at [`MAX_TEMPLATES`].
@@ -510,6 +553,88 @@ impl ComAmazonawsSesSimpleemailserviceState {
     pub fn new_verification_token(&mut self) -> String {
         self.mint_token()[..44].to_string()
     }
+
+    /// Record a configuration set named `name`, and hand back the stored record.
+    ///
+    /// Idempotent: a name already in the store keeps the record (and the sending
+    /// state) it already carries, so the caller can tell a conflict from a
+    /// create by checking the store first.
+    ///
+    /// `None` when the store already holds [`MAX_CONFIGURATION_SETS`] sets and
+    /// this is a new one: the caller refuses the request with the modelled
+    /// `LimitExceeded` rather than growing the store past the account's limit.
+    pub fn add_configuration_set(&mut self, name: &str) -> Option<&ConfigurationSet> {
+        if !self.configuration_sets.contains_key(name)
+            && self.configuration_sets.len() >= MAX_CONFIGURATION_SETS
+        {
+            return None;
+        }
+        Some(
+            self.configuration_sets
+                .entry(name.to_string())
+                .or_insert_with(|| ConfigurationSet {
+                    name: name.to_string(),
+                    // A set SES has just created is not paused: `SendEmail`
+                    // refuses a send naming it only after
+                    // `UpdateConfigurationSetSendingEnabled` disables it.
+                    sending_enabled: true,
+                }),
+        )
+    }
+
+    /// Record a receipt rule set named `name` holding `rules`, and hand back the
+    /// stored record.
+    ///
+    /// The caller has already decided that `name` is free — a name already in
+    /// the store is a naming conflict, which every creating operation answers
+    /// with its own modelled `AlreadyExists` — so this only applies the
+    /// account's own ceiling: `None` when the store already holds
+    /// [`MAX_RECEIPT_RULE_SETS`] sets, which the caller refuses with the
+    /// modelled `LimitExceeded` rather than growing the store past the limit.
+    ///
+    /// `created_at` is taken here, so the timestamp a reader reports is the one
+    /// this write stored.
+    pub fn add_receipt_rule_set(
+        &mut self,
+        name: &str,
+        rules: Vec<crate::ops::types::ReceiptRule>,
+    ) -> Option<&ReceiptRuleSet> {
+        if !self.receipt_rule_sets.contains_key(name)
+            && self.receipt_rule_sets.len() >= MAX_RECEIPT_RULE_SETS
+        {
+            return None;
+        }
+        Some(
+            self.receipt_rule_sets
+                .entry(name.to_string())
+                .or_insert_with(|| ReceiptRuleSet {
+                    name: name.to_string(),
+                    created_at: SystemTime::now(),
+                    rules,
+                }),
+        )
+    }
+}
+
+/// Whether `value` is a receipt rule or rule set name in the form SES documents.
+///
+/// The model states the rule on every `ReceiptRuleSetName` and `ReceiptRuleName`
+/// member (e.g. `CloneReceiptRuleSetRequest$RuleSetName`): the name must
+/// "Contain only ASCII letters (a-z, A-Z), numbers (0-9), underscores (_), or
+/// dashes (-)", "Start and end with a letter or number", and "Contain 64
+/// characters or fewer" ([`MAX_RECEIPT_RULE_SET_NAME`]).
+pub fn is_receipt_rule_set_name(value: &str) -> bool {
+    let mut characters = value.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    let last = characters.next_back().unwrap_or(first);
+    value.len() <= MAX_RECEIPT_RULE_SET_NAME
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        && first.is_ascii_alphanumeric()
+        && last.is_ascii_alphanumeric()
 }
 
 /// The listing name stamped into a `ListTemplates` page token, so a cursor cut
