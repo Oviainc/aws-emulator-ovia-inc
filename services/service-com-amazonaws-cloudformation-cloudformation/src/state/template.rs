@@ -1945,10 +1945,7 @@ fn conventional_attributes(
             &format!("{}/{name}", hyphenated(segment)),
         )
     });
-    let mut conventional = vec![
-        ("Arn".to_string(), arn.clone()),
-        (format!("{segment}Arn"), arn),
-    ];
+    let mut conventional = arn_attributes(resource_type, &arn);
     conventional.extend(identity_attributes(
         resource_type,
         &resource.physical_resource_id,
@@ -1956,6 +1953,26 @@ fn conventional_attributes(
     conventional.push(("Name".to_string(), name.to_string()));
     conventional.push((format!("{segment}Name"), name.to_string()));
     conventional
+}
+
+/// The attributes the uniform convention reads a resource's ARN off: its `Arn`/`<Type>Arn`
+/// names, which are "the resource's ARN" ([`conventional_attributes`]).
+///
+/// Public for the same reason [`identity_attributes`] is: an ARN is not always
+/// CloudFormation's own to compute. Where the OWNING service MINTS it — WAF answers
+/// `CreateWebACL` with the `ARN` it built from the scope, the name and the id it assigned —
+/// the ARN is the one that service reported, which only
+/// [`super::provisioning`](crate::state::provisioning) learns. It re-points these
+/// attributes through this one function, so the ARN a resource reports under either name is
+/// the same string and neither can be left holding a value the owning service does not know.
+pub fn arn_attributes(resource_type: &str, arn: &str) -> Vec<(String, String)> {
+    let Some((_, segment)) = type_segments(resource_type) else {
+        return Vec::new();
+    };
+    vec![
+        ("Arn".to_string(), arn.to_string()),
+        (format!("{segment}Arn"), arn.to_string()),
+    ]
 }
 
 /// The attributes the uniform convention reads off a resource's PHYSICAL ID: its
@@ -3826,9 +3843,17 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 /// answers the `ServerId` it assigned, and that type's `Ref` returns the server's ARN,
 /// which carries that id — so neither the id nor the ARN can be recomputed from the
 /// template.
+///
+/// The four WAFv2 types are in that position too ([`WAFV2_WEB_ACL`] and its siblings): each
+/// create answers an `Id` that service minted, and the entity's ARN carries it, so a
+/// deployment can recompute neither.
 pub fn identity_is_service_assigned(resource_type: &str) -> bool {
     resource_type == FIS_EXPERIMENT_TEMPLATE
         || resource_type == WAF_REGIONAL_IP_SET
+        || resource_type == WAFV2_WEB_ACL
+        || resource_type == WAFV2_RULE_GROUP
+        || resource_type == WAFV2_IP_SET
+        || resource_type == WAFV2_REGEX_PATTERN_SET
         || resource_type == GRAFANA_WORKSPACE
         || resource_type == EMR_CLUSTER
         || resource_type == GUARDDUTY_DETECTOR
@@ -4054,6 +4079,22 @@ pub const FIS_EXPERIMENT_TEMPLATE: &str = "AWS::FIS::ExperimentTemplate";
 /// service itself, and "Ref returns the IPSet ID" — an id only AWS WAF Classic mints — so
 /// the id a stack's output reports for it is the one that service answered with.
 pub const WAF_REGIONAL_IP_SET: &str = "AWS::WAFRegional::IPSet";
+
+/// The four WAF (WAFv2) resource types a stack creates in that service (the WAFv2 model:
+/// `cloudFormationName: WAFv2`).
+///
+/// Each one's identity is WAF's OWN to mint: its create takes the NAME and the scope the
+/// template declares and answers a `Summary` carrying the `Id` it assigned and the `ARN` it
+/// built from the scope, that name and that id — "a unique identifier for the … This ID is
+/// returned in the responses to create and list commands. You provide it to operations like
+/// update and delete" (`WebACLSummary$Id` and its siblings). So the identifiers a stack
+/// publishes for one are the ones that service answered with, which is what
+/// `GetWebACL`/`GetIPSet`/`GetRuleGroup`/`GetRegexPatternSet` resolve and what
+/// `AssociateWebACL` takes, rather than values these naming rules computed.
+pub const WAFV2_WEB_ACL: &str = "AWS::WAFv2::WebACL";
+pub const WAFV2_RULE_GROUP: &str = "AWS::WAFv2::RuleGroup";
+pub const WAFV2_IP_SET: &str = "AWS::WAFv2::IPSet";
+pub const WAFV2_REGEX_PATTERN_SET: &str = "AWS::WAFv2::RegexPatternSet";
 
 /// An Amazon Managed Grafana workspace's resource type (that service's model:
 /// `cloudFormationName: Grafana`). This is a type `super::provisioning` creates in that

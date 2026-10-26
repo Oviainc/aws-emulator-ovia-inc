@@ -89,6 +89,15 @@
 //!   `IPSetDescriptors` entry is INSERTed by an `UpdateIPSet`, and both carry a change
 //!   token of their own. Its identity is its owning service's too ("Ref returns the IPSet
 //!   ID"), so its arm answers the `IPSetId` AWS WAF returned as the resource's physical id.
+//! * the four `AWS::WAFv2::*` types — a web ACL, a rule group, an IP set and a regex
+//!   pattern set — have properties that ARE their create's own members, named identically on
+//!   both sides, so the evaluated document is the request with the name CloudFormation
+//!   decides set on it. One member is spelled differently on the two sides and is rewritten
+//!   both ways ([`wafv2_byte_match_rewritten`]): a byte-match statement's search value is a
+//!   BLOB, which the wire carries base64-encoded while a template declares the bytes. Each
+//!   type's identity is WAF's own — its create assigns the entity `Id` and builds the ARN
+//!   that carries the scope, the name and that id — so its arm answers both, and what the
+//!   stack publishes for the resource is what `AssociateWebACL` and the `Get…` calls take.
 //! * `AWS::Grafana::Workspace`'s properties are `CreateWorkspace`'s own members under
 //!   DIFFERENT names — the type spells the workspace's own fields without the `workspace`
 //!   prefix that API carries (`Name`/`Description`/`RoleArn`/`DataSources` against
@@ -261,7 +270,8 @@ use super::template::{
     S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX,
     S3VECTORS_VECTOR_BUCKET, SAGEMAKER_MODEL_PACKAGE_GROUP, SCHEDULER_SCHEDULE,
     SCHEDULER_SCHEDULE_GROUP, SNS_TOPIC, SQS_QUEUE, SSM_PARAMETER, STEP_FUNCTIONS_ACTIVITY,
-    TRANSFER_SERVER, WAF_REGIONAL_IP_SET,
+    TRANSFER_SERVER, WAFV2_IP_SET, WAFV2_REGEX_PATTERN_SET, WAFV2_RULE_GROUP, WAFV2_WEB_ACL,
+    WAF_REGIONAL_IP_SET,
 };
 use super::StoredResource;
 
@@ -327,6 +337,10 @@ pub(super) enum Provisioner {
     SnsTopic,
     FisExperimentTemplate,
     WafRegionalIpSet,
+    Wafv2WebAcl,
+    Wafv2RuleGroup,
+    Wafv2IpSet,
+    Wafv2RegexPatternSet,
     GrafanaWorkspace,
     GuardDutyDetector,
     MskCluster,
@@ -380,6 +394,10 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         SNS_TOPIC => Some(Provisioner::SnsTopic),
         FIS_EXPERIMENT_TEMPLATE => Some(Provisioner::FisExperimentTemplate),
         WAF_REGIONAL_IP_SET => Some(Provisioner::WafRegionalIpSet),
+        WAFV2_WEB_ACL => Some(Provisioner::Wafv2WebAcl),
+        WAFV2_RULE_GROUP => Some(Provisioner::Wafv2RuleGroup),
+        WAFV2_IP_SET => Some(Provisioner::Wafv2IpSet),
+        WAFV2_REGEX_PATTERN_SET => Some(Provisioner::Wafv2RegexPatternSet),
         GRAFANA_WORKSPACE => Some(Provisioner::GrafanaWorkspace),
         GUARDDUTY_DETECTOR => Some(Provisioner::GuardDutyDetector),
         MSK_CLUSTER => Some(Provisioner::MskCluster),
@@ -474,6 +492,30 @@ impl Provisioner {
             // `AWS::WAFRegional::IPSet` publishes `Name` and `IPSetDescriptors` and no
             // `Tags`: the type is not taggable, so no tags are propagated to it.
             Self::WafRegionalIpSet => create_ip_set(ctx, region, resource).await,
+            // Each WAFv2 type publishes a `Tags` property and its create takes that list as
+            // its own member, so a stack's resources in WAF carry the tags CloudFormation
+            // gives them. Every arm is the same call sequence under the type's own
+            // operation names ([`Wafv2Calls`]).
+            Self::Wafv2WebAcl => {
+                create_wafv2_entity(ctx, region, resource, propagated, WAFV2_WEB_ACL_CALLS).await
+            }
+            Self::Wafv2RuleGroup => {
+                create_wafv2_entity(ctx, region, resource, propagated, WAFV2_RULE_GROUP_CALLS)
+                    .await
+            }
+            Self::Wafv2IpSet => {
+                create_wafv2_entity(ctx, region, resource, propagated, WAFV2_IP_SET_CALLS).await
+            }
+            Self::Wafv2RegexPatternSet => {
+                create_wafv2_entity(
+                    ctx,
+                    region,
+                    resource,
+                    propagated,
+                    WAFV2_REGEX_PATTERN_SET_CALLS,
+                )
+                .await
+            }
             // `AWS::Grafana::Workspace` publishes no `Tags` property either, so the type
             // is not taggable and no stack tags are propagated to it.
             Self::GrafanaWorkspace => create_workspace(ctx, region, resource).await,
@@ -811,6 +853,21 @@ impl Provisioner {
                 delete_experiment_template(ctx, region, physical_resource_id).await
             }
             Self::WafRegionalIpSet => delete_ip_set(ctx, region, physical_resource_id).await,
+            // WAF addresses an entity by the triple its create fixed — the declared name
+            // and scope and the id that service assigned — so the delete takes the whole
+            // record rather than the id.
+            Self::Wafv2WebAcl => {
+                delete_wafv2_entity(ctx, region, resource, WAFV2_WEB_ACL_CALLS).await
+            }
+            Self::Wafv2RuleGroup => {
+                delete_wafv2_entity(ctx, region, resource, WAFV2_RULE_GROUP_CALLS).await
+            }
+            Self::Wafv2IpSet => {
+                delete_wafv2_entity(ctx, region, resource, WAFV2_IP_SET_CALLS).await
+            }
+            Self::Wafv2RegexPatternSet => {
+                delete_wafv2_entity(ctx, region, resource, WAFV2_REGEX_PATTERN_SET_CALLS).await
+            }
             Self::GrafanaWorkspace => {
                 delete_workspace(ctx, region, physical_resource_id).await
             }
@@ -969,6 +1026,19 @@ impl Provisioner {
                 describe_experiment_template(ctx, region, physical_resource_id).await
             }
             Self::WafRegionalIpSet => describe_ip_set(ctx, region, physical_resource_id).await,
+            // Read back by the same triple the delete addresses the entity by.
+            Self::Wafv2WebAcl => {
+                describe_wafv2_entity(ctx, region, resource, WAFV2_WEB_ACL_CALLS).await
+            }
+            Self::Wafv2RuleGroup => {
+                describe_wafv2_entity(ctx, region, resource, WAFV2_RULE_GROUP_CALLS).await
+            }
+            Self::Wafv2IpSet => {
+                describe_wafv2_entity(ctx, region, resource, WAFV2_IP_SET_CALLS).await
+            }
+            Self::Wafv2RegexPatternSet => {
+                describe_wafv2_entity(ctx, region, resource, WAFV2_REGEX_PATTERN_SET_CALLS).await
+            }
             Self::GrafanaWorkspace => {
                 describe_workspace(ctx, region, physical_resource_id).await
             }
@@ -5423,6 +5493,371 @@ async fn call_waf_regional(
         region,
         AWS_JSON_1_1,
         &format!("{WAF_REGIONAL_TARGET_PREFIX}.{operation}"),
+        request,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// AWS WAF (WAFv2): AWS::WAFv2::WebACL, ::RuleGroup, ::IPSet, ::RegexPatternSet
+// ---------------------------------------------------------------------------
+
+/// WAF's signing name and `X-Amz-Target` prefix, from the WAFv2 model (`sigv4Name: wafv2`,
+/// service shape `AWSWAF_20190729`), which speaks `awsJson1_1`.
+const WAFV2_SIGNING_NAME: &str = "wafv2";
+const WAFV2_TARGET_PREFIX: &str = "AWSWAF_20190729";
+
+/// The code WAF answers for an entity it does not hold (`WAFNonexistentItemException`: "WAF
+/// couldn't perform the operation because your resource doesn't exist").
+const WAFV2_NONEXISTENT_ITEM: &str = "WAFNonexistentItemException";
+
+/// The member every WAFv2 create answers the created entity's high-level information under:
+/// its name, the `Id` WAF assigned and the `ARN` WAF built, "that you provide to operations
+/// like `AssociateWebACL`" (`WebACLSummary`, and the same shape per entity kind).
+const WAFV2_SUMMARY: &str = "Summary";
+
+/// The property a WAFv2 entity declares the namespace it lives in under, which every call
+/// addressing one carries: "specifies whether this is for a global resource type, such as a
+/// Amazon CloudFront distribution" — `CLOUDFRONT` or `REGIONAL` (`Scope`).
+const WAFV2_SCOPE: &str = "Scope";
+
+/// The statement whose search value is a BLOB on the wire, and the two spellings a template
+/// declares that value in ([`wafv2_search_string_encoded`]).
+const WAFV2_BYTE_MATCH_STATEMENT: &str = "ByteMatchStatement";
+const WAFV2_SEARCH_STRING: &str = "SearchString";
+const WAFV2_SEARCH_STRING_BASE64: &str = "SearchStringBase64";
+
+/// The calls one KIND of WAFv2 entity is created, read and deleted through.
+///
+/// The four types this emulator provisions differ only in these names: each `Create…` takes
+/// the type's properties as its own members and answers a [`WAFV2_SUMMARY`], each `Get…`
+/// answers the entity under its own member beside the `LockToken` that read marks its state
+/// at, and each `Delete…` takes `Name`, `Scope`, `Id` and that `LockToken`. So one create,
+/// read and delete serve all four, and adding a WAFv2 type is a table entry.
+struct Wafv2Calls {
+    /// The operation that creates one.
+    create: &'static str,
+    /// The operation that reads one back.
+    get: &'static str,
+    /// The member `get` answers the entity under (`WebACL`, `IPSet`, …).
+    entity: &'static str,
+    /// The operation that deletes one.
+    delete: &'static str,
+}
+
+const WAFV2_WEB_ACL_CALLS: &Wafv2Calls = &Wafv2Calls {
+    create: "CreateWebACL",
+    get: "GetWebACL",
+    entity: "WebACL",
+    delete: "DeleteWebACL",
+};
+
+const WAFV2_RULE_GROUP_CALLS: &Wafv2Calls = &Wafv2Calls {
+    create: "CreateRuleGroup",
+    get: "GetRuleGroup",
+    entity: "RuleGroup",
+    delete: "DeleteRuleGroup",
+};
+
+const WAFV2_IP_SET_CALLS: &Wafv2Calls = &Wafv2Calls {
+    create: "CreateIPSet",
+    get: "GetIPSet",
+    entity: "IPSet",
+    delete: "DeleteIPSet",
+};
+
+const WAFV2_REGEX_PATTERN_SET_CALLS: &Wafv2Calls = &Wafv2Calls {
+    create: "CreateRegexPatternSet",
+    get: "GetRegexPatternSet",
+    entity: "RegexPatternSet",
+    delete: "DeleteRegexPatternSet",
+};
+
+/// Create the WAFv2 entity a declaration of one of the four types describes, and answer the
+/// identity WAF MINTED for it: the `Id` it assigned as the resource's physical id, and the
+/// `ARN` it built as the resource's `Arn`/`<Type>Arn` attributes.
+///
+/// Those identifiers are WAF's to produce, not CloudFormation's to compute: a WAFv2 ARN is
+/// `…:wafv2:<region>:<account>:<global|regional>/<kind>/<name>/<id>`, which carries the
+/// scope the declaration asked for and the entity id that service assigned, so it can be
+/// decomposed into the triple the API addresses an entity by. That is why it is read off
+/// the create's own answer and reported back here: what the stack publishes for the
+/// resource is what a client can hand straight to `AssociateWebACL`, a logging
+/// configuration or a `Get…`, instead of a value that identifies nothing.
+async fn create_wafv2_entity(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+    calls: &'static Wafv2Calls,
+) -> Result<Created, Refusal> {
+    let request = wafv2_create_request(resource, propagated)?;
+    let answered = call_wafv2(ctx, region, calls.create, &request).await?;
+    let summary = reported_member(&answered, WAFV2_SUMMARY);
+    let (Some(id), Some(arn)) = (
+        summary.get("Id").and_then(scalar_text),
+        summary.get("ARN").and_then(scalar_text),
+    ) else {
+        // The create answered success and identified nothing, so there is neither an id to
+        // address the entity by nor an ARN to publish for it: not something this stack can
+        // report as a created resource.
+        return Err(Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: format!("{} answered no Summary.Id or Summary.ARN", calls.create),
+        });
+    };
+    Ok(Created {
+        physical_resource_id: Some(id),
+        attributes: super::template::arn_attributes(&resource.resource_type, &arn)
+            .into_iter()
+            .collect(),
+    })
+}
+
+/// Delete the WAFv2 entity a stack created.
+///
+/// The delete carries the `LockToken` of the entity as it stands — "you provide the token to
+/// operations like update and delete. WAF uses the token to ensure that no changes have been
+/// made to the entity since you last retrieved it" — so the entity is read first and the
+/// token that read answered is what the delete is made with. One WAF no longer holds is
+/// already in the state the delete asks for, judged on its own not-found CODE and never on a
+/// message. One a protected resource is still associated with, or another entity still
+/// references, is NOT deleted (`WAFAssociatedItemException`), and that refusal is what the
+/// stack reports.
+async fn delete_wafv2_entity(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    calls: &'static Wafv2Calls,
+) -> Result<(), Refusal> {
+    let Some((_, lock_token)) = read_wafv2_entity(ctx, region, resource, calls).await? else {
+        return Ok(());
+    };
+    let Some(lock_token) = lock_token else {
+        return Err(Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: format!("{} answered no LockToken", calls.get),
+        });
+    };
+    let mut request = wafv2_entity_key(resource);
+    if let Some(members) = request.as_object_mut() {
+        members.insert("LockToken".to_string(), Value::String(lock_token));
+    }
+    match call_wafv2(ctx, region, calls.delete, &request).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == WAFV2_NONEXISTENT_ITEM => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The entity as WAF reports it, for drift detection. One it no longer holds was deleted.
+///
+/// The document the read answers carries the entity's members under exactly the names the
+/// type's properties have (`Description`, `Rules`, `VisibilityConfig`, `Addresses`), so it
+/// is the actual configuration the declared one is compared against — with the one member
+/// whose SPELLING differs between the two sides reported in both of the spellings a template
+/// writes it in ([`wafv2_search_string_decoded`]), so an entity nobody changed is not
+/// reported as modified whichever of them its declaration used.
+async fn describe_wafv2_entity(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    calls: &'static Wafv2Calls,
+) -> Result<Option<Value>, Refusal> {
+    let Some((entity, _)) = read_wafv2_entity(ctx, region, resource, calls).await? else {
+        return Ok(None);
+    };
+    wafv2_byte_match_rewritten(&entity, 0, wafv2_search_string_decoded).map(Some)
+}
+
+/// One WAFv2 entity as its own `Get…` answers it, with the `LockToken` that read marked its
+/// state at. `None` is WAF answering that it no longer holds the entity
+/// ([`WAFV2_NONEXISTENT_ITEM`]).
+async fn read_wafv2_entity(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    calls: &'static Wafv2Calls,
+) -> Result<Option<(Value, Option<String>)>, Refusal> {
+    let request = wafv2_entity_key(resource);
+    match call_wafv2(ctx, region, calls.get, &request).await {
+        Ok(answer) => {
+            let lock_token = answer.get("LockToken").and_then(scalar_text);
+            Ok(Some((reported_member(&answer, calls.entity), lock_token)))
+        }
+        Err(refusal) if refusal.code == WAFV2_NONEXISTENT_ITEM => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The `Create…` request a WAFv2 declaration is.
+///
+/// These types' properties ARE their create's own members, named identically on both sides
+/// (`Scope`, `DefaultAction`, `Rules`, `VisibilityConfig`, `Addresses`,
+/// `RegularExpressionList`, `Capacity`, `CustomResponseBodies`), so the evaluated property
+/// document goes through as the template wrote it, with the one member CloudFormation
+/// decides (the name) set on the way out and the tag list replaced by the set the resource is
+/// to carry ([`tags_of`]) — WAF's `TagList` is `length 1..`, so a resource with no tag at all
+/// carries the member not at all rather than an empty list.
+///
+/// The one member whose SPELLING differs is a byte-match statement's search value
+/// ([`wafv2_search_string_encoded`]).
+fn wafv2_create_request(
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Value, Refusal> {
+    let declared = wafv2_byte_match_rewritten(&resource.properties, 0, wafv2_search_string_encoded)?;
+    let mut request = declared.as_object().cloned().unwrap_or_default();
+    request.insert("Name".to_string(), Value::String(declared_name(resource)));
+    let tags = tags_of(&resource.properties, propagated);
+    if tags.is_empty() {
+        request.remove("Tags");
+    } else {
+        request.insert("Tags".to_string(), tags_as_list(&tags, UPPER_CASED_TAG));
+    }
+    Ok(Value::Object(request))
+}
+
+/// The triple WAF addresses one entity by: the NAME the declaration asked for, the SCOPE it
+/// declared and the `Id` that service assigned, which is this resource's physical id.
+///
+/// A declaration with no `Scope` carries none, and WAF's own validation of its required
+/// member is what refuses the call — this module never stands a value in for one the
+/// template did not declare.
+fn wafv2_entity_key(resource: &StoredResource) -> Value {
+    let mut key = Map::new();
+    key.insert("Name".to_string(), Value::String(declared_name(resource)));
+    if let Some(scope) = property(resource, WAFV2_SCOPE) {
+        key.insert(WAFV2_SCOPE.to_string(), Value::String(scope));
+    }
+    key.insert(
+        "Id".to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    Value::Object(key)
+}
+
+/// The same document with `rewrite` applied to the members of every `ByteMatchStatement` in
+/// it, and everything else — the rules around it, the statements it is nested in — carried
+/// through as it stands.
+///
+/// A byte-match statement is the one place a WAFv2 rule tree holds a BLOB
+/// (`ByteMatchStatement$SearchString`, "a string value that you want WAF to search for"),
+/// and a blob travels base64-encoded on the awsJson wire while a template declares the bytes
+/// themselves. Both directions of that one difference are this walk's `rewrite`, so the
+/// request a declaration becomes and the configuration the entity reads back as are spelled
+/// the way each side spells them. The statement's own members carry no further statement, so
+/// a rewritten one is not descended into.
+///
+/// `depth` is how many levels are already above this one, so the outermost call passes `0`;
+/// a document deeper than [`MAX_PROPERTY_NESTING`] is refused rather than walked.
+fn wafv2_byte_match_rewritten(
+    value: &Value,
+    depth: usize,
+    rewrite: fn(&Map<String, Value>) -> Map<String, Value>,
+) -> Result<Value, Refusal> {
+    if depth >= MAX_PROPERTY_NESTING {
+        return Err(too_deeply_nested());
+    }
+    match value {
+        Value::Object(members) => {
+            let mut rewritten = Map::new();
+            for (key, member) in members {
+                let member = match (key.as_str(), member) {
+                    (WAFV2_BYTE_MATCH_STATEMENT, Value::Object(statement)) => {
+                        Value::Object(rewrite(statement))
+                    }
+                    _ => wafv2_byte_match_rewritten(member, depth + 1, rewrite)?,
+                };
+                rewritten.insert(key.clone(), member);
+            }
+            Ok(Value::Object(rewritten))
+        }
+        Value::Array(items) => {
+            let mut rewritten = Vec::with_capacity(items.len());
+            for item in items {
+                rewritten.push(wafv2_byte_match_rewritten(item, depth + 1, rewrite)?);
+            }
+            Ok(Value::Array(rewritten))
+        }
+        scalar => Ok(scalar.clone()),
+    }
+}
+
+/// One byte-match statement as the API takes it: its search value base64-encoded, which is
+/// how the awsJson wire carries the blob `SearchString` is.
+///
+/// A template declares that value in one of two spellings — the bytes as text, or the
+/// already-encoded form for bytes that are not text — and both name the same blob, so the
+/// encoded spelling goes through as it is and the text one is encoded here. The codec is
+/// `aws_smithy_types::base64`, the one the wire serializers of this workspace use.
+///
+/// A declaration whose encoded spelling is not a scalar is NOT one of the two, and is left
+/// exactly as written: WAF's own validation of the member it then does not carry is what
+/// judges it, rather than this walk dropping the value a template did declare.
+fn wafv2_search_string_encoded(statement: &Map<String, Value>) -> Map<String, Value> {
+    let mut rewritten = statement.clone();
+    let already_encoded = rewritten
+        .get(WAFV2_SEARCH_STRING_BASE64)
+        .and_then(scalar_text);
+    if let Some(encoded) = already_encoded {
+        rewritten.remove(WAFV2_SEARCH_STRING_BASE64);
+        rewritten.insert(WAFV2_SEARCH_STRING.to_string(), Value::String(encoded));
+        return rewritten;
+    }
+    if let Some(declared) = rewritten.get(WAFV2_SEARCH_STRING).and_then(scalar_text) {
+        rewritten.insert(
+            WAFV2_SEARCH_STRING.to_string(),
+            Value::String(::aws_smithy_types::base64::encode(declared)),
+        );
+    }
+    rewritten
+}
+
+/// One byte-match statement as a TEMPLATE spells it: the search value in BOTH spellings a
+/// template can declare it in, so the drift comparison — which compares only a member the
+/// declaration itself carries — finds it in the spelling that declaration wrote, and an
+/// entity nobody changed is not reported as modified.
+///
+/// The encoded spelling is always reported, being the one the wire carried. The text
+/// spelling is reported beside it where the bytes ARE text; bytes that are not text have no
+/// text spelling, which is why a template declaring them has to use the encoded one.
+fn wafv2_search_string_decoded(statement: &Map<String, Value>) -> Map<String, Value> {
+    let mut rewritten = statement.clone();
+    let Some(encoded) = rewritten.get(WAFV2_SEARCH_STRING).and_then(scalar_text) else {
+        return rewritten;
+    };
+    let decoded = ::aws_smithy_types::base64::decode(&encoded)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+    rewritten.insert(
+        WAFV2_SEARCH_STRING_BASE64.to_string(),
+        Value::String(encoded),
+    );
+    match decoded {
+        Some(text) => {
+            rewritten.insert(WAFV2_SEARCH_STRING.to_string(), Value::String(text));
+        }
+        None => {
+            rewritten.remove(WAFV2_SEARCH_STRING);
+        }
+    }
+    rewritten
+}
+
+/// Call one WAFv2 operation on the awsJson1_1 wire its model declares.
+async fn call_wafv2(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    operation: &str,
+    request: &Value,
+) -> Result<Value, Refusal> {
+    call_json_rpc(
+        ctx,
+        WAFV2_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{WAFV2_TARGET_PREFIX}.{operation}"),
         request,
     )
     .await
@@ -11220,8 +11655,8 @@ mod tests {
         );
     }
 
-    /// A property document deeper than [`MAX_PROPERTY_NESTING`] is REFUSED by both
-    /// re-casing walks, and one at the bound is carried.
+    /// A property document deeper than [`MAX_PROPERTY_NESTING`] is REFUSED by every bounded
+    /// walk over one, and one at the bound is carried.
     ///
     /// The nesting of an evaluated property document is the REQUESTER's choice, and a
     /// recursive walk over it that is bounded by the input exhausts the native stack —
@@ -11245,14 +11680,23 @@ mod tests {
             value
         }
 
+        /// Every bounded walk, over one document.
+        fn walks(document: &Value) -> Vec<(&'static str, Result<Value, Refusal>)> {
+            vec![
+                ("camel_cased", camel_cased(document, 0)),
+                ("lower_camel_members", lower_camel_members(document, 0)),
+                (
+                    "wafv2_byte_match_rewritten",
+                    wafv2_byte_match_rewritten(document, 0, wafv2_search_string_encoded),
+                ),
+            ]
+        }
+
         for shape in ["objects", "arrays", "alternating"] {
             // The deepest document the walk carries: the leaf sits at depth
             // MAX_PROPERTY_NESTING - 1, so the walk never reaches the bound.
             let carried = nested(shape, MAX_PROPERTY_NESTING - 1);
-            for (walk, converted) in [
-                ("camel_cased", camel_cased(&carried, 0)),
-                ("lower_camel_members", lower_camel_members(&carried, 0)),
-            ] {
+            for (walk, converted) in walks(&carried) {
                 assert!(
                     converted.is_ok(),
                     "case {walk}({shape} at the bound): expected the document to be carried, \
@@ -11263,10 +11707,7 @@ mod tests {
 
             for levels in [MAX_PROPERTY_NESTING + 1, MAX_PROPERTY_NESTING * 4] {
                 let too_deep = nested(shape, levels);
-                for (walk, refused) in [
-                    ("camel_cased", camel_cased(&too_deep, 0)),
-                    ("lower_camel_members", lower_camel_members(&too_deep, 0)),
-                ] {
+                for (walk, refused) in walks(&too_deep) {
                     let refusal = refused.err().unwrap_or_else(|| {
                         panic!("case {walk}({shape}, {levels} levels): expected a refusal")
                     });
@@ -11276,6 +11717,112 @@ mod tests {
                          {refusal:?}"
                     );
                 }
+            }
+        }
+    }
+
+    /// A byte-match statement's search value survives the round trip between the two
+    /// spellings a template declares it in and the base64 the blob travels as.
+    ///
+    /// The rows differ along the spelling the declaration uses and along what the bytes are:
+    /// text, text carrying the characters base64's own alphabet uses, a single byte, and
+    /// bytes that are not text at all (declarable only in the encoded spelling). Each row
+    /// goes through the walk, so the statement is rewritten where it really sits — nested
+    /// inside a rule's `Statement`.
+    #[test]
+    fn a_byte_match_search_value_round_trips_through_both_template_spellings() {
+        // The bytes of each row, which the wire carries as their base64.
+        let rows: Vec<(&str, Vec<u8>)> = vec![
+            ("plain text", b"sim2real-block".to_vec()),
+            ("text with base64's own alphabet", b"a+b/c=d".to_vec()),
+            ("a single byte", b"/".to_vec()),
+            // Not UTF-8, so a template can only declare these in the encoded spelling.
+            ("bytes that are not text", vec![0xff, 0xfe, 0x00, 0x41]),
+        ];
+
+        for (case, bytes) in rows {
+            let encoded = ::aws_smithy_types::base64::encode(&bytes);
+            let text = String::from_utf8(bytes.clone()).ok();
+            // Both spellings of the same bytes: the text one where the bytes are text, and
+            // the encoded one always.
+            let mut declarations: Vec<(&str, String)> = Vec::new();
+            if let Some(text) = text.clone() {
+                declarations.push((WAFV2_SEARCH_STRING, text));
+            }
+            declarations.push((WAFV2_SEARCH_STRING_BASE64, encoded.clone()));
+
+            for (spelling, declared) in declarations {
+                let mut statement = Map::new();
+                statement.insert(spelling.to_string(), Value::String(declared));
+                statement.insert(
+                    "PositionalConstraint".to_string(),
+                    Value::String("EXACTLY".to_string()),
+                );
+                let properties = serde_json::json!({
+                    "Rules": [{
+                        "Name": "OneRule",
+                        "Statement": { "ByteMatchStatement": Value::Object(statement) },
+                    }],
+                });
+                let request =
+                    wafv2_byte_match_rewritten(&properties, 0, wafv2_search_string_encoded)
+                        .unwrap_or_else(|refusal| {
+                            panic!("case {case:?}/{spelling}: expected the walk to carry the \
+                                    document, got {refusal:?}")
+                        });
+                let statement = request
+                    .pointer("/Rules/0/Statement/ByteMatchStatement")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                // The API takes ONE member, base64, whichever spelling was declared.
+                assert_eq!(
+                    statement.get(WAFV2_SEARCH_STRING).and_then(Value::as_str),
+                    Some(encoded.as_str()),
+                    "case {case:?}/{spelling}: expected the API to be sent the base64 of the \
+                     declared bytes, got {statement}"
+                );
+                assert!(
+                    statement.get(WAFV2_SEARCH_STRING_BASE64).is_none(),
+                    "case {case:?}/{spelling}: expected no encoded-spelling member in the \
+                     request, got {statement}"
+                );
+                assert_eq!(
+                    statement.get("PositionalConstraint").and_then(Value::as_str),
+                    Some("EXACTLY"),
+                    "case {case:?}/{spelling}: expected the statement's other members \
+                     carried, got {statement}"
+                );
+
+                // And the reported statement carries the value in BOTH spellings, so the
+                // drift comparison — which compares only a member the declaration carries —
+                // finds it in the one that declaration wrote.
+                let reported = wafv2_byte_match_rewritten(
+                    &request,
+                    0,
+                    wafv2_search_string_decoded,
+                )
+                .unwrap_or_else(|refusal| {
+                    panic!("case {case:?}/{spelling}: expected the walk to carry the reported \
+                            document, got {refusal:?}")
+                });
+                let statement = reported
+                    .pointer("/Rules/0/Statement/ByteMatchStatement")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                assert_eq!(
+                    statement
+                        .get(WAFV2_SEARCH_STRING_BASE64)
+                        .and_then(Value::as_str),
+                    Some(encoded.as_str()),
+                    "case {case:?}/{spelling}: expected the reported statement to carry the \
+                     encoded spelling, got {statement}"
+                );
+                assert_eq!(
+                    statement.get(WAFV2_SEARCH_STRING).and_then(Value::as_str),
+                    text.as_deref(),
+                    "case {case:?}/{spelling}: expected the reported statement to carry the \
+                     text spelling only where the bytes are text, got {statement}"
+                );
             }
         }
     }

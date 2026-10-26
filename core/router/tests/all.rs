@@ -296,6 +296,11 @@ mod mediaconvert_input_probe;
 // with all of them.
 #[path = "all/cloudformation_ec2_network_identifiers.rs"]
 mod cloudformation_ec2_network_identifiers;
+// Declared HERE, in this same quiet `n`/`o` gap rather than in the appended tail or in the
+// `c…` span beside the other `cloudformation_provisions_*` suites: both of those are where
+// every concurrently landing suite puts its line.
+#[path = "all/cloudformation_provisions_wafv2_entities.rs"]
+mod cloudformation_provisions_wafv2_entities;
 #[path = "all/partnercentral_channel_target_routing.rs"]
 mod partnercentral_channel_target_routing;
 #[path = "all/personalize_signing_name_routing.rs"]
