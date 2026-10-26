@@ -161,8 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         let Some(api) = store.apis.get_mut(&input.api_id) else {
-            return Err(not_found(crate::state::invalid_identifier_message(
-                "API",
+            return Err(not_found(crate::state::invalid_api_identifier_message(
                 &input.api_id,
             )));
         };
@@ -174,8 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // anything again.
         if !api.routes.contains_key(&input.route_id) {
             return Err(not_found(crate::state::invalid_identifier_message(
-                "Route",
-                &input.route_id,
+                crate::state::ROUTE_RESOURCE,
             )));
         }
 

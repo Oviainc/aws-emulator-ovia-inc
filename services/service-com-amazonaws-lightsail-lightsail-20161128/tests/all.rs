@@ -57,6 +57,8 @@ mod container_service_log;
 mod container_service_metric_data;
 #[path = "all/container_service_public_endpoint.rs"]
 mod container_service_public_endpoint;
+#[path = "all/container_service_update.rs"]
+mod container_service_update;
 #[path = "all/cost_estimate.rs"]
 mod cost_estimate;
 #[path = "all/disk_attachment.rs"]

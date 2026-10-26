@@ -1269,6 +1269,122 @@ pub fn decode_page_token(scope: &str, token: &str) -> Option<String> {
         .then(|| after_key.to_string())
 }
 
+/// The page-size bound a `@paginated` listing of this service enforces itself, and the
+/// page it serves when the caller asks for no `maxResults` (the maximum).
+///
+/// Treat it as THIS EMULATOR's cap on one page: the generated "Modeled contract" header
+/// of each listing lists `maxResults` without a range, so the handler enforces the bound
+/// itself (refusing, never clamping) rather than relying on the boundary validator.
+/// `smithy_query(query="operation", operation="ListDomains,ListSubscriptions")` does
+/// report a `range {min: 1, max: 100}` for the member of BOTH listings, which is where
+/// these numbers come from — and why the bound is stated once, here, rather than per
+/// handler.
+pub const MIN_PAGE_SIZE: i32 = 1;
+pub const MAX_PAGE_SIZE: i32 = 100;
+
+/// The input member every listing binds its page size to (`pageSize` of each
+/// operation's `@paginated` trait), as a refusal names it.
+const PAGE_SIZE_MEMBER: &str = "maxResults";
+
+/// The detail text of the refusal answered for a `nextToken` that is not a cursor this
+/// service issued for the collection being listed.
+const UNISSUED_PAGE_TOKEN_DETAIL: &str = "nextToken is not a token this service issued";
+
+/// One page of a paginated listing: how many records to serve, and which key to resume
+/// strictly after.
+///
+/// This is the pagination POLICY both listings of this service obey, held once beside the
+/// cursor primitives it is built on ([`encode_page_token`] / [`decode_page_token`] and
+/// the `*_page_scope` constructors): absent `maxResults` means a full page and a value
+/// outside the bound is refused rather than clamped; a `nextToken` is a resume point only
+/// when this service issued it FOR THIS collection; and a page issues a cursor only when
+/// a matching record is left after it.
+///
+/// [`Page::resolve`] answers the refusal TEXT rather than a modelled error, because the
+/// two listings refuse on different channels — the one whose model declares a
+/// `ValidationException` uses it, the one that declares no error at all uses
+/// [`crate::scaffolded::Scaffolded::validation`] — so the channel stays with the handler
+/// and only the rule is shared.
+#[derive(Debug)]
+pub struct Page {
+    /// The collection this page is a position into, as the `*_page_scope` constructors
+    /// spell it: what a cursor is issued for and checked against.
+    scope: String,
+    size: usize,
+    resume_after: Option<String>,
+}
+
+impl Page {
+    /// The page a request asks for in `scope`, or the detail text of the refusal it
+    /// earns.
+    ///
+    /// The two refusals are reported in the order the request states them: the page size
+    /// first, then the cursor.
+    pub fn resolve(
+        scope: String,
+        max_results: Option<i32>,
+        next_token: Option<&str>,
+    ) -> Result<Self, String> {
+        let size = match max_results {
+            None => MAX_PAGE_SIZE,
+            Some(requested) if (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&requested) => requested,
+            // Worded as AWS words a constraint violation, and in the one place that
+            // sentence is written (`crate::service::error_detail`), so this refusal reads
+            // identically to the boundary validator's for the same violation.
+            Some(requested) => {
+                return Err(crate::service::error_detail::range_violation_message(
+                    PAGE_SIZE_MEMBER,
+                    requested,
+                    MIN_PAGE_SIZE,
+                    MAX_PAGE_SIZE,
+                ))
+            }
+        };
+        let resume_after = match next_token {
+            None => None,
+            Some(token) => match decode_page_token(&scope, token) {
+                Some(key) => Some(key),
+                None => return Err(UNISSUED_PAGE_TOKEN_DETAIL.to_string()),
+            },
+        };
+        Ok(Self {
+            // The bound above is inside `usize` on every target, so the fallback is
+            // unreachable; it is the smallest page rather than an unbounded one.
+            size: usize::try_from(size).unwrap_or(1),
+            scope,
+            resume_after,
+        })
+    }
+
+    /// How many records this page serves at most.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Whether `key` lies after this page's resume point — the filter a listing applies
+    /// to the collection it enumerates.
+    ///
+    /// A page with no cursor starts at the beginning; a page resuming from one starts
+    /// STRICTLY after the key that cursor carries, whether or not that record still
+    /// exists.
+    pub fn starts_after(&self, key: &str) -> bool {
+        self.resume_after
+            .as_deref()
+            .is_none_or(|after| key > after)
+    }
+
+    /// The `nextToken` this page reports: a cursor for `last_key` when a matching record
+    /// is left after the page (`more_after_page`), and otherwise none at all — so a
+    /// caller is handed a cursor only when there is something to resume to, and an empty
+    /// page never carries one.
+    pub fn next_token(&self, more_after_page: bool, last_key: Option<&str>) -> Option<String> {
+        match (more_after_page, last_key) {
+            (true, Some(last)) => Some(encode_page_token(&self.scope, last)),
+            _ => None,
+        }
+    }
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.

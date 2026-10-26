@@ -149,26 +149,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // A reporting operation: it reads the store and writes nothing.
         let store = state.lock();
-        let Some(api) = store.apis.get(&input.api_id) else {
+        // A deployment is addressed WITHIN the api that owns it (`GET
+        // /v2/apis/{ApiId}/deployments/{DeploymentId}`), so the pair is ONE lookup and
+        // the refusal names the resource this call addressed — the deployment — rather
+        // than the api it is scoped by: an api the store no longer holds carries no such
+        // deployment either.
+        let Some(record) = store
+            .apis
+            .get(&input.api_id)
+            .and_then(|api| api.deployments.get(&input.deployment_id))
+        else {
             return Err(GetDeploymentErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!(
-                        "Invalid API identifier specified {}:{}",
-                        ::engine::emulator_account_id(),
-                        input.api_id
-                    )),
-                    resource_type: ::std::option::Option::None,
-                },
-            )
-            .into());
-        };
-        let Some(record) = api.deployments.get(&input.deployment_id) else {
-            return Err(GetDeploymentErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(format!(
-                        "Invalid Deployment identifier specified {}:{}",
-                        ::engine::emulator_account_id(),
-                        input.deployment_id
+                    message: Some(crate::state::invalid_identifier_message(
+                        crate::state::DEPLOYMENT_RESOURCE,
                     )),
                     resource_type: ::std::option::Option::None,
                 },

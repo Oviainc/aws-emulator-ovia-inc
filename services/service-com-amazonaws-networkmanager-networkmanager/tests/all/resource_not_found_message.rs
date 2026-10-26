@@ -16,7 +16,10 @@
 //! Every row is an operation acting on an EXISTING resource, which is what makes the
 //! absent resource a not-found. A CREATE whose input merely REFERENCES a parent that does
 //! not exist is the other half of the rule — a field-validation failure on the referencing
-//! member — and is pinned by `unknown_parent_reference`.
+//! member — and is pinned by `unknown_parent_reference`. A LISTING whose query string
+//! merely SELECTS among stored resources is neither: an id it names that matches nothing
+//! is dropped and the page is answered (`describe_global_networks_id_resolution`), so no
+//! row below is such a request.
 
 use serde_json::{json, Value};
 
@@ -74,9 +77,9 @@ async fn assert_not_found(emulator: &Emulator, row: &NotFoundCase) {
 /// caller can assert whatever else its own operation owes.
 ///
 /// Shared with the suites that pin ONE operation's not-found refusal
-/// (`crate::describe_global_networks_id_resolution`), so the message rule — the constant
-/// text plus the identifying detail in `ResourceId` / `ResourceType` — is asserted in
-/// exactly one place.
+/// (`crate::get_core_network_policy_selection`), so the message rule — the constant text
+/// plus the identifying detail in `ResourceId` / `ResourceType` — is asserted in exactly
+/// one place.
 pub(crate) async fn assert_not_found_answer(
     emulator: &Emulator,
     case: &str,
@@ -160,14 +163,6 @@ async fn every_not_found_refusal_carries_the_constant_message_and_identifies_the
             case: "DeleteGlobalNetwork on a deleted global network",
             method: "DELETE",
             uri: format!("/global-networks/{gone_network}"),
-            body: None,
-            resource_id: gone_network.clone(),
-            resource_type: GLOBAL_NETWORK,
-        },
-        NotFoundCase {
-            case: "DescribeGlobalNetworks naming a deleted global network",
-            method: "GET",
-            uri: format!("/global-networks?globalNetworkIds={gone_network}"),
             body: None,
             resource_id: gone_network.clone(),
             resource_type: GLOBAL_NETWORK,

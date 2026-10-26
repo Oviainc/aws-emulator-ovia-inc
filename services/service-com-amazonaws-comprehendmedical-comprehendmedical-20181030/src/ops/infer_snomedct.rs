@@ -2007,7 +2007,11 @@ const TERMS: &[Term] = &[
 
 /// Words that place the mention after them in the patient's history rather than in the
 /// present, which is what the modelled `PAST_HISTORY` trait reports.
-const PAST_HISTORY_CUES: &[&str] = &[
+///
+/// `PAST_HISTORY` is a member of this ontology's trait enum AND of the RxNorm one, so
+/// `crate::ops::infer_rx_norm` reads this one vocabulary rather than carrying a second
+/// copy of it.
+pub(crate) const PAST_HISTORY_CUES: &[&str] = &[
     "history",
     "hx",
     "previously",
@@ -2135,8 +2139,10 @@ fn modifier_type(token: &Token) -> Option<&'static str> {
     None
 }
 
-/// Tokens between two spans of one clause.
-fn token_distance(left: &Span, right: &Span) -> usize {
+/// Tokens between two spans of one clause. Shared with `crate::ops::infer_rx_norm`,
+/// which measures the distance from a medication mention to a part of its prescription
+/// the same way.
+pub(crate) fn token_distance(left: &Span, right: &Span) -> usize {
     if left.tokens.end <= right.tokens.start {
         right.tokens.start - left.tokens.end
     } else {

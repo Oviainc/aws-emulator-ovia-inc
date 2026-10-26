@@ -39,7 +39,18 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! One of those seams is taken here, for the reason named in [`request_id_header`]: a
+//! refusal of this service states the id of the call it answers in its document, and AWS
+//! reports that same id in the response's `x-amzn-requestid` header, which the framework's
+//! awsJson renderer does not write. `override_operation` wraps the operation the routing
+//! table names, so the header reaches a handler-returned modelled error, the scaffold's
+//! 501 and a refusal raised while serving it. Everything else about those paths — status,
+//! `__type`, `Message`, the whole success path — stays with the framework.
 
+pub mod request_id_header;
+
+use request_id_header::RequestIdHeaderOperation;
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
@@ -52,6 +63,9 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The wrapper every routable request is served through, so the answer carries the
+    /// request id its document states; see [`request_id_header`].
+    request_id_header: RequestIdHeaderOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +75,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            request_id_header: RequestIdHeaderOperation,
         }
     }
 }
@@ -87,12 +102,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Every request the generated routing table can serve is served through the
+        // header wrapper, which delegates to that same table entry and then reports the
+        // answer's own request id in the header AWS carries it in (see
+        // [`request_id_header`]). The routing stays the model's: a request whose target
+        // names no modelled operation is declined here, so the framework answers it as
+        // the unroutable request it is.
+        let routes = self
+            .entry
+            .protocol()
+            .routing_key(req)
+            .ok()
+            .and_then(|key| self.entry.routing_table().get(key))
+            .is_some();
+        routes.then_some(&self.request_id_header as _)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
