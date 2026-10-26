@@ -230,8 +230,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names another service's resource, or nothing at all, is refused here.
         if let Some(kms_key_id) = input.kms_key_id.as_deref() {
             if !crate::state::is_kms_key_id(kms_key_id) {
-                return Err(invalid(format!(
-                    "kmsKeyId must name a KMS key, got '{kms_key_id}'"
+                return Err(invalid(crate::state::not_a_kms_key_message(
+                    "kmsKeyId",
+                    kms_key_id,
                 )));
             }
         }
