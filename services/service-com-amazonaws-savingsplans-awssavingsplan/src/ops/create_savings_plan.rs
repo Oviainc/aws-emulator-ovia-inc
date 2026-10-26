@@ -277,10 +277,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stores is exact.
         let term_hours = offering.term_hours();
         let total = commitment.saturating_mul(term_hours);
+        // The amount is kept alongside the parsed units AS THE CALLER SPELLED
+        // IT, so a clause that reports it back reports the request's own value
+        // rather than the magnitude this service read it at.
         let supplied_upfront = match input.upfront_payment_amount.as_deref() {
-            Some(amount) => Some(
+            Some(amount) => Some((
+                amount,
                 crate::state::parse_amount("upfrontPaymentAmount", amount).map_err(validation)?,
-            ),
+            )),
             None => None,
         };
 
@@ -304,21 +308,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let min = crate::state::ceil_to_whole(crate::state::divide_rounded(total, 2));
                 let max = crate::state::floor_to_whole(total.saturating_mul(99) / 100);
                 let upfront = match supplied_upfront {
-                    Some(upfront) => {
+                    Some((sent, upfront)) => {
                         if !crate::state::is_whole(upfront) {
                             return Err(validation(format!(
-                                "upfrontPaymentAmount must be a whole number, got '{}'",
-                                crate::state::format_amount(upfront)
+                                "upfrontPaymentAmount must be a whole number, got '{sent}'"
                             )));
                         }
                         if upfront < min || upfront > max {
                             return Err(validation(format!(
                                 "upfrontPaymentAmount must be a whole number between 50 and 99 \
                                  percent of the total value of the Savings Plan ({} to {}), got \
-                                 '{}'",
+                                 '{sent}'",
                                 crate::state::format_amount(min),
                                 crate::state::format_amount(max),
-                                crate::state::format_amount(upfront)
                             )));
                         }
                         upfront

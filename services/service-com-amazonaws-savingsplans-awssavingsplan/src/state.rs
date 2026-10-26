@@ -190,6 +190,19 @@ pub const AMOUNT_SCALE: i128 = 100_000_000;
 /// The service's own rendering is wider (see [`AMOUNT_WIRE_DIGITS`]).
 pub const MAX_AMOUNT_DIGITS: usize = 5;
 
+/// The magnitude a well-formed decimal amount too large to hold at
+/// [`AMOUNT_SCALE`] is read at: the largest WHOLE amount the held scale can
+/// represent.
+///
+/// How many digits a number is spelled with says nothing about its FORM: a
+/// decimal number wider than this scale can hold exactly is still a decimal
+/// number, so it is read as the enormous amount it is and refused by whatever
+/// rule governs its member's magnitude — every bound this service publishes is
+/// many orders of magnitude below this — rather than reported as malformed. It
+/// is deliberately a whole amount, so a member whose rule asks for a whole
+/// number is still answered with the range it missed.
+pub const AMOUNT_OVERFLOW_UNITS: i128 = (i128::MAX / AMOUNT_SCALE) * AMOUNT_SCALE;
+
 /// The smallest hourly commitment `CreateSavingsPlan` accepts, from the
 /// documented rule on `commitment`: "a value between 0.001 and 1 million".
 pub const MIN_COMMITMENT_UNITS: i128 = AMOUNT_SCALE / 1000;
@@ -201,7 +214,9 @@ pub const MAX_COMMITMENT_UNITS: i128 = 1_000_000 * AMOUNT_SCALE;
 /// decimal places.
 ///
 /// `Amount` is an unconstrained string in the model, so the shape of the value
-/// is the handler's to enforce.
+/// is the handler's to enforce. A number too large to hold exactly is still such
+/// a number, so it comes back as [`AMOUNT_OVERFLOW_UNITS`] for the caller's own
+/// rule to refuse on its magnitude.
 pub fn parse_amount(member: &str, value: &str) -> Result<i128, String> {
     parse_amount_with_digits(member, value, MAX_AMOUNT_DIGITS)
 }
@@ -267,15 +282,24 @@ fn parse_decimal_amount(
             "{member} cannot specify more than {max_digits} digits after the decimal point, got '{value}'"
         ));
     }
-    let whole: i128 = whole.parse().map_err(|_| invalid())?;
-    let mut units = whole.checked_mul(AMOUNT_SCALE).ok_or_else(invalid)?;
-    if !fraction.is_empty() {
-        // Right-pad to the held scale, so ".1" and ".10000000" are one value.
-        let padded = format!("{fraction:0<width$}", width = AMOUNT_WIRE_DIGITS);
-        units = units
-            .checked_add(padded.parse::<i128>().map_err(|_| invalid())?)
-            .ok_or_else(invalid)?;
-    }
+    // The value's FORM is settled above. Everything below is arithmetic on a
+    // value already known to be a decimal number, so a magnitude that does not
+    // fit the held scale is read as an amount beyond every published bound
+    // ([`AMOUNT_OVERFLOW_UNITS`]) and left to the member's range to refuse —
+    // never reclassified as malformed.
+    let units = whole
+        .parse::<i128>()
+        .ok()
+        .and_then(|whole| whole.checked_mul(AMOUNT_SCALE))
+        .and_then(|units| {
+            if fraction.is_empty() {
+                return Some(units);
+            }
+            // Right-pad to the held scale, so ".1" and ".10000000" are one value.
+            let padded = format!("{fraction:0<width$}", width = AMOUNT_WIRE_DIGITS);
+            units.checked_add(padded.parse::<i128>().ok()?)
+        })
+        .unwrap_or(AMOUNT_OVERFLOW_UNITS);
     Ok(sign * units)
 }
 
