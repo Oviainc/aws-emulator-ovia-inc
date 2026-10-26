@@ -21,6 +21,8 @@ mod anomaly_detector_lifecycle;
 mod anomaly_detector_listing;
 #[path = "all/anomaly_detector_update.rs"]
 mod anomaly_detector_update;
+#[path = "all/create_while_a_removal_is_owed.rs"]
+mod create_while_a_removal_is_owed;
 #[path = "all/default_scraper_configuration.rs"]
 mod default_scraper_configuration;
 #[path = "all/kms_key_arn_and_parent_resolution.rs"]

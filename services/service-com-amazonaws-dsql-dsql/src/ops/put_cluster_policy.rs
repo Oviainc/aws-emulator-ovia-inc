@@ -276,17 +276,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A cluster on its way out takes no new policy.
-        if cluster.status == crate::state::STATUS_DELETING {
-            return Err(PutClusterPolicyErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "cluster {} cannot take a policy while its status is {}",
-                    cluster.identifier, cluster.status
-                ),
-                resource_id: Some(cluster.identifier.clone()),
-                resource_type: Some("cluster".to_string()),
-            })
-            .into());
+        // Attaching a policy writes the cluster's own record, so it is held to the
+        // same rule as every other mutation of a cluster: a cluster the clock
+        // still owes a transition, or one on its way out, takes no new policy.
+        if let Some(conflict) = cluster.mutation_conflict("take a policy") {
+            return Err(PutClusterPolicyErrorModeled::ConflictException(conflict).into());
         }
 
         // `expectedPolicyVersion` is the caller's claim about what it is

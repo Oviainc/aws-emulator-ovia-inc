@@ -247,13 +247,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `clientToken` carries `@idempotencyToken`: replaying a token that already
         // created a namespace in this workspace answers with THAT namespace instead of
-        // creating a second one.
+        // creating a second one — as long as the namespace is still the record that
+        // create left. One whose removal the clock already owes is not: `materialize_due`
+        // drops it once its due instant has passed, so answering from it would accept the
+        // call (202) and persist nothing.
         if let Some(token) = input.client_token.as_deref() {
-            if let Some(existing) = workspace
-                .rule_groups_namespaces
-                .values()
-                .find(|namespace| namespace.create_token.as_deref() == Some(token))
-            {
+            if let Some(existing) = workspace.rule_groups_namespaces.values().find(|namespace| {
+                namespace.create_token.as_deref() == Some(token)
+                    && namespace.status_code != crate::state::NAMESPACE_STATUS_DELETING
+            }) {
                 return Ok(response_for(existing));
             }
         }

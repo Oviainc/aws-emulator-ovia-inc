@@ -188,9 +188,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteConfigurationManagerErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "no configuration manager with ARN {} exists",
-                            input.manager_arn
+                        message: Some(crate::state::manager_not_found_message(
+                            &input.manager_arn,
                         )),
                     },
                 )

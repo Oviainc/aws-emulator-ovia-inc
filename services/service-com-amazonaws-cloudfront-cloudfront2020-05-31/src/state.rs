@@ -3481,6 +3481,53 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .find(|identity| identity.config.caller_reference == caller_reference)
     }
 
+    /// The id of the distribution that attaches the origin access identity `id` to one of
+    /// its Amazon S3 origins, or `None` when nothing stored names it.
+    ///
+    /// `CloudFrontOriginAccessIdentityInUse` is documented as "The Origin Access Identity
+    /// specified is already in use", and a stored configuration names an identity in
+    /// exactly two places: `S3OriginConfig$OriginAccessIdentity` on an origin of a
+    /// distribution, and `S3Origin$OriginAccessIdentity` on a streaming distribution. Both
+    /// carry the reference form [`origin_access_identity_reference`] builds, and both are
+    /// documented EMPTY when the configuration names no identity — so what makes an
+    /// identity in use is a stored S3 origin of either family naming it, and the answer is
+    /// the distribution that does.
+    ///
+    /// The scan reads the STORED configurations rather than a second index beside them, for
+    /// the same reason
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::distribution_using_origin_access_control`]
+    /// scans: it cannot drift out of step with what a read of those distributions reports,
+    /// and both collections are bounded ([`MAX_DISTRIBUTIONS`] and
+    /// [`MAX_STREAMING_DISTRIBUTIONS`], each record with its own bounded origin list).
+    ///
+    /// The holder's ID rather than its record, because the two families are stored as
+    /// different types and only the id is common to both.
+    pub fn distribution_using_origin_access_identity(&self, id: &str) -> Option<&str> {
+        if id.is_empty() {
+            return None;
+        }
+        let reference = origin_access_identity_reference(id);
+        self.distributions
+            .values()
+            .find(|distribution| {
+                distribution.config.origins.items.iter().any(|origin| {
+                    origin
+                        .s3_origin_config
+                        .as_ref()
+                        .is_some_and(|s3| s3.origin_access_identity.trim() == reference)
+                })
+            })
+            .map(|distribution| distribution.id.as_str())
+            .or_else(|| {
+                self.streaming_distributions
+                    .values()
+                    .find(|distribution| {
+                        distribution.config.s3_origin.origin_access_identity.trim() == reference
+                    })
+                    .map(|distribution| distribution.id.as_str())
+            })
+    }
+
     /// The streaming distribution `id` names, or `None` when the store holds none.
     pub fn streaming_distribution(&self, id: &str) -> Option<&StoredStreamingDistribution> {
         self.streaming_distributions.get(id)
@@ -5552,6 +5599,18 @@ pub fn origin_access_identity_path(id: &str) -> String {
     format!("/2020-05-31/origin-access-identity/cloudfront/{id}")
 }
 
+/// The value a distribution's configuration carries to attach the origin access identity
+/// `id` to an Amazon S3 origin.
+///
+/// `S3OriginConfig$OriginAccessIdentity` documents the form exactly — "The format of the
+/// value is: `origin-access-identity/cloudfront/ID-of-origin-access-identity`", where the
+/// id is "the value that CloudFront returned in the `ID` element when you created the
+/// origin access identity" — and `S3Origin$OriginAccessIdentity` names the same identity
+/// the same way, so both are built here rather than spelled out at each use site.
+pub fn origin_access_identity_reference(id: &str) -> String {
+    format!("origin-access-identity/cloudfront/{id}")
+}
+
 /// The path of a response headers policy resource under this service's API version. The
 /// resource is addressed by ID, as `GetResponseHeadersPolicy`'s `{Id}` label is.
 pub fn response_headers_policy_path(id: &str) -> String {
@@ -7473,10 +7532,17 @@ pub fn cname_already_exists(domain: &str) -> CNAMEAlreadyExists {
     }
 }
 
-/// `NoSuchCloudFrontOriginAccessIdentity`'s message: the sentence the model states on the
-/// shape itself, "The specified origin access identity does not exist."
+/// The message `NoSuchCloudFrontOriginAccessIdentity` carries, on the wire.
+///
+/// The WIRE text — what the recorded service answers this code with, and what this
+/// emulator therefore serves. Like [`NO_SUCH_MONITORING_SUBSCRIPTION_MESSAGE`], it differs
+/// from the sentence the MODEL's documentation of the error shape uses for the same rule
+/// ("The specified origin access identity does not exist."): the served sentence names the
+/// resource as the API does, a CLOUDFRONT origin access identity, while the documentation
+/// states the condition in the shorter form. Do not "correct" this constant to the
+/// documentation sentence.
 pub const NO_SUCH_ORIGIN_ACCESS_IDENTITY_MESSAGE: &str =
-    "The specified origin access identity does not exist.";
+    "The specified CloudFront origin access identity does not exist.";
 
 /// The modelled `NoSuchCloudFrontOriginAccessIdentity` (HTTP 404) for an identity id the
 /// store does not hold.
@@ -7487,6 +7553,24 @@ pub const NO_SUCH_ORIGIN_ACCESS_IDENTITY_MESSAGE: &str =
 pub fn no_such_origin_access_identity() -> NoSuchCloudFrontOriginAccessIdentity {
     NoSuchCloudFrontOriginAccessIdentity {
         message: Some(NO_SUCH_ORIGIN_ACCESS_IDENTITY_MESSAGE.to_string()),
+    }
+}
+
+/// The modelled `CloudFrontOriginAccessIdentityInUse` (HTTP 409) for a delete of an
+/// identity an Amazon S3 origin of `distribution_id` still names.
+///
+/// The sentence is the one the model states on the shape itself — "The Origin Access
+/// Identity specified is already in use." — up to the distribution that names it, which it
+/// names at the end: the one piece of store-derived detail in it, and the one a caller
+/// cannot work out for itself. The same shape [`origin_access_control_in_use`] takes, for
+/// the same rule applied to the other way an origin reaches a bucket.
+pub fn origin_access_identity_in_use(
+    distribution_id: &str,
+) -> crate::ops::types::CloudFrontOriginAccessIdentityInUse {
+    crate::ops::types::CloudFrontOriginAccessIdentityInUse {
+        message: Some(format!(
+            "The Origin Access Identity specified is already in use: {distribution_id}"
+        )),
     }
 }
 
@@ -7717,8 +7801,10 @@ pub fn no_such_origin_access_control() -> NoSuchOriginAccessControl {
 /// `NoSuchOriginAccessControl`'s message, in the form CloudFront answers a `NoSuch…` with
 /// for a named resource — "The specified <resource> does not exist.", as
 /// [`NO_SUCH_DISTRIBUTION_MESSAGE`] and [`NO_SUCH_ORIGIN_ACCESS_IDENTITY_MESSAGE`] carry
-/// it. The recorded service answers this code with that sentence, which the shape's own
-/// documentation states in its shorter form.
+/// it. Each fills `<resource>` with the resource as the API names it, which for the origin
+/// access identity is the longer "CloudFront origin access identity". The recorded service
+/// answers this code with that sentence, which the shape's own documentation states in its
+/// shorter form.
 pub const NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE: &str =
     "The specified origin access control does not exist.";
 

@@ -488,3 +488,9 @@ mod transit_gateway_policy_tables;
 // reports back out of that store.
 #[path = "all/network_insights_access_scope_content.rs"]
 mod network_insights_access_scope_content;
+// Declared LAST for the reason the header gives: the sorted region of this file is where
+// every new ec2 suite inserts its lines. What `CreateFpgaImage` refuses — the design
+// checkpoint it reads, which this emulator holds no Amazon S3 object for — and what it
+// answers ahead of that read.
+#[path = "all/create_fpga_image.rs"]
+mod create_fpga_image;

@@ -1757,3 +1757,255 @@ async fn a_request_that_names_no_max_results_is_served_at_the_published_page_cap
         "case \"no maxResults, page 2\": the last page must carry no nextToken, got {second}"
     );
 }
+
+/// One token-identity case: the selection a token is minted over, the selection it
+/// is then presented with, and whether those two request bodies name the SAME
+/// selection.
+///
+/// `filter.actions` is a SET of ANDed predicates, each testing membership of a SET of
+/// values, so two bodies name one selection exactly when they reduce to the same set
+/// of filters with the same value sets — whatever order, repetition or characters
+/// they are written with. `FilterValue` is modelled `length 1..1024, pattern
+/// [\S\s]*` (`smithy_query(query="closure", operation="ListRecommendedActions")`), so
+/// a value may carry ANY character, including the ones a hand-rolled concatenation
+/// would use as separators.
+struct TokenIdentity<'a> {
+    case: &'a str,
+    minted_with: Value,
+    presented_with: Value,
+    same_selection: bool,
+}
+
+impl<'a> TokenIdentity<'a> {
+    /// Two spellings of ONE selection: the token must resume that listing.
+    fn same(case: &'a str, minted_with: Value, presented_with: Value) -> Self {
+        Self {
+            case,
+            minted_with,
+            presented_with,
+            same_selection: true,
+        }
+    }
+
+    /// Two DIFFERENT selections: the token must be refused rather than applied to a
+    /// record set it never named.
+    fn different(case: &'a str, minted_with: Value, presented_with: Value) -> Self {
+        Self {
+            same_selection: false,
+            ..Self::same(case, minted_with, presented_with)
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_token_names_one_selection_whatever_characters_its_values_carry() {
+    let emulator = Emulator::empty();
+    emulator.seed(fixture());
+
+    // Rows differ along what the rule generalises over: which separator a value
+    // carries (`,`, `:`, `&`), where it sits in the value, how many values and how
+    // many filters the selection is written with, and the order and repetition of
+    // both. Every "different" row is a pair a concatenating fingerprint cannot tell
+    // apart (or a pair sharing a filter, which de-duplicating filters must not
+    // collapse); every "same" row is a pair such a fingerprint reads as two
+    // selections.
+    let cases: Vec<TokenIdentity> = vec![
+        TokenIdentity::different(
+            "one value carrying a comma vs two values",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["BUDGETS,PAYMENTS"]}
+            ]}}),
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["BUDGETS", "PAYMENTS"]}
+            ]}}),
+        ),
+        TokenIdentity::different(
+            "the comma moved from one value to the next",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["BUDGETS", "PAYMENTS,IAM"]}
+            ]}}),
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["BUDGETS,PAYMENTS", "IAM"]}
+            ]}}),
+        ),
+        TokenIdentity::different(
+            "one value carrying a colon and an ampersand vs two filters",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS",
+                 "values": ["BUDGETS&SEVERITY:NOT_EQUALS:INFO"]}
+            ]}}),
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["BUDGETS"]},
+                {"key": "SEVERITY", "matchOption": "NOT_EQUALS", "values": ["INFO"]}
+            ]}}),
+        ),
+        TokenIdentity::different(
+            "one value carrying a colon vs a value and a match option",
+            json!({"filter": {"actions": [
+                {"key": "TYPE", "matchOption": "NOT_EQUALS", "values": ["PAYMENTS_DUE:NOT_EQUALS"]}
+            ]}}),
+            json!({"filter": {"actions": [
+                {"key": "TYPE", "matchOption": "NOT_EQUALS", "values": ["PAYMENTS_DUE"]}
+            ]}}),
+        ),
+        TokenIdentity::different(
+            "a second filter added beside the first",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["BUDGETS"]}
+            ]}}),
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["BUDGETS"]},
+                {"key": "SEVERITY", "matchOption": "EQUALS", "values": ["INFO"]}
+            ]}}),
+        ),
+        TokenIdentity::different(
+            "a second value added to the one filter",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["BUDGETS"]}
+            ]}}),
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["BUDGETS", "PAYMENTS"]}
+            ]}}),
+        ),
+        TokenIdentity::same(
+            "the two filters listed in the opposite order",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["BUDGETS"]},
+                {"key": "SEVERITY", "matchOption": "NOT_EQUALS", "values": ["INFO"]}
+            ]}}),
+            json!({"filter": {"actions": [
+                {"key": "SEVERITY", "matchOption": "NOT_EQUALS", "values": ["INFO"]},
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["BUDGETS"]}
+            ]}}),
+        ),
+        TokenIdentity::same(
+            "the one filter listed twice",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["BUDGETS"]}
+            ]}}),
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["BUDGETS"]},
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["BUDGETS"]}
+            ]}}),
+        ),
+        TokenIdentity::same(
+            "a filter whose value carries separators, listed twice",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS",
+                 "values": ["BUDGETS,PAYMENTS&SEVERITY:EQUALS:INFO"]}
+            ]}}),
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS",
+                 "values": ["BUDGETS,PAYMENTS&SEVERITY:EQUALS:INFO"]},
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS",
+                 "values": ["BUDGETS,PAYMENTS&SEVERITY:EQUALS:INFO"]}
+            ]}}),
+        ),
+        TokenIdentity::same(
+            "the same values reordered and repeated",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["BUDGETS", "PAYMENTS"]}
+            ]}}),
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS",
+                 "values": ["PAYMENTS", "BUDGETS", "PAYMENTS"]}
+            ]}}),
+        ),
+        TokenIdentity::same(
+            "separator-carrying values reordered",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["BUDGETS,PAYMENTS", "IAM"]}
+            ]}}),
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["IAM", "BUDGETS,PAYMENTS"]}
+            ]}}),
+        ),
+    ];
+
+    for TokenIdentity {
+        case,
+        minted_with,
+        presented_with,
+        same_selection,
+    } in cases
+    {
+        // One record per page, so the token names offset 1 of the selection it was
+        // minted over.
+        let mut minting = minted_with.clone();
+        minting
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("case {case:?}: the selection is not a JSON object"))
+            .insert("maxResults".to_string(), json!(1));
+        let (status, first) = emulator.list(&minting).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: minting a token expected 200, got {status} with {first}"
+        );
+        let token = first
+            .get("nextToken")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("case {case:?}: expected a nextToken to resume, got {first}"))
+            .to_string();
+
+        // What the PRESENTED selection reports unpaginated, so a resumption can be
+        // checked against the record set the presented body selects.
+        let (status, whole) = emulator.list(&presented_with).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: listing the presented selection expected 200, got {status} with {whole}"
+        );
+        let whole_ids = ids_of(case, &whole);
+
+        let mut resumed = presented_with.clone();
+        resumed
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("case {case:?}: the selection is not a JSON object"))
+            .insert("nextToken".to_string(), json!(token));
+        let (status, body) = emulator.list(&resumed).await;
+
+        if same_selection {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the two bodies name one selection, so the token must resume it; got {status} with {body}"
+            );
+            let page = ids_of(case, &body);
+            assert_eq!(
+                page,
+                whole_ids[1..].to_vec(),
+                "case {case:?}: expected the records after the first, {:?}, got {page:?}",
+                &whole_ids[1..]
+            );
+        } else {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: the two bodies name different selections (the presented one reports {whole_ids:?}), so the token must be refused; got {status} with {body}"
+            );
+            assert_eq!(
+                error_code(case, &body),
+                "ValidationException",
+                "case {case:?}: expected a ValidationException, got {body}"
+            );
+            assert_eq!(
+                body.get("reason").and_then(Value::as_str),
+                Some("cannotParse"),
+                "case {case:?}: expected reason cannotParse, got {body}"
+            );
+            let names: Vec<&str> = body
+                .get("fieldList")
+                .and_then(Value::as_array)
+                .unwrap_or_else(|| panic!("case {case:?}: expected a fieldList array, got {body}"))
+                .iter()
+                .filter_map(|field| field.get("name").and_then(Value::as_str))
+                .collect();
+            assert_eq!(
+                names,
+                vec!["nextToken"],
+                "case {case:?}: expected the refusal to name nextToken, got {names:?} in {body}"
+            );
+            assert!(
+                body.get("recommendedActions").is_none(),
+                "case {case:?}: a refused token must not silently report a page, got {body}"
+            );
+        }
+    }
+}

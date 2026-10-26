@@ -16,6 +16,11 @@
 //! never quotes the rejected value back, never names the member the handler happened to
 //! check, and never enumerates what the request could have said instead.
 //!
+//! The sentence for an unaddressable patch path is the one the OPERATION words, and not
+//! every operation words it the same way: the rows below are the operations whose
+//! refusal is the path alone. `UpdateApiKey` words its own, which the
+//! `update_api_key_patch_path_refusal` suite covers.
+//!
 //! Each test's rows span what the rule generalises over rather than repeating one
 //! recorded call: several operations per rule, both the create and the patch writer of
 //! one member, each published bound and one past it, and every form a path, a location or
@@ -23,7 +28,6 @@
 
 use serde_json::{json, Value};
 
-use crate::api_key_lifecycle::create_key;
 use crate::authorizer_lifecycle::{create_authorizer, lambda_uri, token_request};
 use crate::documentation_parts::{content_map, created_part_id, import_parts};
 use crate::documentation_versions::{create_version, snapshot_request};
@@ -127,14 +131,6 @@ async fn a_patch_path_the_resource_cannot_be_addressed_by_is_refused_with_the_pa
         "CreateDocumentationPart",
     )
     .await;
-    let key = create_key(
-        &gateway,
-        "the key the patch rows target",
-        json!({ "name": "patch-path-sentence" }),
-    )
-    .await;
-    let key_id = string_member(&key, "id", "CreateApiKey");
-
     // Rows differ along what the rule generalises over: the operation and so the resource
     // the pointer was applied to, and the FORM of the unaddressable pointer — a member the
     // service assigns, a member no shape declares, a pointer reaching into a single-valued
@@ -172,14 +168,9 @@ async fn a_patch_path_the_resource_cannot_be_addressed_by_is_refused_with_the_pa
             "/location/type",
         ),
         (
-            "UpdateApiKey sends a path that is no JSON Pointer",
-            format!("/apikeys/{key_id}"),
-            "name",
-        ),
-        (
-            "UpdateApiKey names the key's secret",
-            format!("/apikeys/{key_id}"),
-            "/value",
+            "UpdateDocumentationPart sends a path that is no JSON Pointer",
+            format!("/restapis/{api}/documentation/parts/{documentation_part}"),
+            "properties",
         ),
     ];
 

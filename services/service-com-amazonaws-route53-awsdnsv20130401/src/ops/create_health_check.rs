@@ -102,7 +102,7 @@
 use super::types::*;
 
 use crate::state::{
-    health_check_config_problem, health_check_config_with_defaults, resource_location,
+    health_check_config_problem, health_check_config_with_defaults, now_millis, resource_location,
     StoredHealthCheck, FIRST_HEALTH_CHECK_VERSION, MAX_HEALTH_CHECKS,
 };
 use std::collections::BTreeMap;
@@ -277,6 +277,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             caller_reference: input.caller_reference.clone(),
             config,
             version: FIRST_HEALTH_CHECK_VERSION,
+            // Creating the health check is what starts Route 53 checking its
+            // endpoint, so this instant is the base of the probe cadence
+            // `GetHealthCheckStatus` reports a `CheckedTime` from.
+            created_at_millis: now_millis(),
             // CreateHealthCheck takes no tags; a health check is tagged
             // afterwards, through ChangeTagsForResource.
             tags: BTreeMap::new(),

@@ -216,7 +216,7 @@ fn apply_assignment(
     // nothing. An ARN of a resource kind this emulator holds none of resolves to no
     // resource, which is the not-found answer below.
     let stream = store
-        .resolve_stream_mut(region, None, Some(input.resource_arn.as_str()))
+        .resolve_stream_mut(now, region, None, Some(input.resource_arn.as_str()))
         .map_err(|failure| lookup_refusal(failure, &input.resource_arn))?;
 
     // "The resource is not available for this operation. For successful operation, the

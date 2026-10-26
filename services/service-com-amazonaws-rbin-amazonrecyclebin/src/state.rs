@@ -2,11 +2,17 @@
 
 //! Engine state for the com-amazonaws-rbin-amazonrecyclebin service.
 //!
-//! Recycle Bin's control plane is a flat collection of retention rules addressed
-//! by an 11-character identifier, so the store is one ordered map of rules plus an
-//! ARN index. The ordering is load-bearing: `ListRules` pages through the map in
-//! key order, and its `NextToken` is the last identifier it returned, so a page
-//! boundary stays stable while rules are added or removed.
+//! Recycle Bin's control plane is a collection of retention rules addressed by an
+//! 11-character identifier, so the store is one ordered map of rules plus an ARN
+//! index. The ordering is load-bearing: `ListRules` pages through the map in key
+//! order, and its `NextToken` is the last identifier it returned, so a page boundary
+//! stays stable while rules are added or removed.
+//!
+//! A retention rule is a REGIONAL resource — it exists only in the Region it was
+//! created in — so every rule carries that Region ([`Rule::region`]) and every
+//! resolver, pager and quota counter below takes the Region the request was signed
+//! for ([`request_region`]) and sees that Region's rules alone. One endpoint
+//! therefore neither reports nor resolves nor counts a rule another Region holds.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
@@ -47,11 +53,26 @@ pub const MAX_PAGE_SIZE: usize = 1000;
 /// refused with the modelled `ServiceQuotaExceededException`.
 ///
 /// Recycle Bin's published Service Quotas entry "Retention rules per Region" is 1000
-/// (Amazon EBS User Guide, "Recycle Bin quotas"), so the store is bounded by the same
-/// number the real service bounds an account's Region by, rather than by an invented
-/// cap. It also keeps the store from growing for the process's whole lifetime on
-/// nothing but repeated `CreateRule` calls.
+/// (Amazon EBS User Guide, "Recycle Bin quotas"), so a Region of the store is bounded by
+/// the same number the real service bounds an account's Region by, rather than by an
+/// invented cap.
 pub const MAX_RULES: usize = 1000;
+
+/// The most retention rules this emulator stores, across every Region.
+///
+/// Not an AWS quota: [`MAX_RULES`] is Recycle Bin's own per-Region one, and the Region of
+/// a request is read off the caller's SigV4 credential scope ([`request_region`]), so a
+/// per-Region bound is a bound the CALLER can partition by signing each request for
+/// another Region string. This cap is keyed on nothing in the request, so it bounds
+/// [`ComAmazonawsRbinAmazonrecyclebinState::rules`] — and with it every per-request pass
+/// over those records ([`ComAmazonawsRbinAmazonrecyclebinState::rule_count_in_region`],
+/// [`ComAmazonawsRbinAmazonrecyclebinState::exceeds_resource_tag_quota`] and
+/// [`ComAmazonawsRbinAmazonrecyclebinState::page_from`]) — however the request varies,
+/// and keeps the store from growing for the process's whole lifetime on nothing but
+/// repeated `CreateRule` calls. `CreateRule` checks it before minting anything and
+/// answers the modelled quota error past it, so no sequence of calls can leave the store
+/// larger than this.
+pub const RULE_STORE_LIMIT: usize = 2 * MAX_RULES;
 
 /// The number of tags one retention rule may carry, after which assigning more is
 /// refused with the modelled `ServiceQuotaExceededException` ("The request would
@@ -170,6 +191,10 @@ pub const LOCK_STATE_UNLOCKED: &str = "unlocked";
 pub struct Rule {
     /// The rule's unique id, `^[0-9a-zA-Z]{11}$`, and this map's key.
     pub identifier: String,
+    /// The Region this rule exists in: the one the create was signed for, and the
+    /// Region segment of [`Self::rule_arn`]. Every lookup is scoped by it, so no other
+    /// Region's endpoint reports, resolves or counts this rule.
+    pub region: String,
     /// `arn:aws:rbin:{region}:{account}:rule/{identifier}`.
     pub rule_arn: String,
     pub description: Option<String>,
@@ -700,10 +725,14 @@ fn unanchored(pattern: &str) -> &str {
 /// Per-service state for com-amazonaws-rbin-amazonrecyclebin. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsRbinAmazonrecyclebinState {
-    /// Every retention rule, keyed by `Identifier` and ordered so paging is stable.
+    /// Every retention rule of every Region, keyed by `Identifier` and ordered so
+    /// paging is stable. A rule belongs to exactly one Region ([`Rule::region`]), and
+    /// the resolvers below are the only way a handler reaches one, so the key order is
+    /// shared while the rules themselves stay partitioned.
     pub rules: BTreeMap<String, Rule>,
     /// `RuleArn` -> `Identifier`, so the ARN-addressed tag operations resolve a rule
-    /// without scanning the map.
+    /// without scanning the map. An ARN carries its rule's Region, so an entry is
+    /// still reached through a Region-scoped resolver.
     pub arn_index: HashMap<String, String>,
     /// Monotonic counter behind [`Self::mint_identifier`].
     pub next_identifier_seed: u64,
@@ -734,24 +763,61 @@ impl ComAmazonawsRbinAmazonrecyclebinState {
         self.rules.insert(rule.identifier.clone(), rule);
     }
 
-    /// Remove a rule and drop its ARN index entry. `None` when no such rule exists.
-    pub fn remove_rule(&mut self, identifier: &str) -> Option<Rule> {
+    /// The rule `identifier` addresses in `region`, for a reporting operation.
+    ///
+    /// `None` for an identifier no rule holds AND for one held by a rule that belongs
+    /// to another Region: a retention rule exists only in the Region it was created in,
+    /// so the Region the request was signed for holds no such rule either way and the
+    /// caller reports the modelled 404.
+    pub fn rule(&self, region: &str, identifier: &str) -> Option<&Rule> {
+        self.rules
+            .get(identifier)
+            .filter(|rule| rule.region == region)
+    }
+
+    /// The rule `identifier` addresses in `region`, for an operation that mutates it —
+    /// the write-side twin of [`Self::rule`], scoped the same way.
+    pub fn rule_mut(&mut self, region: &str, identifier: &str) -> Option<&mut Rule> {
+        self.rules
+            .get_mut(identifier)
+            .filter(|rule| rule.region == region)
+    }
+
+    /// Remove the rule `identifier` addresses in `region` and drop its ARN index entry.
+    /// `None` when that Region holds no such rule — including one another Region holds,
+    /// which this Region's endpoint may not reach, let alone delete.
+    pub fn remove_rule(&mut self, region: &str, identifier: &str) -> Option<Rule> {
+        self.rule(region, identifier)?;
         let removed = self.rules.remove(identifier)?;
         self.arn_index.remove(&removed.rule_arn);
         Some(removed)
     }
 
-    /// The rule an ARN addresses, resolved through [`Self::arn_index`].
-    pub fn rule_by_arn(&self, rule_arn: &str) -> Option<&Rule> {
+    /// The rule an ARN addresses in `region`, resolved through [`Self::arn_index`] and
+    /// scoped as [`Self::rule`] scopes an identifier.
+    pub fn rule_by_arn(&self, region: &str, rule_arn: &str) -> Option<&Rule> {
         let identifier = self.arn_index.get(rule_arn)?;
-        self.rules.get(identifier)
+        self.rule(region, identifier)
     }
 
-    /// The rule an ARN addresses, for modification — the write-side twin of
+    /// The rule an ARN addresses in `region`, for modification — the write-side twin of
     /// [`Self::rule_by_arn`], used by the ARN-addressed tag operations.
-    pub fn rule_by_arn_mut(&mut self, rule_arn: &str) -> Option<&mut Rule> {
+    pub fn rule_by_arn_mut(&mut self, region: &str, rule_arn: &str) -> Option<&mut Rule> {
         let identifier = self.arn_index.get(rule_arn)?.clone();
-        self.rules.get_mut(&identifier)
+        self.rule_mut(region, &identifier)
+    }
+
+    /// Every rule `region` holds, in the store's stable identifier order.
+    ///
+    /// What a regional reader walks and what a per-Region quota counts: a rule belongs
+    /// to exactly one Region, the one its ARN names.
+    pub fn rules_in_region<'a>(&'a self, region: &'a str) -> impl Iterator<Item = &'a Rule> + 'a {
+        self.rules.values().filter(move |rule| rule.region == region)
+    }
+
+    /// How many retention rules `region` already holds — the count [`MAX_RULES`] bounds.
+    pub fn rule_count_in_region(&self, region: &str) -> usize {
+        self.rules_in_region(region).count()
     }
 
     /// Whether assigning `tags` as a rule's resource tags would make some tag key and
@@ -763,8 +829,12 @@ impl ComAmazonawsRbinAmazonrecyclebinState {
     /// so re-sending what a rule already holds is never refused. A create names no rule
     /// and passes `None`. The pairs the request repeats are counted once, since a rule
     /// selects on a pair whether it names it once or twice.
+    ///
+    /// Only `region`'s rules are counted: a retention rule exists in one Region, so a
+    /// pair selecting rules elsewhere selects nothing here.
     pub fn exceeds_resource_tag_quota(
         &self,
+        region: &str,
         tags: &[ResourceTag],
         excluding: Option<&str>,
     ) -> bool {
@@ -773,8 +843,7 @@ impl ComAmazonawsRbinAmazonrecyclebinState {
             let pair = resource_tag_pair(tag);
             counted.insert(pair)
                 && self
-                    .rules
-                    .values()
+                    .rules_in_region(region)
                     .filter(|rule| excluding.is_none_or(|identifier| rule.identifier != identifier))
                     .filter(|rule| {
                         rule.resource_tags
@@ -786,17 +855,23 @@ impl ComAmazonawsRbinAmazonrecyclebinState {
         })
     }
 
-    /// The rules to walk for a page, starting after `after` when a `NextToken`
-    /// named one.
+    /// The rules of `region` to walk for a page, starting after `after` when a
+    /// `NextToken` named one.
+    ///
+    /// Region-scoped like every other resolver: a regional reader pages through the
+    /// rules its own Region holds, and a cursor it issued names a rule of that Region.
     pub fn page_from<'a>(
         &'a self,
+        region: &'a str,
         after: Option<&str>,
     ) -> impl Iterator<Item = (&'a String, &'a Rule)> + 'a {
         let lower = match after {
             Some(identifier) => Bound::Excluded(identifier.to_string()),
             None => Bound::Unbounded,
         };
-        self.rules.range((lower, Bound::Unbounded))
+        self.rules
+            .range((lower, Bound::Unbounded))
+            .filter(move |(_, rule)| rule.region == region)
     }
 }
 

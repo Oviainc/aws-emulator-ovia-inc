@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInsightImpactGraph
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetInsightImpactGraph`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetInsightImpactGraph::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers the structural service graph of the STORED insight the request's
+//! `InsightId` names, and refuses an id that names no stored insight with
+//! `InvalidRequestException` (400) — the refusal the model declares for a
+//! request that "has invalid parameters" — worded with the service's one fixed
+//! "the insight you named does not exist" text
+//! ([`crate::ops::get_insight::INSIGHT_NOT_FOUND`]), so the two insight readers
+//! cannot refuse the same id with two different sentences.
+//!
+//! The `@pattern` on `InsightId` is modelled, so an id that is not a UUID is
+//! already refused at the boundary; what is left to decide is whether a
+//! well-formed id resolves, and that is a lookup in
+//! [`crate::state::ComAmazonawsXrayAwsxrayState::insights`] — the same map
+//! `GetInsight` and `GetInsightSummaries` read. Nothing in the X-Ray API creates
+//! an insight (X-Ray mints one itself from anomaly detection over ingested
+//! traces), so that map holds an insight only once something writes one into it,
+//! and until then every well-formed id gets the modelled refusal.
+//!
+//! Once the id resolves, the answer is DERIVED from the stored segment
+//! documents, never echoed: the traces that touch the requested half-open
+//! `[StartTime, EndTime)` window — `StartTime` is "inclusive of the value
+//! provided" and `EndTime` "exclusive of the value provided" — are narrowed by
+//! the `FilterExpression` of the group the insight belongs to and handed to the
+//! ONE graph derivation every graph reader of this crate shares
+//! ([`crate::state::service_graph`]), so this operation and `GetServiceGraph`
+//! cannot describe the same segments differently. What this operation reports of
+//! each node is only its STRUCTURE — "the service graph is limited to only
+//! structural information" — which is the projection in [`structural`]: the
+//! node's identity and the downstream nodes it reaches, with no statistics,
+//! times or state. `ServiceGraphStartTime` / `ServiceGraphEndTime` are
+//! recomputed from the derived graph's own node spans, so they report the
+//! interval the answered graph covers rather than the window that was asked for.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +185,174 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetInsightImpactGraph` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetInsightImpactGraphErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetInsightImpactGraph"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetInsightImpactGraphErrorModeled::ThrottledException(
+                ThrottledException {
+                    message: Some(
+                        "the X-Ray insight store is unavailable on this emulator engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let start = crate::state::epoch_seconds(&input.start_time);
+        let end = crate::state::epoch_seconds(&input.end_time);
+        // The crate's ONE window check, so every operation taking a required
+        // `[StartTime, EndTime]` refuses the same windows with the same wording.
+        if let Err(window) =
+            crate::state::validate_window(start, end, crate::state::now_epoch_seconds())
+        {
+            return Err(refuse(window.message(start, end)));
+        }
+        if end - start > MAX_IMPACT_GRAPH_WINDOW_SECONDS {
+            return Err(refuse(IMPACT_GRAPH_WINDOW_TOO_WIDE.to_string()));
+        }
+
+        let store = state.lock();
+
+        // The insight is what this operation is "filtered by", so an id naming
+        // none is refused rather than answered with the unfiltered graph.
+        let Some(insight) = store.insights.get(&input.insight_id) else {
+            return Err(refuse(
+                crate::ops::get_insight::INSIGHT_NOT_FOUND.to_string(),
+            ));
+        };
+
+        // An insight is raised over the traffic of ONE group, and that group's
+        // `FilterExpression` is what selects the traces its impact graph is
+        // derived from — resolved and compiled by the crate's one group
+        // resolution, shared with `GetServiceGraph`, and evaluated per trace
+        // below. A stored insight that names no group, or one whose group has
+        // since been deleted or carries an expression the evaluator cannot
+        // answer, narrows nothing: the INSIGHT is the resource this operation
+        // reads, so a group that no longer resolves must not turn a readable
+        // insight into a refusal.
+        let region = crate::state::request_region(ctx.parts());
+        let group_filter = match (insight.group_name.as_deref(), insight.group_arn.as_deref()) {
+            (Some(group_name), _) => store.group_filter(&region, Some(group_name), None),
+            (None, group_arn @ Some(_)) => store.group_filter(&region, None, group_arn),
+            (None, None) => Ok(None),
+        }
+        .unwrap_or_default();
+
+        // A trace with no segment in the window is skipped BEFORE the expression
+        // is evaluated — it adds nothing to the graph, so it must not spend the
+        // query budget either — and the expression is evaluated under ONE budget
+        // for the whole request, so a derivation that spends it is answered with
+        // the modelled throttling error rather than with a graph that stopped
+        // halfway.
+        let mut budget = crate::state::filter::QueryBudget::new();
+        let selected = store.traces.values().filter(|trace| {
+            trace.touches_window(start, end)
+                && group_filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.matches(trace, &mut budget))
+        });
+        let services = crate::state::service_graph(selected, Some((start, end)));
+        if group_filter.is_some() && budget.exhausted() {
+            return Err(GetInsightImpactGraphErrorModeled::ThrottledException(
+                ThrottledException {
+                    message: Some(crate::state::FILTER_BUDGET_SPENT_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "The time, in Unix seconds, at which the service graph started" /
+        // "ended": the interval the DERIVED graph covers, read off the node
+        // spans of the whole graph rather than of one page, so every page of one
+        // walk reports the same interval. A window over which nothing is stored
+        // derives no node, and so reports no interval.
+        let graph_start = node_bound(&services, |service| service.start_time.as_ref(), f64::min);
+        let graph_end = node_bound(&services, |service| service.end_time.as_ref(), f64::max);
+
+        // Paged after the graph is derived, so a node's `ReferenceId` is the
+        // same on whichever page it lands and an edge's names a node of the same
+        // graph.
+        let page = crate::state::page_service_graph(
+            &services,
+            input.next_token.as_deref(),
+            crate::ops::get_service_graph::SERVICE_GRAPH_PAGE_SIZE,
+        )
+        .map_err(refuse)?;
+
+        Ok(GetInsightImpactGraphOutput {
+            // The stored insight's own id, which is the id it is keyed by.
+            insight_id: insight
+                .insight_id
+                .clone()
+                .or_else(|| Some(input.insight_id.clone())),
+            // "The provided start time" / "The provided end time".
+            start_time: Some(input.start_time),
+            end_time: Some(input.end_time),
+            service_graph_start_time: graph_start.map(crate::state::timestamp_of),
+            service_graph_end_time: graph_end.map(crate::state::timestamp_of),
+            services: Some(page.services.iter().map(structural).collect()),
+            next_token: page.next_token,
+        })
+    }
+}
+
+/// The widest `[StartTime, EndTime)` window this operation answers over, in
+/// seconds.
+///
+/// `GetInsightImpactGraphRequest$EndTime` states the rule:
+/// "The time range between the start time and end time can't be more than six
+/// hours."
+pub const MAX_IMPACT_GRAPH_WINDOW_SECONDS: f64 = 6.0 * 60.0 * 60.0;
+
+/// What a window wider than [`MAX_IMPACT_GRAPH_WINDOW_SECONDS`] is refused with:
+/// the rule as the model states it, which names neither bound and so does not
+/// vary from request to request.
+pub const IMPACT_GRAPH_WINDOW_TOO_WIDE: &str =
+    "The time range between the start time and end time can't be more than six hours";
+
+/// Refuse the request with the error this operation models for an invalid one.
+fn refuse(message: String) -> GetInsightImpactGraphError {
+    GetInsightImpactGraphErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// One bound of the interval a derived graph covers: `pick` reads the bound off
+/// each node and `fold` keeps the outermost one. `None` when no node of the
+/// graph reports it, which is what an empty graph is.
+fn node_bound(
+    services: &[Service],
+    pick: impl Fn(&Service) -> Option<&::aws_smithy_types::DateTime>,
+    fold: impl Fn(f64, f64) -> f64,
+) -> Option<f64> {
+    services
+        .iter()
+        .filter_map(|service| pick(service).map(crate::state::epoch_seconds))
+        .reduce(fold)
+}
+
+/// One node of the derived service graph as the node this operation reports.
+///
+/// "The service graph is limited to only structural information", so what
+/// survives the projection is a node's identity (`ReferenceId`, `Type`, `Name`,
+/// `Names`, `AccountId`) and the downstream nodes it reaches, each named by its
+/// own `ReferenceId` — and not one count, time or state, which
+/// `GetServiceGraph` is the operation that reports.
+fn structural(service: &Service) -> InsightImpactGraphService {
+    InsightImpactGraphService {
+        reference_id: service.reference_id,
+        r#type: service.r#type.clone(),
+        name: service.name.clone(),
+        names: service.names.clone(),
+        account_id: service.account_id.clone(),
+        edges: Some(
+            service
+                .edges
+                .iter()
+                .flatten()
+                .map(|edge| InsightImpactGraphEdge {
+                    reference_id: edge.reference_id,
+                })
+                .collect(),
+        ),
     }
 }

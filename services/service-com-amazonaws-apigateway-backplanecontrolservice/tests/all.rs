@@ -206,3 +206,5 @@ mod test_invoke_method;
 mod usage_plan_key_collection;
 #[path = "all/stage_invoke_request_id.rs"]
 mod stage_invoke_request_id;
+#[path = "all/update_api_key_patch_path_refusal.rs"]
+mod update_api_key_patch_path_refusal;

@@ -12,7 +12,8 @@
 //! 1. AN AMAZON S3 STORAGE LOCATION THE SERVICE CANNOT READ IS REFUSED with 400
 //!    `InaccessibleStorageLocation`, never accepted: a bucket name outside Amazon S3's
 //!    published naming rules names no bucket, and a stored object nothing holds cannot be
-//!    restored from;
+//!    restored from. The `CreateFpgaImage` side of that rule — the design checkpoint it
+//!    reads, which this emulator holds no object for — is [`super::create_fpga_image`]'s;
 //! 2. `DryRun` ASKS WHETHER THE CALLER MAY MAKE THE REQUEST, so an authorized `DryRun` call
 //!    is answered 412 `DryRunOperation` once the request's own members have been read and
 //!    before any resource is resolved or written — including for a resource the account
@@ -25,7 +26,7 @@
 //! 4. A REQUEST THE RESOURCE'S STATE DOES NOT ADMIT IS REFUSED with `IncorrectState` —
 //!    enabling I/O that is already enabled, detaching a volume nothing holds, cancelling an
 //!    export task that is not active;
-//! 5. EVERY WRITE IS READ BACK OUT OF THE STORE: a created AFI is the one a delete removes
+//! 5. EVERY WRITE IS READ BACK OUT OF THE STORE: a stored AFI is the one a delete removes
 //!    and a reset resets, an attached watermark is the one `DescribeImages` reports, a
 //!    detached volume is the one `DescribeVolumes` reports, and a report of the Recycle Bin
 //!    is the bin's own contents.
@@ -37,14 +38,15 @@
 use std::time::{Duration, Instant, SystemTime};
 
 use ec2::ops::types::{
-    AttachVolumeOutput, ExportTask, ExportToS3Task, ImageUsageReport, InstanceExportDetails,
-    LoadPermission,
+    AttachVolumeOutput, ExportTask, ExportToS3Task, FpgaImage, ImageUsageReport,
+    InstanceExportDetails, LoadPermission,
 };
 use ec2::ops::cancel_export_task::INSTANCE_EXPORT_TASK_ID_PREFIX;
 use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, EXPORT_TASK_STATE_ACTIVE,
     EXPORT_TASK_STATE_CANCELLED, EXPORT_TASK_STATE_CANCELLING, EXPORT_TASK_STATE_COMPLETED,
-    FPGA_IMAGE_STATE_FAILED, FPGA_IMAGE_STATE_PENDING, IMAGE_USAGE_REPORT_ID_PREFIX, ImageSpec,
+    FPGA_IMAGE_GLOBAL_ID_PREFIX, FPGA_IMAGE_ID_PREFIX, FpgaImageRecord,
+    IMAGE_USAGE_REPORT_ID_PREFIX, ImageSpec, TRANSITION_DELAY, fpga_image_payload_bytes,
     MAX_S3_BUCKET_NAME_CHARS, MIN_S3_BUCKET_NAME_CHARS, RECYCLE_BIN_PAGE_SIZE_RANGE,
     VOLUME_ATTACHMENT_STATE_ATTACHED, VOLUME_ATTACHMENT_STATE_DETACHING, VOLUME_STATE_AVAILABLE,
     VOLUME_STATE_DELETED, VOLUME_STATE_IN_USE, WATERMARK_NAME_PUNCTUATION, ExportTaskRecord,
@@ -83,30 +85,61 @@ fn emulator() -> (MultiServiceRouter, std::sync::Arc<engine::InMemoryEngine>) {
     super::ec2_query::emulator()
 }
 
-/// The parameters of a `CreateFpgaImage` whose design checkpoint is in `bucket`.
-fn create_fpga_image_params(bucket: &str) -> Params {
+/// The parameters of a `CreateFpgaImage` whose design checkpoint is in `bucket`. Shared with
+/// [`super::create_fpga_image`], which owns the rule that call keeps.
+pub(super) fn create_fpga_image_params(bucket: &str) -> Params {
     vec![
         p("InputStorageLocation.Bucket", bucket),
         p("InputStorageLocation.Key", "dcp/checkpoint.tar"),
     ]
 }
 
-/// Create one AFI from a readable storage location, and answer its id and global id.
-async fn create_fpga_image(router: &MultiServiceRouter) -> (String, String) {
-    let (status, body) = op(
-        router,
-        "CreateFpgaImage",
-        &create_fpga_image_params(READABLE_BUCKET),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "creating an AFI: expected HTTP 200, got {status} with body {body}"
+/// Store one AFI of the calling account, as a call that mints one leaves it — `pending`, with
+/// the outcome of the minting still owed on the clock — and answer its id and its global id.
+///
+/// SEEDED rather than created through `CreateFpgaImage`: that call reads the design checkpoint
+/// the request names out of Amazon S3, this emulator holds no Amazon S3 object for any
+/// location to name, and so it mints nothing ([`super::create_fpga_image`] owns that rule).
+/// The AFIs this suite acts on are therefore stored the way every other resource it does not
+/// create is, and the bytes they hold are charged the way the handlers charge them.
+pub(super) fn seed_fpga_image(engine: &engine::InMemoryEngine, name: &str) -> (String, String) {
+    let description = format!("the AFI {name}");
+    let store = engine.state::<Ec2State>();
+    let mut guard = store.lock();
+    let fpga_image_id = guard.next_id(FPGA_IMAGE_ID_PREFIX);
+    let fpga_image_global_id = guard.next_id(FPGA_IMAGE_GLOBAL_ID_PREFIX);
+    let minted_at = system_time_to_date_time(SystemTime::now());
+    let payload_bytes =
+        fpga_image_payload_bytes(&[], Some(name), Some(&description), &[], None);
+    guard.add_stored_bytes(payload_bytes);
+    guard.fpga_images.insert(
+        fpga_image_id.clone(),
+        FpgaImageRecord {
+            view: FpgaImage {
+                fpga_image_id: Some(fpga_image_id.clone()),
+                fpga_image_global_id: Some(fpga_image_global_id.clone()),
+                name: Some(name.to_string()),
+                description: Some(description),
+                create_time: Some(minted_at),
+                update_time: Some(minted_at),
+                owner_id: Some(engine::emulator_account_id().to_string()),
+                owner_alias: None,
+                public: Some(false),
+                product_codes: Some(Vec::new()),
+                tags: Some(Vec::new()),
+                data_retention_support: Some(false),
+                shell_version: None,
+                pci_id: None,
+                instance_types: Some(Vec::new()),
+                state: None,
+            },
+            load_permissions: Vec::new(),
+            resolved_at: Instant::now() + TRANSITION_DELAY,
+            failure_message: format!("no FPGA bitstream was built for the AFI {name}"),
+            payload_bytes,
+        },
     );
-    (
-        element(&body, "fpgaImageId").unwrap_or_default(),
-        element(&body, "fpgaImageGlobalId").unwrap_or_default(),
-    )
+    (fpga_image_id, fpga_image_global_id)
 }
 
 /// Create one 8 GiB volume in the Region's first Availability Zone, and answer its id.
@@ -128,9 +161,10 @@ pub(super) async fn create_volume(router: &MultiServiceRouter) -> String {
 /// The bucket names rule 1 is written against.
 ///
 /// Every row names the sentence of the Amazon S3 User Guide's "General purpose bucket naming
-/// rules" it exercises, and the accepted rows sit at each published bound while the refused
-/// ones sit one character past it.
-fn bucket_name_rows() -> Vec<(&'static str, String, bool)> {
+/// rules" it exercises, and the rows whose name is INSIDE those rules sit at each published
+/// bound while the ones outside them sit one character past it. Shared with
+/// [`super::create_fpga_image`], so the two suites read one table.
+pub(super) fn bucket_name_rows() -> Vec<(&'static str, String, bool)> {
     vec![
         (
             "three characters, the published minimum",
@@ -211,114 +245,9 @@ fn bucket_name_rows() -> Vec<(&'static str, String, bool)> {
 // RULE 1: a storage location the service cannot read is refused
 // ---------------------------------------------------------------------------
 
-/// `CreateFpgaImage` refuses every bucket name outside Amazon S3's naming rules with
-/// `InaccessibleStorageLocation`, and accepts every name inside them.
-#[tokio::test]
-async fn create_fpga_image_reads_only_an_accessible_storage_location() {
-    let (router, _engine) = emulator();
-
-    for (case, bucket, accessible) in bucket_name_rows() {
-        let (status, body) = op(&router, "CreateFpgaImage", &create_fpga_image_params(&bucket)).await;
-        if accessible {
-            assert_eq!(
-                status, 200,
-                "case {case:?}: expected HTTP 200 for bucket {bucket:?}, \
-                 got {status} with body {body}"
-            );
-            let fpga_image_id = element(&body, "fpgaImageId").unwrap_or_default();
-            let global_id = element(&body, "fpgaImageGlobalId").unwrap_or_default();
-            assert!(
-                fpga_image_id.starts_with("afi-"),
-                "case {case:?}: expected an afi- id, got {fpga_image_id:?}"
-            );
-            assert!(
-                global_id.starts_with("agfi-"),
-                "case {case:?}: expected an agfi- global id, got {global_id:?}"
-            );
-        } else {
-            assert_eq!(
-                status, 400,
-                "case {case:?}: expected HTTP 400 for bucket {bucket:?}, \
-                 got {status} with body {body}"
-            );
-            assert_eq!(
-                error_code(&body),
-                "InaccessibleStorageLocation",
-                "case {case:?}: expected InaccessibleStorageLocation for bucket {bucket:?}, \
-                 got {body}"
-            );
-        }
-    }
-}
-
-/// The same rule on the logs location `CreateFpgaImage` also takes, and on a location that
-/// names no bucket or no key at all — which names no object, so there is nothing to read.
-#[tokio::test]
-async fn create_fpga_image_holds_every_storage_location_to_the_one_rule() {
-    let (router, _engine) = emulator();
-
-    let logs_rows: Vec<(&str, Params, u16, &str)> = vec![
-        (
-            "a logs location whose bucket name breaks the naming rules",
-            {
-                let mut params = create_fpga_image_params(READABLE_BUCKET);
-                params.push(p("LogsStorageLocation.Bucket", "Logs_Bucket"));
-                params.push(p("LogsStorageLocation.Key", "logs/"));
-                params
-            },
-            400,
-            "InaccessibleStorageLocation",
-        ),
-        (
-            "a logs location that names a bucket but no key",
-            {
-                let mut params = create_fpga_image_params(READABLE_BUCKET);
-                params.push(p("LogsStorageLocation.Bucket", "my-afi-logs"));
-                params
-            },
-            400,
-            "MissingParameter",
-        ),
-        (
-            "an input location that names a key but no bucket",
-            vec![p("InputStorageLocation.Key", "dcp/checkpoint.tar")],
-            400,
-            "MissingParameter",
-        ),
-        (
-            "an input location that names no key",
-            vec![p("InputStorageLocation.Bucket", READABLE_BUCKET)],
-            400,
-            "MissingParameter",
-        ),
-        (
-            "both locations readable",
-            {
-                let mut params = create_fpga_image_params(READABLE_BUCKET);
-                params.push(p("LogsStorageLocation.Bucket", "my-afi-logs"));
-                params.push(p("LogsStorageLocation.Key", "logs/afi.log"));
-                params
-            },
-            200,
-            "",
-        ),
-    ];
-
-    for (case, params, expected_status, expected_code) in logs_rows {
-        let (status, body) = op(&router, "CreateFpgaImage", &params).await;
-        assert_eq!(
-            status, expected_status,
-            "case {case:?}: expected HTTP {expected_status}, got {status} with body {body}"
-        );
-        if !expected_code.is_empty() {
-            assert_eq!(
-                error_code(&body),
-                expected_code,
-                "case {case:?}: expected {expected_code}, got {body}"
-            );
-        }
-    }
-}
+// `CreateFpgaImage`'s side of this rule — the design checkpoint it reads, and the request
+// faults it answers ahead of that read — is [`super::create_fpga_image`]'s, which runs the
+// bucket table above through it.
 
 /// `CreateRestoreImageTask` keeps the same rule: a bucket name outside the naming rules is
 /// refused for being no bucket, and a readable bucket name is refused for the object, whose
@@ -461,7 +390,7 @@ async fn dry_run_is_answered_before_any_resource_is_resolved() {
         );
     }
 
-    // A DryRun writes nothing: no AFI was created by the row above, and the store is as a
+    // A DryRun writes nothing: no AFI was minted by the row above, and the store is as a
     // fresh account's is.
     let store = engine.state::<Ec2State>();
     let guard = store.lock();
@@ -475,93 +404,6 @@ async fn dry_run_is_answered_before_any_resource_is_resolved() {
 // ---------------------------------------------------------------------------
 // RULE 3 and RULE 5: the FPGA-image slice
 // ---------------------------------------------------------------------------
-
-/// `CreateFpgaImage` hands back a `pending` AFI whose creation then FAILS on the clock,
-/// because nothing read the design checkpoint: the AFI is stored, its ids are the ones the
-/// call reported, and one `ClientToken` names one AFI.
-#[tokio::test]
-async fn a_created_afi_is_pending_and_its_creation_fails_on_the_clock() {
-    let (router, engine) = emulator();
-
-    let (fpga_image_id, global_id) = create_fpga_image(&router).await;
-    assert_ne!(
-        fpga_image_id, global_id,
-        "the AFI id and its global id are different identifiers, got {fpga_image_id:?} twice"
-    );
-
-    {
-        let store = engine.state::<Ec2State>();
-        let guard = store.lock();
-        let record = guard
-            .fpga_images
-            .get(&fpga_image_id)
-            .expect("the AFI the create reported is stored");
-        let state = record.state_at(Instant::now());
-        assert_eq!(
-            state.code.as_deref(),
-            Some(FPGA_IMAGE_STATE_PENDING),
-            "straight after the create: expected a {FPGA_IMAGE_STATE_PENDING} AFI, got {state:?}"
-        );
-        let reported = record.view_at(Instant::now());
-        assert_eq!(
-            reported.state.and_then(|state| state.code),
-            Some(FPGA_IMAGE_STATE_PENDING.to_string()),
-            "the AFI as a report of it reads carries the state the clock has reached"
-        );
-        assert_eq!(
-            record.view.fpga_image_global_id.as_deref(),
-            Some(global_id.as_str()),
-            "the stored global id is the one the create reported, got {record:?}"
-        );
-    }
-
-    past_the_transition().await;
-
-    {
-        let store = engine.state::<Ec2State>();
-        let guard = store.lock();
-        let record = guard
-            .fpga_images
-            .get(&fpga_image_id)
-            .expect("the AFI is still stored");
-        let state = record.state_at(Instant::now());
-        assert_eq!(
-            state.code.as_deref(),
-            Some(FPGA_IMAGE_STATE_FAILED),
-            "past the transition: expected a {FPGA_IMAGE_STATE_FAILED} AFI, got {state:?}"
-        );
-        let message = state.message.unwrap_or_default();
-        assert!(
-            message.contains(READABLE_BUCKET),
-            "expected the failure message to name the design checkpoint, got {message:?}"
-        );
-    }
-
-    // "Unique, case-sensitive identifier that you provide to ensure the idempotency of the
-    // request": one token names the one AFI it minted.
-    let mut with_token = create_fpga_image_params(READABLE_BUCKET);
-    with_token.push(p("ClientToken", "one-afi-please"));
-    let (first_status, first) = op(&router, "CreateFpgaImage", &with_token).await;
-    let (second_status, second) = op(&router, "CreateFpgaImage", &with_token).await;
-    assert_eq!(
-        (first_status, second_status),
-        (200, 200),
-        "a replayed create: expected HTTP 200 twice, got {first_status} and {second_status}"
-    );
-    assert_eq!(
-        element(&first, "fpgaImageId"),
-        element(&second, "fpgaImageId"),
-        "a replayed ClientToken names the AFI it minted, got {first} then {second}"
-    );
-    let store = engine.state::<Ec2State>();
-    let guard = store.lock();
-    assert_eq!(
-        guard.fpga_images.len(),
-        2,
-        "a replayed create stores nothing, so two creates leave two AFIs, got {}",
-        guard.fpga_images.len()
-    );
-}
 
 /// An AFI id is resolved MALFORMED BEFORE NOT FOUND, and the same two answers come from
 /// every operation that takes one.
@@ -639,7 +481,7 @@ async fn an_fpga_image_id_is_resolved_malformed_before_not_found() {
 async fn an_afi_round_trips_through_reset_and_delete() {
     let (router, engine) = emulator();
 
-    let (fpga_image_id, _) = create_fpga_image(&router).await;
+    let (fpga_image_id, _) = seed_fpga_image(&engine, "reset-and-delete");
 
     // A load permission an attribute change would have granted, so the reset has something
     // to clear.
@@ -649,7 +491,7 @@ async fn an_afi_round_trips_through_reset_and_delete() {
         let record = guard
             .fpga_images
             .get_mut(&fpga_image_id)
-            .expect("the AFI the create reported is stored");
+            .expect("the seeded AFI is stored");
         record.load_permissions = vec![LoadPermission {
             user_id: Some("210987654321".to_string()),
             group: None,
