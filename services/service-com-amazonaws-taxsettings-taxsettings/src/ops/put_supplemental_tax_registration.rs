@@ -17,9 +17,13 @@
 //! jurisdictions ([`crate::state::SUPPLEMENTAL_TRN_COUNTRIES`]), and an entry
 //! whose `address.countryCode` is not one of them is refused with the modelled
 //! `ValidationException` before anything is stored. The model names no
-//! jurisdiction — see that constant for where the set comes from, and why
-//! refusing is the right answer for a country this emulator has no evidence AWS
-//! accepts.
+//! jurisdiction, so the boundary is read off OBSERVED behaviour instead — an
+//! entry for a country outside the set takes a 400 while one inside it clears
+//! country validation; see that constant for the observations, and why the
+//! model's silence is not permission to report a stored registration for a
+//! jurisdiction the service refuses. The only country code refused for its
+//! SHAPE rather than its jurisdiction (not two letters, or absent) is refused
+//! by the request walk before this handler runs.
 //!
 //! ## Shape of an operation
 //!
