@@ -95,6 +95,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The filter-matching rule every list operation of this service shares, so a change to
+// it (normalising a compared identifier, say) narrows every listing the same way; see
+// `crate::state` for how a sent filter member becomes the set it matches against.
+// `selected_optional` is the rule for a member an enablement may have no value for: an
+// absent actual value is selected only by an absent filter, so a filter on a member no
+// enablement here carries selects nothing (see the module header on `parentIdentifiers`
+// and `inheritanceDriftStatuses`).
+use crate::state::{filter_set, selected, selected_optional};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -128,39 +137,6 @@ impl From<ListEnabledBaselinesErrorModeled> for ListEnabledBaselinesError {
     fn from(modeled: ListEnabledBaselinesErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
-}
-
-/// A filter list the caller sent, as the handler matches it: the values as a SET, so
-/// testing one enablement against it costs `O(log k)` rather than a scan, and the whole
-/// per-request scan is bounded by the store's own [`MAX_ENABLED_BASELINES`] cap.
-///
-/// Every enum-typed member of `EnabledBaselineFilter` deserializes to a plain string, but
-/// the schema front door has already refused a value the model's value set does not
-/// declare (HTTP 400), so reaching this handler means each value is one of the modelled
-/// ones — and each of these lists is modelled with a maximum length, so the front door has
-/// bounded their lengths too.
-///
-/// [`MAX_ENABLED_BASELINES`]: crate::state::MAX_ENABLED_BASELINES
-type Filter<'a> = Option<::std::collections::BTreeSet<&'a str>>;
-
-/// The values of one filter member as a [`Filter`] set, or `None` when the caller sent
-/// that member no list at all. Built BEFORE the state lock is taken, so no caller-sized
-/// work happens while the lock is held.
-fn filter_set(values: Option<&Vec<String>>) -> Filter<'_> {
-    values.map(|values| values.iter().map(String::as_str).collect())
-}
-
-/// Whether `actual` is selected by a filter: a member the caller did not send selects
-/// every enablement, and one they did selects the enablements whose value its set holds.
-fn selected(filter: &Filter<'_>, actual: &str) -> bool {
-    filter.as_ref().is_none_or(|values| values.contains(actual))
-}
-
-/// As [`selected`], for a member no stored enablement has a value for at all: an absent
-/// value is selected only by an absent filter, so such a filter selects nothing (see the
-/// module header on `parentIdentifiers` and `inheritanceDriftStatuses`).
-fn selects_an_absent_value(filter: &Filter<'_>) -> bool {
-    filter.is_none()
 }
 
 /// The `ListEnabledBaselines` operation.
@@ -241,13 +217,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // the module header, and `parentIdentifiers`, which no enablement here
                     // has a value for at all — nor does `includeChildren` widen this set,
                     // because there is no hierarchy to widen it with.
-                    && match enabled_baseline.inheritance_drift_status {
-                        Some(status) => {
-                            selected(&inheritance_drift_statuses, status.as_wire())
-                        }
-                        None => selects_an_absent_value(&inheritance_drift_statuses),
-                    }
-                    && selects_an_absent_value(&parent_identifiers)
+                    && selected_optional(
+                        &inheritance_drift_statuses,
+                        enabled_baseline
+                            .inheritance_drift_status
+                            .map(|status| status.as_wire()),
+                    )
+                    && selected_optional(&parent_identifiers, None)
             })
             .collect();
         enabled.sort_by(|left, right| left.arn.cmp(&right.arn));

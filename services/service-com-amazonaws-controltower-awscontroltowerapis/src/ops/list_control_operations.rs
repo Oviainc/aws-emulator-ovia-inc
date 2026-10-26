@@ -75,6 +75,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The filter-matching rule every list operation of this service shares, so a change to
+// it (normalising a compared identifier, say) narrows every listing the same way; see
+// `crate::state` for how a sent filter member becomes the set it matches against.
+use crate::state::{filter_set, selected};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -108,32 +113,6 @@ impl From<ListControlOperationsErrorModeled> for ListControlOperationsError {
     fn from(modeled: ListControlOperationsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
-}
-
-/// A filter list the caller sent, as the handler matches it: the values as a SET, so
-/// testing one record against it costs `O(log k)` rather than a scan, and the whole
-/// per-request scan is bounded by the log's own [`MAX_CONTROL_OPERATIONS`] cap.
-///
-/// Every enum-typed member of `ControlOperationFilter` deserializes to a plain string,
-/// but the schema front door has already refused a value the model's value set does not
-/// declare, so reaching this handler means each value is one of the modelled ones — and
-/// each of these lists is modelled `@length min 1, max 1`, so the front door has bounded
-/// their length too.
-///
-/// [`MAX_CONTROL_OPERATIONS`]: crate::state::MAX_CONTROL_OPERATIONS
-type Filter<'a> = Option<::std::collections::BTreeSet<&'a str>>;
-
-/// The values of one filter member as a [`Filter`], or `None` when the caller sent that
-/// member no list at all. Built BEFORE the state lock is taken, so no caller-sized work
-/// happens while the lock is held.
-fn filter_set(values: Option<&Vec<String>>) -> Filter<'_> {
-    values.map(|values| values.iter().map(String::as_str).collect())
-}
-
-/// Whether `actual` is selected by a filter: a member the caller did not send selects
-/// every record, and one they did selects the records whose value its set holds.
-fn selected(filter: &Filter<'_>, actual: &str) -> bool {
-    filter.as_ref().is_none_or(|values| values.contains(actual))
 }
 
 /// The summary one log record reports.
