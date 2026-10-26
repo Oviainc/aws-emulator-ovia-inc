@@ -32,3 +32,32 @@ $headers.content-type: value_mismatch (expected 'text/xml;charset=UTF-8', got 't
 Boot the ec2 emulator
 Call CreateSnapshots and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Resolution
+
+Implemented: `CreateSnapshots` makes ONE snapshot of every EBS volume the named instance
+holds an attachment of, stores each as the modelled `Snapshot` shape
+(`state::SnapshotRecord`, in the new `state/snapshots.rs`) and answers the set read back out
+of the store. The scaffold header line is gone. The volumes come from the account's volume
+store through `VolumeRecord::attachments_at`, so this call and `DescribeVolumes` cannot
+disagree about which volumes an instance has; the instance's ROOT volume is the attachment at
+the device its AMI publishes, which is what `ExcludeBootVolume` drops and what
+`ExcludeDataVolumeIds` may not name. Each snapshot is handed back `pending` with no progress
+and reaches `completed` on the clock, never on a call. `DryRun` reports whether the request
+would have worked without writing, and the store's record and byte ceilings are asked for the
+whole set before anything is minted.
+
+Launching an EBS-backed instance now creates that root volume
+(`state::ComAmazonawsEc2Amazonec2State::mint_launched_root_volume`, called from the one place
+every launch path stores an instance), restored from the AMI's root block device mapping — the
+size, type, encryption state and source snapshot are the image's, and `DescribeVolumes`
+reports it as the instance's. Without it no instance of this emulator has a volume, so the
+rule above would never produce a snapshot through the public API.
+
+Covered end to end by `tests/all/create_snapshots.rs`.
+
+Still diverging, on causes this issue does not own: the recorded
+`ec2-create-snapshots-from-instance` launch names an AMI the published catalog does not hold,
+so that instance has no root volume to snapshot (`RunInstances` not resolving its `ImageId`
+is its own defect), and the two recorded refusals match on status and error code but not yet
+on AWS's message text, which the corpus withholds.

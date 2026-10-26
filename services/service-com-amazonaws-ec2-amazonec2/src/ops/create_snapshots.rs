@@ -1,16 +1,52 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSnapshots
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSnapshots`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: makes one snapshot of every EBS volume the named instance holds an
+//! attachment of, persists them in [`crate::state`] and answers the STORED records. This
+//! is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSnapshots::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What it does
 //!
+//! "Creates crash-consistent snapshots of multiple EBS volumes attached to an Amazon EC2
+//! instance. Volumes are chosen by specifying an instance. Each volume attached to the
+//! specified instance will produce one snapshot that is crash-consistent across the
+//! instance." So the SET this call creates is a function of the instance's attachments, not
+//! of anything the request lists: the request names the instance, and the request's two
+//! exclusions ([`InstanceSpecification`]'s `ExcludeBootVolume` and `ExcludeDataVolumeIds`)
+//! narrow that set. The volumes are read out of
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::volumes`] through
+//! [`crate::state::VolumeRecord::attachments_at`], the crate's one clock-aware reading of
+//! which attachments a volume still holds, so this call and `DescribeVolumes` can never
+//! disagree about which volumes an instance has.
+//!
+//! Which of those volumes is the ROOT one is a fact of the attachment's device: the
+//! instance's root device name is the one its AMI publishes (`Image$RootDeviceName`), so an
+//! attachment at that device is the boot volume and every other attachment is a data
+//! volume. That is what `ExcludeBootVolume` excludes, and why naming the root volume in
+//! `ExcludeDataVolumeIds` is refused rather than honoured ("If you specify the ID of the
+//! root volume, the request fails. To exclude the root volume, use `ExcludeBootVolume`").
+//!
+//! Each snapshot is stored as the modelled `Snapshot` shape
+//! ([`crate::state::SnapshotView`]) through
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::insert_snapshot`], which mints the
+//! snapshot id, so the set this call answers is read back OUT of the store rather than
+//! assembled from the request. Every snapshot of one request carries the same `StartTime`
+//! ("This is the same for all snapshots initiated by the same request",
+//! `SnapshotInfo$StartTime`) and is `pending` with no progress yet; reaching `completed` is
+//! owed by the clock, which [`crate::state::SnapshotRecord::view_at`] derives on every read.
+//!
+//! `DryRun` sits after every parameter has been validated and before the first write, so it
+//! reports whether the request WOULD have succeeded and leaves the store untouched. The
+//! store's ceilings are asked for the WHOLE set before anything is minted, so a request
+//! this emulator cannot hold is refused rather than half-written.
+//!
+//! Two members name places this emulator has none of, so each is refused rather than
+//! accepted and ignored: `Location=local` asks for a snapshot in the source instance's
+//! Local Zone, and every Region here reports only Availability Zones
+//! ([`crate::state::availability_zones_in_region`]); `OutpostArn` asks for one on the
+//! instance's Outpost, and no instance of this emulator is on one. Answering either with a
+//! regional snapshot would report a snapshot the caller did not ask for.
+
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -161,18 +197,377 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSnapshots` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSnapshotsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSnapshots"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            COPY_TAGS_FROM_SOURCE_VOLUME, MAX_EXCLUDED_DATA_VOLUME_IDS, MAX_STORED_BYTES,
+            MAX_STORED_SNAPSHOTS, MAX_TAGS_PER_RESOURCE, SNAPSHOT_LOCATION_LOCAL,
+            SNAPSHOT_LOCATION_REGIONAL, SNAPSHOT_STORAGE_TIER_STANDARD,
+            SNAPSHOT_TAGGABLE_RESOURCE, SnapshotView, invalid_volume_id_malformed,
+            require_service_state, snapshot_limit_exceeded, snapshot_payload_bytes, tag_list,
+            tags_from_specifications, volume_id_is_well_formed,
+        };
+
+        let specification = &input.instance_specification;
+        // The store is reached through `self.engine`, and nothing here depends on the
+        // Region a request was signed for: a snapshot carries no Region-derived member (no
+        // ARN, and the Availability Zone belongs to a LOCAL snapshot, which is refused
+        // below), so `ctx` carries nothing this handler reads.
+        let _ = ctx;
+
+        // "The IDs of the data (non-root) volumes to exclude from the multi-volume snapshot
+        // set. […] You can specify up to 40 volume IDs per request"
+        // (`InstanceSpecification$ExcludeDataVolumeIds`), each of which has to be a volume
+        // id — a value that is not one names no volume in any account, so it is refused as
+        // malformed rather than quietly excluding nothing.
+        let excluded: &[String] = specification
+            .exclude_data_volume_ids
+            .as_deref()
+            .unwrap_or_default();
+        if excluded.len() > MAX_EXCLUDED_DATA_VOLUME_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "excludeDataVolumeIds names {} volumes, above the \
+                 {MAX_EXCLUDED_DATA_VOLUME_IDS} a request may exclude",
+                excluded.len()
+            )));
+        }
+        for volume_id in excluded {
+            if !volume_id_is_well_formed(volume_id) {
+                return Err(invalid_volume_id_malformed(volume_id));
+            }
+        }
+
+        // "Only supported for instances in Local Zones. If the source instance is not in a
+        // Local Zone, omit this parameter" (`CreateSnapshotsRequest$Location`). Every Region
+        // of this emulator reports Availability Zones only, so no instance of it is in a
+        // Local Zone and there is no Local Zone to snapshot into; `regional` and an absent
+        // member both name the default location, which is where these snapshots are made. A
+        // value outside the modelled enum never reaches here: the boundary validator refuses
+        // it against the catalog first.
+        if input.location.as_deref() == Some(SNAPSHOT_LOCATION_LOCAL) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{SNAPSHOT_LOCATION_LOCAL}' for location. \
+                 A local snapshot is supported only for an instance in a Local Zone, \
+                 so only '{SNAPSHOT_LOCATION_REGIONAL}' can be served here"
+            )));
+        }
+
+        // "Only supported for instances on Outposts. If the source instance is not on an
+        // Outpost, omit this parameter. […] The snapshots must be created on the same
+        // Outpost as the instance" (`CreateSnapshotsRequest$OutpostArn`): no instance of
+        // this emulator is on an Outpost, so the Outpost the request names could never be
+        // the instance's own — and a regional snapshot is not what such a request asked for.
+        if let Some(outpost_arn) = input.outpost_arn.as_deref() {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{outpost_arn}' for outpostArn. \
+                 The snapshots must be created on the same Outpost as the instance, \
+                 and the instance is not on an Outpost"
+            )));
+        }
+
+        // "Tags to apply to every snapshot specified by the instance"
+        // (`CreateSnapshotsRequest$TagSpecifications`) — the snapshots are the only
+        // resources this call creates, so a specification naming any other resource type is
+        // refused by the crate's one reader of a create's tag specifications, which also
+        // holds the tag payload to its documented bounds.
+        let requested_tags = tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            SNAPSHOT_TAGGABLE_RESOURCE,
+            Self::NAME,
+        )?;
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        let now = ::std::time::Instant::now();
+
+        // The instance is what selects the volumes, so it is resolved first — by THIS
+        // operation's own validator, which answers every id it cannot resolve as malformed
+        // (see `require_instance_with_volumes` below for the recorded evidence).
+        let instance = require_instance_with_volumes(&store, &specification.instance_id)?;
+        let instance_id = instance.instance_id.clone();
+        // "The device name of the root device volume" (`Image$RootDeviceName`): the device
+        // the instance's own AMI boots from, which is what makes one of the instance's
+        // attachments its boot volume. An instance whose AMI this store cannot see has no
+        // published root device, so none of its attachments is known to be the root one.
+        let root_device = instance
+            .image_id
+            .as_deref()
+            .and_then(|image_id| store.images.get(image_id))
+            .and_then(|image| image.root_device_name.clone());
+
+        // "Each volume attached to the specified instance will produce one snapshot"
+        // (`CreateSnapshots`), minus the exclusions the request asked for. The volumes are
+        // walked in id order, which is the store's own order, so one request's snapshot set
+        // is reported in a stable order. An instance that holds no EBS volume therefore
+        // produces no snapshot: the set is the arithmetic consequence of the rule, read out
+        // of the store, and the corpus records no refusal of that case to word one from.
+        let mut sources: Vec<SourceVolume> = Vec::new();
+        for (volume_id, record) in &store.volumes {
+            // The devices THIS instance holds this volume at: none means the volume is not
+            // one of the instance's, and more than one means a Multi-Attach volume the
+            // instance holds twice, which is still one volume and so still one snapshot.
+            let devices: Vec<String> = record
+                .attachments_at(now)
+                .into_iter()
+                .filter(|attachment| {
+                    attachment.instance_id.as_deref() == Some(instance_id.as_str())
+                })
+                .map(|attachment| attachment.device.unwrap_or_default())
+                .collect();
+            if devices.is_empty() {
+                continue;
+            }
+            let is_root = root_device
+                .as_deref()
+                .is_some_and(|root| devices.iter().any(|device| device == root));
+            if excluded.iter().any(|excluded_id| excluded_id == volume_id) {
+                // "If you specify the ID of the root volume, the request fails. To exclude
+                // the root volume, use ExcludeBootVolume."
+                if is_root {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{volume_id}' for excludeDataVolumeIds. \
+                         It is the root volume of instance '{instance_id}', \
+                         which is excluded with excludeBootVolume"
+                    )));
+                }
+                continue;
+            }
+            // "Excludes the root volume from being snapshotted"
+            // (`InstanceSpecification$ExcludeBootVolume`).
+            if is_root && specification.exclude_boot_volume == Some(true) {
+                continue;
+            }
+            sources.push(SourceVolume {
+                volume_id: volume_id.clone(),
+                size: record.view.size,
+                encrypted: record.view.encrypted,
+                kms_key_id: record.view.kms_key_id.clone(),
+                tags: record.view.tags.clone().unwrap_or_default(),
+            });
+        }
+
+        // "Copies the tags from the specified volume to corresponding snapshot"
+        // (`CreateSnapshotsRequest$CopyTagsFromSource`), whose modelled enum publishes the
+        // single source `volume` — and a value outside that catalog never reaches here, the
+        // boundary validator having refused it against the enum first. The request's own
+        // tags are applied to every snapshot, so they win where both name one key.
+        let copy_tags_from_volume =
+            input.copy_tags_from_source.as_deref() == Some(COPY_TAGS_FROM_SOURCE_VOLUME);
+        let mut tag_sets: Vec<Vec<Tag>> = Vec::with_capacity(sources.len());
+        for source in &sources {
+            let mut tags: ::std::collections::BTreeMap<String, String> =
+                ::std::collections::BTreeMap::new();
+            if copy_tags_from_volume {
+                for tag in &source.tags {
+                    tags.insert(
+                        tag.key.clone().unwrap_or_default(),
+                        tag.value.clone().unwrap_or_default(),
+                    );
+                }
+            }
+            for tag in &requested_tags {
+                tags.insert(
+                    tag.key.clone().unwrap_or_default(),
+                    tag.value.clone().unwrap_or_default(),
+                );
+            }
+            if tags.len() > MAX_TAGS_PER_RESOURCE {
+                return Err(Scaffolded::tag_limit_exceeded(format!(
+                    "The snapshot of volume '{}' would carry {} tags, above the maximum of \
+                     {MAX_TAGS_PER_RESOURCE} per resource",
+                    source.volume_id,
+                    tags.len()
+                )));
+            }
+            tag_sets.push(tag_list(&tags));
+        }
+
+        // The ceilings are asked for the WHOLE set: this call makes one snapshot per volume,
+        // so a store with room for some of them has room for none of this request.
+        if !store.has_snapshot_capacity(sources.len()) {
+            return Err(snapshot_limit_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_SNAPSHOTS} EBS snapshots, \
+                 so it cannot store {} more",
+                store.snapshots.len(),
+                sources.len()
+            )));
+        }
+        let payload_bytes: usize = tag_sets
+            .iter()
+            .map(|tags| snapshot_payload_bytes(tags, input.description.as_deref()))
+            .sum();
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(snapshot_limit_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {payload_bytes} more",
+                store.stored_bytes()
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // One instant for the whole set: "Time this snapshot was started. This is the same
+        // for all snapshots initiated by the same request" (`SnapshotInfo$StartTime`).
+        let started_at = ::std::time::SystemTime::now();
+        let owner_id = ::engine::emulator_account_id().to_string();
+        let mut snapshot_ids: Vec<String> = Vec::with_capacity(sources.len());
+        for (source, tags) in sources.iter().zip(tag_sets) {
+            snapshot_ids.push(store.insert_snapshot(
+                SnapshotView {
+                    // "A description propagated to every snapshot specified by the instance"
+                    // (`CreateSnapshotsRequest$Description`).
+                    description: input.description.clone(),
+                    tags: Some(tags),
+                    // "Indicates whether the snapshot is encrypted" (`Snapshot$Encrypted`):
+                    // "snapshots that are taken from encrypted volumes are automatically
+                    // encrypted" (`CreateSnapshot`), so this is the source volume's own
+                    // encryption state and never something the request asked for.
+                    encrypted: Some(source.encrypted.unwrap_or(false)),
+                    // "The Amazon Resource Name (ARN) of the KMS key that was used to
+                    // protect the volume encryption key for the parent volume"
+                    // (`Snapshot$KmsKeyId`): the parent volume's key, for an encrypted one.
+                    kms_key_id: source.kms_key_id.clone(),
+                    // "Source volume from which this snapshot was created"
+                    // (`SnapshotInfo$VolumeId`) and "Size of the volume from which this
+                    // snapshot was created" (`$VolumeSize`), both read off that volume.
+                    volume_id: Some(source.volume_id.clone()),
+                    volume_size: source.size,
+                    owner_id: Some(owner_id.clone()),
+                    // "`standard` indicates that the snapshot is stored in the standard
+                    // snapshot storage tier and that it is ready for use"
+                    // (`Snapshot$StorageTier`); `ModifySnapshotTier` is what archives one.
+                    storage_tier: Some(SNAPSHOT_STORAGE_TIER_STANDARD.to_string()),
+                    // The members a snapshot of this kind carries nothing for: the owner
+                    // alias names an Amazon-published snapshot, the Outpost ARN one stored
+                    // on an Outpost (refused above), the restore expiry a temporarily
+                    // restored archived snapshot, the transfer type and completion duration
+                    // a snapshot COPY ("Only for snapshot copies"), the state message a
+                    // failed asynchronous copy, the data encryption key id a member
+                    // "only returned by DescribeSnapshots", and the Availability Zone a
+                    // LOCAL snapshot ("the Availability Zone or Local Zone of the
+                    // snapshots") rather than a regional one. `SseType` is "reserved for
+                    // future use".
+                    owner_alias: None,
+                    outpost_arn: None,
+                    restore_expiry_time: None,
+                    sse_type: None,
+                    availability_zone: None,
+                    transfer_type: None,
+                    completion_duration_minutes: None,
+                    state_message: None,
+                    data_encryption_key_id: None,
+                    // Nothing in this emulator writes blocks to a volume, so there is no
+                    // full snapshot size measured for one.
+                    full_snapshot_size_in_bytes: None,
+                    // Minted, stamped and derived by the store: the id, the start time, and
+                    // the state, progress and completion time the clock decides.
+                    snapshot_id: None,
+                    start_time: None,
+                    state: None,
+                    progress: None,
+                    completion_time: None,
+                },
+                started_at,
+            ));
+        }
+
+        // Read the answer back OUT of the store, so the caller sees what a later read of
+        // these snapshots will see rather than the request object.
+        let read_at = ::std::time::Instant::now();
+        let mut snapshots: Vec<SnapshotInfo> = Vec::with_capacity(snapshot_ids.len());
+        for snapshot_id in &snapshot_ids {
+            let record = store.snapshots.get(snapshot_id).ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the newly created snapshot '{snapshot_id}' could not be read back"
+                ))
+            })?;
+            snapshots.push(snapshot_info(record.view_at(read_at)));
+        }
+        Ok(CreateSnapshotsOutput {
+            snapshots: Some(snapshots),
+        })
+    }
+}
+
+/// Resolve the instance whose volumes `CreateSnapshots` is asked to snapshot, or refuse the
+/// id: HTTP 400 `InvalidInstanceID.Malformed`, in one of the two wordings that code carries.
+///
+/// EC2's per-operation validators do NOT agree about an instance id they cannot resolve, and
+/// this operation's is the strict one: a well-formed id that names no instance of the
+/// account is answered `InvalidInstanceID.Malformed` — the instance ID is malformed — rather
+/// than reported as not found, the same answer `CreateReplaceRootVolumeTask` is recorded
+/// making for the same id in the same recorded unit (the evidence on
+/// [`crate::scaffolded::Scaffolded::instance_id_is_malformed`], which is the one place both
+/// wordings of this code live). A value that is not an instance id at all is refused one
+/// step earlier, by the id space itself, with the echoed-value message
+/// [`crate::scaffolded::Scaffolded::invalid_instance_id_malformed`] carries; the recorded
+/// units behind this operation's issue pin both halves.
+///
+/// So the choice belongs to the OPERATION rather than to the id, which is why this lives
+/// here and not in [`crate::state::require_known_instance`] — the shared helper the
+/// operations that DO draw the malformed/not-found distinction keep using. The resolved
+/// record is handed back, so the handler reads the instance ONCE rather than looking it up
+/// again behind an unreachable branch.
+fn require_instance_with_volumes<'a, E>(
+    store: &'a crate::state::ComAmazonawsEc2Amazonec2State,
+    instance_id: &str,
+) -> Result<&'a crate::state::InstanceRecord, crate::scaffolded::Scaffolded<E>> {
+    // A value that is not an instance id at all never reaches this operation's resolver: it
+    // is refused by the id space itself, with the echoed-value message every EC2 id space
+    // answers for one.
+    if !crate::state::instance_id_is_well_formed(instance_id) {
+        return Err(crate::scaffolded::Scaffolded::invalid_instance_id_malformed(
+            instance_id,
+        ));
+    }
+    store
+        .instances
+        .get(instance_id)
+        .ok_or_else(|| crate::scaffolded::Scaffolded::instance_id_is_malformed(instance_id))
+}
+
+/// One volume of the instance this call snapshots: everything a snapshot of it reports
+/// about the volume, read off the stored volume under the same guard the write takes.
+struct SourceVolume {
+    /// The volume's id, which its snapshot reports as the source volume.
+    volume_id: String,
+    /// "Size of the volume from which this snapshot was created", in GiB.
+    size: Option<i32>,
+    /// Whether the volume is encrypted, which decides whether its snapshot is.
+    encrypted: Option<bool>,
+    /// The KMS key protecting the volume's encryption key, for an encrypted volume.
+    kms_key_id: Option<String>,
+    /// The volume's own tags, which `CopyTagsFromSource` copies onto the snapshot.
+    tags: Vec<Tag>,
+}
+
+/// One stored snapshot as `CreateSnapshots` reports it: the modelled `SnapshotInfo`, read
+/// off the stored `Snapshot` so this call and a later read of the same snapshot cannot
+/// report it differently.
+///
+/// `SnapshotInfo` carries a SUBSET of the stored shape's members, and three of the members
+/// it does carry are left absent here for the reasons the stored view records: no snapshot
+/// of this emulator is on an Outpost or in a Local Zone, and `SseType` is reserved for
+/// future use.
+fn snapshot_info(view: crate::state::SnapshotView) -> SnapshotInfo {
+    SnapshotInfo {
+        description: view.description,
+        tags: view.tags,
+        encrypted: view.encrypted,
+        volume_id: view.volume_id,
+        state: view.state,
+        volume_size: view.volume_size,
+        start_time: view.start_time,
+        progress: view.progress,
+        owner_id: view.owner_id,
+        snapshot_id: view.snapshot_id,
+        outpost_arn: view.outpost_arn,
+        sse_type: view.sse_type,
+        availability_zone: view.availability_zone,
     }
 }

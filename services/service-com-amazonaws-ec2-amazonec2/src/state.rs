@@ -1298,6 +1298,17 @@ pub use instance_event_windows::*;
 mod classic_link;
 pub use classic_link::*;
 
+/// The EBS snapshots the account holds — what one snapshot is stored as, the store's
+/// bounds, its byte charge and the clock-owed `pending` -> `completed` move every snapshot
+/// starts out owing — in a module of its own, re-exported so a handler reaches them as
+/// `crate::state::<item>` like every other primitive here.
+pub mod snapshots;
+pub use snapshots::*;
+
+/// The EBS root volume a LAUNCH creates for the instance it stores, restored from the AMI's
+/// root block device mapping — one method on the state, in a module of its own.
+mod launched_root_volumes;
+
 /// The one region whose Amazon-provided private DNS suffix is `ec2.internal`
 /// rather than `<region>.compute.internal`.
 pub const EC2_INTERNAL_REGION: &str = "us-east-1";
@@ -2671,6 +2682,13 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// A `CreateVolume` `ClientToken` and the volume id it minted, so a repeat of the
     /// same request answers with that volume instead of creating a second one.
     pub volume_client_tokens: HashMap<String, String>,
+    /// Every EBS snapshot the account holds, by `SnapshotId`, as the modelled
+    /// [`SnapshotView`] shape itself — see [`snapshots`]. Ordered by id, which is the order
+    /// a report of the account's snapshots walks and pages over.
+    ///
+    /// Empty for a fresh account: nothing in AWS makes a snapshot until a caller asks for
+    /// one. [`Self::insert_snapshot`] is the one writer.
+    pub snapshots: BTreeMap<String, SnapshotRecord>,
     /// Every VM Import/Export snapshot import task the account holds, by `ImportTaskId`,
     /// as the modelled [`ImportSnapshotTask`] shape itself — so a member a writer sets
     /// round-trips through `DescribeImportSnapshotTasks` without a field-by-field copy
@@ -3331,6 +3349,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             id_counter: 0,
             volumes: BTreeMap::new(),
             volume_client_tokens: HashMap::new(),
+            snapshots: BTreeMap::new(),
             import_snapshot_tasks: BTreeMap::new(),
             instance_event_windows: BTreeMap::new(),
             volume_modifications: BTreeMap::new(),
@@ -5822,7 +5841,8 @@ impl ComAmazonawsEc2Amazonec2State {
         Some(address)
     }
 
-    /// Store a launched instance, appending it to its reservation.
+    /// Store a launched instance, appending it to its reservation — and create the EBS root
+    /// volume the launch gives it ([`Self::mint_launched_root_volume`]).
     pub fn insert_instance(&mut self, record: InstanceRecord) {
         if let Some(reservation) = self.reservations.get_mut(&record.reservation_id) {
             reservation.instance_ids.push(record.instance_id.clone());
@@ -5831,7 +5851,9 @@ impl ComAmazonawsEc2Amazonec2State {
         self.stored_bytes = self
             .stored_bytes
             .saturating_add(instance_payload_bytes(&record));
+        let instance_id = record.instance_id.clone();
         self.instances.insert(record.instance_id.clone(), record);
+        self.mint_launched_root_volume(&instance_id);
     }
 
     /// The caller-chosen bytes stored right now.
@@ -7351,6 +7373,7 @@ impl ComAmazonawsEc2Amazonec2State {
             secondary_networks => view,
             secondary_subnets,
             security_groups,
+            snapshots => view,
             spot_instance_requests => view,
             subnet_cidr_reservations,
             subnets,

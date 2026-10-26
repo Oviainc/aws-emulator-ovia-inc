@@ -128,6 +128,12 @@ mod carrier_gateways;
 // the tail.
 #[path = "all/classic_link_instances.rs"]
 mod classic_link_instances;
+// What `CreateSnapshots` makes of the volumes one instance holds — one snapshot each, the
+// two exclusions, the tags, and the refusals. Declared in the MIDDLE of the list for the
+// reason the suite above gives: the head and the tail are both where concurrent ec2 landings
+// insert their two lines, and these two lost three serialized squash merges at the tail.
+#[path = "all/create_snapshots.rs"]
+mod create_snapshots;
 #[path = "all/coip_pools.rs"]
 mod coip_pools;
 #[path = "all/confirm_product_instance.rs"]
