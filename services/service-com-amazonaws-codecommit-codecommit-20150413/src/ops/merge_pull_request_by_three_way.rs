@@ -22,8 +22,10 @@
 //!
 //! A merge no strategy and no resolution settles is refused with the modelled
 //! `ManualMergeRequiredException`, and nothing is written; so is a pull request that
-//! is no longer open, and one whose destination branch the repository no longer
-//! holds.
+//! is no longer open, one whose approval rules still state conditions its approvals
+//! do not meet (`PullRequestApprovalRulesNotSatisfiedException`, read through
+//! [`crate::state::PullRequestRecord::approval_rules_satisfied`]), and one whose
+//! destination branch the repository no longer holds.
 //!
 //! The merge runs under one per-request budget and off the async worker, exactly as
 //! `CreateUnreferencedMergeCommit`'s does, because it holds the store guard it reads
@@ -590,6 +592,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         PullRequestAlreadyClosedException {
                             message: Some(
                                 crate::state::PULL_REQUEST_ALREADY_CLOSED_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // "The pull request cannot be merged because one or more approval
+            // rules applied to the pull request have conditions that have not been
+            // met": the conditions are counted against the approvals the STORED
+            // pull request holds, the one reading of an approval rule this crate
+            // has, and an override of its rules is what sets them aside.
+            if !pull_request.approval_rules_satisfied() {
+                return Err(
+                    MergePullRequestByThreeWayErrorModeled::PullRequestApprovalRulesNotSatisfiedException(
+                        PullRequestApprovalRulesNotSatisfiedException {
+                            message: Some(
+                                crate::state::PULL_REQUEST_APPROVAL_RULES_NOT_SATISFIED_MESSAGE
+                                    .to_string(),
                             ),
                         },
                     )
