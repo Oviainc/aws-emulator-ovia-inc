@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDatabases
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDatabases`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDatabases::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the databases of the data warehouse a request connects to, enumerated
+//! from the SQL engine this service holds, and paged with an opaque
+//! `NextToken`. A reporting operation — it reports the databases statements
+//! already created and writes nothing, not even the database it connects
+//! through.
 //!
 //! ## Shape of an operation
 //!
@@ -121,6 +117,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    decode_cursor, encode_cursor, ConnectionRequest, ABSENT_ENDPOINT_MESSAGE, CURSOR_DATABASES,
+    DEFAULT_PAGE_SIZE, INVALID_TOKEN_MESSAGE,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -194,18 +194,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDatabases` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDatabasesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDatabases"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListDatabasesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Redshift Data API state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The same connection combinations every operation of this service
+        // documents: one data warehouse, one database, one authorization
+        // method. Here `Database` is the database the credentials connect
+        // THROUGH — the list itself spans the warehouse — and every documented
+        // combination supplies one, so a request carrying none is refused
+        // exactly as the other operations refuse it. `ListDatabases` takes no
+        // `SessionId`, so no connection of its own can live on a session.
+        let requested = ConnectionRequest {
+            cluster_identifier: input.cluster_identifier.as_ref(),
+            workgroup_name: input.workgroup_name.as_ref(),
+            session_id: None,
+            database: input.database.as_ref(),
+            db_user: input.db_user.as_ref(),
+            secret_arn: input.secret_arn.as_ref(),
+        };
+        let connection = match requested.resolve() {
+            Ok(connection) => connection,
+            Err(problem) => {
+                // The endpoint a request NAMED is resolved before its SELECTION
+                // is judged, exactly as every other operation of this service
+                // does it.
+                if problem.is_target_selection()
+                    && crate::state::warehouse::names_absent_warehouse(ctx, requested).await
+                {
+                    return Err(validation(ABSENT_ENDPOINT_MESSAGE));
+                }
+                return Err(validation(problem.message()));
+            }
+        };
+
+        // A database belongs to a data warehouse, so the target this request
+        // named is resolved against the service that owns it before anything is
+        // listed: a cluster or workgroup that does not exist in this Region
+        // holds no databases to report. A target the owner could not be asked
+        // about is UNDECIDED, and is read rather than refused.
+        if crate::state::warehouse::resolve_target(ctx, &connection.target).await
+            == crate::state::warehouse::TargetResolution::Absent
+        {
+            return Err(validation(ABSENT_ENDPOINT_MESSAGE));
+        }
+
+        // The databases of the warehouse the request addressed, in name order
+        // so that paging walks a stable sequence. They are the databases this
+        // emulator really holds: a database exists because a statement ran
+        // against it, and this read opens none.
+        let databases = state.lock().database_names(&connection.target);
+
+        // The list is read through a connection to ONE of those databases, and
+        // a database this emulator does not hold cannot be connected to: such a
+        // request names a missing resource, which is what a catalog read of the
+        // same database answers.
+        if !databases.contains(&connection.database) {
+            return Err(ListDatabasesErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Database does not exist: {}", connection.database),
+                    resource_id: connection.database.clone(),
+                },
+            )
+            .into());
+        }
+
+        // The cursor is an offset into that name-ordered list, and its kind
+        // names the warehouse the page was issued for, so a token minted while
+        // paging one warehouse's databases is refused for any other rather than
+        // silently resolving to the same offset in a different list.
+        let cursor_kind = format!("{CURSOR_DATABASES}:{}", connection.target.key());
+        let offset = match input.next_token.as_deref() {
+            None => 0_usize,
+            Some(token) => match decode_cursor(&cursor_kind, token)
+                .and_then(|position| usize::try_from(position).ok())
+            {
+                Some(offset) => offset,
+                None => return Err(validation(INVALID_TOKEN_MESSAGE)),
+            },
+        };
+        if offset > databases.len() {
+            return Err(validation(INVALID_TOKEN_MESSAGE));
+        }
+
+        // `MaxResults` is modelled with a default of 0, which names no page
+        // size; the page then holds as much as the modelled maximum allows.
+        let page_size = usize::try_from(input.max_results)
+            .ok()
+            .filter(|size| *size > 0)
+            .unwrap_or(DEFAULT_PAGE_SIZE);
+        let end = offset.saturating_add(page_size).min(databases.len());
+
+        Ok(ListDatabasesOutput {
+            databases: Some(databases[offset..end].to_vec()),
+            // A token only when databases remain past this page, pointing at
+            // the first of them so the next page resumes exactly where this one
+            // stopped.
+            next_token: (end < databases.len())
+                .then(|| encode_cursor(&cursor_kind, u64::try_from(end).unwrap_or(u64::MAX))),
+        })
     }
+}
+
+/// Refuse the request as invalid, with the `ValidationException` this operation
+/// models.
+fn validation(message: &str) -> ListDatabasesError {
+    ListDatabasesErrorModeled::ValidationException(ValidationException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

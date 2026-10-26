@@ -128,7 +128,7 @@
 use super::types::*;
 use crate::state::{
     decode_cursor, encode_cursor, non_empty, ConnectionRequest, ABSENT_ENDPOINT_MESSAGE,
-    CURSOR_COLUMNS, DEFAULT_COLUMN_PAGE_SIZE, DEFAULT_SCHEMA, INVALID_TOKEN_MESSAGE,
+    CURSOR_COLUMNS, DEFAULT_PAGE_SIZE, DEFAULT_SCHEMA, INVALID_TOKEN_MESSAGE,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -375,7 +375,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = usize::try_from(input.max_results)
             .ok()
             .filter(|size| *size > 0)
-            .unwrap_or(DEFAULT_COLUMN_PAGE_SIZE);
+            .unwrap_or(DEFAULT_PAGE_SIZE);
         let end = offset.saturating_add(page_size).min(columns.len());
 
         Ok(DescribeTableOutput {

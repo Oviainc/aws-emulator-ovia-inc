@@ -2067,9 +2067,8 @@ async fn the_number_of_open_databases_is_bounded() {
 #[tokio::test]
 async fn the_operations_outside_this_slice_still_answer_not_implemented() {
     let emulator = Emulator::new();
-    let cases: [(&str, Value); 4] = [
+    let cases: [(&str, Value); 3] = [
         ("GetStatementResultV2", json!({"Id": ABSENT_ID})),
-        ("ListDatabases", json!({"ClusterIdentifier": "my-cluster", "Database": "dev"})),
         (
             "ListSchemas",
             json!({"ClusterIdentifier": "my-cluster", "Database": "dev"}),

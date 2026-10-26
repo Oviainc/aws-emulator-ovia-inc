@@ -72,10 +72,11 @@ pub const COMPLETION_SPAN: Duration = Duration::from_millis(300);
 /// returns as much as one page can hold.
 pub const DEFAULT_LIST_PAGE_SIZE: usize = 100;
 
-/// Page size `DescribeTable` uses when the request leaves `MaxResults` at its
-/// modelled default of 0 — `PageSize`'s modelled maximum of 1000, so an
-/// unparameterised call returns as much of a `ColumnList` as one page can hold.
-pub const DEFAULT_COLUMN_PAGE_SIZE: usize = 1_000;
+/// Page size an operation whose `MaxResults` is the modelled `PageSize` uses
+/// when the request leaves that member at its default of 0 — `PageSize`'s
+/// modelled maximum of 1000, so an unparameterised call returns as much as one
+/// page can hold.
+pub const DEFAULT_PAGE_SIZE: usize = 1_000;
 
 /// Rows `GetStatementResult` returns in one page. Redshift documents no page
 /// size for this operation, so this is an emulator-chosen bound; it only
@@ -488,6 +489,21 @@ impl ConnectionTarget {
         }
     }
 
+    /// This warehouse as ONE identifier, for anything derived per warehouse: a
+    /// storage key ([`Self::database_key`]), or the kind of a pagination cursor
+    /// whose position means something only within one warehouse.
+    ///
+    /// The caller-chosen name is LENGTH-PREFIXED rather than joined by a
+    /// separator, so no two distinct warehouses can produce one identifier
+    /// whatever characters their names carry.
+    pub fn key(&self) -> String {
+        let (kind, name) = match self {
+            Self::Cluster(id) => ("cluster", id.as_str()),
+            Self::Workgroup(name) => ("workgroup", name.as_str()),
+        };
+        format!("{kind}:{}:{name}", name.len())
+    }
+
     /// The key identifying this target's `database` in [`Database`] storage.
     ///
     /// Every caller-chosen part is LENGTH-PREFIXED rather than joined by a
@@ -495,15 +511,7 @@ impl ConnectionTarget {
     /// key whatever characters the names carry — two different warehouses must
     /// never share one engine.
     fn database_key(&self, database: &str) -> String {
-        let (kind, name) = match self {
-            Self::Cluster(id) => ("cluster", id.as_str()),
-            Self::Workgroup(name) => ("workgroup", name.as_str()),
-        };
-        format!(
-            "{kind}:{}:{name}:{}:{database}",
-            name.len(),
-            database.len()
-        )
+        format!("{}:{}:{database}", self.key(), database.len())
     }
 }
 
@@ -1964,6 +1972,8 @@ pub const CURSOR_ROWS: &str = "rows";
 pub const CURSOR_SESSIONS: &str = "sessions";
 /// Cursor kind naming a column offset in one table's `ColumnList`.
 pub const CURSOR_COLUMNS: &str = "columns";
+/// Cursor kind naming an offset into the databases of one data warehouse.
+pub const CURSOR_DATABASES: &str = "databases";
 
 /// Encode an opaque continuation token for `kind` at `position`.
 ///
@@ -2511,6 +2521,20 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
         self.databases
             .get(&target.database_key(database))
             .map(|open| std::sync::Arc::clone(&open.handle))
+    }
+
+    /// The names of the databases of `target` this emulator holds, in name
+    /// order — the databases `ListDatabases` enumerates.
+    ///
+    /// A reporting enumeration, so it opens nothing: a database exists in this
+    /// emulator because a statement ran against it (see
+    /// [`Self::reserve_database`]), and a read that opened one would add a
+    /// database to the warehouse every later caller then found there.
+    pub fn database_names(&self, target: &ConnectionTarget) -> Vec<String> {
+        self.warehouse_handles(target)
+            .into_iter()
+            .map(|(database, _handle)| database)
+            .collect()
     }
 
     /// Resolve the database a submission will run on, opening and confining it on

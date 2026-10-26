@@ -23,6 +23,9 @@ mod emulator;
 #[path = "all/error_surface.rs"]
 mod error_surface;
 
+#[path = "all/list_databases.rs"]
+mod list_databases;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
