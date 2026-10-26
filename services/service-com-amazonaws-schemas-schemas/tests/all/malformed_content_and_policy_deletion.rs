@@ -278,7 +278,7 @@ async fn create_schema_stores_only_content_that_is_a_document_of_the_declared_ty
 /// the shape `NotFoundException` and the condition code `ResourceNotFound` in the
 /// error's own `Code` member — the same pair for every operation, whichever resource
 /// (registry, schema, schema version, code binding, resource policy) is the missing
-/// one. `DeleteSchema`'s and `DeleteResourcePolicy`'s successes are an empty 204, so
+/// one. `DeleteSchema`'s and `DeleteResourcePolicy`'s successes carry no body at all, so
 /// the status and that body are all a client has to go on.
 #[tokio::test]
 async fn naming_a_resource_the_store_does_not_hold_is_resource_not_found() {
@@ -452,14 +452,14 @@ async fn a_deleted_resource_policy_is_gone_from_every_later_read() {
             .call("DELETE", &policy_uri(Some(&registry)), None)
             .await;
         assert_eq!(
-            deleted.status, 204,
-            "case {case:?}: expected 204 from DeleteResourcePolicy, got {} {:?}",
+            deleted.status, 200,
+            "case {case:?}: expected 200 from DeleteResourcePolicy, got {} {:?}",
             deleted.status, deleted.body
         );
         assert_eq!(
             deleted.body,
             Value::Null,
-            "case {case:?}: a 204 carries no body, got {:?}",
+            "case {case:?}: this answer carries no body, got {:?}",
             deleted.body
         );
 
@@ -573,8 +573,8 @@ async fn deleting_one_registrys_policy_leaves_every_other_policy_alone() {
         .call("DELETE", &policy_uri(Some("registry-b")), None)
         .await;
     assert_eq!(
-        deleted.status, 204,
-        "expected 204 from DeleteResourcePolicy, got {} {:?}",
+        deleted.status, 200,
+        "expected 200 from DeleteResourcePolicy, got {} {:?}",
         deleted.status, deleted.body
     );
 

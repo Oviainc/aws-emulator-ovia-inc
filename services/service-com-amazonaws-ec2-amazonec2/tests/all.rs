@@ -564,3 +564,9 @@ mod verified_access_instances;
 mod managed_prefix_lists;
 #[path = "all/validate_security_group_quotas_for_interface.rs"]
 mod validate_security_group_quotas_for_interface;
+// Declared LAST for the reason the header gives: the sorted region of this file is where
+// every new ec2 suite inserts its lines. The account's *block public access for AMIs*
+// setting: what the enable puts in effect, what the disable takes back out, and what
+// `GetImageBlockPublicAccessState` reports out of each Region's own setting.
+#[path = "all/image_block_public_access.rs"]
+mod image_block_public_access;

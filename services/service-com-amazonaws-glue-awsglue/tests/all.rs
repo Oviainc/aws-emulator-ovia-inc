@@ -113,6 +113,8 @@ mod state_roundtrip;
 mod store_capacity;
 #[path = "all/table_versions.rs"]
 mod table_versions;
+#[path = "all/trigger_starts.rs"]
+mod trigger_starts;
 #[path = "all/triggers.rs"]
 mod triggers;
 #[path = "all/usage_profiles.rs"]
