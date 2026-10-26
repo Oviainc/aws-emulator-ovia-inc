@@ -565,6 +565,41 @@ pub const MAX_TAGS_PER_PLAN: usize = 200;
 /// what this emulator holds.
 pub const MAX_RESCORE_EXECUTION_PLANS: usize = 100;
 
+/// The largest page a client may ask `ListRescoreExecutionPlans` for.
+///
+/// The model publishes it on the operation's `MaxResults`
+/// (`MaxResultsIntegerForListRescoreExecutionPlansRequest`, `@range(min: 1, max: 50)`),
+/// so it is the widest page the paginated listing can ever hand back — a request
+/// naming more is already refused with the modelled `ValidationException` before any
+/// handler runs.
+pub const MAX_LISTED_PLANS_PER_PAGE: usize = 50;
+
+/// The page size [`page_size`] serves a listing that names no `MaxResults`.
+///
+/// `ListRescoreExecutionPlans` is `@paginated` (`inputToken`/`outputToken` `NextToken`,
+/// `pageSize` `MaxResults`), so a response is a PAGE whether or not the caller asked for
+/// a size: the remainder is reached through the `NextToken` the page carries. The model
+/// does not publish the service's own default, so this one is the emulator's — the
+/// widest page a client may request ([`MAX_LISTED_PLANS_PER_PAGE`]), which is the most a
+/// response may hold, and never the whole store ([`MAX_RESCORE_EXECUTION_PLANS`] is
+/// larger than one page).
+pub const DEFAULT_LISTED_PLANS_PER_PAGE: usize = MAX_LISTED_PLANS_PER_PAGE;
+
+/// How many plans one `ListRescoreExecutionPlans` request's page holds: the
+/// `MaxResults` it named, or [`DEFAULT_LISTED_PLANS_PER_PAGE`] when it named none.
+///
+/// The ONE place that decision is made, so a listing is bounded by a page size that is
+/// never zero and never wider than [`MAX_LISTED_PLANS_PER_PAGE`], whatever the request
+/// carried. `MaxResults`'s modelled range refuses a value outside 1..=50 before a
+/// handler runs, so the clamp is only what keeps that bound true in code.
+pub fn page_size(max_results: Option<i32>) -> usize {
+    max_results.map_or(DEFAULT_LISTED_PLANS_PER_PAGE, |requested| {
+        usize::try_from(requested)
+            .unwrap_or(DEFAULT_LISTED_PLANS_PER_PAGE)
+            .clamp(1, MAX_LISTED_PLANS_PER_PAGE)
+    })
+}
+
 /// The number of extra capacity units one rescore execution plan may be provisioned
 /// with.
 ///

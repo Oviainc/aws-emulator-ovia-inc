@@ -21,6 +21,8 @@ mod create_plan_tag_charset;
 mod handler_list_ceiling_report;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/list_plans_page_bound.rs"]
+mod list_plans_page_bound;
 #[path = "all/plan_capacity_quota.rs"]
 mod plan_capacity_quota;
 #[path = "all/plan_capacity_units.rs"]

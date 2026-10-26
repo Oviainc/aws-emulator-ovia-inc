@@ -4,8 +4,10 @@
 //!
 //! Reports one summary per plan this service holds IN THE REQUEST'S REGION, in the
 //! store's stable id order, honouring `MaxResults` and round-tripping `NextToken` so a
-//! paged walk visits every plan exactly once. A plan created in another region is not
-//! among them. A pure read: it writes nothing.
+//! paged walk visits every plan exactly once. A request naming no `MaxResults` is served
+//! at `crate::state::DEFAULT_LISTED_PLANS_PER_PAGE`, so no response is ever wider than
+//! the page a client may ask for. A plan created in another region is not among them. A
+//! pure read: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -177,11 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?),
         };
 
-        // Absent `MaxResults` means no page limit was asked for, so the page holds every
-        // remaining plan; `MaxResults` is modelled 1..50, so the cast cannot be negative.
-        let limit = input
-            .max_results
-            .map_or(usize::MAX, |requested| requested.max(0) as usize);
+        // A paginated listing hands back a PAGE whether or not the caller asked for a
+        // size: an absent `MaxResults` takes this service's default page size, and the
+        // remaining plans are reached through the `NextToken` the page carries.
+        let limit = crate::state::page_size(input.max_results);
 
         let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
