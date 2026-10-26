@@ -1547,6 +1547,32 @@ impl ConfigurationProfile {
                 || version.version_label.as_deref() == Some(identifier)
         })
     }
+
+    /// The configuration bytes a consumer of this profile is served for `stored`, the
+    /// content one of its configuration versions holds.
+    ///
+    /// A profile's `Type` is what its content MEANS, so it is also what the content a
+    /// consumer receives is computed from. A freeform profile holds the configuration
+    /// itself, and its stored bytes are served unchanged. A feature-flags profile holds an
+    /// AUTHORING document — flag definitions, their values and the authoring schema
+    /// version — and what AppConfig serves from it is the flag document its feature-flags
+    /// helper resolves ([`feature_flags::resolved_feature_flags_document`]), never the
+    /// authoring bytes. The projection is recomputed from whatever version is in force, so
+    /// it follows a later deployment, and the stored bytes a read of the version reports
+    /// are untouched.
+    ///
+    /// Lives on the profile so every reader of a deployed configuration serves ONE answer:
+    /// the AppConfigData data plane's poll and any other consumer of a deployed
+    /// configuration cannot disagree about what a profile Type owes.
+    pub fn served_content(&self, stored: &[u8]) -> Vec<u8> {
+        if self.profile_type != FEATURE_FLAGS_PROFILE_TYPE {
+            return stored.to_vec();
+        }
+        // A stored feature-flag document was accepted by the helper's own schema check at
+        // write time, so it resolves; bytes that somehow do not parse as a JSON object are
+        // served as they are rather than as an empty document.
+        feature_flags::resolved_feature_flags_document(stored).unwrap_or_else(|| stored.to_vec())
+    }
 }
 
 /// One row of AppConfig's AWS-authored extension catalogue: an extension AppConfig

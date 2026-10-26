@@ -99,6 +99,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::invalid_pagination_token;
+
 /// The most hosted zones one page carries.
 ///
 /// Route 53's listing convention, which its sibling `ListHostedZones` states in
@@ -230,12 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(token) if token_is_well_formed(token) => Some(token.to_string()),
             Some(token) => {
                 return Err(ListHostedZonesByVPCErrorModeled::InvalidPaginationToken(
-                    InvalidPaginationToken {
-                        message: Some(format!(
-                            "Invalid pagination token: {token} does not identify a page of \
-                             hosted zones"
-                        )),
-                    },
+                    invalid_pagination_token(token),
                 )
                 .into());
             }

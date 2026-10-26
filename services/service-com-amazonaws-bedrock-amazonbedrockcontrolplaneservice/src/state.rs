@@ -85,6 +85,10 @@
 //! `ops/put_use_case_for_model_access.rs` submits and `ops/get_use_case_for_model_access.rs`
 //! reads back, so the form one request submits is the form the next request gets.
 //!
+//! And it holds the account's data retention setting — the single record
+//! `ops/put_account_data_retention.rs` stores and `ops/get_account_data_retention.rs` reads
+//! back, so the mode one request sets is the mode the next request reports.
+//!
 //! And it holds the application inference profiles `ops/create_inference_profile.rs`
 //! mints, `ops/get_inference_profile.rs` reads back and `ops/delete_inference_profile.rs`
 //! removes, each holding the foundation models that profile tracks metrics and costs for.
@@ -1752,6 +1756,33 @@ pub struct EnforcedGuardrailConfiguration {
     pub updated_by: String,
 }
 
+/// `DataRetentionMode` — the account-wide mode in force while no put has set one.
+///
+/// The model documents this value as "The standard data handling for the model applies"
+/// (`smithy_query(query="shape",shape="DataRetentionMode")`), which is the handling an
+/// account that has never configured a mode gets. `inherit` is documented as "No data
+/// retention mode is set at this scope", so it is a mode a caller ASKS for rather than the
+/// standing answer for an account that asked for nothing.
+pub const DATA_RETENTION_MODE_DEFAULT: &str = "default";
+
+/// The account's data retention setting: the `mode` `PutAccountDataRetention` last stored,
+/// and the instant that put stored it.
+///
+/// ONE record per account rather than a map, for the reason
+/// [`ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::use_case_for_model_access`]
+/// is one: the operations that write and read it carry no identifier at all, so there is a
+/// single account-level setting rather than a resource a caller can hold more than one of,
+/// and a further put REPLACES this record whole.
+#[derive(Debug, Clone)]
+pub struct AccountDataRetention {
+    /// `mode` — one of `DataRetentionMode`'s values, as the admitted put carried it. Any
+    /// other value is refused by the constraint walk before the handler runs, so what is
+    /// stored here is always a modelled mode.
+    pub mode: String,
+    /// `updatedAt` — when the last admitted put stored this mode.
+    pub updated_at: SystemTime,
+}
+
 /// Per-service state for com-amazonaws-bedrock-amazonbedrockcontrolplaneservice. A handler reaches it through [`service_state`].
 ///
 /// Every map here is bounded, and each bound holds by construction rather than by
@@ -1857,6 +1888,9 @@ pub struct EnforcedGuardrailConfiguration {
 /// * `use_case_for_model_access` is a single optional form, which a put replaces rather
 ///   than appends to, and whose size the model already caps
 ///   (`AcknowledgementFormDataBody` is 10..16384 bytes).
+///
+/// * `account_data_retention` is a single optional setting, which a put replaces rather
+///   than appends to, and whose one member is a value out of a fixed enum.
 ///
 /// So the whole store is bounded by the live resources the quotas admit, and no
 /// sequence of requests — including create/delete cycles with fresh idempotency
@@ -2114,6 +2148,12 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// put carried them, because the get reports that same `AcknowledgementFormDataBody`
     /// back.
     pub use_case_for_model_access: Option<Vec<u8>>,
+    /// The account's data retention setting, as `PutAccountDataRetention` last stored it,
+    /// or `None` while no put has set one — in which case the mode in force is
+    /// [`DATA_RETENTION_MODE_DEFAULT`].
+    ///
+    /// ONE record for the reason [`AccountDataRetention`] gives.
+    pub account_data_retention: Option<AccountDataRetention>,
 }
 
 impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {

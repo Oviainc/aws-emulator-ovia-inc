@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPolicyTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPolicyTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPolicyTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags attached to the managed policy the request's `PolicyArn` names,
+//! sorted by tag key and paged by `Marker`/`MaxItems`. A pure READ — nothing here
+//! writes, so a later caller sees exactly what this one did.
+//!
+//! A 501 from an operation in this service means "nobody has written it yet", never
+//! "the emulator is broken".
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +166,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPolicyTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPolicyTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPolicyTags"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListPolicyTagsErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A value that is not a managed-policy ARN at all is an invalid input
+        // parameter, which is a different refusal from an ARN the account does not
+        // hold: `arnType` constrains only the length, so the form is checked here,
+        // through the one definition of the ARN grammar this crate holds — the same
+        // one `GetPolicy` reads a `PolicyArn` with.
+        if crate::state::parse_policy_arn(&input.policy_arn).is_none() {
+            return Err(ListPolicyTagsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!("ARN {} is not valid.", input.policy_arn)),
+                },
+            )
+            .into());
+        }
+
+        // `maxItemsType` is range 1..1000 and the boundary validator has already refused
+        // anything outside it, so the only choice left here is the default for an absent
+        // `MaxItems`: "if you do not include this parameter, the number of items defaults
+        // to 100". `.max(1)` is what makes the cast lossless.
+        let page_size = input
+            .max_items
+            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
+            .max(1) as usize;
+
+        // A read: it reports the tags the resolved policy persists and writes nothing.
+        let store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any tag is reported, and before the store is consulted for the
+        // policy — so a caller that may not read a policy's tags learns that it may not,
+        // never whether the account holds that policy. The decision is made on the ARN
+        // the request addresses, which is also how a refusal names it, a managed policy
+        // being identified by its ARN rather than by a name.
+        crate::state::authorization::authorize(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_POLICY_TAGS,
+            &input.policy_arn,
+        )?;
+
+        // The policy is resolved the one way every managed-policy read resolves it, so
+        // AWS's own policies are served from the catalog beside the account's.
+        let Some(resolved) = store.resolve_policy(&input.policy_arn) else {
+            // An ARN in AWS's own namespace names a policy AWS owns, and this emulator
+            // carries only part of AWS's catalog: answering `NoSuchEntity` here would
+            // assert that AWS holds no such policy, which this emulator cannot know.
+            if crate::state::is_aws_managed_policy_arn(&input.policy_arn) {
+                return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                    crate::state::uncarried_aws_managed_policy(&input.policy_arn, "tags"),
+                ));
+            }
+            return Err(ListPolicyTagsErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!("Policy {} does not exist.", input.policy_arn)),
+                },
+            )
+            .into());
+        };
+
+        // The page resumes strictly after the POSITION the marker names in THIS policy's
+        // tag order, so a token this service did not issue while paging this policy's
+        // tags is refused as an "invalid … value … supplied for an input parameter"
+        // rather than read as "start from the beginning". A token that decodes but names
+        // a tag removed since the previous page is NOT an error: paging resumes from the
+        // position, and that tag is simply no longer in the range.
+        let scope = crate::state::entity_tags_marker_scope(&input.policy_arn);
+        let resume_after = match &input.marker {
+            Some(marker) => match crate::state::decode_marker(&scope, marker) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(ListPolicyTagsErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(
+                                "Invalid Marker: the value is not a marker this service \
+                                 issued for this policy's tags"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+
+        // ONE page of a tagged entity's tags, the shared rule every IAM tag listing
+        // reports through: sorted by tag key, at most `page_size` long, and truncated
+        // with the marker that resumes after it.
+        let page = crate::state::tag_page(
+            resolved.policy.tags.as_ref(),
+            &scope,
+            resume_after.as_deref(),
+            page_size,
+        );
+        Ok(ListPolicyTagsOutput {
+            // "If no tags are attached to the specified resource, the response contains
+            // an empty list" — the member is required, and empty is that answer.
+            tags: page.tags,
+            is_truncated: page.is_truncated,
+            marker: page.marker,
+        })
     }
 }
+

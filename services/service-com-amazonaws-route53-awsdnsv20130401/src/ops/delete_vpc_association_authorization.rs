@@ -75,7 +75,8 @@
 use super::types::*;
 
 use crate::state::{
-    no_such_hosted_zone, normalize_zone_id, vpc_id_is_well_formed, vpc_region_is_modelled,
+    no_such_hosted_zone, normalize_zone_id, vpc_association_authorization_not_found,
+    vpc_id_is_well_formed, vpc_region_is_modelled,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -207,15 +208,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // authorized, or one whose authorization an earlier request already
         // removed — asks to remove an authorization that is not there, which is
         // the modelled `VPCAssociationAuthorizationNotFound`.
+        // The refusal is worded for the LEDGER this request addresses — no
+        // authorization exists for this zone and this VPC, in this region —
+        // rather than reusing the association path's sentence: an entry is
+        // identified by the VPC id together with its region, so a caller told a
+        // region-scoped entry is missing has to be told which region.
         let position = zone.vpc_authorization_position(vpc_id).ok_or_else(|| {
             DeleteVPCAssociationAuthorizationErrorModeled::VPCAssociationAuthorizationNotFound(
-                VPCAssociationAuthorizationNotFound {
-                    message: Some(format!(
-                        "The VPC {vpc_id} is not authorized to be associated with the hosted \
-                         zone {}",
-                        input.hosted_zone_id
-                    )),
-                },
+                vpc_association_authorization_not_found(
+                    &input.hosted_zone_id,
+                    vpc_id,
+                    vpc_region,
+                ),
             )
         })?;
         // Withdrawing a PERMISSION touches the authorization list only: "If the

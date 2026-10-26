@@ -6,6 +6,13 @@
 //! `DescribeVirtualCluster` keeps reporting the cluster in its new status instead of
 //! answering not-found.
 //!
+//! The teardown reaches everything the cluster HOLDS, not just the cluster record: every
+//! managed endpoint and every job run of the cluster that has not already finished takes
+//! the terminal step of its own kind with it (see
+//! [`crate::state::ComAmazonawsEmrcontainersAwschicagowebserviceState::start_virtual_cluster_teardown`]),
+//! so no endpoint stays reachable and no run keeps being scheduled inside a cluster that
+//! has been torn down.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -174,12 +181,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        state.move_virtual_cluster(
-            &region,
-            &input.id,
-            crate::state::CLUSTER_TERMINATING,
-            crate::state::CLUSTER_TERMINATED,
-        );
+        // The cluster AND everything it holds: an endpoint is a gateway into this cluster
+        // and a run runs in it, so neither outlives the cluster the caller just tore down.
+        state.start_virtual_cluster_teardown(&region, &input.id);
 
         Ok(DeleteVirtualClusterOutput {
             id: Some(input.id),

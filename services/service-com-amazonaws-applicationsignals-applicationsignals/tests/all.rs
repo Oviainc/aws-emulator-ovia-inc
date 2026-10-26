@@ -31,6 +31,8 @@ mod entity_identity;
 mod error_identity;
 #[path = "all/exclusion_window_reads.rs"]
 mod exclusion_window_reads;
+#[path = "all/exclusion_window_start_time.rs"]
+mod exclusion_window_start_time;
 #[path = "all/exclusion_windows.rs"]
 mod exclusion_windows;
 #[path = "all/get_instrumentation_configuration.rs"]

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RequestUploadCredentials
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RequestUploadCredentials`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RequestUploadCredentials::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a fresh set of credentials for uploading a stored build's files — "retrieves a
+//! fresh set of credentials for use when uploading a new set of game build files[;] this is
+//! done as part of the build creation process" — and reports them with the storage location
+//! that build's files belong at.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +153,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RequestUploadCredentials` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RequestUploadCredentialsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RequestUploadCredentials"))
+        use ::emulator_server::aws_credentials::{AWS_SESSION, SECRET_ACCESS_KEY, SESSION_TOKEN};
+
+        let internal = |message: &str| -> Self::Error {
+            RequestUploadCredentialsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into()
+        };
+
+        // "If successful, a new set of credentials are returned": this operation's whole
+        // purpose is to MINT, so it writes where a reporting operation would not. The
+        // material comes from the emulator's credential store, the only thing that creates
+        // credentials, and is minted BEFORE the build store is locked, so no other
+        // component's lock is taken while that guard is held.
+        let credentials = ctx.credential_store();
+        let minted = credentials.create(&AWS_SESSION);
+        let forget = |id: &str, why: &'static str| {
+            if let Err(error) = credentials.delete(id) {
+                ::tracing::warn!(
+                    operation = Self::NAME,
+                    reason = ?error,
+                    why,
+                    "a build upload credential could not be withdrawn from the credential store"
+                );
+            }
+        };
+
+        let (Some(secret_access_key), Some(session_token)) = (
+            minted.secret(SECRET_ACCESS_KEY).map(str::to_string),
+            minted.secret(SESSION_TOKEN).map(str::to_string),
+        ) else {
+            forget(&minted.id, "minted without the secrets an upload is signed with");
+            return Err(internal(
+                "the build upload credentials were minted without their secrets",
+            ));
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            forget(&minted.id, "the service state is unavailable");
+            return Err(internal("the GameLift emulator state is unavailable"));
+        };
+
+        // The credentials are "valid only for the build they were issued for", so they are
+        // recorded on that build — and the set this one replaces is withdrawn, because a
+        // build has ONE live upload credential: these "credentials have a limited lifespan",
+        // and a set that is not the build's current one is past its use.
+        let issued = {
+            let mut state = state.lock();
+            state.tick(::std::time::SystemTime::now());
+            let build_id = state.resolve_build_id(&input.build_id);
+            build_id
+                .and_then(|build_id| state.builds.get_mut(&build_id))
+                .map(|build| {
+                    let replaced = build.upload_credential_id.replace(minted.id.clone());
+                    (build.storage_location.clone(), replaced)
+                })
+        };
+        // The guard is released before the credential store is reached again, so the two
+        // locks are never held at once.
+        let Some((storage_location, replaced)) = issued else {
+            forget(&minted.id, "no stored build to issue credentials for");
+            return Err(RequestUploadCredentialsErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!("The build {} was not found.", input.build_id)),
+                },
+            )
+            .into());
+        };
+        if let Some(replaced) = replaced {
+            forget(&replaced, "replaced by a fresher set for the same build");
+        }
+
+        Ok(RequestUploadCredentialsOutput {
+            upload_credentials: Some(AwsCredentials {
+                access_key_id: Some(minted.id.clone()),
+                secret_access_key: Some(secret_access_key),
+                session_token: Some(session_token),
+            }),
+            storage_location: Some(storage_location),
+        })
     }
 }

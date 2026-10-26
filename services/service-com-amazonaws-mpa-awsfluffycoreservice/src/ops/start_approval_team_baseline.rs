@@ -274,18 +274,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let seq = state.next_session_seq();
-        // The one constructor every session of this service is built by
-        // (`crate::state::Session::for_team`), so the baseline session and the update
-        // session `UpdateApprovalTeam` starts differ only in their kind and their
-        // approvers.
-        let Some(session) = crate::state::Session::for_team(
+        // The one path every session of this service is recorded through
+        // (`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::start_session`), so
+        // the baseline session and the update session `UpdateApprovalTeam` starts differ
+        // only in their kind and their approvers — and a session that cannot be built
+        // writes nothing, so this refusal leaves the store as it was.
+        let Some(arn) = state.start_session(
             crate::state::SessionKind::Baseline,
             &team,
             approvers,
             crate::state::request_region(ctx.parts()),
             now,
-            seq,
         ) else {
             return Err(
                 StartApprovalTeamBaselineErrorModeled::InternalServerException(
@@ -297,8 +296,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let arn = session.arn.clone();
-        state.insert_session(session);
 
         // Read the answer back out of the store, so the response can only ever name a
         // session that was really recorded.

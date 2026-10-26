@@ -61,8 +61,10 @@
 //! resources per `DescribeStackResources` response (the documented cap on that
 //! unpaginated read), [`hook_results::MAX_HOOK_RESULTS`] recorded Hook invocation results,
 //! [`change_set_hooks::MAX_CHANGE_SET_HOOKS`] Hook invocations planned for one change set,
-//! and [`stack_sets::MAX_STACK_SETS`] stack sets with
-//! [`stack_sets::MAX_INSTANCES_PER_STACK_SET`] stack instances each (both oldest-first).
+//! [`stack_sets::MAX_STACK_SETS`] stack sets with
+//! [`stack_sets::MAX_INSTANCES_PER_STACK_SET`] stack instances each (both oldest-first),
+//! and [`handler_progress::MAX_HANDLER_INVOCATIONS`] resource-handler invocations with a
+//! progress record (oldest-first).
 //!
 //! Reading a stack's template body and evaluating what it declares is bounded by the
 //! [`template`] module's own caps (nodes, depth, the documented per-template quotas and
@@ -236,6 +238,10 @@ pub mod hook_results;
 /// The Hook invocations planned for one change set, which `DescribeChangeSetHooks`
 /// reports.
 pub mod change_set_hooks;
+
+/// The progress a resource handler reports for one handler invocation, which
+/// `RecordHandlerProgress` records against the bearer token that invocation was issued.
+pub mod handler_progress;
 
 /// The generated templates this account and Region holds: what `CreateGeneratedTemplate`
 /// starts and `DescribeGeneratedTemplate` reads the progress of.
@@ -2652,6 +2658,13 @@ pub struct ComAmazonawsCloudformationCloudformationState {
     /// rather than a stack's, so it is neither settled on the stack clock nor reclaimed
     /// with a stack; [`stack_sets::MAX_STACK_SETS`] is what bounds the list.
     pub stack_sets: Vec<stack_sets::StoredStackSet>,
+    /// Every resource-handler invocation this account and Region has a progress record for,
+    /// in invocation order, so `RecordHandlerProgress` judges a report against the status
+    /// the invocation its bearer token names holds (see [`handler_progress`]). An
+    /// invocation belongs to no stack, so it is neither settled on the stack clock nor
+    /// reclaimed with one; it is bounded at [`handler_progress::MAX_HANDLER_INVOCATIONS`],
+    /// oldest reclaimed first.
+    pub handler_invocations: Vec<handler_progress::StoredHandlerInvocation>,
 }
 
 impl ComAmazonawsCloudformationCloudformationState {
@@ -2806,6 +2819,65 @@ impl ComAmazonawsCloudformationCloudformationState {
             self.hook_results.remove(0);
         }
         self.hook_results.push(result);
+    }
+
+    /// Record one resource-handler invocation. The oldest record is reclaimed past
+    /// [`handler_progress::MAX_HANDLER_INVOCATIONS`], so the store cannot grow without
+    /// limit.
+    ///
+    /// This is the ONLY way a record enters the store: invoking a handler is what issues
+    /// the bearer token one is addressed by, and [`handler_progress`] is where what can and
+    /// cannot issue one is written down.
+    pub fn record_handler_invocation(
+        &mut self,
+        invocation: handler_progress::StoredHandlerInvocation,
+    ) {
+        while self.handler_invocations.len() >= handler_progress::MAX_HANDLER_INVOCATIONS {
+            self.handler_invocations.remove(0);
+        }
+        self.handler_invocations.push(invocation);
+    }
+
+    /// Record the progress a resource handler reports for the invocation its `BearerToken`
+    /// names, and hand back `Err(message)` for a report this invocation cannot take —
+    /// which is the WHOLE of what `RecordHandlerProgress` decides (see
+    /// [`handler_progress`]): a token naming no invocation of this Region, a
+    /// `CurrentOperationStatus` that is not the status the invocation holds, and an
+    /// `OperationStatus` that does not [`handler_progress::follows`] it. A refused report
+    /// writes nothing; an accepted one leaves the invocation holding the reported status.
+    pub fn record_handler_progress(
+        &mut self,
+        region: &str,
+        bearer_token: &str,
+        current_operation_status: Option<&str>,
+        operation_status: &str,
+    ) -> Result<(), String> {
+        let Some(invocation) = self
+            .handler_invocations
+            .iter_mut()
+            .find(|invocation| invocation.is_addressed_by(region, bearer_token))
+        else {
+            return Err(handler_progress::unknown_bearer_token(bearer_token));
+        };
+        // The conditional check comes first: `CurrentOperationStatus` is what the report
+        // asserts the invocation holds, so a report that is wrong about that is refused
+        // whatever it goes on to report.
+        if let Some(asserted) = current_operation_status {
+            if asserted != invocation.operation_status {
+                return Err(handler_progress::operation_status_check_failed(
+                    &invocation.operation_status,
+                    asserted,
+                ));
+            }
+        }
+        if !handler_progress::follows(&invocation.operation_status, operation_status) {
+            return Err(handler_progress::invalid_state_transition(
+                &invocation.operation_status,
+                operation_status,
+            ));
+        }
+        invocation.operation_status = operation_status.to_string();
+        Ok(())
     }
 
     /// The stack set `name_or_id` addresses in the request's Region, if this store holds it:

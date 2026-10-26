@@ -46,8 +46,15 @@ impl GameLift {
         // an unsigned-but-scoped Authorization header for routing and the region.
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_gamelift_gamelift::EmulatedService::new(engine),
+            service_com_amazonaws_gamelift_gamelift::EmulatedService::new(Arc::clone(&engine)),
         );
+        // Amazon S3 on the SAME engine, the way the router mounts every service: the
+        // location `CreateBuild` hands a caller to upload build files to is a bucket in
+        // that one object store, so the two are mounted together here as well. It claims
+        // only requests scoped to `s3`, so every call below still reaches GameLift.
+        router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+            engine,
+        ));
         Self { router }
     }
 
@@ -93,6 +100,27 @@ impl GameLift {
             "{operation} {body}: expected a failure, got HTTP 200 with body {parsed}"
         );
         (status, error_code(&parsed))
+    }
+
+    /// One Amazon S3 request against the object store this emulator holds, as a client
+    /// sends it path-style (`PUT /<bucket>`, `PUT /<bucket>/<key>`): the data plane behind
+    /// the locations a build's files are read from and uploaded to. Answers the HTTP status
+    /// and the response body.
+    pub(crate) async fn s3(&self, method: &str, path: &str, body: &[u8]) -> (u16, Bytes) {
+        // The credential scope's service field is what routes the request, so this one says
+        // `s3` where the GameLift calls above say `gamelift`.
+        let credential =
+            format!("AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/s3/aws4_request, SignedHeaders=host, Signature=00");
+        let request = http::Request::builder()
+            .method(method)
+            .uri(format!("https://s3.{REGION}.amazonaws.com{path}"))
+            .header("host", format!("s3.{REGION}.amazonaws.com"))
+            .header("authorization", credential)
+            .body(Bytes::copy_from_slice(body))
+            .expect("build the object request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        (status, response.into_parts().1)
     }
 }
 

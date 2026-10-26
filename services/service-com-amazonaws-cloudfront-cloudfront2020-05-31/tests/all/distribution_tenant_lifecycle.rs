@@ -400,7 +400,11 @@ fn member(tenant: &Node, name: &str, case: &str, raw: &str) -> String {
 }
 
 /// The `(Domain, Status)` of every entry of the tenant's `Domains` list, in document order.
-fn domains_of(tenant: &Node) -> Vec<(String, String)> {
+///
+/// `pub(crate)` so a sibling suite that compares a tenant's domains — a LISTING's summary
+/// against a read of the same record, say — reads them the same way rather than growing a
+/// copy of this.
+pub(crate) fn domains_of(tenant: &Node) -> Vec<(String, String)> {
     tenant
         .at("Domains")
         .map(|list| {
