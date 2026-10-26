@@ -29,6 +29,8 @@ mod chain_read_not_found_attribution;
 mod client_token_region_scope;
 #[path = "all/create_app_authorization_contract.rs"]
 mod create_app_authorization_contract;
+#[path = "all/create_app_authorization_credential_idempotency.rs"]
+mod create_app_authorization_credential_idempotency;
 #[path = "all/ingestion_deletion.rs"]
 mod ingestion_deletion;
 #[path = "all/ingestion_destination_lifecycle.rs"]

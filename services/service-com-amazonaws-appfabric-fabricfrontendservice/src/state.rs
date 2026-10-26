@@ -1307,6 +1307,40 @@ pub fn render_destination_configuration(configuration: &DestinationConfiguration
     rendered
 }
 
+/// A canonical rendering of a `Credential`, so it can go into a
+/// [`request_fingerprint`] as one component: the union member that was set AND
+/// that member's own values, reduced to a one-way SHA-256 digest.
+///
+/// Every parameter of a request takes part in the idempotency judgement a spent
+/// `clientToken` is decided by, and a credential is a parameter like any other:
+/// a replay carrying another API key, client id or client secret is a different
+/// request, not a retry. The DIGEST is what lets it take part without the
+/// fingerprint the store keeps holding credential material — two different
+/// credentials render differently, while neither can be read back out of what
+/// was stored. The member name goes inside the digest with the values, so a
+/// credential of another kind renders differently too.
+///
+/// Each value is length-prefixed before hashing, for the same reason a
+/// fingerprint's components are: no two different credentials may render alike.
+pub fn render_credential(credential: &Credential) -> String {
+    let mut material = String::new();
+    match credential {
+        Credential::oauth2Credential(oauth2) => {
+            push_component(&mut material, "oauth2Credential");
+            push_component(&mut material, &oauth2.client_id);
+            push_component(&mut material, &oauth2.client_secret);
+        }
+        Credential::apiKeyCredential(api_key) => {
+            push_component(&mut material, "apiKeyCredential");
+            push_component(&mut material, &api_key.api_key);
+        }
+    }
+
+    let mut digest = <::sha2::Sha256 as ::sha2::Digest>::new();
+    ::sha2::Digest::update(&mut digest, material.as_bytes());
+    ::hex::encode(::sha2::Digest::finalize(digest))
+}
+
 /// One page of a listing, and the token that asks for the page after it.
 #[derive(Debug)]
 pub struct Page<T> {

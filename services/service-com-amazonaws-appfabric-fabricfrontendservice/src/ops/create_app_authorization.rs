@@ -255,10 +255,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The PARENT and every member that identifies the authorization go into
-        // the fingerprint: the same token for another bundle, application or
-        // tenant is a different request rather than a retry of this one. The
-        // credential's KIND is part of it; its secret is not.
+        // The PARENT and every member the request carries go into the
+        // fingerprint: the same token for another bundle, application, tenant or
+        // CREDENTIAL is a different request rather than a retry of this one. The
+        // credential takes part as a one-way digest of its kind and its values
+        // (see [`crate::state::render_credential`]), so the stored fingerprint
+        // keeps no credential material.
+        let rendered_credential = crate::state::render_credential(&input.credential);
         let fingerprint = crate::state::request_fingerprint(
             &[
                 ("appBundleArn", app_bundle_arn.as_str()),
@@ -269,7 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     input.tenant.tenant_display_name.as_str(),
                 ),
                 ("authType", input.auth_type.as_str()),
-                ("credentialKind", credential_kind),
+                ("credential", rendered_credential.as_str()),
             ],
             input.tags.as_deref(),
         );

@@ -24,12 +24,12 @@ tracing = { workspace = true }
 # Diffuses the entropy every AppFabric resource id (a version-4 UUID) is built
 # from — see `crate::state::new_uuid`.
 sha2 = { workspace = true }
+# Renders a digest as hex, rather than this crate hand-coding the encoding — see
+# `crate::state::render_credential`.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-hex = { workspace = true }
 
 [lints]
 workspace = true
