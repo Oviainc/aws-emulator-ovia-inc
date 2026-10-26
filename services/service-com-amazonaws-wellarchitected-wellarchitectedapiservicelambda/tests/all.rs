@@ -309,3 +309,8 @@ mod template_share_deletion;
 // Declared last for the same reason as the declaration above.
 #[path = "all/shared_resource_deletion.rs"]
 mod shared_resource_deletion;
+
+// Declared last for the same reason as the declarations above: the sorted position for a
+// review-template suite falls in a crowded run of this list.
+#[path = "all/review_template_imported_lens_review.rs"]
+mod review_template_imported_lens_review;
