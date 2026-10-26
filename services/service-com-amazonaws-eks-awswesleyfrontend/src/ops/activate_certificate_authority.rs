@@ -80,7 +80,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    self, CertificateAuthorityActivation, PendingClusterConfig, UpdateRecord, CA_BY_CUSTOMER,
+    self, CertificateAuthorityActivation, PendingClusterConfig, UpdateRecord, UpdateScope,
+    CA_BY_CUSTOMER,
     CA_DISTRIBUTION_COMPLETE, CA_DISTRIBUTION_IN_PROGRESS, CA_SIGNING_ACTIVATING, CA_SIGNING_IN_USE,
     CA_SIGNING_NOT_USED, STATUS_ACTIVE, STATUS_UPDATING, UPDATE_COMPLETION_DELAY,
     UPDATE_IN_PROGRESS, UPDATE_PARAM_CERTIFICATE_AUTHORITY_ID, UPDATE_PARAM_SIGNING_STATUS,
@@ -410,6 +411,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // update": none has been, so `CancelUpdate` is the only writer of either.
             cancellation: None,
             cancellation_request_token: None,
+            // The signer this promotes is the cluster's own, so this is an update
+            // of the cluster rather than of a resource inside it.
+            scope: UpdateScope::Cluster,
         };
         let answer = update.to_update();
 
