@@ -259,42 +259,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
-        let (mode, rows) = {
-            let store = state.lock();
-
-            // Asking for the summaries of accounts other than the caller's is
-            // an organization view, which only the organization's management
-            // account has — the same gate `ListRecommendations` applies to the
-            // same filter member.
-            if input
-                .filter
-                .as_ref()
-                .and_then(|filter| filter.account_ids.as_ref())
-                .is_some_and(|account_ids| !account_ids.is_empty())
-                && !store.is_management_account(crate::state::caller_account_id())
-            {
-                return Err(not_an_organization_view());
-            }
-
-            let mode = store
-                .effective_preferences(crate::state::caller_account_id())
-                .savings_estimation_mode;
-            // The rows this account may read — the same visibility
-            // `ListRecommendations` and `GetRecommendation` serve, so a summary
-            // never reports a catalog nobody opted into — narrowed by the
-            // request's filter.
-            let rows: Vec<crate::state::StoredRecommendation> = store
-                .visible_recommendations(crate::state::caller_account_id())
-                .into_iter()
-                .filter(|row| {
-                    input
-                        .filter
-                        .as_ref()
-                        .is_none_or(|filter| row.matches_filter(filter))
-                })
-                .collect();
-            (mode, rows)
-        };
+        // The same shared rule `ListRecommendations` reads its rows through
+        // (`crate::state::...::recommendation_view`): the organization gate on
+        // `filter.accountIds` — only the organization's management account may
+        // ask for other accounts' data — the caller's effective savings
+        // estimation mode, and the rows this account may read (the same
+        // visibility `ListRecommendations` and `GetRecommendation` serve, so a
+        // summary never reports a catalog nobody opted into) narrowed by the
+        // request's filter. The refusal is answered through this operation's own
+        // modelled error.
+        let view = state
+            .lock()
+            .recommendation_view(crate::state::caller_account_id(), input.filter.as_ref())
+            .map_err(|_| not_an_organization_view())?;
+        let rows = view.rows;
+        let mode = view.savings_estimation_mode;
         let mode = mode.as_deref();
 
         // The currency the figures are denominated in is the one the summarised

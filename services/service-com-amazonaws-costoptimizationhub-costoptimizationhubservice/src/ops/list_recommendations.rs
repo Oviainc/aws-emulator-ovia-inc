@@ -199,38 +199,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
-        let (mode, mut rows) = {
-            let store = state.lock();
-
-            // Asking for the recommendations of accounts other than the
-            // caller's is an organization view, which only the organization's
-            // management account has. Refused for ANY populated `accountIds`,
-            // because what the caller lacks is the view, not one account in it.
-            if input
-                .filter
-                .as_ref()
-                .and_then(|filter| filter.account_ids.as_ref())
-                .is_some_and(|account_ids| !account_ids.is_empty())
-                && !store.is_management_account(crate::state::caller_account_id())
-            {
-                return Err(not_an_organization_view());
-            }
-
-            let mode = store
-                .effective_preferences(crate::state::caller_account_id())
-                .savings_estimation_mode;
-            let rows: Vec<crate::state::StoredRecommendation> = store
-                .visible_recommendations(crate::state::caller_account_id())
-                .into_iter()
-                .filter(|row| {
-                    input
-                        .filter
-                        .as_ref()
-                        .is_none_or(|filter| row.matches_filter(filter))
-                })
-                .collect();
-            (mode, rows)
-        };
+        // The gate on `filter.accountIds`, the caller's effective savings
+        // estimation mode and the rows the request selects are the one rule both
+        // recommendation readers apply, written once beside the catalog
+        // (`crate::state::...::recommendation_view`): asking for the
+        // recommendations of accounts other than the caller's is an organization
+        // view, which only the organization's management account has, so this
+        // reader answers the refusal through its own modelled error.
+        let view = state
+            .lock()
+            .recommendation_view(crate::state::caller_account_id(), input.filter.as_ref())
+            .map_err(|_| not_an_organization_view())?;
+        let mode = view.savings_estimation_mode;
+        let mut rows = view.rows;
         let mode = mode.as_deref();
 
         if !input.include_all_recommendations {

@@ -1048,7 +1048,67 @@ impl ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState {
             .cloned()
             .collect()
     }
+
+    /// The recommendation rows one request selects, and the savings estimation
+    /// mode their money members are computed under.
+    ///
+    /// The one place the rule both recommendation readers apply is written:
+    /// asking for the recommendations of accounts other than the caller's — a
+    /// populated `filter.accountIds` — is an organization view, which only the
+    /// organization's management account has, so any other caller is refused
+    /// ([`OrganizationViewRequired`], which each reader answers through its own
+    /// modelled error); otherwise the rows are the ones this account may read
+    /// ([`Self::visible_recommendations`]) narrowed by every member the filter
+    /// sets, under the account's effective `savingsEstimationMode`.
+    pub fn recommendation_view(
+        &self,
+        account_id: &str,
+        filter: Option<&Filter>,
+    ) -> Result<RecommendationView, OrganizationViewRequired> {
+        // Refused for ANY populated `accountIds`, because what the caller lacks
+        // is the view, not one account in it.
+        if filter
+            .and_then(|filter| filter.account_ids.as_ref())
+            .is_some_and(|account_ids| !account_ids.is_empty())
+            && !self.is_management_account(account_id)
+        {
+            return Err(OrganizationViewRequired);
+        }
+
+        Ok(RecommendationView {
+            savings_estimation_mode: self
+                .effective_preferences(account_id)
+                .savings_estimation_mode,
+            rows: self
+                .visible_recommendations(account_id)
+                .into_iter()
+                .filter(|row| filter.is_none_or(|filter| row.matches_filter(filter)))
+                .collect(),
+        })
+    }
 }
+
+/// What [`ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState::recommendation_view`]
+/// hands a recommendation reader: the rows the request selects and the mode the
+/// money members of those rows are reported under.
+#[derive(Debug)]
+pub struct RecommendationView {
+    /// The caller's effective `savingsEstimationMode` preference, which decides
+    /// whether the figures are reported before or after discounts.
+    pub savings_estimation_mode: Option<String>,
+    /// The rows this caller may read, narrowed by the request's filter, in
+    /// catalog order.
+    pub rows: Vec<StoredRecommendation>,
+}
+
+/// The refusal
+/// [`ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState::recommendation_view`]
+/// answers a request for the recommendations of accounts other than the
+/// caller's: the caller is not the organization's management account, so it has
+/// no organization view. Each reader maps it into the modelled error its own
+/// operation declares for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrganizationViewRequired;
 
 /// The recommendation catalog, generated once when the store is created.
 ///

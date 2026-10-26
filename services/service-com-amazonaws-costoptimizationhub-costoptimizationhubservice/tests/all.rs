@@ -25,6 +25,8 @@ mod preference_writes;
 mod recommendation_summaries;
 #[path = "all/rejection_fidelity.rs"]
 mod rejection_fidelity;
+#[path = "all/shared_recommendation_view.rs"]
+mod shared_recommendation_view;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/summary_metrics_and_refusals.rs"]
