@@ -22,8 +22,10 @@
 //! the production front door (`MultiServiceRouter::dispatch`), so what is
 //! asserted is what a client sees.
 
-use serde_json::json;
-use service_com_amazonaws_s3vectors_s3vectors::state::RESERVED_TAG_KEY_PREFIX;
+use serde_json::{json, Value};
+use service_com_amazonaws_s3vectors_s3vectors::state::{
+    RESERVED_TAG_KEY_PREFIX, SYSTEM_TAG_REFUSED,
+};
 
 use crate::resource_tagging::{resource_with_tags, Kind, BUCKET, INDEX};
 use crate::vector_lifecycle::{
@@ -153,6 +155,72 @@ async fn a_reserved_tag_key_is_refused_wherever_a_caller_names_tag_keys() {
             (status, error_code(&body).as_str()),
             (404, "NotFoundException"),
             "case {case:?}: a refused CreateIndex must create nothing, got {status} {body}"
+        );
+    }
+}
+
+/// The refusal's own wording: ONE fixed sentence for the error class, the same on every
+/// member that names caller-supplied tag keys, carrying no value from the request and no
+/// `fieldList`.
+#[tokio::test]
+async fn the_reserved_key_refusal_is_the_services_own_sentence() {
+    let key = "aws:cost-allocation";
+    let tags = tag_object(&pairs(&[(key, "x")]));
+
+    // (operation, the request body that names the reserved key; the two tagging
+    // operations build theirs through the shared `/tags/{resourceArn}` harness)
+    let cases: Vec<(&str, Value)> = vec![
+        ("TagResource", Value::Null),
+        ("UntagResource", Value::Null),
+        (
+            "CreateVectorBucket",
+            json!({ "vectorBucketName": "reserved-wording-bucket", "tags": tags }),
+        ),
+        (
+            "CreateIndex",
+            json!({
+                "vectorBucketName": BUCKET,
+                "indexName": "reserved-wording-index",
+                "dataType": "float32",
+                "dimension": 2,
+                "distanceMetric": "cosine",
+                "tags": tags,
+            }),
+        ),
+    ];
+
+    for (case, request) in cases {
+        let router = router();
+        resource_with_tags(&router, Kind::Index, &[]).await;
+        let arn = expected_bucket_arn(BUCKET);
+        let (status, body) = match case {
+            "TagResource" => tag(&router, &arn, &tags).await,
+            "UntagResource" => untag(&router, &arn, &keys(&[key])).await,
+            operation => call(&router, operation, &request).await,
+        };
+
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: the reserved key must be refused, got {status} {body}"
+        );
+        let message = body
+            .get("message")
+            .or_else(|| body.get("Message"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(
+            message, SYSTEM_TAG_REFUSED,
+            "case {case:?}: the refusal must be the service's own sentence, got {message:?}"
+        );
+        assert!(
+            !message.contains(key) && !message.contains(RESERVED_TAG_KEY_PREFIX),
+            "case {case:?}: the sentence must carry no value from the request, got {message:?}"
+        );
+        assert!(
+            body.get("fieldList").is_none(),
+            "case {case:?}: the refusal is about the request rather than one member, \
+             got {body}"
         );
     }
 }

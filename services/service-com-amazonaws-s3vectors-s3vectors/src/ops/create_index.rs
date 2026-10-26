@@ -111,11 +111,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3vectors-s3vectors.jso
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.s3vectors#CreateIndex",
-    extra_errors = ["ValidationException"]
+    extra_errors = ["ValidationException", "AccessDeniedException"]
 )]
 #[derive(Debug)]
 pub enum CreateIndexErrorModeled {
     ValidationException(ValidationException),
+    AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     NotFoundException(NotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
@@ -190,15 +191,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::validate_resource_name("indexName", &input.index_name).map_err(refusal)?;
         // The `aws:` tag-key namespace is AWS's own wherever a caller names tags.
         if let Some(tags) = input.tags.as_ref() {
-            crate::state::validate_tag_keys("tags", tags.keys().map(String::as_str))
-                .map_err(refusal)?;
+            crate::state::validate_tag_keys(tags.keys().map(String::as_str)).map_err(refusal)?;
         }
 
         let region = crate::state::request_region(ctx.parts());
         let arn = crate::state::index_arn(&region, &bucket_name, &input.index_name);
 
+        // Who the request speaks for, resolved before this service's own store is
+        // locked, so only one store is ever held at a time.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
         let mut store = state.lock();
         let bucket = store.bucket(&bucket_name).map_err(refusal)?;
+
+        // The vector bucket's own resource policy decides this call before it creates
+        // anything: an explicit Deny of the action refuses it.
+        if let Some(message) = store
+            .authorization_target(&bucket_name, None)
+            .map_err(refusal)?
+            .refusal(&caller, &[Self::NAME])
+        {
+            return Err(CreateIndexErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
         if bucket.indexes.contains_key(&input.index_name) {
             return Err(CreateIndexErrorModeled::ConflictException(ConflictException {
                 message: format!(
@@ -239,6 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             encryption,
             index_mode,
             vectors: ::std::collections::BTreeMap::new(),
+            tombstones: ::std::collections::VecDeque::new(),
         };
         store
             .bucket_mut(&bucket_name)

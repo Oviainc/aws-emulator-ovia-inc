@@ -2474,6 +2474,50 @@ impl StoredDistributionTenant {
     }
 }
 
+/// What an `UpdateDistributionTenant` changes about one stored distribution tenant.
+///
+/// Every member mirrors the one the update submits, and each is OPTIONAL in the same sense:
+/// `None` is "the request left this member out", which leaves the stored value exactly as
+/// it was, and `Some` is the value the tenant is updated to. The struct is what carries the
+/// resolved change into
+/// [`ComAmazonawsCloudfrontCloudfront20200531State::apply_distribution_tenant_update`], so
+/// the rule for which members a partial update touches is stated in ONE place rather than
+/// once per member at the call site.
+#[derive(Debug, Default)]
+pub struct DistributionTenantUpdate {
+    /// `DistributionId` — "The ID for the multi-tenant distribution."
+    pub distribution_id: Option<String>,
+    /// The domain names from `Domains` — "The domains to update for the distribution
+    /// tenant."
+    pub domains: Option<Vec<String>>,
+    /// `Customizations` — the tenant's overrides of its distribution's settings.
+    pub customizations: Option<Customizations>,
+    /// `Parameters` — the values that fill in the distribution's
+    /// `TenantConfig$ParameterDefinitions`.
+    pub parameters: Option<Vec<Parameter>>,
+    /// `ConnectionGroupId` — "The ID of the target connection group."
+    pub connection_group_id: Option<String>,
+    /// `Enabled` — "whether the distribution tenant should be updated to an enabled state".
+    pub enabled: Option<bool>,
+    /// `ManagedCertificateRequest` — the CloudFront managed ACM certificate the update asks
+    /// for, which MINTS one over the domains the tenant holds after the update.
+    pub managed_certificate_request: Option<ManagedCertificateRequest>,
+}
+
+/// The customization set a tenant's record retains, or `None` when the set names nothing at
+/// all.
+///
+/// A tenant's customizations are "specific values that you can override or disable from the
+/// multi-tenant distribution", so a set in which every one of them is absent describes no
+/// customization: it is retained as none rather than as an element describing nothing. ONE
+/// rule for every write that stores a tenant's customizations.
+fn retained_customizations(customizations: Customizations) -> Option<Customizations> {
+    (customizations.web_acl.is_some()
+        || customizations.certificate.is_some()
+        || customizations.geo_restrictions.is_some())
+    .then_some(customizations)
+}
+
 /// One CloudFront managed ACM certificate, as this emulator persists it.
 ///
 /// The certificate is MINTED by the call that carries a `ManagedCertificateRequest` for a
@@ -5479,10 +5523,91 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         let tenant = self.distribution_tenants.get_mut(id)?;
         let mut customizations = tenant.customizations.take().unwrap_or_default();
         customizations.web_acl = web_acl;
-        tenant.customizations = (customizations.web_acl.is_some()
-            || customizations.certificate.is_some()
-            || customizations.geo_restrictions.is_some())
-        .then_some(customizations);
+        tenant.customizations = retained_customizations(customizations);
+        tenant.last_modified_time = now;
+        tenant.etag = etag;
+        tenant.status = STATUS_IN_PROGRESS.to_string();
+        tenant.deployed_due = now + PROPAGATION_DELAY;
+        Some(tenant)
+    }
+
+    /// Apply an `UpdateDistributionTenant` to the tenant `id` names, and report the record
+    /// as it now stands.
+    ///
+    /// Every member the update submits is optional and each is documented as what the
+    /// tenant is updated TO ("the domains to update", "updated to an enabled state"), so a
+    /// member the request leaves out is left exactly as it was and one it states REPLACES
+    /// what the record held — the same rule
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::apply_anycast_ip_list_update`]
+    /// follows. A stated customization set that names nothing is retained as none at all,
+    /// so the record never carries an element describing nothing.
+    ///
+    /// A `ManagedCertificateRequest` on the update MINTS a certificate, over the domains
+    /// the tenant holds once the update has landed, and replaces whatever certificate the
+    /// record carried; an update that asks for none leaves the existing one alone.
+    ///
+    /// The write versions the tenant exactly as every other change to its configuration
+    /// does: `LastModifiedTime` becomes `now`, a fresh version token is minted so the token
+    /// the caller matched on no longer satisfies an `If-Match`, and the tenant goes back to
+    /// [`STATUS_IN_PROGRESS`] with a new propagation deadline, since the configuration it
+    /// now runs under has to reach the edge locations before it is deployed again. The
+    /// tenant's identity — its id, its ARN, its name and its creation time — is untouched:
+    /// an update submits none of them, and "[the name] can't be updated after you create the
+    /// distribution tenant".
+    ///
+    /// `None` when the store holds no such tenant, checked BEFORE the mint so a version
+    /// token is never spent on a tenant that is not there.
+    pub fn apply_distribution_tenant_update(
+        &mut self,
+        id: &str,
+        update: DistributionTenantUpdate,
+        now: SystemTime,
+    ) -> Option<&StoredDistributionTenant> {
+        if !self.distribution_tenants.contains_key(id) {
+            return None;
+        }
+        let DistributionTenantUpdate {
+            distribution_id,
+            domains,
+            customizations,
+            parameters,
+            connection_group_id,
+            enabled,
+            managed_certificate_request,
+        } = update;
+        // The certificate covers the domains the tenant holds AFTER this update, so it is
+        // minted from the effective list rather than from the one the record carried.
+        let certificate_domains = domains.clone().unwrap_or_else(|| {
+            self.distribution_tenants
+                .get(id)
+                .map(|tenant| tenant.domains.clone())
+                .unwrap_or_default()
+        });
+        let etag = self.next_etag();
+        let managed_certificate = managed_certificate_request
+            .map(|request| self.request_managed_certificate(request, &certificate_domains, now));
+        let tenant = self.distribution_tenants.get_mut(id)?;
+        if let Some(distribution_id) = distribution_id {
+            tenant.distribution_id = distribution_id;
+        }
+        if let Some(domains) = domains {
+            tenant.domains = domains;
+        }
+        if let Some(customizations) = customizations {
+            tenant.customizations = retained_customizations(customizations);
+        }
+        if let Some(parameters) = parameters {
+            tenant.parameters = parameters;
+        }
+        if let Some(connection_group_id) = connection_group_id {
+            tenant.connection_group_id = connection_group_id;
+        }
+        if let Some(enabled) = enabled {
+            tenant.enabled = enabled;
+        }
+        if let Some(certificate) = managed_certificate {
+            tenant.managed_certificate = Some(certificate);
+        }
         tenant.last_modified_time = now;
         tenant.etag = etag;
         tenant.status = STATUS_IN_PROGRESS.to_string();
@@ -6168,6 +6293,63 @@ pub fn anycast_ips_of(hosts: &[u32], ip_address_type: &str) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// Why the domain list a call would bind to a distribution tenant is no list of domains a
+/// tenant can hold, or `None` when it is one.
+///
+/// "You must specify at least one domain", "Each distribution tenant can have up to 5
+/// domains", and a domain is where the tenant's viewers reach it — so an empty list, a list
+/// over [`MAX_DOMAINS_PER_TENANT`], a member that is no domain name
+/// ([`domain_name_refusal`]) and a domain named twice (which describes no single
+/// association) are each refused. The count is decided FIRST, so neither the per-domain walk
+/// nor anything after it grows with a list the caller chose the length of.
+///
+/// ONE rule for every call that binds a tenant's domains, and decided from the request
+/// alone, so a caller's list is bounded before any store lock is taken. The reason carries
+/// no error wording of its own, for the same reason [`domain_name_refusal`]'s does not.
+pub fn tenant_domains_refusal(domains: &[String]) -> Option<String> {
+    if domains.is_empty() {
+        return Some("you must specify at least one domain for a distribution tenant".to_string());
+    }
+    if domains.len() > MAX_DOMAINS_PER_TENANT {
+        return Some(format!(
+            "a distribution tenant holds at most {MAX_DOMAINS_PER_TENANT} domains but the \
+             request names {}",
+            domains.len()
+        ));
+    }
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for domain in domains {
+        if let Some(reason) = domain_name_refusal(domain) {
+            return Some(reason);
+        }
+        if !seen.insert(domain.to_ascii_lowercase()) {
+            return Some(format!("the domain {domain} is named more than once"));
+        }
+    }
+    None
+}
+
+/// Why `parameters` is more parameter values than a distribution tenant's record carries, or
+/// `None` when it is not.
+///
+/// The values END UP IN THE STORED RECORD, so the count is bounded
+/// ([`MAX_PARAMETERS_PER_TENANT`]) before anything walks them: neither the work a request
+/// causes nor the size of the record it stores grows with a list the caller chose the length
+/// of. Whether the values SATISFY the distribution's definitions is the separate rule
+/// [`parameter_refusal`] states, which needs the stored distribution.
+///
+/// ONE rule for every call that supplies a tenant's parameter values. The reason carries no
+/// error wording of its own, for the same reason [`domain_name_refusal`]'s does not.
+pub fn tenant_parameter_count_refusal(parameters: &[Parameter]) -> Option<String> {
+    (parameters.len() > MAX_PARAMETERS_PER_TENANT).then(|| {
+        format!(
+            "a distribution tenant carries at most {MAX_PARAMETERS_PER_TENANT} parameter values \
+             but the request names {}",
+            parameters.len()
+        )
+    })
 }
 
 /// The path of a continuous deployment policy resource under this service's API version.

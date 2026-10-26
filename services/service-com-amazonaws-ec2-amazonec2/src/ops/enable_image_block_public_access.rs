@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableImageBlockPublicAccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableImageBlockPublicAccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Puts the account's *block public access for AMIs* setting into
+//! `block-new-sharing` in the Region the request was signed for, and reports the state now
+//! in effect — what a `GetImageBlockPublicAccessState` made after it reports. Idempotent: a
+//! Region already enabled is left exactly as it stands. A `DryRun` request is refused before
+//! the write, so it leaves the setting where it was.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableImageBlockPublicAccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +142,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableImageBlockPublicAccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableImageBlockPublicAccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state;
+
+        // "Specify `block-new-sharing` to enable block public access for AMIs at the account
+        // level in the specified Region"
+        // (`EnableImageBlockPublicAccessRequest$ImageBlockPublicAccessState`). The member is
+        // modelled as the `ImageBlockPublicAccessEnabledState` enum, so the boundary refuses
+        // a word outside that catalog before this handler runs; resolving the word here is
+        // what keeps request text out of the store — what is stored is the catalog member,
+        // never the string the request carried.
+        let requested = input.image_block_public_access_state.as_str();
+        let Some(mode) = state::image_block_public_access_mode(requested) else {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({requested}) for parameter imageBlockPublicAccessState is invalid. \
+                 Valid values for EnableImageBlockPublicAccess are {}",
+                state::IMAGE_BLOCK_PUBLIC_ACCESS_MODES.join(", ")
+            )));
+        };
+
+        // "at the account level in the specified Amazon Web Services Region": the Region the
+        // request was signed for is the one being enabled, so every other Region's setting
+        // is left where it was.
+        let region = state::request_region(ctx.parts());
+
+        let store = state::require_service_state(&*self.engine)?;
+        let mut store = store.lock();
+
+        // The store holds the setting for a bounded number of Regions, and the Region comes
+        // from the caller, so a request that would push it past that ceiling is refused
+        // rather than stored. A Region already enabled costs nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableImageBlockPublicAccess"))
+        // This sits BEFORE the DryRun check the way the other account-level settings' own
+        // ceilings do: DryRun asks whether the request WOULD have succeeded, so a request
+        // this emulator could not have carried out is answered with that reason instead.
+        if store.would_exceed_image_block_public_access_regions(&region) {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(format!(
+                "This emulator holds the block public access for AMIs setting for \
+                 {} Regions, which is as many as it stores",
+                state::MAX_IMAGE_BLOCK_PUBLIC_ACCESS_REGIONS
+            )));
+        }
+
+        // DryRun sits AFTER validation and BEFORE the write: the flag asks whether the
+        // request WOULD have succeeded, so one that would have succeeded leaves the setting
+        // untouched. "If you have the required permissions, the error response is
+        // DryRunOperation" (`DryRun`).
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "Returns `block-new-sharing` if the request succeeds"
+        // (`EnableImageBlockPublicAccessResult$ImageBlockPublicAccessState`): the state now
+        // in effect, read back OUT of the store rather than echoed from the request, so this
+        // answer says exactly what a `GetImageBlockPublicAccessState` made after it reports.
+        let in_effect = store.enable_image_block_public_access(&region, mode);
+        Ok(EnableImageBlockPublicAccessOutput {
+            image_block_public_access_state: Some(in_effect.to_string()),
+        })
     }
 }

@@ -51,6 +51,20 @@ const PAST_THE_SETTLE_SPAN: Duration =
 /// underneath it; a span this long cannot elapse inside one test.
 const SEEDED_SANDBOX_SPAN_MILLIS: i64 = 10 * 60 * 1000;
 
+/// How long ago a SEEDED `Running` sandbox's session went live, in millis: a moment, so
+/// the session has the whole of its own wait ahead of it. The sandbox's own wait runs
+/// from that instant and the clock reaps it at the end of it, so a session seeded far in
+/// the past would be reaped before a command reached it.
+const SEEDED_RUNNING_AGE_MILLIS: i64 = 100;
+
+/// The wait a SEEDED sandbox carries: the documented maximum of
+/// `Sandbox$timeoutInMinutes` ("from 5 to 2160 (36 hours)"), which maps onto the
+/// ceiling of the span the sandbox clock publishes
+/// ([`state::MAX_SANDBOX_IDLE_SPAN_MILLIS`]). This suite is about a command execution's
+/// clock, so the sandbox it submits to must stay live throughout, whatever the floor of
+/// that span is.
+const SEEDED_SANDBOX_TIMEOUT_MINUTES: i32 = 2160;
+
 /// Long enough for a sandbox's own clock-owed transition out of `QUEUED` to have
 /// fallen due, so the sandbox a command is submitted to is live.
 const PAST_THE_SANDBOX_SETTLE_SPAN: Duration =
@@ -164,6 +178,7 @@ fn seed_sandbox(
         arn: Some(arn.clone()),
         project_name: Some(project.to_string()),
         request_time: Some(state::datetime(now)),
+        timeout_in_minutes: Some(SEEDED_SANDBOX_TIMEOUT_MINUTES),
         status: Some(
             if ended {
                 state::SANDBOX_STATUS_STOPPED
@@ -189,7 +204,7 @@ fn seed_sandbox(
             // past and the read materialises the live session; the others must not
             // settle while the test runs.
             settle_due_millis: match seeded {
-                SeededSandbox::Running => now - SEEDED_SANDBOX_SPAN_MILLIS,
+                SeededSandbox::Running => now - SEEDED_RUNNING_AGE_MILLIS,
                 SeededSandbox::Queued | SeededSandbox::Ended => {
                     now + SEEDED_SANDBOX_SPAN_MILLIS
                 }

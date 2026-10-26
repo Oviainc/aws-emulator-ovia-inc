@@ -51,6 +51,8 @@ mod get_encoder_configuration;
 mod get_participant;
 #[path = "all/get_stage_session.rs"]
 mod get_stage_session;
+#[path = "all/get_storage_configuration.rs"]
+mod get_storage_configuration;
 #[path = "all/ingest_configurations.rs"]
 mod ingest_configurations;
 #[path = "all/list_compositions.rs"]

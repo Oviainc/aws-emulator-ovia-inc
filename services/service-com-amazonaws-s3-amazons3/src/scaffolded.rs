@@ -295,7 +295,7 @@ static DOCUMENTED_MESSAGE: Schema = Schema::new_member(
 ///
 /// * the code's entry in AWS's S3 *Error responses* `ErrorCodeList`
 ///   (<https://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html#ErrorCodeList>),
-///   which publishes the exact text, for the six rows marked `[ErrorCodeList]`; and
+///   which publishes the exact text, for the five rows marked `[ErrorCodeList]`; and
 /// * otherwise the error shape's own `@documentation` in this service's Smithy model
 ///   (`smithy_query(query="shape",shape="<Code>",
 ///   model_path="services/service-com-amazonaws-s3-amazons3/smithy-model/com-amazonaws-s3-amazons3.json")`),
@@ -368,11 +368,16 @@ pub const DOCUMENTED_ERROR_MESSAGES: &[(&str, &str)] = &[
         crate::state::NO_SUCH_KEY_CODE,
         crate::state::NO_SUCH_KEY_MESSAGE,
     ),
-    // [ErrorCodeList]
     (
         "NoSuchUpload",
-        "The specified multipart upload does not exist. The upload ID might be invalid, or \
-         the multipart upload might have been aborted or completed.",
+        // The sentence S3 sends on the wire for this code. It states the same condition as
+        // the `ErrorCodeList` entry and the model's own prose for the shape, which both
+        // word it with the "multipart" qualifier ("The specified multipart upload does not
+        // exist. The upload ID might be invalid, …"); what the service actually sends names
+        // the upload alone, and the sent text is the contract a message-matching client
+        // keys on.
+        "The specified upload does not exist. The upload ID may be invalid, or the upload \
+         may have been aborted or completed.",
     ),
     ("NotFound", "The specified content does not exist."),
     (
