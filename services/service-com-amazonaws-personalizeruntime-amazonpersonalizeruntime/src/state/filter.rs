@@ -519,6 +519,12 @@ pub struct BoundFilter {
 /// can omit the filter-values. In this case, Amazon Personalize doesn't use that
 /// portion of the expression to filter recommendations", so the clause is dropped.
 ///
+/// A parameter is unbound whenever the request names no value for it, whatever
+/// predicate the clause carries: the key may be missing, or present with a value that
+/// names no value at all ([`resolve`]). That decision is taken in ONE place —
+/// [`unbound_parameter`] — so the two kinds differ only in what the rule does, never in
+/// which requests reach it.
+///
 /// A clause over the other dataset cannot be evaluated against this entity's stored
 /// attributes at all, which is an error for either kind: the caller applied an Items
 /// filter to action recommendations, or the reverse.
@@ -552,41 +558,32 @@ pub fn bind(
                     }
                 }
                 match unbound {
-                    Some(name) if expression.kind == FilterKind::Include => {
-                        return Err(format!(
-                            "filterValues provides no value for the filter expression parameter \
-                             ${name}, which the INCLUDE expression requires"
-                        ))
+                    Some(name) => {
+                        unbound_parameter(expression.kind, &name)?;
+                        continue;
                     }
-                    // EXCLUDE: that portion of the expression is not used.
-                    Some(_) => continue,
                     None => BoundPredicate::In {
                         values: bound_values,
                         negated: *negated,
                     },
                 }
             }
-            Predicate::Compare { op, operand } => match resolve(operand, filter_values) {
-                Some(resolved) => {
-                    let Some(value) = resolved.into_iter().next() else {
+            // A comparison asserts something about ONE value, so a parameter bound to
+            // several is compared against the first.
+            Predicate::Compare { op, operand } => {
+                match resolve(operand, filter_values).and_then(|resolved| resolved.into_iter().next())
+                {
+                    Some(value) => BoundPredicate::Compare { op: *op, value },
+                    None => {
+                        // Only a parameter can go unbound: a literal operand stands for
+                        // itself.
+                        if let Operand::Parameter(name) = operand {
+                            unbound_parameter(expression.kind, name)?;
+                        }
                         continue;
-                    };
-                    BoundPredicate::Compare { op: *op, value }
-                }
-                None => {
-                    if expression.kind == FilterKind::Include {
-                        let name = match operand {
-                            Operand::Parameter(name) => name.clone(),
-                            Operand::Literal(literal) => literal.clone(),
-                        };
-                        return Err(format!(
-                            "filterValues provides no value for the filter expression parameter \
-                             ${name}, which the INCLUDE expression requires"
-                        ));
                     }
-                    continue;
                 }
-            },
+            }
         };
         clauses.push((
             *combinator,
@@ -602,16 +599,38 @@ pub fn bind(
     })
 }
 
-/// One operand's concrete values, or `None` when it is an unbound parameter.
+/// What an expression of `kind` does with a clause whose parameter `name` the request
+/// left unbound: refuse the request, or drop the clause.
+///
+/// `Err` is the refusal an `INCLUDE` expression owes; `Ok(())` means the caller drops
+/// the clause, which is what an `EXCLUDE` expression does with a portion of the
+/// expression it does not use.
+fn unbound_parameter(kind: FilterKind, name: &str) -> Result<(), String> {
+    if kind == FilterKind::Include {
+        return Err(format!(
+            "filterValues provides no value for the filter expression parameter \
+             ${name}, which the INCLUDE expression requires"
+        ));
+    }
+    Ok(())
+}
+
+/// One operand's concrete values — at least one — or `None` when the request did not
+/// bind it to any value.
 ///
 /// A parameter's value may carry several values: "Separate multiple values for one
-/// parameter with a comma."
+/// parameter with a comma." A request that supplies the parameter with text that names
+/// no value at all — nothing, only whitespace, or only separators, all of which
+/// [`split_values`] reads as naming no value — binds it no more than an absent key
+/// does, so it resolves the same way. An explicitly DELIMITED empty value is a value
+/// the caller wrote, and binds the parameter to the empty string.
 fn resolve(operand: &Operand, filter_values: Option<&HashMap<String, String>>) -> Option<Vec<String>> {
     match operand {
         Operand::Literal(literal) => Some(vec![literal.clone()]),
         Operand::Parameter(name) => {
             let raw = filter_values?.get(name)?;
-            Some(split_values(raw))
+            let values = split_values(raw);
+            (!values.is_empty()).then_some(values)
         }
     }
 }

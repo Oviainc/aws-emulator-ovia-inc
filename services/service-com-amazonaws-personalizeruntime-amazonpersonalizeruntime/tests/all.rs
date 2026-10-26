@@ -25,6 +25,8 @@ mod score_denominator;
 mod state_roundtrip;
 #[path = "all/support.rs"]
 mod support;
+#[path = "all/unbound_filter_values.rs"]
+mod unbound_filter_values;
 #[path = "all/unresolved_resource_arns.rs"]
 mod unresolved_resource_arns;
 #[path = "all/unused_personalization_input.rs"]
