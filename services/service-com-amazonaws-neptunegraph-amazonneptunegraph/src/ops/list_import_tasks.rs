@@ -1,26 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListImportTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListImportTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListImportTasks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the import tasks this service stores, as pages over one stable order.
 //!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
 //! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
 //! `ListImportTasks::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! deserialize -> validate -> `handle` -> serialize. You write ONLY the `handle` body.
 //!
 //! ## Reaching this service's state
 //!
-//! The engine is held on `self` (constructor-injected), NOT passed per request — so
+//! The engine is held on `self` (constructor-injected), NOT passed per request, so
 //! engine access is guaranteed by the time any request runs. Reach the store through
 //! [`crate::state::service_state`] and read and write it through the guard it hands back:
 //!
@@ -30,7 +23,7 @@
 //!     state.lock().your_field = /* ... */;
 //! ```
 //!
-//! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only —
+//! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only:
 //! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`.
 //! The engine is NOT reached through `ctx`.
 //!
@@ -42,7 +35,7 @@
 //! # Modeled contract for `ListImportTasks`
 //!
 //! What AWS documents for this operation, from this service's Smithy model. HTML is
-//! stripped and long entries are clipped at ` …`. For the FULL text of any one item,
+//! stripped and long entries are clipped. For the FULL text of any one item,
 //! ask the model rather than reading the raw JSON:
 //!
 //! ```text
@@ -53,36 +46,39 @@
 //!
 //! ## Input
 //!
-//! * `graphIdentifier` (GraphIdentifier, pattern ^g-[a-z0-9]{10}$) — The unique identifier of
+//! * `graphIdentifier` (GraphIdentifier, pattern ^g-[a-z0-9]{10}$) - The unique identifier of
 //!   the Neptune Analytics graph. When provided, the service returns only import tasks
 //!   associated with this graph. If not specified, the service returns all import tasks.
-//! * `maxResults` (MaxResults, range 1..100) — The total number of records to return in the
+//! * `maxResults` (MaxResults, range 1..100) - The total number of records to return in the
 //!   command's output. If the total number of records available is more than the value
 //!   specified, nextToken is provided in the command's output. To resume pagination, provide
 //!   the nextToken output value in the nextToken argument of a subsequent command. Do not use
 //!   the nextToken response element directly outside of the Amazon CLI.
-//! * `nextToken` (PaginationToken, len 1..8192) — Pagination token used to paginate output.
+//! * `nextToken` (PaginationToken, len 1..8192) - Pagination token used to paginate output.
 //!   When this value is provided as input, the service returns results from where the
 //!   previous response left off. When this value is present in output, it indicates that
 //!   there are more results to retrieve.
 //!
 //! ## Output
 //!
-//! * `nextToken` (PaginationToken, len 1..8192) — Pagination token used to paginate output.
+//! * `nextToken` (PaginationToken, len 1..8192) - Pagination token used to paginate output.
 //!   When this value is provided as input, the service returns results from where the
 //!   previous response left off. When this value is present in output, it indicates that
 //!   there are more results to retrieve.
-//! * `tasks` (ImportTaskSummaryList) **required** — The requested list of import tasks.
+//! * `tasks` (ImportTaskSummaryList) **required** - The requested list of import tasks.
 //!
 //! ## Errors
 //!
-//! * `InternalServerException` (HTTP 500) — A failure occurred on the server.
-//! * `ResourceNotFoundException` (HTTP 404) — A specified resource could not be located.
-//! * `ThrottlingException` (HTTP 429) — The exception was interrupted by throttling.
-//! * `ValidationException` (HTTP 400) — A resource could not be validated.
+//! * `InternalServerException` (HTTP 500) - A failure occurred on the server.
+//! * `ResourceNotFoundException` (HTTP 404) - A specified resource could not be located.
+//! * `ThrottlingException` (HTTP 429) - The exception was interrupted by throttling.
+//! * `ValidationException` (HTTP 400) - A resource could not be validated.
 
 #[allow(unused_imports)]
 use super::types::*;
+// The token format every listing of this service issues, hosted once in
+// `crate::state` beside the id-space predicates its decode half takes.
+use crate::state::encode_page_token;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -155,18 +151,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListImportTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListImportTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListImportTasks"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListImportTasksErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the neptune-graph store is not mounted on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A token this service did not issue names no page, so it is refused rather
+        // than treated as the start of the listing. This operation models
+        // `ValidationException`, so the refusal is that modelled 400.
+        let start_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+                ListImportTasksErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "nextToken '{token}' is not a pagination token this service issued"
+                    ),
+                    reason: Some("ILLEGAL_ARGUMENT".to_string()),
+                })
+            })?),
+            None => None,
+        };
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(DEFAULT_PAGE_SIZE);
+
+        // An import task lives in exactly one Region, so this listing reports the tasks
+        // of the Region the request was signed for and no others.
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+        // Reporting only (`@readonly`): the sole write is materialising the terminal
+        // transitions the clock already made due.
+        store.settle_all(now);
+
+        // `graphIdentifier` is optional: absent, the listing spans every import task of
+        // the Region; present, it has to name a graph of this Region, because a listing
+        // of the import tasks of a graph that does not exist is a failed lookup rather
+        // than an empty page.
+        let of_graph = match input.graph_identifier.as_deref() {
+            Some(identifier) => {
+                let Some(graph) = store.settled_graph(identifier, &region, now) else {
+                    return Err(ListImportTasksErrorModeled::ResourceNotFoundException(
+                        crate::state::graph_not_found(identifier),
+                    )
+                    .into());
+                };
+                Some(graph.id.clone())
+            }
+            None => None,
+        };
+
+        // `import_tasks` is a BTreeMap, so one stable total order underlies every page
+        // and a token can name a position in it.
+        let mut remaining =
+            store.import_tasks_in(&region, of_graph.as_deref(), start_after.as_deref());
+        let tasks: Vec<ImportTaskSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(ImportTaskSummary::from)
+            .collect();
+        // A token only when tasks remain, and it resumes after the last one reported, so
+        // a resumed page returns the remainder without repeats.
+        let next_token = if remaining.next().is_some() {
+            tasks
+                .last()
+                .map(|summary| encode_page_token(&summary.task_id))
+        } else {
+            None
+        };
+
+        Ok(Self::Output { tasks, next_token })
+    }
+}
+
+/// The page size when `maxResults` is absent: the largest the member allows
+/// (`smithy_query(query="operation",operation="ListImportTasks")` -> `maxResults`
+/// range 1..100), so an unpaginated caller sees as much as one page can carry.
+const DEFAULT_PAGE_SIZE: usize = 100;
+
+/// The import-task id a token resumes after, or `None` when the token is not one
+/// [`encode_page_token`] produced for the task-id space.
+///
+/// Only the id space is this listing's own: the wire format, and the decision to refuse
+/// a value that names no position in that space rather than treat it as the start of the
+/// list, are [`crate::state::decode_page_token`]'s.
+fn decode_page_token(token: &str) -> Option<String> {
+    crate::state::decode_page_token(token, crate::state::is_import_task_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_page_token, encode_page_token};
+
+    /// A token round-trips to the id it was minted from, and a token this service never
+    /// issued is rejected rather than silently treated as the first page.
+    #[test]
+    fn page_tokens_round_trip_and_reject_foreign_tokens() {
+        for id in ["t-0000000000", "t-abcdefghij", "t-zz99zz99zz"] {
+            let token = encode_page_token(id);
+            let decoded = decode_page_token(&token);
+            assert_eq!(
+                decoded.as_deref(),
+                Some(id),
+                "case {id:?}: token {token:?} did not round-trip, got {decoded:?}"
+            );
+        }
+        for foreign in [
+            "not-a-token",
+            "zz",
+            "abc",
+            // Decodes cleanly, but names no position in the task-id space.
+            &hex::encode("not-a-task-id"),
+            &hex::encode("t-short"),
+            // A graph id and a snapshot id are positions in OTHER id spaces.
+            &hex::encode("g-0123456789"),
+            &hex::encode("gs-0123456789"),
+        ] {
+            let decoded = decode_page_token(foreign);
+            assert!(
+                decoded.is_none(),
+                "case {foreign:?}: expected rejection, got {decoded:?}"
+            );
+        }
     }
 }

@@ -43,6 +43,8 @@ mod graph_snapshot_listing;
 mod graph_summary;
 #[path = "all/import_task_lifecycle.rs"]
 mod import_task_lifecycle;
+#[path = "all/import_task_listing.rs"]
+mod import_task_listing;
 #[path = "all/import_task_minting.rs"]
 mod import_task_minting;
 #[path = "all/import_task_read.rs"]

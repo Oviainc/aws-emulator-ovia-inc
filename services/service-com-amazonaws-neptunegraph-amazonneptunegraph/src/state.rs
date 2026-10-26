@@ -1809,6 +1809,34 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         Some(task)
     }
 
+    /// The import tasks `region` holds, in task-id order, resuming after `after_id`
+    /// when a pagination token named a position, and restricted to the tasks that load
+    /// into one graph when `of_graph` names one: the listing `ListImportTasks` pages
+    /// over.
+    ///
+    /// The same shape as [`Self::export_tasks_in`], for the same reason: `import_tasks`
+    /// is a `BTreeMap`, so one stable total order underlies every page and a token can
+    /// name a position in it. `of_graph` is matched against the task's stored `graph_id`,
+    /// so a task stays listed under the graph it loaded into even once that graph is
+    /// gone.
+    pub fn import_tasks_in<'store>(
+        &'store self,
+        region: &'store str,
+        of_graph: Option<&'store str>,
+        after_id: Option<&str>,
+    ) -> impl Iterator<Item = &'store ImportTask> {
+        let lower = match after_id {
+            Some(id) => ::std::ops::Bound::Excluded(id.to_string()),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        self.import_tasks
+            .range((lower, ::std::ops::Bound::Unbounded))
+            .map(|(_, task)| task)
+            .filter(move |task| {
+                task.is_in(region) && of_graph.is_none_or(|graph_id| task.graph_id == graph_id)
+            })
+    }
+
     /// The tag map of the resource `arn` names IN `region`, or `None` when this
     /// Region holds no resource by that ARN.
     ///
@@ -2181,6 +2209,12 @@ pub fn is_task_id(value: &str) -> bool {
 /// Whether `value` matches the modelled `ExportTaskId` pattern `^t-[a-z0-9]{10}$` —
 /// the same check as [`is_task_id`], under the name the export surface reads it by.
 pub fn is_export_task_id(value: &str) -> bool {
+    is_task_id(value)
+}
+
+/// Whether `value` matches the modelled `TaskId` pattern `^t-[a-z0-9]{10}$` - the same
+/// check as [`is_task_id`], under the name the import surface reads it by.
+pub fn is_import_task_id(value: &str) -> bool {
     is_task_id(value)
 }
 
@@ -2723,6 +2757,10 @@ macro_rules! import_task_record_output {
 import_task_record_output!(
     // `CancelImportTaskOutput` carries only the shared members.
     CancelImportTaskOutput(task) {},
+    // `ImportTaskSummary`, the entry `ListImportTasks` reports, is exactly the shared
+    // member set (`smithy_query(query="shape",shape="ImportTaskSummary")`), so a listed
+    // task cannot differ from what a read of it answers.
+    ImportTaskSummary(task) {},
     StartImportTaskOutput(task) {
         import_options: task.import_options.clone(),
     },
