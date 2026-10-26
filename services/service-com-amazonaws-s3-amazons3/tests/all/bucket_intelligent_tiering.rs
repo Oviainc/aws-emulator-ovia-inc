@@ -45,6 +45,10 @@
 //! * A per-id call naming a configuration the bucket does not carry — one never put, one
 //!   already deleted, or one only another bucket carries — answers `NoSuchConfiguration`
 //!   (HTTP 404) and changes nothing.
+//! * A per-id read reports the container the LATEST put under that id recorded, in full —
+//!   the payload IS the configuration, so a replacement that drops a filter or a tiering
+//!   reads back without it — and it reaches a configuration by its id whether or not the
+//!   first page of the listing happens to carry that one.
 //! * Once every configuration a bucket carried has been deleted, the bucket carries NONE:
 //!   the listing reports an untruncated, EMPTY page — `IntelligentTieringConfigurationList`
 //!   is `xmlFlattened` with `xmlName` `IntelligentTieringConfiguration`
@@ -1687,4 +1691,191 @@ async fn deleting_every_configuration_leaves_the_bucket_carrying_none() {
              {neighbours:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_per_id_read_reports_the_latest_configuration_recorded_under_that_id() {
+    let router = router();
+    let name = "itc-per-id-replacement";
+    bucket(&router, name).await;
+
+    // A second id the bucket carries throughout, so each replacement is seen to address the
+    // id its put named and nothing else.
+    let untouched = ConfigurationRow::enabled("untouched");
+    let put = put_configuration(&router, name, &untouched.id, &untouched).await;
+    assert_eq!(
+        put.status,
+        200,
+        "the untouched configuration must be recorded, got {} ({})",
+        put.status,
+        body_of(&put)
+    );
+
+    let id = "replaced";
+    let (archive, archive_floor) = ACCESS_TIER_FLOORS[0];
+    let (deep, deep_floor) = ACCESS_TIER_FLOORS[1];
+    // Each row replaces the one before it under the SAME id, and the rows differ along what
+    // the container may carry: its `Status`, which form of `Filter` it names (none, a
+    // prefix, a single tag, an `And` over a prefix and a tag), how many tierings it carries
+    // and where each one's `Days` sits in its tier's published range — including a row that
+    // DROPS the filter and the extra tiering a previous row added, so what is pinned is the
+    // latest container in full rather than a merge of what the id ever carried.
+    let rows: Vec<(&str, ConfigurationRow)> = vec![
+        ("the required members only", ConfigurationRow::enabled(id)),
+        (
+            "a prefix filter added",
+            ConfigurationRow::enabled(id).with_filter(FilterRow::prefix("cold/")),
+        ),
+        (
+            "disabled, with a single-tag filter",
+            ConfigurationRow::enabled(id)
+                .with_status("Disabled")
+                .with_filter(FilterRow::tag("archive", "yes")),
+        ),
+        (
+            "two tierings, the second at the published maximum",
+            ConfigurationRow::enabled(id).with_tierings(vec![
+                TieringRow::new(archive_floor, archive),
+                TieringRow::new(MAX_DAYS, deep),
+            ]),
+        ),
+        (
+            "an And filter over a prefix and a tag, deep archive at its floor",
+            ConfigurationRow::enabled(id)
+                .with_filter(FilterRow::and(Some("cold/"), &[("tier", "deep")]))
+                .with_tierings(vec![TieringRow::new(deep_floor, deep)]),
+        ),
+        (
+            "back to the required members only",
+            ConfigurationRow::enabled(id),
+        ),
+    ];
+
+    for (case, configuration) in &rows {
+        let put = put_configuration(&router, name, id, configuration).await;
+        assert_eq!(
+            put.status,
+            200,
+            "case {case:?}: expected the put to answer 200, got {} ({})",
+            put.status,
+            body_of(&put)
+        );
+
+        let read = get_configuration(&router, name, id, &[]).await;
+        assert_eq!(
+            read.status,
+            200,
+            "case {case:?}: expected the per-id read to answer 200, got {} ({})",
+            read.status,
+            body_of(&read)
+        );
+        let reported = reported_configuration(&read);
+        assert_eq!(
+            &reported, configuration,
+            "case {case:?}: expected the container the latest put recorded, got {reported:?}"
+        );
+
+        // A replacement is not an addition: the bucket still carries exactly the two ids,
+        // and the other one reads back as it was put.
+        let mut expected = vec![configuration.clone(), untouched.clone()];
+        expected.sort_by(|left, right| left.id.cmp(&right.id));
+        let listed = reported_configurations(&list_configurations(&router, name, None, &[]).await);
+        assert_eq!(
+            listed, expected,
+            "case {case:?}: expected the replacement beside the untouched configuration, got \
+             {listed:?}"
+        );
+        let other = reported_configuration(&get_configuration(&router, name, &untouched.id, &[]).await);
+        assert_eq!(
+            other, untouched,
+            "case {case:?}: the other id must be untouched, got {other:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_per_id_read_reaches_a_configuration_the_first_listing_page_does_not_carry() {
+    let router = router();
+    let name = "itc-per-id-beyond-the-page";
+    bucket(&router, name).await;
+
+    // More configurations than one listing page reports, so the ids the rows read span the
+    // page break: a per-id read addresses ONE configuration by the id that identifies it,
+    // so where the listing happens to break is nothing to it. The ids are zero-padded, so
+    // ascending id order is also ascending numeric order.
+    let held = 101usize;
+    for index in 0..held {
+        let id = format!("configuration-{index:04}");
+        let put = put_configuration(&router, name, &id, &ConfigurationRow::enabled(&id)).await;
+        assert_eq!(
+            put.status,
+            200,
+            "case {id:?}: expected the put to answer 200, got {} ({})",
+            put.status,
+            body_of(&put)
+        );
+    }
+
+    let first = list_configurations(&router, name, None, &[]).await;
+    let first_page = reported_configurations(&first);
+    assert!(
+        !first_page.is_empty() && first_page.len() < held,
+        "the {held} configurations must not fit in one page, got {}",
+        first_page.len()
+    );
+    let on_the_first_page = first_page.len();
+
+    for (case, index) in [
+        ("the first id of all", 0),
+        ("the last id the first page carries", on_the_first_page - 1),
+        ("the first id past the page break", on_the_first_page),
+        ("the last id of all", held - 1),
+    ] {
+        let id = format!("configuration-{index:04}");
+        let read = get_configuration(&router, name, &id, &[]).await;
+        assert_eq!(
+            read.status,
+            200,
+            "case {case:?} ({id:?}): expected the per-id read to answer 200, got {} ({})",
+            read.status,
+            body_of(&read)
+        );
+        let reported = reported_configuration(&read);
+        assert_eq!(
+            reported,
+            ConfigurationRow::enabled(&id),
+            "case {case:?} ({id:?}): expected the configuration that was put, got {reported:?}"
+        );
+    }
+
+    // A read is a REPORT: an id the bucket does not carry is refused and configures
+    // nothing, so the bucket carries exactly what it did and the id stays absent.
+    let missing = format!("configuration-{held:04}");
+    let refused = get_configuration(&router, name, &missing, &[]).await;
+    assert_eq!(
+        refused.status,
+        404,
+        "case \"an id the bucket does not carry\": expected 404, got {} ({})",
+        refused.status,
+        body_of(&refused)
+    );
+    assert_eq!(
+        refused.error_code(),
+        NO_SUCH_CONFIGURATION_CODE,
+        "case \"an id the bucket does not carry\": expected {NO_SUCH_CONFIGURATION_CODE}, got {}",
+        refused.error_code()
+    );
+    let after = reported_configurations(&list_configurations(&router, name, None, &[]).await);
+    assert_eq!(
+        after, first_page,
+        "a refused read must leave the bucket's configurations as they were, got {after:?}"
+    );
+    let again = get_configuration(&router, name, &missing, &[]).await;
+    assert_eq!(
+        again.status,
+        404,
+        "case \"an id the bucket does not carry, read twice\": expected 404, got {} ({})",
+        again.status,
+        body_of(&again)
+    );
 }

@@ -7,8 +7,8 @@
 //! cluster subnet groups they are configured from, the HSM configurations that
 //! tell a cluster where to store its database encryption keys, the usage limits
 //! set on their features, the snapshot copy grants that let Redshift encrypt
-//! copied snapshots in another region, the Query Editor (QEV2) IAM Identity
-//! Center applications the account registered, and the namespace registrations
+//! copied snapshots in another region, the Query Editor (QEV2) and the Redshift
+//! IAM Identity Center applications the account registered, and the namespace registrations
 //! that expose a cluster's or a serverless namespace's data to a consumer
 //! account through the Glue Data Catalog, and the event notification
 //! subscriptions that say which Amazon Redshift events are published to an
@@ -40,7 +40,8 @@ use crate::ops::types::{
     HsmConfiguration, MaintenanceTrack,
     NamespaceIdentifierUnion,
     NetworkInterface, Parameter, PendingModifiedValues, Qev2IdcApplication, RecurringCharge,
-    ReservedNodeOffering, Snapshot, SnapshotCopyGrant, Subnet, SupportedOperation,
+    RedshiftIdcApplication, ReservedNodeOffering, Snapshot, SnapshotCopyGrant, Subnet,
+    SupportedOperation,
     SupportedPlatform, UpdateTarget,
     VpcEndpoint, VpcSecurityGroupMembership,
 };
@@ -1920,6 +1921,74 @@ pub fn idc_managed_application_arn(idc_instance_arn: &str, application_name: &st
     )
 }
 
+/// How many Redshift IAM Identity Center applications the store holds before
+/// `CreateRedshiftIdcApplication` refuses with the modelled
+/// `RedshiftIdcApplicationQuotaExceededFault`.
+///
+/// The same reasoning as [`QEV2_IDC_APPLICATION_QUOTA`]: the emulator's own
+/// bound on a collection whose records are identified by a NAME, of which there
+/// are unboundedly many, so the bound is what keeps
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::redshift_idc_applications`]
+/// finite. Amazon Redshift publishes no quota for the collection, and the
+/// modelled fault is the service's own way of saying the bound was reached.
+pub const REDSHIFT_IDC_APPLICATION_QUOTA: usize = 10_000;
+
+/// The `IdcOnboardStatus` of a registered Redshift IAM Identity Center
+/// application.
+///
+/// The model publishes no value list for the member (`smithy_query(query="doc",
+/// shape="RedshiftIdcApplication", member="IdcOnboardStatus")` — "The onboarding
+/// status for the Amazon Redshift IAM Identity Center application"), so the
+/// single status this emulator reports is its own choice, for the same reason as
+/// [`QEV2_IDC_ONBOARD_STATUS`]: the call itself mints the IAM Identity Center
+/// managed application, so the application is registered by the time
+/// `CreateRedshiftIdcApplication` returns and the status it reports is terminal.
+pub const REDSHIFT_IDC_ONBOARD_STATUS: &str = "Completed";
+
+/// What every operation taking a `RedshiftIdcApplicationArn` answers when the
+/// ARN names no registered application: ONE sentence, naming the ARN the
+/// request supplied.
+///
+/// One helper rather than a sentence per handler, so the create, the read, the
+/// modify, the delete and the cluster operations that take the member cannot
+/// report different wording for the same precondition.
+pub fn redshift_idc_application_not_exists(application_arn: &str) -> String {
+    format!("The RedshiftIdcApplication with the ARN {application_arn} wasn't found.")
+}
+
+/// What `CreateRedshiftIdcApplication` answers when the NAME the request
+/// carries is one the account already has an application under: one sentence
+/// naming that name and telling the caller what to do about it.
+pub fn redshift_idc_application_already_exists(application_name: &str) -> String {
+    format!(
+        "You already have a RedshiftIdcApplication with the name {application_name}. Use a different name."
+    )
+}
+
+/// What `CreateRedshiftIdcApplication` answers when the account already holds
+/// as many applications as it may ([`REDSHIFT_IDC_APPLICATION_QUOTA`]).
+pub fn redshift_idc_application_quota_exceeded() -> String {
+    format!(
+        "The request would exceed the allowed number of Redshift IAM Identity Center applications ({REDSHIFT_IDC_APPLICATION_QUOTA})."
+    )
+}
+
+/// The ARN of a Redshift IAM Identity Center application:
+/// `arn:aws:redshift:<region>:<account>:redshiftidcapplication:<uuid>`.
+///
+/// Derived from the application's own name and Region exactly as
+/// [`qev2_idc_application_arn`] is, so the value is stable across every read of
+/// the same application and is not a per-run value; it is computed ONCE, by the
+/// create, and then persisted on the stored application.
+pub fn redshift_idc_application_arn(application_name: &str, region: &str) -> String {
+    let uuid = content_uuid(&format!("redshiftidcapplication/{application_name}/{region}"));
+    engine::emulator_arn(
+        "redshift",
+        region,
+        &format!("redshiftidcapplication:{uuid}"),
+    )
+}
+
 /// The longest an ARN this service STORES may be.
 ///
 /// An ARN-valued member the model constrains only by length (`IdcInstanceArn`
@@ -1953,6 +2022,58 @@ pub fn is_arn(value: &str) -> bool {
         && segments.next().is_some()
         && segments.next().is_some()
         && segments.next().is_some_and(|resource| !resource.is_empty())
+}
+
+/// What an operation answers when an ARN-valued member carries a value longer
+/// than an ARN can be ([`MAX_ARN_LENGTH`]): the member, the length it carried
+/// and the bound.
+///
+/// One helper rather than a sentence per handler, so two operations refusing
+/// the same over-long value cannot report different wording.
+pub fn arn_too_long_message(member: &str, length: usize) -> String {
+    format!(
+        "Invalid value for {member}: the value is {length} characters long; an Amazon Resource Name (ARN) is at most {MAX_ARN_LENGTH} characters."
+    )
+}
+
+/// What an operation answers when an ARN-valued member carries a value that is
+/// no ARN at all (see [`is_arn`]): the member and the value it carried.
+///
+/// A member documented as naming ONE kind of resource states that in its own
+/// refusal instead (see `create_qev2_idc_application.rs`); this is the sentence
+/// for a member documented only as an ARN.
+pub fn not_an_arn_message(member: &str, value: &str) -> String {
+    format!(
+        "Invalid value for {member}: '{value}'. The value must be an Amazon Resource Name (ARN)."
+    )
+}
+
+/// Check the trusted token issuer ARNs one request names, naming the member and
+/// the restriction it breaks. An `Err` is an `InvalidParameterValue`.
+///
+/// `TrustedTokenIssuerArn` is modelled only by length, exactly like the
+/// application's own ARN-valued members, so the same rule applies to it: a
+/// value that is no ARN names no token issuer. One helper rather than a copy
+/// per handler, so the create and the modify hold the member to the same rule.
+pub fn check_authorized_token_issuers(
+    issuers: &[crate::ops::types::AuthorizedTokenIssuer],
+) -> Result<(), String> {
+    for (position, issuer) in issuers.iter().enumerate() {
+        let Some(issuer_arn) = issuer.trusted_token_issuer_arn.as_deref() else {
+            continue;
+        };
+        let member = format!(
+            "AuthorizedTokenIssuerList.member.{}.TrustedTokenIssuerArn",
+            position + 1
+        );
+        if issuer_arn.len() > MAX_ARN_LENGTH {
+            return Err(arn_too_long_message(&member, issuer_arn.len()));
+        }
+        if !is_arn(issuer_arn) {
+            return Err(not_an_arn_message(&member, issuer_arn));
+        }
+    }
+    Ok(())
 }
 
 /// What a handler answers when the shared store cannot be reached: the service's
@@ -2284,6 +2405,16 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// so, like [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::usage_limits`],
     /// this collection needs no `Stored*` wrapper.
     pub qev2_idc_applications: Vec<Qev2IdcApplication>,
+    /// Every Redshift IAM Identity Center application the account created, keyed
+    /// by `RedshiftIdcApplicationArn`, in creation order.
+    ///
+    /// The modelled `RedshiftIdcApplication` shape IS the whole record — the
+    /// application carries no status the clock moves (see
+    /// [`REDSHIFT_IDC_ONBOARD_STATUS`]) and nothing the shape has no member
+    /// for — so, like
+    /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::qev2_idc_applications`],
+    /// this collection needs no `Stored*` wrapper.
+    pub redshift_idc_applications: Vec<RedshiftIdcApplication>,
     /// The engine versions this service offers, in catalog order. Unlike the
     /// collections above this one is SEEDED when the store is created — the
     /// versions exist before any cluster does, which is why
@@ -2360,6 +2491,7 @@ impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             hsm_configurations: Vec::new(),
             snapshot_copy_grants: Vec::new(),
             qev2_idc_applications: Vec::new(),
+            redshift_idc_applications: Vec::new(),
             cluster_versions: published_cluster_versions(),
             maintenance_tracks: published_maintenance_tracks(),
             account_attributes: published_account_attributes(),
@@ -2922,6 +3054,31 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         self.qev2_idc_applications
             .iter()
             .find(|application| application.qev2_idc_application_name.as_deref() == Some(name))
+    }
+
+    /// The position of the Redshift IAM Identity Center application with this
+    /// `RedshiftIdcApplicationArn`, if any.
+    ///
+    /// A position rather than a reference, for the same reason as
+    /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::qev2_idc_application_position`]:
+    /// the modify and the delete write the record they find, while the read path
+    /// selects by reference as it walks the collection for a page.
+    pub fn redshift_idc_application_position(&self, application_arn: &str) -> Option<usize> {
+        self.redshift_idc_applications
+            .iter()
+            .position(|application| {
+                application.redshift_idc_application_arn.as_deref() == Some(application_arn)
+            })
+    }
+
+    /// The Redshift IAM Identity Center application with this
+    /// `RedshiftIdcApplicationName`, if any — what the account's applications
+    /// are unique on, since the modelled "already exists" fault is the answer to
+    /// a second create under one name.
+    pub fn redshift_idc_application_named(&self, name: &str) -> Option<&RedshiftIdcApplication> {
+        self.redshift_idc_applications
+            .iter()
+            .find(|application| application.redshift_idc_application_name.as_deref() == Some(name))
     }
 
     /// The position of the cluster with this identifier, if any.

@@ -16,7 +16,9 @@
 //!   not open a support case and updates the request status to Not approved", so a
 //!   request that opted out of its support case ends `NOT_APPROVED` with no `CaseId`
 //!   and puts NOTHING in force, while one that allowed it (explicitly or by omission)
-//!   ends `APPROVED` with its `DesiredValue` in force;
+//!   is processed under a support case and ends `APPROVED`, keeping that case's
+//!   `CaseId`, with its `DesiredValue` in force (the steps that get it there are
+//!   `support_case_lifecycle.rs`);
 //! * every template operation is refused by the template gate: outside the plane's
 //!   home Region with `TemplatesNotAvailableInRegionException`, and inside it — for an
 //!   account that belongs to no AWS Organization, which is the account this emulator
@@ -33,9 +35,11 @@ use smithy_server_runtime::MultiServiceRouter;
 /// `X-Amz-Target: ServiceQuotasV20190624.<OperationName>`.
 const TARGET_PREFIX: &str = "ServiceQuotasV20190624.";
 
-/// Comfortably past `crate::state::REQUEST_DECISION_DELAY` (500 ms), so a request made
-/// before this wait is due for its decision afterwards.
-const PAST_DECISION: Duration = Duration::from_millis(1_200);
+/// Comfortably past both steps the clock owes a quota increase request
+/// (`crate::state::SUPPORT_CASE_OPEN_DELAY` then
+/// `crate::state::REQUEST_DECISION_DELAY`), so a request made before this wait has
+/// settled afterwards.
+const PAST_DECISION: Duration = Duration::from_millis(1_800);
 
 /// A caller pointed at one regional endpoint of one emulator.
 struct Client {
@@ -263,12 +267,21 @@ async fn support_case_allowed_decides_the_terminal_status_and_the_applied_value(
             "case {case}: expected the terminal status {expected_status:?}, got {status:?} \
              in {settled}"
         );
-        // A request AWS did not open a support case for carries no CaseId, and this
-        // emulator opens none for an approved request either.
-        assert!(
-            requested["CaseId"].is_null(),
-            "case {case}: expected no CaseId, got {settled}"
-        );
+        // A support case is what processes a request Service Quotas may open one for,
+        // so an approved request reports the `CaseId` of the case it was processed
+        // under; a request whose submitter opted out of that case has none.
+        let case_id = requested["CaseId"].as_str();
+        if expected_status == "APPROVED" {
+            assert!(
+                case_id.is_some_and(|id| !id.is_empty()),
+                "case {case}: expected the CaseId of the case that processed it, got {settled}"
+            );
+        } else {
+            assert!(
+                case_id.is_none(),
+                "case {case}: expected no CaseId, got {settled}"
+            );
+        }
         // Reading twice does not move the status: the decision was the clock's, not
         // the reader's.
         let again = caller

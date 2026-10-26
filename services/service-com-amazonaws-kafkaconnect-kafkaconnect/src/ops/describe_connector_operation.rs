@@ -176,13 +176,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
         state.settle_due();
 
-        let Some(operation) = state
-            .connector_operations
-            .get(&input.connector_operation_arn)
+        // An operation belongs to the connector it ran against and so lives in
+        // that connector's region: a regional endpoint reports only the
+        // operations of its own region's connectors.
+        let Some(operation) = state.connector_operation_in(&region, &input.connector_operation_arn)
         else {
             return Err(DescribeConnectorOperationErrorModeled::NotFoundException(
                 NotFoundException {

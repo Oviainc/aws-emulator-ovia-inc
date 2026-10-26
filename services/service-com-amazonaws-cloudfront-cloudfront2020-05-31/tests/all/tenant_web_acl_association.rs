@@ -54,7 +54,10 @@ use crate::web_acl_association::{Stated, WEB_ACLS};
 
 /// `PUT /2020-05-31/distribution-tenant/{Id}/associate-web-acl`: the web ACL travels in the
 /// request document, the version (when the row states one) in the `If-Match` header.
-async fn associate(
+///
+/// `pub(crate)` so a sibling suite that needs a tenant's web ACL customization written by a
+/// CALL rather than by a create reaches it over this one wire path.
+pub(crate) async fn associate(
     router: &MultiServiceRouter,
     id: &str,
     web_acl_arn: &str,
@@ -79,8 +82,9 @@ async fn associate(
 /// `PUT /2020-05-31/distribution-tenant/{Id}/disassociate-web-acl`. The operation's input is
 /// the id and the precondition alone, so the request carries no document.
 ///
-/// `pub(crate)` so the suite that asserts how far one disassociation reaches calls it over
-/// the same wire path rather than growing a copy of this.
+/// `pub(crate)` so the suite that asserts how far one disassociation reaches, and the one
+/// that watches a tenant leave a customization listing, each call it over the same wire path
+/// rather than growing a copy of this.
 pub(crate) async fn disassociate(
     router: &MultiServiceRouter,
     id: &str,

@@ -6,6 +6,14 @@
 //! — the ones it omits keep their persisted values — and answers with the
 //! post-update record read back out of the store, not with an echo of the request.
 //!
+//! The configuration lives inside a Slack workspace registered to the account, so an
+//! update whose `teamId` is not in the registry
+//! (`state::slack_workspace_configurations`, written by
+//! `RegisterSlackWorkspaceForOrganization`) is refused with the modelled
+//! `ConflictException` (409), the condition `ConflictException`'s own documentation
+//! names first for an add, an update OR a delete; the `ResourceNotFoundException` (404)
+//! is for a registered workspace in which this channel is not configured.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -218,6 +226,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let mut store = state.lock();
+
+        // The precondition `ConflictException` documents first: "Add, update, or delete
+        // a Slack channel configuration before you add a Slack workspace to your Amazon
+        // Web Services account." A channel configuration lives inside a workspace
+        // registered to this account, so a `teamId` absent from the registry has no
+        // workspace holding a channel configuration to update — a different answer from
+        // a registered workspace in which this channel is simply not configured, which
+        // is the 404 below. Consulted BEFORE the configuration is looked up, so the
+        // conflict is reported rather than hidden behind the miss.
+        if let Some(message) = store.unregistered_workspace_conflict(&input.team_id) {
+            return Err(
+                UpdateSlackChannelConfigurationErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
 
         let key = (input.team_id.clone(), input.channel_id.clone());
         let Some(stored) = store.slack_channel_configurations.get(&key) else {

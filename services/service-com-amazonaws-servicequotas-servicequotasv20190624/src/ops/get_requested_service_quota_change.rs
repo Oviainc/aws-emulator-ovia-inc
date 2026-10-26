@@ -6,10 +6,11 @@
 //! `RequestServiceQuotaIncrease` recorded it — same `Id`, `ServiceCode`,
 //! `QuotaCode`, `DesiredValue` and timestamps — with the status it now has.
 //!
-//! Before answering it materialises the decisions the clock has already made due, so
-//! a request read after [`crate::state::REQUEST_DECISION_DELAY`] reports `APPROVED`
-//! and one read straight after it was made reports `PENDING`. Nothing else moves a
-//! status: reading does not decide a request.
+//! Before answering it materialises the steps the clock has already made due, so a
+//! request read straight after it was made reports `PENDING`, one read while the
+//! support case that processes it is open reports `CASE_OPENED` with that case's
+//! `CaseId`, and one read past its decision reports the status it settled to. Nothing
+//! else moves a status: reading does not decide a request.
 //!
 //! An id this region holds no request for is `NoSuchResourceException` (404).
 //!

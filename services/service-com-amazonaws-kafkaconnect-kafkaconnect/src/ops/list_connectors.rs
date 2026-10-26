@@ -167,17 +167,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
         state.settle_due();
 
         let prefix = input.connector_name_prefix.unwrap_or_default();
+        // "all the connectors in this account and Region": kafkaconnect is a
+        // regional service, so the listing covers the connectors of the region
+        // this call was signed for and no other region's.
+        //
         // Keyed by ARN and paged BEFORE the summaries are built, so a page costs
         // one `ConnectorSummary` per connector it returns rather than one per
         // connector stored.
         let keyed: Vec<(String, &crate::state::ConnectorRecord)> = state
-            .connectors
-            .values()
+            .connectors_in(&region)
             .filter(|connector| connector.name.starts_with(&prefix))
             .map(|connector| (connector.arn.clone(), connector))
             .collect();

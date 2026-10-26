@@ -245,15 +245,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account's workspace registry has nothing to configure a channel in. Checked
         // after the input rules above, because a request that does not satisfy the
         // model's own constraints is refused before any account state is consulted.
-        if !store
-            .slack_workspace_configurations
-            .contains_key(&input.team_id)
-        {
+        if let Some(message) = store.unregistered_workspace_conflict(&input.team_id) {
             return Err(CreateSlackChannelConfigurationErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(crate::state::workspace_not_registered_message(
-                        &input.team_id,
-                    )),
+                    message: Some(message),
                 },
             )
             .into());

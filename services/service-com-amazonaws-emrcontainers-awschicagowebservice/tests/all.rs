@@ -55,5 +55,7 @@ mod virtual_cluster_references;
 mod virtual_cluster_scheduler;
 #[path = "all/virtual_cluster_scheduler_status.rs"]
 mod virtual_cluster_scheduler_status;
+#[path = "all/virtual_cluster_teardown_cascade.rs"]
+mod virtual_cluster_teardown_cascade;
 #[path = "all/virtual_cluster_update.rs"]
 mod virtual_cluster_update;

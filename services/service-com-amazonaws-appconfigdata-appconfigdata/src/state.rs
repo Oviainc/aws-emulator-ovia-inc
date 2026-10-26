@@ -345,7 +345,11 @@ impl UnresolvedResource {
 /// configuration profile) triple.
 #[derive(Debug, Clone)]
 pub struct ServedConfiguration {
-    /// The configuration content, byte for byte as the hosted version holds it.
+    /// The configuration content a consumer of this profile receives for the in-force
+    /// version, which is what the profile's `Type` makes of the stored bytes
+    /// (`ConfigurationProfile::served_content`): a freeform profile's bytes unchanged, and
+    /// for a feature-flags profile the resolved flag document rather than the authoring
+    /// document the hosted version stores.
     pub content: Vec<u8>,
     /// The MIME type the hosted version declares, reported as `ContentType`.
     pub content_type: String,
@@ -407,6 +411,12 @@ pub fn resolve_triple<Eng: Send + Sync + 'static>(
 /// to, or has restored, the configuration that preceded it, so its own version is not
 /// what the data plane serves.
 ///
+/// What that version's stored bytes MEAN is the configuration profile's `Type`, so the
+/// content handed back is the profile's own
+/// `ConfigurationProfile::served_content` of them rather than the stored bytes: a
+/// feature-flags profile stores an authoring document and serves the flag document
+/// resolved from it.
+///
 /// Reporting-only: the environment is brought up to whatever state the CLOCK already
 /// owes it on a COPY, so a poll never writes to the control plane.
 pub fn served_configuration<Eng: Send + Sync + 'static>(
@@ -464,7 +474,9 @@ pub fn served_configuration<Eng: Send + Sync + 'static>(
         ))));
     };
     Some(Ok(ServedConfiguration {
-        content: version.content.clone(),
+        // What the profile's `Type` makes of the stored bytes: the control plane owns that
+        // rule, so the data plane asks the profile rather than deciding here.
+        content: profile.served_content(&version.content),
         content_type: version.content_type.clone(),
         version_label: version.version_label.clone(),
         version: version.version_number.to_string(),

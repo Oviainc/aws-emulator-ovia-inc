@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteObjectTagging
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteObjectTagging`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteObjectTagging::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `DeleteObjectTagging` removes the entire tag set from the object a request addresses;
+//! [`DeleteObjectTagging::handle`] below is the whole of that behaviour.
 //!
 //! ## Shape of an operation
 //!
@@ -92,14 +85,92 @@ use super::types::*;
 // `DeleteObjectTaggingError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `DeleteObjectTaggingError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#DeleteObjectTagging")]
+/// This operation's output, as the wire carries it: the one modelled member, bound to a
+/// response header, and NO body.
+///
+/// A successful removal answers "204 No Content", and an HTTP 204 response has no body.
+/// The modelled `DeleteObjectTaggingOutput` cannot be used for it: the protocol only leaves
+/// the body empty for a `smithy.api#Unit` output shape, so the generated shape serializes
+/// an empty `<DeleteObjectTaggingOutput>` document into that 204. This LOCAL shape keeps
+/// the Unit shape id — hence the empty body — while declaring the modelled member as an
+/// `@httpHeader` binding, which the protocol still captures for a Unit output; `with_http`
+/// carries the modelled 204, without which the status falls back to the protocol default
+/// of 200. It is the same pairing `DeleteObject` uses for its own 204, and it carries that
+/// one's fragility: body suppression is keyed off the Unit SHAPE ID while the members still
+/// run through the HTTP binder, so a protocol change that treated a Unit output as
+/// memberless would silently stop reporting this header. The test
+/// `a_removal_takes_an_objects_whole_tag_set_and_leaves_the_object` pins both the empty body
+/// and the header, so the pairing cannot break unnoticed.
+#[derive(Debug, Clone, Default)]
+pub struct DeleteObjectTaggingNoContent {
+    /// `x-amz-version-id`: "The versionId of the object the tag-set was removed from".
+    /// Reported only when there is one, the way S3 omits the header otherwise.
+    pub version_id: Option<String>,
+}
+
+/// `x-amz-version-id`, as [`DeleteObjectTaggingNoContent`] binds it.
+static VERSION_ID_HEADER: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+    ::aws_smithy_schema::ShapeId::from_static(
+        "com.amazonaws.s3#DeleteObjectTaggingOutput$VersionId",
+        "com.amazonaws.s3#DeleteObjectTaggingOutput",
+        "VersionId",
+    ),
+    ::aws_smithy_schema::ShapeType::String,
+    "VersionId",
+    0,
+)
+.with_http_header("x-amz-version-id");
+
+static DELETE_OBJECT_TAGGING_NO_CONTENT_MEMBERS: &[&::aws_smithy_schema::Schema] =
+    &[&VERSION_ID_HEADER];
+
+impl DeleteObjectTaggingNoContent {
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
+        ::aws_smithy_schema::ShapeType::Structure,
+        DELETE_OBJECT_TAGGING_NO_CONTENT_MEMBERS,
+    )
+    .with_http(::aws_smithy_schema::traits::HttpTrait::new(
+        "DELETE",
+        "/{Bucket}/{Key+}?tagging",
+        Some(204u16),
+    ));
+}
+
+pub static DELETE_OBJECT_TAGGING_NO_CONTENT_SCHEMA: &::aws_smithy_schema::Schema =
+    &DeleteObjectTaggingNoContent::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for DeleteObjectTaggingNoContent {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(version_id) = self.version_id.as_deref() {
+            serializer.write_string(&VERSION_ID_HEADER, version_id)?;
+        }
+        Ok(())
+    }
+}
+
+// The operation's MODELED errors, widened with `extra_errors` by the two 404 shapes this
+// SERVICE models for an address that does not exist.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="DeleteObjectTagging")` reports
+// `errors: []`), yet `Bucket` and `Key` are both @httpLabels, so a request can name a
+// bucket or a key that does not exist — AWS answers `NoSuchBucket` ("The specified bucket
+// does not exist") and `NoSuchKey` ("The specified key does not exist"), each modelled
+// `@httpError(404)`. Widening the set with those two shapes is what lets this handler
+// answer the same two 404s the reader and the writer of this same subresource answer for
+// the same two causes.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#DeleteObjectTagging",
+    extra_errors = ["NoSuchBucket", "NoSuchKey"]
+)]
 #[derive(Debug)]
 pub enum DeleteObjectTaggingErrorModeled {
+    NoSuchBucket(NoSuchBucket),
+    NoSuchKey(NoSuchKey),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -140,12 +211,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for DeleteObjectTagging<Eng>
 {
     type Input = DeleteObjectTaggingInput;
-    type Output = DeleteObjectTaggingOutput;
+    type Output = DeleteObjectTaggingNoContent;
     type Error = DeleteObjectTaggingError;
 
     const NAME: &'static str = "DeleteObjectTagging";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_OBJECT_TAGGING_INPUT_SCHEMA;
-    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_OBJECT_TAGGING_OUTPUT_SCHEMA;
+    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = DELETE_OBJECT_TAGGING_NO_CONTENT_SCHEMA;
     const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
@@ -154,17 +225,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteObjectTagging` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteObjectTaggingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // request metadata only, and this write needs nothing from it.
+        let _ = ctx;
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — `DeleteObjectTaggingRequest$ExpectedBucketOwner`, judged the way the
+        // reader and the writer of this same subresource judge it: this emulator serves one
+        // account, so the owner of every bucket it holds is that account.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ));
+        }
+
+        // "To delete tags of a specific object version, add the versionId query parameter
+        // in the request" — the store does keep versions (`PutObject` mints a version id on
+        // a versioning-enabled bucket), but an object's tag set is only ever written
+        // through the byte budgets of the object at the key, which is the CURRENT one, so
+        // this handler removes the current object's tag set alone. Removing one stored
+        // version's tag set is its own behaviour, as it is for the reader and the writer of
+        // this subresource; the 501 says so rather than clearing the current object's tags
+        // as if they were the named version's.
+        if input.version_id.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteObjectTagging with versionId",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store no tag set can be removed at all, and either modelled
+            // error would be a false statement about the address the request names, so the
+            // scaffold's 501 carries what is true: this emulator cannot serve the request.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteObjectTagging",
+            ));
+        };
+
+        let mut store = state.lock();
+
+        // The ADDRESS is resolved first, so a request naming a bucket or a key this
+        // emulator does not hold answers that — the way every other object-tagging handler
+        // orders the two refusals — rather than reporting a removal from an object no
+        // caller could have tagged.
+        match store
+            .bucket(&input.bucket)
+            .map(|bucket| bucket.object(&input.key).is_some())
+        {
+            None => {
+                return Err(DeleteObjectTaggingErrorModeled::NoSuchBucket(NoSuchBucket {}).into())
+            }
+            Some(false) => {
+                return Err(DeleteObjectTaggingErrorModeled::NoSuchKey(NoSuchKey {}).into())
+            }
+            Some(true) => {}
+        }
+
+        // "Removes the entire tag set from the specified object": the whole set goes, not
+        // part of it, which is the same write the putter makes with an empty container —
+        // hence the one state seam that records an object's tag set, carrying no tags.
+        // Idempotent: an object that carried none is already in the asked-for state, and
+        // the call still succeeds.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteObjectTagging"))
+        // A tag set is retained with the object, so the seam reports the byte budgets it
+        // guards; taking a set AWAY only releases bytes, so neither can be reached from
+        // here. Both are answered rather than asserted, so a future caller of this seam
+        // cannot turn one into a panic.
+        match store.replace_object_tags(&input.bucket, &input.key, Vec::new()) {
+            Some(crate::state::ObjectTagWrite::Applied) => {}
+            // Unreachable through this handler: the address was just resolved under the
+            // same lock.
+            None => {
+                return Err(DeleteObjectTaggingErrorModeled::NoSuchBucket(NoSuchBucket {}).into())
+            }
+            Some(crate::state::ObjectTagWrite::NoSuchKey) => {
+                return Err(DeleteObjectTaggingErrorModeled::NoSuchKey(NoSuchKey {}).into())
+            }
+            Some(crate::state::ObjectTagWrite::ByteBudgetReached { would_hold }) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "untagging {:?} would leave the bucket {:?} holding {would_hold} bytes \
+                     of objects, past the {} bytes this emulator keeps per bucket",
+                    input.key,
+                    input.bucket,
+                    crate::state::MAX_OBJECT_BYTES_PER_BUCKET
+                )));
+            }
+            Some(crate::state::ObjectTagWrite::TotalByteBudgetReached { would_hold }) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "untagging {:?} would leave this emulator holding {would_hold} bytes of \
+                     objects across every bucket, past the {} bytes it keeps in total",
+                    input.key,
+                    crate::state::MAX_OBJECT_BYTES_TOTAL
+                )));
+            }
+        }
+
+        Ok(DeleteObjectTaggingNoContent {
+            // "The versionId of the object the tag-set was removed from" — reported for a
+            // versioned bucket, and a `versionId` request is refused above; the tag set
+            // this handler removes is the current object's, so no version is named rather
+            // than one being invented.
+            version_id: None,
+        })
     }
 }

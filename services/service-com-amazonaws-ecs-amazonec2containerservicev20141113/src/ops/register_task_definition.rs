@@ -552,10 +552,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.container_definitions.len() > crate::state::MAX_CONTAINER_DEFINITIONS {
             return Err(RegisterTaskDefinitionErrorModeled::ClientException(
                 ClientException {
-                    message: Some(format!(
-                        "containerDefinitions must describe at most {} containers; got {}",
+                    message: Some(crate::state::at_most_items_message(
+                        "container definitions",
                         crate::state::MAX_CONTAINER_DEFINITIONS,
-                        input.container_definitions.len()
                     )),
                 },
             )
@@ -655,10 +654,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !names.insert(name.clone()) {
                 return Err(RegisterTaskDefinitionErrorModeled::ClientException(
                     ClientException {
-                        message: Some(format!(
-                            "container names must be unique within a task definition; \
-                             '{name}' is repeated"
-                        )),
+                        message: Some(
+                            crate::state::DUPLICATE_CONTAINER_NAME_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());

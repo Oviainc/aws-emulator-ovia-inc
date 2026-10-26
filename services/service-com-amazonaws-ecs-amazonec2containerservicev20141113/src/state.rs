@@ -62,10 +62,11 @@ use crate::ops::types::{
     ClusterSetting, Container, ContainerDefinition, ContainerInstance, DaemonContainerDefinition,
     DaemonTaskDefinition, DaemonTaskDefinitionSummary, DaemonVolume, Deployment,
     DeploymentCircuitBreaker, DeploymentConfiguration, DeploymentController, EphemeralStorage,
-    Failure, KeyValuePair, LoadBalancer, ManagedInstancesProvider, NetworkConfiguration,
-    PlacementConstraint, PlacementStrategy, PlatformDevice, PortMapping, ProxyConfiguration,
-    Resource, RuntimePlatform, Scale, Service, ServiceConnectConfiguration,
-    ServiceCurrentRevisionSummary, ServiceDeploymentBrief, ServiceEvent, ServiceRegistry,
+    Failure, KeyValuePair, LoadBalancer, ManagedInstancesProvider, NetworkBinding,
+    NetworkConfiguration,
+    PlacementConstraint, PlacementStrategy, PlatformDevice, PortMapping, ProtectedTask,
+    ProxyConfiguration,
+    Resource, RuntimePlatform, Scale, Service, ServiceConnectConfiguration,    ServiceCurrentRevisionSummary, ServiceDeploymentBrief, ServiceEvent, ServiceRegistry,
     ServiceVolumeConfiguration, Setting, Tag, Task, TaskDefinition,
     TaskDefinitionPlacementConstraint, TaskOverride, TaskSet,
     ThresholdConfiguration, VersionInfo, Volume, VpcLatticeConfiguration,
@@ -370,6 +371,60 @@ pub const STATUS_DEACTIVATING: &str = "DEACTIVATING";
 /// See [`STATUS_PENDING`].
 pub const STATUS_STOPPED: &str = "STOPPED";
 
+/// The container lifecycle, in the order a container passes through it — the statuses
+/// this service itself stores on a container ([`ContainerRecord::last_status`], moved by
+/// the task's own clock-owed transitions), earliest first.
+///
+/// `SubmitContainerStateChange` is the AGENT reporting where a container has got to, and
+/// the agent retries: a report may arrive twice, or out of order behind a later one. The
+/// order below is what makes a stale report recognisable — see
+/// [`container_stage_rank`].
+pub const CONTAINER_LIFECYCLE: [&str; 4] = [
+    STATUS_PENDING,
+    STATUS_RUNNING,
+    STATUS_DEACTIVATING,
+    STATUS_STOPPED,
+];
+
+/// How far through [`CONTAINER_LIFECYCLE`] `status` is, or `None` for a status that
+/// lifecycle does not name (a stage a newer agent reports, which this service stores as
+/// reported rather than ranking against stages it does not know).
+pub fn container_stage_rank(status: &str) -> Option<usize> {
+    CONTAINER_LIFECYCLE
+        .iter()
+        .position(|stage| *stage == status)
+}
+
+/// `SubmitContainerStateChangeResponse$acknowledgment` for a state change this service
+/// has recorded: the agent is told the report was taken, which is what the operation's own
+/// doc calls it ("Sent to acknowledge that a container changed states").
+pub const STATE_CHANGE_ACKNOWLEDGMENT: &str = "ACK";
+
+/// `InvalidParameterException$message` for a `containerName` that names no container of
+/// the task the state change names. The sentence the agent plane answers for a reference
+/// that resolves to nothing, one resource along from
+/// [`TASK_NOT_FOUND_MESSAGE`]: the request's own value is not echoed.
+pub const CONTAINER_NOT_FOUND_MESSAGE: &str = "The referenced container was not found";
+
+/// `InvalidParameterException$message` for an `ExecuteCommand` whose `task` names no task
+/// of the cluster: a fixed sentence stating what the caller has to change.
+pub const EXECUTE_COMMAND_TASK_NOT_FOUND_MESSAGE: &str =
+    "The specified task was not found. Specify a valid task ID and try again.";
+
+/// `InvalidParameterException$message` for an `ExecuteCommand` whose `container` names no
+/// container of the task, worded as the task sentence above is.
+pub const EXECUTE_COMMAND_CONTAINER_NOT_FOUND_MESSAGE: &str =
+    "The specified container was not found. Specify a valid container name and try again.";
+
+/// `InvalidParameterException$message` for an `ExecuteCommand` on a task whose execute
+/// command agent is not running — the condition the ECS Exec troubleshooting guidance
+/// words, and the one that holds for every task here: a task of this emulator runs no
+/// container, so no managed agent of it is running to open a session on.
+pub const EXECUTE_COMMAND_AGENT_NOT_RUNNING_MESSAGE: &str =
+    "The execute command failed because execute command was not enabled when the task was \
+     run or the execute command agent isn't running. Wait and try again or run a new task \
+     with execute command enabled and try again.";
+
 /// `Cluster$attachmentsStatus` while the cluster's capacity-provider association is
 /// being applied — the member's doc: "UPDATE_IN_PROGRESS: The available capacity
 /// providers for the cluster are updating."
@@ -466,6 +521,51 @@ pub const CONTAINER_INSTANCE_INACTIVE: &str = "INACTIVE";
 /// EMULATOR-CHOSEN, for the same reason as [`MAX_CLUSTERS`].
 pub const MAX_CONTAINER_INSTANCES: usize = 512;
 
+/// `ContainerInstance$agentUpdateStatus` for an agent update `UpdateContainerAgent` has
+/// accepted but the instance has not finished: the first stage of the `AgentUpdateStatus`
+/// enum (`PENDING`, `STAGING`, `STAGED`, `UPDATING`, `UPDATED`, `FAILED`), and the one the
+/// `UpdateInProgressException` doc names as "a transitional stage, such as PENDING or
+/// STAGING".
+pub const AGENT_UPDATE_PENDING: &str = "PENDING";
+
+/// `ContainerInstance$agentUpdateStatus` once the update the clock owed has landed: the
+/// terminal successful stage of the same enum.
+pub const AGENT_UPDATE_UPDATED: &str = "UPDATED";
+
+/// The `AgentUpdateStatus` stages an update is still under way in, so a second
+/// `UpdateContainerAgent` on the same instance is the `UpdateInProgressException` its doc
+/// describes ("There's already a current Amazon ECS container agent update in progress on
+/// the container instance"). The stages of the enum that are neither terminal success
+/// (`UPDATED`) nor terminal failure (`FAILED`).
+pub const AGENT_UPDATE_IN_FLIGHT: [&str; 4] = ["PENDING", "STAGING", "STAGED", "UPDATING"];
+
+/// The container-agent version this emulator publishes as the update target: the version
+/// an instance's agent is brought to by `UpdateContainerAgent`, and the one an instance
+/// already reporting it has no update available for. EMULATOR-CHOSEN — no model member
+/// carries it — and the single source for both halves of that rule.
+pub const LATEST_CONTAINER_AGENT_VERSION: &str = "1.89.3";
+
+/// `NoUpdateAvailableException$message` for an instance whose agent already runs
+/// [`LATEST_CONTAINER_AGENT_VERSION`], as the error's own doc states the condition
+/// ("There's no update available for this Amazon ECS container agent. This might be
+/// because the agent is already running the latest version").
+pub const NO_AGENT_UPDATE_AVAILABLE_MESSAGE: &str =
+    "There is no update available for this Amazon ECS container agent.";
+
+/// `MissingVersionException$message` for an instance that reported no agent version when
+/// it registered, as the error's own doc states the condition ("Amazon ECS can't determine
+/// the current version of the Amazon ECS container agent on the container instance and
+/// doesn't have enough information to proceed with an update").
+pub const MISSING_AGENT_VERSION_MESSAGE: &str =
+    "Amazon ECS cannot determine the current version of the Amazon ECS container agent on \
+     the container instance and does not have enough information to proceed with an update.";
+
+/// `UpdateInProgressException$message` for an instance whose agent update has not finished
+/// yet, as the error's own doc states the condition.
+pub const AGENT_UPDATE_IN_PROGRESS_MESSAGE: &str =
+    "There is already a current Amazon ECS container agent update in progress on the \
+     specified container instance.";
+
 /// `TaskDefinition$status` for a registered revision.
 pub const TASK_DEFINITION_ACTIVE: &str = "ACTIVE";
 
@@ -542,6 +642,42 @@ pub const SORT_ORDER_DESC: &str = "DESC";
 /// `Failure$reason` for an id that names nothing in this account. The ECS "API failure
 /// reasons" list: `MISSING` — "the described resource could not be found".
 pub const FAILURE_MISSING: &str = "MISSING";
+
+/// `Failure$reason` for a task a task-protection call cannot act on. The
+/// `UpdateTaskProtection` doc: "This operation is only supported for tasks belonging to
+/// an Amazon ECS service. Invoking this operation for a standalone task will result in an
+/// `TASK_NOT_VALID` failure."
+pub const FAILURE_TASK_NOT_VALID: &str = "TASK_NOT_VALID";
+
+/// How long a task stays protected when the request names no period.
+/// `UpdateTaskProtection$expiresInMinutes`: "If you don't specify the time, then the task
+/// is automatically protected for 120 minutes (2 hours)."
+pub const DEFAULT_TASK_PROTECTION_MINUTES: i32 = 120;
+
+/// The shortest protection period the request may name. Same member: "You can specify a
+/// value from 1 minute to up to 2,880 minutes (48 hours)."
+pub const MIN_TASK_PROTECTION_MINUTES: i32 = 1;
+
+/// The longest protection period the request may name — the other end of the same
+/// sentence.
+pub const MAX_TASK_PROTECTION_MINUTES: i32 = 2_880;
+
+/// How many tasks ONE `UpdateTaskProtection` may name.
+/// `UpdateTaskProtection$tasks`: "A list of up to 10 task IDs or full ARN entries."
+pub const MAX_UPDATE_TASK_PROTECTION_TASKS: usize = 10;
+
+/// How many tasks ONE `GetTaskProtection` may name.
+/// `GetTaskProtection$tasks`: "A list of up to 100 task IDs or full ARN entries."
+pub const MAX_GET_TASK_PROTECTION_TASKS: usize = 100;
+
+/// `InvalidParameterException$message` for an `expiresInMinutes` outside the period the
+/// member documents: it names the member and both bounds, and echoes no value.
+pub fn task_protection_period_message() -> String {
+    format!(
+        "expiresInMinutes must be a value from {MIN_TASK_PROTECTION_MINUTES} to \
+         {MAX_TASK_PROTECTION_MINUTES} minutes."
+    )
+}
 
 /// The launch type a task takes when the request names neither a `launchType` nor a
 /// `capacityProviderStrategy` and the cluster has no default strategy: ECS runs the
@@ -1083,9 +1219,20 @@ pub const SERVICE_NOT_FOUND_MESSAGE: &str = "Service not found.";
 /// `InvalidParameterException$message` for a `task` that names no stored task.
 pub const TASK_NOT_FOUND_MESSAGE: &str = "The referenced task was not found";
 
-/// `ClientException$message` for a `taskDefinition` that names no stored revision — the
-/// refusal every operation that resolves a task-definition reference answers with.
+/// `ClientException$message` for a `taskDefinition` that names no stored revision, as the
+/// operations that READ a revision state it — `DescribeTaskDefinition`,
+/// `DeregisterTaskDefinition` and a tagging call naming a revision by ARN.
+///
+/// An operation that resolves a reference in order to PUT the revision to work states the
+/// same condition in its own words ([`TASK_DEFINITION_NOT_FOUND_TO_RUN_MESSAGE`]): the
+/// sentence belongs to the call that was refused, not to the store it looked in.
 pub const TASK_DEFINITION_NOT_FOUND_MESSAGE: &str = "Unable to describe task definition.";
+
+/// `ClientException$message` for a `taskDefinition` that names no stored revision on a
+/// call that would PUT that revision to work — run a task of it, or point a service or a
+/// task set at it. ONE fixed sentence naming neither the family nor the revision the
+/// request carried.
+pub const TASK_DEFINITION_NOT_FOUND_TO_RUN_MESSAGE: &str = "TaskDefinition not found.";
 
 /// `ClientException$message` for a `daemonTaskDefinition` that names no stored daemon
 /// revision. The same condition as [`TASK_DEFINITION_NOT_FOUND_MESSAGE`] one resource
@@ -1116,7 +1263,7 @@ pub const TASK_DEFINITION_INACTIVE_MESSAGE: &str = "TaskDefinition is inactive";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskDefinitionRefusal {
     /// The reference resolves to no stored revision at all: `ClientException`, with
-    /// [`TASK_DEFINITION_NOT_FOUND_MESSAGE`].
+    /// [`TASK_DEFINITION_NOT_FOUND_TO_RUN_MESSAGE`].
     NotFound,
     /// The reference resolves to a stored revision whose status is not
     /// [`TASK_DEFINITION_ACTIVE`]: `InvalidParameterException`, with
@@ -1129,7 +1276,7 @@ impl TaskDefinitionRefusal {
     /// reference.
     pub fn message(self) -> &'static str {
         match self {
-            Self::NotFound => TASK_DEFINITION_NOT_FOUND_MESSAGE,
+            Self::NotFound => TASK_DEFINITION_NOT_FOUND_TO_RUN_MESSAGE,
             Self::Inactive => TASK_DEFINITION_INACTIVE_MESSAGE,
         }
     }
@@ -1142,6 +1289,54 @@ impl TaskDefinitionRefusal {
 /// identifier that is only used to retrieve the next items in a list and not for other
 /// programmatic purposes".
 pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "Invalid nextToken.";
+
+/// `InvalidParameterException$message` for a caller-supplied list that names more entries
+/// than one request may carry: Amazon ECS states the list by the noun the member's own doc
+/// uses for its entries, and the bound, in one sentence — "<entries> can have at most <N>
+/// items." — echoing none of the values the list held.
+///
+/// Spelled once for every bounded list in this crate, so the refusal cannot drift between
+/// the operations that carry one.
+pub fn at_most_items_message(entries: &str, max: usize) -> String {
+    format!("{entries} can have at most {max} items.")
+}
+
+/// The same sentence for a caller-supplied STRING longer than the member documents.
+pub fn at_most_characters_message(member: &str, max: usize) -> String {
+    format!("{member} can have at most {max} characters.")
+}
+
+/// How many network bindings one container may report.
+/// `NetworkBinding$containerPortRange`: "You can specify a maximum of 100 port ranges per
+/// container."
+pub const MAX_NETWORK_BINDINGS: usize = 100;
+
+/// How long a container state change's `reason` may be. `Container$reason`: "A short (255
+/// max characters) human-readable string to provide additional details about a running or
+/// stopped container."
+pub const MAX_CONTAINER_REASON_LENGTH: usize = 255;
+
+/// `InvalidParameterException$message` for a `desiredCount` below the zero its own doc
+/// bounds it at ("The desired number of instantiations of the task definition to keep
+/// running on the service"). A fixed sentence: it names the member and the bound, and
+/// echoes neither the number the request carried nor how this emulator read it.
+pub const DESIRED_COUNT_NEGATIVE_MESSAGE: &str = "DesiredCount can not be lesser than 0";
+
+/// `ClientException$message` for a registration whose `containerDefinitions` repeat a
+/// container name. The name identifies the container within the revision — a
+/// `loadBalancers` entry, a `dependsOn` entry and a `volumesFrom` entry all name one by it
+/// — so one name can stand for only one container. A fixed sentence naming neither the
+/// repeated name nor its position.
+pub const DUPLICATE_CONTAINER_NAME_MESSAGE: &str =
+    "Container names must be unique within a task definition.";
+
+/// `InvalidParameterException$message` for an `UpdateService` that would change the
+/// service's deployment controller while the service has no `PRIMARY` task set: the
+/// controller that is taking the service over has to have one to take over, so the refusal
+/// states the precondition and what the caller has to do about it.
+pub const DEPLOYMENT_CONTROLLER_PRIMARY_TASK_SET_REQUIRED_MESSAGE: &str =
+    "Updating the deployment controller requires a primary taskset in the service. Please \
+     ensure your service has a primary taskset and try again.";
 
 /// `ClientException$message` for a `taskDefinition` that is not a task-definition
 /// reference at all — the condition [`parse_task_definition_reference`] answers `None`
@@ -1504,6 +1699,14 @@ pub struct ContainerInstanceRecord {
     pub status_reason: Option<String>,
     pub agent_connected: bool,
     pub version_info: Option<VersionInfo>,
+    /// `ContainerInstance$agentUpdateStatus`: "The status of the most recent agent update.
+    /// If an update wasn't ever requested, this value is `NULL`" — so it stays `None`
+    /// until an `UpdateContainerAgent` asks for one.
+    pub agent_update_status: Option<String>,
+    /// When the accepted agent update falls due, and `None` once the clock has
+    /// materialised it. The update is owed by the CLOCK from the instant
+    /// `UpdateContainerAgent` accepted it, not by whoever reads the instance next.
+    pub agent_update_due_at: Option<SystemTime>,
     /// `totalResources`, as the agent reported it at registration —
     /// `ContainerInstance$registeredResources` is "the amount of each resource that was
     /// available on the container instance when the container agent registered it".
@@ -1530,8 +1733,8 @@ impl ContainerInstanceRecord {
     /// invented number.
     ///
     /// `healthStatus` stays absent: nothing runs an agent health check here, so there is
-    /// no check result to report, and `agentUpdateStatus` likewise ("If an update wasn't
-    /// ever requested, this value is NULL").
+    /// no check result to report. `agentUpdateStatus` is reported only once an update was
+    /// requested ("If an update wasn't ever requested, this value is NULL").
     pub fn view(&self, fields: ContainerInstanceFields) -> ContainerInstance {
         ContainerInstance {
             container_instance_arn: Some(self.arn.clone()),
@@ -1546,7 +1749,7 @@ impl ContainerInstanceRecord {
             agent_connected: self.agent_connected,
             running_tasks_count: 0,
             pending_tasks_count: 0,
-            agent_update_status: None,
+            agent_update_status: self.agent_update_status.clone(),
             attributes: Some(self.attributes.clone()),
             registered_at: Some(self.registered_at),
             // Attachments are created for a trunk elastic network interface, which this
@@ -1566,6 +1769,25 @@ impl ContainerInstanceRecord {
     /// in both ACTIVE and DRAINING status."
     pub fn is_registered(&self) -> bool {
         self.status == CONTAINER_INSTANCE_ACTIVE || self.status == CONTAINER_INSTANCE_DRAINING
+    }
+
+    /// The agent version this instance reported when it registered, if it reported one at
+    /// all. A blank version names none: `MissingVersionException` is exactly the condition
+    /// "Amazon ECS can't determine the current version of the ... container agent".
+    pub fn reported_agent_version(&self) -> Option<&str> {
+        self.version_info
+            .as_ref()
+            .and_then(|info| info.agent_version.as_deref())
+            .map(str::trim)
+            .filter(|version| !version.is_empty())
+    }
+
+    /// Whether an agent update accepted for this instance has not finished yet
+    /// ([`AGENT_UPDATE_IN_FLIGHT`]).
+    pub fn agent_update_in_flight(&self) -> bool {
+        self.agent_update_status
+            .as_deref()
+            .is_some_and(|status| AGENT_UPDATE_IN_FLIGHT.contains(&status))
     }
 }
 
@@ -1602,7 +1824,8 @@ impl ContainerInstanceFields {
 }
 
 /// One container of a task, derived from the container definition the task's
-/// task-definition revision stored.
+/// task-definition revision stored, and from what the ECS agent has reported about it
+/// since (`SubmitContainerStateChange`).
 #[derive(Debug, Clone)]
 pub struct ContainerRecord {
     pub container_arn: String,
@@ -1613,6 +1836,19 @@ pub struct ContainerRecord {
     pub cpu: Option<String>,
     pub memory: Option<String>,
     pub memory_reservation: Option<String>,
+    /// `Container$runtimeId`: "The ID of the Docker container" — the agent's, reported
+    /// through `SubmitContainerStateChange$runtimeId`, so it is absent until the agent
+    /// reports one.
+    pub runtime_id: Option<String>,
+    /// `Container$exitCode`: "The exit code returned from the container", as the agent
+    /// reported it with the state change.
+    pub exit_code: Option<i32>,
+    /// `Container$reason`: "A short (255 max characters) human-readable string to provide
+    /// additional details about a running or stopped container", as the agent reported it.
+    pub reason: Option<String>,
+    /// `Container$networkBindings`: the host/container port pairs the agent reported for
+    /// this container.
+    pub network_bindings: Vec<NetworkBinding>,
 }
 
 impl ContainerRecord {
@@ -1628,8 +1864,29 @@ impl ContainerRecord {
             cpu: self.cpu.clone(),
             memory: self.memory.clone(),
             memory_reservation: self.memory_reservation.clone(),
+            runtime_id: self.runtime_id.clone(),
+            exit_code: self.exit_code,
+            reason: self.reason.clone(),
+            network_bindings: Some(self.network_bindings.clone()),
             health_status: Some(HEALTH_UNKNOWN.to_string()),
             ..Container::default()
+        }
+    }
+
+    /// Move this container ON to `status`, if that is a LATER stage of
+    /// [`CONTAINER_LIFECYCLE`] than the one it is already reported at.
+    ///
+    /// The agent's report and the task's own clock-owed transitions both move a
+    /// container, and they can arrive in either order: a container the agent has already
+    /// reported STOPPED is not put back to RUNNING by the task reaching RUNNING. A stage
+    /// the lifecycle does not name is taken as reported, since it cannot be ranked.
+    pub fn advance_to(&mut self, status: &str) {
+        let onward = match (container_stage_rank(status), container_stage_rank(&self.last_status)) {
+            (Some(next), Some(current)) => next > current,
+            _ => true,
+        };
+        if onward {
+            self.last_status = status.to_string();
         }
     }
 }
@@ -2081,6 +2338,13 @@ pub struct TaskRecord {
     pub running_due_at: Option<SystemTime>,
     /// When `DEACTIVATING` -> `STOPPED` falls due; `None` once materialised.
     pub stopped_due_at: Option<SystemTime>,
+    /// When the scale-in protection `UpdateTaskProtection` set on this task expires, and
+    /// `None` for a task nobody has protected (or whose protection the clock has already
+    /// cleared). `ProtectedTask$protectionEnabled` is READ from it: "Task-protection, by
+    /// default, expires after 2 hours at which point Amazon ECS clears the
+    /// `protectionEnabled` property", which the clock pass does — the expiry was owed at
+    /// that instant whether or not anybody called.
+    pub protection_expires_at: Option<SystemTime>,
 }
 
 impl TaskRecord {
@@ -2128,6 +2392,26 @@ impl TaskRecord {
     /// `STOPPED` yet.
     pub fn is_active(&self) -> bool {
         self.last_status != STATUS_STOPPED
+    }
+
+    /// The `ProtectedTask` a task-protection operation reports for this task: the
+    /// protection it holds, read off the expiry the clock keeps.
+    pub fn protection_view(&self) -> ProtectedTask {
+        ProtectedTask {
+            task_arn: Some(self.task_arn.clone()),
+            // "If scale-in protection is turned on for a task, the value is true.
+            // Otherwise, it is false."
+            protection_enabled: self.protection_expires_at.is_some(),
+            // "The epoch time when protection for the task will expire" — absent for a
+            // task that is not protected, which has no expiry to report.
+            expiration_date: self.protection_expires_at.map(DateTime::from),
+        }
+    }
+
+    /// Whether this task is one a task-protection call may act on: "This operation is
+    /// only supported for tasks belonging to an Amazon ECS service."
+    pub fn is_protectable(&self) -> bool {
+        self.service_name.is_some()
     }
 }
 
@@ -2672,7 +2956,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     task.pending_due_at = None;
                     task.last_status = STATUS_PENDING.to_string();
                     for container in &mut task.containers {
-                        container.last_status = STATUS_PENDING.to_string();
+                        container.advance_to(STATUS_PENDING);
                     }
                     task.running_due_at = Some(due + TRANSITION_SPAN);
                     task.version += 1;
@@ -2684,7 +2968,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     task.last_status = STATUS_RUNNING.to_string();
                     task.started_at = Some(DateTime::from(due));
                     for container in &mut task.containers {
-                        container.last_status = STATUS_RUNNING.to_string();
+                        container.advance_to(STATUS_RUNNING);
                     }
                     task.version += 1;
                 }
@@ -2699,9 +2983,37 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     task.stopped_at = Some(DateTime::from(due));
                     task.execution_stopped_at = Some(DateTime::from(due));
                     for container in &mut task.containers {
-                        container.last_status = STATUS_STOPPED.to_string();
+                        container.advance_to(STATUS_STOPPED);
                     }
                     task.version += 1;
+                }
+            }
+            // The scale-in protection a task was given lapses on its own: "Task
+            // protection, by default, expires after 2 hours at which point Amazon ECS
+            // clears the protectionEnabled property making the task eligible for
+            // termination by a subsequent scale-in event."
+            if let Some(expires) = task.protection_expires_at {
+                if expires <= now {
+                    task.protection_expires_at = None;
+                    task.version += 1;
+                }
+            }
+        }
+        // The container-agent update `UpdateContainerAgent` accepted: once it is due the
+        // agent has been updated, whether or not anybody called to look, so the instance
+        // reports the version it was brought to and the terminal stage of the update.
+        for instance in self.container_instances.values_mut() {
+            if let Some(due) = instance.agent_update_due_at {
+                if due <= now {
+                    instance.agent_update_due_at = None;
+                    instance.agent_update_status = Some(AGENT_UPDATE_UPDATED.to_string());
+                    let mut version_info = instance.version_info.clone().unwrap_or_default();
+                    version_info.agent_version =
+                        Some(LATEST_CONTAINER_AGENT_VERSION.to_string());
+                    instance.version_info = Some(version_info);
+                    // "Every time a container instance experiences a change ... the
+                    // version counter is incremented."
+                    instance.version += 1;
                 }
             }
         }
@@ -3068,6 +3380,12 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     memory_reservation: container
                         .memory_reservation
                         .map(|memory| memory.to_string()),
+                    // Nothing has run the container yet, so the agent has reported
+                    // neither a runtime id nor an outcome for it.
+                    runtime_id: None,
+                    exit_code: None,
+                    reason: None,
+                    network_bindings: Vec::new(),
                 }
             })
             .collect()
@@ -3589,6 +3907,19 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         self.services
             .values()
             .any(|service| service.cluster_name == cluster_name && service.is_active())
+    }
+
+    /// Whether the service holds a `PRIMARY` task set — the one
+    /// `UpdateServicePrimaryTaskSet` promoted, as `TaskSet$status` records it ("The task
+    /// set is serving production traffic", the `PRIMARY` status).
+    ///
+    /// The precondition `UpdateService` holds a deployment-controller change to: the
+    /// controller taking the service over deploys through a task set, so there has to be a
+    /// primary one for it to take over.
+    pub fn service_has_primary_task_set(&self, cluster_name: &str, service_name: &str) -> bool {
+        self.service_task_sets(cluster_name, service_name)
+            .iter()
+            .any(|task_set| task_set.status == TASK_SET_PRIMARY)
     }
 
     /// Drain a DELETED service: it keeps nothing running and keeps no task set.
@@ -4116,6 +4447,8 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 Some(now + TRANSITION_SPAN)
             },
             stopped_due_at: None,
+            // Nobody has protected a task the scheduler has just placed.
+            protection_expires_at: None,
         };
         self.tasks.insert(task_arn, record);
     }
@@ -4141,7 +4474,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         task.pending_due_at = None;
         task.version += 1;
         for container in &mut task.containers {
-            container.last_status = STATUS_DEACTIVATING.to_string();
+            container.advance_to(STATUS_DEACTIVATING);
         }
     }
 
@@ -5103,20 +5436,83 @@ pub fn setting_view(name: &str, value: &str, principal_arn: &str) -> Setting {
 /// `InvalidParameterException` carries when it is outside them.
 ///
 /// Shared by `PutAccountSetting` and `PutAccountSettingDefault`, so the same value is
-/// accepted or refused whichever of them a client calls.
+/// accepted or refused whichever of them a client calls. The sentence names the MEMBER at
+/// fault and nothing else: neither the value the request carried nor the set of values the
+/// setting accepts, both of which a caller reads out of the API reference.
 pub fn validate_account_setting_value(name: &str, value: &str) -> Result<(), String> {
     let Some(spec) = account_setting_spec(name) else {
         // Unreachable from the wire: `name` targets the closed `SettingName` enum, which
         // the request walk has already checked.
-        return Err(format!("name must be an Amazon ECS account setting; got {name:?}"));
+        return Err(invalid_setting_message("name"));
     };
     if !spec.accepted_values.contains(&value) {
-        return Err(format!(
-            "value for {name} must be one of {}; got {value:?}",
-            spec.accepted_values.join(", ")
-        ));
+        return Err(invalid_setting_message("value"));
     }
     Ok(())
+}
+
+/// `InvalidParameterException$message` for an account-setting member whose value is not
+/// one the named setting takes: `Invalid setting '<member>'`.
+pub fn invalid_setting_message(member: &str) -> String {
+    format!("Invalid setting '{member}'")
+}
+
+/// The words Amazon ECS names a member by in a refusal it builds from the request: the
+/// member's own name split at its camelCase boundaries, lower-cased
+/// (`assignPublicIp` -> `assign public ip`). A dotted validation path is named by its LAST
+/// segment, which is the member whose value was refused.
+pub fn member_words(member_path: &str) -> String {
+    let member = member_path
+        .rsplit('.')
+        .next()
+        .unwrap_or(member_path);
+    let mut words = String::with_capacity(member.len() + 4);
+    for letter in member.chars() {
+        if letter.is_uppercase() && !words.is_empty() {
+            words.push(' ');
+        }
+        words.extend(letter.to_lowercase());
+    }
+    words
+}
+
+/// `InvalidParameterException$message` for a member whose value is not one its modelled
+/// enum names: the member in the words above, and the values it does accept in ascending
+/// order between brackets.
+///
+/// The ONE place this service words that refusal, so every enum member states it alike —
+/// `assignPublicIp` is where the corpus records it.
+pub fn enum_value_message(member_path: &str, accepted: &[String]) -> String {
+    let mut ascending: Vec<&str> = accepted.iter().map(String::as_str).collect();
+    ascending.sort_unstable();
+    format!(
+        "{} should be one of [{}]",
+        member_words(member_path),
+        ascending.join(",")
+    )
+}
+
+/// `InvalidParameterException$message` for a `containerInstance` whose id is not one
+/// Amazon ECS mints: the ids it names are the hexadecimal and UUID forms
+/// [`CONTAINER_INSTANCE_ID_PATTERN`] describes, and the refusal states that pattern
+/// rather than the value it was given.
+pub const CONTAINER_INSTANCE_ID_PATTERN: &str = "^[a-f0-9-]{1,36}$";
+
+/// The sentence a `containerInstance` whose id does not match
+/// [`CONTAINER_INSTANCE_ID_PATTERN`] is refused with.
+pub fn container_instance_id_pattern_message() -> String {
+    format!("ContainerInstanceId must match {CONTAINER_INSTANCE_ID_PATTERN}")
+}
+
+/// Whether `instance_id` is a container-instance id of the form
+/// [`CONTAINER_INSTANCE_ID_PATTERN`]: 1 to 36 characters, each a lowercase hexadecimal
+/// digit or a hyphen — the alphabet of both forms this service mints an id in.
+pub fn is_container_instance_id(instance_id: &str) -> bool {
+    !instance_id.is_empty()
+        && instance_id.chars().count() <= 36
+        && instance_id
+            .chars()
+            .all(|letter| matches!(letter, '0'..='9' | 'a'..='f' | '-'))
 }
 
 /// Whether `principal_arn` is a principal an account setting may be written for, and a

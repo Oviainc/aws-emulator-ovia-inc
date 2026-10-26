@@ -96,7 +96,7 @@ async fn stored_tags(
 
 /// A managed policy ARN in the ACCOUNT's namespace — `arn:aws:iam::<account>:policy<path><name>`,
 /// IAM being global, so the region segment is empty.
-fn account_policy_arn(path: &str, policy_name: &str) -> String {
+pub(crate) fn account_policy_arn(path: &str, policy_name: &str) -> String {
     format!("arn:aws:iam::{}:policy{path}{policy_name}", account_id())
 }
 

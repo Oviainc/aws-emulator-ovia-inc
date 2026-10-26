@@ -247,6 +247,25 @@ impl ClusterState {
     pub fn is_cancellable(self) -> bool {
         matches!(self, Self::AwaitingQuorum)
     }
+
+    /// Whether a cluster in this state is still taking the node jobs it ships with, so
+    /// `CreateJob` naming it can add one.
+    ///
+    /// A cluster is ordered before its nodes exist and then waits for them: "Each cluster
+    /// supports five nodes … The cluster does not ship until these five node jobs have
+    /// been created" (`CreateCluster`), and the nodes it is still missing are the "more
+    /// nodes to create for this cluster" a caller is told to create
+    /// (`ClusterLimitExceededException`). The two states the quorum governs — `AwaitingQuorum`
+    /// while the cluster is short of it and `Pending` once it is whole — are the states in
+    /// which node creation is still what the cluster is waiting on; in the second of them
+    /// the five-node ceiling itself is what refuses a further node. A cluster that has left
+    /// both has either shipped (`InUse`, `Complete`) or been terminated — `Cancelled`, which
+    /// is where `CancelCluster` leaves a cluster that had not shipped ("You can only cancel
+    /// a cluster job while it's in the `AwaitingQuorum` status") — so its node set never
+    /// grows again.
+    pub fn accepts_node_jobs(self) -> bool {
+        matches!(self, Self::AwaitingQuorum | Self::Pending)
+    }
 }
 
 /// How long the update file a `GetSoftwareUpdates` call answers with stays available.
@@ -1823,6 +1842,11 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     /// Registering a node is what can give the cluster its quorum, so the cluster's
     /// quorum-driven state is brought back in line HERE rather than in a handler (see
     /// [`Self::refresh_cluster_quorum_state`]).
+    ///
+    /// Whether the cluster is still taking nodes at all is [`ClusterState::accepts_node_jobs`],
+    /// which a caller holds the cluster to first: the refusal for a cluster past that window
+    /// is a modelled error of the operation asking, so it is raised there rather than
+    /// folded into the `false` this answers when the store cannot hold the nodes.
     pub fn add_cluster_node_jobs(&mut self, cluster_id: &str, nodes: Vec<StoredJob>) -> bool {
         if !self.clusters.contains_key(cluster_id) || !self.can_store_jobs(nodes.len()) {
             return false;

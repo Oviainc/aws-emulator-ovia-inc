@@ -84,6 +84,22 @@ fn pattern_clause(violation: &Violation) -> Option<String> {
     ))
 }
 
+/// The whole `ValidationException` message for the violations a HANDLER's own
+/// constraint walk found, worded exactly as [`refusal_message`] words the
+/// boundary's.
+///
+/// A handler needs this where it applies a constraint the model declares on a
+/// SIBLING member (an email-address expression, say, which this model declares
+/// on one of its two address members): the refusal it words then reads like the
+/// boundary's refusal of that member, because it IS the same sentence about the
+/// same expression, down to how the subject is echoed. `None` means there is
+/// nothing to refuse — no violation — or that the violation is of a class this
+/// service has no wording for, which is the same answer [`override_refusal`]
+/// gives for it.
+pub(crate) fn constraint_refusal_message(violations: &[Violation]) -> Option<String> {
+    refusal_message(violations)
+}
+
 /// One `@length` MAXIMUM violation as Account states it: the subject, its own
 /// length and the maximum the constraint admits — `string "<value>" is too long
 /// (length: <len>, maximum allowed: <max>)` — in the same JSON-Schema voice as

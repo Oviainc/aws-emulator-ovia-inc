@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetStageSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetStageSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetStageSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation reports
+//!
+//! ONE stage session: the record the store holds for the `(stageArn, sessionId)` pair
+//! the request names ([`crate::state::StageSessionRecord`]), which is the same record
+//! `ListStageSessions` reports a summary of — so the two cannot disagree about a
+//! session. A stage session is not created or deleted by an API call: the model's
+//! `StageSession` doc fixes it as beginning "when the first participant joins a stage"
+//! and ending "after the last participant leaves the stage", so
+//! `crate::state::join_stage_session` / `crate::state::leave_stage_session`, the stage
+//! DATA plane's entry points, are what open and close one, and this operation answers
+//! from those records alone.
+//!
+//! Unlike `ListStageSessions`, this operation models `ResourceNotFoundException` (HTTP
+//! 404), so a pair the store resolves no session for is refused rather than answered
+//! with an empty session: a stage this store does not hold, or a session that stage
+//! never had.
 //!
 //! ## Shape of an operation
 //!
@@ -86,10 +94,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivsrealtime-amazoninter
 // here — hence the `GetStageSessionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivsrealtime#GetStageSession")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivsrealtime#GetStageSession",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetStageSessionErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    // Widened in through `extra_errors`: the SERVICE models `InternalServerException`
+    // (HTTP 500) though `GetStageSession` does not list it, and it is the only honest
+    // answer if the shared engine cannot hand back this service's store.
+    InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
 }
@@ -140,23 +155,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::GET_STAGE_SESSION_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report the named session of the named stage.
+    ///
+    /// A pure read over the stored session (`@readonly` in the model, and "Gets
+    /// information for the specified stage session"): nothing is written, so reading a
+    /// session leaves it exactly as a later caller finds it.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetStageSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetStageSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetStageSession"))
+        // Nothing here reads request metadata: the session this reports is named
+        // entirely by the `stageArn` and `sessionId` members, whose modelled lengths
+        // and patterns the framework's constraint walk refuses with a 400
+        // `ValidationException` before `handle` runs.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::store_unavailable(GetStageSessionErrorModeled::InternalServerException)
+        })?;
+        let store = state.lock();
+
+        // Each identifier is resolved in turn, and the one that resolves to nothing is
+        // the one the 404 names: a session id names a session of ONE stage, so a
+        // request naming a stage this store does not hold is never answered from
+        // another stage's records.
+        if !store.stages.contains_key(&input.stage_arn) {
+            return Err(crate::state::resource_not_found(
+                GetStageSessionErrorModeled::ResourceNotFoundException,
+                &input.stage_arn,
+            ));
+        }
+        let session = store
+            .stage_session(&input.stage_arn, &input.session_id)
+            .ok_or_else(|| {
+                crate::state::resource_not_found(
+                    GetStageSessionErrorModeled::ResourceNotFoundException,
+                    &input.session_id,
+                )
+            })?;
+
+        Ok(GetStageSessionOutput {
+            stage_session: Some(session.to_stage_session()),
+        })
     }
 }
+

@@ -234,7 +234,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        let Some(connector) = state.connectors.get(&input.connector_arn) else {
+        // A regional endpoint acts only on its own region's connectors, so a
+        // connectorArn minted in another region updates nothing and is answered
+        // exactly as an ARN this service never minted.
+        let Some(connector) = state.connector_in(&region, &input.connector_arn) else {
             return Err(UpdateConnectorErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::invalid_parameter_because(
                     "connectorArn",
@@ -325,7 +328,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that reads it meanwhile still sees the transient state and the
         // settings it is still running with.
         let connector_state = {
-            let Some(connector) = state.connectors.get_mut(&connector_arn) else {
+            let Some(connector) = state.connector_in_mut(&region, &connector_arn) else {
                 return Err(UpdateConnectorErrorModeled::InternalServerErrorException(
                     InternalServerErrorException {
                         message: Some("the connector could not be updated".to_string()),

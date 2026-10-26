@@ -34,9 +34,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AgentDetails, AggregateStatus, ComponentStatusData, ConfigTypeData, ContactVersion,
-    AzElSegmentsData, DiscoveryData, Eirp, EndpointDetails, EphemerisData, EphemerisMetaData,
-    Frequency, FrequencyBandwidth, InvalidParameterException, KmsKey, S3Object, SpectrumConfig,
+    AgentDetails, AggregateStatus, AntennaDemodDecodeDetails, ComponentStatusData, ConfigDetails,
+    ConfigTypeData, ContactVersion, AzElSegmentsData, DataflowDetail, Destination, DiscoveryData,
+    Eirp, EndpointDetails, EphemerisData, EphemerisMetaData, Frequency, FrequencyBandwidth,
+    InvalidParameterException, KmsKey, S3Object, S3RecordingDetails, Source, SpectrumConfig,
     TrackingOverrides,
 };
 
@@ -2931,6 +2932,120 @@ impl Default for ComAmazonawsGroundstationGroundstationState {
     }
 }
 
+/// What one end of a dataflow edge reports, before it is placed in the `Source` or the
+/// `Destination` the edge wired it to — the two shapes carry the same three facts about
+/// the config, under a region member each names differently.
+struct DataflowEnd {
+    config_type: String,
+    config_id: String,
+    config_details: Option<ConfigDetails>,
+    region: String,
+}
+
+/// One dataflow edge of a mission profile as a `DataflowDetail`: its first `ConfigArn` is
+/// the dataflow's SOURCE and its second the DESTINATION (a `DataflowEdge` is a list of
+/// exactly two — `smithy_query(query="shape", shape="DataflowEdge")`).
+///
+/// `errorMessage` carries nothing: no dataflow has run in this emulator, so none has
+/// failed.
+fn dataflow_detail(
+    state: &ComAmazonawsGroundstationGroundstationState,
+    edge: &[String],
+    contact_region: &str,
+) -> DataflowDetail {
+    let source = edge
+        .first()
+        .and_then(|arn| dataflow_end(state, arn, contact_region))
+        .map(|end| Source {
+            config_type: Some(end.config_type),
+            config_id: Some(end.config_id),
+            config_details: end.config_details,
+            dataflow_source_region: Some(end.region),
+        });
+    let destination = edge
+        .get(1)
+        .and_then(|arn| dataflow_end(state, arn, contact_region))
+        .map(|end| Destination {
+            config_type: Some(end.config_type),
+            config_id: Some(end.config_id),
+            config_details: end.config_details,
+            dataflow_destination_region: Some(end.region),
+        });
+    DataflowDetail {
+        source,
+        destination,
+        error_message: None,
+    }
+}
+
+/// The end of a dataflow the `ConfigArn` `arn` names, or `None` when `arn` addresses no
+/// config at all.
+///
+/// The type and the id are the ARN's own ([`config_arn_parts`]), so an edge is reported by
+/// the config it names rather than echoed back whole. The details are the config's, for the
+/// three capability types `ConfigDetails` has a member for — "additional details for a
+/// `Config`, if type is `dataflow-endpoint` or `antenna-downlink-demod-decode`", plus
+/// `s3RecordingDetails` (`smithy_query(query="shape", shape="ConfigDetails")`) — and absent
+/// for every other type, which that union can say nothing about:
+///
+/// * `dataflow-endpoint`: the endpoint of this account the config names, as the dataflow
+///   endpoint group that holds it stored it; absent when no group holds one by that name,
+///   since there is then no endpoint to describe.
+/// * `antenna-downlink-demod-decode`: the output node the EDGE is wired to, which is the
+///   node segment of the ARN it named ([`config_arn_node`]); absent when the edge named the
+///   config as a whole.
+/// * `s3-recording`: the bucket the config records to, and the key template it records
+///   under — the config's own `prefix`, which is the template the keys of that recording
+///   are built from.
+///
+/// The region is where that end of the dataflow sits: a `dataflow-endpoint` config may
+/// place its endpoint in a region of its own (`dataflowEndpointRegion`), and every other
+/// end is at the region the contact itself was reserved in.
+fn dataflow_end(
+    state: &ComAmazonawsGroundstationGroundstationState,
+    arn: &str,
+    contact_region: &str,
+) -> Option<DataflowEnd> {
+    let (config_type, config_id) = config_arn_parts(arn)?;
+    let config_data = state.config_by_arn(arn).map(|config| &config.config_data);
+
+    let config_details = match config_data {
+        Some(ConfigTypeData::dataflowEndpointConfig(endpoint_config)) => state
+            .dataflow_endpoint(&endpoint_config.dataflow_endpoint_name)
+            .cloned()
+            .map(ConfigDetails::endpointDetails),
+        Some(ConfigTypeData::antennaDownlinkDemodDecodeConfig(_)) => {
+            config_arn_node(arn).map(|output_node| {
+                ConfigDetails::antennaDemodDecodeDetails(AntennaDemodDecodeDetails {
+                    output_node: Some(output_node),
+                })
+            })
+        }
+        Some(ConfigTypeData::s3RecordingConfig(recording)) => {
+            Some(ConfigDetails::s3RecordingDetails(S3RecordingDetails {
+                bucket_arn: Some(recording.bucket_arn.clone()),
+                key_template: recording.prefix.clone(),
+            }))
+        }
+        _ => None,
+    };
+
+    let region = match config_data {
+        Some(ConfigTypeData::dataflowEndpointConfig(endpoint_config)) => endpoint_config
+            .dataflow_endpoint_region
+            .clone()
+            .unwrap_or_else(|| contact_region.to_string()),
+        _ => contact_region.to_string(),
+    };
+
+    Some(DataflowEnd {
+        config_type,
+        config_id,
+        config_details,
+        region,
+    })
+}
+
 impl ComAmazonawsGroundstationGroundstationState {
     /// Refuse a `ConfigTypeData` this account's authorisation or the model's own
     /// documented ranges do not allow, with the modelled `InvalidParameterException`
@@ -3185,6 +3300,33 @@ impl ComAmazonawsGroundstationGroundstationState {
             .filter_map(|id| self.dataflow_endpoint_groups.get(id))
             .flat_map(|group| group.endpoint_details.iter())
             .find(|details| endpoint_name(details) == Some(name))
+    }
+
+    /// The dataflows of a contact's pass, as a `DataflowList`: one entry per dataflow edge
+    /// of the mission profile `mission_profile_arn` names, each end reported by the config
+    /// that edge wired it to and placed in `contact_region` unless the config names a region
+    /// of its own ([`dataflow_detail`]).
+    ///
+    /// Read from the profile rather than copied into the contact, so there is one record of
+    /// each edge; a contact whose profile has since been DELETED (a terminal contact no
+    /// longer holds its profile) reports NO dataflow list at all rather than an empty one,
+    /// since what it was wired to is then no longer known.
+    ///
+    /// Shared by every read that reports a contact's dataflows, so two readers of one
+    /// stored wiring cannot describe it differently.
+    pub fn contact_dataflow_list(
+        &self,
+        mission_profile_arn: &str,
+        contact_region: &str,
+    ) -> Option<Vec<DataflowDetail>> {
+        let profile = self.mission_profile_by_arn(mission_profile_arn)?;
+        Some(
+            profile
+                .dataflow_edges
+                .iter()
+                .map(|edge| dataflow_detail(self, edge, contact_region))
+                .collect(),
+        )
     }
 
     /// The tags of the resource `arn` names, when this service holds one.

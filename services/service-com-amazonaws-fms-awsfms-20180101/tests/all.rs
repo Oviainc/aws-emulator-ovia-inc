@@ -21,6 +21,11 @@
 #[path = "all/third_party_firewall_firewall_policies.rs"]
 mod third_party_firewall_firewall_policies;
 
+// Declared beside it, and for the same reason: the sorted list below is the
+// contended region every late-sorting fms suite lands in.
+#[path = "all/third_party_firewall_association.rs"]
+mod third_party_firewall_association;
+
 #[path = "all/admin_account_disassociation.rs"]
 mod admin_account_disassociation;
 #[path = "all/admin_account_scopes.rs"]

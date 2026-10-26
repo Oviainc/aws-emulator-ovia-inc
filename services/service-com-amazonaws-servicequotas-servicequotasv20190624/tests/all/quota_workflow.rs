@@ -35,9 +35,11 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 /// The history listing, whose name is too long to repeat in every row.
 const HISTORY: &str = "ListRequestedServiceQuotaChangeHistoryByQuota";
 
-/// Comfortably past `crate::state::REQUEST_DECISION_DELAY` (500 ms), so a request
-/// made before this wait is due for its decision afterwards.
-const PAST_DECISION: Duration = Duration::from_millis(1_200);
+/// Comfortably past BOTH steps the clock owes a quota increase request
+/// (`crate::state::SUPPORT_CASE_OPEN_DELAY`, then
+/// `crate::state::REQUEST_DECISION_DELAY` once its support case is open), so a request
+/// made before this wait has settled afterwards.
+const PAST_DECISION: Duration = Duration::from_millis(1_800);
 
 /// A caller pointed at one regional endpoint of one emulator.
 ///
