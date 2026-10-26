@@ -290,7 +290,7 @@ fn encode_next_token(permission: &crate::state::PermissionRecord) -> String {
 fn decode_next_token(token: &str) -> Result<Cursor, ListPermissionsError> {
     let invalid = || {
         ListPermissionsErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
-            message: Some("NextToken is not a token this service issued".to_string()),
+            message: Some(crate::state::invalid_next_token_message("ListPermissions")),
         })
     };
     let bytes = ::hex::decode(token).map_err(|_| invalid())?;

@@ -248,11 +248,13 @@ fn arn_of(authority: &CertificateAuthority) -> &str {
     authority.arn.as_deref().unwrap_or_default()
 }
 
-/// "The token specified in the NextToken argument is not valid." — the refusal for a
-/// cursor this listing did not issue.
+/// The refusal for a cursor this listing did not issue, worded the way the service words
+/// it and naming the operation whose tokens resume this listing.
 fn invalid_next_token() -> ListCertificateAuthoritiesError {
     ListCertificateAuthoritiesErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
-        message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+        message: Some(crate::state::invalid_next_token_message(
+            "ListCertificateAuthorities",
+        )),
     })
     .into()
 }

@@ -23,6 +23,8 @@ mod permissions;
 mod policy_documents;
 #[path = "all/private_ca_lifecycle.rs"]
 mod private_ca_lifecycle;
+#[path = "all/refusal_message_text.rs"]
+mod refusal_message_text;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
 #[path = "all/resource_policy_read.rs"]

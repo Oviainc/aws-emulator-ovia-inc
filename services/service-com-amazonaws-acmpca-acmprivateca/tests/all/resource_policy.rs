@@ -43,7 +43,7 @@ fn absent_ca_message(operation: &str) -> &'static str {
 }
 
 /// The `message` an error body carries, under either casing a protocol may use for it.
-fn error_message(body: &Value, case: &str) -> String {
+pub(crate) fn error_message(body: &Value, case: &str) -> String {
     body.get("message")
         .or_else(|| body.get("Message"))
         .and_then(Value::as_str)

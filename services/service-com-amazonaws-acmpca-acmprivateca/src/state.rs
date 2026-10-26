@@ -84,12 +84,15 @@ pub const DELETE_INVALID_STATE_MESSAGE: &str =
      first disable it.";
 
 /// What Amazon Web Services Private CA answers when a deleted CA is asked to change:
-/// one sentence about the CA's state, naming no request of its own. A CA in `DELETED` is
-/// waiting to be restored or permanently deleted, so what it holds is not writable until
-/// `RestoreCertificateAuthority` puts it back into the status it was deleted from.
+/// the service's own sentence for this refusal, naming the state the CA is in and the
+/// restore that clears it, and carrying no value out of the request or the store. A CA in
+/// `DELETED` is waiting to be restored or permanently deleted, so what it holds is not
+/// writable until `RestoreCertificateAuthority` puts it back into the status it was
+/// deleted from — which is a different refusal from the one a CA outside ACTIVE/DISABLED
+/// gets from `UpdateCertificateAuthority`, so the two keep their own wording.
 pub const DELETED_INVALID_STATE_MESSAGE: &str =
-    "The certificate authority is in the DELETED state, which does not allow this action. \
-     Restore it first.";
+    "The certificate authority is in the DELETED state and must be restored to complete \
+     this action.";
 
 /// The restoration window a deletion opens when the request names none: "By default, if
 /// you do not set the PermanentDeletionTimeInDays parameter, the CA remains restorable
@@ -293,11 +296,16 @@ pub fn page_size(max_results: Option<i32>) -> usize {
 pub const LISTING_CERTIFICATE_AUTHORITIES: &str = "certificate-authorities";
 
 /// What Amazon Web Services Private CA answers for a `NextToken` it did not issue for
-/// the listing being paged — the modelled exception's own sentence, naming no value out
-/// of the request: a token is opaque, so a caller cannot act on its text.
-pub const INVALID_NEXT_TOKEN_MESSAGE: &str =
-    "The token specified in the NextToken argument is not valid. Use the token returned \
-     from your previous call to ListCertificateAuthorities.";
+/// the listing being paged: its own two-sentence refusal, whose only variable part is
+/// `listing_operation` — the operation that mints the tokens of the listing the caller
+/// asked to resume. The rejected token is never echoed, because a token is opaque and a
+/// caller cannot act on its text.
+pub fn invalid_next_token_message(listing_operation: &str) -> String {
+    format!(
+        "The NextToken you provided is invalid. Use a token returned by \
+         {listing_operation}."
+    )
+}
 
 /// The separator between a cursor's listing and the key it resumes at: an ASCII unit
 /// separator, which no ARN and no listing name contains.

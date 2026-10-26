@@ -289,11 +289,7 @@ fn encode_next_token(arn: &str, key: &str) -> String {
 fn decode_next_token(token: &str, arn: &str) -> Result<String, ListTagsError> {
     let invalid = || {
         ListTagsErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
-            message: Some(
-                "NextToken is not a continuation token of this certificate authority's tag \
-                 listing"
-                    .to_string(),
-            ),
+            message: Some(crate::state::invalid_next_token_message("ListTags")),
         })
     };
     let bytes = ::hex::decode(token).map_err(|_| invalid())?;

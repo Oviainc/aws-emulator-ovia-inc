@@ -89,7 +89,7 @@ fn stored(
 /// them through the store the handlers read. The CA's due instant is pushed ahead at the
 /// same time, so a `CREATING` row is not settled out from under the test by the
 /// transition the clock would otherwise owe.
-fn force_status(emulator: &Emulator, arn: &str, status: &str, case: &str) {
+pub(crate) fn force_status(emulator: &Emulator, arn: &str, status: &str, case: &str) {
     let now = SystemTime::now();
     let state = emulator.state();
     let mut state = state.lock();
