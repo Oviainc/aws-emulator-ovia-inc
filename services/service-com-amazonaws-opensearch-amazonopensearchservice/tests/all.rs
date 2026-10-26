@@ -35,6 +35,8 @@ mod domain_health;
 mod domain_lifecycle;
 #[path = "all/domain_nodes.rs"]
 mod domain_nodes;
+#[path = "all/domain_package_listing_cursor.rs"]
+mod domain_package_listing_cursor;
 #[path = "all/engine_version_resolution.rs"]
 mod engine_version_resolution;
 #[path = "all/inbound_connections.rs"]

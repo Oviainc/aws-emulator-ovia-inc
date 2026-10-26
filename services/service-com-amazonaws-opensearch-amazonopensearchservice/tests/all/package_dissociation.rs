@@ -59,7 +59,7 @@ async fn associate(emulator: &Emulator, domain: &str, package_ids: &[String]) ->
 }
 
 /// `DissociatePackages`: `POST /2021-01-01/packages/dissociateMultiple`.
-async fn dissociate_many(emulator: &Emulator, body: Value) -> Answer {
+pub(crate) async fn dissociate_many(emulator: &Emulator, body: Value) -> Answer {
     emulator
         .call(
             "POST",

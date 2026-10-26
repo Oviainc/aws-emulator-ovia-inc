@@ -38,7 +38,7 @@ use super::package_associations::{available_packages, member, UNKNOWN_PACKAGE_ID
 /// The largest page size every listing under test publishes: `MaxResults` is
 /// `@range(max: 100)` with `@default(0)` and no minimum
 /// (`smithy_query(query="shape",shape="MaxResults")`).
-const PUBLISHED_MAX_RESULTS: i32 = 100;
+pub(crate) const PUBLISHED_MAX_RESULTS: i32 = 100;
 
 /// The domains the fixture creates. Each name satisfies `DomainName`'s
 /// `@length(min: 3, max: 28)` with `@pattern("^[a-z][a-z0-9\-]+$")`, and there are more
@@ -65,7 +65,11 @@ async fn associate_one(emulator: &Emulator, domain: &str, package_id: &str) -> A
 /// `AssociatePackages`: `POST /2021-01-01/packages/associateMultiple`, which links a
 /// whole batch in ONE call — a domain refuses a second associate while one is in
 /// flight, so a domain taking several packages takes them together.
-async fn associate_many(emulator: &Emulator, domain: &str, package_ids: &[String]) -> Answer {
+pub(crate) async fn associate_many(
+    emulator: &Emulator,
+    domain: &str,
+    package_ids: &[String],
+) -> Answer {
     emulator
         .call(
             "POST",
@@ -98,7 +102,7 @@ async fn list_for_package(emulator: &Emulator, package_id: &str, query: &str) ->
 
 /// `ListPackagesForDomain`: `GET /2021-01-01/domain/{DomainName}/packages`, carrying
 /// `query` verbatim.
-async fn list_for_domain(emulator: &Emulator, domain: &str, query: &str) -> Answer {
+pub(crate) async fn list_for_domain(emulator: &Emulator, domain: &str, query: &str) -> Answer {
     emulator
         .call(
             "GET",
@@ -126,7 +130,7 @@ fn suffix(query: &str) -> String {
 
 /// The query string for a paged listing: `page_size` of `0` sends no page size at all,
 /// which is the request that asks for no particular one.
-fn page_query(page_size: i32, token: Option<&str>) -> String {
+pub(crate) fn page_query(page_size: i32, token: Option<&str>) -> String {
     let mut parts: Vec<String> = Vec::new();
     if page_size != 0 {
         parts.push(format!("maxResults={page_size}"));
@@ -139,7 +143,7 @@ fn page_query(page_size: i32, token: Option<&str>) -> String {
 
 /// The `DomainPackageDetailsList` of an answered listing, with the case named on
 /// failure.
-fn details(answer: &Answer, case: &str) -> Vec<Value> {
+pub(crate) fn details(answer: &Answer, case: &str) -> Vec<Value> {
     assert_eq!(
         answer.status, 200,
         "case {case}: expected 200, got {} with {:?}",
