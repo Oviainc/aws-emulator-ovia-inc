@@ -172,9 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !guard.control_panels.contains_key(&input.control_panel_arn) {
             return Err(ListRoutingControlsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "no control panel is stored under {}",
-                        input.control_panel_arn
+                    message: crate::state::not_found_message(
+                        crate::state::CONTROL_PANEL_NOUN,
+                        &input.control_panel_arn,
                     ),
                 },
             )
