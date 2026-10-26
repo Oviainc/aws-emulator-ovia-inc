@@ -314,6 +314,8 @@ mod regions;
 mod resource_specific_error_codes;
 #[path = "all/revoke_security_group_ingress.rs"]
 mod revoke_security_group_ingress;
+#[path = "all/route_server_endpoints.rs"]
+mod route_server_endpoints;
 #[path = "all/route_server_peers.rs"]
 mod route_server_peers;
 #[path = "all/route_servers.rs"]
