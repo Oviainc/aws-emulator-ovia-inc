@@ -364,6 +364,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             devices: ::std::collections::BTreeMap::new(),
             // Nothing has asked for a verification code yet.
             outstanding_codes: ::std::collections::BTreeMap::new(),
+            // A created user has registered no passkey: one exists only once a
+            // registration this user started has completed.
+            web_authn_credentials: Vec::new(),
         };
         pool.users.insert(key.clone(), user);
 
