@@ -22,12 +22,16 @@
 //! The second is this account's own registry WRITERS — `RegisterType` and `ActivateType`
 //! (which add an extension version), `SetTypeConfiguration` (`ConfigurationSchema`),
 //! `SetTypeDefaultVersion` (`DefaultVersionId`), `DeprecateType`/`DeregisterType`
-//! (`DeprecatedStatus`) and `TestType` (`TypeTestsStatus`). `TestType` is implemented; the
-//! others are still scaffold stubs with their own issues, so nothing in `src/` ADDS a
-//! record or a version to this registry yet: that is why it carries no growth bound of its
-//! own (the writer that adds a version is where RegisterType's documented "maximum of 50
-//! resource extension versions registered at a time" belongs). The record shape below is
-//! what those writers fill in and what every registry READ is served from.
+//! (`DeprecatedStatus`), `TestType` (`TypeTestsStatus`) and `PublishType` (which publishes
+//! one version of a private record as the PUBLIC extension record [`published_record`] is).
+//! `TestType` and `PublishType` are implemented; the others are still scaffold stubs with
+//! their own issues, so the only record `src/` adds to this registry is a publication's
+//! public one. A publication adds at most one RECORD per private record it publishes, and
+//! the versions it then adds to that record are bounded at [`MAX_PUBLISHED_VERSIONS`],
+//! oldest reclaimed first — the registry's one caller-counted growth site (the writer that
+//! adds a REGISTRATION is where RegisterType's documented "maximum of 50 resource extension
+//! versions registered at a time" belongs). The record shape below is what those writers
+//! fill in and what every registry READ is served from.
 //!
 //! ## The one status transition the clock owes here
 //!
@@ -144,6 +148,48 @@ pub fn public_type_arn(region: &str, type_kind: &str, type_name: &str) -> String
         arn_kind_segment(type_kind),
         arn_type_name(type_name)
     )
+}
+
+/// How many versions of ONE public extension this registry holds, oldest reclaimed first.
+///
+/// Chosen (CloudFormation documents no ceiling on how many versions of a public extension a
+/// publisher may publish): a publisher chooses how many publications it makes, and each one
+/// adds a version to the record, so the one growth site a caller counts up has a bound.
+pub const MAX_PUBLISHED_VERSIONS: usize = 50;
+
+/// The `TypeVersionId` the next version published onto a public extension record carries:
+/// one past the highest id the record already holds, in the zero-padded form the registry's
+/// version ids take (`@pattern("^[A-Za-z0-9-]+$")`).
+///
+/// Counted from the ids rather than from the number of versions, so the id of a version the
+/// [`MAX_PUBLISHED_VERSIONS`] bound reclaimed is never handed to a second version.
+pub fn next_public_version_id(versions: &[StoredTypeVersion]) -> String {
+    let highest = versions
+        .iter()
+        .filter_map(|version| version.version_id.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    format!("{:08}", highest.saturating_add(1))
+}
+
+/// The version number CloudFormation assigns the FIRST publication of an extension:
+/// "You cannot specify a version number the first time you publish a type. CloudFormation
+/// automatically sets the first version number to be 1.0.0" (`PublishTypeInput$PublicVersionNumber`).
+pub const FIRST_PUBLIC_VERSION_NUMBER: &str = "1.0.0";
+
+/// The version number the publication after `latest` is assigned when the request names
+/// none: "if you don't specify a version number, CloudFormation increments the version
+/// number by one minor version release" — so the major version stays as it is, the minor
+/// version advances by one, and the patch starts that new minor release at zero.
+///
+/// `None` for a number this cannot be computed from, which is one whose `MAJOR.MINOR`
+/// prefix the `PublicVersionNumber` pattern (`^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(.*)$`) would
+/// not admit, or one whose minor version has no successor.
+pub fn next_minor_version_number(latest: &str) -> Option<String> {
+    let mut segments = latest.split('.');
+    let major: u64 = segments.next()?.parse().ok()?;
+    let minor: u64 = segments.next()?.parse().ok()?;
+    Some(format!("{major}.{}.0", minor.checked_add(1)?))
 }
 
 /// Split an ARN that MAY name one version of an extension into the extension's own ARN and
@@ -634,6 +680,125 @@ pub fn aws_published_source_url(type_name: &str) -> Option<String> {
         "https://github.com/aws-cloudformation/aws-cloudformation-resource-providers-{}",
         service.to_ascii_lowercase()
     ))
+}
+
+/// The version row a PUBLICATION writes on a public extension record: the model the
+/// published version of the private extension carries, addressed by the public version
+/// number it was published under.
+///
+/// A public extension version carries what is public about the version it was published
+/// from — its description, its `Schema` ("the schema that defines the extension"), its
+/// provisioning behaviour and the URLs the registration supplied — and none of the members
+/// the model reports for registered PRIVATE extension versions alone: the execution role
+/// and the logging configuration belong to the registration in the publisher's own account,
+/// and the contract-test status is one "CloudFormation doesn't return ... for public
+/// extensions, whether they are activated in your account". Its `TypeVersionId` is the
+/// record's own ([`next_public_version_id`]): the version ids of a public extension count up
+/// in the registry that holds it, independently of the private registration's.
+pub fn published_version(
+    public_arn: &str,
+    version_id: &str,
+    publication: &Publication<'_>,
+) -> StoredTypeVersion {
+    StoredTypeVersion {
+        version_id: version_id.to_string(),
+        // A public extension is addressed by the extension's own ARN — that is the ARN
+        // CloudFormation reports for one — so the version carries it unsuffixed, as the
+        // Amazon-Web-Services-published records do.
+        arn: public_arn.to_string(),
+        public_version_number: Some(publication.public_version_number.to_string()),
+        // Private-extension members: they describe the registration this version was
+        // published FROM, not the public extension the publication created.
+        execution_role_arn: None,
+        logging_config: None,
+        type_tests_status: None,
+        type_tests_status_description: None,
+        // Nobody can test a public extension, so no conclusion is ever owed on one.
+        pending_tests: None,
+        // This version entered the public registry when it was published.
+        time_created: Some(publication.published_at),
+        last_updated: Some(publication.published_at),
+        ..publication.version.clone()
+    }
+}
+
+/// A PUBLIC extension record this Region's registry holds because a publisher published one
+/// version of their private extension to it.
+///
+/// `PublishType` "publishes the specified extension to the CloudFormation registry as a
+/// public extension in this Region. Public extensions are available for use by all
+/// CloudFormation users", so the publication is a record of its own rather than a change to
+/// the private registration it was published from: a public extension with the publisher id
+/// the publishing account registered under, addressed by the account-less ARN every public
+/// extension carries ([`public_type_arn`]).
+pub fn published_record(
+    publication: &Publication<'_>,
+    version: StoredTypeVersion,
+) -> StoredExtension {
+    StoredExtension {
+        type_kind: publication.type_kind.to_string(),
+        type_name: publication.type_name.to_string(),
+        arn: publication.public_arn(),
+        region: publication.region.to_string(),
+        visibility: visibility::PUBLIC.to_string(),
+        // "For public extensions, both those provided by Amazon Web Services and published
+        // by third parties, CloudFormation returns null."
+        default_version_id: None,
+        configuration_schema: None,
+        publisher_id: Some(publication.publisher_id.to_string()),
+        // Nothing was activated under an alias: this record IS the public extension, not a
+        // local activation of somebody else's.
+        original_type_name: None,
+        original_type_arn: None,
+        latest_public_version: version.public_version_number.clone(),
+        // `IsActivated` is "whether the extension is activated in the account and Region",
+        // and publishing an extension activates it nowhere — `ActivateType` is what does.
+        is_activated: Some(false),
+        // `AutoUpdate` is a property of an ACTIVATION ("whether CloudFormation
+        // automatically updates the extension in this account and Region when a new minor
+        // version is published"), so a record nobody has activated carries none.
+        auto_update: None,
+        versions: vec![version],
+    }
+}
+
+/// What ONE publication states: the extension of this Region being published, the publisher
+/// publishing it, the version of it being published and the public version number that
+/// version is published under.
+///
+/// `PublishType` resolves all of it before any of it is written —
+/// [`crate::state::ComAmazonawsCloudformationCloudformationState::publish_extension_version`]
+/// is what writes it — so the record and the version a publication produces are built from
+/// one value rather than from members that could disagree.
+#[derive(Debug, Clone, Copy)]
+pub struct Publication<'a> {
+    /// The Region whose registry the public extension is published into: "publishes the
+    /// specified extension to the CloudFormation registry as a public extension in this
+    /// Region".
+    pub region: &'a str,
+    /// [`registry_type`]: the kind of extension being published.
+    pub type_kind: &'a str,
+    /// The name of the extension being published.
+    pub type_name: &'a str,
+    /// `PublisherId`, "the ID assigned this account by CloudFormation for publishing
+    /// extensions": the publisher the public extension belongs to.
+    pub publisher_id: &'a str,
+    /// The version of the private extension being published, which is its default version:
+    /// what the public extension's version is built from.
+    pub version: &'a StoredTypeVersion,
+    /// `PublicVersionNumber`, the number this publication is assigned.
+    pub public_version_number: &'a str,
+    /// The instant of the publishing call, which the published version entered the registry
+    /// at.
+    pub published_at: SystemTime,
+}
+
+impl Publication<'_> {
+    /// The ARN the public extension this publication produces is addressed by: the
+    /// account-less ARN every public extension carries ([`public_type_arn`]).
+    pub fn public_arn(&self) -> String {
+        public_type_arn(self.region, self.type_kind, self.type_name)
+    }
 }
 
 /// The record [`aws_published`] and [`aws_published_by_arn`] both answer with.

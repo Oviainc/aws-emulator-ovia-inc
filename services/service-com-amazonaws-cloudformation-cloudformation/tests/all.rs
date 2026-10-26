@@ -89,6 +89,8 @@ mod nested_resource_outputs;
 mod no_echo_parameters;
 #[path = "all/provisioned_resources.rs"]
 mod provisioned_resources;
+#[path = "all/publish_type.rs"]
+mod publish_type;
 #[path = "all/published_type_schema.rs"]
 mod published_type_schema;
 #[path = "all/publisher_reads.rs"]

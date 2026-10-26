@@ -232,7 +232,7 @@ fn present(value: &str) -> Option<String> {
 /// `RequiredActivatedType` carries `OriginalTypeName` and `PublisherId` members of its own
 /// — the same names as two TOP-LEVEL members `DescribeType` reports only for a public
 /// record. Splitting the document is what lets a case assert each on the right side of it.
-fn split_required_activated_types(body: &str) -> (String, String) {
+pub(crate) fn split_required_activated_types(body: &str) -> (String, String) {
     let open = "<RequiredActivatedTypes>";
     let close = "</RequiredActivatedTypes>";
     match (body.find(open), body.find(close)) {

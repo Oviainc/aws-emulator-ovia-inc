@@ -71,8 +71,10 @@
 //! oldest-first),
 //! [`handler_progress::MAX_HANDLER_INVOCATIONS`] resource-handler invocations with a
 //! progress record (oldest-first),
-//! and [`resource_scans::MAX_RESOURCE_SCANS`] recorded resource scans (oldest-first), each
-//! one carrying the resources this store already holds and so bounded by the ceilings above.
+//! [`resource_scans::MAX_RESOURCE_SCANS`] recorded resource scans (oldest-first), each
+//! one carrying the resources this store already holds and so bounded by the ceilings above,
+//! and [`registry::MAX_PUBLISHED_VERSIONS`] versions published onto one public extension
+//! record (oldest-first), the registry's one caller-counted growth site.
 //!
 //! Reading a stack's template body and evaluating what it declares is bounded by the
 //! [`template`] module's own caps (nodes, depth, the documented per-template quotas and
@@ -3737,6 +3739,13 @@ impl ComAmazonawsCloudformationCloudformationState {
     /// request was signed for: `DescribeType` reads an extension "from the CloudFormation
     /// registry in your current account and Region", so the same name in another Region
     /// names no record.
+    ///
+    /// A name can be held by TWO records at once — the private registration this account
+    /// made and the PUBLIC extension a publication of it wrote, which carries the same kind
+    /// and name under its own account-less ARN — and this answers whichever entered the
+    /// registry first. An operation that must act on the REGISTRATION resolves it through
+    /// [`Self::registered_extension_by_name`] instead, so its answer does not depend on that
+    /// order.
     pub fn extension_by_name(
         &self,
         region: &str,
@@ -3747,6 +3756,27 @@ impl ComAmazonawsCloudformationCloudformationState {
             extension.region == region
                 && extension.type_kind == type_kind
                 && extension.type_name == type_name
+        })
+    }
+
+    /// The record a `Type`-and-`TypeName` request names that this account REGISTERED: the
+    /// private one, "the extension ... only visible and usable within the account in which
+    /// it is registered".
+    ///
+    /// [`Self::extension_by_name`] narrowed to the records a registry WRITER may act on, so
+    /// a name a publication has also written a public record for still resolves to the
+    /// registration.
+    pub fn registered_extension_by_name(
+        &self,
+        region: &str,
+        type_kind: &str,
+        type_name: &str,
+    ) -> Option<&registry::StoredExtension> {
+        self.extensions.iter().find(|extension| {
+            extension.region == region
+                && extension.type_kind == type_kind
+                && extension.type_name == type_name
+                && extension.is_private()
         })
     }
 
@@ -3785,6 +3815,79 @@ impl ComAmazonawsCloudformationCloudformationState {
         self.extensions
             .iter_mut()
             .find(|extension| extension.region == region && extension.arn == arn)
+    }
+
+    /// The PUBLIC extension record this Region's registry holds for this extension, if a
+    /// publication has written one.
+    ///
+    /// That record is what a publication reads to decide the version number the next one is
+    /// assigned ("if you don't specify a version number, CloudFormation increments the
+    /// version number by one minor version release") and which publisher the extension is
+    /// already published by, and it is a record of its own rather than the private
+    /// registration it was published from: a public extension "is publicly visible and
+    /// usable within any Amazon Web Services account", which a private registration is not.
+    ///
+    /// Resolved by the ARN a publication of this extension is addressed by, which is the
+    /// SAME predicate [`Self::publish_extension_version`] writes through: the read that
+    /// decides a publication and the write that performs it cannot land on two different
+    /// records.
+    pub fn published_extension(
+        &self,
+        region: &str,
+        type_kind: &str,
+        type_name: &str,
+    ) -> Option<&registry::StoredExtension> {
+        let arn = registry::public_type_arn(region, type_kind, type_name);
+        self.extensions
+            .iter()
+            .find(|extension| extension.region == region && extension.arn == arn)
+    }
+
+    /// Publish one version of a private extension as a public extension of this Region, and
+    /// answer the ARN the public extension is addressed by.
+    ///
+    /// The FIRST publication adds the public record ([`registry::published_record`]); a
+    /// later one adds its version to that same record and moves the record's
+    /// `LatestPublicVersion` to the number just assigned, so every version a publisher has
+    /// published stays addressable by the public version number it was published under.
+    /// Bounded at [`registry::MAX_PUBLISHED_VERSIONS`] versions per record, oldest reclaimed
+    /// first: a caller chooses how many publications it makes.
+    ///
+    /// The record it writes through is the one [`Self::published_extension`] reads, so a
+    /// publication whose publisher the caller is not is refused by its handler before this
+    /// is reached rather than appended to another publisher's record here.
+    pub fn publish_extension_version(&mut self, publication: registry::Publication<'_>) -> String {
+        let arn = publication.public_arn();
+        match self
+            .extensions
+            .iter_mut()
+            .find(|extension| extension.region == publication.region && extension.arn == arn)
+        {
+            Some(record) => {
+                let version_id = registry::next_public_version_id(&record.versions);
+                record.publisher_id = Some(publication.publisher_id.to_string());
+                record.latest_public_version =
+                    Some(publication.public_version_number.to_string());
+                record.versions.push(registry::published_version(
+                    &arn,
+                    &version_id,
+                    &publication,
+                ));
+                while record.versions.len() > registry::MAX_PUBLISHED_VERSIONS {
+                    record.versions.remove(0);
+                }
+            }
+            None => {
+                let version = registry::published_version(
+                    &arn,
+                    &registry::next_public_version_id(&[]),
+                    &publication,
+                );
+                self.extensions
+                    .push(registry::published_record(&publication, version));
+            }
+        }
+        arn
     }
 
     /// Register this account as a publisher of public extensions, and answer the publisher

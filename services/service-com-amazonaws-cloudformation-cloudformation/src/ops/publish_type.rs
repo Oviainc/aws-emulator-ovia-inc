@@ -1,40 +1,73 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PublishType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PublishType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Publishes the DEFAULT version of a private extension this account and Region registered
+//! as a PUBLIC extension of that Region, and hands back the ARN the public extension is
+//! addressed by.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PublishType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation does
 //!
-//! ## Shape of an operation
+//! "Publishes the specified extension to the CloudFormation registry as a public extension
+//! in this Region. Public extensions are available for use by all CloudFormation users... To
+//! publish an extension, you must be registered as a publisher with CloudFormation."
 //!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `PublishType::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! So the call WRITES a registry record: the public extension
+//! ([`crate::state::registry::published_record`]), carrying the version it published and the
+//! public version number that version was published under, which `DescribeType` is what
+//! reads back. The private registration it was published from is left exactly as it was —
+//! a public extension is a record of its own, visible "within any Amazon Web Services
+//! account", which a private registration is not.
+//!
+//! Five things gate it, in this order:
+//!
+//! 1. WHAT the request identifies: "you must specify Arn, or TypeName and Type", so a
+//!    request carrying both forms, neither, or half of the name form identifies no extension
+//!    and is refused with the registry's modelled `CFNRegistryException` (400). An `Arn` that
+//!    names one VERSION of an extension identifies no publishable extension either: what a
+//!    publication publishes is the extension's default version, never a version the request
+//!    picked. This is read BEFORE the caller is looked at, because it is a property of the
+//!    request alone — an account that is not a publisher yet, naming an extension the
+//!    registry does not hold, is still answered this refusal rather than either of those.
+//! 2. The CALLER: "to publish an extension, you must be registered as a publisher with
+//!    CloudFormation" ([`crate::state::publisher`], which `RegisterPublisher` writes), and
+//!    the publisher id that registration carries is the one the published extension belongs
+//!    to. An account holding no such registration is refused with that same modelled 400.
+//! 3. WHICH record the request names: an extension this account and Region's registry does
+//!    not hold is the modelled `TypeNotFoundException` (404). A record it holds but did not
+//!    REGISTER — a public extension, whether provided by Amazon Web Services or published by
+//!    a third party and activated here — is not a private extension to publish, so it is
+//!    refused with the modelled 400; `Arn` is a `PrivateTypeArn` for that same reason.
+//! 4. The VERSION: the record's default version, "used when the extension version isn't
+//!    specified". A record carrying none is the modelled 404, and one whose default version's
+//!    contract tests have not concluded `PASSED` is refused with the modelled 400 — "an
+//!    extension must have a test status of PASSED before it can be published", which
+//!    `TestType` is what reaches.
+//! 5. The VERSION NUMBER: "you cannot specify a version number the first time you publish a
+//!    type. CloudFormation automatically sets the first version number to be 1.0.0", so a
+//!    first publication carrying one is refused and one carrying none is assigned that
+//!    number; afterwards "if you don't specify a version number, CloudFormation increments
+//!    the version number by one minor version release"
+//!    ([`crate::state::registry::next_minor_version_number`]), and a number the publisher has
+//!    already published another version of this extension under is refused — the registry
+//!    addresses a public version BY that number, so two versions cannot share one.
+//!
+//! Publishing the same version again publishes it as the NEXT public version of the
+//! extension, which is what "CloudFormation increments the version number by one minor
+//! version release" states: every version a publisher has published stays addressable by
+//! the number it was published under, so a number already published is refused rather than
+//! overwritten.
 //!
 //! ## Reaching this service's state
 //!
-//! The engine is held on `self` (constructor-injected), NOT passed per request — so
-//! engine access is guaranteed by the time any request runs. Reach the store through
-//! [`crate::state::service_state`] and read and write it through the guard it hands back:
-//!
-//! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
-//!         .ok_or(/* a modelled server error */)?;
-//!     state.lock().your_field = /* ... */;
-//! ```
+//! The engine is held on `self` (constructor-injected), NOT passed per request — so engine
+//! access is guaranteed by the time any request runs. Reach the store through
+//! [`crate::state::service_state`] and read and write it through the guard it hands back.
 //!
 //! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only —
-//! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`.
+//! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`; the
+//! Region a request is served in comes from there ([`crate::state::request_region`]).
 //! The engine is NOT reached through `ctx`.
 //!
-//! @generated by the emulator core scaffold op-stub generator.
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -161,18 +194,330 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PublishType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PublishTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PublishType"))
+        // What the request identifies, judged before anything is resolved: it is a property
+        // of the request alone.
+        let identifier = read_request(&input).map_err(registry_exception)?;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no registry to publish an extension
+            // into, so this answers 501 rather than an ARN nothing stands behind.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("PublishType"));
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        // Settled FIRST, so a version whose contract tests the clock has already concluded
+        // is published — or refused — on that conclusion rather than on a stale
+        // `IN_PROGRESS`.
+        store.settle(now);
+
+        // "To publish an extension, you must be registered as a publisher with
+        // CloudFormation": the publication belongs to the publisher id that registration
+        // carries, so an account holding none has nothing to publish under.
+        let publisher_id = match store.publisher(None) {
+            Some(registered) => registered.publisher_id.clone(),
+            None => return Err(registry_exception(NOT_A_PUBLISHER.to_string())),
+        };
+
+        // The record the request names, in the Region the request was signed for: the
+        // registry is regional, so a record another Region holds is not addressable here.
+        // A name a publication has already written a public record for is held by two
+        // records at once, so the name form resolves the REGISTRATION first and falls back
+        // to whatever else the name holds — which is what the public-extension refusal below
+        // is answered from.
+        let stored = match identifier {
+            Identifier::Arn(extension) => store.extension_by_arn(&region, extension),
+            Identifier::Name {
+                type_kind,
+                type_name,
+            } => store
+                .registered_extension_by_name(&region, type_kind, type_name)
+                .or_else(|| store.extension_by_name(&region, type_kind, type_name)),
+        };
+        let extension = match stored {
+            Some(extension) => extension,
+            // The registry also holds the public extensions Amazon Web Services publishes,
+            // which are in every account's registry without anybody registering them: one
+            // of those EXISTS, so what the call runs into is the public-extension refusal
+            // rather than "doesn't exist".
+            None => {
+                let published = match identifier {
+                    Identifier::Arn(extension) => {
+                        crate::state::registry::aws_published_by_arn(&region, extension)
+                    }
+                    Identifier::Name {
+                        type_kind,
+                        type_name,
+                    } => crate::state::registry::aws_published(&region, type_kind, type_name),
+                };
+                return Err(match published {
+                    Some(published) => registry_exception(not_a_private_extension(&published.arn)),
+                    None => type_not_found(identifier.named()),
+                });
+            }
+        };
+        if !extension.is_private() {
+            return Err(registry_exception(not_a_private_extension(&extension.arn)));
+        }
+        // "Only default version can be published": the version the record's
+        // `DefaultVersionId` names, which is the one "used when the extension version isn't
+        // specified".
+        let version = extension
+            .default_version()
+            .ok_or_else(|| type_not_found(identifier.named()))?;
+        // "An extension must have a test status of PASSED before it can be published."
+        if version.type_tests_status.as_deref()
+            != Some(crate::state::registry::type_tests_status::PASSED)
+        {
+            return Err(registry_exception(not_tested(
+                &version.arn,
+                version.type_tests_status.as_deref(),
+            )));
+        }
+        let type_kind = extension.type_kind.clone();
+        let type_name = extension.type_name.clone();
+        let source = version.clone();
+
+        // What is already published for this extension in this Region decides both whether
+        // this caller is the publisher it belongs to and the version number the publication
+        // is assigned.
+        let already_published = store.published_extension(&region, &type_kind, &type_name);
+        if let Some(published) = already_published {
+            if published.publisher_id.as_deref() != Some(publisher_id.as_str()) {
+                return Err(registry_exception(published_by_another_publisher(
+                    &type_name,
+                    &published.arn,
+                )));
+            }
+        }
+        let public_version_number = assign_version_number(
+            input.public_version_number.as_deref(),
+            already_published,
+            &type_name,
+        )?;
+
+        let public_type_arn =
+            store.publish_extension_version(crate::state::registry::Publication {
+                region: &region,
+                type_kind: &type_kind,
+                type_name: &type_name,
+                publisher_id: &publisher_id,
+                version: &source,
+                public_version_number: &public_version_number,
+                published_at: now,
+            });
+
+        Ok(PublishTypeOutput {
+            // "The Amazon Resource Name (ARN) assigned to the public extension upon
+            // publication", which is the ARN the record just written is addressed by.
+            public_type_arn: Some(public_type_arn),
+        })
     }
+}
+
+/// The refusal AWS answers a request whose `Arn` names one VERSION of an extension: what a
+/// publication publishes is the extension's DEFAULT version, so the ARN has to name the
+/// extension. Entirely fixed text: no part of it comes from the request or from the store.
+const ONLY_DEFAULT_VERSION_CAN_BE_PUBLISHED: &str =
+    "Only default version can be published. Please remove versionId from Arn";
+
+/// The refusal AWS answers an account that has not registered as a publisher of public
+/// extensions, which is what this operation requires of its caller.
+const NOT_A_PUBLISHER: &str =
+    "You must register as a publisher with CloudFormation to call publish-type.";
+
+/// How a request identifies the extension to publish.
+///
+/// The model states the constraint across three members at once — "Conditional: You must
+/// specify Arn, or TypeName and Type" — so a request carries one form or the other, never a
+/// mix and never neither.
+#[derive(Debug, Clone, Copy)]
+enum Identifier<'a> {
+    /// `Arn`, which addresses the record on its own. It names the EXTENSION: a version ARN
+    /// is refused rather than carried here, since only the default version is published.
+    Arn(&'a str),
+    /// `Type` and `TypeName`, resolved in the Region the request was signed for.
+    Name {
+        type_kind: &'a str,
+        type_name: &'a str,
+    },
+}
+
+impl Identifier<'_> {
+    /// What the request named the extension by, for the not-found message.
+    fn named(&self) -> &str {
+        match self {
+            Self::Arn(extension) => extension,
+            Self::Name { type_name, .. } => type_name,
+        }
+    }
+}
+
+/// Read what the request identifies, or `Err(message)` for a combination of members that
+/// cannot hold together.
+///
+/// Every modelled constraint (each member's length and pattern, and `Type`'s enum) is
+/// already enforced before the handler runs; what is left are the CONDITIONAL rules the
+/// model states in prose — the same ones `DescribeType` and `TestType` read, plus the one
+/// that is this operation's own: a publication is of the default version, so an `Arn` that
+/// pins a version names nothing publishable.
+fn read_request(input: &PublishTypeInput) -> Result<Identifier<'_>, String> {
+    match (
+        input.arn.as_deref(),
+        input.r#type.as_deref(),
+        input.type_name.as_deref(),
+    ) {
+        (Some(arn), None, None) => match crate::state::registry::split_version_arn(arn) {
+            (extension, None) => Ok(Identifier::Arn(extension)),
+            (_, Some(_)) => Err(ONLY_DEFAULT_VERSION_CAN_BE_PUBLISHED.to_string()),
+        },
+        (None, Some(type_kind), Some(type_name)) => Ok(Identifier::Name {
+            type_kind,
+            type_name,
+        }),
+        // Both forms at once: the two identify the extension independently, so a request
+        // carrying both states two identities for one publication.
+        (Some(_), _, _) => Err(
+            "Specify either Arn, or Type and TypeName, but not both: an extension is \
+             identified by its ARN or by its kind and name"
+                .to_string(),
+        ),
+        // Neither form, or half of the name form.
+        (None, _, _) => Err(
+            "Either Arn, or both Type and TypeName, must be specified to identify an \
+             extension"
+                .to_string(),
+        ),
+    }
+}
+
+/// The public version number this publication is assigned: the one the request names, or the
+/// one CloudFormation assigns a request that names none.
+///
+/// `already_published` is the public extension this publisher has published for the
+/// extension so far, which is what the two documented rules are read against: a FIRST
+/// publication is numbered by CloudFormation, and a later one carrying no number advances
+/// the latest by one minor version release.
+fn assign_version_number(
+    requested: Option<&str>,
+    already_published: Option<&crate::state::registry::StoredExtension>,
+    type_name: &str,
+) -> Result<String, PublishTypeError> {
+    let Some(published) = already_published else {
+        return match requested {
+            // "You cannot specify a version number the first time you publish a type.
+            // CloudFormation automatically sets the first version number to be 1.0.0."
+            Some(_) => Err(registry_exception(
+                FIRST_PUBLICATION_IS_NUMBERED.to_string(),
+            )),
+            None => Ok(crate::state::registry::FIRST_PUBLIC_VERSION_NUMBER.to_string()),
+        };
+    };
+    match requested {
+        // A public version is addressed BY its number, so the one this publication is
+        // assigned cannot be one the publisher has already published this extension under.
+        Some(requested) if published.version_of_public_number(requested).is_some() => Err(
+            registry_exception(number_already_published(type_name, requested)),
+        ),
+        Some(requested) => Ok(requested.to_string()),
+        // "If you don't specify a version number, CloudFormation increments the version
+        // number by one minor version release."
+        None => {
+            let latest = published
+                .latest_public_version
+                .as_deref()
+                .unwrap_or(crate::state::registry::FIRST_PUBLIC_VERSION_NUMBER);
+            let increment = |number: &str| {
+                crate::state::registry::next_minor_version_number(number)
+                    .ok_or_else(|| registry_exception(cannot_increment(type_name, number)))
+            };
+            // A public version is addressed BY its number here too: where the minor release
+            // after the latest is one the extension is already published under — which a
+            // publication that NAMED a number below the latest leaves behind — the release
+            // after that is the one this publication takes. Bounded by the versions the
+            // record holds, since every step moves the minor version up by one.
+            let mut candidate = increment(latest)?;
+            for _ in 0..=crate::state::registry::MAX_PUBLISHED_VERSIONS {
+                if published.version_of_public_number(&candidate).is_none() {
+                    return Ok(candidate);
+                }
+                candidate = increment(&candidate)?;
+            }
+            Err(registry_exception(cannot_increment(type_name, latest)))
+        }
+    }
+}
+
+/// The registry's own modelled refusal: HTTP 400 `CFNRegistryException`, "an error occurred
+/// during a CloudFormation registry operation".
+fn registry_exception(message: String) -> PublishTypeError {
+    PublishTypeErrorModeled::CFNRegistryException(CFNRegistryException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The message answered when the request names a record the registry holds but this account
+/// did not register: a public extension is already published, so there is nothing of it this
+/// operation can publish.
+fn not_a_private_extension(arn: &str) -> String {
+    format!(
+        "Cannot publish {arn}: only a private extension registered in this account and \
+         Region can be published"
+    )
+}
+
+/// The message answered when the version this publication would publish has not passed its
+/// contract tests: "an extension must have a test status of PASSED before it can be
+/// published", so the status the version does carry is what the refusal names.
+fn not_tested(version_arn: &str, type_tests_status: Option<&str>) -> String {
+    match type_tests_status {
+        Some(status) => format!(
+            "Cannot publish {version_arn}: an extension must have a test status of PASSED \
+             before it can be published, and this version's test status is {status}"
+        ),
+        None => format!(
+            "Cannot publish {version_arn}: an extension must have a test status of PASSED \
+             before it can be published, and this version carries no test status"
+        ),
+    }
+}
+
+/// The message answered a FIRST publication that names a version number, which is the rule
+/// `PublicVersionNumber` states: entirely fixed text, since the rule names nothing of the
+/// request.
+const FIRST_PUBLICATION_IS_NUMBERED: &str =
+    "You cannot specify a version number the first time you publish a type. CloudFormation \
+     automatically sets the first version number to be 1.0.0";
+
+/// The message answered when the ARN this publication would be addressed by is already held
+/// by a public extension of ANOTHER publisher: a public extension belongs to the publisher
+/// that published it.
+fn published_by_another_publisher(type_name: &str, public_arn: &str) -> String {
+    format!("Cannot publish {type_name}: {public_arn} is published by another publisher")
+}
+
+/// The message answered when the extension is already published under the version number
+/// the request names: a public version is addressed BY its number, so a second version
+/// cannot be published under one.
+fn number_already_published(type_name: &str, public_version_number: &str) -> String {
+    format!("Version {public_version_number} of {type_name} is already published")
+}
+
+/// The message answered when the version number the next publication would be assigned
+/// cannot be computed from the latest published one, so the request has to name one.
+fn cannot_increment(type_name: &str, latest: &str) -> String {
+    format!(
+        "Specify a version number to publish {type_name} under: the version number {latest} \
+         it is published under cannot be incremented by one minor version release"
+    )
+}
+
+/// The modelled 404: "The specified extension doesn't exist in the CloudFormation
+/// registry."
+fn type_not_found(identifier: &str) -> PublishTypeError {
+    PublishTypeErrorModeled::TypeNotFoundException(TypeNotFoundException {
+        message: Some(crate::state::extension_does_not_exist(identifier)),
+    })
+    .into()
 }
