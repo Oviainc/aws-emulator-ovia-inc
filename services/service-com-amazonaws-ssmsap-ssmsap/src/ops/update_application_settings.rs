@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApplicationSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApplicationSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApplicationSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +144,199 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApplicationSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApplicationSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApplicationSettings"))
+        // The Region this request was signed for: a control call reaches an application
+        // registered at THIS regional endpoint and no others.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateApplicationSettingsErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.settle(now);
+
+        let credentials_to_add_or_update =
+            input.credentials_to_add_or_update.as_deref().unwrap_or(&[]);
+        let credentials_to_remove = input.credentials_to_remove.as_deref().unwrap_or(&[]);
+        let changes_credentials =
+            !credentials_to_add_or_update.is_empty() || !credentials_to_remove.is_empty();
+
+        // Every settings member is optional, so a request naming none of them asks for
+        // no change at all: there is nothing to update and nothing to file for it.
+        if !changes_credentials && input.backint.is_none() && input.database_arn.is_none() {
+            return Err(UpdateApplicationSettingsErrorModeled::ValidationException(
+                crate::state::validation(crate::state::MISSING_SETTINGS_MESSAGE),
+            )
+            .into());
+        }
+
+        if let Some(backint) = input.backint.as_ref() {
+            // `BackintMode` is an enum in the model, so the boundary validator has
+            // already refused a value outside it; this re-states the refusal against the
+            // model's own catalogue (`BACKINT_MODE_VALUES`) so the handler never stores a
+            // mode the API does not define.
+            if !BACKINT_MODE_VALUES.contains(&backint.backint_mode.as_str()) {
+                return Err(UpdateApplicationSettingsErrorModeled::ValidationException(
+                    crate::state::validation(format!(
+                        "BackintMode must be one of {}, but was {}",
+                        BACKINT_MODE_VALUES.join(", "),
+                        backint.backint_mode
+                    )),
+                )
+                .into());
+            }
+        }
+
+        let Some(mut application) = state
+            .region(&region)
+            .applications
+            .get(&input.application_id)
+            .cloned()
+        else {
+            return Err(
+                UpdateApplicationSettingsErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::application_not_found_message(
+                        &input.application_id,
+                    )),
+                )
+                .into(),
+            );
+        };
+
+        // A change the clock still owes this application is an operation already under
+        // way on it, which is what `ConflictException` reports. The settings an update
+        // leaves outstanding do not move the application's `Status`, so what the refusal
+        // states is the work in flight rather than the status it is in.
+        if application.pending.is_some() {
+            return Err(UpdateApplicationSettingsErrorModeled::ConflictException(
+                crate::state::conflict(format!(
+                    "Application {} has an operation in progress and its settings cannot \
+                     be updated until that operation completes",
+                    application.id
+                )),
+            )
+            .into());
+        }
+
+        // What the credentials of this application become. Computed — and refused —
+        // BEFORE anything is written, so an update the application cannot take leaves
+        // the credentials it holds untouched.
+        let credentials = application
+            .credentials_after(credentials_to_add_or_update, credentials_to_remove)
+            .map_err(UpdateApplicationSettingsErrorModeled::ValidationException)?;
+        // An application of a type that cannot be managed without credentials
+        // (`crate::state::CONDITIONALLY_REQUIRED_MEMBERS`) cannot be left without them by
+        // an update either: the requirement is the application's, not the registering
+        // call's, so it is stated in the same words here.
+        if crate::state::conditionally_required_members(&application.app_type)
+            .contains(&crate::state::ConditionalMember::Credentials)
+            && credentials.is_empty()
+        {
+            return Err(UpdateApplicationSettingsErrorModeled::ValidationException(
+                crate::state::validation(crate::state::conditional_requirement_message(
+                    &application.app_type,
+                    &[crate::state::ConditionalMember::Credentials],
+                )),
+            )
+            .into());
+        }
+
+        // The settings the call asked to change, which is what its `Message` reports it
+        // is updating. A `Backint` configuration an application holds none of yet is the
+        // agent's installation, which is what the member is documented as.
+        let mut changes: Vec<crate::state::SettingsChange> = Vec::new();
+        if changes_credentials {
+            changes.push(crate::state::SettingsChange::Credentials);
+        }
+        if input.backint.is_some() {
+            changes.push(crate::state::SettingsChange::Backint {
+                installed: application.backint.is_some(),
+            });
+        }
+        if input.database_arn.is_some() {
+            changes.push(crate::state::SettingsChange::DatabaseConnection);
+        }
+        let message = crate::state::settings_update_message(&application.id, &changes);
+
+        // The operation's `Properties` are the parameters of the call that filed it, so
+        // a client reading the record back learns what the update asked for. A
+        // credential's `SecretId` is `@sensitive`, so what the record names of a
+        // credential is the SAP HANA database it reaches and its type, never the secret.
+        let mut properties = ::std::collections::HashMap::new();
+        if !credentials_to_add_or_update.is_empty() {
+            properties.insert(
+                "CredentialsToAddOrUpdate".to_string(),
+                named_credentials(credentials_to_add_or_update),
+            );
+        }
+        if !credentials_to_remove.is_empty() {
+            properties.insert(
+                "CredentialsToRemove".to_string(),
+                named_credentials(credentials_to_remove),
+            );
+        }
+        if let Some(backint) = input.backint.as_ref() {
+            properties.insert("BackintMode".to_string(), backint.backint_mode.clone());
+            properties.insert(
+                "EnsureNoBackupInProcess".to_string(),
+                backint.ensure_no_backup_in_process.to_string(),
+            );
+        }
+        if let Some(database_arn) = input.database_arn.as_ref() {
+            properties.insert("DatabaseArn".to_string(), database_arn.clone());
+        }
+
+        // Updating the settings is asynchronous: the call answers the record its
+        // `OperationIds` names, and the settings themselves fall due one
+        // `TRANSITION_SPAN` from now, materialised for every reader at that instant by
+        // `crate::state::StoredApplication::settle` without anything sleeping. The SAP
+        // system is neither started nor stopped and nothing is re-discovered, so the
+        // `Status` and `DiscoveryStatus` the application is in are left as they were.
+        // `EnsureNoBackupInProcess` asks the service to refuse while a backup of the
+        // database is running; the emulator runs no backup, so none ever is.
+        application.pending = Some(crate::state::PendingTransition {
+            due_at: now + crate::state::TRANSITION_SPAN,
+            change: crate::state::PendingChange::Settings(crate::state::PendingSettings {
+                credentials,
+                backint: input.backint,
+                database_arn: input.database_arn,
+            }),
+        });
+
+        // The application was just found in this Region, so reaching for the partition
+        // to write mints nothing.
+        let region_state = state.region_entry(&region);
+        let operation_id = region_state.record_operation(
+            crate::state::OPERATION_TYPE_UPDATE_APPLICATION_SETTINGS,
+            &application,
+            properties,
+            now,
+        );
+        region_state
+            .applications
+            .insert(input.application_id, application);
+
+        Ok(UpdateApplicationSettingsOutput {
+            message: Some(message),
+            // One call is one unit of work on one application, so it files ONE operation
+            // record — the one a later `GetOperation` resolves by this id.
+            operation_ids: Some(::std::vec![operation_id]),
+        })
     }
+}
+
+/// How an operation record names the credentials a call carried: the SAP HANA database
+/// each one reaches and its `CredentialType`, in the order the call named them.
+///
+/// `ApplicationCredential$SecretId` is `@sensitive`, so the secret a credential names is
+/// never written into a record a later `GetOperation` reads back; what identifies a
+/// credential of an application is the database and the type anyway
+/// (`crate::state::same_credential`).
+fn named_credentials(credentials: &[ApplicationCredential]) -> String {
+    credentials
+        .iter()
+        .map(|credential| format!("{} ({})", credential.database_name, credential.credential_type))
+        .collect::<Vec<String>>()
+        .join(", ")
 }

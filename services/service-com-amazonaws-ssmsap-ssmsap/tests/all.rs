@@ -77,5 +77,7 @@ mod sub_check_results;
 mod tag_resource;
 #[path = "all/untag_resource.rs"]
 mod untag_resource;
+#[path = "all/update_application_settings.rs"]
+mod update_application_settings;
 #[path = "all/validation_message_rendering.rs"]
 mod validation_message_rendering;

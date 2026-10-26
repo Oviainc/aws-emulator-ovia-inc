@@ -5,7 +5,8 @@
 //! The registered SAP application is this service's primary resource: every
 //! application-scoped operation (`RegisterApplication`, `GetApplication`,
 //! `ListApplications`, `StartApplication`, `StopApplication`,
-//! `StartApplicationRefresh`, `DeregisterApplication`) resolves the SAME
+//! `StartApplicationRefresh`, `UpdateApplicationSettings`, `DeregisterApplication`)
+//! resolves the SAME
 //! [`StoredApplication`] out of
 //! [`RegionState::applications`], and every call that changes one files a
 //! [`StoredOperation`] in [`RegionState::operations`] that `GetOperation` reads back and
@@ -14,7 +15,8 @@
 //! and an `OperationId` handed to a caller always names a record that exists.
 //!
 //! Those calls are ASYNCHRONOUS, so what they start is a change the CLOCK owes the
-//! application ([`PendingTransition`]): the next status it takes, or — for a
+//! application ([`PendingTransition`]): the next status it takes, the settings an update
+//! asked for ([`PendingSettings`]), or — for a
 //! deregistration — the removal that ends it. Until that change falls due the
 //! application resolves in the transient status the call gave it (`REGISTERING`,
 //! `STARTING`, `STOPPING`, `DELETING`), and [`RegionState::settle`] materialises the
@@ -113,11 +115,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Application, ApplicationCredential, ApplicationSummary, AssociatedHost, Component,
-    ComponentInfo, ComponentSummary, ConfigurationCheckDefinition, ConfigurationCheckOperation,
-    ConflictException, Database, DatabaseSummary, Filter, InternalServerException, Operation,
-    OperationEvent, Resource, ResourceNotFoundException, RuleResult, RuleStatusCounts,
-    SubCheckResult, ValidationException,
+    Application, ApplicationCredential, ApplicationSummary, AssociatedHost, BackintConfig,
+    Component, ComponentInfo, ComponentSummary, ConfigurationCheckDefinition,
+    ConfigurationCheckOperation, ConflictException, Database, DatabaseSummary, Filter,
+    InternalServerException, Operation, OperationEvent, Resource, ResourceNotFoundException,
+    RuleResult, RuleStatusCounts, SubCheckResult, ValidationException,
     APPLICATION_TYPE_VALUES, CONFIGURATION_CHECK_TYPE_VALUES, FILTER_OPERATOR_VALUES,
     RULE_RESULT_STATUS_VALUES,
 };
@@ -192,6 +194,13 @@ pub const OPERATION_TYPE_DEREGISTER_APPLICATION: &str = "DEREGISTER_APPLICATION"
 /// `Operation$Type` for the operation `StartApplicationRefresh` files, spelled by the
 /// same rule as the records above: the name of the API call that produced it.
 pub const OPERATION_TYPE_START_APPLICATION_REFRESH: &str = "START_APPLICATION_REFRESH";
+
+/// `Operation$Type` for the operation `UpdateApplicationSettings` files, spelled by the
+/// same rule as the records above: the name of the API call that produced it. ONE record
+/// per call, whatever the call changes, because the unit of work the service reports is
+/// the call it was asked for — which is the id `UpdateApplicationSettings$OperationIds`
+/// reports and `GetOperation` reads back.
+pub const OPERATION_TYPE_UPDATE_APPLICATION_SETTINGS: &str = "UPDATE_APPLICATION_SETTINGS";
 
 /// `Operation$ResourceType`: the kind of resource an operation acted on.
 ///
@@ -303,8 +312,11 @@ pub const MAX_APPLICATIONS: usize = 1_000;
 /// The store is partitioned per Region (see [`RegionState`]) and the Region comes from
 /// the caller's own SigV4 credential scope, so without a ceiling a caller could mint a
 /// partition per made-up Region. Comfortably more than the Regions AWS operates, so no
-/// real multi-Region workflow meets it; with [`MAX_APPLICATIONS`] and
-/// [`MAX_RETAINED_OPERATIONS`] it is what bounds the whole store. Like the application
+/// real multi-Region workflow meets it; with [`MAX_APPLICATIONS`],
+/// [`MAX_RETAINED_OPERATIONS`] and the per-resource ceilings
+/// ([`MAX_CREDENTIALS_PER_APPLICATION`], [`MAX_TAGS_PER_RESOURCE`],
+/// [`MAX_PERMISSIONED_RESOURCES`]) it is what bounds the whole store. Like the
+/// application
 /// ceiling it is reported with `ConflictException`, which `RegisterApplication` models,
 /// and a partition left empty is dropped
 /// ([`ComAmazonawsSsmsapSsmsapState::forget_region_if_empty`]) so only Regions that
@@ -399,6 +411,19 @@ pub const MAX_PERMISSION_SOURCES_PER_RESOURCE: usize = 100;
 /// every tagging call models.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// How many credentials this emulator will hold for ONE application.
+///
+/// Neither the model nor `UpdateApplicationSettings`' documentation states how many
+/// credentials an application may hold — only how many ONE call may carry
+/// (`ApplicationCredentialList` is `@length(min: 0, max: 20)`) — so this is the
+/// emulator's own ceiling rather than a fidelity claim about a published quota: it is
+/// what stops a caller looping on `UpdateApplicationSettings` with credentials for fresh
+/// database names growing one application's record, and the database set derived from it
+/// ([`StoredApplication::databases`]), without bound. Generous enough that no realistic
+/// SAP system meets it, and reported with `ValidationException`, which every call that
+/// writes a credential models.
+pub const MAX_CREDENTIALS_PER_APPLICATION: usize = 100;
+
 /// The grants held for ONE resource: `PermissionActionType` -> the source resource
 /// ARNs permitted to take that action on it.
 ///
@@ -434,9 +459,13 @@ impl PendingTransition {
 }
 
 /// What the clock owes an application: the asynchronous calls of this service either
-/// move the application to another status or, for a deregistration, end it.
+/// move the application to another status, settle the settings an update asked for, or,
+/// for a deregistration, end it.
 #[derive(Debug, Clone)]
 pub enum PendingChange {
+    /// The application takes these settings — what an `UpdateApplicationSettings` call
+    /// owes it.
+    Settings(PendingSettings),
     /// The application takes these `ApplicationStatus`/`ApplicationDiscoveryStatus`
     /// values — what registering, starting and stopping owe it.
     Status {
@@ -448,6 +477,28 @@ pub enum PendingChange {
     /// The application stops existing: what a deregistration owes it, materialised by
     /// [`RegionState::settle`].
     Removal,
+}
+
+/// The settings an `UpdateApplicationSettings` call owes an application: what the
+/// application's own settings become when the update falls due.
+///
+/// The update is asynchronous, so the call does not change the settings — it states what
+/// they BECOME, and [`StoredApplication::settle`] is what makes them so, at the same
+/// instant for every reader. A member left `None` is a setting the call did not name,
+/// which the update leaves exactly as it was.
+#[derive(Debug, Clone)]
+pub struct PendingSettings {
+    /// The credentials the application holds once the update falls due: the result of
+    /// adding, updating and removing what the call named
+    /// ([`StoredApplication::credentials_after`]), computed when the call was made
+    /// because nothing else can change them while this update is outstanding.
+    pub credentials: Vec<ApplicationCredential>,
+    /// The AWS Backint Agent for SAP HANA configuration the call asked for, when it
+    /// asked for one.
+    pub backint: Option<BackintConfig>,
+    /// The ARN of the SAP HANA database that replaces the application's current SAP HANA
+    /// connection, when the call named one.
+    pub database_arn: Option<String>,
 }
 
 /// A registered SAP application: the state `Application` and `ApplicationSummary` are
@@ -486,14 +537,24 @@ pub struct StoredApplication {
     pub instances: Vec<String>,
     pub credentials: Vec<ApplicationCredential>,
     /// The ARN of the SAP HANA database the registration named, when it named one: one
-    /// of the databases of this application ([`StoredApplication::databases`]).
+    /// of the databases of this application ([`StoredApplication::databases`]). An
+    /// `UpdateApplicationSettings` call replaces it with the database it names.
     pub database_arn: Option<String>,
+    /// The AWS Backint Agent for SAP HANA configuration this application holds, and
+    /// `None` for one no call has configured the agent for.
+    ///
+    /// Nothing registers it: the configuration is `UpdateApplicationSettings$Backint`'s
+    /// to install, so a freshly registered application holds none, and a later update
+    /// that names a configuration is updating one it already holds rather than
+    /// installing it ([`settings_update_message`] states which).
+    pub backint: Option<BackintConfig>,
     /// The change the clock owes this application, if one is outstanding.
     pub pending: Option<PendingTransition>,
 }
 
 impl StoredApplication {
-    /// Materialise the status change the clock already owes this application.
+    /// Materialise the change the clock already owes this application — the next status
+    /// an asynchronous call moves it to, or the settings an update asked for.
     ///
     /// The change was due at [`PendingTransition::due_at`] whether or not anybody
     /// called, so applying it on a read reports what the resource already is rather
@@ -507,20 +568,117 @@ impl StoredApplication {
         let Some(pending) = self.pending.as_ref() else {
             return;
         };
-        if now < pending.due_at {
+        // A removal is left in place whether or not it has fallen due: a record cannot
+        // drop itself.
+        if now < pending.due_at || pending.removes() {
             return;
         }
-        let PendingChange::Status {
-            status,
-            discovery_status,
-        } = pending.change.clone()
-        else {
-            return;
-        };
         let pending = self.pending.take().expect("checked present just above");
-        self.status = status;
-        self.discovery_status = discovery_status;
+        match pending.change {
+            PendingChange::Status {
+                status,
+                discovery_status,
+            } => {
+                self.status = status;
+                self.discovery_status = discovery_status;
+            }
+            PendingChange::Settings(settings) => {
+                self.credentials = settings.credentials;
+                // A setting the update did not name is left exactly as it was, which is
+                // what the absent member means.
+                if let Some(backint) = settings.backint {
+                    self.backint = Some(backint);
+                }
+                if let Some(database_arn) = settings.database_arn {
+                    // The named database REPLACES the application's current SAP HANA
+                    // connection, so it is this application's database from here on
+                    // ([`Self::databases`]).
+                    self.database_arn = Some(database_arn);
+                }
+            }
+            // Returned above: a record cannot drop itself.
+            PendingChange::Removal => {}
+        }
         self.last_updated = pending.due_at.max(self.last_updated);
+    }
+
+    /// The credentials this application holds after an update that adds or updates
+    /// `add_or_update` and removes `remove` — what
+    /// `UpdateApplicationSettings$CredentialsToAddOrUpdate` and `CredentialsToRemove`
+    /// ask for.
+    ///
+    /// A credential is identified by the SAP HANA database it reaches and its
+    /// `CredentialType`, by the same identity a database itself has here
+    /// ([`database_id_from_name`]), so a credential named for the database and type of
+    /// one this application already holds REPLACES it (the secret the new one names is
+    /// the one that reaches that database from then on) and one naming a database and
+    /// type it holds none for is ADDED, after the ones it keeps. Removal drops the
+    /// credential of that database and type.
+    ///
+    /// Refuses with the modelled `ValidationException` (HTTP 400), and computes nothing,
+    /// when the call asks for a change the application cannot take: a credential named
+    /// for removal that it does not hold, one named in BOTH lists, whose two
+    /// requests contradict each other, and one that would leave the application holding
+    /// more than [`MAX_CREDENTIALS_PER_APPLICATION`] credentials. The caller applies this
+    /// BEFORE writing anything, so a refused update leaves the credentials it holds
+    /// untouched.
+    pub fn credentials_after(
+        &self,
+        add_or_update: &[ApplicationCredential],
+        remove: &[ApplicationCredential],
+    ) -> Result<Vec<ApplicationCredential>, ValidationException> {
+        for removed in remove {
+            if add_or_update
+                .iter()
+                .any(|added| same_credential(added, removed))
+            {
+                return Err(validation(format!(
+                    "The {} credential for database {} is named both for update and for \
+                     removal in the same request",
+                    removed.credential_type, removed.database_name
+                )));
+            }
+            if !self
+                .credentials
+                .iter()
+                .any(|held| same_credential(held, removed))
+            {
+                return Err(validation(format!(
+                    "Application {} has no {} credential for database {}",
+                    self.id, removed.credential_type, removed.database_name
+                )));
+            }
+        }
+        let mut credentials: Vec<ApplicationCredential> = self
+            .credentials
+            .iter()
+            .filter(|held| !remove.iter().any(|removed| same_credential(held, removed)))
+            .cloned()
+            .collect();
+        // Only a credential this application holds none for grows the set; one it holds
+        // is replaced in place. The emulator's own per-application ceiling is what stops
+        // a caller looping with fresh database names growing this record without bound.
+        let added = add_or_update
+            .iter()
+            .filter(|named| !credentials.iter().any(|held| same_credential(held, named)))
+            .count();
+        let would_hold = credentials.len() + added;
+        if would_hold > MAX_CREDENTIALS_PER_APPLICATION {
+            return Err(validation(format!(
+                "this emulator holds at most {MAX_CREDENTIALS_PER_APPLICATION} credentials per application, but this request would leave {} holding {would_hold}",
+                self.id
+            )));
+        }
+        for named in add_or_update {
+            match credentials
+                .iter_mut()
+                .find(|held| same_credential(held, named))
+            {
+                Some(held) => *held = named.clone(),
+                None => credentials.push(named.clone()),
+            }
+        }
+        Ok(credentials)
     }
 
     /// Whether a deregistration is running against this application: it reports
@@ -3231,6 +3389,18 @@ pub fn database_id_from_name(database_name: &str) -> String {
         .collect()
 }
 
+/// Whether two `ApplicationCredential`s name the SAME credential of an application:
+/// the one that reaches a given SAP HANA database with a given `CredentialType`.
+///
+/// The database is matched by its identity here ([`database_id_from_name`]), so the two
+/// name the same credential exactly when they name the same database as every other
+/// read of this service resolves it. `SecretId` is NOT part of the identity: it is the
+/// secret that reaches the database, which is the thing an update replaces.
+pub fn same_credential(one: &ApplicationCredential, other: &ApplicationCredential) -> bool {
+    one.credential_type == other.credential_type
+        && database_id_from_name(&one.database_name) == database_id_from_name(&other.database_name)
+}
+
 /// The name the SAP HANA database ARN `database_arn` names its database by: the last
 /// non-empty segment of the ARN, the `:`- and `/`-separated part that carries the name
 /// of the resource an ARN names (a database ARN minted by [`database_arn`] ends with the
@@ -3385,16 +3555,37 @@ pub fn conditional_requirements_met(
     if required.iter().copied().all(carried) {
         return Ok(());
     }
-    Err(validation(format!(
-        "{} of {application_type} instance must be specified for SAP applications with type {application_type}.",
-        join_labels(required)
+    Err(validation(conditional_requirement_message(
+        application_type,
+        required,
     )))
+}
+
+/// How the service states the requirement that an application of `application_type`
+/// carries `members` ([`CONDITIONALLY_REQUIRED_MEMBERS`]).
+///
+/// One sentence for one condition, whichever call ran into it: a registration that omits
+/// what its type requires states the whole requirement for that type, and an
+/// `UpdateApplicationSettings` call that would leave an application without one of them
+/// states it for that one member — so a client reads the same wording for the same rule.
+pub fn conditional_requirement_message(
+    application_type: &str,
+    members: &[ConditionalMember],
+) -> String {
+    format!(
+        "{} of {application_type} instance must be specified for SAP applications with type {application_type}.",
+        join_labels(members)
+    )
 }
 
 /// The labels of `members`, joined as a sentence lists them: `A`, `A and B`,
 /// `A, B, and C`.
 fn join_labels(members: &[ConditionalMember]) -> String {
-    let labels: Vec<&str> = members.iter().map(|member| member.label()).collect();
+    join_phrases(&members.iter().map(|member| member.label()).collect::<Vec<&str>>())
+}
+
+/// `labels`, joined as a sentence lists them: `A`, `A and B`, `A, B, and C`.
+fn join_phrases(labels: &[&str]) -> String {
     match labels.split_last() {
         None => String::new(),
         Some((last, [])) => (*last).to_string(),
@@ -3402,6 +3593,65 @@ fn join_labels(members: &[ConditionalMember]) -> String {
         Some((last, head)) => format!("{}, and {last}", head.join(", ")),
     }
 }
+
+/// A setting of a registered application an `UpdateApplicationSettings` call changes.
+///
+/// One variant per settings member the model gives that operation
+/// (`smithy_query(query="operation", operation="UpdateApplicationSettings")`:
+/// `CredentialsToAddOrUpdate`/`CredentialsToRemove`, `Backint`, `DatabaseArn`), which is
+/// what the call reports it is updating ([`settings_update_message`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsChange {
+    /// The credentials that reach the application's SAP HANA databases, added, updated
+    /// or removed.
+    Credentials,
+    /// The AWS Backint Agent for SAP HANA, whose configuration the call carries.
+    /// `installed` is whether the application already holds one, so a first
+    /// configuration is the agent's INSTALLATION — which is what the member is
+    /// documented as — and a later one is a change to the configuration it holds.
+    Backint { installed: bool },
+    /// The application's SAP HANA connection, which the database the call names
+    /// replaces.
+    DatabaseConnection,
+}
+
+impl SettingsChange {
+    /// How the service words the setting this names.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Credentials => "credentials",
+            Self::Backint { installed: false } => "AWS Backint Agent for SAP HANA installation",
+            Self::Backint { installed: true } => "AWS Backint Agent for SAP HANA configuration",
+            Self::DatabaseConnection => "SAP HANA database connection",
+        }
+    }
+}
+
+/// The `Message` an `UpdateApplicationSettings` call answers with: the update of
+/// `changes` it accepted for the application `application_id`.
+///
+/// The update is asynchronous — the call files the operation its `OperationIds` reports
+/// and the settings fall due later ([`PendingSettings`]) — so what the message states is
+/// that the request was taken, and it names the settings the call asked to change rather
+/// than any value it carried, so nothing a credential's `@sensitive` `SecretId` holds is
+/// ever worded into a response.
+pub fn settings_update_message(application_id: &str, changes: &[SettingsChange]) -> String {
+    let labels: Vec<&str> = changes.iter().map(|change| change.label()).collect();
+    format!(
+        "Your request to update the {} of application {application_id} has been submitted.",
+        join_phrases(&labels)
+    )
+}
+
+/// The message `UpdateApplicationSettings` reports when the request names NO setting to
+/// change.
+///
+/// Every settings member the operation takes is optional, so a request carrying none of
+/// them asks for nothing — a fixed diagnostic for a fixed condition, stated in the same
+/// shape as [`MISSING_APPLICATION_IDENTIFIER_MESSAGE`] so a client reads one wording for
+/// the class, and naming the four members that could carry a change.
+pub const MISSING_SETTINGS_MESSAGE: &str = "backint, credentialsToAddOrUpdate, \
+     credentialsToRemove or databaseArn need to be specified";
 
 /// The modelled `ValidationException` an operation that models no
 /// `ResourceNotFoundException` is refused with when no registered application answers
