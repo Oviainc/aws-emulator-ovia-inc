@@ -1570,3 +1570,71 @@ pub fn management_event_log<Eng: Send + Sync + 'static>(
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<::service_common::management_events::ManagementEventLog>)
 }
+
+/// The registry of web identity tokens THIS emulator issued, in the same shared engine:
+/// the one store the service that redeems such a token reads
+/// (`sts:AssumeRoleWithWebIdentity`). `None` means the engine carries no such registry.
+pub fn issued_web_identity_tokens<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::web_identity_tokens::IssuedWebIdentityTokens>>
+{
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<::service_common::web_identity_tokens::IssuedWebIdentityTokens>)
+}
+
+/// Record, in the registry the REDEEMER of a web identity token reads, that this emulator
+/// issued `token` for the identity `issued` names.
+///
+/// An OpenID Connect token this service mints is a bearer of an identity that another
+/// service is handed back: "Calling `AssumeRoleWithWebIdentity` does not require the use of
+/// Amazon Web Services security credentials ... the identity of the caller is validated by
+/// using a token from the web identity provider" (`AssumeRoleWithWebIdentity`, that
+/// service's model). The redeemer cannot verify a signature against an issuer's published
+/// key set — this emulator fetches nothing from outside itself — so what it CAN establish
+/// is that the token is one this emulator issued, and that is what this record says. The
+/// claims recorded are exactly the ones the token carries ([`open_id_token`]).
+///
+/// Best-effort, as every recorder in this tree is: an engine carrying no registry (a unit
+/// test over a bare engine) still gets its token, because failing an issuance because the
+/// redemption registry is unreachable would be a worse answer than issuing it unrecorded.
+pub fn record_issued_web_identity<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    token: &str,
+    issued: &IssuedOpenIdToken,
+    now: SystemTime,
+) {
+    let Some(registry) = issued_web_identity_tokens(engine) else {
+        ::tracing::warn!(
+            "the engine carries no issued-web-identity registry: the token was issued \
+             unrecorded, so no redeemer can establish that this emulator issued it"
+        );
+        return;
+    };
+    registry.lock().record(
+        token.to_string(),
+        ::service_common::web_identity_tokens::IssuedWebIdentity {
+            issuer: OIDC_TOKEN_ISSUER.to_string(),
+            audience: issued.identity_pool_id.clone(),
+            subject: issued.identity_id.clone(),
+            expires_at: issued.expiration,
+        },
+        now,
+    );
+}
+
+/// Give up every web identity token this emulator issued FOR `identity_pool_id`, in the
+/// registry the redeemer of one reads.
+///
+/// Called by this service's delete path: a token names an identity of a pool, and once
+/// neither the pool nor the identity exists the token names nothing — so the record that
+/// would still resolve it to a role goes with the pool, exactly as this service's own
+/// record of the issuance does.
+pub fn forget_issued_web_identities<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    identity_pool_id: &str,
+) {
+    if let Some(registry) = issued_web_identity_tokens(engine) {
+        registry.lock().forget_audience(identity_pool_id);
+    }
+}

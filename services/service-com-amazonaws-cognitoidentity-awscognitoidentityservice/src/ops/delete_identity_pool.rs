@@ -200,6 +200,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &access_key_id,
             );
         }
+        // The web identity tokens issued FOR this pool name nothing now either, so the
+        // registry the redeemer of one reads gives them up with the pool.
+        crate::state::forget_issued_web_identities(&*self.engine, &input.identity_pool_id);
         Ok(DeleteIdentityPoolOutput)
     }
 }

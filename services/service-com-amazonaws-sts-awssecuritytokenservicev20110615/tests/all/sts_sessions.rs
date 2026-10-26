@@ -544,21 +544,22 @@ async fn assume_role_refuses_a_role_arn_that_is_not_one() {
 // Session policies and session tags
 // ---------------------------------------------------------------------------
 
-/// `PackedPolicySize` is the percentage of the packed budget the request's session
+/// `PackedPolicySize` is the percentage of the packed token budget the request's session
 /// policies and tags take up: absent when it passes none, rounded up when it passes
-/// any, and over 100 percent the request is refused with `PackedPolicyTooLarge`. A
-/// policy that is not a JSON policy document is refused with
+/// any, and over 100 percent — which is over the budget's 4,096 bytes — the request is
+/// refused with `PackedPolicyTooLarge` (the message that refusal carries is pinned by
+/// `packed_policy_budget`). A policy that is not a JSON policy document is refused with
 /// `MalformedPolicyDocument`.
 #[tokio::test]
 async fn session_policies_are_packed_measured_and_refused_by_the_same_rule() {
     let (router, engine) = emulator();
     let (_role_arn, _role_id) = seed_demo_role(&engine);
     let small_policy = r#"{"Version":"2012-10-17","Statement":[]}"#.to_string();
-    // 2,048 characters is the documented plaintext budget, so a policy well past it
-    // packs to more than 100 percent.
+    // The packed token budget is 4,096 bytes, so a policy well past it packs to more
+    // than 100 percent.
     let huge_policy = format!(
         r#"{{"Version":"2012-10-17","Comment":"{}"}}"#,
-        "x".repeat(2100)
+        "x".repeat(4100)
     );
 
     // One row: case name, action, the extra form parameters, and the expected status,
@@ -593,7 +594,7 @@ async fn session_policies_are_packed_measured_and_refused_by_the_same_rule() {
             ],
             200,
             None,
-            Some(2),
+            Some(1),
         ),
         (
             "assume-role, tags only",
@@ -676,7 +677,7 @@ async fn session_policies_are_packed_measured_and_refused_by_the_same_rule() {
             ],
             200,
             None,
-            Some(2),
+            Some(1),
         ),
         (
             "federation-token, a policy that is not JSON",

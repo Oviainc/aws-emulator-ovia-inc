@@ -17,6 +17,9 @@ mod decode_authorization_message;
 #[path = "all/malformed_session_policy.rs"]
 mod malformed_session_policy;
 
+#[path = "all/packed_policy_budget.rs"]
+mod packed_policy_budget;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
@@ -28,3 +31,6 @@ mod sts_sessions;
 
 #[path = "all/trust_policy_convergence.rs"]
 mod trust_policy_convergence;
+
+#[path = "all/web_identity_federation.rs"]
+mod web_identity_federation;

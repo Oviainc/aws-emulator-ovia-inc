@@ -321,7 +321,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resolve_request_caller, sts_arn, Identity, NewSession, SessionKind,
             ASSUME_ROLE_ACTION, ASSUME_ROLE_DEFAULT_DURATION_SECONDS,
             MAX_MANAGED_SESSION_POLICIES, MAX_SESSION_TAGS, ROLE_CHAINING_MAX_DURATION_SECONDS,
-            SET_SOURCE_IDENTITY_ACTION, TAG_SESSION_ACTION,
+            SESSION_TOKEN_SIZE_LIMIT, SET_SOURCE_IDENTITY_ACTION, TAG_SESSION_ACTION,
         };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -395,20 +395,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // The packed size of the session policies and session tags, as the percentage
-        // of the budget AWS reports; over 100 percent the request does not fit.
+        // The size the session policies and session tags pack into, measured in bytes,
+        // and the same size as the percentage of the token budget AWS reports. A mint
+        // whose packed token passes the budget does not fit, and the refusal names the
+        // measured size and the limit it passed.
+        let packed_bytes = crate::state::packed_policy_bytes(
+            input.policy.as_deref(),
+            &named_policy_arns,
+            input.tags.as_deref().unwrap_or(&[]),
+        );
         let packed_policy = packed_policy_size(
             input.policy.as_deref(),
             &named_policy_arns,
             input.tags.as_deref().unwrap_or(&[]),
         );
-        if let Some(percent) = packed_policy.filter(|percent| *percent > 100) {
+        if packed_bytes > SESSION_TOKEN_SIZE_LIMIT {
             return Err(AssumeRoleErrorModeled::PackedPolicyTooLargeException(
                 PackedPolicyTooLargeException {
-                    message: Some(format!(
-                        "Serialized token too large for session: the session policies and session \
-                         tags pack to {percent} percent of the allowed size"
-                    )),
+                    message: Some(crate::state::packed_policy_too_large_message(packed_bytes)),
                 },
             )
             .into());

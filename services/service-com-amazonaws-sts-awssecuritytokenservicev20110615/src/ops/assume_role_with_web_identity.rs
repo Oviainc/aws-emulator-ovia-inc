@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssumeRoleWithWebIdentity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssumeRoleWithWebIdentity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Federates a web identity into a role session: the presented token is validated here and,
+//! when it is one this emulator ISSUED, exchanged for a session of the role the request
+//! names — recorded in this service's registry like every other session, so
+//! `GetCallerIdentity` under the credential reports the assumed-role identity. The
+//! operation is ANONYMOUS (`auth: []`, `optionalAuth`), so it is served to a caller holding
+//! no Amazon Web Services credential at all — see `crate::service` for how such a request
+//! is attributed to this service.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssumeRoleWithWebIdentity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What decides the answer is the token:
+//!
+//! * a value that is not a compact JSON Web Token is `InvalidIdentityToken`;
+//! * a token whose expiry has passed is `ExpiredTokenException`, whatever its signature;
+//! * a token this emulator did not issue is `InvalidIdentityToken`. Accepting one would mean
+//!   verifying its signature against the key set its issuer publishes at the issuer's own
+//!   endpoint, and this emulator fetches nothing from outside itself, so it holds no
+//!   issuer's verification key — the condition AWS answers with that same error. What it
+//!   CAN establish is that the token is one it issued, which is the registry
+//!   `service_common::web_identity_tokens` holds (written by the Amazon Cognito Identity
+//!   `GetOpenIdToken` / `GetOpenIdTokenForDeveloperIdentity` that minted it);
+//! * a token it did issue is exchanged, provided the role's trust policy admits the
+//!   issuer for `sts:AssumeRoleWithWebIdentity` with the audience and subject the token
+//!   carries; otherwise `AccessDenied`.
+//!
+//! `ProviderId` names "the fully qualified host component of the domain name of the OAuth
+//! 2.0 identity provider" and is read NOWHERE here: it describes an OAuth 2.0 access
+//! token, which is not a token this emulator issues, so a request naming one is answered
+//! for the token it presents exactly as a request without it is.
 //!
 //! ## Shape of an operation
 //!
@@ -308,18 +326,368 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssumeRoleWithWebIdentity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssumeRoleWithWebIdentityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssumeRoleWithWebIdentity"))
+        use crate::state::{
+            packed_policy_bytes, packed_policy_size, packed_policy_too_large_message,
+            parse_role_arn, policy_document_error, sts_arn, Identity, NewSession, SessionKind,
+            ASSUME_ROLE_DEFAULT_DURATION_SECONDS, MAX_MANAGED_SESSION_POLICIES,
+            SESSION_TOKEN_SIZE_LIMIT,
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This service has no store on the engine it was mounted on, so it cannot
+            // record a session and must not hand one out. The router builds the one engine
+            // that does, so this is unreachable there.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "AssumeRoleWithWebIdentity",
+            ));
+        };
+        let store = ctx.credential_store();
+
+        // The TOKEN is what this caller is, and it is decided first: the recorded behaviour
+        // of a well-formed but nonexistent `RoleArn` presented with an unreadable token is
+        // the token's refusal, not the role's.
+        let identity = self.web_identity(&input.web_identity_token, now)?;
+
+        // The role ARN decides the account the session belongs to and the role name the
+        // assumed-role ARN carries. Its length and character set are modelled, but being
+        // an IAM role ARN of an account is not, so it is refused here.
+        if parse_role_arn(&input.role_arn).is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "RoleArn '{}' is not an IAM role ARN of the form \
+                 arn:<partition>:iam::<account>:role/<name>",
+                input.role_arn
+            )));
+        }
+
+        // An inline session policy must be a JSON policy document, and the refusal
+        // "describes the specific error" the submitted document has.
+        if let Some(why) = input.policy.as_deref().and_then(policy_document_error) {
+            return Err(
+                AssumeRoleWithWebIdentityErrorModeled::MalformedPolicyDocumentException(
+                    MalformedPolicyDocumentException { message: Some(why) },
+                )
+                .into(),
+            );
+        }
+
+        // The managed session policies a mint may name are capped by the operation's
+        // documentation, not by the model's list shape.
+        let named_policy_arns = crate::state::policy_arns(input.policy_arns.as_deref());
+        if named_policy_arns.len() > MAX_MANAGED_SESSION_POLICIES {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "1 validation error detected: Value '[{}]' at 'policyArns' failed to satisfy \
+                 constraint: Member must have length less than or equal to \
+                 {MAX_MANAGED_SESSION_POLICIES}",
+                named_policy_arns.join(", ")
+            )));
+        }
+
+        // The packed-token rule this service applies to every mint: the measured size of
+        // the session policies and session tags (this operation carries no session tags),
+        // refused past the token budget with the size and the limit named.
+        let packed_bytes = packed_policy_bytes(input.policy.as_deref(), &named_policy_arns, &[]);
+        let packed_policy = packed_policy_size(input.policy.as_deref(), &named_policy_arns, &[]);
+        if packed_bytes > SESSION_TOKEN_SIZE_LIMIT {
+            return Err(
+                AssumeRoleWithWebIdentityErrorModeled::PackedPolicyTooLargeException(
+                    PackedPolicyTooLargeException {
+                        message: Some(packed_policy_too_large_message(packed_bytes)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The role is read from the IAM store in the same engine, and only the facts this
+        // decision needs are copied out, so the IAM lock and the session lock are never
+        // held at once. A router without IAM mounted holds no role at all, which is the
+        // same answer as a role the account does not hold.
+        let role = crate::state::iam_state(&*self.engine)
+            .and_then(|iam| crate::state::resolve_role(&iam.lock(), &input.role_arn));
+
+        // Nothing is assumed that the account does not hold and no trust policy admits.
+        // The principals a trust policy names for a web identity are the issuer's own
+        // spellings, and the condition keys are the ones that issuer publishes about the
+        // token — see `crate::state::web_identity_principals` /
+        // `web_identity_condition_context`.
+        let principals = crate::state::web_identity_principals(&identity.issuer);
+        let context = crate::state::web_identity_condition_context(&identity);
+        let published = crate::state::web_identity_published_condition_keys(&identity.issuer);
+        let published: Vec<&str> = published.iter().map(String::as_str).collect();
+        let admitted = role.as_ref().is_some_and(|role| {
+            role.trust_policy_admits(
+                crate::state::ASSUME_ROLE_WITH_WEB_IDENTITY_ACTION,
+                &principals,
+                &context,
+                &published,
+            )
+        });
+        // STS does not disclose whether the resource EXISTS, so a role this account holds
+        // no record of and a role whose trust policy withholds the grant are worded alike.
+        let Some(role) = role.filter(|_| admitted) else {
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                WEB_IDENTITY_NOT_AUTHORIZED_MESSAGE,
+            ));
+        };
+
+        // "By default, the temporary security credentials created by
+        // AssumeRoleWithWebIdentity last for one hour", and the ceiling is the role's own
+        // maximum session duration.
+        let duration_seconds = input
+            .duration_seconds
+            .unwrap_or(ASSUME_ROLE_DEFAULT_DURATION_SECONDS);
+        if duration_seconds > role.max_session_duration {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "The requested DurationSeconds exceeds the MaxSessionDuration set for this role.",
+            ));
+        }
+
+        // The token is evidence at EXCHANGE time only: this operation's `DurationSeconds`
+        // "can range from 900 seconds (15 minutes) up to the maximum session duration
+        // setting for the role" (this operation's model) and the identity token's own
+        // lifetime is not among its bounds, so the session it vends is not shortened to it.
+
+        let assumed_role_id = format!("{}:{}", role.role_id, input.role_session_name);
+        let assumed_role_arn = sts_arn(
+            &role.account,
+            &format!("assumed-role/{}/{}", role.role_name, input.role_session_name),
+        );
+        let session_identity = Identity {
+            user_id: assumed_role_id.clone(),
+            account: role.account.clone(),
+            arn: assumed_role_arn.clone(),
+        };
+
+        let mut registry = state.lock();
+        let minted = crate::state::mint_session(
+            store,
+            &mut registry,
+            now,
+            NewSession {
+                packed_policy_size: packed_policy,
+                role_arn: Some(role.arn.clone()),
+                ..NewSession::new(session_identity, SessionKind::AssumedRole, duration_seconds)
+            },
+        );
+        let minted = match minted {
+            Ok(minted) => minted,
+            // The bounded session registry is full of sessions that have not expired, so
+            // this one cannot be recorded — and a credential that is not recorded must not
+            // be handed out.
+            Err(why) => return Err(crate::scaffolded::Scaffolded::validation(why.message())),
+        };
+        if let Err(why) = crate::state::honour_minimum_token_size(
+            &mut registry,
+            store,
+            &minted,
+            input.minimum_session_token_size,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
+
+        let (session_token_utilization, session_token_size) =
+            crate::state::session_token_metrics(&minted.credentials);
+        Ok(AssumeRoleWithWebIdentityOutput {
+            credentials: Some(minted.credentials),
+            assumed_role_user: Some(AssumedRoleUser {
+                assumed_role_id,
+                arn: assumed_role_arn,
+            }),
+            packed_policy_size: packed_policy,
+            // The three facts the token itself carries, as the issuance recorded them:
+            // "the value of the `iss` field", the client id the token was issued for, and
+            // "the value returned by the identity provider as the token's `sub` claim".
+            provider: Some(identity.issuer),
+            audience: Some(identity.audience),
+            subject_from_web_identity_token: Some(identity.subject),
+            // "The value of the source identity that is returned in the JSON web token
+            // (JWT) from the identity provider": a claim of the token, and the tokens this
+            // emulator issues carry none.
+            source_identity: None,
+            session_token_utilization: Some(session_token_utilization),
+            session_token_size: Some(session_token_size),
+        })
     }
+}
+
+/// How AWS words the refusal of a web identity the role's trust policy does not admit —
+/// which is also the answer for a role the account does not hold, because STS does not
+/// disclose whether the resource exists. A web identity presents no Amazon Web Services
+/// principal, so the sentence names the action alone.
+const WEB_IDENTITY_NOT_AUTHORIZED_MESSAGE: &str =
+    "Not authorized to perform sts:AssumeRoleWithWebIdentity";
+
+/// The claim a token carries its expiry in: "the expiration time on or after which the
+/// JWT MUST NOT be accepted for processing", a NumericDate (RFC 7519 §4.1.4), which an
+/// OpenID Connect ID token is required to carry.
+const EXPIRY_CLAIM: &str = "exp";
+
+/// The claim a token carries its ISSUER in — "the principal that issued the JWT" (RFC 7519
+/// §4.1.1) — which an OpenID Connect ID token carries as the issuer's URL. It is what
+/// decides which provider's keys and which condition keys a token is read against.
+const ISSUER_CLAIM: &str = "iss";
+
+/// How AWS words the refusal of a value that is not a readable identity token, including
+/// one that carries no expiry at all: an ID token is a JSON Web Token, and an OAuth 2.0
+/// ACCESS token presented in its place is the mistake the sentence names.
+const UNREADABLE_TOKEN_MESSAGE: &str =
+    "The ID Token provided is not a valid JWT. (You may see this error if you sent an \
+     Access Token)";
+
+/// How AWS words the refusal of a token of valid form whose signature it could not check:
+/// the verifying key lives at the issuer's own key-set endpoint, and the verifier could
+/// not retrieve it.
+const UNVERIFIABLE_TOKEN_MESSAGE: &str =
+    "Couldn't retrieve verification key from your identity provider, please reference \
+     AssumeRoleWithWebIdentity documentation for requirements";
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AssumeRoleWithWebIdentity<Eng> {
+    /// The identity `presented` stands for, or the modelled failure AWS answers for a token
+    /// that stands for none.
+    ///
+    /// What the registry holds is the issuances THIS emulator made, so a token in it is one
+    /// whose issuer is this emulator — the evidence it has in place of a signature checked
+    /// against an issuer's published key. Anything else is classified by
+    /// [`Self::refuse_token`].
+    fn web_identity(
+        &self,
+        presented: &str,
+        now: ::std::time::SystemTime,
+    ) -> Result<::service_common::web_identity_tokens::IssuedWebIdentity, AssumeRoleWithWebIdentityError>
+    {
+        let issued = crate::state::issued_web_identity_tokens(&*self.engine)
+            .and_then(|registry| registry.lock().issued(presented, now).cloned());
+        match issued {
+            Some(issued) => Ok(issued),
+            None => Err(self.refuse_token(presented, now)),
+        }
+    }
+
+    /// Why `presented` is not a web identity this emulator can federate, as the modelled
+    /// failure AWS answers for it.
+    ///
+    /// The classes, in the order a verifier decides them — the form of the value, what its
+    /// claims say, which provider issued it, and whether the token is one it can trust:
+    ///
+    /// 1. not a compact JSON Web Token at all (`service_common::jwt`, the tree's one
+    ///    reading of one), or a token carrying no readable `exp` claim, which an ID token
+    ///    is required to carry: `InvalidIdentityToken`, HTTP 400.
+    /// 2. a token whose `exp` is at or before `now`: `ExpiredTokenException`, HTTP 400. An
+    ///    expired token is expired WHATEVER its signature, so the claim is read from a
+    ///    token nothing signed too (`jwt::read_unsecured`) and this decision is taken
+    ///    before the signature is considered. The message states both instants as the
+    ///    NumericDate seconds the claim is written in — the clock's and the token's own, so
+    ///    the caller can see by how much it missed.
+    /// 3. a token whose `iss` names an identity provider the ACCOUNT has not registered:
+    ///    `InvalidIdentityToken`, HTTP 400, naming the issuer the token claims. An OpenID
+    ///    Connect provider is registered with `iam:CreateOpenIDConnectProvider`, which is
+    ///    what tells the account's roles that the issuer may be trusted at all, and the
+    ///    Amazon Cognito Identity issuer needs no registration because every account's
+    ///    Cognito identity pools are issued by it. Read from IAM's own provider records in
+    ///    the same engine, so registering a provider is what makes its tokens resolvable.
+    /// 4. anything else: `InvalidIdentityToken`, HTTP 400, because the token is not one
+    ///    this emulator issued and it cannot establish that the registered issuer did. A
+    ///    JWS is verified against the key its issuer publishes at that issuer's key-set
+    ///    endpoint; this emulator makes no request outside itself, so it holds no issuer's
+    ///    verification key, and a token whose signature nobody checked must not be
+    ///    federated into credentials. AWS answers this same error when the verification key
+    ///    cannot be retrieved.
+    fn refuse_token(
+        &self,
+        presented: &str,
+        now: ::std::time::SystemTime,
+    ) -> AssumeRoleWithWebIdentityError {
+        let invalid = |message: String| {
+            AssumeRoleWithWebIdentityErrorModeled::InvalidIdentityTokenException(
+                InvalidIdentityTokenException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+        let Ok(token) = ::service_common::jwt::read_unsecured(presented) else {
+            return invalid(UNREADABLE_TOKEN_MESSAGE.to_string());
+        };
+        let Some(expiry) = token.claims.get(EXPIRY_CLAIM).and_then(numeric_date) else {
+            return invalid(UNREADABLE_TOKEN_MESSAGE.to_string());
+        };
+        let at = unix_seconds(now);
+        if at >= expiry {
+            return AssumeRoleWithWebIdentityErrorModeled::ExpiredTokenException(
+                ExpiredTokenException {
+                    message: Some(format!(
+                        "Token expired: current date/time {at} must be before the expiration \
+                         date/time {expiry}"
+                    )),
+                },
+            )
+            .into();
+        }
+        let issuer = token.claim_str(ISSUER_CLAIM).unwrap_or_default().trim();
+        if issuer.is_empty() {
+            // An OpenID Connect ID token is required to name the principal that issued it
+            // (RFC 7519 §4.1.1), and a token naming none cannot be read against any
+            // provider's keys or condition keys at all.
+            return invalid(UNREADABLE_TOKEN_MESSAGE.to_string());
+        }
+        if !self.account_registered_issuer(issuer) {
+            return invalid(format!(
+                "No OpenIDConnect provider found in your account for {issuer}"
+            ));
+        }
+        invalid(UNVERIFIABLE_TOKEN_MESSAGE.to_string())
+    }
+
+    /// Whether the ACCOUNT can resolve `issuer` as an identity provider at all.
+    ///
+    /// Two ways it can: the account registered an IAM OpenID Connect provider for that
+    /// issuer — `iam:CreateOpenIDConnectProvider` keys one by the ARN its URL derives
+    /// ([`crate::state::web_identity_provider_name`] drops the scheme the same way) — or
+    /// the issuer is Amazon Cognito Identity's own, which every account's identity pools
+    /// are issued by and which is registered nowhere.
+    fn account_registered_issuer(&self, issuer: &str) -> bool {
+        let provider = crate::state::web_identity_provider_name(issuer);
+        if provider.is_empty() {
+            return false;
+        }
+        if provider == crate::state::COGNITO_IDENTITY_PROVIDER_NAME {
+            return true;
+        }
+        crate::state::iam_state(&*self.engine).is_some_and(|iam| {
+            iam.lock()
+                .open_id_connect_providers
+                .values()
+                .any(|record| crate::state::web_identity_provider_name(&record.url) == provider)
+        })
+    }
+}
+
+/// `at` as whole seconds since the Unix epoch, the unit a token's expiry claim is written
+/// in (RFC 7519 §2's NumericDate).
+fn unix_seconds(at: ::std::time::SystemTime) -> i64 {
+    at.duration_since(::std::time::SystemTime::UNIX_EPOCH)
+        .map(|since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
+}
+
+/// A claim written as RFC 7519 §2's NumericDate, in whole seconds.
+///
+/// A NumericDate is "a JSON numeric value representing the number of seconds from
+/// 1970-01-01T00:00:00Z UTC until the specified UTC date/time, ignoring leap seconds"
+/// where "non-integer values can be used" (§2) — an issuer that writes a fractional
+/// instant has written a valid one, so it is read and truncated to the whole seconds the
+/// refusal states. A claim that is not a JSON number at all is no NumericDate and reads
+/// as absent.
+fn numeric_date(value: &::serde_json::Value) -> Option<i64> {
+    if let Some(seconds) = value.as_i64() {
+        return Some(seconds);
+    }
+    let seconds = value.as_f64()?;
+    if !seconds.is_finite() {
+        return None;
+    }
+    // A float-to-integer cast saturates at the integer's bounds rather than wrapping, so
+    // an instant beyond them reads as the nearest representable one.
+    Some(seconds.trunc() as i64)
 }

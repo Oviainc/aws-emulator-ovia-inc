@@ -40,16 +40,18 @@ pub const ASSUME_ROLE_DEFAULT_DURATION_SECONDS: i32 = 3600;
 /// this service's model).
 pub const VENDED_SESSION_DEFAULT_DURATION_SECONDS: i32 = 43_200;
 
-/// The budget the packed-policy percentage is measured against: "The plaintext that
-/// you use for both inline and managed session policies can't exceed 2,048
-/// characters." (`AssumeRole`'s documentation, this service's model). AWS reports
-/// `PackedPolicySize` as "a percentage value that indicates the packed size of the
-/// session policies and session tags combined passed in the request", so the
-/// percentage here is of this documented plaintext budget.
-pub const PACKED_POLICY_PLAINTEXT_BUDGET: usize = 2048;
-
-/// The session-token size STS will not exceed, from the model's
-/// `minimumSessionTokenSizeType` range (`0..4096`).
+/// The size, in bytes, of the largest serialized session token STS will issue — the
+/// budget the session policies and session tags of ONE mint are packed into, from the
+/// model's `minimumSessionTokenSizeType` range (`0..4096`).
+///
+/// It is the limit BOTH halves of the packed-policy rule are stated against: a mint
+/// whose packed token passes it is refused ([`packed_policy_too_large_message`]), and
+/// `PackedPolicySize` — "a percentage value that indicates the packed size of the
+/// session policies and session tags combined passed in the request" whose "request
+/// fails if the packed size is greater than 100 percent" (`AssumeRole`'s
+/// documentation, this service's model) — is that same size as a percentage of it
+/// ([`packed_policy_size`]). One budget for the two is what makes them agree: over 100
+/// percent is exactly over the byte limit.
 pub const SESSION_TOKEN_SIZE_LIMIT: usize = 4096;
 
 /// The name of the ambient IAM user: the identity a request speaks for when its
@@ -82,6 +84,12 @@ pub const TAG_SESSION_ACTION: &str = "sts:TagSession";
 
 /// The IAM action a role's trust policy must allow for a mint to set a source identity.
 pub const SET_SOURCE_IDENTITY_ACTION: &str = "sts:SetSourceIdentity";
+
+/// The IAM action a role's trust policy must allow for a WEB IDENTITY to assume it:
+/// "The trust policies of these roles must accept the cognito-identity.amazonaws.com
+/// service principal" (`AssumeRoleWithWebIdentity$RoleArn`, this service's model), which is
+/// a grant of this action to that principal.
+pub const ASSUME_ROLE_WITH_WEB_IDENTITY_ACTION: &str = "sts:AssumeRoleWithWebIdentity";
 
 /// The condition key a trust policy tests a request's `ExternalId` through.
 pub const EXTERNAL_ID_CONDITION_KEY: &str = "sts:ExternalId";
@@ -866,12 +874,32 @@ impl ResolvedRole {
         principals: &[String],
         context: &[(String, String)],
     ) -> bool {
+        self.trust_policy_admits(
+            action,
+            principals,
+            context,
+            ASSUME_ROLE_PUBLISHED_CONDITION_KEYS,
+        )
+    }
+
+    /// [`Self::trust_policy_allows`] with the condition keys the REQUEST publishes stated
+    /// explicitly, for a mint whose published keys are not the `AssumeRole` ones: a web
+    /// identity's keys are named after the provider that issued the token
+    /// ([`web_identity_condition_context`]), so they cannot be a constant.
+    #[must_use]
+    pub fn trust_policy_admits(
+        &self,
+        action: &str,
+        principals: &[String],
+        context: &[(String, String)],
+        published: &[&str],
+    ) -> bool {
         let Some(document) = self.trust_policy.as_deref() else {
             return false;
         };
         let request = ::service_common::iam_authorization::Request::new(action, &self.arn, principals)
             .with_context(context)
-            .with_published_keys(ASSUME_ROLE_PUBLISHED_CONDITION_KEYS);
+            .with_published_keys(published);
         ::service_common::iam_authorization::resource_decision(document, &request)
             == ::service_common::iam_authorization::Decision::Allowed
     }
@@ -1008,6 +1036,89 @@ fn caller_principal_type(kind: Option<SessionKind>) -> &'static str {
         Some(SessionKind::FederationToken) => "FederatedUser",
         Some(SessionKind::SessionToken) | None => "User",
     }
+}
+
+/// The registry of web identity tokens THIS emulator issued, in the same shared engine:
+/// one store, written by the service that issues such a token and read here, by the
+/// service that redeems it (`AssumeRoleWithWebIdentity`).
+///
+/// `None` means the engine carries no such registry, which is an engine on which no token
+/// was ever issued — so no token can be redeemed against it either.
+pub fn issued_web_identity_tokens<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::web_identity_tokens::IssuedWebIdentityTokens>>
+{
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<::service_common::web_identity_tokens::IssuedWebIdentityTokens>)
+}
+
+/// Every spelling of a web identity's ISSUER that a role's trust policy may name in its
+/// `Principal` element.
+///
+/// A trust policy admits a web identity by naming its issuer as a FEDERATED principal, and
+/// AWS accepts two spellings of one issuer: the service principal or host name an identity
+/// provider is known by (`cognito-identity.amazonaws.com`, `accounts.google.com`) and the
+/// ARN of the IAM OpenID Connect provider the account registered for it
+/// (`arn:aws:iam::<account>:oidc-provider/<host>`). The `iss` claim itself carries the
+/// issuer as a URL, so the scheme is dropped to get the name the other two are built from
+/// — the form a policy and a condition key both spell it in.
+#[must_use]
+pub fn web_identity_provider_name(issuer: &str) -> &str {
+    issuer
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+}
+
+/// The identity provider every Amazon Cognito identity pool's tokens are issued by, as a
+/// trust policy and a condition key name it: "The trust policies of these roles must accept
+/// the cognito-identity.amazonaws.com service principal"
+/// (`AssumeRoleWithWebIdentity$RoleArn`, this service's model).
+///
+/// It is the one issuer an account can federate without registering an OpenID Connect
+/// provider for it, because the pools it issues for are the account's own.
+pub const COGNITO_IDENTITY_PROVIDER_NAME: &str = "cognito-identity.amazonaws.com";
+
+/// See [`web_identity_provider_name`]: the principals a trust-policy decision about a web
+/// identity is made for.
+#[must_use]
+pub fn web_identity_principals(issuer: &str) -> Vec<String> {
+    let provider = web_identity_provider_name(issuer);
+    vec![
+        provider.to_string(),
+        issuer.to_string(),
+        format!(
+            "arn:aws:iam::{}:oidc-provider/{provider}",
+            ::engine::emulator_account_id()
+        ),
+    ]
+}
+
+/// The condition keys an identity provider publishes about ONE of its tokens, for a trust
+/// policy's `Condition` to be decided against: `<provider>:aud` — "the intended audience
+/// (also known as client ID) of the web identity token" — and `<provider>:sub`, the
+/// identity the token names. Both are prefixed with the provider the token came from, as
+/// AWS names them, so a clause written for one provider never decides another's token.
+#[must_use]
+pub fn web_identity_condition_context(
+    identity: &::service_common::web_identity_tokens::IssuedWebIdentity,
+) -> Vec<(String, String)> {
+    let provider = web_identity_provider_name(&identity.issuer);
+    vec![
+        (format!("{provider}:aud"), identity.audience.clone()),
+        (format!("{provider}:sub"), identity.subject.clone()),
+    ]
+}
+
+/// The keys [`web_identity_condition_context`] publishes, as the policy evaluator needs
+/// them: the keys whose absence means the token carried no such claim rather than this
+/// emulator not knowing the key.
+#[must_use]
+pub fn web_identity_published_condition_keys(issuer: &str) -> Vec<String> {
+    let provider = web_identity_provider_name(issuer);
+    vec![format!("{provider}:aud"), format!("{provider}:sub")]
 }
 
 /// The modelled character class a session tag's key and value must satisfy
@@ -1196,26 +1307,52 @@ pub fn is_account_id(value: &str) -> bool {
     value.len() == 12 && value.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// The percentage of the packed-policy budget a request's session policies and
-/// session tags take up, or `None` when the request carries none of them — which is
-/// when AWS reports no `PackedPolicySize` at all.
+/// The SIZE, in bytes, of the serialized token one mint's session policies and session
+/// tags pack into.
 ///
-/// AWS packs the inline session policy, the managed policy ARNs and the session tags
-/// into one payload and reports its size as a percentage; a request over 100 percent
-/// is refused with `PackedPolicyTooLargeException`. The percentage is rounded up, so
-/// anything packed at all reports at least one percent.
-pub fn packed_policy_size(policy: Option<&str>, policy_arns: &[String], tags: &[Tag]) -> Option<i32> {
+/// "An Amazon Web Services conversion compresses the session policy document, session
+/// policy ARNs, and session tags into a packed binary format that has a separate limit"
+/// (`PackedPolicyTooLargeException`, this service's model), so the size is measured over
+/// exactly those three: the inline policy document, the managed policy ARNs it names, and
+/// each session tag's key and value. The emulator packs them without compressing, so the
+/// measured size is the bytes they occupy — which is the figure the refusal reports and
+/// the figure [`packed_policy_size`] is the percentage of.
+pub fn packed_policy_bytes(policy: Option<&str>, policy_arns: &[String], tags: &[Tag]) -> usize {
     let policy_bytes = policy.map_or(0, str::len);
     let arn_bytes: usize = policy_arns.iter().map(String::len).sum();
     let tag_bytes: usize = tags.iter().map(|tag| tag.key.len() + tag.value.len()).sum();
-    let packed = policy_bytes + arn_bytes + tag_bytes;
+    policy_bytes + arn_bytes + tag_bytes
+}
+
+/// The percentage of [`SESSION_TOKEN_SIZE_LIMIT`] a request's session policies and
+/// session tags take up, or `None` when the request carries none of them — which is
+/// when AWS reports no `PackedPolicySize` at all.
+///
+/// The percentage is rounded up, so anything packed at all reports at least one percent,
+/// and it passes 100 exactly when the packed size passes the byte limit — the one
+/// condition `PackedPolicyTooLargeException` is answered for.
+pub fn packed_policy_size(policy: Option<&str>, policy_arns: &[String], tags: &[Tag]) -> Option<i32> {
+    let packed = packed_policy_bytes(policy, policy_arns, tags);
     if packed == 0 {
         return None;
     }
-    let percent = packed
-        .saturating_mul(100)
-        .div_ceil(PACKED_POLICY_PLAINTEXT_BUDGET);
+    let percent = packed.saturating_mul(100).div_ceil(SESSION_TOKEN_SIZE_LIMIT);
     Some(i32::try_from(percent).unwrap_or(i32::MAX))
+}
+
+/// How AWS words `PackedPolicyTooLarge`: the size the request's session policies and
+/// session tags were measured at, and the limit that size passed.
+///
+/// The message names the constraint the request violated rather than a percentage,
+/// because the caller trimming a session policy or a session tag to fit needs both
+/// figures to know how much to remove. Both come from this mint — `packed` is measured
+/// over the request ([`packed_policy_bytes`]) and the limit is the service's own
+/// ([`SESSION_TOKEN_SIZE_LIMIT`]).
+pub fn packed_policy_too_large_message(packed: usize) -> String {
+    format!(
+        "Serialized token too large for session. Token size of {packed} bytes exceeds the \
+         maximum allowed limit of {SESSION_TOKEN_SIZE_LIMIT} bytes."
+    )
 }
 
 /// The ARNs of the managed session policies a request named.

@@ -255,7 +255,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             caller_may_call, duplicate_tag_key, long_term_identity, packed_policy_size,
             policy_document_error, resolve_request_caller, sts_arn, Identity, NewSession,
-            SessionKind, MAX_MANAGED_SESSION_POLICIES, VENDED_SESSION_DEFAULT_DURATION_SECONDS,
+            SessionKind, MAX_MANAGED_SESSION_POLICIES, SESSION_TOKEN_SIZE_LIMIT,
+            VENDED_SESSION_DEFAULT_DURATION_SECONDS,
         };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -303,18 +304,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // The same packed-token rule this service applies to every mint: the measured
+        // size of the session policies and session tags, refused past the token budget
+        // with the size and the limit named, and reported as the percentage of that
+        // budget (see `crate::state::packed_policy_bytes`).
+        let packed_bytes = crate::state::packed_policy_bytes(
+            input.policy.as_deref(),
+            &named_policy_arns,
+            input.tags.as_deref().unwrap_or(&[]),
+        );
         let packed_policy = packed_policy_size(
             input.policy.as_deref(),
             &named_policy_arns,
             input.tags.as_deref().unwrap_or(&[]),
         );
-        if let Some(percent) = packed_policy.filter(|percent| *percent > 100) {
+        if packed_bytes > SESSION_TOKEN_SIZE_LIMIT {
             return Err(GetFederationTokenErrorModeled::PackedPolicyTooLargeException(
                 PackedPolicyTooLargeException {
-                    message: Some(format!(
-                        "Serialized token too large for session: the session policies and session \
-                         tags pack to {percent} percent of the allowed size"
-                    )),
+                    message: Some(crate::state::packed_policy_too_large_message(packed_bytes)),
                 },
             )
             .into());

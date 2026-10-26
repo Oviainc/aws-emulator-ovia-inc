@@ -324,17 +324,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // recorded, which is what lets the service say later which identity the token it
         // handed out names. This call carries no `PrincipalTags` member, so the record
         // names none rather than an empty map.
-        store.record_open_id_token(
-            token.clone(),
-            crate::state::IssuedOpenIdToken {
-                identity_id: input.identity_id.clone(),
-                identity_pool_id,
-                issued_at: now,
-                expiration,
-                principal_tags: None,
-            },
-            now,
-        );
+        let issued = crate::state::IssuedOpenIdToken {
+            identity_id: input.identity_id.clone(),
+            identity_pool_id,
+            issued_at: now,
+            expiration,
+            principal_tags: None,
+        };
+        store.record_open_id_token(token.clone(), issued.clone(), now);
+        // The same issuance, in the registry the service that REDEEMS this token reads
+        // (`sts:AssumeRoleWithWebIdentity`), which is how a token this emulator issued is
+        // told apart from one it did not. Recorded after this service's own store and with
+        // its lock released, so the two registries are never held at once.
+        drop(store);
+        crate::state::record_issued_web_identity(&*self.engine, &token, &issued, now);
 
         Ok(GetOpenIdTokenOutput {
             identity_id: Some(input.identity_id),

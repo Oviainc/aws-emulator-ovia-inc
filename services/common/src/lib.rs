@@ -260,6 +260,9 @@ pub mod rpc_target;
 pub mod shared_path;
 pub mod validation;
 pub mod validation_message;
+/// The web identity tokens this emulator itself issued: the registry a redeemer of one
+/// reads, written by the service that issued it.
+pub mod web_identity_tokens;
 
 pub use validation_message::aws_validation_refusal;
 
