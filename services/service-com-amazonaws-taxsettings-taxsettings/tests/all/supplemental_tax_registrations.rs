@@ -45,7 +45,7 @@ use crate::tax_registration_lifecycle::{call, emulator, emulator_with_engine, An
 
 /// Hold every stored supplemental TRN's validation open, so a listing reports
 /// the status the write reported however long the test takes to get there.
-fn hold_supplemental_validations_open(engine: &Arc<engine::InMemoryEngine>) {
+pub(crate) fn hold_supplemental_validations_open(engine: &Arc<engine::InMemoryEngine>) {
     let state = engine.state::<ComAmazonawsTaxsettingsTaxsettingsState>();
     let mut store = state.lock();
     for stored in store.supplemental_registrations.values_mut() {
@@ -56,7 +56,7 @@ fn hold_supplemental_validations_open(engine: &Arc<engine::InMemoryEngine>) {
 /// Make every stored supplemental TRN's validation due, the way the clock would
 /// have: the next listing must report what the validation reached. Never a
 /// sleep — the due instant is state.
-fn make_supplemental_validations_due(engine: &Arc<engine::InMemoryEngine>) {
+pub(crate) fn make_supplemental_validations_due(engine: &Arc<engine::InMemoryEngine>) {
     let state = engine.state::<ComAmazonawsTaxsettingsTaxsettingsState>();
     let mut store = state.lock();
     for stored in store.supplemental_registrations.values_mut() {

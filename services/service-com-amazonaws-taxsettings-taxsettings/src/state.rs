@@ -31,11 +31,15 @@ use crate::ops::types::{
 /// validation occurring on the TRN, the status can be Verified, Pending or
 /// Rejected."
 pub const STATUS_PENDING: &str = "Pending";
-/// See [`STATUS_PENDING`]. Never reached: a TRN is verified by checking it
-/// against the tax authority's registry, and there is none here — see
-/// [`SETTLED_REGISTRATION_STATUS`].
+/// See [`STATUS_PENDING`]: the validation of the submitted TRN succeeded, which
+/// is what a registration the service accepted and stored reaches once that
+/// validation falls due — see [`SETTLED_REGISTRATION_STATUS`].
 pub const STATUS_VERIFIED: &str = "Verified";
-/// See [`STATUS_PENDING`].
+/// See [`STATUS_PENDING`]: the validation of the submitted TRN failed. No stored
+/// record reaches it, because a submission this service does not accept is
+/// refused by the write itself ([`check_tax_registration_entry`] and the
+/// per-country rules it applies) rather than stored and reported as failed; a
+/// write that answered 200 accepted the entry.
 pub const STATUS_REJECTED: &str = "Rejected";
 /// See [`STATUS_PENDING`]. Never reached: `DeleteTaxRegistration` REMOVES the
 /// account's record, which is what the real service does too — a read of a
@@ -46,13 +50,14 @@ pub const STATUS_DELETED: &str = "Deleted";
 /// The status a submitted TRN reaches once the validation the write started has
 /// run.
 ///
-/// Validating a TRN means checking the number against the tax authority's
-/// registry, and this emulator has no registry to check one against: no number it
-/// is given can be VERIFIED, whatever its shape, so the validation ends in the
-/// status AWS gives a TRN whose validation did not succeed. Nothing here inspects
-/// the submitted number — a format test would report a verification that never
-/// happened.
-pub const SETTLED_REGISTRATION_STATUS: &str = STATUS_REJECTED;
+/// A registration this service STORED is one it accepted: every entry it will not
+/// stand behind is refused by the write, with the `ValidationException` the
+/// structural and per-country rules state, so the validation of what did get
+/// stored succeeded and the record settles [`STATUS_VERIFIED`]. Reporting
+/// [`STATUS_REJECTED`] for a registration the write answered 200 for would
+/// contradict that 200, and nothing here inspects the submitted number further —
+/// a format test of its own would report a verification that never happened.
+pub const SETTLED_REGISTRATION_STATUS: &str = STATUS_VERIFIED;
 
 /// How long after a write the TRN's validation is due.
 ///
@@ -189,8 +194,8 @@ pub const ADDRESS_MEMBER_DEFAULT: &str = "Unknown";
 ///
 /// NOT a derived value, and not the model's rule for this member: filling one in
 /// means reading the account's registration back from the tax authority's
-/// registry, which this emulator has none of ([`SETTLED_REGISTRATION_STATUS`] is
-/// the other consequence of that), so the LOOKUP is knowingly not emulated and
+/// registry, which this emulator has none of, so the LOOKUP is knowingly not
+/// emulated and
 /// the member says "not known" instead of carrying a legal name or a postcode
 /// nothing produced. A later fixer holding a source for the real value fills it
 /// in here, and nothing else changes.

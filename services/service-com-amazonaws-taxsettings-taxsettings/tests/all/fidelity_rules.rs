@@ -262,12 +262,16 @@ async fn a_submitted_trn_is_pending_until_its_validation_is_due_then_settles() {
         REGISTRATION_STATUSES.contains(&SETTLED_REGISTRATION_STATUS),
         "the settled status must be one the model lists, got {SETTLED_REGISTRATION_STATUS:?}"
     );
-    // And it is the terminal status a TRN no registry could verify reaches: a
-    // registration that settled `Verified` here would claim a verification
-    // nothing performed.
+    // And it is the status a successful validation reaches: the service accepted
+    // and stored this TRN, so settling it to the failed-validation status would
+    // contradict the 200 the write answered.
     assert_eq!(
+        SETTLED_REGISTRATION_STATUS, STATUS_VERIFIED,
+        "an accepted TRN settles Verified, got {SETTLED_REGISTRATION_STATUS:?}"
+    );
+    assert_ne!(
         SETTLED_REGISTRATION_STATUS, STATUS_REJECTED,
-        "an unverifiable TRN settles Rejected, got {SETTLED_REGISTRATION_STATUS:?}"
+        "a stored TRN never settles Rejected, got {SETTLED_REGISTRATION_STATUS:?}"
     );
 
     // Rows differ in the type, the sector and whether documents were submitted:
@@ -388,7 +392,7 @@ async fn a_submitted_trn_is_pending_until_its_validation_is_due_then_settles() {
 
 /// The status `operation` reports for `account_id`, read through `GetTaxRegistration`
 /// or found in the `ListTaxRegistrations` page that carries the account.
-async fn read_status(
+pub(crate) async fn read_status(
     router: &smithy_server_runtime::MultiServiceRouter,
     operation: &str,
     account_id: &str,
