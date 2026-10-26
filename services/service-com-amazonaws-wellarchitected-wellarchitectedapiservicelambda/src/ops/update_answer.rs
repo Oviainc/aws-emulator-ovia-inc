@@ -324,6 +324,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             answer: Some(crate::state::answer_projection(
                 &question,
                 workload.answer(&input.lens_alias, &input.question_id),
+                workload.question_jira_configuration(&input.lens_alias, &input.question_id),
             )),
         })
     }
