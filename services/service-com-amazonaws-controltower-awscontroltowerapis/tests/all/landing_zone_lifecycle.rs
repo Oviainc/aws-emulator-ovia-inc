@@ -430,7 +430,7 @@ async fn the_landing_zone_lifecycle_is_served_from_the_store() {
         listed.get("landingZones")
     );
 
-    // Deleting it removes it from state and logs a DELETE operation.
+    // Deleting it starts an asynchronous decommissioning and logs a DELETE operation.
     let deleted = call(
         &router,
         "/delete-landingzone",
@@ -452,25 +452,34 @@ async fn the_landing_zone_lifecycle_is_served_from_the_store() {
         "delete: expected a new operationIdentifier, got the create's {create_operation:?}"
     );
 
-    let gone = call(
+    // While that DELETE is in flight the landing zone is still a resource, PROCESSING,
+    // and the list still reports it.
+    let decommissioning = call(
         &router,
         "/get-landingzone",
         serde_json::json!({ "landingZoneIdentifier": arn }),
     )
     .await;
     assert_eq!(
-        (gone.status, gone.error_code.as_deref()),
-        (404, Some("ResourceNotFoundException")),
-        "get-landingzone after delete: expected 404 ResourceNotFoundException, got {:?} body {:?}",
-        (gone.status, gone.error_code.as_deref()),
-        gone.body
+        (
+            decommissioning.status,
+            decommissioning
+                .get("landingZone")
+                .get("status")
+                .and_then(|v| v.as_str())
+        ),
+        (200, Some("PROCESSING")),
+        "get-landingzone while the delete is in flight: expected 200 PROCESSING, got {} \
+         body {:?}",
+        decommissioning.status,
+        decommissioning.body
     );
-    let emptied = call(&router, "/list-landingzones", serde_json::json!({})).await;
+    let still_listed = call(&router, "/list-landingzones", serde_json::json!({})).await;
     assert_eq!(
-        emptied.get("landingZones"),
-        &serde_json::json!([]),
-        "list after delete: expected an empty landingZones list, got {:?}",
-        emptied.get("landingZones")
+        still_listed.get("landingZones"),
+        &serde_json::json!([{ "arn": arn }]),
+        "list while the delete is in flight: expected the landing zone still listed, got {:?}",
+        still_listed.get("landingZones")
     );
 
     // The operation log outlives the landing zone: both identifiers still resolve.
@@ -512,9 +521,33 @@ async fn the_landing_zone_lifecycle_is_served_from_the_store() {
         too_soon.body
     );
 
+    // Once the clock has made the DELETE due the landing zone is gone: the reporting
+    // calls stop resolving it.
+    tokio::time::sleep(past_the_settle_span()).await;
+    let gone = call(
+        &router,
+        "/get-landingzone",
+        serde_json::json!({ "landingZoneIdentifier": arn }),
+    )
+    .await;
+    assert_eq!(
+        (gone.status, gone.error_code.as_deref()),
+        (404, Some("ResourceNotFoundException")),
+        "get-landingzone after the delete completed: expected 404 ResourceNotFoundException, \
+         got {:?} body {:?}",
+        (gone.status, gone.error_code.as_deref()),
+        gone.body
+    );
+    let emptied = call(&router, "/list-landingzones", serde_json::json!({})).await;
+    assert_eq!(
+        emptied.get("landingZones"),
+        &serde_json::json!([]),
+        "list after the delete completed: expected an empty landingZones list, got {:?}",
+        emptied.get("landingZones")
+    );
+
     // And a create succeeds again once that operation is due and the account holds no
     // landing zone.
-    tokio::time::sleep(past_the_settle_span()).await;
     let recreated = create(&router, "3.2", simple_manifest()).await;
     assert_ne!(
         recreated.string("arn"),

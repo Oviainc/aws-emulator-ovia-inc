@@ -2,9 +2,10 @@
 
 //! @op DeleteLandingZone
 //!
-//! Removes the landing zone a `landingZoneIdentifier` names from [`crate::state`] and
-//! appends a `DELETE` entry to the landing zone operation log, returning that entry's
-//! `operationIdentifier`.
+//! Starts the decommissioning of the landing zone a `landingZoneIdentifier` names by
+//! appending a `DELETE` entry to the landing zone operation log and parking the landing
+//! zone's removal for that entry's due instant, returning its `operationIdentifier`. The
+//! landing zone stays a reportable resource, `PROCESSING`, until the removal is due.
 //!
 //! Implemented: this operation no longer answers HTTP 501.
 //!
@@ -212,14 +213,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        store.landing_zones.remove(&arn);
-        // The resource is gone, so its tags go with it.
-        store.tags.remove(&arn);
-
-        // The operation log outlives the landing zone, so this identifier stays
-        // resolvable through GetLandingZoneOperation.
-        let operation_identifier =
-            store.record_operation(crate::state::LandingZoneOperationType::Delete, &arn, now);
+        // The delete is ASYNCHRONOUS: this call starts the decommissioning and the
+        // landing zone stops existing when that operation completes, not when this call
+        // returns. Until then the landing zone is still a resource — PROCESSING, listed,
+        // and tagged — and `crate::state`'s settle is what removes it (and its tags) once
+        // the clock has made the operation due. The operation log outlives the landing
+        // zone, so this identifier stays resolvable through GetLandingZoneOperation.
+        let operation_identifier = store.record_landing_zone_deletion(&arn, now);
 
         Ok(DeleteLandingZoneOutput {
             operation_identifier,

@@ -382,6 +382,9 @@ async fn an_arn_that_names_no_resource_is_not_found() {
         "delete-landingzone: expected 200, got {} body {:?}",
         deleted.status, deleted.body
     );
+    // The delete is asynchronous: the landing zone (and its tags) go once the clock has
+    // made that operation due, so the ARN only names nothing after this wait.
+    tokio::time::sleep(past_the_settle_span()).await;
 
     // Every value satisfies `Arn`'s @length(20..2048) and
     // @pattern ^arn:aws[0-9a-zA-Z_\-:\/]+$, so the front door passes them and the

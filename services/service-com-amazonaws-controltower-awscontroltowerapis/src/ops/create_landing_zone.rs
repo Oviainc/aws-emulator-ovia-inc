@@ -210,6 +210,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
+        // A landing zone whose DELETE has not completed is still being decommissioned, so
+        // the account it occupies is not free yet: creating now would collide with that
+        // operation, which is what `ConflictException` reports. Checked before the
+        // one-per-account rule below, so the in-flight decommissioning is reported as the
+        // conflict it is rather than as a landing zone that is simply there.
+        if let Some(in_flight) = store.deletion_in_flight() {
+            return Err(CreateLandingZoneErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "landing zone operation {in_flight} is still in progress; creating a \
+                         landing zone now would leave this account in an inconsistent state"
+                    ),
+                },
+            )
+            .into());
+        }
+
         // One landing zone per account. The rule is read off the store, so it holds no
         // matter which call created the existing one.
         if let Some(existing) = store.landing_zones.keys().min() {
@@ -218,21 +235,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: format!(
                         "this account already has a landing zone ({existing}); AWS Control \
                          Tower supports one landing zone per account"
-                    ),
-                },
-            )
-            .into());
-        }
-
-        // The landing zone an in-flight DELETE is tearing down is already out of the map
-        // above, so the account is still occupied by that operation: creating now would
-        // collide with it, which is what `ConflictException` reports.
-        if let Some(in_flight) = store.oldest_operation_in_flight() {
-            return Err(CreateLandingZoneErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "landing zone operation {in_flight} is still in progress; creating a \
-                         landing zone now would leave this account in an inconsistent state"
                     ),
                 },
             )
@@ -262,6 +264,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // A create deploys the configuration it was given; nothing else is
                 // queued behind it.
                 pending_configuration: None,
+                // A landing zone is not being decommissioned the moment it is created.
+                pending_deletion: None,
                 created_at: now,
             },
         );

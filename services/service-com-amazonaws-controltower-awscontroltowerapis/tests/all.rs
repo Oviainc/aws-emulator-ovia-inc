@@ -47,6 +47,8 @@ mod enabled_control_update;
 mod front_door_validation;
 #[path = "all/get_enabled_control.rs"]
 mod get_enabled_control;
+#[path = "all/landing_zone_decommission.rs"]
+mod landing_zone_decommission;
 #[path = "all/landing_zone_identifier.rs"]
 mod landing_zone_identifier;
 #[path = "all/landing_zone_lifecycle.rs"]

@@ -541,6 +541,25 @@ pub struct PendingLandingZoneConfiguration {
     pub due_at: SystemTime,
 }
 
+/// A landing zone decommissioning a `DELETE` has started and the clock has not yet made
+/// due.
+///
+/// `DeleteLandingZone` "starts an asynchronous operation" that decommissions the landing
+/// zone, so the resource does not disappear when that call returns: it stays a reportable
+/// resource, `PROCESSING`, until [`settle`] removes it at `due_at` — the same instant the
+/// `DELETE` record reaches its terminal status.
+///
+/// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
+#[derive(Debug, Clone)]
+pub struct PendingLandingZoneDeletion {
+    /// The `DELETE` operation whose completion removes the landing zone.
+    pub operation_identifier: String,
+    /// The instant the clock owes this removal — the same instant that operation becomes
+    /// due, held here so applying it never depends on the operation's record still being
+    /// in the (bounded) log. Stored, never slept on.
+    pub due_at: SystemTime,
+}
+
 /// `DriftStatus`: whether an enabled control still matches the configuration Control
 /// Tower deployed.
 ///
@@ -680,6 +699,13 @@ pub struct LandingZone {
     ///
     /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
     pub pending_configuration: Option<PendingLandingZoneConfiguration>,
+    /// The decommissioning an in-flight `DELETE` will complete, `None` while no delete is
+    /// running. [`settle`] removes the landing zone once the clock makes it due, so the
+    /// resource stops existing when the asynchronous delete completes and not when the
+    /// call that asked for it returned.
+    ///
+    /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
+    pub pending_deletion: Option<PendingLandingZoneDeletion>,
     pub created_at: SystemTime,
 }
 
@@ -970,6 +996,30 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             }
         }
 
+        // A DELETE the clock has made due has finished decommissioning its landing zone,
+        // so the resource is gone whether or not anybody called; its operation record
+        // stays, and still resolves. The due instant is the pending deletion's OWN, not
+        // read back off the operation log: `enforce_log_bound` evicts the oldest in-flight
+        // record when every record is in flight, and a missing record must not be read as
+        // "due" and remove a resource the clock does not owe yet.
+        let decommissioned: Vec<String> = self
+            .landing_zones
+            .iter()
+            .filter(|(_, landing_zone)| {
+                landing_zone
+                    .pending_deletion
+                    .as_ref()
+                    .is_some_and(|pending| now >= pending.due_at)
+            })
+            .map(|(arn, _)| arn.clone())
+            .collect();
+        for arn in decommissioned {
+            self.landing_zones.remove(&arn);
+            // A tag entry never outlives the resource it tags, which is what keeps the tag
+            // map bounded by the resource stores.
+            self.tags.remove(&arn);
+        }
+
         // A configuration an UPDATE started deploying becomes the deployed one once the
         // clock has made that deployment due — the same instant the operation record
         // reaches its terminal status — whether or not anybody called. Until then a
@@ -997,7 +1047,12 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             if landing_zone.status == LandingZoneStatus::Failed {
                 continue;
             }
-            let in_flight = any_operation_in_flight(operations, arn);
+            // A landing zone still being decommissioned is PROCESSING whether or not its
+            // DELETE record is still in the (bounded) log: the parked removal is what the
+            // clock owes, so the reported status and that pending transition cannot
+            // diverge.
+            let in_flight = any_operation_in_flight(operations, arn)
+                || landing_zone.pending_deletion.is_some();
             landing_zone.status = if in_flight {
                 LandingZoneStatus::Processing
             } else {
@@ -1246,24 +1301,50 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
         }
     }
 
-    /// The identifier of the earliest-started operation still `IN_PROGRESS` against ANY
-    /// landing zone, or `None` when the account has none. Call [`settle`] first.
+    /// The `operationIdentifier` of a `DELETE` still decommissioning a landing zone of
+    /// this account, or `None` when none is. Call [`settle`] first.
     ///
-    /// An account holds one landing zone, so an operation in flight against any of them
-    /// occupies the account — including a `DELETE`, whose landing zone is already out of
-    /// the map. The `start_time`/identifier pair orders candidates totally, so the answer
-    /// does not depend on the map's iteration order.
+    /// An account holds one landing zone, and a landing zone being decommissioned still
+    /// occupies it: the account is only free once the clock has made that removal due. The
+    /// `due_at`/identifier pair orders the candidates totally, so the answer does not
+    /// depend on the map's iteration order.
     ///
     /// [`settle`]: Self::settle
-    pub fn oldest_operation_in_flight(&self) -> Option<String> {
-        self.landing_zone_operations
+    pub fn deletion_in_flight(&self) -> Option<String> {
+        self.landing_zones
             .values()
-            .filter(|op| op.status == LandingZoneOperationStatus::InProgress)
+            .filter_map(|landing_zone| landing_zone.pending_deletion.as_ref())
             .min_by(|a, b| {
-                (a.start_time, a.operation_identifier.as_str())
-                    .cmp(&(b.start_time, b.operation_identifier.as_str()))
+                (a.due_at, a.operation_identifier.as_str())
+                    .cmp(&(b.due_at, b.operation_identifier.as_str()))
             })
-            .map(|op| op.operation_identifier.clone())
+            .map(|pending| pending.operation_identifier.clone())
+    }
+
+    /// Start a `DELETE` against the landing zone `arn` names, parking its removal for
+    /// [`settle`] to apply once the clock makes it due, and return the operation's
+    /// `operationIdentifier`.
+    ///
+    /// The landing zone stays in the store, `PROCESSING`, until that instant: the delete
+    /// is asynchronous, so while it runs the landing zone is still a resource a reporting
+    /// call reports and a second mutating call collides with. Only the operation record is
+    /// written when `arn` names nothing, which a caller rules out first by resolving it.
+    ///
+    /// [`settle`]: Self::settle
+    pub fn record_landing_zone_deletion(&mut self, arn: &str, now: SystemTime) -> String {
+        let operation_identifier =
+            self.record_operation(LandingZoneOperationType::Delete, arn, now);
+        if let Some(landing_zone) = self.landing_zones.get_mut(arn) {
+            // The landing zone is PROCESSING while its DELETE runs. `settle` derives the
+            // status, from the parked removal below as well as from the log, so this only
+            // covers the gap until the next settle rather than owning the status.
+            landing_zone.status = LandingZoneStatus::Processing;
+            landing_zone.pending_deletion = Some(PendingLandingZoneDeletion {
+                operation_identifier: operation_identifier.clone(),
+                due_at: now + OPERATION_SETTLE_AFTER,
+            });
+        }
+        operation_identifier
     }
 
     /// Append an operation to the log and return its `operationIdentifier`.
