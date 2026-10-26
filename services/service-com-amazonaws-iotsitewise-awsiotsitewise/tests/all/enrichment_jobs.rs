@@ -28,7 +28,12 @@
 //!   one naming a workspace or a dataset the store does not hold is the modelled
 //!   not-found refusal, a retry carrying the same `clientToken` replays the job the
 //!   first call started, and a second create for work a job is still doing is the
-//!   modelled conflict.
+//!   modelled conflict;
+//! * a `clientToken` of any length the input models makes its create idempotent —
+//!   a retry replays the job that token started, identical or not, and starts
+//!   nothing — while a token outside that length is refused as client input and
+//!   starts no job; and the identity, status and creation instant a create answers
+//!   are the ones the job it persisted carries.
 //!
 //! The HTTP harness (`call`, `router`, `router_with_engine`, `error_code`,
 //! `hex_token`, `is_modelled_id`) is the one the asset suite already has; this suite
@@ -866,6 +871,237 @@ fn seed_filler_jobs(
             .enrichment_jobs
             .insert(enrichment_job_key(workspace, &job_id), record);
     }
+}
+
+/// The shortest `clientToken` the input admits. Source: `smithy_query(query="shape",
+/// shape="ClientToken")` — `@length(min: 36, max: 64)` with pattern `^\S{36,64}$`.
+const CLIENT_TOKEN_MIN: usize = 36;
+
+/// The longest `clientToken` that same shape admits.
+const CLIENT_TOKEN_MAX: usize = 64;
+
+/// A `clientToken` of exactly `length` non-space characters, distinct for each
+/// `label`: a token is what identifies ONE create, so no two rows may share one.
+fn client_token(label: &str, length: usize) -> String {
+    let mut token: String = label.chars().filter(|ch| !ch.is_whitespace()).collect();
+    token.truncate(length);
+    while token.len() < length {
+        token.push('t');
+    }
+    token
+}
+
+#[tokio::test]
+async fn a_client_token_replays_its_job_for_every_length_the_input_models() {
+    let (router, engine) = router_with_engine();
+    create_workspace(&router, WORKSPACE).await;
+    let dataset_id = create_dataset(&router, "Camera footage").await;
+
+    let held = |engine: &Arc<engine::InMemoryEngine>| -> usize {
+        let state = service_state(&**engine).expect("the IoT SiteWise store");
+        let store = state.lock();
+        store.enrichment_jobs.len()
+    };
+
+    // Rows: the `@length` floor of `ClientToken`, a middling length and its
+    // ceiling. Each row's job analyses a time series of its own, so no row is the
+    // duplicate of the job another row started.
+    let rows: [(&str, usize); 3] = [
+        ("a token at the length floor", CLIENT_TOKEN_MIN),
+        (
+            "a token of a middling length",
+            (CLIENT_TOKEN_MIN + CLIENT_TOKEN_MAX) / 2,
+        ),
+        ("a token at the length ceiling", CLIENT_TOKEN_MAX),
+    ];
+
+    let mut started: Vec<(String, f64)> = Vec::new();
+    for (at, (case, length)) in rows.iter().enumerate() {
+        let token = client_token(case, *length);
+        assert_eq!(
+            token.len(),
+            *length,
+            "case {case:?}: this row needs a token of {length} characters, got {token:?}"
+        );
+        let alias = format!("/company/windfarm/{at}/turbine/{at}/camera");
+        let body = |alias: &str, token: &str| {
+            json!({
+                "clientToken": token,
+                "jobConfiguration": { "eventDetection": {
+                    "datasetId": dataset_id,
+                    "propertyAlias": alias,
+                    "trimSettings": {
+                        "startTime": instant(1_700_000_000, 0),
+                        "endTime": instant(1_700_003_600, 0),
+                    },
+                }},
+            })
+        };
+
+        let since = std::time::Instant::now();
+        let (status, first) = create(&router, WORKSPACE, body(&alias, &token)).await;
+        let elapsed = since.elapsed();
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} {first}"
+        );
+        let job_id = first["jobId"].as_str().unwrap_or("").to_string();
+        assert!(
+            is_modelled_id(&job_id),
+            "case {case:?}: jobId must have the modelled form, got {first}"
+        );
+        let answered = first["status"].as_str().unwrap_or("").to_string();
+        assert!(
+            ENRICHMENT_JOB_STATUSES.contains(&answered.as_str()),
+            "case {case:?}: status must be a modelled value, got {first}"
+        );
+        // "Initial status of the enrichment job, typically PENDING": guarded on the
+        // measured elapsed time, because the status is the one the clock has made
+        // due and only a call inside the first step can rely on seeing the first.
+        if elapsed < ENRICHMENT_JOB_STEP {
+            assert_eq!(
+                answered, "PENDING",
+                "case {case:?}: a job answered {elapsed:?} after its create has not started \
+                 processing yet, got {first}"
+            );
+        }
+        let created_at = first["createdAt"].as_f64().unwrap_or(-1.0);
+        assert!(
+            created_at > 0.0,
+            "case {case:?}: createdAt is the instant the job was created, got {first}"
+        );
+
+        // The very same request again: the idempotency replay is resolved BEFORE the
+        // duplicate-job rule, so an identical retry replays the job its token
+        // started rather than colliding with it.
+        let (status, replayed) = create(&router, WORKSPACE, body(&alias, &token)).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: an identical retry got {status} {replayed}"
+        );
+        assert_eq!(
+            replayed["jobId"].as_str(),
+            Some(job_id.as_str()),
+            "case {case:?}: an identical retry replays the first job, got {replayed}"
+        );
+        assert_eq!(
+            replayed["createdAt"].as_f64(),
+            Some(created_at),
+            "case {case:?}: a replay reports the job's own creation instant, got {replayed}"
+        );
+
+        // The same token asking for other work replays that same job too: the token
+        // identifies the create, not the configuration it carried.
+        let (status, again) = create(&router, WORKSPACE, body(UNUSED_ALIAS, &token)).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a retry asking for other work got {status} {again}"
+        );
+        assert_eq!(
+            again["jobId"].as_str(),
+            Some(job_id.as_str()),
+            "case {case:?}: the token replays the job it started, got {again}"
+        );
+
+        assert_eq!(
+            held(&engine),
+            at + 1,
+            "case {case:?}: only the first create carrying a token starts a job"
+        );
+        started.push((job_id, created_at));
+    }
+
+    // Distinct tokens started jobs of their own, and each job the creates answered
+    // is the one the store holds: the listing reports every jobId with the
+    // createdAt its own create answered, so the answer came off the record.
+    let ids_started: BTreeSet<String> = started.iter().map(|(id, _)| id.clone()).collect();
+    assert_eq!(
+        ids_started.len(),
+        rows.len(),
+        "every row started a job of its own, got {started:?}"
+    );
+    let body = list_all(&router, WORKSPACE, "").await;
+    assert_eq!(
+        ids(&body).into_iter().collect::<BTreeSet<String>>(),
+        ids_started,
+        "the listing reports exactly the jobs the rows started, got {body}"
+    );
+    for (job_id, created_at) in &started {
+        let summary = summary_of(&body, job_id);
+        assert_eq!(
+            summary["createdAt"].as_f64(),
+            Some(*created_at),
+            "job {job_id}: the create answered the instant the stored job carries, got {summary}"
+        );
+    }
+
+    // One character short of the floor and one past the ceiling: client input the
+    // modelled length does not admit, refused without starting a job. Only the
+    // STATUS is asserted, as the dataset bounds suite's past-the-ceiling row does:
+    // a token outside the length is refused by the boundary validator before this
+    // handler runs, and the error code that walk renders is its own subject.
+    let before = held(&engine);
+    for (case, length) in [
+        ("one character short of the floor", CLIENT_TOKEN_MIN - 1),
+        ("one character past the ceiling", CLIENT_TOKEN_MAX + 1),
+    ] {
+        let token = client_token("out of range", length);
+        let (status, refused) = create(
+            &router,
+            WORKSPACE,
+            json!({
+                "clientToken": token,
+                "jobConfiguration": { "eventDetection": {
+                    "datasetId": dataset_id,
+                    "propertyAlias": UNUSED_ALIAS,
+                    "trimSettings": {
+                        "startTime": instant(1_700_000_000, 0),
+                        "endTime": instant(1_700_003_600, 0),
+                    },
+                }},
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a {length}-character clientToken must be refused, \
+             got {status} {refused}"
+        );
+        assert_eq!(
+            held(&engine),
+            before,
+            "case {case:?}: a refused create must start no job"
+        );
+    }
+
+    // The same work with a token the length DOES admit is accepted, so the two rows
+    // above were refused for the length they name and not for the rest of the
+    // request.
+    let (status, accepted) = create(
+        &router,
+        WORKSPACE,
+        json!({
+            "clientToken": client_token("in range", CLIENT_TOKEN_MIN),
+            "jobConfiguration": { "eventDetection": {
+                "datasetId": dataset_id,
+                "propertyAlias": UNUSED_ALIAS,
+                "trimSettings": {
+                    "startTime": instant(1_700_000_000, 0),
+                    "endTime": instant(1_700_003_600, 0),
+                },
+            }},
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a create carrying a token inside the modelled length got {status} {accepted}"
+    );
+    assert_eq!(
+        held(&engine),
+        before + 1,
+        "the accepted create started one job"
+    );
 }
 
 /// A router over a fresh engine holding the workspace and the seeded jobs.
