@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetConfiguredTableAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetConfiguredTableAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetConfiguredTableAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the configured table association `CreateConfiguredTableAssociation` persisted
+//! in [`crate::state`], read back unchanged: every member of the modelled shape is
+//! absolute, so nothing here is derived per caller.
+//!
+//! An association is a sub-resource of ONE membership (the URI is
+//! `/memberships/{membershipIdentifier}/configuredTableAssociations/{configuredTableAssociationIdentifier}`),
+//! so an association of another membership is not found through this one.
 //!
 //! ## Shape of an operation
 //!
@@ -150,20 +149,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetConfiguredTableAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetConfiguredTableAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetConfiguredTableAssociation"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                GetConfiguredTableAssociationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("cleanrooms state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let store = state.lock();
+
+        // The membership the association is addressed under is resolved first, the same
+        // way every other membership-scoped read resolves it.
+        if !store.memberships.contains_key(&input.membership_identifier) {
+            return Err(
+                GetConfiguredTableAssociationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: st::membership_not_found_message(
+                            &input.membership_identifier,
+                            st::caller_account_id(),
+                        ),
+                        resource_id: input.membership_identifier,
+                        resource_type: st::RESOURCE_TYPE_MEMBERSHIP.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        match store.configured_table_association_in(
+            &input.membership_identifier,
+            &input.configured_table_association_identifier,
+        ) {
+            Some(association) => Ok(GetConfiguredTableAssociationOutput {
+                configured_table_association: association.clone(),
+            }),
+            None => Err(
+                GetConfiguredTableAssociationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "configured table association {} not found in membership {}",
+                            input.configured_table_association_identifier,
+                            input.membership_identifier
+                        ),
+                        resource_id: input.configured_table_association_identifier,
+                        resource_type: st::RESOURCE_TYPE_CONFIGURED_TABLE_ASSOCIATION.to_string(),
+                    },
+                )
+                .into(),
+            ),
+        }
     }
 }

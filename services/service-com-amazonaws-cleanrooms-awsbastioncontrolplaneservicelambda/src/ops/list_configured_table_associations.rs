@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConfiguredTableAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConfiguredTableAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConfiguredTableAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the configured table associations stored under one membership, in the order they
+//! were created, so a token handed out by one call resumes at the same row on the next.
+//! Each row is the modelled `ConfiguredTableAssociationSummary` projection of the stored
+//! association ([`crate::state::configured_table_association_summary`]).
 //!
 //! ## Shape of an operation
 //!
@@ -154,20 +150,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConfiguredTableAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConfiguredTableAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConfiguredTableAssociations"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                ListConfiguredTableAssociationsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("cleanrooms state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let store = state.lock();
+
+        if !store.memberships.contains_key(&input.membership_identifier) {
+            return Err(
+                ListConfiguredTableAssociationsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: st::membership_not_found_message(
+                            &input.membership_identifier,
+                            st::caller_account_id(),
+                        ),
+                        resource_id: input.membership_identifier,
+                        resource_type: st::RESOURCE_TYPE_MEMBERSHIP.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Insertion order, so a token handed out by one call resumes at the same row on
+        // the next one. An association belongs to exactly one membership, which is the one
+        // this listing is scoped to.
+        let summaries: Vec<ConfiguredTableAssociationSummary> = store
+            .configured_table_association_order
+            .iter()
+            .filter_map(|id| store.configured_table_associations.get(id))
+            .filter(|association| association.membership_id == input.membership_identifier)
+            .map(st::configured_table_association_summary)
+            .collect();
+
+        let (configured_table_association_summaries, next_token) = st::page(
+            summaries,
+            |summary| summary.id.as_str(),
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|error| {
+            let (member, message) = match error {
+                st::PageError::UnknownToken => (
+                    "nextToken",
+                    "must be a token returned by a previous ListConfiguredTableAssociations call",
+                ),
+                st::PageError::InvalidMaxResults => {
+                    ("maxResults", "must be a page size of at least 1")
+                }
+            };
+            ListConfiguredTableAssociationsErrorModeled::ValidationException(ValidationException {
+                message: Some(format!("{member} {message}")),
+                reason: Some(st::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
+                field_list: Some(vec![ValidationExceptionField {
+                    name: member.to_string(),
+                    message: message.to_string(),
+                }]),
+            })
+        })?;
+
+        Ok(ListConfiguredTableAssociationsOutput {
+            configured_table_association_summaries,
+            next_token,
+        })
     }
 }

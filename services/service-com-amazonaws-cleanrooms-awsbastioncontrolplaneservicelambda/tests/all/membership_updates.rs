@@ -18,7 +18,7 @@
 use serde_json::{json, Value};
 
 use super::cleanrooms_collaboration_lifecycle::{
-    error_code, minimal_collaboration, Emulator, ALL_LOG_STATUSES,
+    collaboration_owned_elsewhere, error_code, minimal_collaboration, Emulator, ALL_LOG_STATUSES,
 };
 
 /// Every member the modelled `Membership` shape declares except `updateTime` (restamped
@@ -483,8 +483,21 @@ async fn update_membership_rejects_a_membership_that_is_not_there() {
     // Both rows carry an identifier the model's `MembershipIdentifier` pattern accepts
     // (36 lowercase-hex characters), so the 404 comes from the handler's state lookup
     // rather than from constraint validation: one id that never existed, and one that
-    // existed and was deleted.
-    let (deleted_id, _) = seeded_membership(&emulator, "deleted", &["CAN_QUERY"]).await;
+    // existed and was deleted. The deleted one is a membership of a collaboration this
+    // account only PARTICIPATES in, because a participant may leave while the creator's
+    // own membership is removed only by deleting the collaboration.
+    let collaboration_id = collaboration_owned_elsewhere(&emulator, "deleted", Some(&["CAN_QUERY"])).await;
+    let (status, joined) = emulator
+        .create_membership(baseline_membership_body(&collaboration_id))
+        .await;
+    assert_eq!(
+        status, 200,
+        "CreateMembership must succeed before the delete, got {status} with {joined}"
+    );
+    let deleted_id = joined["membership"]["id"]
+        .as_str()
+        .expect("the created membership carries an id")
+        .to_string();
     let (status, body) = emulator
         .call("DELETE", &format!("/memberships/{deleted_id}"), None)
         .await;

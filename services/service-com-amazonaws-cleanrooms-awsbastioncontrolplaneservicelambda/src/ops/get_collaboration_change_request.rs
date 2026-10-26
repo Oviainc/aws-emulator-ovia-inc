@@ -144,7 +144,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
@@ -172,9 +172,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetCollaborationChangeRequestErrorModeled::AccessDeniedException(
                     AccessDeniedException {
-                        message: Some(st::collaboration_access_denied_message(
-                            &input.collaboration_identifier,
-                            caller,
+                        // This operation binds the collaboration identifier as a URI
+                        // label, so the resource the decision was taken on is that
+                        // collaboration.
+                        message: Some(st::authorization_denied_message(
+                            Self::NAME,
+                            &st::collaboration_arn(
+                                &st::request_region(ctx.parts()),
+                                &input.collaboration_identifier,
+                            ),
                         )),
                         reason: Some(
                             st::ACCESS_DENIED_REASON_INSUFFICIENT_PERMISSIONS.to_string(),
