@@ -22,7 +22,11 @@
 //!   expression the service advertises and not the model's anchored source;
 //! * the clauses are counted and joined into the AWS envelope — `1 validation error
 //!   detected: <clause>` for one, `N validation errors detected: <clause>; <clause>` for
-//!   several — in the order the walk found them.
+//!   several — in the order the walk found them, and the envelope stays inside
+//!   `ValidationException$Message`'s own modelled bound: the count is of every violation
+//!   the walk found, while the clauses spelled after it are budgeted and whatever does not
+//!   fit is reported as a remainder (`crate::state::clip_list_for_message`), because a
+//!   clause echoes a value the caller sent and one request can be refused for many.
 //!
 //! Nothing here is keyed to an operation, a member name or a value: the rule is applied
 //! to whatever [`Violation`] the walk produces, so it holds for every constrained member
@@ -123,19 +127,30 @@ pub(crate) fn clause(violation: &Violation) -> Option<String> {
 
 /// The `message` of a refused request: the AWS envelope over one clause per violation, in
 /// the order the walk found them. `None` declines the whole refusal — see [`clause`].
+///
+/// The count is of every clause the walk produced, while the clauses the sentence SPELLS
+/// are budgeted by `crate::state::clip_list_for_message` for the reason stated there: a
+/// clause echoes a caller-supplied value, a refused request carries up to
+/// [`MAX_VIOLATIONS`] of them, and `ValidationException$Message` admits 1024 characters —
+/// so the count is stated whole and the clauses that do not fit are reported as a
+/// remainder.
 pub(crate) fn envelope(violations: &[Violation]) -> Option<String> {
     let clauses = violations
         .iter()
         .map(clause)
         .collect::<Option<Vec<String>>>()?;
-    match clauses.len() {
-        0 => None,
-        1 => Some(format!("1 validation error detected: {}", clauses[0])),
-        n => Some(format!(
-            "{n} validation errors detected: {}",
-            clauses.join("; ")
-        )),
-    }
+    let opening = match clauses.len() {
+        0 => return None,
+        1 => "1 validation error detected: ".to_string(),
+        n => format!("{n} validation errors detected: "),
+    };
+    let clauses: Vec<&str> = clauses.iter().map(String::as_str).collect();
+    let stated = crate::state::clip_list_for_message(
+        &clauses,
+        "; ",
+        crate::state::MESSAGE_LENGTH_LIMIT.saturating_sub(opening.len()),
+    );
+    Some(format!("{opening}{stated}"))
 }
 
 /// How this service states `refusal`, or `None` to keep the framework's wording.
