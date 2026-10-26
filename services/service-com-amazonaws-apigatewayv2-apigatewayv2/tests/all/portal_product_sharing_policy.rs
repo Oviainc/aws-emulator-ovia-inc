@@ -32,6 +32,9 @@
 //! ONE row of the first table.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_apigatewayv2_apigatewayv2::state::{
+    invalid_identifier_message, PORTAL_PRODUCT_RESOURCE,
+};
 
 use crate::api_lifecycle::{as_str, call, emulator, error_code};
 
@@ -440,10 +443,12 @@ async fn a_product_id_nothing_minted_is_not_found_by_any_of_the_three_operations
                 "NotFoundException",
                 "case {case:?}: expected NotFoundException from {operation}, got {refused}"
             );
-            assert!(
-                as_str(&refused, "message").contains(&id),
-                "case {case:?}: expected the refusal from {operation} to name the \
-                 identifier, got {refused}"
+            assert_eq!(
+                as_str(&refused, "message"),
+                invalid_identifier_message(PORTAL_PRODUCT_RESOURCE),
+                "case {case:?}: expected the portal product's unknown-identifier \
+                 sentence from {operation}, which carries neither the identifier nor \
+                 the account, got {refused}"
             );
         }
     }

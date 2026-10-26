@@ -168,10 +168,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let Some(record) = store.portals.get(&input.portal_id) else {
             return Err(GetPortalErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "Invalid portal identifier specified {}:{}",
-                    ::engine::emulator_account_id(),
-                    input.portal_id
+                message: Some(crate::state::invalid_identifier_message(
+                    crate::state::PORTAL_RESOURCE,
                 )),
                 resource_type: ::std::option::Option::None,
             })

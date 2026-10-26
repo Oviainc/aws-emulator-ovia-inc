@@ -246,10 +246,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = stored.map(crate::state::Integration::to_wire) else {
             return Err(GetIntegrationErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!(
-                        "Invalid Integration identifier specified {}:{}",
-                        ::engine::emulator_account_id(),
-                        input.integration_id
+                    message: Some(crate::state::invalid_identifier_message(
+                        crate::state::INTEGRATION_RESOURCE,
                     )),
                     resource_type: ::std::option::Option::None,
                 },
