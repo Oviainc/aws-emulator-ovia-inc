@@ -71,6 +71,16 @@
 //! which is what `CreateGlossary`'s modelled `AlreadyExistsException` refuses a second
 //! create under.
 //!
+//! GLOSSARY TERMS — the business concepts `CreateGlossaryTerm` registers within a glossary
+//! — sit BESIDE the glossaries in their own per-account namespace
+//! ([`ComAmazonawsGlueAwsglueState::glossary_terms`]) keyed by the opaque `GlossaryTermId`
+//! the create mints, because every operation that reads, updates or deletes a term
+//! addresses it by that id alone and names no glossary; the glossary a term belongs to is
+//! recorded ON the term ([`GlossaryTermEntry::glossary_id`]), and the term's NAME is a
+//! uniqueness constraint within that one glossary
+//! ([`ComAmazonawsGlueAwsglueState::glossary_term_by_name`]), which is what
+//! `CreateGlossaryTerm`'s modelled `AlreadyExistsException` refuses a second create under.
+//!
 //! RESOURCE POLICIES — the IAM policy documents `PutResourcePolicy` attaches to a Glue
 //! resource — sit beside the catalog tree in one per-account namespace keyed by the
 //! resource's ARN ([`ComAmazonawsGlueAwsglueState::resource_policies`]). The ARN is the
@@ -100,7 +110,8 @@ use crate::ops::types::{
     AssetTypeFormReference,
     CodeGenConfigurationNode, Column, ColumnStatisticsTaskRun, Connection, ConnectionInput,
     ConnectionPasswordEncryption, ConnectionsList, Crawler, CrawlerTargets, CreateCrawlerInput,
-    CreateCustomEntityTypeInput, CreateGlossaryInput, CreateJobInput, CustomEntityType,
+    CreateCustomEntityTypeInput, CreateGlossaryInput, CreateGlossaryTermInput, CreateJobInput,
+    CustomEntityType,
     DataCatalogEncryptionSettings, DataLakePrincipal, Database, DatabaseIdentifier, DatabaseInput,
     EncryptionAtRest, ErrorDetail, ExecutionProperty, FederatedDatabase, FederatedTable, Job,
     CreateUsageProfileInput,
@@ -247,6 +258,14 @@ pub const MAX_ASSET_TYPES: usize = 1_000;
 /// rather than stored; `CreateGlossary` models no limit error, so the refusal is the
 /// closest client error it does model (`InvalidInputException`).
 pub const MAX_GLOSSARIES: usize = 1_000;
+
+/// Ceiling on the glossary terms this emulator will hold, for the same reason as
+/// [`MAX_GLOSSARIES`]: `CreateGlossaryTerm` writes a record any caller can reach, each one
+/// carrying descriptions of up to the modelled 1024 and 4096 characters, so the number of
+/// records one process will hold is bounded here. A create past the ceiling is refused
+/// rather than stored; `CreateGlossaryTerm` models no limit error, so the refusal is the
+/// closest client error it does model (`InvalidInputException`).
+pub const MAX_GLOSSARY_TERMS: usize = 1_000;
 
 /// Ceiling on the usage profiles this emulator will hold, for the same reason as
 /// [`MAX_CRAWLERS`]: `CreateUsageProfile` writes a record any caller can reach, each one
@@ -574,6 +593,22 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// [`Self::glossary_by_name`] is that resolution, and `CreateGlossary`'s modelled
     /// `AlreadyExistsException` is what a second create under a stored name gets.
     pub glossaries: BTreeMap<String, GlossaryEntry>,
+    /// Every glossary term this emulator holds, keyed by its `GlossaryTermId`.
+    ///
+    /// BESIDE the glossaries rather than inside them, exactly as a column statistics task
+    /// run sits beside the table it covers: `GetGlossaryTerm`, `UpdateGlossaryTerm` and
+    /// `DeleteGlossaryTerm` address a term by a `GlossaryTermId` alone, with no glossary
+    /// member at all, so the id is the whole address and the glossary a term belongs to is
+    /// recorded ON the term ([`GlossaryTermEntry::glossary_id`]). That is also why deleting
+    /// a glossary leaves its terms addressable: the term records are not held by the
+    /// glossary record. Ordered, so `ListGlossaryTerms` has one deterministic order to page
+    /// over, and bounded by [`MAX_GLOSSARY_TERMS`].
+    ///
+    /// A term's NAME is a uniqueness constraint within ONE glossary rather than its key:
+    /// [`Self::glossary_term_by_name`] is that resolution, and `CreateGlossaryTerm`'s
+    /// modelled `AlreadyExistsException` is what a second create of that name in that
+    /// glossary gets.
+    pub glossary_terms: BTreeMap<String, GlossaryTermEntry>,
     /// Every usage profile this emulator holds, keyed by its name, in name order.
     ///
     /// Per account, like crawlers and custom entity types: `GetUsageProfile`,
@@ -1107,6 +1142,45 @@ impl ComAmazonawsGlueAwsglueState {
         self.glossaries
             .values()
             .find(|glossary| glossary.name == name)
+    }
+
+    /// Whether the store can hold another glossary term, i.e. is below
+    /// [`MAX_GLOSSARY_TERMS`].
+    pub fn can_store_glossary_term(&self) -> bool {
+        self.glossary_terms.len() < MAX_GLOSSARY_TERMS
+    }
+
+    /// The stored glossary term whose `Id` is `id`, or `None` when this account holds no
+    /// term under that id.
+    ///
+    /// Every operation that addresses a term does so by a `GlossaryTermId`, which is this
+    /// map's key, so the lookup is the key lookup. One copy, shared, so no two operations
+    /// can disagree about which record an identifier names.
+    pub fn glossary_term(&self, id: &str) -> Option<&GlossaryTermEntry> {
+        self.glossary_terms.get(id)
+    }
+
+    /// The stored glossary term whose `Id` is `id`, mutably.
+    pub fn glossary_term_mut(&mut self, id: &str) -> Option<&mut GlossaryTermEntry> {
+        self.glossary_terms.get_mut(id)
+    }
+
+    /// The term carrying this `Name` within the glossary `glossary_id` names, or `None`
+    /// when that name is free in that glossary.
+    ///
+    /// A term's name identifies it WITHIN its glossary — that is what
+    /// `CreateGlossaryTerm`'s modelled `AlreadyExistsException` refuses a second create
+    /// under — so the same name in another glossary is a different term. The records are
+    /// keyed by id, so the resolution is a walk bounded by [`MAX_GLOSSARY_TERMS`]. The name
+    /// is matched exactly as sent: the model documents no case fold for `GlossaryTermName`.
+    pub fn glossary_term_by_name(
+        &self,
+        glossary_id: &str,
+        name: &str,
+    ) -> Option<&GlossaryTermEntry> {
+        self.glossary_terms
+            .values()
+            .find(|term| term.glossary_id == glossary_id && term.name == name)
     }
 
     /// The tag set of the resource `resource` names, or `None` when this store holds no
@@ -2486,6 +2560,98 @@ impl GlossaryEntry {
         Self::new(
             input.name.clone(),
             input.description.clone(),
+            input.client_token.clone(),
+        )
+    }
+}
+
+/// How many glossary term ids this process has minted. A nonce source for
+/// [`new_glossary_term_id`], exactly as [`MINTED_GLOSSARY_IDS`] is for a glossary id.
+static MINTED_GLOSSARY_TERM_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh `GlossaryTermId`: the opaque identifier the Data Catalog assigns a glossary term
+/// when `CreateGlossaryTerm` stores it.
+///
+/// The same shape as a glossary id ([`new_glossary_id`]) and for the same reason:
+/// `GlossaryTermId` carries no length or pattern constraint of its own, and the bits come
+/// from [`mint_hex_id`], so two creates landing in the same nanosecond cannot be given the
+/// same id. It is minted ONCE, at create, and kept on the [`GlossaryTermEntry`] through
+/// every later update — a rename included — so every read of that term reports the same id
+/// and two terms never share one.
+///
+/// This names a RESOURCE, not a credential: a credential would come from the credential
+/// store, never from here.
+pub fn new_glossary_term_id() -> String {
+    mint_hex_id(&MINTED_GLOSSARY_TERM_IDS, CATALOG_ID_WORDS)
+}
+
+/// A stored glossary term: one business concept `CreateGlossaryTerm` registers within a
+/// glossary.
+///
+/// Every member of the modelled term is held here — its id, the glossary it belongs to, its
+/// name and its two descriptions — and nothing else: the model gives a term no status,
+/// owner or timestamp. The glossary, the name and the descriptions come from the request;
+/// the id is the one server-set member, minted by [`new_glossary_term_id`] when the term is
+/// stored.
+#[derive(Debug, Clone)]
+pub struct GlossaryTermEntry {
+    /// `GlossaryTermId`, minted by [`new_glossary_term_id`] at create and unchanged
+    /// afterwards, so a caller that kept the id from the create can still address the term
+    /// after it has been updated.
+    pub id: String,
+    /// "The unique identifier of the glossary in which to create the term"
+    /// (`CreateGlossaryTermRequest$GlossaryIdentifier`), recorded on the term because a
+    /// term is addressed by its own id alone and the glossary it belongs to is reported by
+    /// every read of it.
+    pub glossary_id: String,
+    /// "The name of the glossary term" (`CreateGlossaryTermRequest$Name`), unique within
+    /// [`Self::glossary_id`]. Stored exactly as sent — the model documents no case fold for
+    /// `GlossaryTermName`.
+    pub name: String,
+    /// "A short description of the glossary term", absent when the create carried none: the
+    /// member is optional and the model gives it no default, so a term created without one
+    /// reports none rather than an empty string.
+    pub short_description: Option<String>,
+    /// "A long description of the glossary term", absent for the same reason as
+    /// [`Self::short_description`].
+    pub long_description: Option<String>,
+    /// The `ClientToken` of the request that created this term, when it carried one.
+    ///
+    /// `CreateGlossaryTermRequest$ClientToken` is "a unique, case-sensitive identifier that
+    /// you provide to ensure the idempotency of the request", so a retry of that same
+    /// request is answered with this record instead of being refused as a duplicate name.
+    pub client_token: Option<String>,
+}
+
+impl GlossaryTermEntry {
+    /// The record a create stores: the glossary, name and descriptions it carried, under a
+    /// freshly minted id, beside the idempotency token a retry of that create is recognised
+    /// by.
+    pub fn new(
+        glossary_id: String,
+        name: String,
+        short_description: Option<String>,
+        long_description: Option<String>,
+        client_token: Option<String>,
+    ) -> Self {
+        Self {
+            id: new_glossary_term_id(),
+            glossary_id,
+            name,
+            short_description,
+            long_description,
+            client_token,
+        }
+    }
+
+    /// The same, read off a `CreateGlossaryTerm` request: every member comes from the
+    /// request except the id, which the catalog assigns.
+    pub fn from_create_input(input: &CreateGlossaryTermInput) -> Self {
+        Self::new(
+            input.glossary_identifier.clone(),
+            input.name.clone(),
+            input.short_description.clone(),
+            input.long_description.clone(),
             input.client_token.clone(),
         )
     }
