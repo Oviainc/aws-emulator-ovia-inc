@@ -53,7 +53,10 @@ fn null_at(member: &str) -> String {
 }
 
 /// The requirement clause for a `@pattern`, with the pattern as it is REPORTED.
-fn must_match(reported_pattern: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite asserting a `@pattern` refusal states the clause the
+/// same way rather than re-spelling it.
+pub(crate) fn must_match(reported_pattern: &str) -> String {
     format!("Member must satisfy regular expression pattern: {reported_pattern}")
 }
 

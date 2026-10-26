@@ -37,10 +37,40 @@ use ring::rand::{SecureRandom, SystemRandom};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AliasListEntry, CustomKeyStoresListEntry, GrantConstraints, GrantListEntry, KeyMetadata,
-    MultiRegionConfiguration, MultiRegionKey, Tag, XksProxyConfigurationType,
+    AliasListEntry, CustomKeyStoresListEntry, GrantConstraints, GrantListEntry, KeyLastUsageData,
+    KeyMetadata, MultiRegionConfiguration, MultiRegionKey, Tag, XksProxyConfigurationType,
     CUSTOMER_MASTER_KEY_SPEC_VALUES, DATA_KEY_SPEC_VALUES,
 };
+
+/// The `ExpirationModelType` of imported key material that expires, which is the
+/// default: "the default is KEY_MATERIAL_EXPIRES"
+/// (`smithy_query(query="doc",shape="ImportKeyMaterialRequest",member="ExpirationModel")`).
+pub const EXPIRATION_MODEL_EXPIRES: &str = "KEY_MATERIAL_EXPIRES";
+
+/// The `ExpirationModelType` of imported key material that does not expire. See
+/// [`EXPIRATION_MODEL_EXPIRES`].
+pub const EXPIRATION_MODEL_DOES_NOT_EXPIRE: &str = "KEY_MATERIAL_DOES_NOT_EXPIRE";
+
+/// The furthest ahead imported key material may be set to expire: "the maximum value
+/// is 365 days from the request date"
+/// (`smithy_query(query="doc",shape="ImportKeyMaterialRequest",member="ValidTo")`).
+pub const MAX_IMPORTED_MATERIAL_VALIDITY_DAYS: u64 = 365;
+
+/// What a caller stated about the key material it imported: whether it expires, when,
+/// and the description it gave the material.
+#[derive(Debug, Clone)]
+pub struct ImportedKeyMaterial {
+    /// An `ExpirationModelType` value — [`EXPIRATION_MODEL_EXPIRES`] or
+    /// [`EXPIRATION_MODEL_DOES_NOT_EXPIRE`].
+    pub expiration_model: String,
+    /// When the material expires, which is present exactly when the expiration model
+    /// says it expires: "this parameter is required when the value of the
+    /// ExpirationModel parameter is KEY_MATERIAL_EXPIRES. Otherwise it is not valid"
+    /// (`smithy_query(query="doc",shape="ImportKeyMaterialRequest",member="ValidTo")`).
+    pub valid_to: Option<SystemTime>,
+    /// "Description for the key material being imported", as the request gave it.
+    pub description: Option<String>,
+}
 
 /// `KeyState` values, from `smithy_query(shape="KeyState")`.
 pub const KEY_STATE_ENABLED: &str = "Enabled";
@@ -209,6 +239,10 @@ pub struct ComAmazonawsKmsTrentserviceState {
     /// The custom key store ids in creation order, so a custom key store reader
     /// pages over a stable order rather than the hash map's.
     pub custom_key_store_order: Vec<String>,
+    /// The wrapping key pairs `GetParametersForImport` has handed out and not yet
+    /// seen expire, keyed by the import token that names each — see
+    /// [`ImportParameters`]. `ImportKeyMaterial` is the only reader.
+    pub import_parameters: HashMap<String, ImportParameters>,
 }
 
 impl ComAmazonawsKmsTrentserviceState {
@@ -431,9 +465,28 @@ impl ComAmazonawsKmsTrentserviceState {
             .collect()
     }
 
-    /// The custom key store `region`'s endpoint serves under the id
-    /// `custom_key_store_id`, for an operation that then moves it through its
-    /// connection state.
+    /// The custom key store `region`'s endpoint serves under exactly the id
+    /// `custom_key_store_id`.
+    ///
+    /// A `CustomKeyStoreId` member has ONE form — the id of a key store this account
+    /// and Region holds — so a value that is not one of those ids names no key store,
+    /// whatever it looks like: "KMS cannot find a custom key store with the specified
+    /// key store name or ID" (`CustomKeyStoreNotFoundException`) is the one answer for
+    /// a well-formed-but-absent id and for a value that is not a key store id at all.
+    /// One resolver for every operation that takes the member, so no two of them split
+    /// that absence differently.
+    pub fn custom_key_store_in(
+        &self,
+        region: &str,
+        custom_key_store_id: &str,
+    ) -> Option<&CustomKeyStore> {
+        self.custom_key_stores
+            .get(custom_key_store_id)
+            .filter(|store| store.region == region)
+    }
+
+    /// [`Self::custom_key_store_in`], for an operation that then mutates the key store
+    /// — moving it through its connection state, or changing its properties.
     ///
     /// A custom key store belongs to one Region, so an id minted through another
     /// Region's endpoint names no key store here: the same Region scoping
@@ -469,7 +522,8 @@ impl ComAmazonawsKmsTrentserviceState {
     /// through another's.
     pub fn resolve(&self, region: &str, id: &str) -> KeyRef<'_> {
         match parse_key_identifier(id) {
-            Err(()) => KeyRef::MalformedArn,
+            Err(IdentifierRefusal::MalformedArn) => KeyRef::MalformedArn,
+            Err(IdentifierRefusal::UnauthorizedAccount) => KeyRef::UnauthorizedAccount,
             Ok(identifier) => match self.lookup(region, &identifier) {
                 Some(key) => KeyRef::Found(key),
                 None => KeyRef::NotFound,
@@ -480,7 +534,8 @@ impl ComAmazonawsKmsTrentserviceState {
     /// [`Self::resolve`], for an operation that then mutates the key.
     pub fn resolve_mut(&mut self, region: &str, id: &str) -> KeyRefMut<'_> {
         match parse_key_identifier(id) {
-            Err(()) => KeyRefMut::MalformedArn,
+            Err(IdentifierRefusal::MalformedArn) => KeyRefMut::MalformedArn,
+            Err(IdentifierRefusal::UnauthorizedAccount) => KeyRefMut::UnauthorizedAccount,
             Ok(identifier) => {
                 match self
                     .lookup(region, &identifier)
@@ -500,6 +555,38 @@ impl ComAmazonawsKmsTrentserviceState {
     /// lookup a ciphertext envelope needs, which names a key id and nothing else.
     pub fn key_in(&self, region: &str, key_id: &str) -> Option<&Cmk> {
         self.keys.get(key_id).filter(|key| key.region == region)
+    }
+
+    /// Record that `operation` used the key `key_id` in a successful cryptographic
+    /// operation — see [`Cmk::record_last_usage`], which this is the store-level way
+    /// in to, for a handler that has finished reading the key.
+    pub fn record_last_usage(&mut self, key_id: &str, operation: &str) {
+        if let Some(key) = self.keys.get_mut(key_id) {
+            key.record_last_usage(operation);
+        }
+    }
+
+    /// Remember one wrapping key pair against the import token that names it,
+    /// dropping every record whose validity the clock has already ended.
+    ///
+    /// The pruning is what the clock already owes: a pair past its
+    /// `ParametersValidTo` can no longer be used by anyone, so holding it changes no
+    /// answer. The caller refuses the request past [`MAX_IMPORT_PARAMETERS`] BEFORE
+    /// minting, so this never grows the store without a bound.
+    pub fn insert_import_parameters(&mut self, token: String, parameters: ImportParameters) {
+        let now = SystemTime::now();
+        self.import_parameters
+            .retain(|_, held| held.usable_at(now));
+        self.import_parameters.insert(token, parameters);
+    }
+
+    /// How many wrapping key pairs are still usable at `now`, which is what
+    /// [`MAX_IMPORT_PARAMETERS`] bounds.
+    pub fn usable_import_parameters(&self, now: SystemTime) -> usize {
+        self.import_parameters
+            .values()
+            .filter(|held| held.usable_at(now))
+            .count()
     }
 
     /// The Amazon Web Services managed key the predefined alias `alias_name`
@@ -597,6 +684,10 @@ pub enum KeyRef<'a> {
     NotFound,
     /// The identifier is an ARN that is not a well-formed KMS key or alias ARN.
     MalformedArn,
+    /// The identifier is a KMS ARN whose account-id segment is not an account id —
+    /// see [`names_an_account_id`]. The request is refused for want of permission,
+    /// before the resource it names is looked up.
+    UnauthorizedAccount,
 }
 
 /// [`KeyRef`], for a mutating operation.
@@ -607,6 +698,8 @@ pub enum KeyRefMut<'a> {
     NotFound,
     /// The identifier is an ARN that is not a well-formed KMS key or alias ARN.
     MalformedArn,
+    /// See [`KeyRef::UnauthorizedAccount`].
+    UnauthorizedAccount,
 }
 
 /// A parsed `KeyId` request member.
@@ -634,9 +727,39 @@ impl KeyIdentifier {
     }
 }
 
-/// Parse a `KeyId` member into the thing it names, or `Err(())` when it is an ARN
-/// that is not a KMS key or alias ARN.
-fn parse_key_identifier(id: &str) -> Result<KeyIdentifier, ()> {
+/// Why a `KeyId` member names nothing this endpoint can act on, short of naming a
+/// resource that does not exist.
+enum IdentifierRefusal {
+    /// The identifier is an ARN that is not a well-formed KMS key or alias ARN.
+    MalformedArn,
+    /// The ARN has the shape of a KMS ARN, but its account-id segment is not an
+    /// account id at all.
+    UnauthorizedAccount,
+}
+
+/// Whether `account` has the form of an Amazon Web Services account id: exactly 12
+/// decimal digits, which is `AccountIdType`'s modelled `@length(12, 12)` and
+/// `@pattern(^[0-9]{12}$)` (`smithy_query(query="shape",shape="AccountIdType")`).
+///
+/// A value outside that form names no account, so no account's permission can cover a
+/// resource addressed through it — which is why an ARN carrying one is refused for
+/// want of permission rather than reported as a missing resource.
+pub fn names_an_account_id(account: &str) -> bool {
+    account.len() == ACCOUNT_ID_LEN && account.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// How many digits an account id has, from `AccountIdType`'s modelled length.
+const ACCOUNT_ID_LEN: usize = 12;
+
+/// Parse a `KeyId` member into the thing it names.
+///
+/// The three steps are ordered the way KMS resolves an ARN: its SHAPE as a KMS key or
+/// alias ARN, then AUTHORIZATION of the account it names, and only then — in
+/// [`ComAmazonawsKmsTrentserviceState::lookup`] — the existence of the resource. So an
+/// ARN whose account-id segment is not an account id is refused for want of permission
+/// whatever it goes on to name, and a cross-account ARN never discloses whether the
+/// resource it names exists.
+fn parse_key_identifier(id: &str) -> Result<KeyIdentifier, IdentifierRefusal> {
     let Some(rest) = id.strip_prefix("arn:") else {
         return Ok(if let Some(name) = id.strip_prefix(ALIAS_PREFIX) {
             KeyIdentifier::Alias {
@@ -655,28 +778,33 @@ fn parse_key_identifier(id: &str) -> Result<KeyIdentifier, ()> {
     // may itself contain ':' — hence splitn(5, ..).
     let segments: Vec<&str> = rest.splitn(5, ':').collect();
     let [partition, service, region, account, resource] = segments.as_slice() else {
-        return Err(());
+        return Err(IdentifierRefusal::MalformedArn);
     };
     if partition.is_empty() || *service != ARN_SERVICE || region.is_empty() || account.is_empty() {
-        return Err(());
+        return Err(IdentifierRefusal::MalformedArn);
     }
     let scope = Some(((*region).to_string(), (*account).to_string()));
-    if let Some(name) = resource.strip_prefix(ALIAS_PREFIX) {
+    let identifier = if let Some(name) = resource.strip_prefix(ALIAS_PREFIX) {
         if name.is_empty() {
-            return Err(());
+            return Err(IdentifierRefusal::MalformedArn);
         }
-        return Ok(KeyIdentifier::Alias {
+        KeyIdentifier::Alias {
             alias: format!("{ALIAS_PREFIX}{name}"),
             scope,
-        });
+        }
+    } else {
+        match resource.strip_prefix("key/") {
+            Some(key_id) if !key_id.is_empty() => KeyIdentifier::KeyId {
+                key_id: key_id.to_string(),
+                scope,
+            },
+            _ => return Err(IdentifierRefusal::MalformedArn),
+        }
+    };
+    if !names_an_account_id(account) {
+        return Err(IdentifierRefusal::UnauthorizedAccount);
     }
-    match resource.strip_prefix("key/") {
-        Some(key_id) if !key_id.is_empty() => Ok(KeyIdentifier::KeyId {
-            key_id: key_id.to_string(),
-            scope,
-        }),
-        _ => Err(()),
-    }
+    Ok(identifier)
 }
 
 /// How a failed `KeyId` lookup is reported: by the ARN of the resource the REQUEST
@@ -707,9 +835,10 @@ fn parse_key_identifier(id: &str) -> Result<KeyIdentifier, ()> {
 /// what this function pins is WHICH resource, in which form, the message names.
 ///
 /// An identifier that is an ARN but not a KMS key or alias ARN has no resource ARN to
-/// name, so it keeps the identifier-shaped wording. The operations that model
-/// `InvalidArnException` answer that instead and never reach this case; `Encrypt` and
-/// `Decrypt`, which do not model it, report such an identifier as not found.
+/// name, so the refusal names the identifier itself, with the same `Invalid arn …`
+/// wording the Region case carries. The operations that model `InvalidArnException`
+/// answer that instead and never reach this case; `Encrypt`, `Decrypt` and
+/// `GetKeyLastUsage`, which report such an identifier as not found, do.
 pub fn key_not_found_message(region: &str, requested: &str) -> String {
     if let Some(arn_region) = arn_region(requested) {
         if arn_region != region {
@@ -733,8 +862,51 @@ pub fn key_not_found_message(region: &str, requested: &str) -> String {
                 arn_of(region, scope, requested, &resource)
             )
         }
-        Err(()) => format!("KMS cannot find the key with identifier {requested} in {region}."),
+        // An identifier that is an ARN this endpoint cannot resolve has no resource
+        // ARN to name, so the refusal names the ARN itself — the same "Invalid arn
+        // <the part that is invalid>" wording the Region case above carries, where
+        // the invalid part is the whole identifier rather than its Region.
+        Err(_) => format!("Invalid arn {requested}"),
     }
+}
+
+/// How a request addressing a resource through an ARN that names no account is
+/// refused: KMS answers an authorization failure, and words it the way every AWS
+/// service words one — naming the principal it refused, the IAM action it refused, and
+/// the resource the request named.
+///
+/// The principal is [`caller_identity_arn`]: every request to this emulator
+/// authenticates as the one identity it publishes, so that is who the refusal is about.
+///
+/// One function for the whole service, so no two operations word it differently.
+pub fn unauthorized_account_message(operation: &str, requested: &str) -> String {
+    format!(
+        "User: {} is not authorized to perform: {ARN_SERVICE}:{operation} on resource: \
+         {requested} because no resource-based policy allows the {ARN_SERVICE}:{operation} \
+         action",
+        caller_identity_arn()
+    )
+}
+
+/// The ARN of the identity this emulator's callers authenticate as, which is what an
+/// authorization refusal names: the identity `sts:GetCallerIdentity` answers with for
+/// the credentials every request here is signed with.
+pub fn caller_identity_arn() -> String {
+    ::engine::emulator_arn("iam", "", "user/emulator")
+}
+
+/// The refusal every operation answers for [`KeyRef::UnauthorizedAccount`].
+///
+/// `AccessDeniedException` is not in this service's model at all — KMS answers an
+/// authorization failure with it regardless — so it travels on the error channel's
+/// own variant and is built here once, for every operation's error type.
+pub fn unauthorized_account<E>(
+    operation: &str,
+    requested: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::access_denied(unauthorized_account_message(
+        operation, requested,
+    ))
 }
 
 /// The Region segment of `identifier`, when it is a KMS key or alias ARN.
@@ -1329,6 +1501,44 @@ pub struct Cmk {
     /// `EnableKeyRotation` sets it, `DisableKeyRotation` clears it, and
     /// `GetKeyRotationStatus` reports it.
     pub rotation_schedule: Option<RotationSchedule>,
+    /// The last successful cryptographic operation performed with this key, or
+    /// `None` while it has had none — the record `GetKeyLastUsage` reports. Every
+    /// cryptographic operation that succeeds writes it ([`Self::record_last_usage`]);
+    /// a reporting operation never does.
+    pub last_usage: Option<KeyUsage>,
+    /// What the caller stated about the key material it imported, or `None` for a key
+    /// whose material KMS generated and for one still waiting for material — see
+    /// [`ImportedKeyMaterial`]. It is what the `ExpirationModel` and `ValidTo`
+    /// metadata members report, and what makes the material expire.
+    pub imported_material: Option<ImportedKeyMaterial>,
+}
+
+/// One use of a KMS key in a successful cryptographic operation, as
+/// `GetKeyLastUsage` reports it (`smithy_query(query="shape",shape="KeyLastUsageData")`).
+#[derive(Debug, Clone)]
+pub struct KeyUsage {
+    /// The name of the KMS API operation that used the key.
+    pub operation: String,
+    /// When it used the key.
+    pub at: SystemTime,
+    /// "The CloudTrail event ID of the cryptographic operation": the identifier of
+    /// the CloudTrail event the call was recorded in, minted per call.
+    pub cloud_trail_event_id: String,
+    /// The id KMS gave the request that used the key, minted per call.
+    pub kms_request_id: String,
+}
+
+impl KeyUsage {
+    /// This record as `GetKeyLastUsage` projects it onto the wire — the one place a
+    /// usage record is serialized, so two readers cannot disagree.
+    pub fn last_usage_data(&self) -> KeyLastUsageData {
+        KeyLastUsageData {
+            operation: Some(self.operation.clone()),
+            timestamp: Some(date_time(self.at)),
+            cloud_trail_event_id: Some(self.cloud_trail_event_id.clone()),
+            kms_request_id: Some(self.kms_request_id.clone()),
+        }
+    }
 }
 
 impl std::fmt::Debug for Cmk {
@@ -1360,6 +1570,8 @@ impl std::fmt::Debug for Cmk {
             .field("superseded_material", &self.superseded_material.len())
             .field("rotations", &self.rotations)
             .field("rotation_schedule", &self.rotation_schedule)
+            .field("last_usage", &self.last_usage)
+            .field("imported_material", &self.imported_material)
             .finish()
     }
 }
@@ -1422,7 +1634,120 @@ impl Cmk {
             // automatic rotation of a customer managed KMS key" is what starts
             // one (`smithy_query(query="doc",shape="EnableKeyRotation")`).
             rotation_schedule: None,
+            // A new KMS key has not been used in a cryptographic operation yet, so
+            // "the KeyLastUsage response element is empty"
+            // (`smithy_query(query="doc",shape="GetKeyLastUsage")`).
+            last_usage: None,
+            // A key created with no key material has not been given any yet, and a key
+            // whose material KMS generated never carries imported material.
+            imported_material: None,
         }
+    }
+
+    /// Record that `operation` just used this key in a successful cryptographic
+    /// operation.
+    ///
+    /// "Returns usage information about the last successful cryptographic operation
+    /// performed with a specified KMS key"
+    /// (`smithy_query(query="doc",shape="GetKeyLastUsage")`), so only the LAST one is
+    /// kept, and only a call that succeeded writes it: a refused call did not use the
+    /// key. The CloudTrail event id and the request id belong to the call that is
+    /// being recorded, so each is minted here rather than derived from the request.
+    pub fn record_last_usage(&mut self, operation: &str) {
+        self.last_usage = Some(KeyUsage {
+            operation: operation.to_string(),
+            at: SystemTime::now(),
+            cloud_trail_event_id: ::uuid::Uuid::new_v4().to_string(),
+            kms_request_id: ::uuid::Uuid::new_v4().to_string(),
+        });
+    }
+
+    /// When KMS began recording cryptographic activity for this key, which is "the
+    /// date the KMS key was created, whichever is later"
+    /// (`smithy_query(query="doc",shape="GetKeyLastUsageResponse",member="TrackingStartDate")`):
+    /// this store starts tracking a key when it mints it, so the later of the two is
+    /// always the key's creation date.
+    pub fn tracking_start_date(&self) -> SystemTime {
+        self.creation_date
+    }
+
+    /// The `KeyMaterialId` of the material this key was CREATED with, which is the
+    /// oldest version it holds: the first version a rotation superseded, or the
+    /// current one while no rotation has happened. `None` for material KMS gives no
+    /// id — see [`KeyMaterial::id`].
+    pub fn first_key_material_id(&self) -> Option<String> {
+        match self.superseded_material.first() {
+            Some(material) => material.id(),
+            None => self.current_key_material_id.clone(),
+        }
+    }
+
+    /// Give this key the key material a caller imported, with what the caller stated
+    /// about it, and report that material's `KeyMaterialId`.
+    ///
+    /// "Without its key material, the KMS key is unusable"
+    /// (`smithy_query(query="doc",shape="ImportKeyMaterialRequest",member="ValidTo")`),
+    /// so a key that was waiting for material becomes usable once it has some: it
+    /// leaves [`KEY_STATE_PENDING_IMPORT`] for [`KEY_STATE_ENABLED`]. A key that
+    /// already had material keeps the key state it is in — a re-import does not
+    /// re-enable a disabled key.
+    pub fn import_key_material(
+        &mut self,
+        material: KeyMaterial,
+        imported: ImportedKeyMaterial,
+    ) -> Option<String> {
+        self.current_key_material_id = material.id();
+        self.material = material;
+        self.imported_material = Some(imported);
+        if self.key_state == KEY_STATE_PENDING_IMPORT {
+            self.key_state = KEY_STATE_ENABLED.to_string();
+            self.enabled = true;
+        }
+        self.current_key_material_id.clone()
+    }
+
+    /// Whether this key retains the key material `key_material_id` names — a version a
+    /// rotation replaced, which is kept so ciphertext sealed under it still decrypts.
+    pub fn retains_key_material(&self, key_material_id: &str) -> bool {
+        self.superseded_material
+            .iter()
+            .any(|material| material.id().as_deref() == Some(key_material_id))
+    }
+
+    /// Delete the key material this key encrypts under, leaving it with none, and
+    /// report the `KeyMaterialId` of what was deleted.
+    ///
+    /// A key with no key material "is unusable" until material is imported again
+    /// (`smithy_query(query="doc",shape="DeleteImportedKeyMaterial")`), so the key is
+    /// left waiting in [`KEY_STATE_PENDING_IMPORT`] — except while its deletion is
+    /// scheduled, since "when the specified KMS key is in the PendingDeletion state,
+    /// this operation does not change the KMS key's state" (the same doc).
+    ///
+    /// `None` means there was no key material to delete, which is the state the call
+    /// asks for rather than a failure.
+    pub fn delete_current_key_material(&mut self) -> Option<String> {
+        let deleted = self.current_key_material_id.take();
+        self.material = KeyMaterial::AwaitingImport;
+        self.imported_material = None;
+        if self.key_state != KEY_STATE_PENDING_DELETION {
+            self.key_state = KEY_STATE_PENDING_IMPORT.to_string();
+            self.enabled = false;
+        }
+        deleted
+    }
+
+    /// Delete one version of this key's material that a rotation retained, reporting
+    /// the `KeyMaterialId` of what was deleted.
+    ///
+    /// The material the key encrypts under is untouched, so the key stays usable; the
+    /// rotation that made the deleted version current is kept, because it happened.
+    pub fn forget_key_material(&mut self, key_material_id: &str) -> Option<String> {
+        let held = self
+            .superseded_material
+            .iter()
+            .position(|material| material.id().as_deref() == Some(key_material_id))?;
+        self.superseded_material.remove(held);
+        Some(key_material_id.to_string())
     }
 
     /// The Amazon Web Services managed key behind a predefined
@@ -1601,18 +1926,26 @@ impl Cmk {
             key_id: self.key_id.clone(),
             arn: Some(self.arn.clone()),
             creation_date: Some(date_time(self.creation_date)),
-            enabled: self.enabled,
+            enabled: self.enabled && !self.key_material_expired(),
             description: Some(self.description.clone()),
             key_usage: Some(self.key_usage.clone()),
-            key_state: Some(self.key_state.clone()),
+            key_state: Some(self.reported_key_state().to_string()),
             deletion_date: self.deletion_date.map(date_time),
-            // Only a key with imported material expires, and importing is not
-            // implemented, so no key here has a `ValidTo` or an expiration model.
-            valid_to: None,
+            // Only a key with imported key material expires, and only when the caller
+            // asked for material that does: both members are read from what the caller
+            // stated at the import (`ImportedKeyMaterial`).
+            valid_to: self
+                .imported_material
+                .as_ref()
+                .and_then(|imported| imported.valid_to)
+                .map(date_time),
             origin: Some(self.origin.clone()),
             custom_key_store_id: None,
             cloud_hsm_cluster_id: None,
-            expiration_model: None,
+            expiration_model: self
+                .imported_material
+                .as_ref()
+                .map(|imported| imported.expiration_model.clone()),
             key_manager: Some(self.key_manager.clone()),
             // "The KeySpec and CustomerMasterKeySpec fields have the same value"
             // (`smithy_query(shape="KeyMetadata")` -> `CustomerMasterKeySpec`) — for
@@ -1642,7 +1975,10 @@ impl Cmk {
             pending_deletion_window_in_days: None,
             mac_algorithms: self.algorithms_under(KEY_USAGE_GENERATE_VERIFY_MAC),
             xks_key_configuration: None,
-            current_key_material_id: self.current_key_material_id.clone(),
+            current_key_material_id: self
+                .current_key_material_id
+                .clone()
+                .filter(|_| !self.key_material_expired()),
         }
     }
 
@@ -1663,9 +1999,35 @@ impl Cmk {
         self.multi_region_topology.is_some()
     }
 
+    /// Whether this key's imported key material has reached the instant the caller set
+    /// it to expire at.
+    ///
+    /// "When the key material expires, KMS deletes the key material from the KMS key.
+    /// Without its key material, the KMS key is unusable"
+    /// (`smithy_query(query="doc",shape="ImportKeyMaterialRequest",member="ValidTo")`) —
+    /// a deletion the CLOCK makes due, so it is read from the instant the caller set
+    /// rather than written by whoever happens to look.
+    pub fn key_material_expired(&self) -> bool {
+        self.imported_material
+            .as_ref()
+            .and_then(|imported| imported.valid_to)
+            .is_some_and(|valid_to| SystemTime::now() >= valid_to)
+    }
+
+    /// The `KeyState` a READER reports for this key, which is the one it carries unless
+    /// the clock has already taken its key material away: material past its `ValidTo`
+    /// is deleted, and a key with no key material waits in
+    /// [`KEY_STATE_PENDING_IMPORT`].
+    pub fn reported_key_state(&self) -> &str {
+        if self.key_material_expired() {
+            return KEY_STATE_PENDING_IMPORT;
+        }
+        &self.key_state
+    }
+
     /// Whether this key can be used in a cryptographic operation right now.
     pub fn is_usable(&self) -> bool {
-        self.enabled && self.key_state == KEY_STATE_ENABLED
+        self.enabled && self.reported_key_state() == KEY_STATE_ENABLED
     }
 
     /// Whether this key's key state is one of the two `EnableKey` and `DisableKey`
@@ -2011,6 +2373,21 @@ pub enum MaterialKind {
     KeyPair,
 }
 
+impl MaterialKind {
+    /// How many bytes of key material a key of this kind holds, or `None` for a kind
+    /// this service does not hold the bytes of (an asymmetric key pair).
+    ///
+    /// It is what makes IMPORTED key material either the material the key needs or
+    /// material that "does not meet the requirements" of the key it is imported into.
+    pub fn material_len(&self) -> Option<usize> {
+        match self {
+            Self::Aes256 => Some(MATERIAL_LEN),
+            Self::Hmac(len) => Some(*len),
+            Self::KeyPair => None,
+        }
+    }
+}
+
 /// The key material behind one KMS key.
 pub enum KeyMaterial {
     /// The 256-bit AES-GCM key of a symmetric encryption KMS key, from the OS
@@ -2045,7 +2422,7 @@ impl KeyMaterial {
     /// It is the 64 lowercase hex characters `BackingKeyIdType` requires, derived
     /// from the material itself so two keys never share one and a read never
     /// changes it.
-    fn id(&self) -> Option<String> {
+    pub fn id(&self) -> Option<String> {
         let Self::Aes256(material) = self else {
             return None;
         };
@@ -2061,6 +2438,23 @@ impl KeyMaterial {
         match self {
             Self::Aes256(material) => Some(material),
             Self::Hmac(_) | Self::KeyPairNotGenerated | Self::AwaitingImport => None,
+        }
+    }
+
+    /// Key material of `kind` made of exactly these bytes — how material a caller
+    /// IMPORTED becomes the key material of a key, as [`mint_material`] is for material
+    /// KMS generates.
+    ///
+    /// `None` means the bytes are not material of that kind: the wrong length for it, or
+    /// a kind this service does not hold the bytes of.
+    pub fn from_bytes(kind: MaterialKind, bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != kind.material_len()? {
+            return None;
+        }
+        match kind {
+            MaterialKind::Aes256 => Some(Self::Aes256(bytes.try_into().ok()?)),
+            MaterialKind::Hmac(_) => Some(Self::Hmac(bytes.to_vec())),
+            MaterialKind::KeyPair => None,
         }
     }
 }
@@ -2590,7 +2984,7 @@ pub fn invalid_arn_message(requested: &str) -> String {
 /// One function for the whole service, so no two operations word the same key state
 /// differently.
 pub fn invalid_state_message(key: &Cmk) -> String {
-    format!("{} is {}.", key.arn, key_state_prose(&key.key_state))
+    format!("{} is {}.", key.arn, key_state_prose(key.reported_key_state()))
 }
 
 /// How KMS words the refusal of a request that REQUIRES a key state the key is not in
@@ -3461,6 +3855,21 @@ pub fn decode_custom_key_store_marker(marker: &str) -> Option<String> {
     decode_marker_for(CUSTOM_KEY_STORE_MARKER_PREFIX, marker)
 }
 
+/// [`MARKER_PREFIX`], for the key-material rotation list, which pages over the
+/// versions of one key's material and so mints its own tokens.
+const ROTATION_MARKER_PREFIX: &str = "key-rotations/1/";
+
+/// [`encode_marker`], for the rotation list: the token resumes after the key material
+/// whose `KeyMaterialId` is `key_material_id`.
+pub fn encode_rotation_marker(key_material_id: &str) -> String {
+    encode_marker_for(ROTATION_MARKER_PREFIX, key_material_id)
+}
+
+/// [`decode_marker`], for the rotation list.
+pub fn decode_rotation_marker(marker: &str) -> Option<String> {
+    decode_marker_for(ROTATION_MARKER_PREFIX, marker)
+}
+
 /// One encoding for every list, so no two pagers mint tokens a reader must handle
 /// differently.
 fn encode_marker_for(prefix: &str, id: &str) -> String {
@@ -3474,6 +3883,192 @@ fn decode_marker_for(prefix: &str, marker: &str) -> Option<String> {
     let id = text.strip_prefix(prefix)?;
     (!id.is_empty()).then(|| id.to_string())
 }
+
+// ---------------------------------------------------------------------------
+// Importing key material
+// ---------------------------------------------------------------------------
+
+/// The `WrappingKeySpec` values this service generates a wrapping key pair for, from
+/// `smithy_query(query="shape",shape="WrappingKeySpec")`. `SM2` is the fourth value
+/// and is not one of these: see [`wrapping_key_size`].
+pub const WRAPPING_KEY_SPEC_RSA_2048: &str = "RSA_2048";
+/// See [`WRAPPING_KEY_SPEC_RSA_2048`].
+pub const WRAPPING_KEY_SPEC_RSA_3072: &str = "RSA_3072";
+/// See [`WRAPPING_KEY_SPEC_RSA_2048`].
+pub const WRAPPING_KEY_SPEC_RSA_4096: &str = "RSA_4096";
+
+/// The RSA key size a `WrappingKeySpec` names, or `None` for a spec that is not an RSA
+/// key pair this service generates.
+fn wrapping_key_size(wrapping_key_spec: &str) -> Option<::aws_lc_rs::rsa::KeySize> {
+    match wrapping_key_spec {
+        WRAPPING_KEY_SPEC_RSA_2048 => Some(::aws_lc_rs::rsa::KeySize::Rsa2048),
+        WRAPPING_KEY_SPEC_RSA_3072 => Some(::aws_lc_rs::rsa::KeySize::Rsa3072),
+        WRAPPING_KEY_SPEC_RSA_4096 => Some(::aws_lc_rs::rsa::KeySize::Rsa4096),
+        _ => None,
+    }
+}
+
+/// Whether this service can generate a wrapping key pair of `wrapping_key_spec`.
+pub fn generates_wrapping_key(wrapping_key_spec: &str) -> bool {
+    wrapping_key_size(wrapping_key_spec).is_some()
+}
+
+/// A freshly generated wrapping key pair of the kind `wrapping_key_spec` names: the
+/// public half as X.509 `SubjectPublicKeyInfo` DER, which is what the response carries,
+/// and the private half as PKCS#8 DER, which is what this store keeps.
+///
+/// The RSA key pair comes from `aws-lc-rs` (`aws_lc_rs::rsa`) rather than from anything
+/// written here, and the public half really is the public half of the private one, so
+/// key material wrapped with it is material `ImportKeyMaterial` can open.
+///
+/// `None` means the platform refused to generate a key pair; the caller answers a
+/// modelled server error rather than returning a public key with no private half.
+pub fn mint_wrapping_key(wrapping_key_spec: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+    use ::aws_lc_rs::encoding::AsDer;
+
+    let key_size = wrapping_key_size(wrapping_key_spec)?;
+    let private_key = ::aws_lc_rs::rsa::PrivateDecryptingKey::generate(key_size).ok()?;
+    let public_key = private_key.public_key().as_der().ok()?.as_ref().to_vec();
+    let private_key_pkcs8 = private_key.as_der().ok()?.as_ref().to_vec();
+    Some((public_key, private_key_pkcs8))
+}
+
+// The matching UNWRAP of key material a caller sealed under the public half of a
+// wrapping key pair is [`unwrap_key_material`] below.
+
+/// Open key material a caller wrapped under the public half of `parameters`' wrapping
+/// key pair, with the wrapping algorithm those parameters were issued for.
+///
+/// The RSA-OAEP decryption comes from `aws-lc-rs` (`aws_lc_rs::rsa`), under the private
+/// half this store kept when the public half was handed out, so what comes back is
+/// exactly the material the caller wrapped.
+///
+/// `None` means the bytes are not key material those parameters can open: either the
+/// wrapping algorithm is one this service does not unwrap (see
+/// [`unwraps_wrapping_algorithm`]) or the unwrapping failed.
+pub fn unwrap_key_material(parameters: &ImportParameters, wrapped: &[u8]) -> Option<Vec<u8>> {
+    let algorithm = oaep_algorithm(&parameters.wrapping_algorithm)?;
+    let private_key =
+        ::aws_lc_rs::rsa::PrivateDecryptingKey::from_pkcs8(&parameters.private_key_pkcs8).ok()?;
+    let oaep = ::aws_lc_rs::rsa::OaepPrivateDecryptingKey::new(private_key).ok()?;
+    let mut opened = vec![0u8; oaep.key_size_bytes()];
+    let len = oaep
+        .decrypt(algorithm, wrapped, &mut opened, None)
+        .ok()?
+        .len();
+    opened.truncate(len);
+    Some(opened)
+}
+
+/// Whether this service can unwrap key material wrapped with `wrapping_algorithm`.
+pub fn unwraps_wrapping_algorithm(wrapping_algorithm: &str) -> bool {
+    oaep_algorithm(wrapping_algorithm).is_some()
+}
+
+/// The RSA-OAEP parameters an `AlgorithmSpec` names, or `None` for a spec that is not
+/// one of the two RSAES-OAEP values of `smithy_query(query="shape",shape="AlgorithmSpec")`:
+/// "for RSAES wrapping algorithms, you encrypt your key material directly with the RSA
+/// public key from KMS"
+/// (`smithy_query(query="doc",shape="GetParametersForImportRequest",member="WrappingAlgorithm")`),
+/// while the `RSA_AES` ones wrap an AES key that wraps the material, and `SM2PKE` is not
+/// RSA at all.
+fn oaep_algorithm(
+    wrapping_algorithm: &str,
+) -> Option<&'static ::aws_lc_rs::rsa::OaepAlgorithm> {
+    match wrapping_algorithm {
+        ALGORITHM_SPEC_RSAES_OAEP_SHA_1 => Some(&::aws_lc_rs::rsa::OAEP_SHA1_MGF1SHA1),
+        ALGORITHM_SPEC_RSAES_OAEP_SHA_256 => Some(&::aws_lc_rs::rsa::OAEP_SHA256_MGF1SHA256),
+        _ => None,
+    }
+}
+
+/// The `AlgorithmSpec` values a caller wraps key material with directly under the RSA
+/// public key — see [`oaep_algorithm`].
+pub const ALGORITHM_SPEC_RSAES_OAEP_SHA_1: &str = "RSAES_OAEP_SHA_1";
+/// See [`ALGORITHM_SPEC_RSAES_OAEP_SHA_1`].
+pub const ALGORITHM_SPEC_RSAES_OAEP_SHA_256: &str = "RSAES_OAEP_SHA_256";
+
+/// How long one wrapping key pair and its import token stay usable: "Each public key
+/// and import token set is valid for 24 hours"
+/// (`smithy_query(query="doc",shape="GetParametersForImport")`).
+pub const IMPORT_PARAMETERS_VALIDITY: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
+/// The largest number of outstanding wrapping key pairs this store holds.
+///
+/// A bound the EMULATOR imposes, not a quota KMS publishes: `GetParametersForImport`
+/// mints a key pair per call and is reachable by any caller, so without a cap a loop
+/// of valid calls grows the process without end. Past it the operation refuses with a
+/// modelled server error and mints nothing.
+pub const MAX_IMPORT_PARAMETERS: usize = 200;
+
+/// One wrapping key pair `GetParametersForImport` handed out, with the import token
+/// that names it.
+///
+/// "The public key (or 'wrapping key') of an RSA key pair that KMS generates" is
+/// returned to the caller and the private half stays here, which is what lets
+/// `ImportKeyMaterial` open the key material the caller wraps with it. "The public key
+/// and its import token are permanently linked and must be used together"
+/// (`smithy_query(query="doc",shape="GetParametersForImport")`), so the token is the
+/// key of this record and the record holds everything the import must agree with: the
+/// KMS key the parameters were issued for, and the wrapping algorithm the caller said
+/// it would use.
+///
+/// `Debug` is written by hand rather than derived so the private key is REDACTED.
+#[derive(Clone)]
+pub struct ImportParameters {
+    /// The key id of the KMS key the parameters were issued for.
+    pub key_id: String,
+    /// The `AlgorithmSpec` the request named, which is the algorithm the caller
+    /// wraps the key material with.
+    pub wrapping_algorithm: String,
+    /// The `WrappingKeySpec` the request named, which is the kind of RSA key pair
+    /// that was generated.
+    pub wrapping_key_spec: String,
+    /// The PKCS#8 DER of the private half of the wrapping key pair. It never leaves
+    /// this process: only the public half is returned, and only `ImportKeyMaterial`
+    /// reads this one.
+    pub private_key_pkcs8: Vec<u8>,
+    /// When the pair and its token stop being usable, which is
+    /// [`IMPORT_PARAMETERS_VALIDITY`] after the call that minted them.
+    pub valid_to: SystemTime,
+}
+
+impl std::fmt::Debug for ImportParameters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImportParameters")
+            .field("key_id", &self.key_id)
+            .field("wrapping_algorithm", &self.wrapping_algorithm)
+            .field("wrapping_key_spec", &self.wrapping_key_spec)
+            .field("private_key_pkcs8", &"<redacted>")
+            .field("valid_to", &self.valid_to)
+            .finish()
+    }
+}
+
+impl ImportParameters {
+    /// Whether these parameters are still usable at `now`: an import token past its
+    /// `ParametersValidTo` "cannot be used in an ImportKeyMaterial request"
+    /// (`smithy_query(query="doc",shape="GetParametersForImport")`).
+    pub fn usable_at(&self, now: SystemTime) -> bool {
+        now < self.valid_to
+    }
+}
+
+/// The import token that names one [`ImportParameters`] record: opaque to the caller,
+/// drawn from the OS CSPRNG so no two calls share one and no client can construct one.
+///
+/// `None` means the platform refused to produce entropy; the caller answers a modelled
+/// server error rather than minting a predictable token.
+pub fn mint_import_token() -> Option<Vec<u8>> {
+    random_bytes(IMPORT_TOKEN_LEN)
+}
+
+/// How many bytes an import token carries. The value is this emulator's: `ImportToken`
+/// is only "the import token to send in a subsequent ImportKeyMaterial request"
+/// (`smithy_query(query="doc",shape="GetParametersForImportResponse",member="ImportToken")`)
+/// with a modelled 1..6144 length and no structure.
+const IMPORT_TOKEN_LEN: usize = 32;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

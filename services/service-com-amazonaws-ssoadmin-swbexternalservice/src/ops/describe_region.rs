@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeRegion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeRegion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports ONE Region record of the IAM Identity Center instance its
+//! `InstanceArn` names — the same records `ListRegions` enumerates and `DescribeInstance`
+//! projects, so the three cannot disagree about a Region. This is the ONLY file to touch
+//! for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeRegion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure READ: it answers the Region's name, the `RegionStatus` it is in, the instant it
+//! was added to the instance and whether it is the Region the instance was enabled in, and
+//! it changes nothing a later caller sees beyond what the CLOCK already owed at this
+//! instant (an activation or a removal that has fallen due, applied by the store's own
+//! `materialize_due`).
+//!
+//! The documented preconditions are refused rather than ignored:
+//!
+//! * an `InstanceArn` this account holds no instance for, and a `RegionName` the instance
+//!   is not enabled in, are the modelled `ResourceNotFoundException`;
+//! * "The request must be made from one of the enabled Regions of the IAM Identity Center
+//!   instance" is the modelled `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -96,6 +104,29 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The modelled refusal for a resource this request names that does not exist — an
+/// instance this account does not hold, or a Region the instance is not enabled in.
+///
+/// `Reason` is left absent: every value the model's `ResourceNotFoundExceptionReason` enum
+/// carries reports a KMS key state, and this refusal inspects no key.
+fn not_found(message: impl Into<String>) -> DescribeRegionError {
+    DescribeRegionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message.into()),
+        reason: None,
+    })
+    .into()
+}
+
+/// The modelled refusal for a request this operation's documented precondition on WHERE it
+/// was made rejects. `Reason` is absent for the same reason as above.
+fn validation(message: impl Into<String>) -> DescribeRegionError {
+    DescribeRegionErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+        reason: None,
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -168,18 +199,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeRegion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeRegionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeRegion"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeRegionErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the SSO Admin state store is unavailable".to_string()),
+            })
+        })?;
+        // The Region this call was MADE in, which the request carries only on its SigV4
+        // credential scope: "The request must be made from one of the enabled Regions of
+        // the IAM Identity Center instance."
+        let called_from = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        // A READ, except for what the CLOCK already owes: an instance whose deletion
+        // instant has passed is gone before this call looks for it, a Region whose own
+        // removal workflow has run out is no longer one of the instance's, one whose
+        // extension workflow has run out is already `ACTIVE`, and the account's ambient
+        // instance is enabled if nothing has enabled one yet — all of it owed at this
+        // instant whether or not anybody called.
+        store.on_request(&called_from, now);
+
+        // A syntactically valid ARN for an instance this account does not hold is a
+        // MISSING RESOURCE, which this operation models (unlike `ListRegions`, whose only
+        // not-found channel is `AccessDeniedException`).
+        let instance = store.instance(&input.instance_arn).ok_or_else(|| {
+            not_found(crate::state::instance_not_found_message(&input.instance_arn))
+        })?;
+
+        // "The request must be made from one of the enabled Regions of the IAM Identity
+        // Center instance" — any Region the instance currently holds a record for, in
+        // whatever status, not just the primary one.
+        if !instance
+            .regions
+            .iter()
+            .any(|region| region.region_name == called_from)
+        {
+            let enabled: Vec<&str> = instance
+                .regions
+                .iter()
+                .map(|region| region.region_name.as_str())
+                .collect();
+            return Err(validation(format!(
+                "DescribeRegion must be called in an enabled Region of instance {} ({}); \
+                 this request was made in {called_from}",
+                input.instance_arn,
+                enabled.join(", ")
+            )));
+        }
+
+        // Only a Region the instance holds a record for names a resource this read can
+        // report; every other `RegionName` names nothing.
+        let region = instance.region(&input.region_name).ok_or_else(|| {
+            not_found(format!(
+                "Instance {} is not enabled in Region {}",
+                input.instance_arn, input.region_name
+            ))
+        })?;
+
+        // Reported from the one stored record, so this read, `ListRegions` and
+        // `DescribeInstance` answer the same thing about the same Region.
+        Ok(DescribeRegionOutput {
+            region_name: Some(region.region_name.clone()),
+            status: Some(region.status.clone()),
+            added_date: Some(region.added_date),
+            is_primary_region: region.is_primary_region,
+        })
     }
 }

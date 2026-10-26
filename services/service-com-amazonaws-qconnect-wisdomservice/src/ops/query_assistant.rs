@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op QueryAssistant
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `QueryAssistant`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`QueryAssistant::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Performs a manual search against the assistant its `assistantId` names and answers one
+//! page of results, out of the STORED records.
+//!
+//! The assistant is resolved FIRST: an `assistantId` this account holds no assistant under
+//! is the modelled `ResourceNotFoundException` (HTTP 404), worded as every other read of a
+//! missing assistant words it — a query cannot search a resource that does not exist. A
+//! `sessionId`, when the request names one, is resolved under that same assistant, so a
+//! session of another assistant names nothing here either. `results` is always present: a
+//! query that selects nothing reports an empty list, which is what the required output
+//! member says.
+//!
+//! A result is a document of the content an assistant's knowledge bases hold, and content
+//! is minted only by `CreateContent`/`StartImportJob`, which are still scaffolded in this
+//! crate, so no assistant this emulator holds has a document to answer with yet and every
+//! query of one that exists reports the empty page its state has. Nothing here invents a
+//! hit or scores one.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +179,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `QueryAssistant` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(QueryAssistantErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("QueryAssistant"))
+        // The modelled constraints on every member — the `UuidOrArn` patterns on
+        // `assistantId` and `sessionId`, `queryText`'s length, `maxResults`' range — are
+        // already refused BEFORE this handler runs, so what is left here is which
+        // resources the request names and what they hold.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("QueryAssistant")
+        })?;
+        let store = state.lock();
+
+        let Some(assistant) = store.assistant(&input.assistant_id) else {
+            return Err(QueryAssistantErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::MESSAGE_ASSISTANT_NOT_FOUND.to_string()),
+                    resource_name: Some(input.assistant_id.clone()),
+                },
+            )
+            .into());
+        };
+
+        // A session is reachable only through its own assistant, so one this assistant
+        // does not hold names nothing here — the same lookup `GetSession` makes.
+        if let Some(session_label) = input.session_id.as_deref() {
+            if !assistant
+                .sessions
+                .contains_key(crate::state::resolve_id(session_label))
+            {
+                return Err(QueryAssistantErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::MESSAGE_SESSION_NOT_FOUND.to_string()),
+                        resource_name: Some(session_label.to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A token this service did not mint names no position, so it is refused rather
+        // than silently read as "from the beginning".
+        if let Some(token) = input.next_token.as_deref() {
+            crate::state::decode_cursor(token).ok_or_else(|| {
+                QueryAssistantErrorModeled::ValidationException(ValidationException {
+                    message: Some("nextToken: the specified token is not valid.".to_string()),
+                })
+            })?;
+        }
+
+        // The documents this assistant's content answers the query with. The page is
+        // EMPTY because the store is: content is minted only by
+        // `CreateContent`/`StartImportJob`, both still scaffolded in this crate, so no
+        // assistant this emulator holds has a document. What this answers is the
+        // assistant's own (empty) content, never an invented or scored hit.
+        let results: Vec<ResultData> = Vec::new();
+
+        Ok(QueryAssistantOutput {
+            results,
+            // Nothing follows an empty page, so there is no position to continue from.
+            next_token: None,
+        })
     }
 }

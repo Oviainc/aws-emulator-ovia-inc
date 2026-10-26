@@ -25,9 +25,11 @@
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. Firehose words those refusals itself: the clause names the
-//!   member path and the constraint and never the value that was rejected, and a
+//!   member path and the constraint and never the value that was rejected, a
 //!   `@pattern` is reported as the expression a value must satisfy rather than as the
-//!   model's anchored string (see `constraint_clause` / `reported_pattern`).
+//!   model's anchored string (see `constraint_clause` / `reported_pattern`), and a value
+//!   submitted as an element of a list of constrained strings is reported against the list
+//!   with that element's whole constraint set.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -44,12 +46,17 @@
 //!
 //! This file also owns the sentences the HANDLERS state for the rules they enforce
 //! themselves (`already_exists_message` and friends), so every operation words the same
-//! refusal the same way instead of spelling its own.
+//! refusal the same way instead of spelling its own — and the one modelled constraint the
+//! request boundary cannot enforce (`check_tag_keys` / `check_tag_key_list`), so a handler
+//! judging it refuses in the words the boundary would have used.
 
+use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
+use aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
+use aws_smithy_schema_server::constraints::{validate, PatternTrait};
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 /// The error code this service answers an input-constraint violation with: the
 /// `ValidationException` the framework's own renderer names for a request refused at the
@@ -88,7 +95,37 @@ const INVALID_ROLE_ARN: &str = "Invalid role ARN.";
 /// rather than invent a sentence for it ([`ViolationKind`] is `#[non_exhaustive]`, so a
 /// class can be added upstream).
 fn constraint_clause(violation: &Violation) -> Option<String> {
-    let requirement = match &violation.kind {
+    let requirement = constraint_requirement(&violation.kind)?;
+    // A value submitted as an ELEMENT of a list of constrained strings has no member name
+    // of its own, so it is reported against the LIST it was submitted in, and with that
+    // element shape's whole constraint SET rather than the one clause that failed.
+    if let Some(member) = tag_key_list_member(&violation.path) {
+        return Some(element_clause(member, &tag_key_constraints()));
+    }
+    // An absent member has no submitted value at all, so it is reported as the null it
+    // was: that is a fact of the request's shape, not a rendering of a value the caller
+    // sent. Every other violation names the member ONLY — the values this service
+    // constrains include record payloads (`Data`, up to 1,024,000 bytes) and tag values,
+    // and none of them belongs in a 400 body.
+    let subject = match &violation.kind {
+        ViolationKind::MissingRequiredMember => "Value null",
+        _ => "Value",
+    };
+    Some(format!(
+        "{subject} at '{}' failed to satisfy constraint: {requirement}",
+        violation.path
+    ))
+}
+
+/// The requirement one violated constraint states, with no subject and no member path —
+/// the half of a clause that describes the CONSTRAINT.
+///
+/// `None` for a violation class this service has no wording for, which lets
+/// [`constraint_envelope`] decline the whole refusal and keep the framework's wording
+/// rather than invent a sentence for it ([`ViolationKind`] is `#[non_exhaustive]`, so a
+/// class can be added upstream).
+fn constraint_requirement(kind: &ViolationKind) -> Option<String> {
+    Some(match kind {
         ViolationKind::MissingRequiredMember => "Member must not be null".to_string(),
         ViolationKind::MinLength(min) => {
             format!("Member must have length greater than or equal to {min}")
@@ -111,20 +148,22 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
         }
         ViolationKind::UniqueItems => "Member must have unique values".to_string(),
         _ => return None,
-    };
-    // An absent member has no submitted value at all, so it is reported as the null it
-    // was: that is a fact of the request's shape, not a rendering of a value the caller
-    // sent. Every other violation names the member ONLY — the values this service
-    // constrains include record payloads (`Data`, up to 1,024,000 bytes) and tag values,
-    // and none of them belongs in a 400 body.
-    let subject = match &violation.kind {
-        ViolationKind::MissingRequiredMember => "Value null",
-        _ => "Value",
-    };
-    Some(format!(
-        "{subject} at '{}' failed to satisfy constraint: {requirement}",
-        violation.path
-    ))
+    })
+}
+
+/// The clause for a value submitted as an element of a list of constrained strings: the
+/// LIST member it was submitted in, and every constraint that list's elements carry, in
+/// the order a refusal lists them.
+///
+/// The element shape is what is constrained and the element has no member name, so there
+/// is no path below the list to report one constraint at — the whole set is what describes
+/// the element the list admits.
+fn element_clause(member: &str, constraints: &[String]) -> String {
+    format!(
+        "Value at '{member}' failed to satisfy constraint: Member must satisfy constraint: \
+         [{}]",
+        constraints.join(", ")
+    )
 }
 
 /// A `@pattern` expression as a constraint message REPORTS it, which is not quite the
@@ -136,14 +175,20 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
 /// * the anchors are dropped, so `^[a-zA-Z0-9_.-]+$` is reported as `[a-zA-Z0-9_.-]+`;
 /// * a TOP-LEVEL alternation cannot lose them branch by branch without changing the
 ///   language it accepts, so for one the anchoring is restated once around the whole
-///   group: `^$|\.[0-9a-z]+$` is reported as `^(|\.[0-9a-z]+)$`.
+///   group: `^$|\.[0-9a-z]+$` is reported as `^(|\.[0-9a-z]+)$`;
+/// * an expression carrying a LOOK-AROUND cannot lose them at all — the look-around is
+///   positioned by the anchor it sits behind, so an expression without them admits values
+///   the constraint refuses — and is reported exactly as the model spells it.
 ///
-/// Both forms describe exactly the values the constraint admits; neither is the raw
-/// model string, which is what a client re-validating with the pattern it read out of a
-/// message would otherwise get. An alternation the model did NOT anchor at both ends is
+/// The first two forms describe exactly the values the constraint admits; neither is the
+/// raw model string, which is what a client re-validating with the pattern it read out of
+/// a message would otherwise get. An alternation the model did NOT anchor at both ends is
 /// reported as the model spells it: anchoring it here would describe a narrower language
 /// than the constraint enforces.
 fn reported_pattern(pattern: &str) -> String {
+    if carries_look_around(pattern) {
+        return pattern.to_string();
+    }
     let body = unanchored(pattern);
     let branches = top_level_alternatives(body);
     match branches.as_slice() {
@@ -177,6 +222,36 @@ fn without_end_anchor(pattern: &str) -> Option<&str> {
     let trimmed = pattern.strip_suffix('$')?;
     let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
     (backslashes % 2 == 0).then_some(trimmed)
+}
+
+/// Whether `expression` carries a look-around group — `(?=`, `(?!`, `(?<=` or `(?<!`. A
+/// `(` that is escaped or inside a character class is a literal parenthesis and opens no
+/// group.
+fn carries_look_around(expression: &str) -> bool {
+    let mut in_class = false;
+    let mut escaped = false;
+    for (index, character) in expression.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '(' if !in_class => {
+                let group = &expression[index..];
+                if ["(?=", "(?!", "(?<=", "(?<!"]
+                    .iter()
+                    .any(|opener| group.starts_with(opener))
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The branches of `expression`'s top-level alternation — the `|`s that are not inside a
@@ -219,6 +294,13 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
         .iter()
         .map(constraint_clause)
         .collect::<Option<Vec<String>>>()?;
+    violation_envelope(&clauses)
+}
+
+/// The AWS envelope over the clauses of one refusal, counting them the way the envelope
+/// states them. `None` when there is no clause at all: nothing was violated, so there is
+/// no refusal to word.
+fn violation_envelope(clauses: &[String]) -> Option<String> {
     match clauses.len() {
         0 => None,
         1 => Some(format!("1 validation error detected: {}", clauses[0])),
@@ -227,6 +309,200 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
             clauses.join("; ")
         )),
     }
+}
+
+// ---------------------------------------------------------------------------------
+// A modelled constraint the request boundary cannot enforce
+//
+// The boundary's constraint walk compiles a `@pattern` with the linear-time `regex` crate,
+// which has no look-around, and reads a pattern it cannot compile as satisfied — so a value
+// constrained by a pattern written with a look-ahead reaches a handler UNCHECKED. A handler
+// judges such a value itself, by the clause the look-ahead states and the same walk for the
+// rest of the expression, and words the refusal with the renderer above so it is the
+// sentence the boundary would have stated for the same violation.
+// ---------------------------------------------------------------------------------
+
+/// The `@pattern` of `TagKey`, the shape every member that takes a tag key targets
+/// (`smithy_query(query="shape", shape="TagKey")`): the characters a key may be written
+/// with, and the reserved prefix a key may not begin with. Held as the model spells it,
+/// because that expression is what a refusal reports.
+const TAG_KEY_PATTERN: &str = r"^(?!aws:)[\p{L}\p{Z}\p{N}_.:\/=+\-@%]*$";
+
+/// The prefix [`TAG_KEY_PATTERN`]'s look-ahead excludes, which Amazon Web Services keeps
+/// for the tags it sets itself. A look-ahead this simple is a prefix test, so the
+/// expression is decided WITHOUT a backtracking engine: this clause here, and the rest of
+/// it by the walk below.
+const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// [`TAG_KEY_PATTERN`] without that clause: the characters a tag key may be written with.
+const TAG_KEY_CHARACTERS: &str = r"^[\p{L}\p{Z}\p{N}_.:\/=+\-@%]*$";
+
+/// This service's model namespace, for the shadow member schema below. It is only ever a
+/// shape id's namespace; nothing reads it off the wire.
+const NAMESPACE: &str = "com.amazonaws.firehose";
+
+/// [`TAG_KEY_CHARACTERS`] hung on a member schema, so the decision below is the
+/// framework's own constraint walk and the Unicode general categories the expression names
+/// mean there exactly what they mean at the request boundary.
+///
+/// The shadow member is the shape this tree already uses for a `@pattern` a handler has to
+/// apply itself (`service-com-amazonaws-amp-amazonprometheusservice/src/state.rs`, for a
+/// tag key of its own): the alternative readings each cost fidelity the walk does not —
+/// `char` predicates admit a combining mark `\p{L}` refuses, and a second, look-around
+/// pattern engine would decide an untrusted value by backtracking where the boundary
+/// decides it in linear time.
+static TAG_KEY_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(PatternTrait::new(TAG_KEY_CHARACTERS)));
+    traits
+});
+
+/// The member schema carrying [`TAG_KEY_TRAITS`]. Its name never reaches a message: a
+/// refusal names the member the key was SUBMITTED at, which the checks below are given.
+static M_TAG_KEY: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.firehose#CheckedMember$tagKey",
+        NAMESPACE,
+        "tagKey",
+    ),
+    ShapeType::String,
+    "tagKey",
+    0,
+)
+.with_traits(&TAG_KEY_TRAITS);
+
+/// The root of the shadow input the walk is driven over. Its member list is empty on
+/// purpose: the walk visits what [`CheckedString`] WRITES, and a root struct schema carries
+/// no member name, so it contributes no path segment. The shape id is deliberately one the
+/// model does not declare, so it cannot collide with a modelled shape.
+static CHECKED_MEMBER_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "com.amazonaws.firehose#CheckedMember",
+        NAMESPACE,
+        "CheckedMember",
+    ),
+    ShapeType::Structure,
+    &[],
+);
+
+/// One string written for the validating walk the way the codec writes a string member,
+/// against the member schema whose re-declared constraint the walk is to apply.
+struct CheckedString<'a> {
+    member: &'static Schema,
+    value: &'a str,
+}
+
+impl SerializableStruct for CheckedString<'_> {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(self.member, self.value)
+    }
+}
+
+/// Whether [`TAG_KEY_PATTERN`] admits `key`: it does not begin with the reserved prefix the
+/// look-ahead excludes, and its characters are the ones the rest of the expression lists.
+fn admits_tag_key(key: &str) -> bool {
+    !key.starts_with(RESERVED_TAG_KEY_PREFIX)
+        && validate(
+            &CheckedString {
+                member: &M_TAG_KEY,
+                value: key,
+            },
+            &CHECKED_MEMBER_SCHEMA,
+        )
+        .is_empty()
+}
+
+/// Refuse every tag key of a request that [`TAG_KEY_PATTERN`] does not admit, each named
+/// at the dotted path it was submitted at; `Ok(())` when they all satisfy it.
+///
+/// For the keys submitted as NAMED members — a `Tags` entry's `Key`, a start key. One
+/// refusal states every violating key, the way the boundary walk accumulates violations
+/// rather than reporting only the first. The key's `@length` bounds and the `TagValue`
+/// pattern are separate traits the boundary enforces itself, so they are not re-checked
+/// here.
+pub(crate) fn check_tag_keys<'a, I>(keys: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = (String, &'a str)>,
+{
+    let clauses: Vec<String> = keys
+        .into_iter()
+        .filter(|(_, key)| !admits_tag_key(key))
+        .filter_map(|(path, _)| {
+            constraint_clause(&Violation {
+                path,
+                kind: ViolationKind::Pattern(TAG_KEY_PATTERN.to_string()),
+                // The rejected key is the value, and this service states no value in a
+                // constraint refusal at all — see `constraint_clause`.
+                value: None,
+            })
+        })
+        .collect();
+    match violation_envelope(&clauses) {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a LIST of tag keys holding a key [`TAG_KEY_PATTERN`] does not admit; `Ok(())`
+/// when every element satisfies it.
+///
+/// An element has no member name of its own, so the refusal names the list ONCE however
+/// many of its elements violate the pattern, and states the whole constraint set the
+/// list's elements carry — see [`element_clause`].
+pub(crate) fn check_tag_key_list(keys: &[String]) -> Result<(), String> {
+    if keys.iter().all(|key| admits_tag_key(key)) {
+        return Ok(());
+    }
+    let clauses = vec![element_clause(&tag_keys_member(), &tag_key_constraints())];
+    match violation_envelope(&clauses) {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
+}
+
+/// Every constraint the elements of a list of tag keys carry, in the order a refusal
+/// lists them: `TagKey`'s `@length(1..128)` and its `@pattern`
+/// (`smithy_query(query="shape", shape="TagKey")`).
+fn tag_key_constraints() -> Vec<String> {
+    [
+        ViolationKind::MaxLength(TAG_KEY_MAX_LENGTH),
+        ViolationKind::MinLength(TAG_KEY_MIN_LENGTH),
+        ViolationKind::Pattern(TAG_KEY_PATTERN.to_string()),
+    ]
+    .iter()
+    .filter_map(constraint_requirement)
+    .collect()
+}
+
+/// `TagKey`'s modelled `@length` bounds (`smithy_query(query="shape", shape="TagKey")`),
+/// which the request boundary enforces and a refusal about an element of a list of tag
+/// keys states alongside the pattern.
+const TAG_KEY_MIN_LENGTH: i64 = 1;
+const TAG_KEY_MAX_LENGTH: i64 = 128;
+
+/// The member a list of tag keys is submitted at, in the casing a dotted path spells it
+/// with. `UntagDeliveryStream`'s `TagKeys` is the one list of tag keys this service takes
+/// (`smithy_query(query="operation", operation="UntagDeliveryStream")`).
+fn tag_keys_member() -> String {
+    ::aws_smithy_schema_server::constraints::path::member("TagKeys")
+}
+
+/// The list member `path` names an ELEMENT of, when it names an element of a list of tag
+/// keys; `None` for every other path.
+///
+/// A list element's path is the list member, the element's 1-based position and the step
+/// into it, and nothing below that — which is exactly what says the constrained value has
+/// no member name of its own.
+fn tag_key_list_member(path: &str) -> Option<&str> {
+    let (head, step) = path.rsplit_once('.')?;
+    let (member, position) = head.rsplit_once('.')?;
+    let element = ::aws_smithy_schema_server::constraints::path::element(1);
+    let (_, collection_step) = element.split_once('.')?;
+    (step == collection_step
+        && !position.is_empty()
+        && position.chars().all(|digit| digit.is_ascii_digit())
+        && member == tag_keys_member())
+    .then_some(member)
 }
 
 // ---------------------------------------------------------------------------------

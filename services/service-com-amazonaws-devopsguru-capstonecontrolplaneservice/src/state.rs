@@ -1571,10 +1571,42 @@ impl DayRange {
         }
     }
 
+    /// The range a request's `FromTime` / `ToTime` pair names, or the refusal of a bound
+    /// that is not an instant this service can keep.
+    ///
+    /// Every day-granular read of this store carries the SAME two modelled members, so
+    /// the translation from them into a span of days — and the refusal of an
+    /// unrepresentable bound — lives here once and two such reads cannot disagree about
+    /// which days a request names. An absent `ToTime` is documented "then the current day
+    /// is used", which [`Self::of_days`] substitutes.
+    pub fn requested(
+        from_time: &::aws_smithy_types::DateTime,
+        to_time: Option<&::aws_smithy_types::DateTime>,
+    ) -> Result<Self, FilterRejection> {
+        let from = day_bound(from_time, "FromTime")?;
+        let to = match to_time {
+            Some(to_time) => Some(day_bound(to_time, "ToTime")?),
+            None => None,
+        };
+        Ok(Self::of_days(from, to))
+    }
+
     /// Whether the instant `at` lies in this range.
     pub fn holds(&self, at: i64) -> bool {
         at >= self.from && at < self.until
     }
+}
+
+/// A submitted day bound in the milliseconds this store keeps, or the refusal naming
+/// `member` when the instant is not one this service can represent.
+fn day_bound(at: &::aws_smithy_types::DateTime, member: &str) -> Result<i64, FilterRejection> {
+    millis_of(at).ok_or_else(|| FilterRejection {
+        message: format!("{member} is not an instant this service can represent"),
+        reason: "FIELD_VALIDATION_FAILED",
+        field: member.to_string(),
+        field_message: "must be an instant representable in milliseconds since the epoch"
+            .to_string(),
+    })
 }
 
 /// The wall clock in the milliseconds this store keeps.

@@ -676,7 +676,10 @@ fn property_value(
         component.properties,
         property_name,
     );
-    crate::state::latest_property_value(component.properties.get(property_name), definition)
+    crate::state::latest_property_value(
+        component.properties.get(property_name),
+        definition.as_ref(),
+    )
 }
 
 /// The `propertyValues` answer: the latest value of each selected property of

@@ -29,6 +29,8 @@ mod data_key_pair_without_plaintext;
 mod data_key_without_plaintext;
 #[path = "all/decrypt_key_origin.rs"]
 mod decrypt_key_origin;
+#[path = "all/error_semantics.rs"]
+mod error_semantics;
 #[path = "all/get_key_rotation_status_reads.rs"]
 mod get_key_rotation_status_reads;
 #[path = "all/grants.rs"]

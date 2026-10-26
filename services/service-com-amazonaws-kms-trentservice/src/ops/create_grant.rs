@@ -394,6 +394,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
                 (key.key_id.clone(), key.arn.clone())
             }
+            crate::state::KeyRef::UnauthorizedAccount => {
+                return Err(crate::state::unauthorized_account(
+                    Self::NAME,
+                    &input.key_id,
+                ));
+            }
             crate::state::KeyRef::MalformedArn => {
                 return Err(CreateGrantErrorModeled::InvalidArnException(InvalidArnException {
                     message: Some(crate::state::invalid_arn_message(&input.key_id)),

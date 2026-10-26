@@ -156,8 +156,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// report is being reused, which is what the modelled `Message` is documented to
     /// indicate. Only when no live report is left does the call mint one, stored
     /// `PENDING` — the status the model documents for a report that was just
-    /// initiated — with the snapshot of the quota values in force now and the instants
-    /// its generation and its deletion come due at; nothing here sleeps for them.
+    /// initiated — with the snapshot of the quota values in force now, the usage the
+    /// account is making of them now, and the instants its generation and its deletion
+    /// come due at; nothing here sleeps for them.
     async fn handle(
         &self,
         input: Self::Input,
@@ -172,6 +173,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let now = ::std::time::SystemTime::now();
+        // The account's CONSUMPTION, read out of the services that own the resources
+        // each quota is counted in, before the state lock is taken: a report analyses
+        // the account's usage, and the usage of a VPC or of a running instance's vCPUs
+        // is EC2's fact, not this service's.
+        let usage = crate::state::usage::measure(ctx, &region).await;
         let mut quotas_state = state.lock();
         // The snapshot the report analyses must see every increase the clock has
         // already made due, the same way a quota read does. The report transitions the
@@ -179,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the status a read of it at this instant reports.
         quotas_state.settle_due_requests(&region, now);
 
-        let started = quotas_state.start_utilization_report(&region, now);
+        let started = quotas_state.start_utilization_report(&region, now, &usage);
         let report = started.report();
         let message = if started.reused() {
             "An existing recent quota utilization report is being reused; call \
