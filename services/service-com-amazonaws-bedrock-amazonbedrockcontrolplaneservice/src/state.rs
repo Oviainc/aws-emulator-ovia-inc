@@ -30,7 +30,8 @@
 //! data source and key live, so there is only ever one copy of either.
 //!
 //! And it holds the evaluation jobs `ops/create_evaluation_job.rs` mints and
-//! `ops/get_evaluation_job.rs` reads back.
+//! `ops/get_evaluation_job.rs` reads back, together with the instant each job
+//! `ops/batch_delete_evaluation_job.rs` accepted for deletion is owed its removal.
 //!
 //! And it holds the advanced prompt optimization jobs
 //! `ops/create_advanced_prompt_optimization_job.rs` mints,
@@ -385,6 +386,45 @@ pub const EVALUATION_JOB_STATUS_STOPPED: &str = "Stopped";
 /// from the stored due instant on the next call that touches the record rather than waited
 /// on, so no handler sleeps.
 pub const EVALUATION_JOB_STOPPED_AFTER: Duration = Duration::from_millis(500);
+
+/// `EvaluationJobStatus` — the job ran to completion. See
+/// [`EVALUATION_JOB_STATUS_IN_PROGRESS`] for the value list and for why no call here mints
+/// it; it is named because a job that carries it is one a batch delete accepts.
+pub const EVALUATION_JOB_STATUS_COMPLETED: &str = "Completed";
+
+/// `EvaluationJobStatus` — the job ended without producing its results. Named for the same
+/// reason [`EVALUATION_JOB_STATUS_COMPLETED`] is.
+pub const EVALUATION_JOB_STATUS_FAILED: &str = "Failed";
+
+/// `EvaluationJobStatus` — the job a batch delete accepted is being deleted.
+///
+/// The status `BatchDeleteEvaluationJob` moves an accepted job to: deleting is
+/// asynchronous (the operation answers the modelled 202), so this is the non-terminal
+/// status the job carries from that call until the deletion has taken effect, after
+/// [`EVALUATION_JOB_DELETED_AFTER`], at which point the job is gone and an identifier that
+/// named it names nothing.
+pub const EVALUATION_JOB_STATUS_DELETING: &str = "Deleting";
+
+/// The statuses an evaluation job may be DELETED in: "An evaluation job can only be deleted
+/// if it has following status FAILED, COMPLETED, and STOPPED"
+/// (`smithy_query(query="operation",operation="BatchDeleteEvaluationJob")`), which is also
+/// every TERMINAL value of the status enum.
+pub const EVALUATION_JOB_DELETABLE_STATUSES: [&str; 3] = [
+    EVALUATION_JOB_STATUS_COMPLETED,
+    EVALUATION_JOB_STATUS_FAILED,
+    EVALUATION_JOB_STATUS_STOPPED,
+];
+
+/// How long after `BatchDeleteEvaluationJob` an accepted job's `Deleting` status is owed its
+/// move to being gone.
+///
+/// CHOSEN, not documented: AWS publishes no duration for deleting an evaluation job, so this
+/// is the emulator's span, built the way [`EVALUATION_JOB_STOPPED_AFTER`] is. It is
+/// non-zero, so a caller that reads a job straight after the delete still observes the
+/// `Deleting` status the response reported; and it is materialised from the stored due
+/// instant on the next call that touches the record rather than waited on, so no handler
+/// sleeps.
+pub const EVALUATION_JOB_DELETED_AFTER: Duration = Duration::from_millis(500);
 
 /// `EvaluationJobType` — the job computes metrics itself.
 ///
@@ -1174,6 +1214,11 @@ pub struct EvaluationJobRecord {
     /// The due INSTANT, not a timer, for the same reason
     /// [`ModelImportJobRecord::completed_due_at`] is one.
     pub stopped_due_at: Option<SystemTime>,
+    /// When this job, which a batch delete accepted, is owed its removal from the store —
+    /// and `None` while no delete has asked for one.
+    ///
+    /// The due INSTANT, not a timer, for the same reason [`Self::stopped_due_at`] is one.
+    pub deleted_due_at: Option<SystemTime>,
     pub created_at: SystemTime,
     /// When the job last changed, which is the creation instant until something changes
     /// it.
@@ -1200,6 +1245,37 @@ impl EvaluationJobRecord {
         self.status = EVALUATION_JOB_STATUS_STOPPING;
         self.stopped_due_at = Some(now + EVALUATION_JOB_STOPPED_AFTER);
         self.last_modified_at = now;
+    }
+
+    /// Whether this job is one a batch delete may accept: its status is terminal.
+    ///
+    /// "An evaluation job can only be deleted if it has following status FAILED,
+    /// COMPLETED, and STOPPED"
+    /// (`smithy_query(query="operation",operation="BatchDeleteEvaluationJob")`), so a job
+    /// in any other status — one still running, one winding down, one already being
+    /// deleted — is not deletable yet.
+    #[must_use]
+    pub fn is_deletable(&self) -> bool {
+        EVALUATION_JOB_DELETABLE_STATUSES.contains(&self.status)
+    }
+
+    /// Move this job to [`EVALUATION_JOB_STATUS_DELETING`] and record when its removal from
+    /// the store is owed.
+    ///
+    /// The caller's own write, asked for by `BatchDeleteEvaluationJob` — not a clock
+    /// transition: [`BedrockState::evaluation_job`] is what materialises the removal the
+    /// clock owes.
+    pub fn delete(&mut self, now: SystemTime) {
+        self.status = EVALUATION_JOB_STATUS_DELETING;
+        self.deleted_due_at = Some(now + EVALUATION_JOB_DELETED_AFTER);
+        self.last_modified_at = now;
+    }
+
+    /// Whether this job's removal from the store is one the clock has already made due at
+    /// `now`.
+    #[must_use]
+    pub fn is_removal_due(&self, now: SystemTime) -> bool {
+        self.deleted_due_at.is_some_and(|due| now >= due)
     }
 
     /// Materialise the move to [`EVALUATION_JOB_STATUS_STOPPED`] the clock has already made
@@ -3075,13 +3151,50 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// The evaluation job an `EvaluationJobIdentifier` names, with any status transition
     /// the clock has made due at `now` materialised first — so every caller reads the
     /// status it holds at `now`, whichever operation asked.
+    ///
+    /// A job a batch delete accepted and whose removal the clock has since made due is gone
+    /// by the time it is asked for, so an identifier that named it names nothing — the one
+    /// other transition this resource is owed, and the reason the removal is swept here
+    /// rather than inside [`EvaluationJobRecord::settle`], which cannot reach the store the
+    /// record is held in.
     pub fn evaluation_job(
         &mut self,
         identifier: &str,
         now: SystemTime,
     ) -> Option<&mut EvaluationJobRecord> {
+        self.expire_deleted_evaluation_jobs(now);
         let job = self.evaluation_jobs.get_mut(identifier)?;
         job.settle(now);
+        Some(job)
+    }
+
+    /// Forget every evaluation job whose removal the clock has already made due at `now`.
+    ///
+    /// Swept over the whole family rather than over the one identifier asked for, because a
+    /// removal frees the job's NAME and its place under the account's bound: both are read
+    /// without an identifier in hand.
+    pub fn expire_deleted_evaluation_jobs(&mut self, now: SystemTime) {
+        let due: Vec<String> = self
+            .evaluation_jobs
+            .iter()
+            .filter(|(_, job)| job.is_removal_due(now))
+            .map(|(arn, _)| arn.clone())
+            .collect();
+        for arn in due {
+            self.remove_evaluation_job(&arn);
+        }
+    }
+
+    /// Forget the evaluation job `arn` names, together with its name index entry and the
+    /// idempotency tokens that minted it — so a deletion leaves nothing behind for a later
+    /// create of the same name to collide with, exactly as
+    /// [`Self::remove_provisioned_model_throughput`] does for that family.
+    pub fn remove_evaluation_job(&mut self, arn: &str) -> Option<EvaluationJobRecord> {
+        let job = self.evaluation_jobs.remove(arn)?;
+        self.evaluation_job_names
+            .remove(&(job.region.clone(), job.name.clone()));
+        self.evaluation_job_create_tokens
+            .retain(|_, minted| minted != arn);
         Some(job)
     }
 

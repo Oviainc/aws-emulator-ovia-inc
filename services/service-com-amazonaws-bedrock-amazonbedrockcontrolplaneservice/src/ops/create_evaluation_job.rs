@@ -231,6 +231,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // Every job a batch delete accepted and whose removal the clock has since made due
+        // is gone before this create reads the name index and the account's bound below:
+        // a removed job holds neither its name nor its place under that bound.
+        store.expire_deleted_evaluation_jobs(now);
+
         // `@idempotencyToken`: a replay answers with what the first request minted.
         let replayed = input
             .client_request_token
@@ -304,6 +309,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: crate::state::EVALUATION_JOB_STATUS_IN_PROGRESS,
             // Nothing has asked for a stop yet, so the clock owes this job no transition.
             stopped_due_at: None,
+            // And nothing has asked for its deletion, so it is owed no removal either.
+            deleted_due_at: None,
             created_at: now,
             last_modified_at: now,
         };

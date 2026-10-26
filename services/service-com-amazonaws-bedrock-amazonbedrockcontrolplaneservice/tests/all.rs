@@ -27,6 +27,8 @@ mod automated_reasoning_policy_test_cases;
 mod automated_reasoning_policy_updates;
 #[path = "all/automated_reasoning_policy_versions.rs"]
 mod automated_reasoning_policy_versions;
+#[path = "all/batch_delete_evaluation_jobs.rs"]
+mod batch_delete_evaluation_jobs;
 #[path = "all/custom_model_deployments.rs"]
 mod custom_model_deployments;
 #[path = "all/custom_models.rs"]

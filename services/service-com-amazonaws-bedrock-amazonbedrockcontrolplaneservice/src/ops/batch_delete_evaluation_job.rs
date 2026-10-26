@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDeleteEvaluationJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDeleteEvaluationJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDeleteEvaluationJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this handler does
+//!
+//! Deletes the evaluation jobs the `jobIdentifiers` ARNs name. A job is deletable only in a
+//! terminal status ([`crate::state::EVALUATION_JOB_DELETABLE_STATUSES`]), so a request that
+//! names one in any other status is refused with `ValidationException` and deletes none of
+//! them; every accepted job moves to `Deleting` and is reported under `evaluationJobs` with
+//! that status, and the clock owes it its removal from the store
+//! ([`crate::state::EVALUATION_JOB_DELETED_AFTER`]), after which `GetEvaluationJob` no
+//! longer finds it. An identifier no stored job answers to deletes nothing, so it is
+//! reported per job under `errors`.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +86,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The `code` a per-job error carries for an identifier no stored evaluation job answers
+/// to: the HTTP status `ResourceNotFoundException` is modelled with
+/// (`smithy_query(query="operation",operation="BatchDeleteEvaluationJob")`), which is what
+/// a read of that same identifier answers.
+const NOT_FOUND_STATUS_CODE: &str = "404";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -155,20 +163,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDeleteEvaluationJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDeleteEvaluationJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDeleteEvaluationJob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchDeleteEvaluationJobErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "evaluation job state is not available on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // An `EvaluationJobIdentifier` is the job's ARN alone
+        // (`smithy_query(query="operation",operation="BatchDeleteEvaluationJob")`), so the
+        // same ARN twice in one request names ONE job: the repeats are dropped and the rest
+        // kept in request order, which is the order the response reports them in. The
+        // modelled `@length(1..25)` on `EvaluationJobIdentifiers` is enforced ahead of this
+        // handler.
+        let mut identifiers: Vec<String> = Vec::with_capacity(input.job_identifiers.len());
+        for identifier in input.job_identifiers {
+            if !identifiers.contains(&identifier) {
+                identifiers.push(identifier);
+            }
+        }
+
+        // "An evaluation job can only be deleted if it has following status FAILED,
+        // COMPLETED, and STOPPED": the whole batch is validated before anything is
+        // deleted, so a request naming a job that is not in one of those statuses deletes
+        // none of the jobs it names. The refusal is the modelled `ValidationException` at
+        // the top level — the status requirement is one the request has to satisfy, and a
+        // top-level rejection is what the corpus `simparity-behavioral-ga-prod-v1` records
+        // Amazon Bedrock answering for a batch delete naming a job that is still running.
+        for identifier in &identifiers {
+            let Some(job) = store.evaluation_job(identifier, now) else {
+                continue;
+            };
+            if !job.is_deletable() {
+                let status = job.status;
+                return Err(BatchDeleteEvaluationJobErrorModeled::ValidationException(
+                    ValidationException {
+                        // The second sentence is the requirement as the model words it,
+                        // down to the spelling of the statuses it names; the first names the
+                        // job the batch addressed and the status it holds instead.
+                        message: Some(format!(
+                            "Evaluation job: {identifier} is in status {status} and cannot be \
+                             deleted. An evaluation job can only be deleted if it has \
+                             following status FAILED, COMPLETED, and STOPPED."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut evaluation_jobs: Vec<BatchDeleteEvaluationJobItem> = Vec::new();
+        let mut errors: Vec<BatchDeleteEvaluationJobError2> = Vec::new();
+        for identifier in identifiers {
+            match store.evaluation_job(&identifier, now) {
+                // Deleting is asynchronous — the operation answers the modelled 202 — so
+                // the job is reported `Deleting` from here onwards and the clock owes it
+                // its removal. What the caller is told is read back out of the STORED
+                // record, so it is exactly what a later `GetEvaluationJob` finds.
+                Some(job) => {
+                    job.delete(now);
+                    evaluation_jobs.push(BatchDeleteEvaluationJobItem {
+                        job_identifier: job.arn.clone(),
+                        job_status: job.status.to_string(),
+                    });
+                }
+                // "A JSON object containing the HTTP status codes and the ARNs of
+                // evaluation jobs that failed to be deleted"
+                // (`smithy_query(query="shape",shape="BatchDeleteEvaluationJobError")`): an
+                // ARN no stored job answers to deletes nothing, and `code` is "A HTTP
+                // status code of the evaluation job being deleted" — the one a read of that
+                // same identifier answers with.
+                None => errors.push(BatchDeleteEvaluationJobError2 {
+                    job_identifier: identifier.clone(),
+                    code: NOT_FOUND_STATUS_CODE.to_string(),
+                    message: Some(format!(
+                        "no evaluation job answers to {identifier} in this account"
+                    )),
+                }),
+            }
+        }
+
+        Ok(BatchDeleteEvaluationJobOutput {
+            errors,
+            evaluation_jobs,
+        })
     }
 }
+
