@@ -9,7 +9,7 @@
 //! writes the one record, and a configuration is reclaimed with the manager that
 //! owns it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -44,8 +44,31 @@ pub const STATUS_SUCCEEDED: &str = "SUCCEEDED";
 /// the service tears that manager's deployed resources down, from the same enum.
 pub const STATUS_DELETING: &str = "DELETING";
 
-/// How long a deployment or a teardown stays in its transient status before the clock
-/// owes it what comes next.
+/// The `StatusType` of the summary that reports the asynchronous executions a
+/// deployment runs on the accounts and Regions it targets — the second value the
+/// modelled `StatusType` enum publishes (`crate::ops::types::STATUS_TYPE_VALUES`).
+pub const STATUS_TYPE_ASYNC_EXECUTIONS: &str = "AsyncExecutions";
+
+/// The status a deployment is in while it is rolling its resources out, after it has
+/// initialized and before it reaches an outcome, from the modelled `Status` enum.
+pub const STATUS_DEPLOYING: &str = "DEPLOYING";
+
+/// The status a kind of work that has not run reports, from the same enum.
+pub const STATUS_NONE: &str = "NONE";
+
+/// The phases the deployment of a configuration manager (or of one of its
+/// configurations) is reported in, in the order it walks them: it initializes, rolls
+/// out, and then reports its outcome. Every value is from the modelled `Status` enum.
+pub const DEPLOYMENT_PHASES: [&str; 3] = [STATUS_INITIALIZING, STATUS_DEPLOYING, STATUS_SUCCEEDED];
+
+/// The phases the asynchronous executions a deployment runs are reported in, in the
+/// order they walk them: nothing has run while the deployment is still rolling out, and
+/// once it has rolled out the executions it ran report their outcome. Both values are
+/// from the modelled `Status` enum.
+pub const ASYNC_EXECUTION_PHASES: [&str; 2] = [STATUS_NONE, STATUS_SUCCEEDED];
+
+/// How long a deployment or a teardown is in flight before the clock owes it its
+/// outcome.
 ///
 /// `CreateConfigurationManager` starts a deployment and
 /// `DeleteConfigurationManager` starts a teardown, so the manager and its
@@ -53,9 +76,13 @@ pub const STATUS_DELETING: &str = "DELETING";
 /// transition the clock owes. The span is this emulator's own choice (AWS documents
 /// no duration for a Quick Setup deployment or teardown) and is deliberately
 /// non-zero, so a caller reading straight after the call still observes the
-/// transient status, as it does against the real service. The instant it comes due is
-/// stored on the summary ([`StatusSummaryRecord::settles`]) — or, for a teardown, on
-/// the manager ([`ConfigurationManagerRecord::deletes_at`]) — and materialised by
+/// transient status, as it does against the real service. Work that walks more than
+/// one transient phase shares this span out over them
+/// ([`StatusSummaryRecord::walking`]), so it reaches its terminal status this long
+/// after the call that started it however many phases it passes through. The instant
+/// each phase comes due is stored on the summary ([`StatusSummaryRecord::settles`]) —
+/// or, for a teardown, on the manager
+/// ([`ConfigurationManagerRecord::deletes_at`]) — and materialised by
 /// [`ComAmazonawsSsmquicksetupQuicksetupState::settle`]; nothing sleeps.
 pub const TRANSITION_SPAN: Duration = Duration::from_millis(500);
 
@@ -547,7 +574,7 @@ impl ServiceSettingsRecord {
 /// A status change the clock owes a status summary: where it lands, and when.
 #[derive(Debug, Clone)]
 pub struct PendingStatus {
-    /// The `Status` the summary settles into.
+    /// The `Status` the summary moves into.
     pub to: String,
     /// The instant the change comes due.
     pub due_at: SystemTime,
@@ -561,29 +588,70 @@ pub struct StatusSummaryRecord {
     pub status_type: String,
     /// A `Status` value.
     pub status: String,
+    /// The informational message this status and status type call for, from
+    /// [`status_message`], or `None` where the status is the whole of what there is to
+    /// report.
     pub status_message: Option<String>,
     pub last_updated_at: SystemTime,
+    /// Free-form details about the status, reported through the modelled
+    /// `StatusDetails` map whenever there are any.
+    ///
+    /// The model documents the member as "Details about the status" and publishes no
+    /// key for it, so nothing goes here that this service does not actually hold: a
+    /// summary with no details to report carries the member absent rather than keys
+    /// nothing produced.
     pub status_details: BTreeMap<String, String>,
-    /// The change the clock owes this summary, or `None` once it has settled.
-    pub settles: Option<PendingStatus>,
+    /// The phases the clock still owes this summary, in the order they come due, and
+    /// empty once the work it reports has reached its terminal status.
+    pub settles: VecDeque<PendingStatus>,
 }
 
 impl StatusSummaryRecord {
-    /// The deployment summary a configuration manager (or one of its configurations)
-    /// carries from the moment it is created: `INITIALIZING` now, `SUCCEEDED` once
-    /// [`TRANSITION_SPAN`] has passed.
-    pub fn deployment(now: SystemTime) -> Self {
+    /// The summary of ONE kind of work that walks `phases`: reported in the first of
+    /// them from `now`, with every later phase coming due a share of
+    /// [`TRANSITION_SPAN`] after the one before, so the work reaches its terminal
+    /// phase one whole span after the call that started it and each phase in between
+    /// is observable to a caller that polls. Work with a single phase has nothing the
+    /// clock owes it.
+    ///
+    /// The one place a phased summary is built, so the deployment and the asynchronous
+    /// executions of one manager (or of one of its configurations) are reported, moved
+    /// and messaged the same way.
+    fn walking(status_type: &str, phases: &[&str], now: SystemTime) -> Self {
+        // Total in both directions: a kind of work named with no phase at all reports
+        // that nothing has run, and one named with a single phase has nothing the clock
+        // owes it.
+        let first = phases.first().copied().unwrap_or(STATUS_NONE);
+        let later = phases.get(1..).unwrap_or_default();
         Self {
-            status_type: STATUS_TYPE_DEPLOYMENT.to_string(),
-            status: STATUS_INITIALIZING.to_string(),
-            status_message: None,
+            status_type: status_type.to_string(),
+            status: first.to_string(),
+            status_message: status_message(status_type, first),
             last_updated_at: now,
             status_details: BTreeMap::new(),
-            settles: Some(PendingStatus {
-                to: STATUS_SUCCEEDED.to_string(),
-                due_at: now + TRANSITION_SPAN,
-            }),
+            settles: later
+                .iter()
+                .enumerate()
+                .map(|(step, status)| PendingStatus {
+                    to: (*status).to_string(),
+                    due_at: now + TRANSITION_SPAN * (step as u32 + 1) / later.len() as u32,
+                })
+                .collect(),
         }
+    }
+
+    /// The deployment summary a configuration manager (or one of its configurations)
+    /// carries from the moment its deployment is submitted: the first of
+    /// [`DEPLOYMENT_PHASES`] now, each later one as the clock makes it due.
+    pub fn deployment(now: SystemTime) -> Self {
+        Self::walking(STATUS_TYPE_DEPLOYMENT, &DEPLOYMENT_PHASES, now)
+    }
+
+    /// The summary of the asynchronous executions that same deployment runs, walking
+    /// [`ASYNC_EXECUTION_PHASES`]: none has run while the deployment is still rolling
+    /// out, and the outcome is reported once it has.
+    pub fn async_executions(now: SystemTime) -> Self {
+        Self::walking(STATUS_TYPE_ASYNC_EXECUTIONS, &ASYNC_EXECUTION_PHASES, now)
     }
 
     /// The summary the work on a configuration manager (or on one of its
@@ -591,31 +659,31 @@ impl StatusSummaryRecord {
     /// with nothing to settle into — the record it belongs to is removed when the
     /// teardown completes, so no later status is ever reported for it.
     pub fn teardown(now: SystemTime) -> Self {
-        Self {
-            status_type: STATUS_TYPE_DEPLOYMENT.to_string(),
-            status: STATUS_DELETING.to_string(),
-            status_message: None,
-            last_updated_at: now,
-            status_details: BTreeMap::new(),
-            settles: None,
-        }
+        Self::walking(STATUS_TYPE_DEPLOYMENT, &[STATUS_DELETING], now)
     }
 
-    /// Materialise the change the clock already owes this summary.
+    /// Materialise every phase change the clock already owes this summary.
     ///
-    /// This is the ONLY write a reporting operation makes: the change was owed at
-    /// this instant whether or not anybody called. Nothing is cloned on the way: a
-    /// summary that is not yet due is left exactly as it was.
+    /// This is the ONLY write a reporting operation makes: each change was owed at
+    /// this instant whether or not anybody called, so a summary whose whole span has
+    /// passed is reported in its terminal phase even if nobody looked while it was in
+    /// an earlier one. Nothing is cloned on the way: a summary whose next phase is not
+    /// yet due is left exactly as it was.
     fn settle(&mut self, now: SystemTime) {
-        if self.settles.as_ref().is_none_or(|pending| now < pending.due_at) {
-            return;
+        while self
+            .settles
+            .front()
+            .is_some_and(|pending| pending.due_at <= now)
+        {
+            let Some(pending) = self.settles.pop_front() else {
+                return;
+            };
+            self.status = pending.to;
+            // The change happened when the clock made it due, not when someone looked.
+            self.last_updated_at = pending.due_at.max(self.last_updated_at);
+            // The message belongs to the phase now reported, not to the one left.
+            self.status_message = status_message(&self.status_type, &self.status);
         }
-        let Some(pending) = self.settles.take() else {
-            return;
-        };
-        self.status = pending.to;
-        // The change happened when the clock made it due, not when someone looked.
-        self.last_updated_at = pending.due_at.max(self.last_updated_at);
     }
 
     /// The modelled `StatusSummary` for this record.
@@ -631,36 +699,78 @@ impl StatusSummaryRecord {
     }
 }
 
-/// Submit `summaries` for deployment again: the `Deployment` summary becomes a fresh
-/// one in its transient status, due to settle [`TRANSITION_SPAN`] later, and every
-/// other kind of summary is left as it was.
+/// The informational message a summary of `status_type` carries while it reports
+/// `status`, or `None` where the status is the whole of what there is to report.
+///
+/// `StatusSummary$StatusMessage` is documented as the message relevant to the current
+/// status AND status type of the summary, carried when applicable — so the pair decides
+/// it, and this is the one place it is decided: every summary this service reports takes
+/// its message from here, and a summary the clock moves gets the message of the phase it
+/// moved into rather than keeping the one it left.
+pub fn status_message(status_type: &str, status: &str) -> Option<String> {
+    let message = match (status_type, status) {
+        (STATUS_TYPE_DEPLOYMENT, STATUS_INITIALIZING) => "The deployment is initializing.",
+        (STATUS_TYPE_DEPLOYMENT, STATUS_DEPLOYING) => "The deployment is in progress.",
+        (STATUS_TYPE_DEPLOYMENT, STATUS_DELETING) => {
+            "The configuration and the resources deployed for it are being deleted."
+        }
+        (STATUS_TYPE_ASYNC_EXECUTIONS, STATUS_NONE) => {
+            "No asynchronous executions have run for this configuration yet."
+        }
+        (STATUS_TYPE_ASYNC_EXECUTIONS, STATUS_SUCCEEDED) => {
+            "All asynchronous executions have succeeded."
+        }
+        // A terminal deployment status is the outcome itself: there is no further
+        // information to add to it, and the member is carried only when applicable.
+        _ => return None,
+    };
+    Some(message.to_string())
+}
+
+/// The status summaries a manager (or one of its configurations) carries from the
+/// moment its deployment is submitted: ONE per modelled `StatusType` — the deployment
+/// itself, and the asynchronous executions that deployment runs on the accounts and
+/// Regions it targets — each walking its own phases on the clock.
+///
+/// The one place the set is built, so a manager and every configuration deployed from
+/// one of its definitions report the same kinds of work.
+pub fn fresh_summaries(now: SystemTime) -> Vec<StatusSummaryRecord> {
+    vec![
+        StatusSummaryRecord::deployment(now),
+        StatusSummaryRecord::async_executions(now),
+    ]
+}
+
+/// Submit `summaries` for deployment again: every kind of work starts over from its
+/// first phase, due to walk the rest as the clock makes them due.
 ///
 /// A mutation that changes what the service deploys (`UpdateConfigurationDefinition`)
-/// starts a deployment exactly as `CreateConfigurationManager` does, so the same record
-/// and the same clock-owed transition serve both; this is the one place that
-/// construction lives.
+/// starts a deployment exactly as `CreateConfigurationManager` does — and with it the
+/// asynchronous executions that deployment runs — so the same records and the same
+/// clock-owed phases serve both.
 pub fn restart_deployment(summaries: &mut Vec<StatusSummaryRecord>, now: SystemTime) {
-    replace_deployment_summary(summaries, StatusSummaryRecord::deployment(now));
+    *summaries = fresh_summaries(now);
 }
 
 /// Report `summaries` as being torn down: the `Deployment` summary becomes the
-/// transient teardown one, and every other kind of summary is left as it was.
+/// transient teardown one, and every other kind of summary keeps the status it had
+/// reached.
 ///
 /// A manager and each configuration it owns are torn down together, so the same
-/// record serves both; this is the one place that construction lives.
+/// record serves both; this is the one place that construction lives. Accepting a
+/// delete ends the work that was in flight, so no phase of any other kind of work
+/// comes due after this instant.
 pub fn start_teardown(summaries: &mut Vec<StatusSummaryRecord>, now: SystemTime) {
-    replace_deployment_summary(summaries, StatusSummaryRecord::teardown(now));
-}
-
-/// Put `fresh` in place of the `Deployment` summary of `summaries`, adding it when
-/// there is none; summaries of every other `StatusType` are left alone.
-fn replace_deployment_summary(summaries: &mut Vec<StatusSummaryRecord>, fresh: StatusSummaryRecord) {
+    for summary in summaries.iter_mut() {
+        summary.settles.clear();
+    }
+    let teardown = StatusSummaryRecord::teardown(now);
     match summaries
         .iter_mut()
         .find(|summary| summary.status_type == STATUS_TYPE_DEPLOYMENT)
     {
-        Some(existing) => *existing = fresh,
-        None => summaries.push(fresh),
+        Some(existing) => *existing = teardown,
+        None => summaries.push(teardown),
     }
 }
 
@@ -824,7 +934,7 @@ impl ConfigurationRecord {
             created_at: now,
             last_modified_at: now,
             parameters: definition.parameters.clone(),
-            status_summaries: vec![StatusSummaryRecord::deployment(now)],
+            status_summaries: fresh_summaries(now),
         }
     }
 

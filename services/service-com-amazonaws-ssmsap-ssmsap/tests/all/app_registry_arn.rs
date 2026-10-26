@@ -47,7 +47,11 @@ const REGIONS: &[&str] = &["us-east-1", "eu-west-1", "ap-southeast-2"];
 /// — `^arn:aws:servicecatalog:[a-z0-9:\/-]+$`, so after the `servicecatalog` prefix only
 /// lower-case letters, digits, `:`, `/` and `-` are admitted, and at least one character
 /// has to follow.
-fn is_app_registry_arn(value: &str) -> bool {
+///
+/// `pub(crate)` because the suites of this target share one reading of the modelled form:
+/// `tests/all/registration_derived_state.rs` pins the SAME form on the ARN a settled read
+/// reports.
+pub(crate) fn is_app_registry_arn(value: &str) -> bool {
     let Some(rest) = value.strip_prefix("arn:aws:servicecatalog:") else {
         return false;
     };
@@ -59,13 +63,17 @@ fn is_app_registry_arn(value: &str) -> bool {
 
 /// The prefix an AppRegistry application ARN of `region` carries: an AppRegistry
 /// application is a Service Catalog resource of the Region and account that holds it.
-fn app_registry_arn_prefix(region: &str) -> String {
+///
+/// `pub(crate)` for the same reason as [`is_app_registry_arn`].
+pub(crate) fn app_registry_arn_prefix(region: &str) -> String {
     format!("arn:aws:servicecatalog:{region}:{ACCOUNT}:/applications/")
 }
 
 /// The `AppRegistryArn` of the `Application` a reply reports, or `None` when it reports
 /// none.
-fn reported(reply: &Reply) -> Option<String> {
+///
+/// `pub(crate)` for the same reason as [`is_app_registry_arn`].
+pub(crate) fn reported(reply: &Reply) -> Option<String> {
     reply
         .app(APP_REGISTRY_ARN)
         .and_then(Value::as_str)

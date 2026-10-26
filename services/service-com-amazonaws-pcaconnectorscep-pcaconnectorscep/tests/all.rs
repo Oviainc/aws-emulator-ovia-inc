@@ -27,6 +27,8 @@ mod connector_lifecycle;
 mod connector_oidc_parameters;
 #[path = "all/connector_vpc_endpoint.rs"]
 mod connector_vpc_endpoint;
+#[path = "all/region_isolation.rs"]
+mod region_isolation;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

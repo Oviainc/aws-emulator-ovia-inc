@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDeliveryDestinationPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDeliveryDestinationPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDeliveryDestinationPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the delivery destination policy from the delivery destination the request names, so
+//! the destination holds no policy afterwards and `GetDeliveryDestinationPolicy` reports none.
+//! The policy lives on the destination it was assigned to
+//! (`crate::state::DeliveryDestinationRecord::policy`), which is where
+//! `PutDeliveryDestinationPolicy` put it; nothing else about that destination is touched.
+//!
+//! The resource the request specifies is the delivery DESTINATION, so a name the account holds
+//! no destination under is the modelled not-found refusal. A destination holding no policy is
+//! already in the state this call asks for, so the deletion is idempotent.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +160,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDeliveryDestinationPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDeliveryDestinationPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDeliveryDestinationPolicy"))
+        // Deleting a policy names the destination it was assigned to and nothing else; `ctx`
+        // carries only request metadata, which takes no part in identifying it.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteDeliveryDestinationPolicyError::from(
+                DeleteDeliveryDestinationPolicyErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // The policy is assigned TO a delivery destination, so a name this account holds no
+        // destination under names no resource to delete a policy from — the refusal the
+        // assignment and the report of this same policy answer such a name with.
+        let Some(destination) = store
+            .delivery_destinations
+            .get_mut(&input.delivery_destination_name)
+        else {
+            return Err(
+                DeleteDeliveryDestinationPolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::DELIVERY_DESTINATION_NOT_FOUND_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A destination holds at most one delivery destination policy, so deleting it leaves
+        // the destination holding none — the state a destination none was ever assigned to is
+        // already in, which is why repeating the delete is accepted and changes nothing. Every
+        // other parameter of the destination stays where it is: the policy is assigned by its
+        // own operation and deleted by this one.
+        destination.policy = None;
+
+        Ok(DeleteDeliveryDestinationPolicyOutput)
     }
 }

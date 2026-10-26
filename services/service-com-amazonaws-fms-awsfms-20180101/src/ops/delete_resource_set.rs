@@ -184,8 +184,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         // The ARN-keyed tag index is maintained from the record, so the deleted
-        // resource set's tags go with it rather than outliving the resource.
-        store.tags_by_arn.remove(&removed.arn);
+        // resource set's tags go with it rather than outliving the resource: the
+        // record is gone, and the store's single index writer drops its entry.
+        store.refresh_tag_index(&removed.arn);
         Ok(DeleteResourceSetOutput)
     }
 }

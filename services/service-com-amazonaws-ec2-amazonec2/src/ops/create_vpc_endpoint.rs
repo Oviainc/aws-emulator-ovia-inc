@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVpcEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVpcEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: creates the VPC endpoint the request describes in the VPC it names, stores
+//! it as the modelled [`VpcEndpoint`] shape — the endpoint service it connects to, the
+//! subnets and security groups the request named, the policy attached to it, and the
+//! endpoint network interface created in each subnet — and answers it in `Pending` with the
+//! instant the clock owes it `Available` recorded beside it (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::vpc_endpoint_moves`]).
+//! `DescribeVpcEndpoints` reports the record this operation stored.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVpcEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An endpoint of a type that points at a resource configuration or a service network, and
+//! a request member naming state this slice does not hold (a VPC route table, an IPv6
+//! address), is answered with a 501 rather than an endpoint that silently lacks what was
+//! asked for — the same rule the siblings of this operation follow. The account's OWN
+//! endpoint services are created by `CreateVpcEndpointServiceConfiguration`, still a
+//! scaffold, so no name resolves to one yet: when it lands, an endpoint to one of them also
+//! owes the `PendingAcceptance` state and a `VpcEndpointConnection` row, which is that
+//! operation's change rather than this one's.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +199,799 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVpcEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVpcEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+        use std::time::SystemTime;
+
+        // "The type of endpoint … Default: Gateway" (`VpcEndpointType`). The member targets
+        // the `VpcEndpointType` enum, so the boundary validator has already refused every
+        // value outside it.
+        let endpoint_type = input
+            .vpc_endpoint_type
+            .clone()
+            .unwrap_or_else(|| state::VPC_ENDPOINT_TYPE_GATEWAY.to_string());
+        let gateway = endpoint_type == state::VPC_ENDPOINT_TYPE_GATEWAY;
+        let interface = endpoint_type == state::VPC_ENDPOINT_TYPE_INTERFACE;
+        let load_balancer = endpoint_type == state::VPC_ENDPOINT_TYPE_GATEWAY_LOAD_BALANCER;
+
+        // Request shapes this slice holds no state for. Each one CONTRADICTS what the
+        // endpoint would otherwise report, so it is answered with a 501 ("nobody has
+        // written this yet") rather than with an endpoint that silently lacks what was
+        // asked for. A `Resource`, `ServiceNetwork` or `Tunnel` endpoint points at a
+        // resource configuration or a service network — resources of their own, which this
+        // emulator holds no store of.
+        if !(gateway || interface || load_balancer) {
+            return Err(Scaffolded::not_implemented(&format!(
+                "CreateVpcEndpoint of type {endpoint_type}"
+            )));
+        }
+        if input.resource_configuration_arn.is_some() || input.service_network_arn.is_some() {
+            return Err(Scaffolded::not_implemented(
+                "CreateVpcEndpoint for a resource configuration or a service network",
+            ));
+        }
+        // "(Gateway endpoint) The route table IDs" (`RouteTableIds`): a VPC route table is a
+        // resource of its own and this crate holds no store of them (`CreateRouteTable` is
+        // still a scaffold), so there is nothing an association could name.
+        if input
+            .route_table_ids
+            .as_deref()
+            .is_some_and(|ids| !ids.is_empty())
+        {
+            return Err(Scaffolded::not_implemented(
+                "CreateVpcEndpoint with route table associations",
+            ));
+        }
+        // "The IP address type for the endpoint" (`IpAddressType`): an endpoint reached over
+        // IPv6 needs IPv6 addresses on its endpoint network interfaces, and a subnet of this
+        // slice holds no IPv6 range to take one from.
+        let ip_address_type = input
+            .ip_address_type
+            .as_deref()
+            .unwrap_or(state::IP_ADDRESS_TYPE_IPV4);
+        if ip_address_type != state::IP_ADDRESS_TYPE_IPV4 {
+            return Err(Scaffolded::not_implemented(&format!(
+                "CreateVpcEndpoint with the {ip_address_type} IP address type"
+            )));
+        }
+        let requested_dns_options = input.dns_options.clone().unwrap_or_default();
+        let dns_record_ip_type = requested_dns_options
+            .dns_record_ip_type
+            .clone()
+            .unwrap_or_else(|| state::DNS_RECORD_IP_TYPE_IPV4.to_string());
+        if dns_record_ip_type != state::DNS_RECORD_IP_TYPE_IPV4 {
+            // "The DNS records created for the endpoint" (`DnsOptions$DnsRecordIpType`):
+            // every other value promises records for addresses this slice cannot assign.
+            return Err(Scaffolded::not_implemented(&format!(
+                "CreateVpcEndpoint with the {dns_record_ip_type} DNS record IP type"
+            )));
+        }
+        if requested_dns_options.private_dns_preference.is_some()
+            || requested_dns_options.private_dns_specified_domains.is_some()
+        {
+            // "Only supported when private DNS is enabled and when the VPC endpoint type is
+            // ServiceNetwork or Resource"
+            // (`DnsOptionsSpecification$PrivateDnsPreference`) — the types refused above.
+            return Err(Scaffolded::not_implemented(
+                "CreateVpcEndpoint with a private DNS domain preference",
+            ));
+        }
+        if requested_dns_options
+            .private_dns_only_for_inbound_resolver_endpoint
+            .is_some()
+        {
+            // "Indicates whether to enable private DNS only for inbound endpoints"
+            // (`DnsOptionsSpecification$PrivateDnsOnlyForInboundResolverEndpoint`): an
+            // inbound Resolver endpoint is a resource of another service entirely.
+            return Err(Scaffolded::not_implemented(
+                "CreateVpcEndpoint with private DNS only for inbound resolver endpoints",
+            ));
+        }
+        let subnet_configurations: &[SubnetConfiguration] =
+            input.subnet_configurations.as_deref().unwrap_or_default();
+        if subnet_configurations
+            .iter()
+            .any(|configuration| configuration.ipv6.is_some())
+        {
+            // "The IPv6 address to assign to the endpoint network interface in the subnet"
+            // (`SubnetConfiguration$Ipv6`): the same missing IPv6 range as above.
+            return Err(Scaffolded::not_implemented(
+                "CreateVpcEndpoint with an IPv6 subnet configuration",
+            ));
+        }
+
+        // The members each endpoint TYPE admits, from the doc of each: a member this type
+        // has no meaning for is refused rather than stored and reported back as though it
+        // had been honoured. The lists are deduplicated first — naming one subnet or group
+        // twice asks for it once — and bounded before any per-entry work is done.
+        let requested_subnets =
+            state::deduplicate_ids(input.subnet_ids.as_deref().unwrap_or_default());
+        let requested_groups =
+            state::deduplicate_ids(input.security_group_ids.as_deref().unwrap_or_default());
+        if requested_subnets.len() > state::MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "SubnetIds carries {supplied} ids, above the maximum of {maximum}",
+                supplied = requested_subnets.len(),
+                maximum = state::MAX_RESOURCE_IDS,
+            )));
+        }
+        if requested_groups.len() > state::MAX_SECURITY_GROUPS_PER_INSTANCE {
+            return Err(state::invalid_parameter_value(format!(
+                "SecurityGroupIds names {supplied} security groups, above the maximum of \
+                 {maximum} per network interface",
+                supplied = requested_groups.len(),
+                maximum = state::MAX_SECURITY_GROUPS_PER_INSTANCE,
+            )));
+        }
+        if gateway && !requested_subnets.is_empty() {
+            // "(Interface, Gateway Load Balancer endpoints, Resource, ServiceNetwork, and
+            // Tunnel endpoints only) The IDs of the subnets" (`SubnetIds`).
+            return Err(state::invalid_parameter_combination(
+                "SubnetIds cannot be specified for a Gateway endpoint",
+            ));
+        }
+        if !interface && !requested_groups.is_empty() {
+            // "(Interface, Resource, ServiceNetwork, and Tunnel endpoints only) The IDs of
+            // the security groups" (`SecurityGroupIds`).
+            return Err(state::invalid_parameter_combination(format!(
+                "SecurityGroupIds cannot be specified for a {endpoint_type} endpoint"
+            )));
+        }
+        if load_balancer && requested_subnets.len() > 1 {
+            // "For a Gateway Load Balancer endpoint, you can specify only one subnet"
+            // (`SubnetIds`).
+            return Err(state::invalid_parameter_value(
+                "A GatewayLoadBalancer endpoint can be created in only one subnet",
+            ));
+        }
+        if !interface && input.private_dns_enabled.unwrap_or(false) {
+            // "(Interface endpoint) Indicates whether to associate a private hosted zone
+            // with the specified VPC" (`PrivateDnsEnabled`): there is no private hosted zone
+            // to associate for any other type. Asking for it to be OFF is what every other
+            // type already is, so only a request asking for it ON is refused.
+            return Err(state::invalid_parameter_combination(format!(
+                "PrivateDnsEnabled cannot be enabled for a {endpoint_type} endpoint"
+            )));
+        }
+        // "The subnet configurations for the endpoint" (`SubnetConfigurations`): each one
+        // configures one of the subnets the endpoint is created in, so a configuration for
+        // any other subnet configures nothing, and a second one for a subnet already
+        // configured has no defined winner. The configurations are read into a map keyed by
+        // subnet BEFORE any placement is resolved, so the matching below costs one lookup
+        // per subnet rather than a walk of the list — the model bounds neither list, and the
+        // PRODUCT of the two is what an unbounded scan would cost.
+        let named_subnets: ::std::collections::BTreeSet<&str> =
+            requested_subnets.iter().map(String::as_str).collect();
+        let mut configured: ::std::collections::BTreeMap<&str, &SubnetConfiguration> =
+            ::std::collections::BTreeMap::new();
+        for configuration in subnet_configurations {
+            let subnet_id = configuration.subnet_id.as_deref().unwrap_or_default();
+            if !named_subnets.contains(subnet_id) {
+                return Err(state::invalid_parameter_combination(format!(
+                    "The subnet configuration for '{subnet_id}' names a subnet that is not \
+                     one of SubnetIds"
+                )));
+            }
+            if configured.insert(subnet_id, configuration).is_some() {
+                return Err(state::invalid_parameter_combination(format!(
+                    "The subnet '{subnet_id}' is configured more than once"
+                )));
+            }
+        }
+
+        // "The name of the endpoint service" (`ServiceName`): every endpoint this operation
+        // creates is an endpoint TO a service, so one has to be named — and a value that is
+        // not an endpoint service name at all names no service rather than one that cannot
+        // be found.
+        let Some(service_name) = input
+            .service_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+        else {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter ServiceName",
+            ));
+        };
+        let Some(service) = state::parse_endpoint_service_name(service_name) else {
+            return Err(state::invalid_service_name(service_name));
+        };
+        // "The Region where the service is hosted. The default is the current Region"
+        // (`ServiceRegion`) — which is the Region the service NAME carries for a service of
+        // the current Region, so the name is what the default is read from rather than a
+        // second source that could disagree with it. A name of ANOTHER Region therefore
+        // reports that Region as the one hosting the service, which is what the member
+        // means, rather than the Region the request was signed for.
+        let service_region = match input.service_region.as_deref() {
+            None => service.region.clone(),
+            Some(named) if state::region_name_is_well_formed(named) => named.to_string(),
+            Some(named) => {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({named}) for parameter serviceRegion is invalid. \
+                     This is not a Region name."
+                )))
+            }
+        };
+
+        // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request" (`ClientToken`) — a caller-chosen string this store retains, so it is
+        // held to the length EC2 documents for a client token.
+        if let Some(token) = input.client_token.as_deref() {
+            if token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS {
+                return Err(state::invalid_parameter_value(format!(
+                    "Invalid value for clientToken: it may carry at most {max} characters",
+                    max = state::MAX_CLIENT_TOKEN_CHARS,
+                )));
+            }
+        }
+
+        // "The tags to associate with the endpoint" — the shared tag-specification reader
+        // every create of this crate uses, so the resource-type rule, the tag ceilings and
+        // the reserved-key refusal cannot drift per operation.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_VPC_ENDPOINT,
+            Self::NAME,
+        )?;
+
+        // "(Interface and gateway endpoints) A policy to attach to the endpoint that
+        // controls access to the service. The policy must be in valid JSON format. If this
+        // parameter is not specified, we attach a default policy that allows full access to
+        // the service" (`PolicyDocument`). A Gateway Load Balancer endpoint is neither, so
+        // it carries no policy at all.
+        if load_balancer && input.policy_document.is_some() {
+            return Err(state::invalid_parameter_combination(
+                "PolicyDocument cannot be specified for a GatewayLoadBalancer endpoint",
+            ));
+        }
+        let policy_document: Option<String> = if load_balancer {
+            None
+        } else {
+            match input
+                .policy_document
+                .as_deref()
+                .filter(|document| !document.trim().is_empty())
+            {
+                None => Some(FULL_ACCESS_POLICY.to_string()),
+                Some(document) => {
+                    // "VPC endpoint policy size: 20,480 characters" (the published Amazon
+                    // VPC quota for a VPC endpoint policy), asked BEFORE the document is
+                    // parsed so the work of reading it is bounded by the published limit
+                    // rather than by what a caller chose to send.
+                    if document.chars().count() > state::MAX_VPC_ENDPOINT_POLICY_CHARS {
+                        return Err(state::invalid_parameter_value(format!(
+                            "Invalid value for policyDocument: a VPC endpoint policy may \
+                             carry at most {max} characters",
+                            max = state::MAX_VPC_ENDPOINT_POLICY_CHARS,
+                        )));
+                    }
+                    // Read with the JSON parser this crate already depends on rather than a
+                    // hand-rolled shape check, so "valid JSON format" means what JSON means.
+                    if ::serde_json::from_str::<::serde_json::Value>(document).is_err() {
+                        return Err(state::invalid_parameter_value(
+                            "Invalid value for policyDocument: the policy must be in valid \
+                             JSON format",
+                        ));
+                    }
+                    Some(document.to_string())
+                }
+            }
+        };
+
+        let endpoints = state::require_service_state(&*self.engine)?;
+        let region = state::request_region(ctx.parts());
+        let mut store = endpoints.lock();
+        // Every move the clock already owed is applied before this request reads the store,
+        // so the endpoint an idempotent replay answers with is not a stale one.
+        store.materialize_due_transitions();
+
+        // "Creates a VPC endpoint … between the specified VPC and the specified endpoint
+        // service": a VPC id this account holds no VPC for is a refusal, not an endpoint in
+        // no VPC.
+        if !store.vpcs.contains_key(&input.vpc_id) {
+            return Err(state::invalid_vpc_id_not_found(&input.vpc_id));
+        }
+
+        // "To use a private hosted zone, you must set the following VPC attributes to true:
+        // enableDnsHostnames and enableDnsSupport" (`PrivateDnsEnabled`) — a VPC without
+        // them cannot resolve the private name, so the endpoint is refused rather than
+        // created with an association that would never answer.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVpcEndpoint"))
+        // The model publishes no DEFAULT for this member (`smithy_query(query="doc",
+        // shape="CreateVpcEndpointRequest",member="PrivateDnsEnabled")` states the rule
+        // above and no default), so an endpoint reports the association the request asked
+        // for and none when it asked for nothing: a request that named no private hosted
+        // zone is not refused for a VPC whose attributes could not have served one.
+        let private_dns_enabled = interface && input.private_dns_enabled.unwrap_or(false);
+        if private_dns_enabled {
+            let attributes = store
+                .vpc_attributes_of(&input.vpc_id)
+                .ok_or_else(|| state::invalid_vpc_id_not_found(&input.vpc_id))?;
+            if !(attributes.enable_dns_support && attributes.enable_dns_hostnames) {
+                return Err(state::private_dns_unsupported_vpc(&input.vpc_id));
+            }
+        }
+
+        // "The IDs of the subnets in which to create endpoint network interfaces"
+        // (`SubnetIds`): each subnet is what an interface's Availability Zone and address
+        // range come from, so a subnet this account does not hold — or one of another VPC,
+        // which this endpoint cannot reach — is an error. "You can specify only one subnet
+        // per Availability Zone" (Amazon Web Services PrivateLink User Guide, "Interface
+        // endpoints"), so two subnets of one zone are refused rather than given two
+        // interfaces in one zone. The member carries no `@required` and no documented
+        // minimum, so a request naming none asks for an endpoint with no interface yet,
+        // which is stored as such rather than refused for a bound the model does not state.
+        let mut placements: Vec<Placement> = Vec::with_capacity(requested_subnets.len());
+        for subnet_id in &requested_subnets {
+            let Some(subnet) = store
+                .subnets
+                .get(subnet_id)
+                .filter(|subnet| subnet.vpc_id.as_deref() == Some(input.vpc_id.as_str()))
+            else {
+                return Err(state::invalid_subnet_id_not_found(subnet_id));
+            };
+            let availability_zone = subnet.availability_zone.clone().unwrap_or_default();
+            if let Some(held) = placements
+                .iter()
+                .find(|placement| placement.availability_zone == availability_zone)
+            {
+                return Err(state::duplicate_subnets_in_same_zone(&held.subnet_id));
+            }
+            placements.push(Placement {
+                subnet_id: subnet_id.clone(),
+                cidr_block: subnet.cidr_block.clone().unwrap_or_default(),
+                availability_zone,
+                availability_zone_id: subnet.availability_zone_id.clone().unwrap_or_default(),
+                // "The IPv4 address to assign to the endpoint network interface in the
+                // subnet" (`SubnetConfiguration$Ipv4`), when the request chose one.
+                requested_address: configured
+                    .get(subnet_id.as_str())
+                    .and_then(|configuration| configuration.ipv4.clone())
+                    .filter(|address| !address.is_empty()),
+            });
+        }
+
+        // "The IDs of the security groups to associate with the endpoint network
+        // interfaces" (`SecurityGroupIds`). A group has to exist and has to be a group of
+        // the endpoint's own VPC — a security group only applies within its VPC.
+        let mut groups: Vec<GroupIdentifier> = Vec::with_capacity(requested_groups.len());
+        for group_id in &requested_groups {
+            if !state::security_group_id_is_well_formed(group_id) {
+                return Err(state::invalid_group_id_malformed(group_id));
+            }
+            let Some(group) = store
+                .security_groups
+                .get(group_id)
+                .filter(|group| group.vpc_id.as_deref() == Some(input.vpc_id.as_str()))
+            else {
+                return Err(state::invalid_group_not_found(group_id));
+            };
+            groups.push(GroupIdentifier {
+                group_id: group.group_id.clone(),
+                group_name: group.group_name.clone(),
+            });
+        }
+        // "If this parameter is not specified, we use the default security group for the
+        // VPC" (`SecurityGroupIds`) — the group "your VPC automatically comes with" — so an
+        // interface endpoint created without groups gets its VPC's default group rather
+        // than none.
+        if interface && groups.is_empty() {
+            if let Some(default_group) = store.security_groups.values().find(|group| {
+                group.vpc_id.as_deref() == Some(input.vpc_id.as_str())
+                    && group.group_name.as_deref() == Some(state::DEFAULT_SECURITY_GROUP_NAME)
+            }) {
+                groups.push(GroupIdentifier {
+                    group_id: default_group.group_id.clone(),
+                    group_name: default_group.group_name.clone(),
+                });
+            }
+        }
+
+        // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request": a repeat of a request this store already served answers with the
+        // endpoint it created then, and creates nothing. Compared on what the REQUEST chose
+        // — never on the values the service selected itself, which a repeat could not have
+        // asked for — and answered before any ceiling is asked about, so a replay is
+        // neither charged again nor refused for a store that has since filled up. A token
+        // naming an endpoint the store no longer holds names nothing, so it is no replay and
+        // this request is served as a first one rather than refused for the store's own
+        // bookkeeping.
+        let replayed: Option<VpcEndpoint> = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.vpc_endpoint_client_tokens.get(token))
+            .and_then(|endpoint_id| store.vpc_endpoints.get(endpoint_id))
+            .cloned();
+        if let Some(stored) = replayed {
+            let stored_group_ids: Vec<Option<String>> = stored
+                .groups
+                .iter()
+                .flatten()
+                .map(|group| group.group_id.clone())
+                .collect();
+            let asked_group_ids: Vec<Option<String>> = groups
+                .iter()
+                .map(|group| group.group_id.clone())
+                .collect();
+            // The address asked for in each subnet is part of what the request chose too,
+            // and the stored endpoint holds it on the interface of that subnet — so the
+            // comparison reads the addresses those interfaces took rather than a second
+            // copy of the request.
+            let stored_addresses: Vec<Option<String>> = stored
+                .network_interface_ids
+                .iter()
+                .flatten()
+                .map(|network_interface_id| {
+                    store
+                        .network_interfaces
+                        .get(network_interface_id)
+                        .and_then(|interface| interface.private_ip_address.clone())
+                })
+                .collect();
+            let asked_addresses_match = placements.iter().enumerate().all(|(index, placement)| {
+                placement.requested_address.is_none()
+                    || stored_addresses.get(index).cloned().flatten()
+                        == placement.requested_address
+            });
+            let same_request = stored.vpc_id.as_deref() == Some(input.vpc_id.as_str())
+                && stored.vpc_endpoint_type.as_deref() == Some(endpoint_type.as_str())
+                && stored.service_name.as_deref() == Some(service_name)
+                && stored.service_region.as_deref() == Some(service_region.as_str())
+                && stored.policy_document == policy_document
+                && stored.private_dns_enabled.unwrap_or(false) == private_dns_enabled
+                && stored.subnet_ids.as_deref().unwrap_or_default() == requested_subnets
+                && stored_group_ids == asked_group_ids
+                && asked_addresses_match
+                && stored
+                    .ip_address_type
+                    .as_deref()
+                    .is_none_or(|held| held == ip_address_type)
+                && stored
+                    .dns_options
+                    .as_ref()
+                    .and_then(|options| options.dns_record_ip_type.as_deref())
+                    .is_none_or(|held| held == dns_record_ip_type)
+                && state::same_tags(stored.tags.as_deref().unwrap_or_default(), &tags);
+            if !same_request {
+                return Err(state::idempotent_parameter_mismatch());
+            }
+            // A dry run never makes the request, and an idempotent repeat is still the
+            // request: "If you have the required permissions, the error response is
+            // DryRunOperation" (`DryRun`).
+            if input.dry_run.unwrap_or(false) {
+                return Err(state::dry_run_operation());
+            }
+            return Ok(CreateVpcEndpointOutput {
+                vpc_endpoint: Some(stored),
+                client_token: input.client_token.clone(),
+            });
+        }
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of. The
+        // endpoint network interfaces are counted against their own store's ceiling as each
+        // one is created below.
+        if !store.has_vpc_endpoint_capacity() {
+            return Err(state::vpc_endpoint_limit_exceeded());
+        }
+        // What this request would retain: the record itself and its tags (what
+        // `insert_vpc_endpoint` charges), the caller-chosen policy, service name and client
+        // token, and an upper bound on the derived DNS names of an interface endpoint.
+        let payload_bytes = state::tag_list_bytes(&tags)
+            .saturating_add(state::STORED_RECORD_OVERHEAD_BYTES)
+            .saturating_add(policy_document.as_deref().map_or(0, str::len))
+            .saturating_add(service_name.len())
+            .saturating_add(input.client_token.as_deref().map_or(0, str::len))
+            .saturating_add(if interface {
+                dns_payload_bound(&service.service, &service_region, &placements)
+            } else {
+                0
+            });
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "An endpoint network interface is created … in an Availability Zone"
+        // (`SubnetIds`): one interface per subnet, taking a private address out of that
+        // subnet's own range through the store's one choice-and-take, so no two resources of
+        // a subnet can be handed the same address. Every refusal below hands back what this
+        // loop already took, so a refused create leaves the store where it found it.
+        let interface_type = if load_balancer {
+            state::NETWORK_INTERFACE_TYPE_GATEWAY_LOAD_BALANCER_ENDPOINT
+        } else {
+            state::NETWORK_INTERFACE_TYPE_VPC_ENDPOINT
+        };
+        let mut network_interface_ids: Vec<String> = Vec::with_capacity(placements.len());
+        for placement in &placements {
+            let address = match placement.requested_address.as_deref() {
+                Some(asked) => {
+                    if !state::is_assignable_subnet_address(&placement.cidr_block, asked) {
+                        release_interfaces(&mut store, &network_interface_ids);
+                        return Err(state::invalid_parameter_value(format!(
+                            "Value ({asked}) for parameter ipv4 is invalid. Address does not \
+                             fall within the subnet's assignable address range {cidr}",
+                            cidr = placement.cidr_block,
+                        )));
+                    }
+                    if !store.reserve_private_ip(asked) {
+                        release_interfaces(&mut store, &network_interface_ids);
+                        return Err(Scaffolded::invalid_ip_address_in_use(asked));
+                    }
+                    asked.to_string()
+                }
+                None => match store.mint_private_ip_in_cidr(&placement.cidr_block) {
+                    Some(free) => free,
+                    None => {
+                        release_interfaces(&mut store, &network_interface_ids);
+                        return Err(Scaffolded::insufficient_free_addresses());
+                    }
+                },
+            };
+            let spec = state::NetworkInterfaceSpec {
+                subnet_id: placement.subnet_id.clone(),
+                vpc_id: input.vpc_id.clone(),
+                availability_zone: placement.availability_zone.clone(),
+                availability_zone_id: placement.availability_zone_id.clone(),
+                region: region.clone(),
+                // Filled in with the endpoint it serves once the endpoint has its id.
+                description: String::new(),
+                interface_type: interface_type.to_string(),
+                private_ip_addresses: vec![address.clone()],
+                groups: groups.clone(),
+                // An endpoint network interface is attached to nothing a caller can see.
+                attachment: None,
+                // The endpoint carries the request's tags; its interfaces are not the
+                // resource the request tagged.
+                tags: Vec::new(),
+            };
+            match store.insert_network_interface(spec) {
+                Some(network_interface_id) => network_interface_ids.push(network_interface_id),
+                None => {
+                    store.release_private_ip(&address);
+                    release_interfaces(&mut store, &network_interface_ids);
+                    return Err(state::network_interface_limit_exceeded());
+                }
+            }
+        }
+
+        // The record itself. The endpoint is stored `Pending` — the non-terminal state this
+        // call ANSWERS with — and "Indicates whether the endpoint is being managed by its
+        // service" (`RequesterManaged`) is false for one a caller created. Only the members
+        // the endpoint's own TYPE has are set, so a gateway endpoint does not report an
+        // address type it has none of.
+        let endpoint = VpcEndpoint {
+            vpc_endpoint_type: Some(endpoint_type.clone()),
+            vpc_id: Some(input.vpc_id.clone()),
+            service_name: Some(service_name.to_string()),
+            state: Some(state::VPC_ENDPOINT_STATE_PENDING.to_string()),
+            policy_document: policy_document.clone(),
+            // "(Gateway endpoint) The IDs of the route tables associated with the
+            // endpoint": none are, nothing having associated one.
+            route_table_ids: gateway.then(Vec::new),
+            subnet_ids: (!gateway).then(|| {
+                placements
+                    .iter()
+                    .map(|placement| placement.subnet_id.clone())
+                    .collect()
+            }),
+            groups: interface.then(|| {
+                groups
+                    .iter()
+                    .map(|group| SecurityGroupIdentifier {
+                        group_id: group.group_id.clone(),
+                        group_name: group.group_name.clone(),
+                    })
+                    .collect()
+            }),
+            ip_address_type: (!gateway).then(|| ip_address_type.to_string()),
+            dns_options: (!gateway).then(|| DnsOptions {
+                dns_record_ip_type: Some(dns_record_ip_type.clone()),
+                ..Default::default()
+            }),
+            private_dns_enabled: interface.then_some(private_dns_enabled),
+            requester_managed: Some(false),
+            network_interface_ids: (!gateway).then(|| network_interface_ids.clone()),
+            creation_timestamp: Some(state::system_time_to_date_time(SystemTime::now())),
+            tags: Some(tags.clone()),
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            service_region: Some(service_region.clone()),
+            ..Default::default()
+        };
+        // `None` only when the store filled between the capacity question above and here,
+        // which cannot happen under the one lock this handler holds — answered with the
+        // refusal that question earns rather than unwrapped, handing back the interfaces and
+        // the addresses they took.
+        let Some(endpoint_id) = store.insert_vpc_endpoint(endpoint) else {
+            release_interfaces(&mut store, &network_interface_ids);
+            return Err(state::vpc_endpoint_limit_exceeded());
+        };
+        // The caller-chosen bytes the record retains beyond the tags `insert_vpc_endpoint`
+        // charged, reserved by the budget question above.
+        store.add_stored_bytes(
+            policy_document
+                .as_deref()
+                .map_or(0, str::len)
+                .saturating_add(service_name.len()),
+        );
+        // What the clock now owes this endpoint: `Available`, one TRANSITION_DELAY from now
+        // — the same span, off the same monotonic clock, as every other move this store
+        // owes. The span is never zero, so a caller that reads the endpoint straight after
+        // this call still sees it `Pending`.
+        store.vpc_endpoint_moves.insert(
+            endpoint_id.clone(),
+            state::PendingStateMove::starting_now(state::VPC_ENDPOINT_STATE_AVAILABLE),
+        );
+        // "(Interface endpoint) The DNS entries for the endpoint" (`DnsEntries`): the names
+        // the endpoint answers on, built from the id it was just given, the service it is to
+        // and the zones its interfaces sit in.
+        if interface {
+            let hosted_zone_id = store.mint_hosted_zone_id();
+            let private_hosted_zone_id = if private_dns_enabled {
+                Some(store.mint_hosted_zone_id())
+            } else {
+                None
+            };
+            let entries = dns_entries(
+                &endpoint_id,
+                &service.service,
+                &service_region,
+                &placements,
+                &hosted_zone_id,
+                private_hosted_zone_id.as_deref(),
+            );
+            store.add_stored_bytes(state::dns_entry_list_bytes(&entries));
+            if let Some(stored) = store.vpc_endpoints.get_mut(&endpoint_id) {
+                stored.dns_entries = Some(entries);
+            }
+        }
+        // Each endpoint network interface names the endpoint it serves, and is managed by
+        // the service rather than by the caller — "Indicates whether the interface is being
+        // managed by Amazon" (`NetworkInterface$RequesterManaged`).
+        for network_interface_id in &network_interface_ids {
+            if let Some(stored) = store.network_interfaces.get_mut(network_interface_id) {
+                stored.description = Some(format!("VPC Endpoint Interface {endpoint_id}"));
+                stored.requester_managed = Some(true);
+            }
+        }
+        if let Some(token) = input.client_token.clone() {
+            store.add_stored_bytes(token.len());
+            store
+                .vpc_endpoint_client_tokens
+                .insert(token, endpoint_id.clone());
+        }
+
+        // The answer is the record as it was stored, so `CreateVpcEndpoint` and
+        // `DescribeVpcEndpoints` cannot drift apart.
+        let Some(stored) = store.vpc_endpoints.get(&endpoint_id).cloned() else {
+            return Err(state::internal_error(
+                "the VPC endpoint just created could not be read back",
+            ));
+        };
+        Ok(CreateVpcEndpointOutput {
+            vpc_endpoint: Some(stored),
+            client_token: input.client_token.clone(),
+        })
+    }
+}
+
+/// The policy a request that named none gets: "If this parameter is not specified, we attach
+/// a default policy that allows full access to the service" (`PolicyDocument`) — every
+/// action, by every principal, on every resource of the service.
+const FULL_ACCESS_POLICY: &str =
+    r#"{"Statement":[{"Action":"*","Effect":"Allow","Principal":"*","Resource":"*"}]}"#;
+
+/// One subnet the endpoint is created in, as the resolution above read it off the stored
+/// subnet: what an endpoint network interface's zone and address range come from, beside the
+/// address the request asked for in that subnet, if it asked for one.
+struct Placement {
+    /// The subnet itself.
+    subnet_id: String,
+    /// Its IPv4 range, which the interface's private address comes out of.
+    cidr_block: String,
+    /// "The Availability Zone of the subnet" — one subnet per zone, so this is also the zone
+    /// the endpoint's zonal DNS name is built for.
+    availability_zone: String,
+    /// That zone's id.
+    availability_zone_id: String,
+    /// `SubnetConfiguration$Ipv4` for this subnet, when the request carried one.
+    requested_address: Option<String>,
+}
+
+/// The DNS names an interface endpoint answers on.
+///
+/// AWS gives an interface endpoint endpoint-specific regional and zonal names under
+/// [`crate::state::ENDPOINT_DNS_SUFFIX`] — `<endpoint>.<service>.<region>.vpce.amazonaws.com`
+/// and one `<endpoint>-<zone>.…` per Availability Zone its interfaces sit in — and, when a
+/// private hosted zone was asked for, "the default public DNS name for the service for the
+/// Region (for example, kinesis.us-east-1.amazonaws.com)"
+/// (`CreateVpcEndpointRequest$PrivateDnsEnabled`) in that zone. Every part is derived: the
+/// endpoint's own id, the service name's labels, and the zones of the stored subnets — never
+/// a value read off a clock or a random source.
+fn dns_entries(
+    endpoint_id: &str,
+    service: &str,
+    service_region: &str,
+    placements: &[Placement],
+    hosted_zone_id: &str,
+    private_hosted_zone_id: Option<&str>,
+) -> Vec<DnsEntry> {
+    let suffix = crate::state::ENDPOINT_DNS_SUFFIX;
+    let mut entries: Vec<DnsEntry> = Vec::with_capacity(placements.len() + 2);
+    if let Some(private_hosted_zone_id) = private_hosted_zone_id {
+        entries.push(DnsEntry {
+            dns_name: Some(format!(
+                "{service}.{service_region}.{public}",
+                public = crate::state::SERVICE_DNS_SUFFIX,
+            )),
+            hosted_zone_id: Some(private_hosted_zone_id.to_string()),
+        });
+    }
+    entries.push(DnsEntry {
+        dns_name: Some(format!("{endpoint_id}.{service}.{service_region}.{suffix}")),
+        hosted_zone_id: Some(hosted_zone_id.to_string()),
+    });
+    for placement in placements {
+        entries.push(DnsEntry {
+            dns_name: Some(format!(
+                "{endpoint_id}-{zone}.{service}.{service_region}.{suffix}",
+                zone = placement.availability_zone,
+            )),
+            hosted_zone_id: Some(hosted_zone_id.to_string()),
+        });
+    }
+    entries
+}
+
+/// An upper bound on [`crate::state::dns_entry_list_bytes`] of the entries an interface
+/// endpoint in `placements` will be given, which the create's byte-budget question asks
+/// about BEFORE the endpoint id those names are built from has been minted.
+///
+/// The bound is exact up to the fixed widths of a minted id and hosted zone id, which is
+/// what a budget gate needs: a request is refused when storing it would pass the budget, not
+/// accounted to the byte.
+fn dns_payload_bound(service: &str, service_region: &str, placements: &[Placement]) -> usize {
+    // `vpce-` and 17 hexadecimal digits (`ComAmazonawsEc2Amazonec2State::next_id`), and a
+    // hosted zone id of `Z` and 13 (`mint_hosted_zone_id`).
+    const MINTED_ID_BYTES: usize = 32;
+    let longest_zone = placements
+        .iter()
+        .map(|placement| placement.availability_zone.len())
+        .max()
+        .unwrap_or(0);
+    let per_entry = MINTED_ID_BYTES
+        + longest_zone
+        + service.len()
+        + service_region.len()
+        + crate::state::ENDPOINT_DNS_SUFFIX.len()
+        + crate::state::SERVICE_DNS_SUFFIX.len()
+        // The separating dots and dashes of the longest form.
+        + 8;
+    per_entry.saturating_mul(placements.len().saturating_add(2))
+}
+
+/// Hand back every endpoint network interface this call had already created.
+///
+/// The loop above TAKES a private address per interface, which is what stops two resources
+/// of a subnet being handed one address; so every refusal after the first interface removes
+/// them again ([`crate::state::ComAmazonawsEc2Amazonec2State::remove_network_interface`],
+/// the exact reverse of the insert), which gives their addresses, their bytes and the
+/// subnet's own available-address count back — leaving the store as the request found it.
+fn release_interfaces(
+    store: &mut crate::state::ComAmazonawsEc2Amazonec2State,
+    network_interface_ids: &[String],
+) {
+    for network_interface_id in network_interface_ids {
+        store.remove_network_interface(network_interface_id);
     }
 }

@@ -202,3 +202,5 @@ mod stage_export_documentation;
 mod update_domain_name;
 #[path = "all/test_invoke_method.rs"]
 mod test_invoke_method;
+#[path = "all/usage_plan_key_collection.rs"]
+mod usage_plan_key_collection;

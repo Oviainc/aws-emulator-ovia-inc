@@ -25,6 +25,8 @@ mod bucket_analytics_configuration;
 mod bucket_analytics_configuration_listing;
 #[path = "all/bucket_cors.rs"]
 mod bucket_cors;
+#[path = "all/bucket_cors_delete.rs"]
+mod bucket_cors_delete;
 #[path = "all/bucket_deletion_emptiness.rs"]
 mod bucket_deletion_emptiness;
 #[path = "all/bucket_encryption.rs"]

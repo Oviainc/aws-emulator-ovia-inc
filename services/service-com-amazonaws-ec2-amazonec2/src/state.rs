@@ -2772,6 +2772,18 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`VpcEndpoint`] shape itself. Ordered by id, which is the order
     /// `DescribeVpcEndpoints` reports and pages over.
     pub vpc_endpoints: BTreeMap<String, VpcEndpoint>,
+    /// The state move the clock owes a VPC endpoint, by `VpcEndpointId` — the endpoint's
+    /// counterpart of [`Self::vpc_endpoint_connection_moves`], beside the endpoint store
+    /// rather than inside it because that store holds the modelled shape itself.
+    /// `CreateVpcEndpoint` answers an endpoint in the non-terminal `Pending` state, so the
+    /// clock owes it `Available` [`TRANSITION_DELAY`] later whether or not anybody calls
+    /// again; an endpoint nothing owes a move has no entry here.
+    pub vpc_endpoint_moves: BTreeMap<String, PendingStateMove>,
+    /// A `CreateVpcEndpoint` `ClientToken` and the `VpcEndpointId` it minted, so a repeat
+    /// of the same request answers with that endpoint instead of creating a second one:
+    /// "Unique, case-sensitive identifier that you provide to ensure the idempotency of the
+    /// request" (`CreateVpcEndpointRequest$ClientToken`).
+    pub vpc_endpoint_client_tokens: HashMap<String, String>,
     /// Every Site-to-Site VPN connection the account holds, by `VpnConnectionId`, as
     /// [`VpnConnectionRecord`]s — the modelled [`VpnConnection`] every operation that reports
     /// one answers with, plus the move the clock owes each static route that is not in a
@@ -3154,6 +3166,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpc_endpoint_connection_moves: BTreeMap::new(),
             vpc_endpoint_services: BTreeMap::new(),
             vpc_endpoints: BTreeMap::new(),
+            vpc_endpoint_moves: BTreeMap::new(),
+            vpc_endpoint_client_tokens: HashMap::new(),
             vpn_connections: BTreeMap::new(),
             transit_gateway_attachments: BTreeMap::new(),
             transit_gateway_multicast_domains: BTreeMap::new(),
@@ -3232,6 +3246,17 @@ impl ComAmazonawsEc2Amazonec2State {
     pub fn next_id(&mut self, prefix: &str) -> String {
         self.id_counter = self.id_counter.saturating_add(1);
         format!("{prefix}-{:017x}", self.id_counter)
+    }
+
+    /// Mint the next hosted zone id a DNS entry names, e.g. `Z0000000000001`.
+    ///
+    /// A hosted zone id is an opaque identifier beginning with `Z` (`DnsEntry$HostedZoneId`
+    /// — "The ID of the private hosted zone"), so it takes that form over the store's own
+    /// monotonic counter, the source [`Self::next_id`] draws on: unique within a run, the
+    /// same across runs, and never read off a clock or a random source.
+    pub fn mint_hosted_zone_id(&mut self) -> String {
+        self.id_counter = self.id_counter.saturating_add(1);
+        format!("Z{:013X}", self.id_counter)
     }
 
     /// Mint an Amazon-provided IPv6 CIDR block with the `/56` prefix length
@@ -6433,6 +6458,20 @@ impl ComAmazonawsEc2Amazonec2State {
                 connection.vpc_endpoint_state = Some(pending.to.clone());
             }
             // The move is applied once; nothing is owed on this connection any more.
+            false
+        });
+        // The end of the `Pending` a `CreateVpcEndpoint` answers with: the endpoint is in
+        // service once its instant has passed, whether or not anybody called again — the
+        // same contract, on the same clock, as the connection move above.
+        let endpoints = &mut self.vpc_endpoints;
+        self.vpc_endpoint_moves.retain(|endpoint_id, pending| {
+            if now < pending.due_at {
+                return true;
+            }
+            if let Some(endpoint) = endpoints.get_mut(endpoint_id) {
+                endpoint.state = Some(pending.to.clone());
+            }
+            // The move is applied once; nothing is owed on this endpoint any more.
             false
         });
         // A NAT gateway address an association or an assignment left in a transient
@@ -19781,6 +19820,15 @@ pub const NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX: &str = "eni-attach";
 /// (`smithy_query(query="shape",shape="NetworkInterfaceType")`).
 pub const NETWORK_INTERFACE_TYPE_INTERFACE: &str = "interface";
 
+/// The type of the endpoint network interface an interface VPC endpoint is served by: that
+/// enum's `vpc_endpoint` member ([`crate::ops::types::NETWORK_INTERFACE_TYPE_VALUES`]).
+pub const NETWORK_INTERFACE_TYPE_VPC_ENDPOINT: &str = "vpc_endpoint";
+
+/// The type of the endpoint network interface a Gateway Load Balancer endpoint is served
+/// by: that enum's `gateway_load_balancer_endpoint` member.
+pub const NETWORK_INTERFACE_TYPE_GATEWAY_LOAD_BALANCER_ENDPOINT: &str =
+    "gateway_load_balancer_endpoint";
+
 /// The status of a network interface nothing holds: the `NetworkInterfaceStatus` enum's
 /// `available` member (`smithy_query(query="shape",shape="NetworkInterfaceStatus")`), which
 /// is where an interface with no attachment sits — and the one state a delete accepts.
@@ -21554,6 +21602,166 @@ pub const VPC_ENDPOINT_STATE_FILTER_VALUES: [(&str, &str); 7] = [
 /// `AcceptanceRequired` enters.
 pub const VPC_ENDPOINT_STATE_PENDING_ACCEPTANCE: &str = "PendingAcceptance";
 
+/// "The type of endpoint … Default: Gateway" (`CreateVpcEndpointRequest$VpcEndpointType`):
+/// the `VpcEndpointType` enum's `Gateway` member
+/// ([`crate::ops::types::VPC_ENDPOINT_TYPE_VALUES`]), and the type an endpoint is created
+/// as when the request names none.
+pub const VPC_ENDPOINT_TYPE_GATEWAY: &str = "Gateway";
+
+/// An endpoint served by endpoint network interfaces in the VPC's subnets: that enum's
+/// `Interface` member.
+pub const VPC_ENDPOINT_TYPE_INTERFACE: &str = "Interface";
+
+/// An endpoint served by a Gateway Load Balancer: that enum's `GatewayLoadBalancer`
+/// member.
+pub const VPC_ENDPOINT_TYPE_GATEWAY_LOAD_BALANCER: &str = "GatewayLoadBalancer";
+
+/// The `ResourceType` enum's `vpc-endpoint` member: the one resource type a
+/// `CreateVpcEndpoint` `TagSpecification` may name, since that is the resource it creates.
+pub const RESOURCE_TYPE_VPC_ENDPOINT: &str = "vpc-endpoint";
+
+/// DNS records for IPv4 addresses only: the `DnsRecordIpType` enum's `ipv4` member
+/// ([`crate::ops::types::DNS_RECORD_IP_TYPE_VALUES`]), which is what an endpoint whose
+/// address type is [`IP_ADDRESS_TYPE_IPV4`] has records for.
+pub const DNS_RECORD_IP_TYPE_IPV4: &str = "ipv4";
+
+/// The prefix of every endpoint service name Amazon Web Services itself offers, as the
+/// `ServiceName` doc's own examples spell it (`com.amazonaws.us-east-1.s3`).
+pub const AWS_ENDPOINT_SERVICE_PREFIX: &str = "com.amazonaws.";
+
+/// How many characters a VPC endpoint policy may carry: the published Amazon VPC quota for
+/// "VPC endpoint policy size", which is what bounds the document a create reads and stores.
+pub const MAX_VPC_ENDPOINT_POLICY_CHARS: usize = 20_480;
+
+/// The further label a partner or Marketplace endpoint service name carries between that
+/// prefix and its Region (`com.amazonaws.vpce.<region>.vpce-svc-…`).
+pub const PARTNER_ENDPOINT_SERVICE_LABEL: &str = "vpce.";
+
+/// The DNS suffix of the endpoint-specific names an interface endpoint answers on, under
+/// which the Region's own label sits (`<endpoint>.<service>.<region>.vpce.amazonaws.com`).
+pub const ENDPOINT_DNS_SUFFIX: &str = "vpce.amazonaws.com";
+
+/// The DNS suffix of the default public name of a service of a Region, which private DNS
+/// resolves inside the VPC — "the default public DNS name for the service for the Region
+/// (for example, `kinesis.us-east-1.amazonaws.com`)"
+/// (`CreateVpcEndpointRequest$PrivateDnsEnabled`).
+pub const SERVICE_DNS_SUFFIX: &str = "amazonaws.com";
+
+/// `InvalidServiceName` (HTTP 400): the request named something that is not the name of an
+/// endpoint service.
+pub const INVALID_SERVICE_NAME: &str = "InvalidServiceName";
+
+/// `VpcEndpointLimitExceeded` (HTTP 400): the account already holds as many VPC endpoints
+/// as this emulator stores.
+pub const VPC_ENDPOINT_LIMIT_EXCEEDED: &str = "VpcEndpointLimitExceeded";
+
+/// Refuse a request that named something no endpoint service of the Region is called, the
+/// way EC2 does: HTTP 400 [`INVALID_SERVICE_NAME`], naming the value at fault.
+pub fn invalid_service_name<E>(service_name: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_SERVICE_NAME,
+        400,
+        format!("The Vpc Endpoint Service '{service_name}' does not exist"),
+    )
+}
+
+/// Refuse a create that would take the account past the number of VPC endpoints this
+/// emulator stores: HTTP 400 [`VPC_ENDPOINT_LIMIT_EXCEEDED`], the quota code EC2 answers
+/// for one endpoint too many — the same contract as [`vpc_limit_exceeded`].
+pub fn vpc_endpoint_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        VPC_ENDPOINT_LIMIT_EXCEEDED,
+        400,
+        format!(
+            "This emulator stores at most {max} VPC endpoints",
+            max = MAX_STORED_RECORDS_PER_STORE,
+        ),
+    )
+}
+
+/// `DuplicateSubnetsInSameZone` (HTTP 400): the request named two subnets of one
+/// Availability Zone for an endpoint that has at most one network interface per zone.
+pub const DUPLICATE_SUBNETS_IN_SAME_ZONE: &str = "DuplicateSubnetsInSameZone";
+
+/// Refuse a request naming a second subnet of a zone the endpoint already has one in:
+/// HTTP 400 [`DUPLICATE_SUBNETS_IN_SAME_ZONE`], naming the subnet already placed there.
+pub fn duplicate_subnets_in_same_zone<E>(subnet_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        DUPLICATE_SUBNETS_IN_SAME_ZONE,
+        400,
+        format!("Found another VPC endpoint subnet in the availability zone of {subnet_id}"),
+    )
+}
+
+/// `InvalidParameter` (HTTP 400): a member's value cannot be honoured given the state of the
+/// resource it names — as opposed to [`INVALID_PARAMETER_VALUE`], which is about the value
+/// itself.
+pub const INVALID_PARAMETER: &str = "InvalidParameter";
+
+/// Refuse a request asking to associate a private hosted zone with a VPC whose DNS
+/// attributes do not admit one: HTTP 400 [`INVALID_PARAMETER`].
+///
+/// "To use a private hosted zone, you must set the following VPC attributes to true:
+/// enableDnsHostnames and enableDnsSupport"
+/// (`CreateVpcEndpointRequest$PrivateDnsEnabled`), which [`VpcAttributes`] holds.
+pub fn private_dns_unsupported_vpc<E>(vpc_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PARAMETER,
+        400,
+        format!(
+            "Private DNS can't be enabled because the VPC {vpc_id} doesn't support DNS \
+             hostnames or DNS resolution"
+        ),
+    )
+}
+
+/// What an endpoint service name says about the service it names: the Region hosting it and
+/// the service's own label within that Region.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointServiceName {
+    /// "The Region where the service is hosted" (`VpcEndpoint$ServiceRegion`), as the name
+    /// itself carries it.
+    pub region: String,
+    /// The service's label under that Region — `logs` in `com.amazonaws.us-west-2.logs`.
+    /// This is the label the endpoint-specific and private DNS names are built on.
+    pub service: String,
+}
+
+/// Read an endpoint service name, or `None` when the value is not one at all.
+///
+/// A service name is `com.amazonaws.<region>.<service>`, or
+/// `com.amazonaws.vpce.<region>.<service>` for one a partner offers — the forms the
+/// `ServiceName` doc's own examples take ([`AWS_ENDPOINT_SERVICE_PREFIX`],
+/// [`PARTNER_ENDPOINT_SERVICE_LABEL`]). The Region label has to be a Region name
+/// ([`region_name_is_well_formed`]) and the service label a non-empty run of the characters
+/// a DNS label of a service name is made of, since both end up in the DNS names the
+/// endpoint answers on. The ONE reading of a service name, so every operation that resolves
+/// one agrees about what it names.
+pub fn parse_endpoint_service_name(service_name: &str) -> Option<EndpointServiceName> {
+    let within_amazon = service_name.strip_prefix(AWS_ENDPOINT_SERVICE_PREFIX)?;
+    let within_region = within_amazon
+        .strip_prefix(PARTNER_ENDPOINT_SERVICE_LABEL)
+        .unwrap_or(within_amazon);
+    let (region, service) = within_region.split_once('.')?;
+    if !region_name_is_well_formed(region) {
+        return None;
+    }
+    if service.is_empty()
+        || !service.chars().all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || character == '-'
+                || character == '.'
+        })
+    {
+        return None;
+    }
+    Some(EndpointServiceName {
+        region: region.to_string(),
+        service: service.to_string(),
+    })
+}
+
 /// A connection whose endpoint is in service: the `State` enum's `Available` member.
 pub const VPC_ENDPOINT_STATE_AVAILABLE: &str = "Available";
 
@@ -21702,15 +21910,7 @@ pub fn vpc_endpoint_connection_payload_bytes(connection: &VpcEndpointConnection)
         arns.into_iter().flatten().map(String::len).sum()
     };
     let text_bytes = |value: Option<&String>| -> usize { value.map_or(0, String::len) };
-    let dns_bytes: usize = connection
-        .dns_entries
-        .iter()
-        .flatten()
-        .map(|entry| {
-            entry.dns_name.as_deref().unwrap_or_default().len()
-                + entry.hosted_zone_id.as_deref().unwrap_or_default().len()
-        })
-        .sum();
+    let dns_bytes = dns_entry_list_bytes(connection.dns_entries.as_deref().unwrap_or_default());
     STORED_RECORD_OVERHEAD_BYTES
         .saturating_add(
             connection
@@ -21727,6 +21927,24 @@ pub fn vpc_endpoint_connection_payload_bytes(connection: &VpcEndpointConnection)
         .saturating_add(dns_bytes)
         .saturating_add(text_bytes(connection.vpc_endpoint_owner.as_ref()))
         .saturating_add(text_bytes(connection.vpc_endpoint_region.as_ref()))
+}
+
+/// The bytes a stored list of DNS entries holds: each entry's name and the hosted zone it
+/// is served by.
+///
+/// The ONE definition of that charge, the way [`tag_list_bytes`] is for a tag list, so every
+/// writer of a record that carries DNS entries — a VPC endpoint connection
+/// ([`vpc_endpoint_connection_payload_bytes`]) and the endpoint itself — charges exactly it
+/// and a removal path gives back the same number. The names are built from the service name
+/// the caller supplied, so they are caller-sized rather than fixed.
+pub fn dns_entry_list_bytes(entries: &[DnsEntry]) -> usize {
+    entries
+        .iter()
+        .map(|entry| {
+            entry.dns_name.as_deref().unwrap_or_default().len()
+                + entry.hosted_zone_id.as_deref().unwrap_or_default().len()
+        })
+        .sum()
 }
 
 // =============================================================================
