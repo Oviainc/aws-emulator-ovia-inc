@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/composition_destination_kinds.rs"]
 mod composition_destination_kinds;
+#[path = "all/composition_layout_default_lifetime.rs"]
+mod composition_layout_default_lifetime;
 #[path = "all/composition_stop.rs"]
 mod composition_stop;
 #[path = "all/composition_tag_lifetime.rs"]
