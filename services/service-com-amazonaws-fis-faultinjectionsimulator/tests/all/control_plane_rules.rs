@@ -1722,10 +1722,13 @@ async fn updating_a_target_account_configuration_changes_only_what_the_request_n
             Some("only the description moved"),
         ),
         (
+            // An explicitly empty description CLEARS the stored one: the configuration
+            // then reports no `description` member at all, the same answer one that never
+            // had a description gives.
             "an empty description",
             json!({ "description": "" }),
             Some("arn:aws:iam::111122223333:role/second"),
-            Some(""),
+            None,
         ),
     ];
 

@@ -339,7 +339,14 @@ fn assert_matches_row(case: &str, source: &str, row: &Row, configuration: &Value
         "case {case:?}: expected {source} to report the roleArn the create carried, \
          got {configuration:?}"
     );
-    match &row.description {
+    // A description with characters in it round-trips exactly, while an explicitly empty
+    // one is normalized like an omitted one: the configuration then has no description at
+    // all, which is the rule `target_account_configuration_description.rs` owns.
+    match row
+        .description
+        .as_deref()
+        .filter(|description| !description.is_empty())
+    {
         Some(description) => assert_eq!(
             configuration["description"],
             json!(description),

@@ -11,7 +11,8 @@
 //!   by the (`experimentTemplateId`, `accountId`) pair rather than by a minted id, so
 //!   `CreateTargetAccountConfiguration` persists exactly the members the request carried
 //!   under that name and every later `GetTargetAccountConfiguration` of that name reports
-//!   them unchanged, down to whether `description` was absent or empty;
+//!   them unchanged (an explicitly empty `description` is normalized like an omitted one,
+//!   the rule `target_account_configuration_description.rs` owns);
 //! * a create naming an account the template is already configured for answers
 //!   `ConflictException` (HTTP 409), unless it replays the `@idempotencyToken` that
 //!   created that configuration — in which case it reports that configuration back
@@ -391,6 +392,16 @@ fn rows() -> Vec<Row> {
     ]
 }
 
+/// The `description` a configuration REPORTS once a write carried `sent`.
+///
+/// A description with characters in it round-trips exactly, while an explicitly empty one
+/// is normalized like an omitted one — the configuration then has no description at all.
+/// `target_account_configuration_description.rs` asserts that rule on its own; here it
+/// only says what these rows expect to read back.
+fn reported_description(sent: Option<&str>) -> Option<&str> {
+    sent.filter(|description| !description.is_empty())
+}
+
 /// What the configuration for one row has to look like, whoever reports it.
 fn assert_matches_row(case: &str, source: &str, row: &Row, configuration: &Value) {
     assert_configuration(
@@ -398,7 +409,7 @@ fn assert_matches_row(case: &str, source: &str, row: &Row, configuration: &Value
         source,
         &row.account_id,
         &row.role_arn,
-        row.description.as_deref(),
+        reported_description(row.description.as_deref()),
         configuration,
     );
 }
@@ -919,11 +930,14 @@ impl UpdateRow {
     }
 
     /// See [`UpdateRow::expected_role_arn`] — and an absent `description` stays absent
-    /// only while no update carries one.
+    /// only while no update carries one. A carried description is reported as
+    /// [`reported_description`] says, so an explicitly empty one clears what was stored.
     fn expected_description(&self) -> Option<String> {
-        self.description
-            .clone()
-            .or_else(|| self.baseline_description.clone())
+        let stored = match self.description.as_deref() {
+            Some(carried) => Some(carried),
+            None => self.baseline_description.as_deref(),
+        };
+        reported_description(stored).map(str::to_string)
     }
 }
 

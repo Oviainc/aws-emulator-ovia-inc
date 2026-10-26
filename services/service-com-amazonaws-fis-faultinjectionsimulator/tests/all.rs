@@ -57,6 +57,8 @@ mod resource_tagging;
 mod safety_lever;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/target_account_configuration_description.rs"]
+mod target_account_configuration_description;
 #[path = "all/target_account_configuration_errors.rs"]
 mod target_account_configuration_errors;
 #[path = "all/target_account_configurations.rs"]

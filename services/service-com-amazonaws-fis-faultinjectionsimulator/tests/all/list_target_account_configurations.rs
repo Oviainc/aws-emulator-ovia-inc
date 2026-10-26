@@ -11,8 +11,8 @@
 //! * a page reports the target account configurations the NAMED template holds and
 //!   nothing else, each configuration carrying exactly what
 //!   `CreateTargetAccountConfiguration` persisted for it and what
-//!   `GetTargetAccountConfiguration` reports for it, down to whether `description` was
-//!   absent or empty;
+//!   `GetTargetAccountConfiguration` reports for it, down to whether `description` is
+//!   absent or empty (an explicitly empty one normalized like an omitted one);
 //! * a page is at most `maxResults` long, a `nextToken` arrives only with a full page,
 //!   and following that token enumerates every configuration exactly once at any page
 //!   size — in one and the same order, whatever the page size and however often the list
@@ -452,7 +452,14 @@ async fn a_listed_configuration_reports_what_the_create_persisted() {
             "case {case:?}: expected the listed configuration to report the roleArn the \
              create carried, got {configuration:?}"
         );
-        match &row.description {
+        // An explicitly empty `description` is normalized like an omitted one, so the
+        // configuration created with one is listed with no description at all (the rule
+        // `target_account_configuration_description.rs` owns).
+        match row
+            .description
+            .as_deref()
+            .filter(|description| !description.is_empty())
+        {
             Some(description) => assert_eq!(
                 configuration["description"],
                 json!(description),

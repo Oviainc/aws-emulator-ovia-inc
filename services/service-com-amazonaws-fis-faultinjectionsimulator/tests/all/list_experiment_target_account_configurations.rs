@@ -11,7 +11,7 @@
 //! * a page reports the target account configurations the NAMED experiment holds — the
 //!   snapshot its template carried when `StartExperiment` ran — and nothing else, each
 //!   configuration carrying exactly what `GetExperimentTargetAccountConfiguration`
-//!   reports for it, down to whether `description` was absent or empty;
+//!   reports for it — an explicitly empty `description` normalized like an omitted one;
 //! * the operation models no `maxResults`, so the page size is the service's own: a
 //!   `nextToken` arrives only with a full page, and following that token enumerates every
 //!   configuration exactly once, in one and the same order, however often the list is
@@ -467,7 +467,14 @@ async fn a_listed_configuration_reports_what_the_experiment_was_started_with() {
             "case {case:?}: expected the listed configuration to report the roleArn the \
              create carried, got {configuration:?}"
         );
-        match &row.description {
+        // An explicitly empty `description` is normalized like an omitted one, so the
+        // configuration created with one is listed with no description at all (the rule
+        // `target_account_configuration_description.rs` owns).
+        match row
+            .description
+            .as_deref()
+            .filter(|description| !description.is_empty())
+        {
             Some(description) => assert_eq!(
                 configuration["description"],
                 json!(description),

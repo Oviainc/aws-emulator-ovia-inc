@@ -8,6 +8,11 @@
 //! and the answer is built from the record that is now persisted, so a later
 //! `GetTargetAccountConfiguration` of that name reports exactly what this call returned.
 //!
+//! An explicitly empty `description` is how a caller CLEARS one: the configuration is
+//! left with no description at all, so every read of it reports no `description` member —
+//! the same answer a configuration that never had one gives
+//! ([`crate::state::stored_description`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -194,7 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Partial update: `roleArn` and `description` are both optional here, so a member
-        // the request omits keeps the value the store already holds.
+        // the request omits keeps the value the store already holds. A `description` the
+        // request carries replaces it — and an explicitly empty one CLEARS it, leaving the
+        // configuration with no description at all
+        // ([`crate::state::stored_description`]).
         record.apply_update(input.role_arn.as_deref(), input.description.as_deref());
         // Built from the record now in the store, so this answer and every later read of
         // this name agree. The owning template's `lastUpdateTime` is not moved: this call

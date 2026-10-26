@@ -249,8 +249,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::TargetAccountConfigurationRecord::new(
             input.account_id.clone(),
             input.role_arn.clone(),
-            // Stored as the request carried it: an absent description stays absent and an
-            // empty one stays empty.
+            // Normalized as the store holds it: a description with characters in it
+            // round-trips exactly, while an absent one and an explicitly empty one both
+            // leave the configuration with no description
+            // ([`crate::state::stored_description`]).
             input.description.clone(),
             input.client_token.clone(),
         );

@@ -398,7 +398,14 @@ fn assert_matches_row(case: &str, source: &str, row: &Row, configuration: &Value
         json!(row.role_arn),
         "case {case:?}: {source} reported the wrong roleArn: {configuration:?}"
     );
-    match row.description.as_deref() {
+    // An explicitly empty `description` is normalized like an omitted one, so a row
+    // created with one reports no description at all (the rule
+    // `target_account_configuration_description.rs` owns).
+    match row
+        .description
+        .as_deref()
+        .filter(|description| !description.is_empty())
+    {
         Some(description) => assert_eq!(
             configuration["description"],
             json!(description),

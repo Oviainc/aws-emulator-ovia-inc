@@ -1038,11 +1038,12 @@ pub struct TargetAccountConfigurationRecord {
     /// `RoleArn` — "the Amazon Resource Name (ARN) of an IAM role for the target
     /// account", stored exactly as the request carried it.
     pub role_arn: String,
-    /// `TargetAccountConfigurationDescription`, absent when the request named none.
+    /// `TargetAccountConfigurationDescription`, absent when the configuration has none.
     ///
-    /// Held as an `Option` so a read reports what the caller actually sent: an absent
-    /// description stays absent and an empty one stays an empty string, rather than the
-    /// two collapsing into one value.
+    /// Held as an `Option` because the member is OPTIONAL on the wire, and normalized by
+    /// [`stored_description`] on every write: a configuration either has a description
+    /// with characters in it or has none, so an omitted description and an explicitly
+    /// empty one are the one same stored value.
     pub description: Option<String>,
     /// The `@idempotencyToken` of the request that created this configuration, when it
     /// carried one.
@@ -1052,6 +1053,22 @@ pub struct TargetAccountConfigurationRecord {
     /// which maps a token to a single minted id; the token is kept on the record and
     /// compared by [`TargetAccountConfigurationRecord::is_replay_of`] instead.
     pub client_token: Option<String>,
+}
+
+/// A `TargetAccountConfigurationDescription` as this service STORES it: a description
+/// with characters in it, or none at all.
+///
+/// The member is modelled `@length(min: 0, max: 512)`, `@pattern ^[\s\S]*$`, so an empty
+/// string is a legal value for a request to carry — and a configuration written with one
+/// reports NO `description` member, which is the single representation FIS has for a
+/// configuration without a description (the same one an omitted description gives). An
+/// empty string is therefore collapsed to absent on every write, by the create and by the
+/// update alike, so no read can report a third representation and a caller that sends the
+/// empty string to clear a description sees it cleared.
+pub fn stored_description(description: Option<&str>) -> Option<String> {
+    description
+        .filter(|description| !description.is_empty())
+        .map(str::to_string)
 }
 
 impl TargetAccountConfigurationRecord {
@@ -1065,7 +1082,9 @@ impl TargetAccountConfigurationRecord {
         Self {
             account_id,
             role_arn,
-            description,
+            // Normalized on the way in, so the store holds one representation of "this
+            // configuration has no description" (see [`stored_description`]).
+            description: stored_description(description.as_deref()),
             client_token,
         }
     }
@@ -1088,9 +1107,9 @@ impl TargetAccountConfigurationRecord {
     /// required on the create, so the update is a partial one: a member the request
     /// carries replaces the stored value, and a member it omits leaves the stored value
     /// exactly as it was. An empty `description` IS carried
-    /// (`TargetAccountConfigurationDescription` is modelled `@length(min: 0)`), so it
-    /// replaces the stored description with the empty string rather than counting as
-    /// "omitted".
+    /// (`TargetAccountConfigurationDescription` is modelled `@length(min: 0)`) and is how
+    /// a caller CLEARS a description: it is normalized by [`stored_description`], so the
+    /// configuration is left with no description at all rather than with an empty one.
     ///
     /// The `accountId` names the record and so is never changed by an update, and the
     /// creating `@idempotencyToken` is kept: a retry of the create still resolves to this
@@ -1100,7 +1119,7 @@ impl TargetAccountConfigurationRecord {
             self.role_arn = role_arn.to_string();
         }
         if let Some(description) = description {
-            self.description = Some(description.to_string());
+            self.description = stored_description(Some(description));
         }
     }
 
