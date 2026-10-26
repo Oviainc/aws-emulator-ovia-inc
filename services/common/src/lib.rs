@@ -233,6 +233,10 @@ pub mod iam_role;
 pub mod iam_trust_policy;
 pub mod iot_commands;
 pub mod iot_job_executions;
+/// The ONE reading of an ISO 8601 DURATION a service is handed as a caller-supplied
+/// string, for every service whose API takes a span that way — so two services asked how
+/// long a duration is cannot answer differently.
+pub mod iso8601_span;
 /// The ONE minification of a JSON document a service takes as an opaque string member and
 /// reports back on every read, so no two services report one document's bytes differently.
 pub mod json_document;

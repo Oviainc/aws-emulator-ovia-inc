@@ -112,7 +112,9 @@ async fn list_profile_times(harness: &Harness, name: &str, query: &str) -> Answe
 /// spread over hours and days — which is what an aggregation period is about — sets
 /// their receipt times in the store afterwards. This writes the same fields
 /// `PostAgentProfile` wrote, through the harness's one shared engine, and nothing else.
-fn place_receipts(harness: &Harness, name: &str, receipts: &[i64]) {
+/// `pub(crate)` so every suite that needs a profile at a chosen instant places it one
+/// way.
+pub(crate) fn place_receipts(harness: &Harness, name: &str, receipts: &[i64]) {
     let state = harness
         .engine
         .state::<service_com_amazonaws_codeguruprofiler_codeguruprofiler::ComAmazonawsCodeguruprofilerCodeguruprofilerState>();

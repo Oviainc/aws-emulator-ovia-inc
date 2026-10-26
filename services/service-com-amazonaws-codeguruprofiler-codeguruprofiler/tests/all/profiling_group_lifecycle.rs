@@ -72,7 +72,9 @@ pub(crate) fn complete_aggregation_in(engine: &Arc<engine::InMemoryEngine>, name
 /// suites in this test target drive the same harness instead of forking it.
 pub(crate) struct Answer {
     pub(crate) status: u16,
-    content_type: Option<String>,
+    /// The media type the response announces, which is `GetProfile`'s modelled
+    /// `contentType`. `pub(crate)` so every suite in this target reads it one way.
+    pub(crate) content_type: Option<String>,
     pub(crate) body: Vec<u8>,
 }
 
@@ -281,8 +283,9 @@ impl Harness {
     }
 
     /// `GetProfile` with the modelled `accept` member, which binds to the `Accept`
-    /// request header rather than to the query string.
-    async fn get_profile_accepting(
+    /// request header rather than to the query string. `pub(crate)` so every suite about
+    /// the representation a profile is served in drives the one sender.
+    pub(crate) async fn get_profile_accepting(
         &self,
         name: &str,
         query: &str,
@@ -1289,11 +1292,14 @@ async fn get_profile_selects_by_the_requested_time_range() {
             "?startTime=2000-01-01T00:00:00Z&endTime=2999-01-01T00:00:00Z&period=P1D",
             400,
         ),
-        // Only the three aggregation periods the doc offers are selectable.
-        ("an unoffered period", "?period=PT7M", 400),
-        // Truncating the stored profile's call stacks is not something this emulator
-        // can do, so it is refused rather than answered with an untruncated profile.
-        ("maxDepth", "?maxDepth=2", 400),
+        // `period` here is the free-form `Period` string, not the `AggregationPeriod`
+        // enum: any ISO 8601 duration names a window length, and on its own selects the
+        // latest profile. The spans each duration names are
+        // `crate::profile_representations`' table.
+        ("a period that is not an aggregation period", "?period=PT7M", 200),
+        // The depth the served profile's call stacks are bounded to; what it leaves out
+        // is `crate::profile_representations`' table.
+        ("maxDepth", "?maxDepth=2", 200),
     ];
 
     for (label, query, expected_status) in cases {
@@ -1304,7 +1310,7 @@ async fn get_profile_selects_by_the_requested_time_range() {
             answer.status,
             String::from_utf8_lossy(&answer.body)
         );
-        if answer.status == 200 {
+        if answer.status == 200 && !query.contains("maxDepth") {
             assert_eq!(
                 answer.body, body,
                 "case {label:?} ({query}): must return the posted bytes"
@@ -1312,22 +1318,32 @@ async fn get_profile_selects_by_the_requested_time_range() {
         }
     }
 
-    // `accept` asking for a media type the stored profile is not in cannot be served
-    // without transcoding the profile, so it is refused; one that accepts the stored
-    // media type is served.
-    for (label, accept, expected_status) in [
-        ("the stored media type", "application/json", 200u16),
-        ("any media type", "*/*", 200),
-        ("a media type the profile is not in", "application/x-amzn-ion", 400),
+    // `accept` selects which of the two representations the service serves this profile
+    // in, and the response reports the one it served; it refuses nothing. Which
+    // representation each media range selects is `crate::profile_representations`' table.
+    for (label, accept, expected_content_type) in [
+        ("the stored media type", "application/json", "application/json"),
+        ("any media type", "*/*", "application/json"),
+        (
+            "the service's other media type",
+            "application/x-amzn-ion",
+            "application/x-amzn-ion",
+        ),
     ] {
         let answer = harness
             .get_profile_accepting(&case.name, "", Some(accept))
             .await;
         assert_eq!(
-            answer.status, expected_status,
-            "case {label:?} (accept: {accept}): expected HTTP {expected_status}, got {} {}",
+            answer.status, 200,
+            "case {label:?} (accept: {accept}): expected HTTP 200, got {} {}",
             answer.status,
             String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(
+            answer.content_type.as_deref(),
+            Some(expected_content_type),
+            "case {label:?} (accept: {accept}): expected {expected_content_type}, got {:?}",
+            answer.content_type
         );
     }
 

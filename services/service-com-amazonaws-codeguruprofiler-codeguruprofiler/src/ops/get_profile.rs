@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetProfile
-//! Returns the AGGREGATED profile of a group over a requested window: the bytes
-//! exactly as `PostAgentProfile` uploaded them, under the `Content-Type` they were
-//! posted with. A profile the group has received but that the service has not yet
-//! collected into an aggregated profile is not servable, so a window covered by no
+//! Returns the AGGREGATED profile of a group over a requested window, in the
+//! representation the request accepts and bounded to the call-stack depth it asks for:
+//! the bytes exactly as `PostAgentProfile` uploaded them when the caller accepts the
+//! representation they were posted under and asks for no depth bound, and otherwise the
+//! same document re-encoded in an accepted representation, carrying no frame nested
+//! deeper than `maxDepth`. A profile the group has received but that the service has not
+//! yet collected into an aggregated profile is not servable, so a window covered by no
 //! aggregated profile is the operation's 404. Reporting only: it writes nothing.
 //!
 //! ## Shape of an operation
@@ -115,6 +118,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::std::cmp::Ordering;
+
+use ::base64::Engine as _;
+use ::ion_rs::{Element, IonType, Sequence, Struct, Value as IonValue};
+
 /// The time window a `GetProfile` request selects over, as (start, end) bounds either
 /// of which may be open.
 ///
@@ -133,52 +141,501 @@ fn requested_window(
     ),
     GetProfileError,
 > {
-    let period_seconds = match input.period.as_deref() {
+    // `period` here targets the free-form `Period` string, NOT the `AggregationPeriod`
+    // enum `ListProfileTimes` takes: it is the LENGTH of the requested window, stated as
+    // an ISO 8601 duration, and the one read of such a value is
+    // [`crate::state::iso8601_period`]. Only a string that names no fixed span is
+    // refused.
+    let period = match input.period.as_deref() {
         None => None,
-        // The aggregation periods this service offers live in `crate::state`, so
-        // `GetProfile` and `ListProfileTimes` read the same table, and both enumerate
-        // them in a refusal from the generated `AGGREGATION_PERIOD_VALUES`.
-        Some(period) => Some(
-            crate::state::aggregation_period_seconds(period).ok_or_else(|| {
-                crate::scaffolded::Scaffolded::validation(format!(
-                    "period must be one of {}, got {period}",
-                    AGGREGATION_PERIOD_VALUES.join(", ")
-                ))
-            })?,
-        ),
+        Some(period) => Some(crate::state::iso8601_period(period).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::period_validation_message(
+                period,
+            ))
+        })?),
     };
 
-    match (input.start_time, input.end_time, period_seconds) {
-        (Some(_), Some(_), Some(_)) => Err(crate::scaffolded::Scaffolded::validation(
-            "specify 1 or 2 of startTime, endTime and period, not all 3",
-        )),
-        (Some(start), None, Some(seconds)) => Ok((Some(start), Some(shifted(start, seconds)))),
-        (None, Some(end), Some(seconds)) => Ok((Some(shifted(end, -seconds)), Some(end))),
-        // A request that names BOTH bounds names an interval, and a pair of bounds is one
-        // only when the start is strictly before the end — the service-wide rule stated
-        // once in [`crate::state::validate_interval`]. A window completed from `period`
-        // above is increasing by construction, so only the caller-supplied pair is
-        // checked, and it is checked here: ahead of the group lookup, so a request that
-        // names no interval is refused rather than answered about one. `period` alone
-        // (and no bound at all) names no interval and selects the latest profile.
-        (start, end, _) => {
-            if let (Some(start), Some(end)) = (start, end) {
-                if let Err(message) = crate::state::validate_interval(start, end) {
-                    return Err(crate::scaffolded::Scaffolded::validation(message));
+    let (start, end) = match (input.start_time, input.end_time, period) {
+        (Some(_), Some(_), Some(_)) => {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "specify 1 or 2 of startTime, endTime and period, not all 3",
+            ));
+        }
+        (Some(start), None, Some(span)) => (Some(start), Some(shifted(start, nanos(span)))),
+        (None, Some(end), Some(span)) => (Some(shifted(end, -nanos(span))), Some(end)),
+        // `period` alone (and no bound at all) names no interval and selects the latest
+        // profile.
+        (start, end, _) => (start, end),
+    };
+
+    // A window that names BOTH bounds names an interval, and a pair of bounds is one only
+    // when the start is strictly before the end — the service-wide rule stated once in
+    // [`crate::state::validate_interval`]. It is checked here, ahead of the group lookup,
+    // so a request that names no interval is refused rather than answered about one, and
+    // it is checked on the COMPLETED window, so a `period` of zero length is refused as
+    // the zero-width window it names rather than served as a window at all.
+    if let (Some(start), Some(end)) = (start, end) {
+        if let Err(message) = crate::state::validate_interval(start, end) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+    }
+    Ok((start, end))
+}
+
+/// `span` as whole nanoseconds, saturating — the sign is the caller's, which is how the
+/// same span completes a window forwards from a start and backwards from an end.
+fn nanos(span: ::std::time::Duration) -> i128 {
+    i128::try_from(span.as_nanos()).unwrap_or(i128::MAX)
+}
+
+/// `at` moved by `nanos` nanoseconds, exactly: a window length is an arbitrary ISO 8601
+/// duration, so a bound it completes keeps the sub-second part of both the instant and
+/// the span rather than rounding either to whole seconds.
+fn shifted(at: ::aws_smithy_types::DateTime, nanos: i128) -> ::aws_smithy_types::DateTime {
+    const NANOS_PER_SECOND: i128 = 1_000_000_000;
+    let total = i128::from(at.secs()) * NANOS_PER_SECOND + i128::from(at.subsec_nanos()) + nanos;
+    // `div_euclid`/`rem_euclid` floor towards the past on both sides of the epoch, so the
+    // remainder is always in `0..NANOS_PER_SECOND` and is always the in-range sub-second
+    // part of the instant.
+    let seconds = total.div_euclid(NANOS_PER_SECOND);
+    let subsec = total.rem_euclid(NANOS_PER_SECOND);
+    ::aws_smithy_types::DateTime::from_secs_and_nanos(
+        i64::try_from(seconds).unwrap_or(if seconds.is_negative() {
+            i64::MIN
+        } else {
+            i64::MAX
+        }),
+        u32::try_from(subsec).unwrap_or(0),
+    )
+}
+
+/// The representations this service serves an aggregated profile in, as the model's
+/// `GetProfile$accept` doc names them: "application/json — standard JSON format" and
+/// "application/x-amzn-ion — the Amazon Ion data format".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Representation {
+    Json,
+    Ion,
+}
+
+impl Representation {
+    /// Every representation. The order breaks a tie between two the request accepts
+    /// equally and that the stored profile is in neither of, so one request has one
+    /// answer.
+    const ALL: [Self; 2] = [Self::Json, Self::Ion];
+
+    /// The media type this representation is announced and requested under: its media
+    /// TYPE and SUBTYPE, which are also what a media range in an `Accept` header matches
+    /// against.
+    fn type_and_subtype(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Json => ("application", "json"),
+            Self::Ion => ("application", "x-amzn-ion"),
+        }
+    }
+
+    /// This representation's media type, as `contentType` announces it.
+    fn media_type(self) -> &'static str {
+        match self {
+            Self::Json => "application/json",
+            Self::Ion => "application/x-amzn-ion",
+        }
+    }
+
+    /// The representation `media_type` names, or `None` for a media type that is neither
+    /// of them (including one that is no media type at all). Parameters and case are the
+    /// media-type grammar's, so the parse is the `mime` crate's and the comparison is on
+    /// the essence — `application/json; charset=utf-8` is JSON.
+    fn of(media_type: &str) -> Option<Self> {
+        let parsed: ::mime::Mime = media_type.parse().ok()?;
+        Self::ALL
+            .into_iter()
+            .find(|representation| parsed.essence_str() == representation.media_type())
+    }
+
+    /// Whether the media range `range` allows this representation: a range allows it when
+    /// it names its type and subtype, that type's wildcard (`application/*`) or the
+    /// wildcard that allows anything (`*/*`).
+    fn allowed_by(self, range: &::mime::Mime) -> bool {
+        let (media_type, subtype) = self.type_and_subtype();
+        (range.type_() == ::mime::STAR || range.type_() == media_type)
+            && (range.subtype() == ::mime::STAR || range.subtype() == subtype)
+    }
+}
+
+/// The representation an `Accept` header asks for, out of the ones this service serves,
+/// or `None` when it asks for none of them.
+///
+/// `Accept` is a comma-separated list of media ranges, each with an optional quality: the
+/// representation to serve is the one the header gives the highest quality, and a quality
+/// of zero is how a caller says a representation is NOT acceptable. A tie goes to the
+/// representation the profile is already stored in (`stored`), which is the one the
+/// service can serve without re-encoding it.
+fn negotiated(accept: &str, stored: Option<Representation>) -> Option<Representation> {
+    let mut best: Option<(Representation, f32)> = None;
+    for representation in Representation::ALL {
+        let Some(quality) = quality_of(accept, representation) else {
+            continue;
+        };
+        let better = match best {
+            None => true,
+            Some((chosen, best_quality)) => match quality.total_cmp(&best_quality) {
+                Ordering::Greater => true,
+                Ordering::Equal => {
+                    Some(representation) == stored && Some(chosen) != stored
                 }
+                Ordering::Less => false,
+            },
+        };
+        if better {
+            best = Some((representation, quality));
+        }
+    }
+    best.map(|(representation, _)| representation)
+}
+
+/// The quality the `Accept` header `accept` gives `representation`: the highest quality
+/// of any media range in it that allows that representation, or `None` when no range
+/// does.
+///
+/// A range that is not a media range at all names nothing and is skipped; a range whose
+/// quality is zero (or is not a number) allows nothing, so it is skipped too.
+fn quality_of(accept: &str, representation: Representation) -> Option<f32> {
+    accept
+        .split(',')
+        .filter_map(|range| range.trim().parse::<::mime::Mime>().ok())
+        .filter(|range| representation.allowed_by(range))
+        .filter_map(|range| match range.get_param("q") {
+            None => Some(1.0),
+            Some(quality) => quality.as_str().parse::<f32>().ok(),
+        })
+        .filter(|quality| *quality > 0.0)
+        .max_by(|left, right| left.total_cmp(right))
+}
+
+/// How many container levels deep this operation reads a profile document.
+///
+/// A profile is a document a caller posted, so its nesting is caller-controlled: the read
+/// that re-encodes or depth-bounds one DESCENDS into it, one frame per level, so the
+/// descent is bounded here rather than by the request — in BOTH representations, the JSON
+/// one by the limit `serde_json` applies to its own parse and the Ion one by
+/// [`ion_document`], which drives the reader level by level so nothing recurses on a
+/// caller-chosen depth. The number is `serde_json`'s own default, so neither
+/// representation is read deeper than the other. A document nested deeper than this is
+/// not one this operation re-encodes — it is served exactly as it is stored, under the
+/// media type it really has.
+const DOCUMENT_NESTING_LIMIT: u32 = 128;
+
+/// The bytes to serve and the media type to announce them under, for `profile` read with
+/// the request's `accept` and `max_depth`.
+///
+/// The two inputs are what the caller asks the service to do with the aggregated profile:
+/// serve it in a representation the caller understands (`accept`), and leave out the
+/// frames below a depth (`maxDepth`, whose doc: "if the maxDepth is set to 2, then the
+/// aggregated profile contains representations of methods A and B"). Neither is a
+/// constraint on the request, so neither can refuse one: a profile the caller accepts as
+/// it is stored and asks for no depth bound on is served byte for byte, and anything else
+/// is the stored document re-encoded. A profile this service cannot read as a document in
+/// the representation it was posted under holds no frames it can see — there is nothing
+/// in it to re-encode or to bound — so it is served as stored, under the media type it
+/// really has, which is what the response's `contentType` then reports.
+fn served_profile(
+    profile: &crate::state::AgentProfile,
+    accept: Option<&str>,
+    max_depth: Option<i32>,
+) -> (Vec<u8>, String) {
+    let as_stored = || (profile.bytes.clone(), profile.content_type.clone());
+    let stored = Representation::of(&profile.content_type);
+    let wanted = accept
+        .and_then(|accept| negotiated(accept, stored))
+        .or(stored);
+    // The modelled range is 1..10000, so the boundary validator has already refused
+    // anything else; a value outside it bounds nothing rather than panicking here.
+    let keep = max_depth.and_then(|depth| u32::try_from(depth).ok());
+
+    if keep.is_none() && wanted == stored {
+        return as_stored();
+    }
+    let (Some(stored), Some(wanted)) = (stored, wanted) else {
+        return as_stored();
+    };
+    let Some(document) = decoded(&profile.bytes, stored) else {
+        return as_stored();
+    };
+    // No `maxDepth` bounds no depth, so the whole document is kept — up to the nesting
+    // this operation reads at all.
+    let Some(document) = bounded(&document, keep.unwrap_or(u32::MAX), DOCUMENT_NESTING_LIMIT)
+    else {
+        return as_stored();
+    };
+    match encoded(&document, wanted) {
+        Some(bytes) => (bytes, wanted.media_type().to_string()),
+        None => as_stored(),
+    }
+}
+
+/// `bytes` read as a document in the representation `from`, or `None` when they are not
+/// one.
+fn decoded(bytes: &[u8], from: Representation) -> Option<Element> {
+    match from {
+        // One profile is one document, so a JSON text carrying anything after its single
+        // value is not one — which is what `serde_json` says.
+        Representation::Json => {
+            let value: ::serde_json::Value = ::serde_json::from_slice(bytes).ok()?;
+            ion_from_json(&value, DOCUMENT_NESTING_LIMIT)
+        }
+        Representation::Ion => ion_document(bytes, DOCUMENT_NESTING_LIMIT),
+    }
+}
+
+/// `bytes` read as ONE Ion document in Ion's BINARY encoding, descending no more than
+/// `budget` container levels.
+///
+/// The bytes are a document a caller posted, so how deeply they nest is the caller's
+/// choice and the descent into them is this operation's to bound
+/// ([`DOCUMENT_NESTING_LIMIT`]). Two things together make that bound real. Every value of
+/// the binary encoding carries its own length, so the reader hands back a value by reading
+/// its header and descends into a container only where this walk steps into one; and the
+/// walk below stops at the bound. So nothing follows a caller-chosen depth: a document
+/// nested deeper than the bound is read as no document at all, exactly like bytes the
+/// reader cannot read — which is also the answer for Ion's TEXT encoding, where finding
+/// where a value ends means reading through everything nested inside it first.
+fn ion_document(bytes: &[u8], budget: u32) -> Option<Element> {
+    let mut reader = ::ion_rs::Reader::new(::ion_rs::v1_0::Binary, bytes).ok()?;
+    let document = ion_element(reader.next().ok()??, budget)?;
+    // One profile is one document, so a stream carrying anything after its first value is
+    // not one.
+    reader.next().ok()?.is_none().then_some(document)
+}
+
+/// The Ion value `value` as an owned [`Element`], descending no more than `budget`
+/// container levels — the bounded half of [`ion_document`].
+fn ion_element<D: ::ion_rs::Decoder>(
+    value: ::ion_rs::LazyValue<'_, D>,
+    budget: u32,
+) -> Option<Element> {
+    let kept = match value.read().ok()? {
+        ::ion_rs::ValueRef::List(sequence) => {
+            let budget = budget.checked_sub(1)?;
+            let mut elements: Vec<Element> = Vec::new();
+            for item in &sequence {
+                elements.push(ion_element(item.ok()?, budget)?);
             }
-            Ok((start, end))
+            IonValue::List(Sequence::new(elements))
+        }
+        ::ion_rs::ValueRef::SExp(sequence) => {
+            let budget = budget.checked_sub(1)?;
+            let mut elements: Vec<Element> = Vec::new();
+            for item in &sequence {
+                elements.push(ion_element(item.ok()?, budget)?);
+            }
+            IonValue::SExp(Sequence::new(elements))
+        }
+        ::ion_rs::ValueRef::Struct(fields) => {
+            let budget = budget.checked_sub(1)?;
+            let mut members: Vec<(::ion_rs::Symbol, Element)> = Vec::new();
+            for field in &fields {
+                let field = field.ok()?;
+                members.push((
+                    field.name().ok()?.to_owned(),
+                    ion_element(field.value(), budget)?,
+                ));
+            }
+            IonValue::Struct(Struct::from_iter(members))
+        }
+        // A scalar holds nothing to descend into, so the crate's own conversion reads it
+        // (annotations and all) in one step.
+        _ => return Element::try_from(value).ok(),
+    };
+    let mut annotations: Vec<::ion_rs::Symbol> = Vec::new();
+    for annotation in value.annotations() {
+        annotations.push(annotation.ok()?.to_owned());
+    }
+    Some(Element::from(kept).with_annotations(annotations))
+}
+
+/// `document` written out in the representation `into`, or `None` when it has no form in
+/// it.
+fn encoded(document: &Element, into: Representation) -> Option<Vec<u8>> {
+    match into {
+        Representation::Json => {
+            ::serde_json::to_vec(&json_from_ion(document, DOCUMENT_NESTING_LIMIT)?).ok()
+        }
+        // Ion's own binary encoding, which is the serialized form of an Ion document.
+        Representation::Ion => document.encode_as(::ion_rs::v1_0::Binary).ok(),
+    }
+}
+
+/// `element` with every value nested more than `keep` container levels inside it dropped,
+/// or `None` when it is nested deeper than `budget` levels.
+///
+/// This is `maxDepth`: the call stacks of a profile are its nested frames, so the depth of
+/// a frame is how many containers of the document it sits inside, and bounding that depth
+/// keeps the outermost `keep` levels. A container AT the bound is kept and emptied — the
+/// frame itself is in the profile, the frames it calls are not — so a profile bounded to
+/// one depth is a prefix of the same profile bounded to a greater one.
+fn bounded(element: &Element, keep: u32, budget: u32) -> Option<Element> {
+    // A null container holds nothing, so there is nothing below it to drop.
+    if element.is_null() {
+        return Some(element.clone());
+    }
+    let annotations: Vec<::ion_rs::Symbol> = element.annotations().iter().cloned().collect();
+    match element.ion_type() {
+        IonType::Struct => {
+            let fields = element.as_struct()?;
+            let kept: Struct = if keep == 0 {
+                Struct::from_iter(::std::iter::empty::<(::ion_rs::Symbol, Element)>())
+            } else {
+                let mut bounded_fields: Vec<(::ion_rs::Symbol, Element)> = Vec::new();
+                for (name, value) in fields.fields() {
+                    bounded_fields.push((
+                        name.clone(),
+                        bounded(value, keep - 1, budget.checked_sub(1)?)?,
+                    ));
+                }
+                Struct::from_iter(bounded_fields)
+            };
+            Some(Element::from(kept).with_annotations(annotations))
+        }
+        kind @ (IonType::List | IonType::SExp) => {
+            let items = element.as_sequence()?;
+            let kept: Sequence = if keep == 0 {
+                Sequence::new(Vec::<Element>::new())
+            } else {
+                let mut bounded_items: Vec<Element> = Vec::new();
+                for item in items.elements() {
+                    bounded_items.push(bounded(item, keep - 1, budget.checked_sub(1)?)?);
+                }
+                Sequence::new(bounded_items)
+            };
+            let value = if kind == IonType::List {
+                IonValue::List(kept)
+            } else {
+                IonValue::SExp(kept)
+            };
+            Some(Element::from(value).with_annotations(annotations))
+        }
+        // A scalar is a value a frame carries, not a frame: it is kept wherever it sits.
+        _ => Some(element.clone()),
+    }
+}
+
+/// `value` as an Ion document: the JSON data model is a subset of Ion's, so every JSON
+/// value has exactly one Ion counterpart. `None` when the document is nested deeper than
+/// `budget` container levels.
+fn ion_from_json(value: &::serde_json::Value, budget: u32) -> Option<Element> {
+    match value {
+        ::serde_json::Value::Null => Some(Element::null(IonType::Null)),
+        ::serde_json::Value::Bool(boolean) => Some(Element::from(*boolean)),
+        ::serde_json::Value::Number(number) => Some(match (number.as_i64(), number.as_f64()) {
+            (Some(integer), _) => Element::from(integer),
+            // A magnitude past an `i64` is carried over as the float `serde_json` holds
+            // it as, which is the only other form it has it in.
+            (None, Some(float)) => Element::from(float),
+            // Unreachable: `serde_json` holds every number it parsed as one of the two
+            // above. A number it holds as neither is no number this operation can carry
+            // over, so it is carried over as the absence of one.
+            (None, None) => Element::null(IonType::Float),
+        }),
+        ::serde_json::Value::String(text) => Some(Element::from(text.clone())),
+        ::serde_json::Value::Array(items) => {
+            let budget = budget.checked_sub(1)?;
+            let mut elements: Vec<Element> = Vec::with_capacity(items.len());
+            for item in items {
+                elements.push(ion_from_json(item, budget)?);
+            }
+            Some(Element::from(IonValue::List(Sequence::new(elements))))
+        }
+        ::serde_json::Value::Object(fields) => {
+            let budget = budget.checked_sub(1)?;
+            let mut members: Vec<(::ion_rs::Symbol, Element)> = Vec::with_capacity(fields.len());
+            for (name, field) in fields {
+                members.push((
+                    ::ion_rs::Symbol::from(name.as_str()),
+                    ion_from_json(field, budget)?,
+                ));
+            }
+            Some(Element::from(Struct::from_iter(members)))
         }
     }
 }
 
-/// `at` moved by a whole number of seconds, keeping its sub-second part exactly — the
-/// aggregation periods are whole seconds, so a window bound needs no `f64` round trip.
-fn shifted(at: ::aws_smithy_types::DateTime, seconds: i64) -> ::aws_smithy_types::DateTime {
-    ::aws_smithy_types::DateTime::from_secs_and_nanos(
-        at.secs().saturating_add(seconds),
-        at.subsec_nanos(),
-    )
+/// `element` as a JSON document, down-converted the way Amazon Ion documents down-convert
+/// to JSON: a value of an Ion type JSON does not have is carried over as the JSON value
+/// that holds the same information — a timestamp as its text, a symbol as its text, a
+/// blob or clob as base64 text, an s-expression as an array, a decimal as a number — and
+/// an annotation, which JSON cannot carry at all, is dropped. `None` when the document is
+/// nested deeper than `budget` container levels.
+fn json_from_ion(element: &Element, budget: u32) -> Option<::serde_json::Value> {
+    if element.is_null() {
+        return Some(::serde_json::Value::Null);
+    }
+    let value = match element.value() {
+        IonValue::Null(_) => ::serde_json::Value::Null,
+        IonValue::Bool(boolean) => ::serde_json::Value::Bool(*boolean),
+        IonValue::Int(integer) => integer
+            .expect_i64()
+            .ok()
+            .map(::serde_json::Value::from)
+            .unwrap_or_else(|| json_number(integer.to_string())),
+        IonValue::Float(float) => ::serde_json::Number::from_f64(*float)
+            .map(::serde_json::Value::Number)
+            // JSON has no infinity and no NaN, so a float that is neither finite nor
+            // representable is carried over as the absence of a number.
+            .unwrap_or(::serde_json::Value::Null),
+        IonValue::Decimal(decimal) => json_number(decimal.to_string()),
+        IonValue::Timestamp(timestamp) => ::serde_json::Value::String(timestamp.to_string()),
+        IonValue::String(text) => ::serde_json::Value::String(text.text().to_string()),
+        // A symbol with unknown text names nothing JSON can carry.
+        IonValue::Symbol(symbol) => symbol
+            .text()
+            .map(|text| ::serde_json::Value::String(text.to_string()))
+            .unwrap_or(::serde_json::Value::Null),
+        IonValue::Blob(bytes) => ::serde_json::Value::String(
+            ::base64::engine::general_purpose::STANDARD.encode(bytes.as_ref()),
+        ),
+        IonValue::Clob(bytes) => ::serde_json::Value::String(
+            ::base64::engine::general_purpose::STANDARD.encode(bytes.as_ref()),
+        ),
+        IonValue::List(items) | IonValue::SExp(items) => {
+            // An s-expression is a sequence, and a JSON array is the only sequence JSON
+            // has, so both carry over as one.
+            let budget = budget.checked_sub(1)?;
+            let mut values: Vec<::serde_json::Value> = Vec::with_capacity(items.len());
+            for item in items.elements() {
+                values.push(json_from_ion(item, budget)?);
+            }
+            ::serde_json::Value::Array(values)
+        }
+        IonValue::Struct(fields) => {
+            let budget = budget.checked_sub(1)?;
+            let mut members = ::serde_json::Map::new();
+            for (name, field) in fields.fields() {
+                // A field whose name has unknown text names nothing a JSON member can be
+                // keyed by, so it is left out rather than keyed by an invented name.
+                let Some(name) = name.text() else {
+                    continue;
+                };
+                members.insert(name.to_string(), json_from_ion(field, budget)?);
+            }
+            ::serde_json::Value::Object(members)
+        }
+    };
+    Some(value)
+}
+
+/// `text` — an Ion integer or decimal written out in Ion's own notation — as a JSON
+/// number, or as the text itself when JSON cannot hold that number (a magnitude or a
+/// precision beyond a JSON number is information a string keeps and a number loses).
+///
+/// Ion writes a decimal exponent with `d`, where JSON (and Rust) write it with `e`.
+fn json_number(text: String) -> ::serde_json::Value {
+    match text.replace(['d', 'D'], "e").parse::<f64>() {
+        Ok(number) => ::serde_json::Number::from_f64(number)
+            .map(::serde_json::Value::Number)
+            .unwrap_or(::serde_json::Value::String(text)),
+        Err(_) => ::serde_json::Value::String(text),
+    }
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -259,61 +716,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // An agent profile is an opaque payload (Amazon Ion or JSON) this emulator
-        // stores and returns verbatim. Truncating its call stacks (`maxDepth`) or
-        // transcoding it into another media type (`accept`) would mean parsing and
-        // rewriting that payload, which this emulator does not do — so those are
-        // refused with the operation's own ValidationException rather than answered
-        // with a profile that is not the one the caller asked for.
-        if input.max_depth.is_some() {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "maxDepth is not supported: this emulator returns the stored agent \
-                 profile unmodified and cannot truncate its call stacks",
-            ));
-        }
-
         let (start, end) = requested_window(&input)?;
 
-        let guard = state.lock();
-        let group = guard.groups.get(&input.profiling_group_name).ok_or_else(|| {
-            GetProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: crate::state::group_not_found_message(&input.profiling_group_name),
-            })
-        })?;
-        // The group IS there; what is missing is an AGGREGATED profile covering the
-        // requested range. Collecting posted agent profiles into aggregated profiles is
-        // work the service does after the fact, so a profile this group received is
-        // servable only once the aggregation it belongs to is due — before that, and for
-        // a window the group holds nothing in, this operation reports the same absence.
-        // That is a different refusal from a missing group, and the service states it
-        // with its own fixed text — the only thing distinguishing the two, since both
-        // are 404 `ResourceNotFoundException`.
-        let profile = group
-            .latest_profile_in(start, end, crate::state::now())
-            .ok_or_else(|| {
+        // The stored profile is taken out of the store and the guard released before the
+        // document is read or written: re-encoding or bounding a document a caller posted
+        // is work whose size that caller chose, and holding the store's lock across it
+        // would make one profile's size every other caller's latency.
+        let stored = {
+            let guard = state.lock();
+            let group = guard.groups.get(&input.profiling_group_name).ok_or_else(|| {
                 GetProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: crate::state::NO_PROFILES_IN_TIME_RANGE.to_string(),
+                    message: crate::state::group_not_found_message(&input.profiling_group_name),
                 })
             })?;
+            // The group IS there; what is missing is an AGGREGATED profile covering the
+            // requested range. Collecting posted agent profiles into aggregated profiles
+            // is work the service does after the fact, so a profile this group received
+            // is servable only once the aggregation it belongs to is due — before that,
+            // and for a window the group holds nothing in, this operation reports the
+            // same absence. That is a different refusal from a missing group, and the
+            // service states it with its own fixed text — the only thing distinguishing
+            // the two, since both are 404 `ResourceNotFoundException`.
+            group
+                .latest_profile_in(start, end, crate::state::now())
+                .ok_or_else(|| {
+                    GetProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                        message: crate::state::NO_PROFILES_IN_TIME_RANGE.to_string(),
+                    })
+                })?
+                .clone()
+        };
 
-        if let Some(accept) = input.accept.as_deref() {
-            let acceptable = accept
-                .split(',')
-                .map(|media_type| media_type.split(';').next().unwrap_or("").trim())
-                .any(|media_type| media_type == "*/*" || media_type == profile.content_type);
-            if !acceptable {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "accept {accept} does not accept {}, the content type this profile \
-                     was posted under, and this emulator does not transcode profiles",
-                    profile.content_type
-                )));
-            }
-        }
+        // What the caller asked the service to do with the aggregated profile: serve it
+        // in a representation the request accepts, carrying no frame deeper than
+        // `maxDepth`. Both are stated once, in [`served_profile`].
+        //
+        // Reading and writing the document is CPU work over a payload whose size the
+        // caller chose (bounded by the store's retention caps and by
+        // [`DOCUMENT_NESTING_LIMIT`]), so it runs on the blocking pool instead of on the
+        // async worker serving this request — and `spawn_blocking(..).await` is a real
+        // await point, so a health check, a timeout and a shutdown all still land while
+        // one profile is being written out. The stored profile was copied out of the
+        // store above, so the task owns everything it reads.
+        let accept = input.accept.clone();
+        let max_depth = input.max_depth;
+        let served =
+            ::tokio::task::spawn_blocking(move || served_profile(&stored, accept.as_deref(), max_depth))
+                .await;
+        let (bytes, content_type) = served.map_err(|_| {
+            GetProfileErrorModeled::InternalServerException(InternalServerException {
+                message: "reading the stored profile did not complete".to_string(),
+            })
+        })?;
 
         Ok(GetProfileOutput {
-            profile: profile.bytes.clone(),
-            content_type: profile.content_type.clone(),
-            // Profiles are stored and returned uncompressed, so there is no content
+            profile: bytes,
+            content_type,
+            // Profiles are stored and served uncompressed, so there is no content
             // encoding to report.
             content_encoding: None,
         })

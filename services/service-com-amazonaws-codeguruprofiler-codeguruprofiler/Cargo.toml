@@ -34,6 +34,18 @@ tracing = { workspace = true }
 # the store's own mint count and the write it identifies.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The Amazon Ion reader and writer `GetProfile` serves the Ion representation of a
+# profile through (the model's `accept`/`contentType` offer Ion beside JSON). The
+# reader-writer API is what lets the descent into a caller-posted document be driven —
+# and bounded — by this crate instead of recursing inside the crate. Held at this
+# release because every later one pins `winnow` to a version older than the one this
+# workspace already locks.
+ion-rs = { version = "=1.0.0-rc.11", features = ["experimental-reader-writer"] }
+# Base64, the documented down-conversion of an Ion blob or clob into a JSON string.
+base64 = "0.22"
+# Media-type (and media-RANGE) parsing, so `GetProfile`'s `Accept` is read by the
+# grammar rather than by string comparison.
+mime = "0.3"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

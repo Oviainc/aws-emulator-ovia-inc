@@ -4120,35 +4120,21 @@ fn action_span(action: &ExperimentTemplateAction) -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
-/// The fixed span the ISO 8601 duration `value` names, or `None` when it names none.
+/// The fixed span the ISO 8601 duration `value` names, or `None` when it names none —
+/// [`::service_common::iso8601_span::iso8601_span`], the one reading of such a value, so
+/// no two services disagree about how long a duration is.
 ///
 /// A duration whose length depends on the calendar (a year or a month designator) names no
 /// fixed span, so it is read as no duration at all rather than guessed at — the same
 /// reading [`wait_duration`], which is this parse under `aws:fis:wait`'s documented range,
 /// takes of one.
 ///
-/// TOTAL over every string a caller can send: a value this cannot read as a fixed,
-/// representable span — one that is not a duration, one that is negative, and one whose
-/// span does not fit a [`Duration`] (the parser's fields are floats, so a request may name
-/// 1e20 seconds) — is `None`. Nothing here may panic: the `duration` of an action that is
-/// not `aws:fis:wait` is never range-checked when the template is created, so this parse
-/// runs on unvalidated request text inside `StartExperiment`, while that handler holds the
-/// store guard.
+/// TOTAL over every string a caller can send, and nothing in it may panic: the `duration`
+/// of an action that is not `aws:fis:wait` is never range-checked when the template is
+/// created, so this parse runs on unvalidated request text inside `StartExperiment`, while
+/// that handler holds the store guard.
 pub fn iso8601_span(value: &str) -> Option<Duration> {
-    let parsed = ::iso8601_duration::Duration::parse(value).ok()?;
-    if parsed.year != 0.0 || parsed.month != 0.0 {
-        return None;
-    }
-    let seconds = f64::from(parsed.day) * 86_400.0
-        + f64::from(parsed.hour) * 3_600.0
-        + f64::from(parsed.minute) * 60.0
-        + f64::from(parsed.second);
-    if !seconds.is_finite() || seconds < 0.0 {
-        return None;
-    }
-    // `try_from_secs_f64` is the non-panicking construction: a value a `Duration` cannot
-    // hold names no span this service can run, exactly like a value that is no duration.
-    Duration::try_from_secs_f64(seconds).ok()
+    ::service_common::iso8601_span::iso8601_span(value)
 }
 
 /// `None` when this emulator has no reason to think FIS could not assume `role_arn`;

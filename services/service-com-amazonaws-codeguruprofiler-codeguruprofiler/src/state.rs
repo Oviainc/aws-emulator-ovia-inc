@@ -6,6 +6,7 @@
 //! handler computes its response from what is stored here; nothing is canned.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::time::Duration;
 
 use ::aws_smithy_types::DateTime;
 
@@ -45,6 +46,32 @@ pub fn aggregation_period_seconds(period: &str) -> Option<i64> {
         .iter()
         .find(|(name, _)| *name == period)
         .map(|(_, seconds)| *seconds)
+}
+
+/// The span the ISO 8601 duration `period` names, or `None` when it names none —
+/// [`::service_common::iso8601_span::iso8601_span`], the one reading of such a value, so
+/// no two services disagree about how long a duration is.
+///
+/// This reads a FREE-FORM duration, which is what `GetProfile$period` targets (`Period`:
+/// a string of length 1..64, whose own doc gives `P1DT1H1M1S` as an example) — as opposed
+/// to [`aggregation_period_seconds`], which reads the `AggregationPeriod` ENUM that
+/// `ListProfileTimes$period` targets.
+///
+/// A duration of zero length IS a span and is returned as one: a window of zero width is
+/// refused by [`validate_interval`], with the sentence that rule states, rather than
+/// reported here as a duration that could not be read.
+pub fn iso8601_period(period: &str) -> Option<Duration> {
+    ::service_common::iso8601_span::iso8601_span(period)
+}
+
+/// The message a read refused for a `period` that names no fixed span carries: the rule
+/// the member states ("Specify using the ISO 8601 format. For example, P1DT1H1M1S") and
+/// the value the request sent, so the caller sees what to change.
+pub fn period_validation_message(period: &str) -> String {
+    format!(
+        "period must name a fixed span of time in the ISO 8601 duration format, for \
+         example P1DT1H1M1S, got {period}"
+    )
 }
 
 /// The start of the `period_seconds`-long aggregation window, aligned to the UTC
