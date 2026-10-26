@@ -61,6 +61,9 @@ pub const LIST_POLICIES: &str = "iam:ListPolicies";
 /// `iam:ListInstanceProfiles`.
 pub const LIST_INSTANCE_PROFILES: &str = "iam:ListInstanceProfiles";
 
+/// `iam:ListPoliciesGrantingServiceAccess`.
+pub const LIST_POLICIES_GRANTING_SERVICE_ACCESS: &str = "iam:ListPoliciesGrantingServiceAccess";
+
 /// `iam:CreateGroup`.
 pub const CREATE_GROUP: &str = "iam:CreateGroup";
 

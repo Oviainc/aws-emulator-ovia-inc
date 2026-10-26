@@ -59,6 +59,8 @@ mod managed_policies;
 mod open_id_connect_client_ids;
 #[path = "all/open_id_connect_providers.rs"]
 mod open_id_connect_providers;
+#[path = "all/policies_granting_service_access.rs"]
+mod policies_granting_service_access;
 #[path = "all/policy_listing.rs"]
 mod policy_listing;
 #[path = "all/policy_simulation.rs"]
