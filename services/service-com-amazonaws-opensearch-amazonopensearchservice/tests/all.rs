@@ -91,6 +91,8 @@ mod upgrade_history;
 mod upgrade_status;
 #[path = "all/version_catalog.rs"]
 mod version_catalog;
+#[path = "all/vpc_access_endpoints.rs"]
+mod vpc_access_endpoints;
 #[path = "all/vpc_endpoint_access.rs"]
 mod vpc_endpoint_access;
 #[path = "all/vpc_endpoint_updates.rs"]

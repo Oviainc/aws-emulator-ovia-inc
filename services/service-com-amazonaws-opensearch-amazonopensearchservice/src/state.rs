@@ -23,7 +23,7 @@
 //! because they are one resource sharing a `ConnectionId`.
 
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -228,6 +228,22 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// The ARN namespace and endpoint prefix of this service, from the model's
 /// `aws.api#service` trait (`arnNamespace`/`endpointPrefix`: `es`).
 pub const ARN_NAMESPACE: &str = "es";
+
+/// `IPAddressType`'s `dualstack` value — the other being `ipv4`
+/// (`smithy_query(query="shape",shape="IPAddressType")`). A domain set to it is
+/// reachable over IPv6 as well as IPv4, which is what gives it a second, dual-stack
+/// host beside its IPv4 one.
+pub const IP_ADDRESS_TYPE_DUALSTACK: &str = "dualstack";
+
+/// The `DomainStatus$Endpoints` key a VPC-access domain's IPv4 host is published
+/// under, from that member's own documentation: "IPv4 IP addresses -
+/// `'vpc','vpc-endpoint-<opaque-id>.<region>.es.amazonaws.com'`".
+pub const ENDPOINTS_KEY_VPC: &str = "vpc";
+
+/// The `DomainStatus$Endpoints` key a VPC-access domain's DUAL-STACK host is
+/// published under, from that member's own documentation: "Dual stack IP addresses -
+/// `'vpcv2':'vpc-endpoint-<opaque-id>.aos.<region>.on.aws'`".
+pub const ENDPOINTS_KEY_VPC_DUALSTACK: &str = "vpcv2";
 
 /// How many domains the store holds before `CreateDomain` refuses with the modelled
 /// `LimitExceededException`.
@@ -2579,7 +2595,22 @@ pub struct Domain {
     /// One of `DomainUseCase`'s values; see [`DEFAULT_USE_CASE`].
     pub use_case: String,
     /// The domain-specific endpoint index and search requests go to.
+    ///
+    /// This is the PUBLIC host, which only a domain provisioned OUTSIDE a VPC is
+    /// reachable on; a VPC-access domain is reached on the hosts
+    /// [`Self::vpc_access_endpoints`] publishes instead.
     pub endpoint: String,
+    /// The opaque id the hosts of a VPC-access domain's endpoints carry, minted once
+    /// for the domain when it comes to hold `VPCOptions` and `None` while it holds
+    /// none — so the hosts such a domain publishes are stable across reads and no two
+    /// domains share one. Minted by
+    /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::provision_vpc_access_host`],
+    /// the ONE place that decides a domain needs one.
+    ///
+    /// Distinct from a service-managed [`VpcEndpointRecord`], which is a resource of
+    /// its own that `CreateVpcEndpoint` mints to reach this domain from ANOTHER VPC;
+    /// this is the domain's own address inside the VPC it was provisioned in.
+    pub vpc_access_suffix: Option<String>,
     /// `DomainStatus$Created`.
     pub created: bool,
     /// `DomainStatus$Deleted`. Only ever true on the record `DeleteDomain` returns:
@@ -2983,25 +3014,68 @@ impl Domain {
         })
     }
 
+    /// The hosts a VPC-access domain is reachable on, as `DomainStatus$Endpoints`
+    /// reports them — or `None` for a domain reached on a public endpoint, which
+    /// publishes no such map.
+    ///
+    /// `Endpoints` is "the key-value pair that exists if the OpenSearch Service domain
+    /// uses VPC endpoints": the IPv4 host under `vpc`, and beside it the dual-stack
+    /// host under `vpcv2` for a domain whose `IPAddressType` is `dualstack`, which is
+    /// the setting that gives a domain a dual-stack host at all.
+    pub fn vpc_access_endpoints(&self) -> Option<HashMap<String, String>> {
+        // A domain is VPC-access exactly when it holds `VPCOptions`; the suffix is the
+        // host id minted for it when it came to hold them.
+        let suffix = match (self.vpc_options.as_ref(), self.vpc_access_suffix.as_deref()) {
+            (Some(_), Some(suffix)) => suffix,
+            _ => return None,
+        };
+        let mut endpoints = HashMap::new();
+        endpoints.insert(
+            ENDPOINTS_KEY_VPC.to_string(),
+            vpc_access_endpoint(suffix, &self.region),
+        );
+        if self.ip_address_type.as_deref() == Some(IP_ADDRESS_TYPE_DUALSTACK) {
+            endpoints.insert(
+                ENDPOINTS_KEY_VPC_DUALSTACK.to_string(),
+                vpc_access_endpoint_v2(suffix, &self.region),
+            );
+        }
+        Some(endpoints)
+    }
+
     /// This domain as `DomainStatus` — what `CreateDomain`, `DescribeDomain` and
     /// `DeleteDomain` answer with.
     pub fn to_status(&self) -> DomainStatus {
+        // Where this domain is reachable decides which endpoint members it reports:
+        // the map is present exactly for a VPC-access domain, and the public endpoint
+        // exactly for the domain that has one.
+        let vpc_access_endpoints = self.vpc_access_endpoints();
         DomainStatus {
             domain_id: self.domain_id.clone(),
             domain_name: self.domain_name.clone(),
             arn: self.arn.clone(),
             created: Some(self.created),
             deleted: Some(self.deleted),
-            endpoint: Some(self.endpoint.clone()),
-            // A version 2 endpoint and a dual-stack hosted zone are provisioned by
-            // the parts of the service this slice does not model.
+            // `Endpoint` is the "domain-specific endpoint used to submit index,
+            // search, and data upload requests" — the PUBLIC one, which a domain
+            // provisioned inside a VPC does not have: it is reached on the hosts
+            // `Endpoints` below carries instead.
+            endpoint: vpc_access_endpoints
+                .is_none()
+                .then(|| self.endpoint.clone()),
+            // `EndpointV2` is the dual-stack PUBLIC endpoint, provisioned by the part
+            // of the service this slice does not model; a VPC-access domain has no
+            // public host of either version and reports its dual-stack host in
+            // `Endpoints` below, under `vpcv2`.
             endpoint_v2: None,
-            // `Endpoints` is the domain's OWN endpoint map, keyed by the kind of
-            // endpoint ("vpc"), which the parts of the service this slice does not
-            // model provision; the endpoint a caller reaches this domain on is reported
-            // in `Endpoint` above. A service-managed VPC endpoint is a resource of its
-            // own, reported by `DescribeVpcEndpoints` rather than here.
-            endpoints: None,
+            // "The key-value pair that exists if the OpenSearch Service domain uses VPC
+            // endpoints": present for a VPC-access domain and absent for a public one.
+            // A service-managed VPC endpoint is a resource of its own, reported by
+            // `DescribeVpcEndpoints` rather than here.
+            endpoints: vpc_access_endpoints,
+            // The dual-stack hosted zone is a Route 53 zone of the service's own,
+            // published by a part of AWS this emulator does not model, so its id stays
+            // absent rather than being invented.
             domain_endpoint_v2_hosted_zone_id: None,
             // A domain applying a service software deployment is processing too, even
             // when no configuration change is in flight.
@@ -4980,6 +5054,20 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
         }
     }
 
+    /// Give `domain` the opaque host id its VPC endpoints are named by, if it is a
+    /// VPC-access domain that has none yet.
+    ///
+    /// The ONE place that decides a domain needs one, so a domain reaches it however
+    /// it came to hold `VPCOptions` — created with them, or given them by a later
+    /// update — and a domain that already holds one keeps it, which is what makes the
+    /// hosts [`Domain::vpc_access_endpoints`] publishes stable across calls. A domain
+    /// with no `VPCOptions` is reached on its public endpoint and gets none.
+    pub fn provision_vpc_access_host(&mut self, domain: &mut Domain) {
+        if domain.vpc_options.is_some() && domain.vpc_access_suffix.is_none() {
+            domain.vpc_access_suffix = Some(self.mint_endpoint_suffix());
+        }
+    }
+
     /// The domain a `CreateVpcEndpoint` can mint an endpoint for, given the
     /// `DomainArn` the request named.
     ///
@@ -5630,6 +5718,29 @@ pub fn domain_arn(domain_name: &str, region: &str) -> String {
 /// service's endpoint prefix.
 pub fn domain_endpoint(domain_name: &str, suffix: &str, region: &str) -> String {
     format!("search-{domain_name}-{suffix}.{region}.{ARN_NAMESPACE}.amazonaws.com")
+}
+
+/// The host a VPC-access domain is reached on over IPv4 — what
+/// `DomainStatus$Endpoints` publishes under [`ENDPOINTS_KEY_VPC`].
+///
+/// The shape is that member's own example,
+/// `vpc-endpoint-h2dsd34efgyghrtguk5gt6j2foh4.us-east-1.es.amazonaws.com`: the
+/// `vpc-endpoint-` prefix, an opaque per-domain id, then the Region and this service's
+/// endpoint prefix. Unlike [`domain_endpoint`] it carries no domain name: the host is
+/// reached from inside the VPC and names only the endpoint.
+pub fn vpc_access_endpoint(suffix: &str, region: &str) -> String {
+    format!("vpc-endpoint-{suffix}.{region}.{ARN_NAMESPACE}.amazonaws.com")
+}
+
+/// The host a dual-stack VPC-access domain is reached on over IPv4 *or* IPv6 — what
+/// `DomainStatus$Endpoints` publishes under [`ENDPOINTS_KEY_VPC_DUALSTACK`], beside
+/// the IPv4 host of [`vpc_access_endpoint`].
+///
+/// The shape is that member's own example,
+/// `vpc-endpoint-h2dsd34efgyghrtguk5gt6j2foh4.aos.us-east-1.on.aws`: the SAME opaque
+/// id as the IPv4 host, under the service's dual-stack domain.
+pub fn vpc_access_endpoint_v2(suffix: &str, region: &str) -> String {
+    format!("vpc-endpoint-{suffix}.aos.{region}.on.aws")
 }
 
 /// The connection endpoint a service-managed VPC endpoint is reached on.

@@ -470,6 +470,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             merged.begin_change(PROCESSING_STATUS_MODIFYING, &touched, now);
         }
 
+        // An update that moves a domain into a VPC makes it a VPC-access domain, so it
+        // gets the opaque host id the endpoints it publishes are named by — from the
+        // same one place a create reaches, which also leaves a domain that already has
+        // one on the host it has been publishing. Reached only here, after the dry-run
+        // return above: a dry run stores nothing and so provisions nothing.
+        store.provision_vpc_access_host(&mut merged);
+
         let domain_config = merged.to_config();
         store.domains.insert(name, merged);
         Ok(UpdateDomainConfigOutput {

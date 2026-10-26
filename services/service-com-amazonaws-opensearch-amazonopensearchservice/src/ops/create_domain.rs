@@ -311,6 +311,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .use_case
                 .unwrap_or_else(|| DEFAULT_USE_CASE.to_string()),
             endpoint: domain_endpoint(&name, &suffix, &region),
+            // Minted below by the store, which is the one place that decides a
+            // VPC-access domain needs a host id of its own.
+            vpc_access_suffix: None,
             // `DomainStatus$Created` is the creation REQUEST's outcome: the domain now
             // exists. Whether its configuration is live is `Processing`, below.
             created: true,
@@ -456,6 +459,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for option in &touched {
             domain.touch(option, now);
         }
+
+        // A domain created with `VPCOptions` is reached through a VPC endpoint rather
+        // than a public one, so it carries the opaque host id the endpoints it
+        // publishes are named by; one created without them is reached on its public
+        // endpoint and carries none.
+        store.provision_vpc_access_host(&mut domain);
 
         // A domain is not settled the instant the create returns: the clock owes it an
         // `Active` configuration once the provisioning span has passed, and the change
