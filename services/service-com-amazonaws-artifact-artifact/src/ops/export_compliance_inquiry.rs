@@ -23,9 +23,12 @@
 //!   itself is left as it stands (bar the transition the clock already owed it), so an
 //!   export changes nothing a later reader of the inquiry sees.
 //!
-//! Nothing serves the URL and nothing renders the document: this emulator persists the
-//! export and publishes its location, and does not synthesise document bytes or a SigV4
-//! signature it did not compute.
+//! The URL this answers with is a promise the caller can FOLLOW it, so it names the
+//! endpoint the caller reached this emulator on ([`crate::state::document_url_host`]) and
+//! a path `crate::service` serves the stored export document at — the same rule `GetReport`
+//! and `GetTermForReport` announce their documents under. No SigV4 signature is attached:
+//! this emulator does not sign documents and does not fabricate a signature it did not
+//! compute.
 //!
 //! ## Shape of an operation
 //!
@@ -177,7 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let region = crate::state::request_region(ctx.parts());
+        // The endpoint the CALLER reached this emulator on, which is what the announced
+        // URL has to name for the caller to be able to fetch the document behind it.
+        let host = crate::state::document_url_host(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
@@ -258,7 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(ExportComplianceInquiryOutput {
             document_presigned_url: Some(crate::state::inquiry_export_url(
-                &region,
+                &host,
                 &input.compliance_inquiry_id,
                 &export_id,
             )),
