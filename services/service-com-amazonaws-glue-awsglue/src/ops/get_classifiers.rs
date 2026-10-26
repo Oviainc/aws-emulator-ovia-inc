@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetClassifiers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetClassifiers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetClassifiers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over this account's classifier namespace
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::classifiers`]) in name order, reporting
+//! each stored classifier as the one `Classifier` member its kind fills — the same
+//! projection `GetClassifier` serves for one. Reporting only: nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -67,6 +63,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The largest page this listing will serve, and the page it serves when the request
+/// names no size: the top of `MaxResults`' modelled range ("range 1..1000" on
+/// `GetClassifiersRequest$MaxResults`, `smithy_query operation=GetClassifiers`).
+const MAX_PAGE_SIZE: i32 = 1_000;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -136,18 +137,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetClassifiers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetClassifiersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetClassifiers"))
+        // Classifiers live in one per-account namespace, so nothing here depends on the
+        // request's Region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is reported
+            // as the operation's own timeout error rather than invented as a shape the
+            // model does not declare for it.
+            return Err(GetClassifiersErrorModeled::OperationTimeoutException(
+                OperationTimeoutException {
+                    message: Some("the Glue classifier store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // "The size of the list to return (optional)" (`MaxResults`, range 1..1000).
+        // Absent, the page is the largest the model accepts for it; the clamp re-states
+        // that range here so the page size is never 0 even if the boundary validator ever
+        // stops enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        // Reporting only: the stored classifiers are projected out and nothing is written.
+        let store = state.lock();
+        // The namespace is keyed by classifier name and iterated in key order, so one page
+        // follows another deterministically.
+        let stored: Vec<&crate::state::ClassifierEntry> = store.classifiers.values().collect();
+
+        // "An optional continuation token": the token is the last name of the previous
+        // page, so the page resumes at the first stored name strictly after it — which
+        // stays correct across classifiers created or deleted between two calls.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => stored.partition_point(|entry| entry.name.as_str() <= cursor),
+            None => 0,
+        };
+        // Taken with `skip`/`take` rather than by slicing, so a cursor the request chose
+        // can never index outside the set.
+        let page: Vec<&crate::state::ClassifierEntry> =
+            stored.iter().skip(start).take(page_size).copied().collect();
+        let end = start.saturating_add(page.len());
+        // "A continuation token": present only while classifiers remain, and naming the
+        // last entry of the page, taken from the page itself so there is no index
+        // arithmetic to underflow on an empty page.
+        let next_token = if end < stored.len() {
+            page.last().map(|entry| entry.name.clone())
+        } else {
+            None
+        };
+
+        // "The requested list of classifier objects", each the same projection a single
+        // read of that classifier serves.
+        Ok(GetClassifiersOutput {
+            classifiers: Some(page.iter().map(|entry| entry.to_classifier()).collect()),
+            next_token,
+        })
     }
 }

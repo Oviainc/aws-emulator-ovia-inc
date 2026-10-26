@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateClassifier
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateClassifier`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateClassifier::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Modifies one classifier in this account's per-account classifier namespace
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::classifiers`]): the request names ONE
+//! of the four classifier kinds, that field's `Name` addresses the record, and every
+//! member the field carries replaces the stored one while every member it omits is
+//! preserved. The write moves the server-set members (`Version` by one, `LastUpdated` to
+//! now); the response carries no member — `UpdateClassifierResponse` declares none.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +142,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateClassifier` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateClassifierErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateClassifier"))
+        // Classifiers live in one per-account namespace, so nothing here depends on the
+        // request's Region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is reported
+            // as the operation's own timeout error rather than invented as a shape the
+            // model does not declare for it.
+            return Err(UpdateClassifierErrorModeled::OperationTimeoutException(
+                OperationTimeoutException {
+                    message: Some("the Glue classifier store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // "Modifies an existing classifier … depending on which field is present": the
+        // classifier this request is about is the field it carries, so a request carrying
+        // none names no classifier and one carrying several names no single one. Both are
+        // refused rather than guessed at.
+        let (named_kinds, target) = crate::state::update_classifier_target(&input);
+        let Some((requested_kind, name)) = target.filter(|_| named_kinds == 1) else {
+            let message = if named_kinds == 0 {
+                crate::state::messages::CLASSIFIER_REQUIRES_ONE
+            } else {
+                crate::state::messages::CLASSIFIER_ALLOWS_ONLY_ONE
+            };
+            return Err(UpdateClassifierErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message.to_string()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // The instant of the write is read before the store is locked, so the
+        // `LastUpdated` a record carries is the instant the update was served.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(entry) = store.classifiers.get(&name) else {
+            return Err(UpdateClassifierErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::classifier_not_found(&name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // A stored classifier's kind is fixed at create, so a request naming another
+        // kind's field describes a classifier this account does not hold rather than a
+        // change to the one it does.
+        let stored_kind = entry.definition.kind();
+        if stored_kind != requested_kind {
+            return Err(UpdateClassifierErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::classifier_kind_mismatch(
+                        &name,
+                        stored_kind,
+                        requested_kind,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        // A CSV classifier's quote symbol "must be different from the column delimiter"
+        // (`CsvClassifier$QuoteSymbol`). The rule is about the classifier the write would
+        // leave behind, so it is checked on the EFFECTIVE pair: the members this request
+        // carries over the ones the record already holds.
+        if let Some(request) = input.csv_classifier.as_ref() {
+            let stored = entry.csv_definition();
+            let delimiter = request
+                .delimiter
+                .as_deref()
+                .or_else(|| stored.and_then(|csv| csv.delimiter.as_deref()));
+            let quote_symbol = request
+                .quote_symbol
+                .as_deref()
+                .or_else(|| stored.and_then(|csv| csv.quote_symbol.as_deref()));
+            if crate::state::csv_separators_collide(delimiter, quote_symbol) {
+                return Err(UpdateClassifierErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(
+                            crate::state::messages::CSV_QUOTE_SYMBOL_MUST_DIFFER.to_string(),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Nothing above wrote anything, so a refused update leaves the stored classifier
+        // exactly as the last accepted write left it.
+        let Some(entry) = store.classifiers.get_mut(&name) else {
+            // Unreachable: the same lock has been held since the lookup above.
+            return Err(UpdateClassifierErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::classifier_not_found(&name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        entry.apply_update(&input, now);
+        ::tracing::info!(
+            operation = "UpdateClassifier",
+            classifier = %name,
+            "updated a Glue classifier"
+        );
+
+        // `UpdateClassifierResponse` declares no member: what the update wrote is read
+        // back through `GetClassifier`.
+        Ok(UpdateClassifierOutput {})
     }
 }

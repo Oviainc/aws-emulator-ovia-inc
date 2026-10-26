@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateClassifier
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateClassifier`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateClassifier::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers a custom classifier in this account's per-account classifier namespace
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::classifiers`]): the request names ONE of
+//! the four classifier kinds, that kind's definition is stored under the `Name` it
+//! carries, and the three server-set members (`Version`, `CreationTime`, `LastUpdated`)
+//! are the service's own. `GetClassifier` reads the record back, and the response carries
+//! no member at all — `CreateClassifierResponse` declares none.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +141,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateClassifier` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateClassifierErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateClassifier"))
+        // Classifiers live in one per-account namespace, so nothing here depends on the
+        // request's Region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is reported
+            // as the operation's own timeout error rather than invented as a shape the
+            // model does not declare for it.
+            return Err(CreateClassifierErrorModeled::OperationTimeoutException(
+                OperationTimeoutException {
+                    message: Some("the Glue classifier store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // "This can be a GrokClassifier, an XMLClassifier, a JsonClassifier, or a
+        // CsvClassifier, depending on which field of the request is present": the kind to
+        // create is which field is present, so a request naming none asks for no
+        // classifier, and one naming several describes two classifiers under one name.
+        // Neither is a kind this service can store, so both are refused.
+        match crate::state::named_classifier_kinds(&input) {
+            1 => {}
+            0 => {
+                return Err(CreateClassifierErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(
+                            crate::state::messages::CLASSIFIER_REQUIRES_ONE.to_string(),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+            _ => {
+                return Err(CreateClassifierErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(
+                            crate::state::messages::CLASSIFIER_ALLOWS_ONLY_ONE.to_string(),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A CSV classifier's quote symbol "must be different from the column delimiter"
+        // (`CreateCsvClassifierRequest$QuoteSymbol`): one character cannot both separate
+        // columns and quote them, so such a classifier is refused rather than stored.
+        if let Some(csv) = input.csv_classifier.as_ref() {
+            if crate::state::csv_separators_collide(
+                csv.delimiter.as_deref(),
+                csv.quote_symbol.as_deref(),
+            ) {
+                return Err(CreateClassifierErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(
+                            crate::state::messages::CSV_QUOTE_SYMBOL_MUST_DIFFER.to_string(),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The creation instant is read before the store is locked, so the timestamps a
+        // record carries are the instant the create was served.
+        let now = ::std::time::SystemTime::now();
+        let Some(entry) = crate::state::ClassifierEntry::from_create_input(&input, now) else {
+            // Unreachable: exactly one kind is present by the check above, and that is
+            // what the entry is built from. Refused rather than unwrapped so a future
+            // model with a fifth kind cannot panic a request.
+            return Err(CreateClassifierErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::CLASSIFIER_REQUIRES_ONE.to_string()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The name is the whole address of a classifier, so a create under a name already
+        // stored is refused rather than overwriting the classifier a crawler may already
+        // refer to.
+        if store.classifiers.contains_key(&entry.name) {
+            return Err(CreateClassifierErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(
+                        crate::state::messages::CLASSIFIER_ALREADY_EXISTS.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        // The store is resident memory and this create is reachable by any caller, so the
+        // number of records one process will hold is bounded. This operation models no
+        // limit error, so past the ceiling the request is refused with the closest client
+        // error it does model rather than with a server fault, which an SDK would retry.
+        if !store.can_store_classifier() {
+            return Err(CreateClassifierErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "This account already holds the maximum of {} classifiers",
+                        crate::state::MAX_CLASSIFIERS
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        let name = entry.name.clone();
+        store.classifiers.insert(name.clone(), entry);
+        ::tracing::info!(
+            operation = "CreateClassifier",
+            classifier = %name,
+            "created a Glue classifier"
+        );
+
+        // `CreateClassifierResponse` declares no member: what the create persisted is read
+        // back through `GetClassifier`.
+        Ok(CreateClassifierOutput {})
     }
 }
