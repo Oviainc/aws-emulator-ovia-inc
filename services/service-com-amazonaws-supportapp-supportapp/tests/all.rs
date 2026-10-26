@@ -31,3 +31,5 @@ mod slack_workspace_configurations;
 mod slack_workspace_team_name;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_severity_rule_scope.rs"]
+mod update_severity_rule_scope;

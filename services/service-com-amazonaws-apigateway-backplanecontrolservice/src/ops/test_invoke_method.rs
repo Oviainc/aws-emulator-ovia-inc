@@ -1,15 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TestInvokeMethod
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TestInvokeMethod`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: simulates an invocation of one stored `Method` and reports the response
+//! that method's own records produce for it — the status, the body and the headers its
+//! integration answers with, the execution log of the simulation, and the latency the
+//! simulation took — or `NotFoundException` when the API, the resource or the verb has no
+//! record. Reads only: a simulated invocation changes nothing a later caller sees.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TestInvokeMethod::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What a simulated invocation resolves
+//!
+//! A test invocation is the LIVE method's, not a deployed snapshot's: this operation takes
+//! no stage, so the `Method`, its integration and its method responses are read as they
+//! stand now, which is what lets a developer test a change before deploying it. The
+//! simulated `headers` and `multiValueHeaders` are what the integration reads — the
+//! `Content-Type` selects the integration request template, the `Accept` selects the
+//! response template — and performing the integration is
+//! [`crate::service::invoke::perform_integration`], the very function the `execute-api`
+//! data plane serves a real request through. One function, so a simulated call and a real
+//! one cannot answer one stored configuration differently.
+//!
+//! Neither the method's `authorizationType` nor its `apiKeyRequired` is applied: this
+//! operation is reached through the control plane by the API's own owner, its input carries
+//! no API key and no end-caller identity to authorize, and the authorizer half of a
+//! simulated call is its own operation (`TestInvokeAuthorizer`). `clientCertificateId` is
+//! likewise unused — the certificate is what API Gateway presents on the HTTPS request to a
+//! backend, and no backend is called — and is reported in the execution log as such.
+//!
+//! An integration this emulator cannot perform (one naming a backend it cannot call, or a
+//! mapping template written in Velocity) is reported exactly as the data plane answers it:
+//! through this API's gateway response for the matching response type, with the reason in
+//! the execution log. Nothing is invented for a backend that never ran.
 //!
 //! ## Shape of an operation
 //!
@@ -97,6 +117,128 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use crate::service::invoke::{
+    perform_integration, refusal_rendering, MethodRequest, JSON_CONTENT_TYPE,
+};
+
+/// The request this operation's execution log is a log of. A simulated invocation never
+/// reaches the data plane, so it has no request id of its own: the log names the kind of
+/// execution it reports instead of minting an identifier nothing else can be correlated
+/// with.
+const TEST_INVOKE_REQUEST_ID: &str = "test-invoke-request";
+
+/// The simulated request header that selects the integration REQUEST template, as
+/// `Integration$requestTemplates` keys it.
+const CONTENT_TYPE: &str = "content-type";
+
+/// The simulated request header that selects the integration RESPONSE template, as
+/// `IntegrationResponse$responseTemplates` keys it.
+const ACCEPT: &str = "accept";
+
+/// The reported response header the rendered body's media type travels in.
+const CONTENT_TYPE_HEADER: &str = "Content-Type";
+
+/// The API Gateway execution log this operation reports: the steps the simulation took, in
+/// the order it took them.
+///
+/// Every line carries ONE instant, the one the call started at. The whole simulation is
+/// performed in process out of stored records, with no backend call to wait on, so there is
+/// no later instant for a line to be stamped with.
+#[derive(Debug)]
+struct ExecutionLog {
+    /// The instant the simulation started, rendered as this service renders a timestamp.
+    stamp: String,
+    /// The log, first line first.
+    lines: Vec<String>,
+}
+
+impl ExecutionLog {
+    /// The log of an execution that started at `stamp`, opened with the two lines every
+    /// execution log opens with: what it is a log of, and that the execution started.
+    fn started_at(stamp: String) -> Self {
+        let mut log = Self {
+            stamp,
+            lines: vec![format!("Execution log for request {TEST_INVOKE_REQUEST_ID}")],
+        };
+        log.line(format!(
+            "Starting execution for request: {TEST_INVOKE_REQUEST_ID}"
+        ));
+        log
+    }
+
+    /// Append one step of the execution.
+    fn line(&mut self, text: String) {
+        self.lines.push(format!("{} : {text}", self.stamp));
+    }
+
+    /// The log as the operation reports it: one line per step, newline separated.
+    fn rendered(&self) -> String {
+        self.lines.join("\n")
+    }
+}
+
+/// The value the simulated request carries for `name`, looked up case-insensitively (a
+/// header name is case-insensitive on the wire, and these are supplied as map keys) across
+/// both members a caller may carry it in: `headers` first, then the FIRST value of the
+/// `multiValueHeaders` entry, which is the value a single-valued read of a multi-valued
+/// header sees.
+fn simulated_header<'i>(input: &'i TestInvokeMethodInput, name: &str) -> Option<&'i str> {
+    let single = input.headers.iter().flatten().find_map(|(key, value)| {
+        key.eq_ignore_ascii_case(name)
+            .then_some(value.as_str())
+    });
+    single.or_else(|| {
+        input
+            .multi_value_headers
+            .iter()
+            .flatten()
+            .find_map(|(key, values)| {
+                key.eq_ignore_ascii_case(name)
+                    .then(|| values.first().map(String::as_str))
+                    .flatten()
+            })
+    })
+}
+
+/// The names of the headers the simulated request carries, in name order.
+///
+/// The NAMES, not the values: a simulated header is where an authorization token or an API
+/// key would travel, and an execution log is not where a caller's credential belongs.
+fn header_names(input: &TestInvokeMethodInput) -> Vec<String> {
+    let mut names: BTreeSet<&str> = input
+        .headers
+        .iter()
+        .flatten()
+        .map(|(key, _)| key.as_str())
+        .collect();
+    names.extend(
+        input
+            .multi_value_headers
+            .iter()
+            .flatten()
+            .map(|(key, _)| key.as_str()),
+    );
+    names.into_iter().map(str::to_owned).collect()
+}
+
+/// The path and the query string of `pathWithQueryString` — "The URI path, including query
+/// string, of the simulated invocation request" — split at the first `?`. Each half is
+/// absent when the member carries none of it.
+fn split_query(path_with_query: Option<&str>) -> (Option<&str>, Option<&str>) {
+    let Some(value) = path_with_query.filter(|value| !value.is_empty()) else {
+        return (None, None);
+    };
+    match value.split_once('?') {
+        Some((path, query)) => (
+            (!path.is_empty()).then_some(path),
+            (!query.is_empty()).then_some(query),
+        ),
+        None => (Some(value), None),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -168,18 +310,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TestInvokeMethod` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TestInvokeMethodErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TestInvokeMethod"))
+        let _ = ctx;
+        // `latency` is "the execution latency, in ms, of the test invoke request", so it is
+        // MEASURED over the simulation rather than stated: the clock is started before the
+        // records are read and read once the response has been computed.
+        let started = ::std::time::Instant::now();
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let store = state.lock();
+        let api = store
+            .rest_apis
+            .get(&input.rest_api_id)
+            .ok_or_else(|| not_found(crate::state::no_such_rest_api(&input.rest_api_id)))?;
+        let resource = api
+            .resources
+            .get(&input.resource_id)
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_RESOURCE.to_string()))?;
+        // The verb is addressed exactly as `GetMethod` addresses it, so a method is
+        // reachable by the spelling it was put under.
+        let verb = super::put_method::method_key(&input.http_method);
+        let method = resource
+            .methods
+            .get(&verb)
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_METHOD.to_string()))?;
+
+        let mut log = ExecutionLog::started_at(
+            crate::state::now()
+                .fmt(::aws_smithy_types::date_time::Format::DateTime)
+                .unwrap_or_default(),
+        );
+        log.line(format!(
+            "HTTP Method: {verb}, Resource Path: {}",
+            resource.path
+        ));
+        let (path, query) = split_query(input.path_with_query_string.as_deref());
+        if let Some(path) = path {
+            log.line(format!("Method request path: {path}"));
+        }
+        if let Some(query) = query {
+            log.line(format!("Method request query string: {query}"));
+        }
+        log.line(format!(
+            "Method request headers: [{}]",
+            header_names(&input).join(", ")
+        ));
+        // The body's SIZE, not the body: it is the caller's own text, and reporting its
+        // length says what the integration was handed without copying a payload into a log.
+        log.line(format!(
+            "Method request body before transformations: {} byte(s)",
+            input.body.as_deref().unwrap_or_default().len()
+        ));
+        let stage_variables: Vec<&str> = input
+            .stage_variables
+            .iter()
+            .flatten()
+            .map(|(name, _)| name.as_str())
+            .collect::<BTreeSet<&str>>()
+            .into_iter()
+            .collect();
+        if !stage_variables.is_empty() {
+            log.line(format!(
+                "Stage variables: [{}]",
+                stage_variables.join(", ")
+            ));
+        }
+        if let Some(certificate) = input.client_certificate_id.as_deref() {
+            log.line(format!(
+                "Client certificate {certificate} is not presented: a simulated invocation \
+                 makes no HTTPS request to a backend"
+            ));
+        }
+        log.line(format!(
+            "Integration type: {}",
+            method
+                .integration
+                .as_ref()
+                .and_then(|integration| integration.r#type.as_deref())
+                .unwrap_or("none")
+        ));
+
+        let call = MethodRequest::simulated(
+            simulated_header(&input, CONTENT_TYPE),
+            simulated_header(&input, ACCEPT),
+        );
+        let (status, body, headers) = match perform_integration(Some(method), &call) {
+            Ok(served) => {
+                let mut headers = served.headers;
+                headers.insert(CONTENT_TYPE_HEADER.to_string(), served.content_type);
+                log.line("Successfully completed execution".to_string());
+                (served.status, served.body, headers)
+            }
+            Err(unserved) => {
+                // The same sentence the data plane logs for this call, and the same gateway
+                // response it answers through — including a developer's customization of
+                // that response type, which `refusal_rendering` reads off this API.
+                log.line(format!(
+                    "Execution failed due to configuration error: {}",
+                    unserved.reason
+                ));
+                log.line(format!(
+                    "Answered through this API's {} gateway response",
+                    unserved.refusal.response_type()
+                ));
+                let (status, body) = refusal_rendering(Some(api), unserved.refusal);
+                let headers = BTreeMap::from([(
+                    CONTENT_TYPE_HEADER.to_string(),
+                    JSON_CONTENT_TYPE.to_string(),
+                )]);
+                (status, body, headers)
+            }
+        };
+        // The response headers with their VALUES, where the request-side line above logs
+        // names only: a response header is rendered from the API's own records (a static
+        // mapping a control-plane call stored), so no caller credential travels in one.
+        // That asymmetry is deliberate and is not licence to log a request header's value.
+        log.line(format!(
+            "Method response headers: [{}]",
+            headers
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<String>>()
+                .join(", ")
+        ));
+        log.line(format!(
+            "Method response body after transformations: {} byte(s)",
+            body.len()
+        ));
+        log.line(format!("Method completed with status: {status}"));
+
+        Ok(TestInvokeMethodOutput {
+            status: i32::from(status),
+            // The rendered body as text: `body` is modelled a `String`, and a stored
+            // response template is text a caller wrote.
+            body: Some(String::from_utf8_lossy(&body).into_owned()),
+            headers: Some(
+                headers
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect::<HashMap<String, String>>(),
+            ),
+            // The multi-valued view of the same headers: a mapped response header carries
+            // one value, so each name maps to the single-element list of it.
+            multi_value_headers: Some(
+                headers
+                    .into_iter()
+                    .map(|(name, value)| (name, vec![value]))
+                    .collect::<HashMap<String, Vec<String>>>(),
+            ),
+            log: Some(log.rendered()),
+            latency: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+        })
     }
+}
+
+/// The modelled 404 this operation answers for an identifier no record of this account
+/// carries, worded as every other reader of the same records words it.
+fn not_found(message: String) -> TestInvokeMethodError {
+    TestInvokeMethodErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+    })
+    .into()
 }

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetLogDeliveryConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetLogDeliveryConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetLogDeliveryConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This call SETS the whole collection: the pool's stored `LogConfigurations`
+//! become the ones the request carries, so an empty collection is a clear and a
+//! configuration the request leaves out is one the pool no longer has. Every entry
+//! is judged BEFORE anything is written, so a refused request leaves the pool's
+//! logging configuration exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +157,303 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetLogDeliveryConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetLogDeliveryConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetLogDeliveryConfiguration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let mut guard = state.lock();
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // The whole collection is judged before the first entry is stored, so a
+        // request with one unacceptable entry changes nothing at all.
+        check_request(&input.log_configurations, &pool.user_pool_tier)?;
+
+        // A SET replaces the collection: what the pool reports from here on is
+        // exactly what this request carried, empty collection included.
+        pool.log_configurations = input.log_configurations;
+
+        // The response renders the STORED configuration, which is also what
+        // `GetLogDeliveryConfiguration` reads back.
+        Ok(SetLogDeliveryConfigurationOutput {
+            log_delivery_configuration: Some(pool.to_log_delivery_configuration()),
+        })
     }
+}
+
+/// Whether the collection a request carries is one the named pool can deliver.
+///
+/// `LogConfigurationType.LogLevel` pairs each event source with the level and the
+/// destinations it supports: "To send `userNotification` activity with information
+/// about message delivery, choose `ERROR` with `CloudWatchLogsConfiguration`. To
+/// send `userAuthEvents` activity with user logs from threat protection with the
+/// Plus feature plan, choose `INFO` with one of `CloudWatchLogsConfiguration`,
+/// `FirehoseConfiguration`, or `S3Configuration`" (this service's model). So an
+/// entry is acceptable when its level is the one its source emits, it names
+/// exactly one destination that source may be exported to, it is the only entry
+/// for its source, and the pool's feature plan includes that source.
+///
+/// Amazon Cognito validates the REQUEST rather than one entry: a refusal names
+/// the condition once and lists every event source in the request that fails it,
+/// so each condition is evaluated over the whole collection and the first one any
+/// entry fails is what the caller is told.
+fn check_request(
+    configurations: &[LogConfigurationType],
+    user_pool_tier: &str,
+) -> Result<(), SetLogDeliveryConfigurationError> {
+    for condition in REQUEST_CONDITIONS {
+        // Each failing source is named ONCE, however many entries of the request
+        // failed the condition on it: the list is of event sources, not of
+        // entries.
+        let mut failing: Vec<&str> = Vec::new();
+        for configuration in configurations {
+            let event_source = configuration.event_source.as_str();
+            if (condition.failed_by)(configuration, configurations)
+                && !failing.contains(&event_source)
+            {
+                failing.push(event_source);
+            }
+        }
+        if !failing.is_empty() {
+            return Err(invalid_parameter(request_validation_message(
+                condition.clause,
+                &failing,
+            )));
+        }
+    }
+
+    // The plan gate is asked after the request itself validates: a source the
+    // pool's feature plan does not include is refused because those logs are not
+    // available to the pool at all, not because the request is malformed, and the
+    // two carry different error codes.
+    for configuration in configurations {
+        let Some(rule) = source_rule(&configuration.event_source) else {
+            continue;
+        };
+        if let Some(plan) = rule.required_plan {
+            if user_pool_tier != plan.tier {
+                return Err(tier_excludes_source(user_pool_tier, plan.feature));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// The destination members one entry names, in the order the model lists them.
+fn named_destinations(configuration: &LogConfigurationType) -> Vec<&'static str> {
+    DESTINATIONS
+        .iter()
+        .filter(|destination| (destination.named)(configuration))
+        .map(|destination| destination.member)
+        .collect()
+}
+
+/// The rule for `event_source`.
+///
+/// `None` for a source this service's model does not name. No request reaches
+/// this handler carrying one: `LogConfigurationType.EventSource` targets the
+/// modelled `EventSourceName` enum
+/// ([`crate::ops::types::EVENT_SOURCE_NAME_VALUES`]), whose membership is
+/// checked before the handler runs — so an entry with no rule is left to the
+/// conditions that hold for every source (a destination, and only one of them).
+fn source_rule(event_source: &str) -> Option<&'static DeliverableSource> {
+    DELIVERABLE_SOURCES
+        .iter()
+        .find(|rule| rule.event_source == event_source)
+}
+
+/// One condition every entry of a request has to satisfy, and the clause a
+/// refusal names it with.
+struct RequestCondition {
+    /// What the refusal says the listed event sources did, as the clause between
+    /// "Following event sources in request" and the list.
+    clause: &'static str,
+    /// Whether this entry fails the condition, judged against the whole
+    /// collection so a condition about two entries (one source configured twice)
+    /// is expressible.
+    failed_by: fn(&LogConfigurationType, &[LogConfigurationType]) -> bool,
+}
+
+/// The conditions a request is judged against, in the order Amazon Cognito
+/// reports them: whether the collection says what each source's configuration IS
+/// at all comes before whether one entry's configuration is deliverable.
+const REQUEST_CONDITIONS: &[RequestCondition] = &[
+    RequestCondition {
+        clause: "are configured more than once",
+        failed_by: |configuration, all| {
+            all.iter()
+                .filter(|other| other.event_source == configuration.event_source)
+                .count()
+                > 1
+        },
+    },
+    RequestCondition {
+        clause: "have an unsupported log level",
+        failed_by: |configuration, _| {
+            source_rule(&configuration.event_source)
+                .is_some_and(|rule| rule.log_level != configuration.log_level)
+        },
+    },
+    RequestCondition {
+        clause: "have no destination",
+        failed_by: |configuration, _| named_destinations(configuration).is_empty(),
+    },
+    RequestCondition {
+        clause: "have more than one destination",
+        failed_by: |configuration, _| named_destinations(configuration).len() > 1,
+    },
+    RequestCondition {
+        clause: "have an unsupported destination",
+        failed_by: |configuration, _| {
+            source_rule(&configuration.event_source).is_some_and(|rule| {
+                named_destinations(configuration)
+                    .iter()
+                    .any(|named| !rule.destinations.contains(named))
+            })
+        },
+    },
+];
+
+/// What a `SetLogDeliveryConfiguration` request-validation refusal says.
+///
+/// The fixed sentence and the bracketed list of event sources are what Amazon
+/// Cognito answers for a collection it will not accept — the refusal names the
+/// condition once and then every event source in the request that failed it,
+/// rather than one sentence per entry. `clause` is the condition.
+fn request_validation_message(clause: &str, event_sources: &[&str]) -> String {
+    format!(
+        "Request validation Failed. Following event sources in request {clause}: [{}].",
+        event_sources.join(", ")
+    )
+}
+
+/// What one `EventSourceName` may be exported as: the level it emits, the
+/// destinations it may be exported to, and the feature plan that includes it.
+struct DeliverableSource {
+    /// One of the modelled [`crate::ops::types::EVENT_SOURCE_NAME_VALUES`].
+    event_source: &'static str,
+    /// The one [`crate::ops::types::LOG_LEVEL_VALUES`] entry this source's logs
+    /// carry.
+    log_level: &'static str,
+    /// The `LogConfigurationType` destination members this source may be
+    /// exported to, in the order the model lists them.
+    destinations: &'static [&'static str],
+    /// The one feature plan that includes this source, where only one does, and
+    /// how a tier refusal names what the request asked for; `None` for a source
+    /// every plan includes.
+    required_plan: Option<RequiredPlan>,
+}
+
+/// The feature plan a source needs, and the feature a tier refusal names.
+#[derive(Clone, Copy)]
+struct RequiredPlan {
+    /// A `UserPoolTierType` value.
+    tier: &'static str,
+    /// What the refusal calls the feature, in the tail of
+    /// [`crate::state::feature_unavailable_in_tier_message`].
+    feature: &'static str,
+}
+
+/// Each modelled event source, as `LogConfigurationType.LogLevel` and
+/// `LogConfigurationType.EventSource` describe it.
+const DELIVERABLE_SOURCES: [DeliverableSource; 2] = [
+    DeliverableSource {
+        event_source: "userNotification",
+        log_level: "ERROR",
+        destinations: &["CloudWatchLogsConfiguration"],
+        // "User pools can export user notification logs and, when threat
+        // protection is active, user-activity logs"
+        // (`SetLogDeliveryConfiguration` in this service's model): only the
+        // second of the two names a plan, so notification logs are included in
+        // every plan.
+        required_plan: None,
+    },
+    DeliverableSource {
+        event_source: "userAuthEvents",
+        log_level: "INFO",
+        destinations: &[
+            "CloudWatchLogsConfiguration",
+            "FirehoseConfiguration",
+            "S3Configuration",
+        ],
+        // `LogConfigurationType.EventSource`: "To send info-level logs about
+        // threat-protection user activity in user pools with the Plus feature
+        // plan, set to `userAuthEvents`" — the plan, and the feature as the
+        // operation's own documentation names what is exported ("user-activity
+        // logs", "Exporting user pool logs").
+        required_plan: Some(RequiredPlan {
+            tier: crate::state::PLUS_USER_POOL_TIER,
+            feature: "User Activity Logs",
+        }),
+    },
+];
+
+/// One destination member of `LogConfigurationType`, and whether an entry names
+/// it.
+struct Destination {
+    member: &'static str,
+    named: fn(&LogConfigurationType) -> bool,
+}
+
+/// The three destinations `LogConfigurationType` models, in the order its
+/// `LogLevel` documentation lists them.
+const DESTINATIONS: [Destination; 3] = [
+    Destination {
+        member: "CloudWatchLogsConfiguration",
+        named: |configuration| configuration.cloud_watch_logs_configuration.is_some(),
+    },
+    Destination {
+        member: "FirehoseConfiguration",
+        named: |configuration| configuration.firehose_configuration.is_some(),
+    },
+    Destination {
+        member: "S3Configuration",
+        named: |configuration| configuration.s3_configuration.is_some(),
+    },
+];
+
+/// The tier refusal for a source the pool's feature plan does not include,
+/// reported with the same template every tier refusal uses.
+fn tier_excludes_source(
+    user_pool_tier: &str,
+    feature: &str,
+) -> SetLogDeliveryConfigurationError {
+    SetLogDeliveryConfigurationErrorModeled::FeatureUnavailableInTierException(
+        FeatureUnavailableInTierException {
+            message: Some(crate::state::feature_unavailable_in_tier_message(
+                user_pool_tier,
+                feature,
+            )),
+        },
+    )
+    .into()
+}
+
+/// This operation's `InvalidParameterException` for a collection it cannot
+/// deliver.
+fn invalid_parameter(message: String) -> SetLogDeliveryConfigurationError {
+    SetLogDeliveryConfigurationErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        reason_code: None,
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> SetLogDeliveryConfigurationError {
+    SetLogDeliveryConfigurationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> SetLogDeliveryConfigurationError {
+    SetLogDeliveryConfigurationErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

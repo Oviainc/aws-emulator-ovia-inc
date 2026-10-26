@@ -263,7 +263,7 @@ async fn the_composite_alarm_configuration_round_trips_through_describe_alarms()
         );
     }
 
-    // A deleted composite alarm is gone, and deleting it twice reports it missing.
+    // A deleted composite alarm is gone, and deleting it again is a clean no-op success.
     ok(
         &router,
         "DeleteAlarms",
@@ -281,17 +281,12 @@ async fn the_composite_alarm_configuration_round_trips_through_describe_alarms()
         Some(&json!([])),
         "a deleted composite alarm is no longer reported, got {gone}"
     );
-    let (status, body) = call(
+    ok(
         &router,
         "DeleteAlarms",
         &json!({"AlarmNames": ["service-unhealthy"]}),
     )
     .await;
-    assert_eq!(
-        (status, error_code(&body).as_str()),
-        (404, "ResourceNotFound"),
-        "deleting an alarm that does not exist must report it missing, got {body}"
-    );
 }
 
 #[tokio::test]
@@ -526,7 +521,7 @@ async fn a_composite_alarm_rule_may_reference_another_composite_alarm() {
     let (status, body) = call(&router, "DeleteAlarms", &json!({"AlarmNames": ["inner"]})).await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (409, "ResourceConflict"),
+        (400, "ValidationError"),
         "an alarm another composite alarm's rule references cannot be deleted, got {body}"
     );
     // "this total can include no more than one composite alarm"

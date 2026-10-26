@@ -29,6 +29,8 @@ mod capability_lifecycle;
 mod certificate_authority;
 #[path = "all/certificate_authority_activation.rs"]
 mod certificate_authority_activation;
+#[path = "all/certificate_authority_deletion.rs"]
+mod certificate_authority_deletion;
 #[path = "all/certificate_authority_listing.rs"]
 mod certificate_authority_listing;
 #[path = "all/child_create_resolves_the_cluster_first.rs"]
@@ -37,6 +39,8 @@ mod child_create_resolves_the_cluster_first;
 mod cluster_config_update;
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
+#[path = "all/cluster_update_concurrency.rs"]
+mod cluster_update_concurrency;
 #[path = "all/cluster_version_catalog.rs"]
 mod cluster_version_catalog;
 #[path = "all/cluster_version_update.rs"]
