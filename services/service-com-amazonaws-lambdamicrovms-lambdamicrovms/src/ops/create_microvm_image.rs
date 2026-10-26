@@ -363,6 +363,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_else(|| crate::state::default_logging(&input.name)),
         );
 
+        // The asynchronous build fans out into one build per target the accepted
+        // `cpuConfigurations` ask for, so the version's build records exist from the
+        // moment the build is scheduled and settle with it.
+        let builds = store.mint_builds(&cpu_configurations, created_at);
+
         let version = MicrovmImageVersion {
             image_version: image_version.clone(),
             state: crate::state::VERSION_STATE_IN_PROGRESS.to_string(),
@@ -388,6 +393,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The build is asynchronous: the version completes, and with it the
             // image's CREATING -> CREATED move, once the clock makes it due.
             build_due_at: Some(now + crate::state::IMAGE_BUILD_SPAN),
+            builds,
         };
 
         let mut versions = ::std::collections::BTreeMap::new();

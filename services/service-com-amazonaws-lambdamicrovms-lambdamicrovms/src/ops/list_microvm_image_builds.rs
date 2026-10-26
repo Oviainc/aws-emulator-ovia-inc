@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMicrovmImageBuilds
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMicrovmImageBuilds`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMicrovmImageBuilds::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +152,173 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMicrovmImageBuilds` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMicrovmImageBuildsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListMicrovmImageBuildsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MicroVM image store is unavailable".to_string()),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_token(token)?),
+            None => None,
+        };
+        // `maxResults` carries `@range(min: 1, max: 50)`, which the boundary validator
+        // has already enforced; the clamp is a second line of defence, so a page size
+        // can never be zero or unbounded however the value arrived.
+        let page_size = input
+            .max_results
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(crate::state::MAX_LIST_PAGE)
+            .clamp(1, crate::state::MAX_LIST_PAGE);
+
+        let mut store = state.lock();
+        store.materialize_due(::std::time::Instant::now());
+
+        // The build plane's AUTHORIZATION verdict, decided before anything is looked
+        // up: a caller may read the builds of an image its own account holds, so an
+        // identifier that resolves to no image of this account — an AWS-owned managed
+        // base image, another account's, or one nobody created — is DENIED rather than
+        // reported missing, and a value that is no identifier this API can address at
+        // all is a request that can never succeed (400).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMicrovmImageBuilds"))
+        // Deciding this before the lookup is the point: a 404 here would tell a caller
+        // with no permission on the identifier whether it exists.
+        let image_name = match store.resolve_image_reference(&input.image_identifier) {
+            crate::state::ImageReference::Resolved(name) => name,
+            crate::state::ImageReference::Absent => {
+                return Err(ListMicrovmImageBuildsErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(crate::state::ACCESS_DENIED_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+            crate::state::ImageReference::Malformed => {
+                return Err(ListMicrovmImageBuildsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::invalid_arn_format_message(
+                            &input.image_identifier,
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // Past the verdict the lookup is an own-account one, so a version this
+        // account's own image does not hold is the modelled 404.
+        let Some(image) = store.images.get(&image_name) else {
+            return Err(not_found(crate::state::image_not_found_message(
+                &input.image_identifier,
+            )));
+        };
+        let Some(version) = image.versions.get(&input.image_version) else {
+            return Err(not_found(crate::state::image_version_not_found_message(
+                &image.image_arn,
+                &input.image_version,
+            )));
+        };
+
+        // "Lists builds for a MicroVM image version with optional filtering by
+        // architecture and chipset": a filter the request omits selects every build,
+        // and the filters compose.
+        let matched = version.builds.values().filter(|build| {
+            input
+                .architecture
+                .as_deref()
+                .is_none_or(|value| value == build.architecture)
+                && input
+                    .chipset
+                    .as_deref()
+                    .is_none_or(|value| value == build.chipset)
+                && input
+                    .chipset_generation
+                    .as_deref()
+                    .is_none_or(|value| value == build.chipset_generation)
+        });
+
+        // The builds enumerate in one stable order (their ids sort in creation order),
+        // so "after this build" is a cursor that stays valid even when another build is
+        // recorded between two pages.
+        let mut remaining = matched.filter(|build| {
+            after
+                .as_deref()
+                .is_none_or(|cursor| build.build_id.as_str() > cursor)
+        });
+        let page: Vec<&crate::state::MicrovmImageBuild> = remaining.by_ref().take(page_size).collect();
+
+        // A `nextToken` is issued only when the page did not exhaust the builds.
+        let next_token = match (page.last(), remaining.next()) {
+            (Some(last), Some(_)) => Some(encode_token(&last.build_id)),
+            _ => None,
+        };
+
+        Ok(ListMicrovmImageBuildsOutput {
+            next_token,
+            // `items` is `@required`, so it is always projected — an empty page included.
+            items: page
+                .into_iter()
+                .map(|build| MicrovmImageBuildSummary {
+                    image_arn: image.image_arn.clone(),
+                    image_version: version.image_version.clone(),
+                    build_id: build.build_id.clone(),
+                    build_state: build.state.clone(),
+                    architecture: build.architecture.clone(),
+                    chipset: build.chipset.clone(),
+                    chipset_generation: build.chipset_generation.clone(),
+                    state_reason: build.state_reason.clone(),
+                    created_at: build.created_at,
+                })
+                .collect(),
+        })
     }
+}
+
+/// 404: the request named a version the resolved image does not hold.
+///
+/// `ResourceNotFoundException` models `message` as the only required member;
+/// `resourceType` and `resourceId` are optional and this service leaves them unset, so
+/// the message is the whole envelope.
+fn not_found(message: String) -> ListMicrovmImageBuildsError {
+    ListMicrovmImageBuildsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+        resource_type: None,
+        resource_id: None,
+    })
+    .into()
+}
+
+/// The marker every `nextToken` this operation issues carries, so a token the service
+/// did not mint is refused rather than silently positioning the listing.
+const TOKEN_MARKER: &str = "ListMicrovmImageBuilds/1:";
+
+/// The opaque `nextToken` for a cursor: the id of the last build served.
+fn encode_token(build_id: &str) -> String {
+    ::hex::encode(format!("{TOKEN_MARKER}{build_id}").as_bytes())
+}
+
+/// The cursor a `nextToken` carries. A token this service did not mint is refused
+/// with the modelled 400 rather than silently restarting or skipping the listing.
+fn decode_token(token: &str) -> Result<String, ListMicrovmImageBuildsError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|decoded| {
+            decoded
+                .strip_prefix(TOKEN_MARKER)
+                .map(::std::string::ToString::to_string)
+        })
+        .ok_or_else(|| {
+            ListMicrovmImageBuildsErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    "nextToken is not a pagination token this service issued".to_string(),
+                ),
+            })
+            .into()
+        })
 }

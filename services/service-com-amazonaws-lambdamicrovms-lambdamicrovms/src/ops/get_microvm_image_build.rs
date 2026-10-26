@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMicrovmImageBuild
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMicrovmImageBuild`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMicrovmImageBuild::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +159,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMicrovmImageBuild` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMicrovmImageBuildErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetMicrovmImageBuildErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MicroVM image store is unavailable".to_string()),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        let mut store = state.lock();
+        store.materialize_due(::std::time::Instant::now());
+
+        // The build plane's AUTHORIZATION verdict, decided before anything is looked
+        // up: a caller may read the builds of an image its own account holds, so an
+        // identifier that resolves to no image of this account — an AWS-owned managed
+        // base image, another account's, or one nobody created — is DENIED rather than
+        // reported missing, and a value that is no identifier this API can address at
+        // all is a request that can never succeed (400).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMicrovmImageBuild"))
+        // Deciding this before the lookup is the point: a 404 here would tell a caller
+        // with no permission on the identifier whether it exists.
+        let image_name = match store.resolve_image_reference(&input.image_identifier) {
+            crate::state::ImageReference::Resolved(name) => name,
+            crate::state::ImageReference::Absent => {
+                return Err(GetMicrovmImageBuildErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(crate::state::ACCESS_DENIED_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+            crate::state::ImageReference::Malformed => {
+                return Err(GetMicrovmImageBuildErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::invalid_arn_format_message(
+                            &input.image_identifier,
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // Past the verdict the lookup is an own-account one, so a version or a build
+        // this account's own image does not hold is the modelled 404.
+        let Some(image) = store.images.get(&image_name) else {
+            return Err(not_found(crate::state::image_not_found_message(
+                &input.image_identifier,
+            )));
+        };
+        let Some(version) = image.versions.get(&input.image_version) else {
+            return Err(not_found(crate::state::image_version_not_found_message(
+                &image.image_arn,
+                &input.image_version,
+            )));
+        };
+        let Some(build) = version.builds.get(&input.build_id) else {
+            return Err(not_found(crate::state::image_build_not_found_message(
+                &image.image_arn,
+                &version.image_version,
+                &input.build_id,
+            )));
+        };
+
+        Ok(GetMicrovmImageBuildOutput {
+            image_arn: image.image_arn.clone(),
+            image_version: version.image_version.clone(),
+            build_id: build.build_id.clone(),
+            build_state: build.state.clone(),
+            architecture: build.architecture.clone(),
+            chipset: build.chipset.clone(),
+            chipset_generation: build.chipset_generation.clone(),
+            state_reason: build.state_reason.clone(),
+            created_at: build.created_at,
+            snapshot_build: build.snapshot_build.clone(),
+        })
     }
+}
+
+/// 404: the request named a version or a build the resolved image does not hold.
+///
+/// `ResourceNotFoundException` models `message` as the only required member;
+/// `resourceType` and `resourceId` are optional and this service leaves them unset, so
+/// the message is the whole envelope.
+fn not_found(message: String) -> GetMicrovmImageBuildError {
+    GetMicrovmImageBuildErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+        resource_type: None,
+        resource_id: None,
+    })
+    .into()
 }

@@ -385,7 +385,7 @@ fn no_active_version(image: &str) -> RunMicrovmError {
 /// 404: the request named an `imageVersion` the image does not carry.
 fn version_not_found(image: &str, image_version: &str) -> RunMicrovmError {
     RunMicrovmErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: format!("MicroVM image {image} has no version {image_version}"),
+        message: crate::state::image_version_not_found_message(image, image_version),
         resource_type: None,
         resource_id: None,
     })

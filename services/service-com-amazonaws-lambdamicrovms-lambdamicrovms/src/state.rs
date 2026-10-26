@@ -30,6 +30,7 @@ use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
     CloudWatchLogging, CodeArtifact, CpuConfiguration, Hooks, IdlePolicy, Logging, Resources,
+    SnapshotBuild,
 };
 
 /// The region an ARN carries when the request is unsigned, matching the region
@@ -461,6 +462,31 @@ pub fn no_active_version_message(image: &str) -> String {
     format!("No active version found for MicroVM image {image}")
 }
 
+/// The `message` of the 404 a version-addressed call answers when the image it resolved
+/// carries no such `imageVersion`, built from the image the request named and that
+/// version.
+pub fn image_version_not_found_message(image: &str, image_version: &str) -> String {
+    format!("MicroVM image {image} has no version {image_version}")
+}
+
+/// The `message` of the 404 a build-addressed call answers when the image version it
+/// resolved holds no build with the `buildId` the request named.
+///
+/// The template states the same thing one level deeper than
+/// [`image_version_not_found_message`]: the resource that is missing, and the record it
+/// was looked for in.
+pub fn image_build_not_found_message(image: &str, image_version: &str, build_id: &str) -> String {
+    format!("MicroVM image {image} version {image_version} has no build {build_id}")
+}
+
+/// The `message` of the 403 a read answers for a resource the caller may not read.
+///
+/// `AccessDeniedException` is documented as "You do not have sufficient access to
+/// perform this action."; AWS's own message additionally names the CALLING PRINCIPAL,
+/// which is caller identity rather than anything of this request, so the modelled
+/// sentence for the error class is the whole envelope here.
+pub const ACCESS_DENIED_MESSAGE: &str = "You do not have sufficient access to perform this action.";
+
 /// The version the NEXT build of an image is minted as, given the versions it
 /// already holds.
 ///
@@ -505,6 +531,71 @@ pub const VERSION_STATUS_ACTIVE: &str = "ACTIVE";
 /// A `MicrovmImageVersionStatus` value (`MICROVM_IMAGE_VERSION_STATUS_VALUES`).
 pub const VERSION_STATUS_INACTIVE: &str = "INACTIVE";
 
+/// A `BuildState` value (`BUILD_STATE_VALUES`): the build is running.
+pub const BUILD_STATE_IN_PROGRESS: &str = "IN_PROGRESS";
+/// A `BuildState` value (`BUILD_STATE_VALUES`): the build produced a snapshot.
+pub const BUILD_STATE_SUCCESSFUL: &str = "SUCCESSFUL";
+
+/// One target an image version's asynchronous build produces a build record for: a CPU
+/// architecture, the chipset that architecture runs on, and the generation of that
+/// chipset the build targets.
+#[derive(Debug, Clone, Copy)]
+pub struct BuildTarget {
+    /// An `Architecture` (`ARCHITECTURE_VALUES`).
+    pub architecture: &'static str,
+    /// A `Chipset` (`CHIPSET_VALUES`).
+    pub chipset: &'static str,
+    /// The chipset generation, as `MicrovmImageBuildSummary$chipsetGeneration` reports
+    /// it.
+    pub chipset_generation: &'static str,
+}
+
+/// The targets this service builds a MicroVM image version for — one build record each.
+///
+/// `Architecture` enumerates `ARM_64` only and `Chipset` enumerates `GRAVITON` only
+/// (`smithy_query(query="shape",shape="Architecture,Chipset")`), so an `ARM_64` image is
+/// built for `GRAVITON`; a build is per chipset GENERATION, so one scheduled build fans
+/// out across the generations the service builds that chipset for.
+/// `chipsetGeneration` is a free-form `NonBlankString` the model publishes no values
+/// for, so the generations named here are chosen (like [`IMAGE_BUILD_SPAN`]) rather
+/// than modelled.
+pub const BUILD_TARGETS: &[BuildTarget] = &[
+    BuildTarget {
+        architecture: DEFAULT_CPU_ARCHITECTURE,
+        chipset: "GRAVITON",
+        chipset_generation: "GRAVITON_2",
+    },
+    BuildTarget {
+        architecture: DEFAULT_CPU_ARCHITECTURE,
+        chipset: "GRAVITON",
+        chipset_generation: "GRAVITON_3",
+    },
+];
+
+/// Bytes in one MiB: `Resources$minimumMemoryInMiB` is in MiB while
+/// `SnapshotBuild$memorySnapshotSizeInBytes` is in bytes.
+const BYTES_PER_MIB: i64 = 1024 * 1024;
+
+/// The snapshot a SUCCESSFUL build of a version configured with `resources` produces,
+/// or `None` when the version carries no resource requirement to size it from.
+///
+/// `SnapshotBuild` is "size information about a MicroVM image snapshot build": the
+/// memory snapshot of a MicroVM that is configured with `minimumMemoryInMiB` of memory
+/// is that much memory, which is the one size this emulator holds the input for. It
+/// holds no artifact bytes and no disk image, so `codeInstallSizeInBytes` and
+/// `diskSnapshotSizeInBytes` — both optional — are left unset rather than invented.
+pub fn snapshot_build_of(resources: &[Resources]) -> Option<SnapshotBuild> {
+    let memory_in_mib = resources
+        .iter()
+        .map(|resource| i64::from(resource.minimum_memory_in_mi_b))
+        .max()?;
+    Some(SnapshotBuild {
+        memory_snapshot_size_in_bytes: Some(memory_in_mib * BYTES_PER_MIB),
+        code_install_size_in_bytes: None,
+        disk_snapshot_size_in_bytes: None,
+    })
+}
+
 /// A `MicrovmState` value (`MICROVM_STATE_VALUES`).
 pub const MICROVM_STATE_PENDING: &str = "PENDING";
 /// A `MicrovmState` value (`MICROVM_STATE_VALUES`).
@@ -513,6 +604,24 @@ pub const MICROVM_STATE_RUNNING: &str = "RUNNING";
 pub const MICROVM_STATE_TERMINATING: &str = "TERMINATING";
 /// A `MicrovmState` value (`MICROVM_STATE_VALUES`).
 pub const MICROVM_STATE_TERMINATED: &str = "TERMINATED";
+
+/// One build of one MicroVM image version: the target it was built for and the state
+/// of that build. Held in [`MicrovmImageVersion::builds`], keyed by its `buildId`.
+#[derive(Debug, Clone)]
+pub struct MicrovmImageBuild {
+    pub build_id: String,
+    /// A `BuildState`.
+    pub state: String,
+    /// An `Architecture`.
+    pub architecture: String,
+    /// A `Chipset`.
+    pub chipset: String,
+    pub chipset_generation: String,
+    pub state_reason: Option<String>,
+    pub created_at: DateTime,
+    /// The snapshot the build produced; absent until the build succeeds.
+    pub snapshot_build: Option<SnapshotBuild>,
+}
 
 /// One version of a MicroVM image: the build inputs the create (or an update)
 /// carried, plus the state of that build.
@@ -540,6 +649,9 @@ pub struct MicrovmImageVersion {
     pub tags: BTreeMap<String, String>,
     /// When the asynchronous build completes; `None` once it has.
     pub build_due_at: Option<Instant>,
+    /// The per-target builds this version's asynchronous build fans out into, keyed by
+    /// `buildId` — see [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::mint_builds`].
+    pub builds: BTreeMap<String, MicrovmImageBuild>,
 }
 
 /// A MicroVM image, keyed in [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::images`] by its name.
@@ -636,6 +748,8 @@ pub struct ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     pub idempotency: BTreeMap<String, IdempotencyRecord>,
     /// The sequence the next minted `microvmId` is formatted from.
     pub next_microvm_seq: u64,
+    /// The sequence the next minted `buildId` is formatted from.
+    pub next_build_seq: u64,
     /// When this store published the AWS-managed base-image catalogue
     /// ([`MANAGED_BASE_IMAGE_IDS`]) — the `createdAt` every entry of it reports.
     ///
@@ -657,6 +771,7 @@ impl Default for ComAmazonawsLambdamicrovmsLambdamicrovmsState {
             microvm_arn_index: BTreeMap::new(),
             idempotency: BTreeMap::new(),
             next_microvm_seq: 0,
+            next_build_seq: 0,
             managed_catalogue_published_at: now_datetime(),
         }
     }
@@ -722,6 +837,14 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
                 record.state = VERSION_STATE_SUCCESSFUL.to_string();
                 record.status = VERSION_STATUS_ACTIVE.to_string();
                 record.updated_at = Some(updated_at);
+                // The version's build is the fan-out of its per-target builds, so the
+                // builds settle with it: each produced the snapshot the version's own
+                // resource requirement sizes.
+                let snapshot = snapshot_build_of(&record.resources);
+                for build in record.builds.values_mut() {
+                    build.state = BUILD_STATE_SUCCESSFUL.to_string();
+                    build.snapshot_build = snapshot.clone();
+                }
                 image.updated_at = Some(updated_at);
                 // A newly successful build becomes the image's active version,
                 // and the previous one steps down: `MicrovmImageVersionStatus`
@@ -995,6 +1118,55 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
         let seq = self.next_microvm_seq;
         self.next_microvm_seq += 1;
         format!("mvm-{seq:016x}")
+    }
+
+    /// Mint the next `buildId`. Zero-padded for the same reason as
+    /// [`Self::next_microvm_id`]: the ids sort in creation order, which is the order
+    /// `ListMicrovmImageBuilds` pages through.
+    pub fn next_build_id(&mut self) -> String {
+        let seq = self.next_build_seq;
+        self.next_build_seq += 1;
+        format!("build-{seq:016x}")
+    }
+
+    /// The builds a version's asynchronous build fans out into: one per target of
+    /// [`BUILD_TARGETS`] the version's `cpuConfigurations` ask for, each `IN_PROGRESS`
+    /// until the clock settles the version's build ([`Self::materialize_due`]).
+    ///
+    /// The fan-out is driven by the TARGETS, so a request that names one architecture
+    /// twice still gets one build per target rather than a duplicate of each.
+    pub fn mint_builds(
+        &mut self,
+        cpu_configurations: &[CpuConfiguration],
+        created_at: DateTime,
+    ) -> BTreeMap<String, MicrovmImageBuild> {
+        let mut builds = BTreeMap::new();
+        let requested: Vec<BuildTarget> = BUILD_TARGETS
+            .iter()
+            .filter(|target| {
+                cpu_configurations
+                    .iter()
+                    .any(|configuration| configuration.architecture == target.architecture)
+            })
+            .copied()
+            .collect();
+        for target in requested {
+            let build_id = self.next_build_id();
+            builds.insert(
+                build_id.clone(),
+                MicrovmImageBuild {
+                    build_id,
+                    state: BUILD_STATE_IN_PROGRESS.to_string(),
+                    architecture: target.architecture.to_string(),
+                    chipset: target.chipset.to_string(),
+                    chipset_generation: target.chipset_generation.to_string(),
+                    state_reason: None,
+                    created_at,
+                    snapshot_build: None,
+                },
+            );
+        }
+        builds
     }
 }
 
