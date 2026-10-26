@@ -192,3 +192,5 @@ mod update_integration_response;
 mod rest_api_import_security_warning;
 #[path = "all/request_validator_create_api_refusal.rs"]
 mod request_validator_create_api_refusal;
+#[path = "all/delete_domain_name.rs"]
+mod delete_domain_name;
