@@ -5,10 +5,11 @@
 //! plan, read back from [`crate::state`] and paged by `MaxResults`/`NextToken`.
 //!
 //! Both input members are required and together name ONE plan, but this operation binds
-//! no not-found error at all, so a (`ScalingPlanName`, `ScalingPlanVersion`) pair naming
-//! no stored plan is not a client error: it reports the empty set of scalable resources,
-//! HTTP 200 with an empty `ScalingPlanResources` list and no `NextToken`. Only the
-//! request's own members (`MaxResults`, `NextToken`) can make this call a refusal.
+//! no not-found error at all, so a `ScalingPlanName` naming no stored plan is not a client
+//! error: it reports the empty set of scalable resources, HTTP 200 with an empty
+//! `ScalingPlanResources` list and no `NextToken`. Only the request's own members
+//! (`ScalingPlanVersion`, which documents exactly one valid value, `MaxResults` and
+//! `NextToken`) can make this call a refusal.
 //!
 //! A read, except for the transitions the clock already owes: `settle_due` applies
 //! only what was due at this instant whether or not anybody called.
@@ -156,11 +157,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(internal)?;
         let now = ::std::time::SystemTime::now();
-        let mut state = state.lock();
-        state.settle_due(now);
 
+        // The request's own members are refused BEFORE any lookup: none of these refusals
+        // depends on what this service holds, so a request AWS would not accept is refused
+        // whether or not the named plan exists.
         let page_size =
             crate::state::effective_max_results(input.max_results).map_err(validation)?;
+        // `ScalingPlanVersion` documents exactly one valid value, so any other version is
+        // a request this service refuses on the member rather than a lookup that misses —
+        // the same rule the forecast read applies to its own copy of this member.
+        crate::state::validate_plan_version(input.scaling_plan_version).map_err(validation)?;
 
         // The cursor is the index into the plan's own instruction list, which is
         // ordered exactly as the plan stores it.
@@ -171,7 +177,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .ok_or_else(|| invalid_next_token("The NextToken provided is not valid"))?,
         };
 
-        // A lookup by (name, version) that finds no plan reports the empty set of
+        let mut state = state.lock();
+        // Clock-owed work first, so this read reports the state the clock already made due
+        // rather than a stale one.
+        state.settle_due(now);
+
+        // A lookup that finds no plan of the requested name reports the empty set of
         // scalable resources, not a client error: this operation binds no not-found shape
         // (`ObjectNotFoundException` is modelled only on the mutating `DeleteScalingPlan`
         // and `UpdateScalingPlan`), and `ScalingPlanResources` is exactly the list of

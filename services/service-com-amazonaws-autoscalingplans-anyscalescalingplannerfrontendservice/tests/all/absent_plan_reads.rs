@@ -7,11 +7,12 @@
 //! Two rules are pinned here:
 //!
 //! * an operation that REPORTS on a resource and binds no not-found error answers HTTP 200
-//!   with its collection member empty when the (`ScalingPlanName`, `ScalingPlanVersion`)
-//!   pair names no stored plan — the empty set of things to report, not a client error. A
-//!   refusal belongs to the operations that DO model a not-found error (the two mutating
-//!   ones, pinned in [`crate::error_message_wording`]) and to what the request itself
-//!   says;
+//!   with its collection member empty when the `ScalingPlanName` names no stored plan —
+//!   the empty set of things to report, not a client error. A refusal belongs to the
+//!   operations that DO model a not-found error (the two mutating ones, pinned in
+//!   [`crate::error_message_wording`]) and to what the request itself says — including its
+//!   `ScalingPlanVersion`, which documents one valid value and is refused on the member
+//!   ([`crate::plan_version_member_validation`]);
 //! * the day bounds documented on the forecast window are spans of forecast DATA, and
 //!   forecast data exists at one data point per hour, so each bound is measured in whole
 //!   hourly forecast periods: a window reaching less than one period past a bound is
@@ -41,7 +42,9 @@ use crate::scaling_plan_lifecycle::{
 /// second `InternalServiceException` and `ValidationException`. NEITHER binds a not-found
 /// shape, while the mutating `DeleteScalingPlan` and `UpdateScalingPlan` both bind
 /// `ObjectNotFoundException`.
-const READS: [(&str, &str); 2] = [
+///
+/// `pub(crate)` so a suite driving the same two reads names the same pair.
+pub(crate) const READS: [(&str, &str); 2] = [
     ("DescribeScalingPlanResources", "ScalingPlanResources"),
     ("GetScalingPlanResourceForecastData", "Datapoints"),
 ];
@@ -66,7 +69,9 @@ const RESOURCE_ID: &str = "autoScalingGroup/my-asg";
 /// operation, the five further members the model marks required. Its window is one
 /// forecast period starting on the hour, well inside both documented bounds, so only the
 /// lookup can decide the answer.
-fn read_request(operation: &str, name: &str, version: i64) -> Value {
+///
+/// `pub(crate)` so a suite driving the same two reads builds their requests the same way.
+pub(crate) fn read_request(operation: &str, name: &str, version: i64) -> Value {
     if operation == "GetScalingPlanResourceForecastData" {
         let start = now_secs().div_euclid(HOUR) * HOUR;
         return json!({
@@ -166,40 +171,26 @@ async fn a_read_that_matches_no_stored_plan_reports_its_collection_empty() {
         }
     }
 
-    // The VERSION half of the same lookup. `DescribeScalingPlanResources` bounds its
-    // `ScalingPlanVersion` member nowhere, so a version this service does not hold is a
-    // lookup that misses — the empty set again. The forecast operation documents one valid
-    // value for that member, so it refuses the member before any lookup, which is a
-    // property of the request and not of what is stored.
+    // The VERSION half of the same lookup is NOT a miss: `ScalingPlanVersion` documents
+    // exactly one valid value on both reporting requests, so each refuses the member
+    // before any lookup — a property of the request and not of what is stored. The full
+    // table of versions lives in [`crate::plan_version_member_validation`].
     for (label, version) in [
         ("the version past the only one modelled", ONLY_VERSION + 1),
         ("version zero", 0),
         ("a negative version", -1),
         ("a version past 32 bits", 4_294_967_296),
     ] {
-        let body = emulator
-            .ok(
-                "DescribeScalingPlanResources",
-                read_request("DescribeScalingPlanResources", STORED_PLAN, version),
-            )
-            .await;
-        assert_eq!(
-            body["ScalingPlanResources"],
-            json!([]),
-            "case {label} ({version}): a version this service does not hold matches no \
-             plan, so its resources are empty, got {body}"
-        );
-
-        let request = read_request("GetScalingPlanResourceForecastData", STORED_PLAN, version);
-        let (status, body) = emulator
-            .call("GetScalingPlanResourceForecastData", &request)
-            .await;
-        assert_eq!(
-            (status, error_code(&body)),
-            (400, "ValidationException"),
-            "case {label} ({version}): the documented member bound refuses it, got \
-             {status} with {body}"
-        );
+        for (operation, _) in READS {
+            let request = read_request(operation, STORED_PLAN, version);
+            let (status, body) = emulator.call(operation, &request).await;
+            assert_eq!(
+                (status, error_code(&body)),
+                (400, "ValidationException"),
+                "case {operation}/{label} ({version}): the documented member bound refuses \
+                 it, got {status} with {body}"
+            );
+        }
     }
 
     // The control: the plan that IS held reports what it holds on both paths, so the empty

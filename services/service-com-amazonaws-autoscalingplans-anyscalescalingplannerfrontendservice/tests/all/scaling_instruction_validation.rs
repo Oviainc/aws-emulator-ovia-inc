@@ -8,8 +8,8 @@
 //!    The rows below each name a different documented relation; a maximum capacity
 //!    below its minimum is one of them, not the rule.
 //! 2. `DescribeScalingPlanResources` identifies ONE plan by its two required members but
-//!    models no not-found error, so a lookup on (`ScalingPlanName`, `ScalingPlanVersion`)
-//!    that finds no stored plan reports the empty set of scalable resources (HTTP 200,
+//!    models no not-found error, so a lookup on a `ScalingPlanName` that finds no stored
+//!    plan reports the empty set of scalable resources (HTTP 200,
 //!    `ScalingPlanResources` = `[]`) rather than a refusal.
 //!
 //! The harness (`Emulator`, `instruction`, `stack_source`) is the sibling suite's: every
@@ -753,9 +753,11 @@ async fn describe_scaling_plan_resources_reports_an_empty_set_for_a_lookup_that_
     emulator.make_all_due();
 
     // Rows: the ways a (name, version) lookup can miss — a name nothing ever created,
-    // a name whose case differs, a name that was created and then deleted, and a
-    // version this service does not hold — plus a bounded page size on the miss, which
-    // changes nothing: there is no page to size.
+    // a name whose case differs, and a name that was created and then deleted — plus a
+    // bounded page size on the miss, which changes nothing: there is no page to size. A
+    // version other than the one documented valid value is NOT a miss but a refusal on the
+    // member ([`crate::plan_version_member_validation`]), so every row holds the version
+    // the model documents.
     emulator
         .ok(
             "CreateScalingPlan",
@@ -793,12 +795,6 @@ async fn describe_scaling_plan_resources_reports_an_empty_set_for_a_lookup_that_
             "gone",
             1,
             json!({ "ScalingPlanName": "gone", "ScalingPlanVersion": 1 }),
-        ),
-        (
-            "a version this service does not hold",
-            "known",
-            2,
-            json!({ "ScalingPlanName": "known", "ScalingPlanVersion": 2 }),
         ),
         (
             "a miss with an explicit page size",

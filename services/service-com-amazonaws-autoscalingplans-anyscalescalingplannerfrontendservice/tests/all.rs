@@ -25,6 +25,8 @@ mod forecast_data;
 mod forecast_datapoints;
 #[path = "all/forecast_window_precision.rs"]
 mod forecast_window_precision;
+#[path = "all/plan_version_member_validation.rs"]
+mod plan_version_member_validation;
 #[path = "all/predictive_scaling_predicate.rs"]
 mod predictive_scaling_predicate;
 #[path = "all/scaling_instruction_validation.rs"]

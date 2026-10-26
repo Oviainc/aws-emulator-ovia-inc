@@ -769,25 +769,33 @@ async fn an_unknown_plan_or_version_answers_each_operations_own_envelope() {
     emulator.make_all_due();
 
     // `DescribeScalingPlanResources` identifies one plan by its two required members but
-    // models no not-found shape, so a miss on (name, version) reports the empty set of
-    // scalable resources — see `tests/all/absent_plan_reads.rs` for the full table.
-    for (label, name, version) in [
-        ("unknown name", "missing", 1),
-        ("known name, unmodelled version", "known", 2),
-    ] {
-        let body = emulator
-            .ok(
-                "DescribeScalingPlanResources",
-                json!({ "ScalingPlanName": name, "ScalingPlanVersion": version }),
-            )
-            .await;
-        assert_eq!(
-            body["ScalingPlanResources"],
-            json!([]),
-            "case {label}: expected an empty ScalingPlanResources list for a plan that is \
-             not held, got {body:?}"
-        );
-    }
+    // models no not-found shape, so an unknown NAME reports the empty set of scalable
+    // resources, while a version other than the one documented valid value is refused on
+    // the member — see `tests/all/absent_plan_reads.rs` and
+    // `tests/all/plan_version_member_validation.rs` for the full tables.
+    let body = emulator
+        .ok(
+            "DescribeScalingPlanResources",
+            json!({ "ScalingPlanName": "missing", "ScalingPlanVersion": 1 }),
+        )
+        .await;
+    assert_eq!(
+        body["ScalingPlanResources"],
+        json!([]),
+        "case unknown name: expected an empty ScalingPlanResources list for a plan that is \
+         not held, got {body:?}"
+    );
+    let (status, code) = emulator
+        .err(
+            "DescribeScalingPlanResources",
+            json!({ "ScalingPlanName": "known", "ScalingPlanVersion": 2 }),
+        )
+        .await;
+    assert_eq!(
+        (status, code.as_str()),
+        (400, "ValidationException"),
+        "case known name, unmodelled version: expected a 400 ValidationException"
+    );
 
     // The same two inputs on the mutating operations, which DO model a not-found error.
     for operation in ["UpdateScalingPlan", "DeleteScalingPlan"] {

@@ -209,7 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             FORECAST_DATA_TYPE_VALUES,
         )
         .map_err(validation)?;
-        validate_plan_version(input.scaling_plan_version).map_err(validation)?;
+        crate::state::validate_plan_version(input.scaling_plan_version).map_err(validation)?;
         validate_forecast_window(input.start_time, input.end_time, now).map_err(validation)?;
         validate_forecast_resource(&input).map_err(validation)?;
 
@@ -362,24 +362,6 @@ fn whole_periods(span: i128) -> i128 {
 /// `days` as a count of whole forecast periods.
 fn days_in_periods(days: i64) -> i128 {
     days_in_nanos(days) / period_nanos()
-}
-
-/// The scaling plan version a caller asked a forecast for.
-///
-/// `GetScalingPlanResourceForecastDataRequest$ScalingPlanVersion` documents exactly one
-/// valid value ([`crate::state::ONLY_VERSION`]), so any other version is a request this
-/// service refuses rather than a lookup that misses: this operation models no not-found
-/// error at all
-/// (`smithy_query(query="operation",operation="GetScalingPlanResourceForecastData")` binds
-/// only `InternalServiceException` and `ValidationException`).
-fn validate_plan_version(version: i64) -> Result<(), String> {
-    if version != crate::state::ONLY_VERSION {
-        return Err(format!(
-            "ScalingPlanVersion {version} is not valid: the only valid value is {}",
-            crate::state::ONLY_VERSION
-        ));
-    }
-    Ok(())
 }
 
 /// The scalable resource a caller asked a forecast for.
