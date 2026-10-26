@@ -207,23 +207,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The tier sets the maximum bitrate, in Mbps, for the router input", and the Tier
         // doc publishes the Mbps of each tier, so the tier the request names bounds the
-        // `MaximumBitrate` it may ask for (see
-        // `crate::state::router_input_tier_bitrate_ceiling`). A bitrate at or below zero names
-        // no capacity at all.
-        if input.maximum_bitrate <= 0 {
-            return Err(bad_request(format!(
-                "MaximumBitrate must be a positive number of bits per second; this request \
-                 asks for {}.",
-                input.maximum_bitrate
-            )));
-        }
-        if let Some(ceiling) = crate::state::router_input_tier_bitrate_ceiling(&input.tier) {
-            if input.maximum_bitrate > ceiling {
-                return Err(bad_request(format!(
-                    "MaximumBitrate {} exceeds the {} bits per second the {} tier allows.",
-                    input.maximum_bitrate, ceiling, input.tier
-                )));
-            }
+        // `MaximumBitrate` it may ask for, and a bitrate at or below zero names no capacity
+        // at all. Both halves are the one rule
+        // `crate::state::router_input_bitrate_rejection` owns, which UpdateRouterInput
+        // judges the pair it leaves an input with through as well.
+        if let Some(rejection) =
+            crate::state::router_input_bitrate_rejection(&input.tier, input.maximum_bitrate)
+        {
+            return Err(bad_request(rejection));
         }
 
         // "The Amazon Web Services Region for the router input. Defaults to the current

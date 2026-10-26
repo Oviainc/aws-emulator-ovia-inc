@@ -20,7 +20,8 @@ use crate::ops::types::{
     ContentQualityAnalysisFeatureConfiguration,
     DestinationConfiguration, EgressGatewayBridge, EncodingConfig, EncodingParameters, Encryption,
     Entitlement, FabricConfiguration, FailoverConfig, FailoverRouterInputIndexedStreamDetails,
-    FailoverRouterInputStreamDetails, Flow, FlowTransitEncryption, Gateway,
+    FailoverRouterInputStreamDetails, Flow, FlowTransitEncryption,
+    FlowTransitEncryptionKeyConfiguration, Gateway,
     GatewayInstance,
     GatewayNetwork,
     GatewayBridgeSource, GrantEntitlementRequest, IngressGatewayBridge, InputConfiguration,
@@ -33,6 +34,7 @@ use crate::ops::types::{
     MediaConnectFlowRouterInputStreamDetails,
     MediaConnectFlowRouterOutputStreamDetails, MediaStream,
     MediaLiveChannelRouterInputStreamDetails,
+    MediaLiveTransitEncryption, MediaLiveTransitEncryptionKeyConfiguration,
     MediaStreamAttributes, MediaStreamAttributesRequest,
     MediaLiveInputRouterOutputStreamDetails,
     MediaStreamOutputConfiguration, MediaStreamOutputConfigurationRequest,
@@ -233,8 +235,9 @@ pub fn is_stopped_bridge_state(bridge_state: &str) -> bool {
 /// The `RouterInputState` enum the model declares for a router input
 /// (`smithy_query(query="shape",shape="RouterInputState")`: CREATING | STANDBY | STARTING
 /// | ACTIVE | STOPPING | DELETING | UPDATING | ERROR | RECOVERING | MIGRATING). Only the
-/// states a router input's create, start, restart and delete reach are named here; the rest
-/// belong to the router-input operations that are still scaffolded (stop, update, migrate).
+/// states a router input's create, start, restart, reconfiguration and delete reach are
+/// named here; the rest belong to the router-input operations that are still scaffolded
+/// (stop, migrate).
 ///
 /// The non-terminal state a router input is answered in while it is being created; the
 /// clock settles it into [`ROUTER_INPUT_STATE_STANDBY`] one [`TRANSITION_SPAN`] later.
@@ -249,6 +252,12 @@ pub const ROUTER_INPUT_STATE_STANDBY: &str = "STANDBY";
 pub const ROUTER_INPUT_STATE_STARTING: &str = "STARTING";
 /// See [`ROUTER_INPUT_STATE_CREATING`]. The state of a router input that is running.
 pub const ROUTER_INPUT_STATE_ACTIVE: &str = "ACTIVE";
+/// See [`ROUTER_INPUT_STATE_CREATING`]. The transient state an input is RECONFIGURED in:
+/// UpdateRouterInput answers `202 Accepted`, so the settings it accepted are not in effect
+/// the instant it answers, and the clock settles the input back into the state it was
+/// heading for one [`TRANSITION_SPAN`] later ([`StoredRouterInput::begin_transition`]) —
+/// the input-side counterpart of [`ROUTER_OUTPUT_STATE_UPDATING`].
+pub const ROUTER_INPUT_STATE_UPDATING: &str = "UPDATING";
 /// See [`ROUTER_INPUT_STATE_CREATING`]. The non-terminal state a router input is answered
 /// in while a restart is in flight: RestartRouterInput "can be used to recover from errors
 /// or refresh the input state"
@@ -3444,6 +3453,39 @@ pub fn router_input_tier_bitrate_ceiling(tier: &str) -> Option<i64> {
     Some(megabits_per_second * BITS_PER_MEGABIT)
 }
 
+/// Why a router input of tier `tier` may not carry a `MaximumBitrate` of
+/// `maximum_bitrate`, or `None` when that pair is acceptable.
+///
+/// "The tier sets the maximum bitrate, in Mbps, for the router input"
+/// (`smithy_query(query="doc",shape="CreateRouterInputRequest",member="Tier")`, which
+/// `UpdateRouterInput$Tier` repeats), so the tier an input ENDS UP with bounds the bitrate
+/// it may be asked for, through the one catalog [`router_input_tier_bitrate_ceiling`]; and a
+/// bitrate is a count of bits per second, so it is positive. Every operation that sets
+/// either member (CreateRouterInput, UpdateRouterInput) judges the pair HERE, so the bound
+/// cannot drift between them — the input-side counterpart of
+/// [`router_output_bitrate_rejection`]. The detail is the sentence the refusal's envelope
+/// carries ([`validation_failed_message`]).
+pub fn router_input_bitrate_rejection(tier: &str, maximum_bitrate: i64) -> Option<String> {
+    let Some(ceiling) = router_input_tier_bitrate_ceiling(tier) else {
+        return Some(format!(
+            "Tier {tier:?} is not a router input tier this service offers."
+        ));
+    };
+    if maximum_bitrate <= 0 {
+        return Some(format!(
+            "MaximumBitrate is a number of bits per second and must be positive; this \
+             request asks for {maximum_bitrate}."
+        ));
+    }
+    if maximum_bitrate > ceiling {
+        return Some(format!(
+            "MaximumBitrate {maximum_bitrate} bps exceeds the {ceiling} bps the {tier} tier \
+             allows."
+        ));
+    }
+    None
+}
+
 /// The `RouterInputTransitEncryption` an input reports when the create named none.
 ///
 /// `RouterInput$TransitEncryption` is a REQUIRED member while
@@ -3594,6 +3636,108 @@ pub fn router_input_has_own_address(configuration: &RouterInputConfiguration) ->
     router_input_network_interface_arn(configuration).is_some()
 }
 
+/// The SOURCE an input configured by `configuration` is currently CONNECTED to, named as
+/// the kind of resource it is, or `None` for a configuration that is connected to no such
+/// source.
+///
+/// Two router input configurations take their content from a resource of another AWS
+/// service, and each documents what connects it: "to connect the router input to the flow
+/// output, provide both `flowArn` and `flowOutputArn`. To disconnect it, call the update
+/// operation and omit both fields while keeping this configuration object"
+/// (`smithy_query(query="shape",shape="MediaConnectFlowRouterInputConfiguration")`), and
+/// the same for all three of `mediaLiveChannelArn`, `mediaLivePipelineId` and
+/// `mediaLiveChannelOutputName`
+/// (`smithy_query(query="shape",shape="MediaLiveChannelRouterInputConfiguration")`). The
+/// three configurations that ingest on a network interface of this account name no such
+/// source, so none of them is connected to one.
+pub fn router_input_connected_source(
+    configuration: &RouterInputConfiguration,
+) -> Option<&'static str> {
+    match configuration {
+        RouterInputConfiguration::MediaConnectFlow(flow) => {
+            (flow.flow_arn.is_some() && flow.flow_output_arn.is_some()).then_some("a flow output")
+        }
+        RouterInputConfiguration::MediaLiveChannel(channel) => (channel
+            .media_live_channel_arn
+            .is_some()
+            && channel.media_live_pipeline_id.is_some()
+            && channel.media_live_channel_output_name.is_some())
+        .then_some("a MediaLive channel output"),
+        RouterInputConfiguration::Standard(_)
+        | RouterInputConfiguration::Failover(_)
+        | RouterInputConfiguration::Merge(_) => None,
+    }
+}
+
+/// The values that tell two transit decryption configurations apart: the key type, and the
+/// secret and the role a Secrets Manager key is read with (an automatic key is managed by
+/// the service and carries nothing else to compare).
+type TransitDecryptionIdentity<'a> = (Option<&'a str>, Option<(&'a str, &'a str)>);
+
+/// [`TransitDecryptionIdentity`] for the decryption of a flow source connected to an input.
+fn flow_transit_decryption_identity(
+    encryption: &FlowTransitEncryption,
+) -> TransitDecryptionIdentity<'_> {
+    (
+        encryption.encryption_key_type.as_deref(),
+        match &encryption.encryption_key_configuration {
+            FlowTransitEncryptionKeyConfiguration::SecretsManager(key) => {
+                Some((key.secret_arn.as_str(), key.role_arn.as_str()))
+            }
+            FlowTransitEncryptionKeyConfiguration::Automatic(_) => None,
+        },
+    )
+}
+
+/// [`TransitDecryptionIdentity`] for the decryption of a MediaLive channel output connected
+/// to an input.
+fn media_live_transit_decryption_identity(
+    encryption: &MediaLiveTransitEncryption,
+) -> TransitDecryptionIdentity<'_> {
+    (
+        encryption.encryption_key_type.as_deref(),
+        match &encryption.encryption_key_configuration {
+            MediaLiveTransitEncryptionKeyConfiguration::SecretsManager(key) => {
+                Some((key.secret_arn.as_str(), key.role_arn.as_str()))
+            }
+            MediaLiveTransitEncryptionKeyConfiguration::Automatic(_) => None,
+        },
+    )
+}
+
+/// Whether the configuration `requested` asks for a different SOURCE TRANSIT DECRYPTION
+/// than the one `stored` carries.
+///
+/// "You can't change `sourceTransitDecryption` while the router input is connected to a
+/// flow output. To change it, first disconnect the router input, then update the decryption"
+/// (`smithy_query(query="shape",shape="MediaConnectFlowRouterInputConfiguration")`, and the
+/// same note on `MediaLiveChannelRouterInputConfiguration`), so an operation that replaces a
+/// configuration asks HERE whether it would change that member. Two configurations of
+/// different kinds carry no one decryption to compare, and the three that ingest on a
+/// network interface carry none at all, so neither is a change of one.
+pub fn router_input_source_transit_decryption_differs(
+    stored: &RouterInputConfiguration,
+    requested: &RouterInputConfiguration,
+) -> bool {
+    match (stored, requested) {
+        (
+            RouterInputConfiguration::MediaConnectFlow(stored),
+            RouterInputConfiguration::MediaConnectFlow(requested),
+        ) => {
+            flow_transit_decryption_identity(&stored.source_transit_decryption)
+                != flow_transit_decryption_identity(&requested.source_transit_decryption)
+        }
+        (
+            RouterInputConfiguration::MediaLiveChannel(stored),
+            RouterInputConfiguration::MediaLiveChannel(requested),
+        ) => {
+            media_live_transit_decryption_identity(&stored.source_transit_decryption)
+                != media_live_transit_decryption_identity(&requested.source_transit_decryption)
+        }
+        _ => false,
+    }
+}
+
 /// A router input, as the service holds it between calls. Every router input operation's
 /// response is computed from this record.
 ///
@@ -3690,6 +3834,19 @@ impl StoredRouterInput {
             status: settled.to_string(),
             due_at: now + TRANSITION_SPAN,
         });
+    }
+
+    /// The state this input is heading for: the one the clock already owes it, or the one it
+    /// is settled in when the clock owes none.
+    ///
+    /// What a call that puts the input through a TRANSIENT state of its own hands
+    /// [`Self::begin_transition`] as the settled state, so an input reconfigured while it was
+    /// still being created still reaches the state its creation owed it. The input-side
+    /// counterpart of [`StoredRouterOutput::settling_state`].
+    pub fn settling_state(&self) -> String {
+        self.pending
+            .as_ref()
+            .map_or_else(|| self.state.clone(), |pending| pending.status.clone())
     }
 
     /// Whether a state change is in flight for this input: the clock still owes it one, so

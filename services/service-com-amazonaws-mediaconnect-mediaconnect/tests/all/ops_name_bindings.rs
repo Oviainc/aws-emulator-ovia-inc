@@ -318,12 +318,25 @@ fn dispatch_table() -> Vec<(&'static str, &'static str, String, &'static str, Re
             },
         ),
         (
-            // Still a scaffold: it answers the 501 that names it, which is what proves a
-            // request on its own route reaches ITS handler and not a neighbour's.
+            // Implemented: it answers the modelled `NotFoundException` (404) for a router
+            // input ARN this store does not hold.
             "UpdateRouterInput",
             "PUT",
             format!("/v1/routerInput/{ROUTER_INPUT_ARN}"),
             "{}",
+            Reached::ModelledError {
+                status: 404,
+                code: "NotFoundException",
+            },
+        ),
+        (
+            // Still a scaffold: it answers the 501 that names it, which is what proves a
+            // request on its own route reaches ITS handler and not a neighbour's — here the
+            // implemented UpdateRouterInput one route segment away.
+            "StopRouterInput",
+            "POST",
+            format!("/v1/routerInput/stop/{ROUTER_INPUT_ARN}"),
+            "",
             Reached::ScaffoldedStub,
         ),
         (

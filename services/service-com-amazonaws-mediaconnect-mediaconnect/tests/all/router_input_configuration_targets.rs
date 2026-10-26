@@ -143,7 +143,11 @@ struct InputTargets {
 /// `crate::router_outputs::minted_flow_source` mints the flow a router OUTPUT delivers into
 /// (a flow SOURCE); a router INPUT takes its content from a flow OUTPUT, so the flow this
 /// mints carries one.
-async fn minted_flow_output(emulator: &Emulator, name: &str) -> (String, String) {
+///
+/// `pub(crate)` because the UpdateRouterInput suite repoints an input at a second flow output
+/// minted the same way (see `tests/all/update_router_input.rs`), so there is one helper rather
+/// than one per suite.
+pub(crate) async fn minted_flow_output(emulator: &Emulator, name: &str) -> (String, String) {
     let (status, code, created) = emulator
         .create_flow(json!({
             "name": name,

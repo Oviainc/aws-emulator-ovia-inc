@@ -145,6 +145,8 @@ mod update_flow_media_stream;
 mod update_flow_output;
 #[path = "all/update_flow_source.rs"]
 mod update_flow_source;
+#[path = "all/update_router_input.rs"]
+mod update_router_input;
 #[path = "all/update_router_network_interface.rs"]
 mod update_router_network_interface;
 #[path = "all/update_router_output.rs"]
