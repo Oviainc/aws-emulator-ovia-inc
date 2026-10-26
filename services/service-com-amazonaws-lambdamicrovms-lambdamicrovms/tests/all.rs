@@ -15,6 +15,8 @@
 mod image_request_validation;
 #[path = "all/managed_base_image_catalogue.rs"]
 mod managed_base_image_catalogue;
+#[path = "all/managed_base_image_versions.rs"]
+mod managed_base_image_versions;
 #[path = "all/microvm_image_and_instance_paths.rs"]
 mod microvm_image_and_instance_paths;
 #[path = "all/microvm_lifecycle.rs"]

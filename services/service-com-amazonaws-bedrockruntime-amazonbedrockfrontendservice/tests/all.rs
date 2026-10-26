@@ -21,5 +21,9 @@ mod bedrock_runtime_inference;
 mod bedrock_runtime_request_claim;
 #[path = "all/bedrock_runtime_streaming.rs"]
 mod bedrock_runtime_streaming;
+#[path = "all/guardrail_checks_inline.rs"]
+mod guardrail_checks_inline;
+#[path = "all/resource_reference_refusals.rs"]
+mod resource_reference_refusals;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

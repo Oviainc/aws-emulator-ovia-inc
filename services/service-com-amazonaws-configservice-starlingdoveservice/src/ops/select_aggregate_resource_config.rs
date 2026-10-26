@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SelectAggregateResourceConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SelectAggregateResourceConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SelectAggregateResourceConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Runs a Config query over the resources ONE configuration aggregator aggregates, and
+//! answers the properties that query selected.
+//!
+//! What this handler enforces, and where each rule comes from:
+//!
+//! * the aggregator the request names has to be one this account holds; one it does not
+//!   is refused with the modelled `NoSuchConfigurationAggregatorException`, never
+//!   answered with an empty result set — a client has to be able to tell a bad
+//!   aggregator name from a query that matched nothing;
+//! * the `Expression` is READ as the SQL `SELECT` command the Config query language is
+//!   ([`crate::state::read_expression`], the same reading `SelectResourceConfig`
+//!   applies, which parses it with `sqlparser`); an expression that is not one is
+//!   refused with the modelled `InvalidExpressionException` ("The syntax of the query is
+//!   incorrect");
+//! * the query runs over the CURRENT configuration item of each resource the aggregator
+//!   takes in ([`crate::state::aggregated_configuration_item_documents`]), so the
+//!   properties it selects and filters on are the members of `ConfigurationItem`;
+//! * `MaxResults` is the page size, with `Limit` accepted for it as well ("Config also
+//!   allows the Limit request parameter"); a request that asks for neither gets the page
+//!   size this operation documents for the query it ran, and a value outside the
+//!   modelled range is `InvalidLimitException`;
+//! * `NextToken` resumes the page after the results already answered, and a token
+//!   outside the opaque form this operation issues is `InvalidNextTokenException`.
 //!
 //! ## Shape of an operation
 //!
@@ -93,6 +108,19 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// How many results one page carries when the request asks for no page size and the
+/// query AGGREGATES (`SelectAggregateResourceConfig`: "If you run an aggregation query
+/// (i.e., using GROUP BY or using aggregate functions such as COUNT; …) and do not
+/// specify the MaxResults or the Limit query parameters, the default page size is set to
+/// 500").
+const AGGREGATION_PAGE_SIZE: usize = 500;
+
+/// How many results one page carries when the request asks for no page size and the
+/// query does NOT aggregate (same doc: "If you run a non-aggregation query … and do not
+/// specify the MaxResults or the Limit query parameters, the default page size is set to
+/// 25").
+const NON_AGGREGATION_PAGE_SIZE: usize = 25;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -164,18 +192,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SelectAggregateResourceConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SelectAggregateResourceConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SelectAggregateResourceConfig"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // This store stands for ONE account in ONE Region, so the Config data an
+        // aggregator over it can take in is this account's, in the Region the request is
+        // signed for.
+        let account_id = ::emulator_server::emulator_account_id();
+        let region = crate::state::request_region(ctx);
+        let store = state.lock();
+
+        // The query is run BY an aggregator, so one this account does not hold is the
+        // first thing refused: there is nothing for the query to search, and an empty
+        // result set would claim the aggregator holds no matching resource.
+        let Some(aggregator) = store
+            .configuration_aggregators
+            .get(&input.configuration_aggregator_name)
+        else {
+            return Err(
+                SelectAggregateResourceConfigErrorModeled::NoSuchConfigurationAggregatorException(
+                    NoSuchConfigurationAggregatorException {
+                        message: Some(
+                            crate::state::NO_SUCH_CONFIGURATION_AGGREGATOR_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "The maximum number of query results returned on each page", which this
+        // operation takes under either of two members — `MaxResults`, and `Limit`, which
+        // it "also allows" for the same thing. Both are judged by the one rule both
+        // select operations apply (`crate::state::requested_page_size`), so a value
+        // outside the modelled range answers this operation's own modelled
+        // `InvalidLimitException`; a value of 0 is the modelled default — "unspecified" —
+        // so the page size falls to the one this operation documents for the query that
+        // ran, and `MaxResults` is the member that decides it where both are asked for.
+        let mut asked_for = None;
+        for (member, requested) in [("limit", input.limit), ("maxResults", input.max_results)] {
+            let size = crate::state::requested_page_size(member, requested).map_err(|message| {
+                SelectAggregateResourceConfigErrorModeled::InvalidLimitException(
+                    InvalidLimitException {
+                        message: Some(message),
+                    },
+                )
+            })?;
+            asked_for = size.or(asked_for);
+        }
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let Some(resume_at) = crate::state::select_resume_at(input.next_token.as_deref()) else {
+            return Err(
+                SelectAggregateResourceConfigErrorModeled::InvalidNextTokenException(
+                    InvalidNextTokenException {
+                        message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // An expression that is not a Config query is refused BEFORE anything is read
+        // out of the store: a malformed query is a different answer from a query that
+        // matched nothing, and a client has to be able to tell the two apart. The
+        // refusal carries its own message ([`crate::state::ExpressionRefusal`]) because
+        // this one error code stands for every rule of the query language.
+        let query = crate::state::read_expression(&input.expression).map_err(|refusal| {
+            SelectAggregateResourceConfigErrorModeled::InvalidExpressionException(
+                InvalidExpressionException {
+                    message: Some(refusal.message()),
+                },
+            )
+        })?;
+
+        // A request that asked for no page size gets the one this operation documents
+        // for the kind of query it ran, which is why it is settled only once the
+        // expression has been read.
+        let page_size = asked_for.unwrap_or(if query.aggregates() {
+            AGGREGATION_PAGE_SIZE
+        } else {
+            NON_AGGREGATION_PAGE_SIZE
+        });
+
+        let documents = crate::state::aggregated_configuration_item_documents(
+            &store,
+            aggregator,
+            account_id,
+            &region,
+        );
+        let results = query.run(&documents);
+        let (page, next_token) =
+            crate::state::select_results_page(&results, resume_at, page_size);
+
+        Ok(SelectAggregateResourceConfigOutput {
+            results: Some(page),
+            // "Details about the query": the fields this query selected, in the order it
+            // selected them.
+            query_info: Some(crate::state::select_query_info(&query)),
+            next_token,
+        })
     }
 }

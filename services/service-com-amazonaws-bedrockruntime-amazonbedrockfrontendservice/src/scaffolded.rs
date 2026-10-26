@@ -177,6 +177,76 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The message member of the `AccessDeniedException` an ARN-ownership refusal
+/// renders.
+///
+/// Its wire name is `Message`, not the `message` this service's own
+/// `AccessDeniedException` declares: the refusal is answered by the layer that
+/// reads a resource ARN before the operation is reached, and the response that
+/// layer renders carries the capitalised key. A client reading the text of such a
+/// refusal reads it under THAT key, so the casing is part of the contract.
+static ARN_ACCESS_DENIED_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#AccessDeniedException$Message",
+        "smithy.framework",
+        "Message",
+    ),
+    ShapeType::String,
+    "Message",
+    0,
+)
+.with_json_name("Message")
+.with_xml_name("Message");
+
+/// Schema for the `AccessDeniedException` an ARN-ownership refusal renders.
+///
+/// In the `smithy.framework` namespace for the same reason as the two above: the
+/// shape differs from the modelled `AccessDeniedException` in the one thing a
+/// model cannot express here — the wire name of its message member — so it must
+/// not collide with the modelled one. The wire error code is still
+/// `AccessDeniedException` ([`OperationError::shape_name`] below), which is what a
+/// client branches on.
+pub static ARN_ACCESS_DENIED_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#AccessDeniedException",
+        "smithy.framework",
+        "AccessDeniedException",
+    ),
+    ShapeType::Structure,
+    &[&ARN_ACCESS_DENIED_MESSAGE],
+);
+
+/// The payload of an `AccessDeniedException`: why the caller may not reach the
+/// resource it named.
+#[derive(Debug, Clone)]
+pub struct AccessDeniedException {
+    pub message: String,
+}
+
+impl AccessDeniedException {
+    /// An `AccessDeniedException` carrying `message`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for AccessDeniedException {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AccessDeniedException: {}", self.message)
+    }
+}
+
+impl std::error::Error for AccessDeniedException {}
+
+impl SerializableStruct for AccessDeniedException {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&ARN_ACCESS_DENIED_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -196,12 +266,25 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
+    /// The caller named a resource ARN it may not reach. Renders as HTTP 403 with
+    /// the error code `AccessDeniedException` and the message under the key
+    /// `Message`, which is how the layer that reads a resource ARN before the
+    /// operation answers such a refusal. The operation's own modelled
+    /// `AccessDeniedException` carries the same code and status but spells its
+    /// member `message`, so it cannot render this body.
+    ArnAccessDenied(AccessDeniedException),
 }
 
 impl<E> Scaffolded<E> {
     /// The scaffold signal for `operation`.
     pub fn not_implemented(operation: &str) -> Self {
         Self::NotImplemented(NotImplemented::new(operation))
+    }
+
+    /// Refuse the request because the resource ARN it names is not the caller's,
+    /// with HTTP 403 `AccessDeniedException`.
+    pub fn arn_access_denied(message: impl Into<String>) -> Self {
+        Self::ArnAccessDenied(AccessDeniedException::new(message))
     }
 
     /// Refuse the request as invalid, with HTTP 400 `ValidationException`.
@@ -229,6 +312,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
+            Self::ArnAccessDenied(e) => write!(f, "{e}"),
         }
     }
 }
@@ -241,6 +325,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
+            Self::ArnAccessDenied(e) => e.source(),
         }
     }
 }
@@ -255,6 +340,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
+            Self::ArnAccessDenied(e) => e,
         }
     }
 
@@ -263,6 +349,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
+            Self::ArnAccessDenied(_) => &ARN_ACCESS_DENIED_SCHEMA,
         }
     }
 
@@ -275,6 +362,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
+            Self::ArnAccessDenied(_) => "AccessDeniedException",
         }
     }
 
@@ -287,6 +375,10 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
+            // The status the model gives `AccessDeniedException`
+            // (`smithy_query(query="shape",shape="AccessDeniedException")`:
+            // errorKind client, httpError 403).
+            Self::ArnAccessDenied(_) => 403,
         }
     }
 
@@ -299,6 +391,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
+            Self::ArnAccessDenied(_) => None,
         }
     }
 }

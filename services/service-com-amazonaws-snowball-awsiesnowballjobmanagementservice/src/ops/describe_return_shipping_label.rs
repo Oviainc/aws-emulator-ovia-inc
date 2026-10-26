@@ -4,8 +4,9 @@
 //!
 //! Reports the current return shipping label of a job this service persisted: the status
 //! of the task that creates it and, once that task has finished, the label's download URI
-//! and the instant it expires. The job must carry a device that can still be returned, and
-//! a job no label has been created for has none to report.
+//! and the instant it expires. The job must carry a device of its own, and a job no label
+//! has been created for has none to report — because its state does not allow one to exist
+//! yet, or because nothing has created one.
 //!
 //! ## Shape of an operation
 //!
@@ -197,26 +198,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The same window `CreateReturnShippingLabel` creates a label in: a job whose
-        // device will never ship, or whose device is already back at Amazon Web Services,
-        // has no return shipment to report on.
-        if !job.job_state.has_returnable_device() {
-            return Err(
-                DescribeReturnShippingLabelErrorModeled::InvalidJobStateException(
-                    InvalidJobStateException {
-                        message: Some(format!(
-                            "The job {} is in state {} and has no device to return, so it has no \
-                             return shipping label.",
-                            input.job_id,
-                            job.job_state.as_wire()
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-
+        // What this operation reports is the label record the creating call persisted, so a
+        // job that HAS one is reported its own label whatever its device has done since:
+        // receiving the device back does not unmake the label that was created for it.
         let Some(label) = store.return_shipping_label(&input.job_id) else {
+            // A job with no label record has none to report, and which refusal says so
+            // depends on whether a label could exist for it at all: outside the window
+            // `CreateReturnShippingLabel` creates one in
+            // ([`crate::state::JobState::has_returnable_device`]) — the device has not been
+            // handed to the customer yet, or is already back at Amazon Web Services — the
+            // job's state is what doesn't allow the action; inside it, the label is simply a
+            // resource nothing has created yet.
+            if !job.job_state.has_returnable_device() {
+                return Err(
+                    DescribeReturnShippingLabelErrorModeled::InvalidJobStateException(
+                        InvalidJobStateException {
+                            message: Some(
+                                "The action can't be performed because the job's current state \
+                                 doesn't allow that action to be performed."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
             return Err(
                 DescribeReturnShippingLabelErrorModeled::InvalidResourceException(
                     InvalidResourceException {

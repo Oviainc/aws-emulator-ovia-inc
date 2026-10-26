@@ -45,9 +45,8 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use super::ComAmazonawsConfigserviceStarlingdoveserviceState;
-use crate::ops::types::ConfigurationItem;
-
+use super::{ComAmazonawsConfigserviceStarlingdoveserviceState, ConfigurationAggregatorEntry};
+use crate::ops::types::{ConfigurationItem, FieldInfo, QueryInfo};
 /// The deepest BRACKETING one `Expression` may carry, counted before the parser is
 /// entered.
 ///
@@ -219,7 +218,7 @@ impl SelectQuery {
 
     /// Whether this query aggregates: one that does answers one row per group rather
     /// than one row per matched configuration item.
-    fn aggregates(&self) -> bool {
+    pub fn aggregates(&self) -> bool {
         !self.group_by.is_empty()
             || self
                 .fields
@@ -1418,12 +1417,136 @@ pub fn resource_configuration_item_documents(
         .discovered_resources
         .values()
         .filter(|entry| entry.deleted_at.is_none())
-        .map(|entry| {
-            let item = entry.to_configuration_item(
-                aws_region,
-                store.recording_frequency_of(&entry.resource_type),
-            );
-            configuration_item_document(&item)
-        })
+        .map(|entry| recorded_resource_document(store, entry, aws_region))
         .collect()
+}
+
+/// The document a query runs over for ONE recorded resource: its CURRENT configuration
+/// item, at the recording frequency the recording recorder records that resource type at.
+///
+/// The ONE mapping both readers below use, so the single-account and the aggregate query
+/// paths cannot drift on what a document contains.
+fn recorded_resource_document(
+    store: &ComAmazonawsConfigserviceStarlingdoveserviceState,
+    entry: &super::DiscoveredResourceEntry,
+    aws_region: &str,
+) -> Value {
+    let item = entry.to_configuration_item(
+        aws_region,
+        store.recording_frequency_of(&entry.resource_type),
+    );
+    configuration_item_document(&item)
+}
+
+/// Every configuration item an AGGREGATE query of `aggregator` searches: the CURRENT
+/// configuration item of each resource that aggregator takes in, as the document a
+/// query runs over.
+///
+/// An aggregator answers only for the Config data it aggregates, so what it takes in is
+/// decided by the same two questions the single-resource aggregate read asks — is the
+/// source account and Region one of the aggregator's sources, and is the resource type
+/// one it takes in ([`super::ConfigurationAggregatorEntry::aggregates_source`] and
+/// `aggregates_resource_type`). This store stands for ONE account in ONE Region, so the
+/// only source it can answer for is `account_id` in `aws_region`: an aggregator over
+/// any other source aggregates data this store does not hold and its queries match
+/// nothing.
+pub fn aggregated_configuration_item_documents(
+    store: &ComAmazonawsConfigserviceStarlingdoveserviceState,
+    aggregator: &ConfigurationAggregatorEntry,
+    account_id: &str,
+    aws_region: &str,
+) -> Vec<Value> {
+    // Whether this store's own source is one the aggregator takes in is one question
+    // for the whole query, so it is asked once rather than per resource.
+    if !aggregator.aggregates_source(account_id, aws_region) {
+        return Vec::new();
+    }
+    store
+        .discovered_resources
+        .values()
+        .filter(|entry| entry.deleted_at.is_none())
+        .filter(|entry| aggregator.aggregates_resource_type(&entry.resource_type))
+        .map(|entry| recorded_resource_document(store, entry, aws_region))
+        .collect()
+}
+
+/// How a select operation words `InvalidLimitException` ("The specified limit is outside
+/// the allowable range") for the page size `requested` under the member `member`.
+///
+/// BUILT FROM THE REQUEST — it quotes the value sent, names the member that carried it
+/// and states the bound it missed — and written once, so the two select operations cannot
+/// word the same refusal differently.
+pub fn invalid_limit_message(member: &str, requested: i32) -> String {
+    format!(
+        "Value '{requested}' at '{member}' failed to satisfy constraint: Member must be \
+         between 0 and {SELECT_RESULTS_PAGE_SIZE}"
+    )
+}
+
+/// The page size `requested` asks for, as the one rule both select operations apply:
+/// `Some(size)` for a value inside the modelled range, `None` for the modelled default of
+/// 0 — "unspecified", which leaves the page size to the operation's own documented
+/// default — and `Err` carrying the message of the refusal for a value outside the range.
+///
+/// The modelled range (0..100) is refused at the request boundary where the boundary
+/// enforces it; this check stands so a value that reaches a handler answers that
+/// handler's own modelled `InvalidLimitException` either way.
+pub fn requested_page_size(member: &str, requested: i32) -> Result<Option<usize>, String> {
+    match usize::try_from(requested) {
+        Ok(0) => Ok(None),
+        Ok(size) if size <= SELECT_RESULTS_PAGE_SIZE => Ok(Some(size)),
+        _ => Err(invalid_limit_message(member, requested)),
+    }
+}
+
+/// Where in a query's results the page `next_token` names begins: 0 when the request
+/// carries no token, and `None` for a token outside the opaque form a select operation
+/// issues — which is the modelled `InvalidNextTokenException`.
+///
+/// The token is opaque to its holder: it names how many results of this query were
+/// already answered, which is what makes the next page the rows after them.
+pub fn select_resume_at(next_token: Option<&str>) -> Option<usize> {
+    match next_token {
+        None => Some(0),
+        Some(token) => {
+            super::decode_page_token(token).and_then(|resume_at| resume_at.parse::<usize>().ok())
+        }
+    }
+}
+
+/// The page of `results` that begins at `resume_at` and carries at most `page_size`
+/// rows, and the token that names the page after it (`None` once the whole result set has
+/// been answered).
+///
+/// Each result is one JSON document of the properties the query selected, which is what
+/// `Results` carries on the wire.
+pub fn select_results_page(
+    results: &[Value],
+    resume_at: usize,
+    page_size: usize,
+) -> (Vec<String>, Option<String>) {
+    let page: Vec<String> = results
+        .iter()
+        .skip(resume_at)
+        .take(page_size)
+        .map(Value::to_string)
+        .collect();
+    let answered = resume_at.saturating_add(page.len());
+    let next_token =
+        (answered < results.len()).then(|| super::encode_page_token(&answered.to_string()));
+    (page, next_token)
+}
+
+/// The `QueryInfo` a select answers for `query`: the fields it selected, in the order it
+/// selected them (`QueryInfo$SelectFields`, "Returns a `FieldInfo` object" per field).
+pub fn select_query_info(query: &SelectQuery) -> QueryInfo {
+    QueryInfo {
+        select_fields: Some(
+            query
+                .field_names()
+                .into_iter()
+                .map(|name| FieldInfo { name: Some(name) })
+                .collect(),
+        ),
+    }
 }

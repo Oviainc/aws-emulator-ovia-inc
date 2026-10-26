@@ -97,6 +97,8 @@ mod role_permissions_boundary;
 mod role_policy_listing;
 #[path = "all/role_policy_removal.rs"]
 mod role_policy_removal;
+#[path = "all/role_settings.rs"]
+mod role_settings;
 #[path = "all/role_tag_removal.rs"]
 mod role_tag_removal;
 #[path = "all/role_tags.rs"]

@@ -193,12 +193,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The lookup goes through the ONE resolver every operation that names a DB
         // subnet group uses, so a group one operation reports as existing is never
         // reported absent by another.
+        //
+        // The WORDING is the one RDS answers where the group is the subject of the call
+        // and the call changes it, which is not the wording it answers where a call only
+        // looks a group up — so the message comes from the mutating-path helper rather
+        // than from the lookup one the report and the placement paths share.
         let key = (region.clone(), name.clone());
         if store.resolve_db_subnet_group(&region, &name).is_none() {
             return Err(
                 DeleteDBSubnetGroupErrorModeled::DBSubnetGroupNotFoundFault(
                     DBSubnetGroupNotFoundFault {
-                        message: Some(crate::state::db_subnet_group_not_found_message(&name)),
+                        message: Some(crate::state::db_subnet_group_does_not_exist_message(&name)),
                     },
                 )
                 .into(),

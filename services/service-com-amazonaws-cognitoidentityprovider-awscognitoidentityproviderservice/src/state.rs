@@ -106,6 +106,39 @@ pub const REFRESH_TOKEN_AUTH_FLOWS: [&str; 1] = ["ALLOW_REFRESH_TOKEN_AUTH"];
 /// (`CreateUserPoolClient.ExplicitAuthFlows` in this service's model).
 pub const USER_AUTH_FLOWS: [&str; 1] = ["ALLOW_USER_AUTH"];
 
+/// The `ExplicitAuthFlows` value that configures an app client for
+/// machine-to-machine authorization: "you must configure the app client with a
+/// client secret and enable the `ALLOW_CLIENT_TOKEN_AUTH` authentication flow"
+/// (`GetClientToken` in this service's model).
+pub const CLIENT_TOKEN_AUTH_FLOW: &str = "ALLOW_CLIENT_TOKEN_AUTH";
+
+/// The message an app-client configuration owes when its `ExplicitAuthFlows`
+/// breaks the exclusivity rule [`CLIENT_TOKEN_AUTH_FLOW`] carries: the rule as
+/// `GetClientToken` states it in this service's model, word for word. It names no
+/// value from the request, so every such refusal carries this one sentence.
+pub const EXCLUSIVE_AUTH_FLOW_MESSAGE: &str =
+    "The ALLOW_CLIENT_TOKEN_AUTH flow is mutually exclusive with user authentication \
+     flows. It must be the only authentication flow that you configure for the app \
+     client.";
+
+/// [`EXCLUSIVE_AUTH_FLOW_MESSAGE`] when `flows` breaks that rule, and `None` when
+/// it configures an app client the service accepts.
+///
+/// "The `ALLOW_CLIENT_TOKEN_AUTH` flow is mutually exclusive with user
+/// authentication flows. It must be the only authentication flow that you
+/// configure for the app client" (`GetClientToken` in this service's model). So a
+/// list naming it beside ANOTHER flow describes an app client that cannot exist,
+/// while a list naming it alone — or not at all — is a configuration the service
+/// accepts. A list that merely repeats it names no other flow, so it is accepted:
+/// the rule is about which flows are configured, not how many times each is sent.
+/// Both the create and the update path ask this one function, so the two cannot
+/// disagree about what an app client may hold.
+pub fn exclusive_auth_flow_violation(flows: &[String]) -> Option<&'static str> {
+    let names_exclusive_flow = flows.iter().any(|flow| flow == CLIENT_TOKEN_AUTH_FLOW);
+    let names_another_flow = flows.iter().any(|flow| flow != CLIENT_TOKEN_AUTH_FLOW);
+    (names_exclusive_flow && names_another_flow).then_some(EXCLUSIVE_AUTH_FLOW_MESSAGE)
+}
+
 /// `UserPoolTierType` defaults to `ESSENTIALS` (`CreateUserPool.UserPoolTier`).
 const DEFAULT_USER_POOL_TIER: &str = "ESSENTIALS";
 
@@ -708,6 +741,17 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         let issued_at = unix_seconds(now);
         let origin_jti = new_uuid();
 
+        // Every expiry is derived from the app client's configured validity, which
+        // the request chose, so each sum is computed with CHECKED arithmetic and
+        // before anything is stored: a validity whose expiry cannot be represented
+        // mints no token at all, the same answer this function already gives for a
+        // token it could not sign, rather than panicking part-way through. The
+        // refresh token's own expiry is computed only where that token is minted.
+        let access_expires_at = now.checked_add(access_ttl)?;
+        let id_expires_at = now.checked_add(id_ttl)?;
+        let access_exp = expiry_claim(issued_at, access_ttl)?;
+        let id_exp = expiry_claim(issued_at, id_ttl)?;
+
         let mut access_claims = serde_json::json!({
             "sub": sub,
             "iss": issuer,
@@ -717,7 +761,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
             "scope": "aws.cognito.signin.user.admin",
             "auth_time": issued_at,
             "iat": issued_at,
-            "exp": issued_at + access_ttl.as_secs() as i64,
+            "exp": access_exp,
             "jti": new_uuid(),
             "origin_jti": origin_jti,
         });
@@ -729,7 +773,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
             "token_use": "id",
             "auth_time": issued_at,
             "iat": issued_at,
-            "exp": issued_at + id_ttl.as_secs() as i64,
+            "exp": id_exp,
             "jti": new_uuid(),
             "origin_jti": origin_jti,
         });
@@ -769,7 +813,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
                 "username": stored_username,
                 "token_use": "refresh",
                 "iat": issued_at,
-                "exp": issued_at + refresh_ttl.as_secs() as i64,
+                "exp": expiry_claim(issued_at, refresh_ttl)?,
                 "jti": new_uuid(),
                 "origin_jti": origin_jti,
             });
@@ -789,17 +833,24 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
 
         // A token's lifetime comes from the app client's stored validity
         // settings, which a caller sets, so every instant a token expires at is
-        // computed with the CHECKED addition BEFORE anything is stored: an
+        // the CHECKED sum computed above, before anything is stored: an
         // unrepresentable one answers no token at all rather than unwinding out
         // of this state mutation or leaving half a triple behind.
+        let refresh_expires_at = match refresh_token.as_ref() {
+            Some(_) => Some(now.checked_add(refresh_ttl)?),
+            None => None,
+        };
         let mut records = Vec::with_capacity(minted);
-        for (token, kind, ttl) in [
-            (Some(&access_token), TokenKind::Access, access_ttl),
-            (Some(&id_token), TokenKind::Id, id_ttl),
-            (refresh_token.as_ref(), TokenKind::Refresh, refresh_ttl),
+        for (token, kind, expires_at) in [
+            Some((&access_token, TokenKind::Access, access_expires_at)),
+            Some((&id_token, TokenKind::Id, id_expires_at)),
+            refresh_token
+                .as_ref()
+                .zip(refresh_expires_at)
+                .map(|(token, expires_at)| (token, TokenKind::Refresh, expires_at)),
         ]
         .into_iter()
-        .filter_map(|(token, kind, ttl)| token.map(|token| (token, kind, ttl)))
+        .flatten()
         {
             records.push((
                 token.clone(),
@@ -809,7 +860,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
                     username: stored_username.clone(),
                     kind,
                     issued_at: now,
-                    expires_at: now.checked_add(ttl)?,
+                    expires_at,
                     revoked: false,
                 },
             ));
@@ -2960,6 +3011,13 @@ impl TokenValidityUnit {
             Self::Days => 24 * 60 * 60,
         }
     }
+}
+
+/// The `exp` claim of a token issued `issued_at` seconds after the epoch and
+/// living for `ttl`, and `None` when that sum is not representable as the whole
+/// seconds a claim states: a token whose expiry cannot be stated is not issued.
+fn expiry_claim(issued_at: i64, ttl: Duration) -> Option<i64> {
+    issued_at.checked_add(i64::try_from(ttl.as_secs()).ok()?)
 }
 
 /// `validity` counted in `unit` (or `default_unit` when the client set none), or

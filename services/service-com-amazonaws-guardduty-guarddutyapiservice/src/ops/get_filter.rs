@@ -187,15 +187,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_else(|| crate::state::FILTER_ACTION_NOOP.to_string()),
             rank: filter.rank,
             finding_criteria: filter.finding_criteria.clone(),
-            // `TagMap` is `len 1..200` (`smithy_query(operation="GetFilter")`), so an
-            // untagged filter reports no map rather than an empty one.
-            tags: (!filter.tags.is_empty()).then(|| {
-                filter
-                    .tags
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect()
-            }),
+            // Projected through the ONE tag-map rule every read of this service
+            // shares ([`crate::state::reported_tags`]): the member is always
+            // reported, empty when nothing tagged the filter.
+            tags: crate::state::reported_tags(&filter.tags),
             created_at: Some(::aws_smithy_types::DateTime::from_millis(
                 filter.created_at_millis,
             )),

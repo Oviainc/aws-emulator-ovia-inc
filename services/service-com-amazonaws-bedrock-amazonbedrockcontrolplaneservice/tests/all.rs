@@ -21,6 +21,8 @@ mod automated_reasoning_policies;
 mod automated_reasoning_policy_build_workflows;
 #[path = "all/automated_reasoning_policy_test_cases.rs"]
 mod automated_reasoning_policy_test_cases;
+#[path = "all/automated_reasoning_policy_versions.rs"]
+mod automated_reasoning_policy_versions;
 #[path = "all/custom_model_deployments.rs"]
 mod custom_model_deployments;
 #[path = "all/custom_models.rs"]
