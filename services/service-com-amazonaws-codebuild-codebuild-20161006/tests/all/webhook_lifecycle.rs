@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Cover for `CreateWebhook` and `UpdateWebhook`, driven over the wire the router
-//! serves: `POST /` with `X-Amz-Target: CodeBuild_20161006.<Operation>` on awsJson1_1.
+//! Cover for `CreateWebhook`, `UpdateWebhook` and `DeleteWebhook`, driven over the wire
+//! the router serves: `POST /` with `X-Amz-Target: CodeBuild_20161006.<Operation>` on
+//! awsJson1_1.
 //!
 //! The rule under test is that a webhook is a record kept against a project whose
 //! source provider sends repository events: it is created once per project, computed
@@ -96,6 +97,11 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16
 }
 
 /// Create a project named `name` whose source is `source_type`, asserting it succeeded.
+///
+/// A webhook call CodeBuild carries out against the repository provider needs an access
+/// token for it, which is its own rule (see `tests/all/webhook_access_token.rs`), so a
+/// project whose source has such a provider is given one here — leaving every case below
+/// to be about the webhook rule it is written for.
 async fn create_project(router: &MultiServiceRouter, name: &str, source_type: &str) {
     let (status, body) = call(
         router,
@@ -116,6 +122,30 @@ async fn create_project(router: &MultiServiceRouter, name: &str, source_type: &s
     assert_eq!(
         status, 200,
         "CreateProject {name:?} ({source_type}): expected 200, got {status} with {body}"
+    );
+    import_source_credentials(router, source_type).await;
+}
+
+/// Hold an access token for `server_type` — one of the model's `ServerType` values, so
+/// nothing is imported for a source type that has no repository provider.
+async fn import_source_credentials(router: &MultiServiceRouter, server_type: &str) {
+    if !state::WEBHOOK_SOURCE_TYPES.contains(&server_type) {
+        return;
+    }
+    let (status, body) = call(
+        router,
+        "ImportSourceCredentials",
+        json!({
+            "serverType": server_type,
+            "authType": "PERSONAL_ACCESS_TOKEN",
+            "token": "an-access-token",
+            "shouldOverwrite": true,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "ImportSourceCredentials ({server_type}): expected 200, got {status} with {body}"
     );
 }
 
@@ -1065,5 +1095,178 @@ async fn an_update_touches_the_projects_last_modified() {
     assert!(
         stamps[1] > stamps[0],
         "two updates must not report the same lastModified, got {stamps:?}"
+    );
+}
+
+// --- DeleteWebhook ------------------------------------------------------------------
+
+/// Disconnecting a project removes the webhook record and nothing else: a later read
+/// reports no webhook, the project itself is untouched, and the project can be connected
+/// again. The table spans every source type that takes a webhook at all, each with its
+/// own configuration.
+#[tokio::test]
+async fn a_delete_removes_the_webhook_and_leaves_the_project() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(Arc::clone(&engine));
+
+    for (source_type, _) in SOURCE_TYPES.iter().filter(|(_, supported)| *supported) {
+        let case = format!("source type {source_type}");
+        let project = format!("dw-{}", source_type.to_ascii_lowercase());
+        let created =
+            create_project_with_webhook(&router, &project, source_type, full_configuration()).await;
+        assert!(
+            !created["payloadUrl"].as_str().unwrap_or_default().is_empty(),
+            "{case}: the created webhook must carry a payload URL, got {created}"
+        );
+
+        let (status, body) = call(&router, "DeleteWebhook", json!({"projectName": project})).await;
+        assert_eq!(
+            status, 200,
+            "{case}: expected 200 from DeleteWebhook, got {status} with {body}"
+        );
+
+        let read = read_project(&router, &project).await;
+        assert!(
+            read["webhook"].is_null(),
+            "{case}: a deleted webhook must not be reported, got {}",
+            read["webhook"]
+        );
+        assert_eq!(
+            read["name"].as_str(),
+            Some(project.as_str()),
+            "{case}: the project itself must survive the delete, got {read}"
+        );
+        assert!(
+            engine
+                .state::<CodeBuildState>()
+                .lock()
+                .projects
+                .get(&project)
+                .is_some_and(|stored| stored.project.webhook.is_none()),
+            "{case}: the store must hold the project with no webhook"
+        );
+
+        // A project with no webhook can be connected again: the delete left nothing of
+        // the first record behind to refuse the second creation.
+        let mut configuration = full_configuration();
+        configuration["projectName"] = json!(project);
+        let (status, body) = call(&router, "CreateWebhook", configuration).await;
+        assert_eq!(
+            status, 200,
+            "{case}: expected 200 re-creating the webhook, got {status} with {body}"
+        );
+        let again = body["webhook"].clone();
+        assert_eq!(
+            read_project(&router, &project).await["webhook"],
+            again,
+            "{case}: the read must report the re-created webhook, got {again}"
+        );
+    }
+}
+
+/// A delete refuses what it cannot remove — no project, or a project with no webhook —
+/// and changes nothing.
+#[tokio::test]
+async fn a_delete_refuses_what_it_cannot_remove() {
+    let router = emulator();
+
+    let (status, body) = call(
+        &router,
+        "DeleteWebhook",
+        json!({"projectName": "no-such-project"}),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "DeleteWebhook on an unknown project: expected 400, got {status} with {body}"
+    );
+    assert!(
+        error_type(&body).contains("ResourceNotFoundException"),
+        "DeleteWebhook on an unknown project: expected ResourceNotFoundException, got {body}"
+    );
+
+    create_project(&router, "dw-no-webhook", "GITHUB").await;
+    let (status, body) = call(
+        &router,
+        "DeleteWebhook",
+        json!({"projectName": "dw-no-webhook"}),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "DeleteWebhook on a project with no webhook: expected 400, got {status} with {body}"
+    );
+    assert!(
+        error_type(&body).contains("ResourceNotFoundException"),
+        "DeleteWebhook on a project with no webhook: expected ResourceNotFoundException, \
+         got {body}"
+    );
+
+    // And a second delete of a webhook that was already removed is the same refusal.
+    create_project_with_webhook(&router, "dw-twice", "GITHUB", full_configuration()).await;
+    for attempt in 1..=2 {
+        let (status, body) =
+            call(&router, "DeleteWebhook", json!({"projectName": "dw-twice"})).await;
+        let expected = if attempt == 1 { 200 } else { 400 };
+        assert_eq!(
+            status, expected,
+            "DeleteWebhook attempt {attempt}: expected {expected}, got {status} with {body}"
+        );
+    }
+}
+
+/// The webhook belongs to the project, so disconnecting one is a change to the project's
+/// settings — which is what `Project$lastModified` reports.
+#[tokio::test]
+async fn a_delete_touches_the_projects_last_modified() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(Arc::clone(&engine));
+    create_project_with_webhook(&router, "dw-stamped", "GITHUB", full_configuration()).await;
+
+    // Rewind the stored instants, so the assertion below is about the write and not
+    // about how fast the test runs.
+    let created_at = {
+        let state = engine.state::<CodeBuildState>();
+        let mut guard = state.lock();
+        let stored = guard
+            .projects
+            .get_mut("dw-stamped")
+            .expect("the project is persisted");
+        stored.created_millis -= 60_000;
+        stored.last_modified_millis -= 60_000;
+        stored.project.created = Some(state::datetime(stored.created_millis));
+        stored.project.last_modified = Some(state::datetime(stored.last_modified_millis));
+        stored.last_modified_millis
+    };
+
+    let (status, body) = call(
+        &router,
+        "DeleteWebhook",
+        json!({"projectName": "dw-stamped"}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "DeleteWebhook: expected 200, got {status} with {body}"
+    );
+
+    let state = engine.state::<CodeBuildState>();
+    let guard = state.lock();
+    let stored = guard
+        .projects
+        .get("dw-stamped")
+        .expect("the project is persisted");
+    assert!(
+        stored.last_modified_millis > created_at,
+        "DeleteWebhook: expected lastModified to move past {created_at}, got {}",
+        stored.last_modified_millis
+    );
+    assert_eq!(
+        stored
+            .project
+            .last_modified
+            .map(|at| at.to_millis().unwrap_or_default()),
+        Some(stored.last_modified_millis),
+        "DeleteWebhook: the reported lastModified must be the instant the store holds"
     );
 }

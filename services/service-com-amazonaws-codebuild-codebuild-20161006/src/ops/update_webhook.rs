@@ -15,6 +15,14 @@
 //! the status) identify the webhook that was created and are left exactly as they were,
 //! and the secret changes only when `rotateSecret` asks for it.
 //!
+//! ## What an update needs before it changes anything
+//!
+//! Rewriting a webhook is also a change CodeBuild carries out against the repository
+//! provider's hook, so it needs an access token for the project's source provider —
+//! see [`crate::state::webhook_access_token_violation`] for where a token comes from.
+//! With none, the call is refused and the stored record is left untouched, so a later
+//! read still reports the configuration the webhook already had.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -195,10 +203,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // READ PASS: the project's source type is what the requested build type is
-        // judged against, and a project with no webhook has no configuration to
-        // rewrite. The pass takes a copy of both and judges nothing while the lock is
-        // held; the write pass below re-asserts them under one critical section of its
-        // own.
+        // judged against, a project with no webhook has no configuration to rewrite, and
+        // whether CodeBuild holds an access token for that source's provider is read
+        // from the same store the imported credentials live in. The pass takes a copy of
+        // all three and judges nothing while the lock is held; the write pass below
+        // re-asserts the records it writes under one critical section of its own.
         let found = {
             let guard = state.lock();
             guard.projects.get(&input.project_name).map(|stored| {
@@ -210,10 +219,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .as_ref()
                         .map(|source| source.r#type.clone())
                         .unwrap_or_default(),
+                    crate::state::webhook_access_token_violation(
+                        stored.project.source.as_ref(),
+                        &guard.source_credentials,
+                    ),
                 )
             })
         };
-        let Some((has_webhook, source_type)) = found else {
+        let Some((has_webhook, source_type, missing_token)) = found else {
             return Err(refuse(
                 Self::NAME,
                 ctx,
@@ -241,6 +254,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::AuditOutcome::ValidationRefused,
                 &project_arn,
                 invalid_input(message),
+            ));
+        }
+
+        // An update rewrites the hook the repository provider holds as well as the
+        // record kept here — the input models no `manualCreation`, so every update is
+        // CodeBuild's to carry out upstream — and that needs an access token for the
+        // project's source provider. Without one the call is refused with nothing
+        // written, so a following read still reports the configuration the webhook was
+        // created with.
+        if let Some(message) = missing_token {
+            return Err(refuse(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                &project_arn,
+                access_token_not_found(message),
             ));
         }
 
@@ -396,6 +425,17 @@ fn webhook_not_found(project_arn: &str) -> UpdateWebhookError {
         message: Some(format!(
             "A webhook does not exist for CodeBuild project: {project_arn}"
         )),
+    })
+    .into()
+}
+
+/// CodeBuild holds no access token for the project's source provider, so the credential
+/// this call would authenticate the provider with does not exist: AWS models that as
+/// `ResourceNotFoundException`, with the wording
+/// [`crate::state::webhook_access_token_violation`] builds.
+fn access_token_not_found(message: String) -> UpdateWebhookError {
+    UpdateWebhookErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
     })
     .into()
 }

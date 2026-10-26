@@ -222,6 +222,27 @@ async fn the_fleet_capacity_refusal_is_one_fixed_sentence() {
 async fn the_webhook_build_type_refusal_is_worded_as_codebuild_words_it() {
     let router = emulator();
 
+    // Acting on the provider's half of a webhook needs an access token for it, which is
+    // its own refusal class (see `tests/all/webhook_access_token.rs`): hold one for every
+    // `ServerType` so each row below is decided by the build-type pairing under test.
+    for server_type in state::WEBHOOK_SOURCE_TYPES {
+        let (status, body) = call(
+            &router,
+            "ImportSourceCredentials",
+            json!({
+                "serverType": server_type,
+                "authType": "PERSONAL_ACCESS_TOKEN",
+                "token": "an-access-token",
+                "shouldOverwrite": true,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "ImportSourceCredentials ({server_type}): expected 200, got {status} with {body}"
+        );
+    }
+
     for source_type in SOURCE_TYPE_VALUES {
         let takes_repository_events = state::WEBHOOK_SOURCE_TYPES.contains(source_type);
         let expected = format!("Invalid build type provided for {source_type} type webhook");

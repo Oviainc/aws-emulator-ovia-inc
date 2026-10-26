@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteWebhook
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteWebhook`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Disconnects a build project from its repository's events by removing the webhook kept
+//! against that project in [`crate::state`]: this is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteWebhook::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What a delete removes, and what it needs first
+//!
+//! CodeBuild's half of a webhook is the record kept against the project, and that record
+//! is what is removed here — the project itself, and every other setting on it, is left
+//! alone, so a project can be connected again afterwards. Removing the repository
+//! provider's half is a call CodeBuild makes on the caller's behalf, so it needs an
+//! access token for that provider (see
+//! [`crate::state::webhook_access_token_violation`]). A webhook the caller registered
+//! itself — the manual creation AWS documents as "CodeBuild doesn't create a webhook in
+//! GitHub and instead returns payloadUrl and secret values" — has no provider-side hook
+//! of CodeBuild's making, so dropping the record needs no token.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +145,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteWebhook` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteWebhookErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteWebhook"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable through the router, which always builds the shared
+            // `InMemoryEngine`: this service models no server fault, and 501 is the
+            // only honest answer for "this emulator cannot serve the call at all".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteWebhook (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_millis();
+        let project_arn = crate::state::project_arn(&region, &input.project_name);
+
+        // ONE critical section: the precondition and the removal are about the same
+        // record, so a webhook removed while this request was resolving cannot be
+        // removed twice, and a refusal leaves the record untouched.
+        let mut guard = state.lock();
+        let Some(stored) = guard.projects.get(&input.project_name) else {
+            drop(guard);
+            return Err(refuse(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                &project_arn,
+                project_not_found(&project_arn),
+            ));
+        };
+        let Some(webhook) = stored.project.webhook.as_ref() else {
+            drop(guard);
+            return Err(refuse(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                &project_arn,
+                webhook_not_found(&project_arn),
+            ));
+        };
+
+        // A manually created webhook is the caller's own registration with the provider,
+        // so CodeBuild has nothing to remove there and needs no token for it; every
+        // other webhook is CodeBuild's to remove upstream.
+        let registered_by_codebuild = webhook.manual_creation != Some(true);
+        let missing_token = crate::state::webhook_access_token_violation(
+            stored.project.source.as_ref(),
+            &guard.source_credentials,
+        );
+        if let Some(message) = missing_token.filter(|_| registered_by_codebuild) {
+            drop(guard);
+            return Err(refuse(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                &project_arn,
+                access_token_not_found(message),
+            ));
+        }
+
+        // The same record, taken mutably now that the read of the credentials above has
+        // ended: the lock has been held throughout, so nothing could have changed it in
+        // between, and the `else` arm is unreachable.
+        let Some(stored) = guard.projects.get_mut(&input.project_name) else {
+            drop(guard);
+            return Err(refuse(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                &project_arn,
+                project_not_found(&project_arn),
+            ));
+        };
+        stored.project.webhook = None;
+
+        // The webhook is part of the project's settings, which is what
+        // `Project$lastModified` reports. The service clock is millisecond-resolution,
+        // so the stamp is the later of now and one millisecond past the stored stamp:
+        // strictly increasing per project, and never ahead of the clock.
+        let last_modified_millis = now.max(stored.last_modified_millis + 1);
+        stored.last_modified_millis = last_modified_millis;
+        stored.project.last_modified = Some(crate::state::datetime(last_modified_millis));
+        drop(guard);
+
+        // The project's settings changed, so the write leaves the same metadata-only
+        // record every other change to a project does — with the lock already released,
+        // so a log consumer never waits on this request's critical section.
+        crate::state::audit(
+            Self::NAME,
+            ctx.parts(),
+            crate::state::AuditOutcome::ProjectUpdated,
+            Some(&project_arn),
+        );
+
+        // The output models no members: the webhook is gone, and there is nothing left
+        // of it to report.
+        Ok(DeleteWebhookOutput {})
     }
+}
+
+/// Audit one refusal and hand it back, so a refused delete leaves the same record the
+/// successful one does. The lock is never held here: every caller has dropped it.
+fn refuse(
+    operation: &str,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    outcome: crate::state::AuditOutcome,
+    project_arn: &str,
+    error: DeleteWebhookError,
+) -> DeleteWebhookError {
+    crate::state::audit(operation, ctx.parts(), outcome, Some(project_arn));
+    error
+}
+
+/// No project of that name is held, so there is no webhook to remove. The wording is the
+/// one every operation of this service uses for a missing project.
+fn project_not_found(project_arn: &str) -> DeleteWebhookError {
+    DeleteWebhookErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("Project cannot be found: {project_arn}")),
+    })
+    .into()
+}
+
+/// The project is held but carries no webhook, so the resource this call names does not
+/// exist: AWS models that as `ResourceNotFoundException`, "the specified Amazon Web
+/// Services resource cannot be found".
+fn webhook_not_found(project_arn: &str) -> DeleteWebhookError {
+    DeleteWebhookErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "A webhook does not exist for CodeBuild project: {project_arn}"
+        )),
+    })
+    .into()
+}
+
+/// CodeBuild holds no access token for the project's source provider, so the credential
+/// this call would remove the provider's hook with does not exist: AWS models that as
+/// `ResourceNotFoundException`, with the wording
+/// [`crate::state::webhook_access_token_violation`] builds.
+fn access_token_not_found(message: String) -> DeleteWebhookError {
+    DeleteWebhookErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
 }

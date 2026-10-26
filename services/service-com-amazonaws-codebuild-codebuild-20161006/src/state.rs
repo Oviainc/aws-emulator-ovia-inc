@@ -2405,6 +2405,43 @@ pub fn webhook_build_type_violation(source_type: &str, build_type: Option<&str>)
         .then(|| format!("Invalid build type provided for {source_type} type webhook"))
 }
 
+/// Why CodeBuild cannot act on the repository provider's half of a webhook for a project
+/// whose primary source is `source`, as the message the modelled
+/// `ResourceNotFoundException` carries — or `None` when it can.
+///
+/// Registering, rewriting or removing a hook with the repository provider is a call
+/// CodeBuild makes on the caller's behalf, and it needs an access token for that
+/// provider to make it. A token reaches a project two ways: on the source itself
+/// (`ProjectSource$auth`, "the authorization settings for CodeBuild to access the source
+/// code to be built"), or imported for that provider's `ServerType` by
+/// `ImportSourceCredentials` — the same per-server-type record `ListSourceCredentials`
+/// reports. With neither, the provider's half of the webhook cannot be settled, so the
+/// resource CodeBuild would authenticate with does not exist and the call is refused
+/// before anything is written. A source whose provider sends no repository events at all
+/// ([`WEBHOOK_SOURCE_TYPES`] is exactly the model's `ServerType` set) authenticates
+/// nothing, so a runner webhook on a `NO_SOURCE` project needs no token.
+///
+/// The message is CodeBuild's own fixed clause; its one variable part is the project's
+/// stored source type, rendered the way a token's ARN renders it (see
+/// [`source_credential_arn`]). Recorded behaviour — the model states no message for the
+/// error.
+pub fn webhook_access_token_violation(
+    source: Option<&ProjectSource>,
+    imported: &BTreeMap<String, StoredSourceCredentials>,
+) -> Option<String> {
+    let source = source?;
+    if !WEBHOOK_SOURCE_TYPES.contains(&source.r#type.as_str()) {
+        return None;
+    }
+    let holds_token = source.auth.is_some() || imported.contains_key(&source.r#type);
+    (!holds_token).then(|| {
+        format!(
+            "Access token not found in CodeBuild project for server type {}",
+            source.r#type.to_ascii_lowercase()
+        )
+    })
+}
+
 /// `arn:aws:codebuild:<region>:<account>:build-batch/<id>`.
 ///
 /// `build-batch` is CodeBuild's own resource type for a batch build, which is

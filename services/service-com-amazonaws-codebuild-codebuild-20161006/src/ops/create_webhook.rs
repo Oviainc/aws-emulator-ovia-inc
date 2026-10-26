@@ -206,9 +206,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // READ PASS: the project's source type decides whether a webhook can exist at
-        // all, so it is read first and the request is judged against it. The write pass
-        // below re-asserts both under the same lock.
-        let source_type = {
+        // all, so it is read first and the request is judged against it, together with
+        // whether CodeBuild holds an access token for that source's provider. The write
+        // pass below re-asserts the records it writes under the same lock.
+        let (source_type, missing_token) = {
             let guard = state.lock();
             let Some(stored) = guard.projects.get(&input.project_name) else {
                 return Err(not_found(&project_arn));
@@ -216,15 +217,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if stored.project.webhook.is_some() {
                 return Err(already_exists(&project_arn));
             }
-            stored
-                .project
-                .source
-                .as_ref()
-                .map(|source| source.r#type.clone())
-                .unwrap_or_default()
+            (
+                stored
+                    .project
+                    .source
+                    .as_ref()
+                    .map(|source| source.r#type.clone())
+                    .unwrap_or_default(),
+                crate::state::webhook_access_token_violation(
+                    stored.project.source.as_ref(),
+                    &guard.source_credentials,
+                ),
+            )
         };
 
         check_source_supports_webhook(&source_type, &input, &project_arn)?;
+
+        // Creating the hook with the repository provider is CodeBuild's own call, and it
+        // needs an access token for that provider. The one creation that makes no such
+        // call is the manual one AWS documents on `manualCreation`: "CodeBuild doesn't
+        // create a webhook in GitHub and instead returns payloadUrl and secret values
+        // for the webhook", so there the caller registers the hook with its own
+        // credentials and CodeBuild needs none.
+        if let Some(message) = missing_token.filter(|_| input.manual_creation != Some(true)) {
+            return Err(access_token_not_found(message));
+        }
 
         // A webhook's secret is minted by the emulator's credential store, never built
         // here — and a Bitbucket webhook carries none, which AWS documents on
@@ -317,6 +334,17 @@ fn already_exists(project_arn: &str) -> CreateWebhookError {
         message: Some(format!(
             "A webhook already exists for CodeBuild project: {project_arn}"
         )),
+    })
+    .into()
+}
+
+/// CodeBuild holds no access token for the project's source provider, so the credential
+/// this call would register the provider's hook with does not exist: AWS models that as
+/// `ResourceNotFoundException`, with the wording
+/// [`crate::state::webhook_access_token_violation`] builds.
+fn access_token_not_found(message: String) -> CreateWebhookError {
+    CreateWebhookErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
     })
     .into()
 }
