@@ -3,7 +3,9 @@
 //! @op StartSigningJob
 //!
 //! Implemented: starts a signing job against a stored signing profile, snapshotting
-//! the profile's platform, version and signing material onto the job record.
+//! the profile's platform, version and signing material onto the job record. A profile
+//! whose platform is published for the payload (container-image) workflow rather than
+//! this S3 one is refused instead.
 //!
 //! ## Shape of an operation
 //!
@@ -273,6 +275,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     profile.profile_name, profile.status
                 ),
             ));
+        }
+
+        // This operation runs ONE of AWS Signer's two signing workflows — the S3
+        // source/destination one its documentation describes — and a signing
+        // platform is published for one workflow only
+        // ([`crate::state::SigningWorkflow`]): a profile on a platform published
+        // for the payload workflow is signed through `SignPayload` instead, so
+        // this call is refused for the platform rather than starting a job
+        // nothing in that workflow would ever run over S3. Judged after the
+        // profile's status, which refuses a profile that could start no job on
+        // any workflow, and before anything is written.
+        const WORKFLOW: crate::state::SigningWorkflow =
+            crate::state::SigningWorkflow::CodeSigningJob;
+        if !crate::state::platform_signs_through(&profile.platform_id, WORKFLOW) {
+            return Err(StartSigningJobErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::workflow_unsupported_message(
+                        WORKFLOW,
+                        &profile.platform_id,
+                    )),
+                    code: Some(crate::state::ERROR_CODE_VALIDATION.to_string()),
+                },
+            )
+            .into());
         }
 
         // What the job runs with is fixed now: a later `PutSigningProfile` on the

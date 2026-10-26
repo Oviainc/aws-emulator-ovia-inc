@@ -47,5 +47,8 @@ mod signing_platform_catalog;
 #[path = "all/signing_profile_lifecycle.rs"]
 mod signing_profile_lifecycle;
 
+#[path = "all/start_signing_job_platform_workflow.rs"]
+mod start_signing_job_platform_workflow;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

@@ -34,7 +34,7 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_signer_wallabyservice::ops::types::SIGNING_STATUS_VALUES;
 use service_com_amazonaws_signer_wallabyservice::state::{
-    JOB_COMPLETION_SPAN, SIGNING_PLATFORM_CATALOG,
+    SigningWorkflow, JOB_COMPLETION_SPAN, SIGNING_PLATFORM_CATALOG,
 };
 use service_com_amazonaws_signer_wallabyservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -275,12 +275,13 @@ fn revocation_cases() -> Vec<RevocationCase> {
             reason: "certificate material leaked".to_string(),
             job_owner: Some(ACCOUNT_ID),
         },
-        // A platform whose profile holds the certificate its signatures are
-        // issued under.
+        // A reason carrying the whole printable range a client can send, on a
+        // third published platform.
         RevocationCase {
-            name: "Revoked_Container_Signature",
-            platform_id: "Notation-OCI-SHA384-ECDSA",
-            reason: "image rebuilt".to_string(),
+            name: "Revoked_Verbose_Reason",
+            platform_id: "AWSLambda-SHA384-ECDSA",
+            reason: "key compromise: cert 'abc' (rotated), see case #7 — 50% re-signed"
+                .to_string(),
             job_owner: Some(ACCOUNT_ID),
         },
     ]
@@ -418,13 +419,19 @@ async fn revoking_records_the_revocation_and_every_read_reports_it() {
 /// publishes revocation support, and a platform published without it refuses the
 /// call with the modelled 400 and writes nothing.
 ///
-/// One row per PUBLISHED platform, with the expectation read off the service's own
-/// `GetSigningPlatform` answer rather than written out here.
+/// One row per published platform whose profiles this workflow signs, with the
+/// expectation read off the service's own `GetSigningPlatform` answer rather than
+/// written out here. A platform published for the container-image workflow has no
+/// row: `StartSigningJob` does not serve it (`SignPayload` does), so there is no
+/// job of one to revoke — see `start_signing_job_platform_workflow.rs`.
 #[tokio::test]
 async fn revocation_follows_the_platforms_published_revocation_support() {
     let router = emulator();
 
-    for entry in SIGNING_PLATFORM_CATALOG {
+    for entry in SIGNING_PLATFORM_CATALOG
+        .iter()
+        .filter(|entry| entry.workflow == SigningWorkflow::CodeSigningJob)
+    {
         let platform_id = entry.platform_id;
         let profile_name = format!("Platform_{}", platform_id.replace('-', "_"));
         let job_id = seed_job(&router, &profile_name, platform_id).await;

@@ -930,6 +930,38 @@ pub const PLATFORM_CATEGORY_AWS_IOT: &str = "AWSIoT";
 /// [`PLATFORM_CATEGORY_AWS_IOT`]).
 pub const PLATFORM_CATEGORY_AWS: &str = "AWS";
 
+/// Which of AWS Signer's two signing workflows a platform's profiles are signed
+/// through.
+///
+/// A signing platform belongs to exactly one of them, and the signing operation
+/// of the OTHER workflow is not available for its profiles. The model states the
+/// split per action: `AddProfilePermissionRequest$action` documents
+/// `signer:StartSigningJob` as "not supported for container image workflows" and,
+/// symmetrically, `signer:SignPayload` as "not supported for AWS Lambda
+/// workflows"; `StartSigningJob`'s own documentation describes the S3
+/// source/destination flow only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigningWorkflow {
+    /// The S3 code-signing-job workflow: the caller names an S3 source object and
+    /// a destination bucket and `StartSigningJob` signs the code into it.
+    CodeSigningJob,
+    /// The container-image (Notation/OCI) workflow: the caller hands over the
+    /// payload digest and `SignPayload` answers with the signature envelope, so
+    /// no object is read from or written to S3.
+    ContainerImage,
+}
+
+impl SigningWorkflow {
+    /// The operation that signs through this workflow — the name a refusal states
+    /// so a client knows which of the two it should have called.
+    pub fn signing_operation(self) -> &'static str {
+        match self {
+            Self::CodeSigningJob => "StartSigningJob",
+            Self::ContainerImage => "SignPayload",
+        }
+    }
+}
+
 /// One signing platform this emulator publishes.
 ///
 /// Every member is a fact about the PLATFORM — none of it comes from a request —
@@ -968,6 +1000,10 @@ pub struct SigningPlatformEntry {
     /// Whether a profile on this platform must name the ACM certificate its
     /// signatures are issued under (`signingMaterial`).
     pub requires_signing_material: bool,
+    /// Which signing workflow a profile on this platform is signed through, and
+    /// therefore which signing operation its profiles accept (see
+    /// [`SigningWorkflow`]).
+    pub workflow: SigningWorkflow,
 }
 
 impl SigningPlatformEntry {
@@ -1048,6 +1084,12 @@ fn default_value(values: &[&'static str]) -> String {
 /// created with no `signingMaterial`, while the container-image platform is
 /// refused ("signing material cannot be null.").
 ///
+/// [`SigningPlatformEntry::workflow`] is stated per entry for the same reason:
+/// the code-signing platforms are signed through the S3 signing-job workflow and
+/// the Notation container-image platform through the payload workflow, which is
+/// the split the model's own action documentation states (see
+/// [`SigningWorkflow`]).
+///
 /// The catalog is the WHOLE set of platforms a profile can be created on: an id
 /// outside it names no platform, so there is no entry to read a signing
 /// configuration, a display name or a signing-material rule off, and the create
@@ -1064,6 +1106,7 @@ pub const SIGNING_PLATFORM_CATALOG: &[SigningPlatformEntry] = &[
         max_size_in_mb: 2048,
         revocation_supported: true,
         requires_signing_material: false,
+        workflow: SigningWorkflow::CodeSigningJob,
     },
     SigningPlatformEntry {
         platform_id: "AWSLambda-SHA384-ECDSA",
@@ -1076,6 +1119,7 @@ pub const SIGNING_PLATFORM_CATALOG: &[SigningPlatformEntry] = &[
         max_size_in_mb: 250,
         revocation_supported: true,
         requires_signing_material: false,
+        workflow: SigningWorkflow::CodeSigningJob,
     },
     SigningPlatformEntry {
         platform_id: "AmazonFreeRTOS-Default",
@@ -1088,6 +1132,7 @@ pub const SIGNING_PLATFORM_CATALOG: &[SigningPlatformEntry] = &[
         max_size_in_mb: 16,
         revocation_supported: false,
         requires_signing_material: false,
+        workflow: SigningWorkflow::CodeSigningJob,
     },
     SigningPlatformEntry {
         platform_id: "AmazonFreeRTOS-TI-CC3220SF",
@@ -1100,6 +1145,7 @@ pub const SIGNING_PLATFORM_CATALOG: &[SigningPlatformEntry] = &[
         max_size_in_mb: 16,
         revocation_supported: false,
         requires_signing_material: false,
+        workflow: SigningWorkflow::CodeSigningJob,
     },
     SigningPlatformEntry {
         platform_id: "Notation-OCI-SHA384-ECDSA",
@@ -1112,6 +1158,7 @@ pub const SIGNING_PLATFORM_CATALOG: &[SigningPlatformEntry] = &[
         max_size_in_mb: 16,
         revocation_supported: true,
         requires_signing_material: true,
+        workflow: SigningWorkflow::ContainerImage,
     },
 ];
 
@@ -1232,6 +1279,28 @@ pub fn platform_supports_revocation(platform_id: &str) -> bool {
 /// not supporting revocation.
 pub fn revocation_unsupported_message(platform_id: &str) -> String {
     format!("Revocation is not supported for platform {platform_id}")
+}
+
+/// Whether a profile on `platform_id` is signed through `workflow` — the
+/// published [`SigningPlatformEntry::workflow`], which is what decides whether
+/// that workflow's signing operation is available for the platform's profiles at
+/// all.
+///
+/// A platform this emulator publishes NO entry for states nothing either way, so
+/// it is not held to be outside the workflow: only a platform published for the
+/// other one is (the same convention as [`platform_supports_revocation`]).
+pub fn platform_signs_through(platform_id: &str, workflow: SigningWorkflow) -> bool {
+    signing_platform(platform_id).is_none_or(|entry| entry.workflow == workflow)
+}
+
+/// The refusal prose for a signing call on a profile whose platform is published
+/// for the other workflow: the operation that is not available for it, and the
+/// platform that does not sign through it.
+pub fn workflow_unsupported_message(workflow: SigningWorkflow, platform_id: &str) -> String {
+    format!(
+        "{} is not supported for platform {platform_id}",
+        workflow.signing_operation()
+    )
 }
 
 /// True when `value` satisfies `ProfileName`'s `@length(2, 64)` and
