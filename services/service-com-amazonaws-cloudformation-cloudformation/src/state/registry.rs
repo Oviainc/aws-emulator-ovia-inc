@@ -22,9 +22,12 @@
 //! The second is this account's own registry WRITERS — `RegisterType` and `ActivateType`
 //! (which add an extension version), `SetTypeConfiguration` (`ConfigurationSchema`),
 //! `SetTypeDefaultVersion` (`DefaultVersionId`), `DeprecateType`/`DeregisterType`
-//! (`DeprecatedStatus`), `TestType` (`TypeTestsStatus`) and `PublishType` (which publishes
-//! one version of a private record as the PUBLIC extension record [`published_record`] is).
-//! `TestType` and `PublishType` are implemented; the others are still scaffold stubs with
+//! (`DeprecatedStatus`), `DeactivateType` (which deactivates an activation, see
+//! [`StoredExtension::deactivate`]), `TestType` (`TypeTestsStatus`) and `PublishType` (which
+//! publishes one version of a private record as the PUBLIC extension record
+//! [`published_record`] is).
+//! `TestType`, `PublishType` and `DeactivateType` are implemented; the others are still
+//! scaffold stubs with
 //! their own issues, so the only record `src/` adds to this registry is a publication's
 //! public one. A publication adds at most one RECORD per private record it publishes, and
 //! the versions it then adds to that record are bounded at [`MAX_PUBLISHED_VERSIONS`],
@@ -492,6 +495,41 @@ impl StoredExtension {
     /// withheld from them.
     pub fn is_public_third_party(&self) -> bool {
         !self.is_private() && self.publisher_id.is_some()
+    }
+
+    /// Whether this record is a public third-party extension that is ACTIVATED in this
+    /// account and Region right now — `IsActivated`, "whether the extension is activated in
+    /// the account and Region".
+    ///
+    /// That is the one kind of record `DeactivateType` ("deactivates a public third-party
+    /// extension ... when you no longer use it") can name: a private registration, an
+    /// extension Amazon Web Services published (those carry no publisher id and nobody
+    /// activated them) and an activation already deactivated are all outside it.
+    pub fn is_activated_third_party(&self) -> bool {
+        self.is_public_third_party() && self.is_activated == Some(true)
+    }
+
+    /// Deactivate this activation: what `DeactivateType` leaves behind.
+    ///
+    /// "Deactivating an extension deletes the configuration details that are associated with
+    /// it", so the configuration data this account held for the extension goes; `IsActivated`
+    /// becomes false, since the extension is no longer activated in this account and Region;
+    /// "deactivated extensions aren't automatically updated if a new version of the extension
+    /// is released", so `AutoUpdate` is false; and "once deactivated, an extension can't be
+    /// used in any CloudFormation operation", which is what `DEPRECATED` states of every
+    /// version of it ("the extension has been deactivated or deregistered and can no longer
+    /// be used in CloudFormation operations").
+    ///
+    /// The record itself stays in the registry, deprecated rather than dropped — that is what
+    /// a deprecation status meaning "has been deactivated" is for — so a later read still
+    /// reports what this account and Region hold for the extension.
+    pub fn deactivate(&mut self) {
+        self.is_activated = Some(false);
+        self.auto_update = Some(false);
+        self.configuration_schema = None;
+        for version in &mut self.versions {
+            version.deprecated_status = deprecated_status::DEPRECATED.to_string();
+        }
     }
 
     /// The version with this `TypeVersionId`, if the registry holds it.

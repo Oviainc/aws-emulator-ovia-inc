@@ -4865,10 +4865,12 @@ pub fn resource_does_not_exist(logical_resource_id: &str, stack_name: &str) -> S
 /// The message answered when a request names an extension the registry of this account and
 /// Region does not hold — an unknown name or ARN, a name registered under another kind or
 /// in another Region, a publisher that published no such extension, or a version the
-/// record does not carry. Built from what the request named, the way
-/// [`stack_does_not_exist`] is.
+/// record does not carry.
+///
+/// The sentence CloudFormation answers for `TypeNotFoundException`, with the extension the
+/// request named quoted in it; nothing else of the request appears in it.
 pub fn extension_does_not_exist(identifier: &str) -> String {
-    format!("Extension with identifier {identifier} does not exist")
+    format!("The type '{identifier}' cannot be found.")
 }
 
 /// The message answered when a request names a `StackDriftDetectionId` this account has

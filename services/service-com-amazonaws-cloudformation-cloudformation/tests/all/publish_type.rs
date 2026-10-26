@@ -174,7 +174,7 @@ fn assert_not_found(case: &str, status_code: u16, body: &str, identifier: &str) 
         "case {case:?}: expected TypeNotFoundException, got {body}"
     );
     let reported = xml_text(body, "Message");
-    let expected = format!("Extension with identifier {identifier} does not exist");
+    let expected = format!("The type '{identifier}' cannot be found.");
     assert_eq!(
         reported.as_deref(),
         Some(expected.as_str()),
