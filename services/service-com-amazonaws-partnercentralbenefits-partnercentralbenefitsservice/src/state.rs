@@ -1027,12 +1027,11 @@ impl BenefitApplication {
         self.created_revision.to_string()
     }
 
-    /// Advance `UpdatedAt` past the previous write, without changing the revision.
+    /// Advance `UpdatedAt` past the previous write.
     ///
-    /// The revision is the optimistic-concurrency token `UpdateBenefitApplication`
-    /// checks, so only a change to the application's own content moves it (see
-    /// [`BenefitApplication::revise`]); a status transition the caller asked for records
-    /// only the time.
+    /// The timestamp half of recording a write: every change to the stored application
+    /// also moves its revision, so a handler records its write with
+    /// [`BenefitApplication::revise`], which advances both.
     pub fn touch(&mut self, now_millis: i64) {
         self.updated_at_millis = bump_millis(self.updated_at_millis, now_millis);
     }
@@ -1090,9 +1089,16 @@ impl BenefitApplication {
             && self.recall_client_token.as_deref() == Some(client_token)
     }
 
-    /// Record a content change: bump the revision and advance `UpdatedAt`.
+    /// Record a change to the stored application: bump the revision and advance
+    /// `UpdatedAt`.
     ///
-    /// Any content change also ENDS a recall's idempotency window: the record the recall
+    /// The revision is the application's optimistic-concurrency token — the `Revision` a
+    /// write has to carry to be accepted — so EVERY call that changes the stored record
+    /// moves it: a change to the application's own content, and equally a status
+    /// transition the caller drove, because a caller holding the revision it read before
+    /// that change no longer holds the current one.
+    ///
+    /// Any such change also ENDS a recall's idempotency window: the record the recall
     /// left has moved on, so replaying that recall must not answer as a retry of it. A
     /// recall itself records its token after calling this.
     pub fn revise(&mut self, now_millis: i64) {

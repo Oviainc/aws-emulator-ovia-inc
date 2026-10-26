@@ -191,15 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 detector.updated_at_millis,
                 Some(&detector.malware_protection_service_role),
             )),
-            // A detector always reports a tag map, EMPTY when nothing tagged it:
-            // `Tags` is a `TagMap`, so a client iterates it without a null guard.
-            tags: Some(
-                detector
-                    .tags
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-            ),
+            // Projected through the ONE tag-map rule every read of this service
+            // shares ([`crate::state::reported_tags`]): the member is always
+            // reported, empty when nothing tagged the detector.
+            tags: crate::state::reported_tags(&detector.tags),
             features: Some(
                 detector
                     .features

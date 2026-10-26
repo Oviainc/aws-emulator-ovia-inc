@@ -162,54 +162,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         check_subnet_group_name(&name)
             .map_err(CreateDBSubnetGroupError::invalid_parameter_value)?;
 
-        // "The request would result in the user exceeding the allowed number of subnets
-        // in a DB subnet groups" — the published allowance for ONE group.
-        if input.subnet_ids.len() > crate::state::MAX_SUBNETS_PER_DB_SUBNET_GROUP {
-            return Err(CreateDBSubnetGroupErrorModeled::DBSubnetQuotaExceededFault(
-                DBSubnetQuotaExceededFault {
-                    message: Some(format!(
-                        "the request names {} subnets: a DB subnet group holds at most {}",
-                        input.subnet_ids.len(),
-                        crate::state::MAX_SUBNETS_PER_DB_SUBNET_GROUP
-                    )),
-                },
-            )
-            .into());
-        }
-        // A value that is not an EC2 subnet id names no subnet at all, which is what
-        // `InvalidSubnet` says: "The requested subnet is invalid".
-        for subnet_id in &input.subnet_ids {
-            crate::state::check_subnet_id(subnet_id).map_err(|message| {
-                CreateDBSubnetGroupError::from(CreateDBSubnetGroupErrorModeled::InvalidSubnet(
-                    InvalidSubnet {
+        // The `SubnetIds` list a DB subnet group can be made of is the same list
+        // whichever operation carries it, so the published allowance for one group, the
+        // EC2 subnet id form and the documented two-Availability-Zone coverage are
+        // checked once in `crate::state` and mapped here onto THIS operation's modelled
+        // faults.
+        if let Err(rejection) = crate::state::check_db_subnet_group_subnets(&input.subnet_ids) {
+            return Err(match rejection {
+                crate::state::SubnetListRejection::TooManySubnets(message) => {
+                    CreateDBSubnetGroupErrorModeled::DBSubnetQuotaExceededFault(
+                        DBSubnetQuotaExceededFault {
+                            message: Some(message),
+                        },
+                    )
+                }
+                crate::state::SubnetListRejection::NotASubnet(message) => {
+                    CreateDBSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
                         message: Some(message),
-                    },
-                ))
-            })?;
-        }
-        // "DB subnet groups must contain at least one subnet in at least two AZs in the
-        // Amazon Web Services Region." A subnet lies in exactly ONE Availability Zone,
-        // so a group naming fewer than two DISTINCT subnets cannot cover two zones
-        // whatever those subnets are — that much follows from the request alone, and is
-        // the modelled `DBSubnetGroupDoesNotCoverEnoughAZs`. Which zones the named
-        // subnets actually lie in is an EC2 fact this service does not hold, so no
-        // further coverage claim is made.
-        let distinct: std::collections::BTreeSet<&str> =
-            input.subnet_ids.iter().map(String::as_str).collect();
-        if distinct.len() < 2 {
-            return Err(
-                CreateDBSubnetGroupErrorModeled::DBSubnetGroupDoesNotCoverEnoughAZs(
-                    DBSubnetGroupDoesNotCoverEnoughAZs {
-                        message: Some(format!(
-                            "the request names {} distinct subnet(s): a DB subnet group must \
-                             cover at least two Availability Zones, so it must name at least \
-                             two subnets",
-                            distinct.len()
-                        )),
-                    },
-                )
-                .into(),
-            );
+                    })
+                }
+                crate::state::SubnetListRejection::NotEnoughAvailabilityZones(message) => {
+                    CreateDBSubnetGroupErrorModeled::DBSubnetGroupDoesNotCoverEnoughAZs(
+                        DBSubnetGroupDoesNotCoverEnoughAZs {
+                            message: Some(message),
+                        },
+                    )
+                }
+            }
+            .into());
         }
 
         // No store means this service was mounted on an engine it has no state in,

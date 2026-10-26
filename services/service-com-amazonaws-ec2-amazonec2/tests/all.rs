@@ -219,6 +219,9 @@ mod ipam_internet_registry_associations;
 mod ipam_policies;
 #[path = "all/ipam_pools.rs"]
 mod ipam_pools;
+// Creating one further IPAM scope in an IPAM, and reading the account's scopes back.
+#[path = "all/ipam_scopes.rs"]
+mod ipam_scopes;
 #[path = "all/ipam_routing_policy_registrations.rs"]
 mod ipam_routing_policy_registrations;
 #[path = "all/launch_templates.rs"]

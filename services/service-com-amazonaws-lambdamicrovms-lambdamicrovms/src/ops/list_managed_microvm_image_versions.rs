@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListManagedMicrovmImageVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListManagedMicrovmImageVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListManagedMicrovmImageVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Serves the versions one AWS-MANAGED base image publishes — the set read through
+//! [`crate::state::ComAmazonawsLambdamicrovmsLambdamicrovmsState::managed_base_image_versions`],
+//! which is the version side of the catalogue `ListManagedMicrovmImages` serves, so a
+//! listing of an image's versions and the version a build that pins none resolves to
+//! cannot disagree. The entries are AWS-owned and regional, so each ARN carries `aws`
+//! in its account field and the region the request was signed for.
+//!
+//! The `imageIdentifier` is resolved against that catalogue by both forms
+//! `MicrovmImageIdentifier` accepts ([`crate::state::resolve_managed_base_image`]): a
+//! well-formed reference the catalogue does not publish is the modelled 404, and a
+//! value that is neither a published id nor an ARN is the modelled 400.
+//!
+//! A pure report: nothing here writes, so a later caller sees exactly what this one
+//! saw. The `@paginated` contract is honoured as `ListManagedMicrovmImages` honours it
+//! — `maxResults` caps the page, a `nextToken` is issued (and accepted) only while
+//! entries remain, and a token this service did not mint is the modelled 400 rather
+//! than a silent restart.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +163,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListManagedMicrovmImageVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListManagedMicrovmImageVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListManagedMicrovmImageVersions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListManagedMicrovmImageVersionsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the managed MicroVM image catalogue is unavailable".to_string(),
+                        ),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The identifier addresses a MANAGED image, so it is resolved against the
+        // published catalogue rather than against this account's store. The outcomes
+        // mean different things to a caller: a reference the catalogue does not publish
+        // is a missing resource (404), while a value that is no identifier of this API
+        // at all is a request that can never succeed (400).
+        let image_id = match crate::state::resolve_managed_base_image(&input.image_identifier) {
+            crate::state::ImageReference::Resolved(image_id) => image_id,
+            crate::state::ImageReference::Absent => {
+                // `ResourceNotFoundException` models `message` as the only required
+                // member; `resourceType` and `resourceId` are optional and this service
+                // leaves them unset, so the message — built from the identifier the
+                // request carried — is the whole envelope.
+                return Err(
+                    ListManagedMicrovmImageVersionsErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: crate::state::base_image_not_found_message(
+                                &input.image_identifier,
+                            ),
+                            resource_type: None,
+                            resource_id: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            crate::state::ImageReference::Malformed => {
+                return Err(
+                    ListManagedMicrovmImageVersionsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(crate::state::invalid_arn_format_message(
+                                &input.image_identifier,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_token(token)?),
+            None => None,
+        };
+        // `maxResults` carries `@range(min: 1, max: 50)`, which the boundary validator
+        // has already enforced; the clamp is a second line of defence, so a page size
+        // can never be zero or unbounded however the value arrived.
+        let page_size = input
+            .max_results
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(crate::state::MAX_LIST_PAGE)
+            .clamp(1, crate::state::MAX_LIST_PAGE);
+
+        // A managed image is an AWS-owned, REGIONAL resource, so the catalogue is
+        // projected into the region this request was signed for — the same region the
+        // ARNs of this account's own resources carry.
+        let versions = state
+            .lock()
+            .managed_base_image_versions(&image_id, &crate::state::request_region(ctx));
+
+        // The versions enumerate in one stable order, so "after this version" is a
+        // cursor that stays valid even when another version is published between two
+        // pages.
+        let mut remaining = versions.iter().filter(|entry| {
+            after.as_deref().is_none_or(|cursor| {
+                crate::state::version_order(&entry.image_version)
+                    > crate::state::version_order(cursor)
+            })
+        });
+        let page: Vec<&crate::state::ManagedBaseImageVersion> =
+            remaining.by_ref().take(page_size).collect();
+
+        // A `nextToken` is issued only when the page did not exhaust the versions.
+        let next_token = match (page.last(), remaining.next()) {
+            (Some(last), Some(_)) => Some(encode_token(&last.image_version)),
+            _ => None,
+        };
+
+        Ok(ListManagedMicrovmImageVersionsOutput {
+            next_token,
+            // `items` is `@required`, so it is always projected — an empty page included.
+            items: page
+                .into_iter()
+                .map(|entry| ManagedMicrovmImageVersion {
+                    image_arn: entry.image_arn.clone(),
+                    image_version: entry.image_version.clone(),
+                    status: Some(entry.status.clone()),
+                    created_at: entry.created_at,
+                    updated_at: entry.updated_at,
+                })
+                .collect(),
+        })
     }
+}
+
+/// The marker every `nextToken` this operation issues carries, so a token the service
+/// did not mint is refused rather than silently positioning the listing.
+const TOKEN_MARKER: &str = "ListManagedMicrovmImageVersions/1:";
+
+/// The opaque `nextToken` for a cursor: the version of the last entry served.
+fn encode_token(image_version: &str) -> String {
+    ::hex::encode(format!("{TOKEN_MARKER}{image_version}").as_bytes())
+}
+
+/// The cursor a `nextToken` carries. A token this service did not mint is refused
+/// with the modelled 400 rather than silently restarting or skipping the listing.
+fn decode_token(token: &str) -> Result<String, ListManagedMicrovmImageVersionsError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|decoded| {
+            decoded
+                .strip_prefix(TOKEN_MARKER)
+                .map(::std::string::ToString::to_string)
+        })
+        .ok_or_else(|| {
+            ListManagedMicrovmImageVersionsErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    "nextToken is not a pagination token this service issued".to_string(),
+                ),
+            })
+            .into()
+        })
 }

@@ -2,9 +2,10 @@
 
 //! @op SubmitBenefitApplication
 //! Submits one stored benefit application for AWS review: the record moves from
-//! `PENDING_SUBMISSION` to `IN_REVIEW` and its `UpdatedAt` advances, so the application
-//! reports the review stage of the processing workflow and no longer carries the
-//! `StatusReason` of a status it has left.
+//! `PENDING_SUBMISSION` to `IN_REVIEW` and its `UpdatedAt` and `Revision` advance, so the
+//! application reports the review stage of the processing workflow, no longer carries the
+//! `StatusReason` of a status it has left, and a write built on the revision read before
+//! the submission is refused.
 //!
 //! Submission is only defined for an application the partner has not submitted yet, so
 //! an application in any other status is refused with the modelled `ConflictException`.
@@ -207,7 +208,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // also drops the reason a recall of an earlier submission left behind, because
         // that sentence explains a status this application no longer holds.
         application.set_status(crate::state::STATUS_IN_REVIEW, None);
-        application.touch(now);
+        // The submission changed the stored record, so it moves the optimistic-concurrency
+        // token with it — see [`crate::state::BenefitApplication::revise`].
+        application.revise(now);
 
         Ok(SubmitBenefitApplicationOutput {})
     }

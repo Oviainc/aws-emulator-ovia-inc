@@ -1035,10 +1035,13 @@ fn default_value(values: &[&'static str]) -> String {
 /// `requires_signing_material` is a SEPARATE fact from publishing a platform,
 /// stated per entry rather than inferred from membership: for the four
 /// code-signing platforms the recorded `PutSigningProfile` accepts a profile
-/// created with no `signingMaterial`, while the container-image platform and any
-/// platform outside this catalog are refused ("signing material cannot be
-/// null."). See [`platform_requires_signing_material`] for what an UNPUBLISHED
-/// platform answers and why.
+/// created with no `signingMaterial`, while the container-image platform is
+/// refused ("signing material cannot be null.").
+///
+/// The catalog is the WHOLE set of platforms a profile can be created on: an id
+/// outside it names no platform, so there is no entry to read a signing
+/// configuration, a display name or a signing-material rule off, and the create
+/// is refused rather than guessed at ([`signing_platform`]).
 pub const SIGNING_PLATFORM_CATALOG: &[SigningPlatformEntry] = &[
     SigningPlatformEntry {
         platform_id: "AWSIoTDeviceManagement-SHA256-ECDSA",
@@ -1104,20 +1107,16 @@ pub const SIGNING_PLATFORM_CATALOG: &[SigningPlatformEntry] = &[
 
 /// The catalog entry for `platform_id`, or `None` for a platform this emulator
 /// publishes no entry for.
+///
+/// The ONE place a `platformId` carried by a request is resolved: every fact a
+/// handler needs about a platform — its display name, its signing configuration,
+/// whether it requires signing material, whether it supports revocation — is read
+/// off the entry this answers, so an id that resolves to nothing is refused
+/// instead of being treated as a platform with unknown properties.
 pub fn signing_platform(platform_id: &str) -> Option<&'static SigningPlatformEntry> {
     SIGNING_PLATFORM_CATALOG
         .iter()
         .find(|entry| entry.platform_id == platform_id)
-}
-
-/// The display name AWS Signer publishes for a signing platform, or `None` for a
-/// platform [`SIGNING_PLATFORM_CATALOG`] publishes no display name for (an id it
-/// holds no entry for at all, or one whose entry publishes none) — such a
-/// platform simply has no display name to report.
-pub fn platform_display_name(platform_id: &str) -> Option<String> {
-    signing_platform(platform_id)
-        .and_then(|entry| entry.display_name)
-        .map(str::to_string)
 }
 
 /// The refusal prose for a `platformId` this emulator publishes no platform for.
@@ -1125,21 +1124,85 @@ pub fn platform_not_found_message(platform_id: &str) -> String {
     format!("Platform with id {platform_id} does not exist")
 }
 
-/// Whether a profile on `platform_id` must carry `signingMaterial` — the ACM
-/// certificate its signatures are issued under.
+/// Which `overrides.signingConfiguration` member an override refusal is about.
 ///
-/// A published platform answers with its own
-/// [`SigningPlatformEntry::requires_signing_material`]. A platform this emulator
-/// publishes NO entry for defaults to requiring it: a profile on a platform whose
-/// signing configuration is unknown here holds the certificate itself, which is
-/// what the recorded `PutSigningProfile` shows — it refuses such a request with
-/// "signing material cannot be null." rather than accepting it.
+/// A platform publishes one option set per member
+/// ([`SigningPlatformEntry::signing_configuration`]), so the member is what says
+/// which set the overridden value had to fall inside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigningConfigurationMember {
+    /// `SigningConfigurationOverrides$hashAlgorithm`, held to the platform's
+    /// `signingConfiguration.hashAlgorithmOptions.allowedValues`.
+    HashAlgorithm,
+    /// `SigningConfigurationOverrides$encryptionAlgorithm`, held to the
+    /// platform's `signingConfiguration.encryptionAlgorithmOptions.allowedValues`.
+    EncryptionAlgorithm,
+}
+
+impl SigningConfigurationMember {
+    /// The member's name as the model spells it on the wire — what a refusal
+    /// names so a client knows which override it has to change.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::HashAlgorithm => "hashAlgorithm",
+            Self::EncryptionAlgorithm => "encryptionAlgorithm",
+        }
+    }
+
+    /// The `allowedValues` `entry` publishes for this member.
+    pub fn allowed_values(self, entry: &SigningPlatformEntry) -> &'static [&'static str] {
+        match self {
+            Self::HashAlgorithm => entry.hash_algorithms,
+            Self::EncryptionAlgorithm => entry.encryption_algorithms,
+        }
+    }
+}
+
+/// The first `overrides.signingConfiguration` member whose value is not one the
+/// platform publishes as allowed, with that value — or `None` when every override
+/// the request carries falls inside the platform's published options.
 ///
-/// The model cannot express the distinction: `signingMaterial` is one optional
-/// member for every platform
-/// (`smithy_query(query="shape",shape="PutSigningProfileRequest")`).
-pub fn platform_requires_signing_material(platform_id: &str) -> bool {
-    signing_platform(platform_id).is_none_or(|entry| entry.requires_signing_material)
+/// An override selects among the algorithms the PLATFORM signs under, which is
+/// exactly what its `allowedValues` publish; a value outside them names a
+/// configuration the platform publishes none of, so nothing could be signed
+/// under it. A member the request leaves out is not an override at all and takes
+/// the platform's `defaultValue`.
+pub fn unsupported_signing_configuration_override<'a>(
+    entry: &SigningPlatformEntry,
+    overrides: Option<&'a SigningPlatformOverrides>,
+) -> Option<(SigningConfigurationMember, &'a str)> {
+    let configuration = overrides.and_then(|overrides| overrides.signing_configuration.as_ref())?;
+    [
+        (
+            SigningConfigurationMember::HashAlgorithm,
+            configuration.hash_algorithm.as_deref(),
+        ),
+        (
+            SigningConfigurationMember::EncryptionAlgorithm,
+            configuration.encryption_algorithm.as_deref(),
+        ),
+    ]
+    .into_iter()
+    .find_map(|(member, value)| {
+        let value = value?;
+        (!member.allowed_values(entry).contains(&value)).then_some((member, value))
+    })
+}
+
+/// The refusal prose for an override outside the platform's published options:
+/// which member carried it, the value it carried, the platform that publishes no
+/// such option, and the values that platform does publish.
+pub fn unsupported_override_message(
+    entry: &SigningPlatformEntry,
+    member: SigningConfigurationMember,
+    value: &str,
+) -> String {
+    let allowed = member.allowed_values(entry).join(", ");
+    format!(
+        "{} {value} is not supported for platform {}. Supported values: [{allowed}]",
+        member.wire_name(),
+        entry.platform_id
+    )
 }
 
 /// Whether a signature produced on `platform_id` can be revoked — the platform's

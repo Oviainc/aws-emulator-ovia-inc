@@ -163,7 +163,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The ARN is RESOLVED before this service's records are consulted, and the
+        // order the resolution runs in is what a caller sees: a reference that
+        // cannot be read is a client-input fault, one naming another region names
+        // nothing this endpoint reports on, and one owned by another account is an
+        // authorization refusal (403) — none of which depends on what this account
+        // holds. Only then is the record looked up.
+        let region = crate::state::request_region(ctx.parts());
+        if let Err(rejection) =
+            crate::state::resolve_invocation_arn(&input.invocation_arn, &region)
+        {
+            return Err(match rejection {
+                crate::state::ArnRejection::ForeignAccount => {
+                    crate::scaffolded::Scaffolded::arn_access_denied(rejection.message())
+                }
+                readable_fault => GetAsyncInvokeErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(readable_fault.message().to_string()),
+                    },
+                )
+                .into(),
+            });
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetAsyncInvokeErrorModeled::InternalServerException(
                 InternalServerException {
@@ -176,12 +197,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.settle_async_invokes(crate::state::now_millis());
 
         let Some(record) = guard.async_invokes.get(&input.invocation_arn) else {
+            // This operation models no `ResourceNotFoundException`
+            // (`smithy_query(query="operation",operation="GetAsyncInvoke")`), so an
+            // ARN that resolves to no invocation is refused as a client-input
+            // fault with the service's own fixed text for it.
             return Err(GetAsyncInvokeErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(format!(
-                        "The invocation ARN {} does not exist.",
-                        input.invocation_arn
-                    )),
+                    message: Some(crate::state::ASYNC_INVOKE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

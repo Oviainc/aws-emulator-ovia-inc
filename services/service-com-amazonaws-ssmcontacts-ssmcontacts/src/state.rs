@@ -529,6 +529,45 @@ impl ComAmazonawsSsmcontactsSsmcontactsState {
             .collect()
     }
 
+    /// The ARNs of the rotations that still name `contact_arn` as a member, in creation
+    /// order.
+    ///
+    /// A rotation's shift team (`ContactIds`, modelled `@required` with `length` 1..30) and
+    /// an override's replacement team (`NewContactIds`, `@required` on the create) are both
+    /// references the referring rotation cannot be without, so a rotation that names a
+    /// contact DEPENDS on it. An override is not an ARN-named resource — it is identified by
+    /// a uuid within the rotation it overrides — so an override's membership is reported as
+    /// the rotation that holds it, which is the resource an `SsmContactsArn` can name.
+    pub fn rotation_arns_depending_on_contact(&self, contact_arn: &str) -> Vec<String> {
+        let overriding: BTreeSet<&str> = self
+            .rotation_overrides
+            .values()
+            .filter(|record| {
+                record
+                    .new_contact_ids
+                    .iter()
+                    .any(|member| member == contact_arn)
+            })
+            .map(|record| record.rotation_arn.as_str())
+            .collect();
+        let mut dependents: Vec<&RotationRecord> = self
+            .rotations
+            .values()
+            .filter(|rotation| {
+                rotation
+                    .contact_ids
+                    .iter()
+                    .any(|member| member == contact_arn)
+                    || overriding.contains(rotation.arn.as_str())
+            })
+            .collect();
+        dependents.sort_by_key(|rotation| rotation.sequence);
+        dependents
+            .into_iter()
+            .map(|rotation| rotation.arn.clone())
+            .collect()
+    }
+
     /// The channel of `contact_arn` that carries `name`, when the contact has one.
     ///
     /// A channel's `Name` is its identifier WITHIN its contact, so this is the lookup a

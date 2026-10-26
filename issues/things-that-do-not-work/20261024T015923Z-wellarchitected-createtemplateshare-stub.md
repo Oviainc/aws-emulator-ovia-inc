@@ -23,3 +23,17 @@ The handler carries the scaffold marker `//! SCAFFOLDED, NOT IMPLEMENTED:` at th
 
 1. Boot the wellarchitected emulator
 2. Call CreateTemplateShare and observe HTTP 501 with no state persisted
+
+## Resolution note
+
+`CreateTemplateShare` is now IMPLEMENTED and its `//! SCAFFOLDED, NOT IMPLEMENTED:` header
+line is gone: it was written alongside `ListTemplateShares`
+(`issues/things-that-now-work/20261024T015924Z-wellarchitected-listtemplateshares-stub.md`),
+because a list of review-template shares cannot be read back end-to-end until something
+records one. The handler mints the share's `ShareId` and the `ShareInvitationId` of the
+invitation it raises, records the share `PENDING` against the template's `TemplateArn` in
+`src/state.rs` (`template_shares`), refuses a self-share (400), a principal that already
+holds a share (409) and a token replayed with different parameters (409), replays the
+original share for an unchanged token, and meters shares per template (402). It is covered
+end-to-end by `tests/all/template_shares.rs`. Nothing remains to do for this report.
+
