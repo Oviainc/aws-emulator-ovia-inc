@@ -93,6 +93,8 @@ mod repository_creation_templates;
 mod repository_image_lifecycle;
 #[path = "all/repository_policy.rs"]
 mod repository_policy;
+#[path = "all/repository_policy_principal.rs"]
+mod repository_policy_principal;
 #[path = "all/request_preconditions.rs"]
 mod request_preconditions;
 #[path = "all/resource_tag_mutations.rs"]

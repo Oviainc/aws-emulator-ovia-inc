@@ -3654,6 +3654,77 @@ pub fn validate_resource_policy(
     Ok(())
 }
 
+/// The constraint a resource policy document fails when one of the identities it grants to
+/// cannot be resolved: the principal was looked up and this account's IAM holds no such
+/// identity.
+pub const POLICY_PRINCIPAL_NOT_FOUND_CONSTRAINT: &str = "Principal not found";
+
+/// Every identity the statements of the resource policy `text` grant to: the values of
+/// their `Principal` elements — the element a resource-based policy states its grantees in,
+/// and the one this service's grammar requires of every statement — flattened out of the
+/// string, the list or the
+/// `{"AWS": …}`-style object each may be written as ([`policy_values`]), in the order the
+/// document names them and without repeats — the same identity named twice is one identity
+/// to resolve.
+///
+/// Reported for a document that is a resource policy ([`validate_resource_policy`]), so a
+/// text this cannot read names no principal rather than failing: what makes a document
+/// unusable is stated by the grammar, once, and not a second time here.
+pub fn policy_principals(text: &str) -> Vec<String> {
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    let statements: Vec<&serde_json::Value> = match document.get("Statement") {
+        Some(serde_json::Value::Array(entries)) => entries.iter().collect(),
+        // One statement may be written as the object itself rather than as a list.
+        Some(single) => vec![single],
+        None => Vec::new(),
+    };
+    let mut named: Vec<String> = Vec::new();
+    for principal in statements
+        .iter()
+        .filter_map(|statement| statement.get("Principal"))
+        .flat_map(policy_values)
+    {
+        if !named.iter().any(|already| already == principal) {
+            named.push(principal.to_string());
+        }
+    }
+    named
+}
+
+/// The refusal a resource policy document earns when one of the identities it grants to is
+/// not there, or `None` when every identity it names resolves.
+///
+/// A resource-based policy states WHO a permission is granted to, so ECR resolves the
+/// identities a document names against this account's IAM before it stores the document —
+/// a grant to an identity that does not exist is a grant to nobody — and refuses the
+/// `policyText` parameter with [`POLICY_PRINCIPAL_NOT_FOUND_CONSTRAINT`] when IAM answers
+/// that one of them is absent. Both of the documents this service stores go through here:
+/// a repository policy (`ops::set_repository_policy`) and the registry policy
+/// (`ops::put_registry_policy`).
+///
+/// The resolution itself is [`::service_common::iam_principal::identity_is_absent`], the
+/// tree's one reading of a policy principal against IAM, so a refusal is grounded in what
+/// IAM ANSWERED: a principal that names no IAM role or user of this account — the `*`
+/// wildcard, an account or its root, a service principal, another account's identity — is
+/// resolved by nothing here and refuses nothing.
+pub async fn unresolved_policy_principal(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    text: &str,
+) -> Option<Fault> {
+    for principal in policy_principals(text) {
+        if ::service_common::iam_principal::identity_is_absent(ctx, region, &principal).await {
+            return Some(invalid_document(
+                POLICY_TEXT_PARAMETER,
+                POLICY_PRINCIPAL_NOT_FOUND_CONSTRAINT,
+            ));
+        }
+    }
+    None
+}
+
 /// The indentation one nesting level of an IAM policy document is written with: see
 /// [`canonical_policy_document`].
 const POLICY_INDENT: usize = 2;

@@ -47,6 +47,17 @@ pub fn role_name(role_arn: &str) -> Option<&str> {
     entity_name(role_arn, "role")
 }
 
+/// The user name an IAM ARN carries, when the ARN names an IAM user of THIS account
+/// (`arn:<partition>:iam::<account>:user<path><name>`).
+///
+/// A user and a role are different IAM entities even where they share a name, so a
+/// `role/…` ARN resolves to nothing here. `None` otherwise for the same reasons
+/// [`role_name`] answers it.
+#[must_use]
+pub fn user_name(user_arn: &str) -> Option<&str> {
+    entity_name(user_arn, "user")
+}
+
 /// The instance profile name an IAM ARN carries, when the ARN names an EC2 instance
 /// profile of THIS account (`arn:<partition>:iam::<account>:instance-profile<path><name>`).
 ///
@@ -134,7 +145,7 @@ pub async fn role_is_unassumable(
 
 #[cfg(test)]
 mod tests {
-    use super::{instance_profile_name, role_name};
+    use super::{instance_profile_name, role_name, user_name};
 
     /// The name is read from the resource field of an IAM role ARN of this account,
     /// whatever path the role lives under — and from nothing else.
@@ -277,6 +288,76 @@ mod tests {
             assert!(
                 read.is_none() || role_name(&value).is_none(),
                 "case {case:?}: an instance profile ARN must not read as a role ARN"
+            );
+        }
+    }
+
+    /// The THIRD IAM entity a policy names by ARN: a user. Read under its own entity type,
+    /// so a role ARN and a user ARN never resolve to each other.
+    #[test]
+    fn a_user_name_is_read_only_from_this_accounts_user_arn() {
+        let account = ::emulator_server::emulator_account_id();
+        // (case, value, the name the parse must report)
+        let rows: Vec<(&str, String, Option<&str>)> = vec![
+            (
+                "a user under the default path",
+                format!("arn:aws:iam::{account}:user/builder"),
+                Some("builder"),
+            ),
+            (
+                "a user under a path",
+                format!("arn:aws:iam::{account}:user/team/builder"),
+                Some("builder"),
+            ),
+            (
+                "another partition",
+                format!("arn:aws-cn:iam::{account}:user/builder"),
+                Some("builder"),
+            ),
+            (
+                "a user ARN carrying no account",
+                "arn:aws:iam:::user/builder".to_string(),
+                Some("builder"),
+            ),
+            (
+                "another account",
+                "arn:aws:iam::123456789012:user/builder".to_string(),
+                None,
+            ),
+            (
+                "a role ARN, which names another IAM entity",
+                format!("arn:aws:iam::{account}:role/builder"),
+                None,
+            ),
+            (
+                "an account's root, which names no user",
+                format!("arn:aws:iam::{account}:root"),
+                None,
+            ),
+            (
+                "an empty user name",
+                format!("arn:aws:iam::{account}:user/"),
+                None,
+            ),
+            (
+                "a Region in the IAM field, which an IAM ARN does not carry",
+                format!("arn:aws:iam:us-east-1:{account}:user/builder"),
+                None,
+            ),
+            ("the wildcard every identity is named by", "*".to_string(), None),
+            ("the empty string", String::new(), None),
+        ];
+
+        for (case, value, expected) in rows {
+            let read = user_name(&value);
+            assert_eq!(
+                read, expected,
+                "case {case:?}: expected {expected:?}, got {read:?}"
+            );
+            // A value reads as at most ONE entity type.
+            assert!(
+                read.is_none() || role_name(&value).is_none(),
+                "case {case:?}: a user ARN must not read as a role ARN"
             );
         }
     }

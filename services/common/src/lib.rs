@@ -229,6 +229,10 @@ pub mod iam_client;
 /// API takes one as a string and has to decide whether to accept it — so two services
 /// handed the same document cannot disagree about whether it is a policy at all.
 pub mod iam_policy;
+/// The ONE resolution of an identity a resource-based policy grants to against this
+/// account's IAM, for every service that resolves a policy document's principals before it
+/// stores it.
+pub mod iam_principal;
 pub mod iam_role;
 pub mod iam_trust_policy;
 pub mod iot_commands;

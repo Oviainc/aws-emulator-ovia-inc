@@ -4,7 +4,9 @@
 //! Applies a repository policy to one repository of this emulator's registry: the
 //! document is validated as a resource-based IAM policy by the crate's shared
 //! [`crate::state::validate_resource_policy`] — the same grammar `PutRegistryPolicy`
-//! uses — and then persisted on the repository's record in [`crate::state`], where
+//! uses — its principals are resolved against this account's IAM by the crate's shared
+//! [`crate::state::unresolved_policy_principal`], and it is then persisted on the
+//! repository's record in [`crate::state`], where
 //! `GetRepositoryPolicy` reads it back and `DeleteRepositoryPolicy` removes it. Unlike a
 //! REGISTRY policy, a repository policy may grant to every principal (that is how a
 //! repository is shared publicly), so this operation adds no principal rule of its own;
@@ -231,17 +233,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
-        let _ = ctx;
 
         // `registryId` names the registry holding the repository; this emulator serves
         // exactly one registry — its own account's.
         crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
 
-        let mut store = state.lock();
         // The repository the policy is for is resolved FIRST: a policy for a repository
         // that does not exist is reported as the missing repository, whatever else is
-        // wrong with the document.
-        store
+        // wrong with the document. The store is released again before the document's
+        // principals are resolved, which is a call out to IAM.
+        state
+            .lock()
             .repository(&input.repository_name)
             .map_err(fault_error)?;
 
@@ -266,6 +268,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(fault_error)?;
 
+        // A repository policy states WHO may act on the repository, so the identities it
+        // grants to are resolved against this account's IAM before anything is written:
+        // a document granting to an identity IAM does not hold is refused, and the policy
+        // the repository already carries stays as it was.
+        if let Some(fault) = crate::state::unresolved_policy_principal(
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            &input.policy_text,
+        )
+        .await
+        {
+            return Err(fault_error(fault).into());
+        }
+
+        let mut store = state.lock();
         let repo = store
             .repository_mut(&input.repository_name)
             .map_err(fault_error)?;

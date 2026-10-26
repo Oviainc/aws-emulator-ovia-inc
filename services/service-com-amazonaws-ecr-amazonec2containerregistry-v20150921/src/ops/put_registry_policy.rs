@@ -2,7 +2,9 @@
 
 //! @op PutRegistryPolicy
 //! Creates or replaces the permissions policy of this emulator's registry: the document
-//! is validated as a resource-based IAM policy and then persisted in [`crate::state`] in
+//! is validated as a resource-based IAM policy, the identities it grants to are resolved
+//! against this account's IAM ([`crate::state::unresolved_policy_principal`]), and it is
+//! then persisted in [`crate::state`] in
 //! the canonical IAM-policy rendering ECR reports a policy in
 //! ([`crate::state::canonical_policy_document`]), so `GetRegistryPolicy` reads back the
 //! same document this call answered with and a later put replaces it. A document that is
@@ -156,8 +158,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `PutRegistryPolicyRequest` carries only `policyText`; one registry is served
         // here, so there is no registry to resolve.
-        let _ = ctx;
-
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(PutRegistryPolicyErrorModeled::ServerException(ServerException {
                 message: Some("the ecr registry store is unavailable".to_string()),
@@ -168,6 +168,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The modelled length bound is already enforced at the boundary; what the model
         // cannot express is that the text has to be a usable registry policy document.
         crate::state::validate_registry_policy(&input.policy_text).map_err(invalid_parameter)?;
+
+        // A registry policy states WHO may act on this registry, so the identities it
+        // grants to are resolved against this account's IAM before anything is written —
+        // the same rule a repository policy's principals go through — and the policy the
+        // registry already carries stays as it was when one of them is not there.
+        if let Some(fault) = crate::state::unresolved_policy_principal(
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            &input.policy_text,
+        )
+        .await
+        {
+            return Err(invalid_parameter(fault).into());
+        }
 
         // Stored — and answered with — in the canonical IAM-policy rendering ECR echoes
         // an attached policy in: the caller's own tokens, in the caller's own order,
