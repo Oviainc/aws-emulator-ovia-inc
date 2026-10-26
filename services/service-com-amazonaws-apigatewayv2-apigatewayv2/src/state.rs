@@ -69,6 +69,7 @@ enum IdKind {
     IntegrationResponse,
     ProductPage,
     ProductRestEndpointPage,
+    ApiMapping,
 }
 
 impl IdKind {
@@ -88,6 +89,7 @@ impl IdKind {
         IdKind::IntegrationResponse,
         IdKind::ProductPage,
         IdKind::ProductRestEndpointPage,
+        IdKind::ApiMapping,
     ];
 
     /// The kind declared LAST, whose ordinal is therefore the largest. Named so the
@@ -95,7 +97,7 @@ impl IdKind {
     /// the last ordinal plus one) and that the largest ordinal still has a residue class
     /// of its own: a variant added to the enum and forgotten in `ALL`, or one added past
     /// [`ID_KIND_STRIDE`], fails the build rather than minting another kind's id.
-    const LAST: IdKind = IdKind::ProductRestEndpointPage;
+    const LAST: IdKind = IdKind::ApiMapping;
 
     /// This kind's residue class in the id space, below [`ID_KIND_STRIDE`].
     const fn ordinal(self) -> u128 {
@@ -329,6 +331,81 @@ pub const DOMAIN_NAME_MIGRATION: Duration = Duration::from_millis(500);
 /// configuration is expected — and quotes nothing from the request.
 pub const EMPTY_DOMAIN_NAME_CONFIGURATIONS: &str =
     "Invalid input. Expected one domain name configuration";
+
+/// The punctuation an `ApiMappingKey` segment may carry, beside letters and digits.
+///
+/// `SelectionKey` carries no `@pattern` trait, so the character class is the service's
+/// rule rather than the boundary validator's: API Gateway accepts a base path built from
+/// letters, numbers and these characters, and refuses anything else with
+/// [`API_MAPPING_KEY_ILLEGAL_CHARACTER`].
+pub const API_MAPPING_KEY_PUNCTUATION: &str = "$-_.+!*'(),";
+
+/// The refusal an `ApiMappingKey` carrying a character outside the class
+/// [`API_MAPPING_KEY_PUNCTUATION`] describes takes: fixed text for the whole
+/// illegal-character class, naming nothing from the request.
+pub const API_MAPPING_KEY_ILLEGAL_CHARACTER: &str =
+    "An API mapping key may contain only letters, numbers and one of $-_.+!*'(), characters.";
+
+/// The refusal an `ApiMappingKey` whose SHAPE as a path is wrong takes: a base path is
+/// the part of a request path after the host, written without the leading separator and
+/// with exactly one separator between segments.
+pub const API_MAPPING_KEY_MALFORMED_PATH: &str =
+    "API mapping key should not start with a '/' or have consecutive '/'s.";
+
+/// The refusal a `CreateApiMapping`/`UpdateApiMapping` request whose `Stage` does not
+/// name a stage of the mapped api takes. Fixed text: the stage the caller asked for is
+/// already the value it sent, and API Gateway reports the kind of identifier that was
+/// not usable rather than echoing it back.
+pub const INVALID_STAGE_IDENTIFIER: &str = "Invalid stage identifier specified";
+
+/// The refusal an operation addressing a domain name the account does not hold takes:
+/// the message of the modelled `NotFoundException`. Fixed text, naming no value from the
+/// request — the domain name the caller asked for is already the resource it addressed.
+pub const INVALID_DOMAIN_NAME_IDENTIFIER: &str = "Invalid domain name identifier specified";
+
+/// The refusal an operation addressing an api mapping its domain name does not hold
+/// takes: the message of the modelled `NotFoundException`. Fixed text in the same form as
+/// [`INVALID_DOMAIN_NAME_IDENTIFIER`], the other `@httpLabel` resource of the same path —
+/// the mapping the caller asked for is already the resource it addressed, so the message
+/// names the kind of identifier that was not found rather than echoing it back.
+pub const INVALID_API_MAPPING_IDENTIFIER: &str = "Invalid API mapping identifier specified";
+
+/// The most API mappings one custom domain name may hold, after which
+/// `CreateApiMapping` is refused.
+///
+/// An EMULATOR growth bound, not a figure AWS publishes: API Gateway documents no quota
+/// for API mappings per domain name, so this takes the same shape as the other
+/// per-parent bounds here and is what stops a loop of CreateApiMapping calls growing
+/// this store without end. `TooManyRequestsException` ("A limit has been exceeded") is
+/// the modelled error the operation refuses with.
+pub const MAX_API_MAPPINGS_PER_DOMAIN: usize = 200;
+
+/// Refuse an `ApiMappingKey` that is not a base path API Gateway can route on.
+///
+/// Two rules, in the order API Gateway applies them, and each is exactly what its refusal
+/// states: the key's SHAPE as a path — it does not start with a separator and carries no
+/// consecutive separators ([`API_MAPPING_KEY_MALFORMED_PATH`]) — and then the character
+/// class each segment is drawn from ([`API_MAPPING_KEY_ILLEGAL_CHARACTER`]). Neither rule
+/// speaks of a TRAILING separator, so `a/` is accepted. A key the request omitted, or
+/// sent empty, is the root mapping — the base path of the domain itself — so it has no
+/// segment to check and is accepted.
+///
+/// `Err` carries the message for the operation's `BadRequestException`.
+pub fn validate_api_mapping_key(key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Ok(());
+    }
+    if key.starts_with('/') || key.contains("//") {
+        return Err(API_MAPPING_KEY_MALFORMED_PATH.to_string());
+    }
+    let legal = |character: char| {
+        character.is_ascii_alphanumeric() || API_MAPPING_KEY_PUNCTUATION.contains(character)
+    };
+    if key.split('/').any(|segment| !segment.chars().all(legal)) {
+        return Err(API_MAPPING_KEY_ILLEGAL_CHARACTER.to_string());
+    }
+    Ok(())
+}
 
 /// The most authorizers one api may hold, after which CreateAuthorizer is refused.
 ///
@@ -3099,6 +3176,70 @@ pub struct DomainName {
     /// whose endpoints have never been migrated. Until it passes the domain name reports
     /// `UPDATING` and refuses a further update; after it, `AVAILABLE`.
     pub migration_due_at: Option<SystemTime>,
+    /// This domain name's API mappings, keyed by `ApiMappingId`. A mapping is addressed
+    /// only under the domain that owns it
+    /// (`/v2/domainnames/{DomainName}/apimappings/{ApiMappingId}`), so it is stored
+    /// INSIDE the record rather than in a second map that could outlive a deleted
+    /// domain name. `BTreeMap` for the stable key order `GetApiMappings` pages over.
+    pub api_mappings: BTreeMap<String, ApiMapping>,
+    /// Drives [`DomainName::mint_api_mapping_id`]. Per-domain, because an
+    /// `ApiMappingId` only has to be unique within the domain name that owns it.
+    pub api_mapping_id_seed: u64,
+}
+
+impl DomainName {
+    /// Mint a fresh `ApiMappingId` for this domain name: ten lowercase alphanumerics,
+    /// never one this domain name already minted.
+    pub fn mint_api_mapping_id(&mut self) -> String {
+        self.api_mapping_id_seed = self.api_mapping_id_seed.wrapping_add(1);
+        mint_id(IdKind::ApiMapping, self.api_mapping_id_seed)
+    }
+
+    /// This domain name's mapping whose base path is `key`, if it holds one.
+    ///
+    /// The base path is what a request is matched on, so it identifies the mapping
+    /// within its domain name: no two mappings of one domain name may carry the same
+    /// one. An absent and an empty `ApiMappingKey` are the SAME base path — the root of
+    /// the domain — which is why the comparison goes through
+    /// [`ApiMapping::base_path`].
+    pub fn api_mapping_for_key(&self, key: &str) -> Option<&ApiMapping> {
+        self.api_mappings
+            .values()
+            .find(|mapping| mapping.base_path() == key)
+    }
+}
+
+/// A persisted `ApiMapping`: one base path of a custom domain name, and the api stage
+/// requests on that base path are routed to.
+///
+/// Keyed in its owning [`DomainName`] by [`ApiMapping::api_mapping_id`].
+#[derive(Debug, Clone)]
+pub struct ApiMapping {
+    pub api_mapping_id: String,
+    pub api_id: String,
+    /// The base path as the request wrote it, kept verbatim so a read reports back
+    /// exactly what was stored; `None` is the root mapping (the request named no key).
+    pub api_mapping_key: Option<String>,
+    /// The `StageName` of the stage of [`ApiMapping::api_id`] this mapping routes to.
+    pub stage: String,
+}
+
+impl ApiMapping {
+    /// The base path this mapping occupies on its domain name: the key the request gave,
+    /// or the empty path for the root mapping. This is the value mappings are unique on.
+    pub fn base_path(&self) -> &str {
+        self.api_mapping_key.as_deref().unwrap_or("")
+    }
+
+    /// Project the record onto the modelled `ApiMapping` shape.
+    pub fn to_wire(&self) -> wire::ApiMapping {
+        wire::ApiMapping {
+            api_id: self.api_id.clone(),
+            api_mapping_id: Some(self.api_mapping_id.clone()),
+            api_mapping_key: self.api_mapping_key.clone(),
+            stage: self.stage.clone(),
+        }
+    }
 }
 
 impl DomainName {
