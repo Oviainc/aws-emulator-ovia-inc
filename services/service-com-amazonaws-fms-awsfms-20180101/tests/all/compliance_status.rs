@@ -244,6 +244,14 @@ pub(crate) fn seed_violations(
                     n.to_string(),
                 )])),
                 detected_at,
+                // The per-resource detail `GetViolationDetails` reports is not
+                // what these compliance suites are about, so these rows record a
+                // violation with no finding of that shape and no resource tags or
+                // description; the `violation_details` suite is where a recorded
+                // detail is seeded and read back.
+                resource_violations: Vec::new(),
+                resource_tags: None,
+                resource_description: None,
             };
             // The modelled projection of a recorded violation reports exactly
             // what was recorded, which is what the compliance DETAIL slice reads.

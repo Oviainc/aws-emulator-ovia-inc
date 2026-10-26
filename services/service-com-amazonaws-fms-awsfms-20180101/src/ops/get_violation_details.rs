@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetViolationDetails
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetViolationDetails`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetViolationDetails::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports, for ONE violating resource of ONE stored policy in ONE member
+//! account, the `ViolationDetail` the store records for that triple: what the
+//! evaluation found wrong with the resource, where `GetComplianceDetail` only
+//! NAMES the resource as a violator and `ListComplianceStatus` only counts it.
+//!
+//! The read is organisation-scoped — it answers about an organisation member
+//! account — so with no Firewall Manager administrator association in this
+//! account/Region it is refused by [`crate::state::require_administrator`]
+//! BEFORE any identifier is looked up. The identifiers are then resolved in the
+//! order they narrow: a `PolicyId` naming no stored policy, a `MemberAccount`
+//! the stored policy does not apply to
+//! ([`crate::state::ComAmazonawsFmsAwsfms20180101State::policy_scope_accounts`],
+//! the same scope the compliance surfaces enumerate), and a (`ResourceId`,
+//! `ResourceType`) pair the policy's violations in that account do not record
+//! are all the modelled not-found: Firewall Manager holds violation detail only
+//! for a resource an evaluation found violating, and only in an account the
+//! policy applies to.
+//!
+//! The detail itself is
+//! [`crate::state::ComAmazonawsFmsAwsfms20180101State::resource_violation_detail`],
+//! which reads the SAME violation inventory the compliance surfaces read, so no
+//! two of them can disagree. Nothing is invented and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +166,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetViolationDetails` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetViolationDetailsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetViolationDetails"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetViolationDetailsErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the Firewall Manager store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        // Authorization FIRST, before any identifier is looked up: this read
+        // answers about an organisation member account, so a caller that is
+        // neither a Firewall Manager administrator nor the organisation's
+        // management account is refused identically whatever it sent — a refusal
+        // that leaked whether the policy or the resource exists would tell an
+        // unauthorized caller what the organisation holds.
+        crate::state::require_administrator(&store, &region)?;
+
+        // "The ID of the Firewall Manager policy that you want the details for":
+        // an id naming no stored policy is the modelled not-found.
+        let Some(policy) = store.policies.get(&input.policy_id) else {
+            return Err(GetViolationDetailsErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            )
+            .into());
+        };
+
+        // "The Amazon Web Services account ID that you want the details for" is a
+        // MEMBER account of the policy: Firewall Manager evaluates a policy
+        // against the accounts the policy applies to, the same scope the
+        // compliance surfaces report one entry per. An account outside that scope
+        // was never evaluated against this policy, so it holds no violation of it
+        // to detail, and the request is the same modelled not-found as an unknown
+        // policy.
+        if !store
+            .policy_scope_accounts(&policy.policy)
+            .contains(&input.member_account)
+        {
+            return Err(GetViolationDetailsErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            )
+            .into());
+        }
+
+        // "The ID of the resource that has violations", of "the resource type"
+        // the request names: the detail exists for exactly the resources the
+        // store records as violating THIS policy in THIS account. A resource with
+        // no recorded violation — including one recorded under another resource
+        // type — has no detail to report, rather than an empty detail that would
+        // claim an evaluation of the resource found nothing.
+        let Some(detail) = store.resource_violation_detail(
+            &input.policy_id,
+            &input.member_account,
+            &input.resource_id,
+            &input.resource_type,
+        ) else {
+            return Err(GetViolationDetailsErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            )
+            .into());
+        };
+
+        Ok(GetViolationDetailsOutput {
+            violation_detail: Some(detail),
+        })
     }
 }

@@ -31,6 +31,11 @@ mod third_party_firewall_association;
 #[path = "all/tag_index_single_writer.rs"]
 mod tag_index_single_writer;
 
+// Declared beside them, for the same reason: this suite's name sorts past the
+// end of the contended region of the list below.
+#[path = "all/violation_details.rs"]
+mod violation_details;
+
 #[path = "all/admin_account_disassociation.rs"]
 mod admin_account_disassociation;
 #[path = "all/admin_account_scopes.rs"]

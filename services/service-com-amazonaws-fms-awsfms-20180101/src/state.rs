@@ -19,7 +19,8 @@ use crate::ops::types::{
     DiscoveredResource, EvaluationResult, InvalidOperationException, OrganizationalUnitScope,
     Policy, PolicyComplianceDetail, PolicyComplianceStatus,
     PolicySummary, PolicyTypeScope, ProtocolsListData, ProtocolsListDataSummary, RegionScope,
-    ResourceNotFoundException, ResourceSet, ResourceSetSummary, Tag,
+    ResourceNotFoundException, ResourceSet, ResourceSetSummary, ResourceViolation, Tag,
+    ViolationDetail,
 };
 
 /// The Region an emulated service reports when the request carries no SigV4
@@ -969,6 +970,27 @@ pub struct PolicyViolationRecord {
     /// Further detail about the violating resource
     /// (`ComplianceViolator$Metadata`).
     pub metadata: Option<HashMap<String, String>>,
+    /// What the evaluation found wrong with the resource, as the per-resource
+    /// read reports it (`ViolationDetail$ResourceViolations`): one entry per
+    /// finding, each naming the finding's own kind through the `ResourceViolation`
+    /// member that models it.
+    ///
+    /// Held here rather than derived, for the reason the inventory exists at all:
+    /// a finding of this shape is what an evaluation of the resource PRODUCES,
+    /// and this emulator stands in for no evaluator — so the detail is exactly
+    /// what was recorded with the violation, and a violation recorded with no
+    /// finding of this shape reports none rather than one worded here.
+    pub resource_violations: Vec<ResourceViolation>,
+    /// The tags the violating resource carried when the violation was recorded
+    /// (`ViolationDetail$ResourceTags`). `None` when the evaluation recorded
+    /// none: the violating resource belongs to another service, so its tags are
+    /// not this store's own tag index ([`ComAmazonawsFmsAwsfms20180101State::tags_by_arn`],
+    /// which holds the tags of FIREWALL MANAGER resources).
+    pub resource_tags: Option<Vec<Tag>>,
+    /// The "brief description for the requested resource"
+    /// (`ViolationDetail$ResourceDescription`) the evaluation recorded, or `None`
+    /// when it recorded none.
+    pub resource_description: Option<String>,
     /// When the evaluation recorded this violation. It is what moves a
     /// compliance status's `LastUpdated` when the evaluation moves — see
     /// [`ComAmazonawsFmsAwsfms20180101State::policy_compliance_status`].
@@ -1813,6 +1835,52 @@ impl ComAmazonawsFmsAwsfms20180101State {
             expired_at: None,
             issue_info_map: None,
         }
+    }
+
+    /// The `ViolationDetail` of ONE violating resource under ONE stored policy
+    /// in ONE member account: the per-resource read `GetViolationDetails`
+    /// reports, where [`Self::policy_compliance_detail`] reports the same
+    /// evaluation's resources NAMED and [`Self::policy_compliance_status`]
+    /// reports them counted.
+    ///
+    /// It is the same violation inventory all three read, so no two of them can
+    /// disagree about what the evaluation of one account found: a resource this
+    /// answers for is one the compliance detail names as a violator, and every
+    /// member of the answer is read off that recorded violation.
+    ///
+    /// `None` — the caller's not-found — when the inventory records no violation
+    /// of this policy by this resource in this account, and also when it records
+    /// one of a DIFFERENT resource type than the request names: the request
+    /// identifies the resource by its type as well as by its id ("The resource
+    /// type. This is in the format shown in the Amazon Web Services Resource
+    /// Types Reference"), so a recorded violation of another type is not the
+    /// resource that was asked about, and a violation recorded with no resource
+    /// type at all names no type to match.
+    pub fn resource_violation_detail(
+        &self,
+        policy_id: &str,
+        account_id: &str,
+        resource_id: &str,
+        resource_type: &str,
+    ) -> Option<ViolationDetail> {
+        let violation = self
+            .policy_violations
+            .get(&policy_violation_key(policy_id, account_id, resource_id))?;
+        // Read off the RECORD, not off the request: the two are equal here by
+        // the filter, and the record is what the evaluation found.
+        let recorded_type = violation
+            .resource_type
+            .clone()
+            .filter(|recorded| recorded == resource_type)?;
+        Some(ViolationDetail {
+            policy_id: violation.policy_id.clone(),
+            member_account: violation.account_id.clone(),
+            resource_id: violation.resource_id.clone(),
+            resource_type: recorded_type,
+            resource_violations: violation.resource_violations.clone(),
+            resource_tags: violation.resource_tags.clone(),
+            resource_description: violation.resource_description.clone(),
+        })
     }
 
     /// The stored applications list `list_id` names IN THE NAMESPACE
