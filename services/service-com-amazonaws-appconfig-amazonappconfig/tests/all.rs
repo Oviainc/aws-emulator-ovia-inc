@@ -37,6 +37,8 @@ mod delete_experiment_definition;
 mod delete_extension_association;
 #[path = "all/delete_hosted_configuration_version.rs"]
 mod delete_hosted_configuration_version;
+#[path = "all/deployment_strategy_patch_paces_deployments.rs"]
+mod deployment_strategy_patch_paces_deployments;
 #[path = "all/deployment_wire_fidelity.rs"]
 mod deployment_wire_fidelity;
 #[path = "all/environment_state_wire_form.rs"]
