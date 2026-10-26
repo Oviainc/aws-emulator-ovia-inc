@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTrafficPolicyInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTrafficPolicyInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTrafficPolicyInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -102,6 +93,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::Instant;
+
+use crate::state::{
+    canonical_dns_name, name_is_in_zone, name_not_permitted_in_zone_message, no_such_hosted_zone,
+    no_such_traffic_policy, normalize_zone_id, record_set_already_exists_message,
+    resource_location, zone_record_set_limit_message, RecordKey, StoredTrafficPolicyInstance,
+    MAX_RECORD_SETS_PER_ZONE, MAX_TRAFFIC_POLICY_INSTANCES, TRAFFIC_POLICY_INSTANCE_PROPAGATION,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -174,18 +174,212 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTrafficPolicyInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTrafficPolicyInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`; `InvalidInput` is the only error this
+            // operation models that can carry the reason at all.
+            CreateTrafficPolicyInstanceErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        // A caller may address the zone by the bare id or by the
+        // `/hostedzone/`-prefixed form a response handed it back, and the
+        // instance's record sets are stored and reported under the ONE
+        // canonical form of their name, whatever spelling the request used.
+        let zone_id = normalize_zone_id(&input.hosted_zone_id).to_string();
+        let name = canonical_dns_name(&input.name);
+
+        let mut store = state.lock();
+
+        let zone = store.zones.get(&zone_id).ok_or_else(|| {
+            CreateTrafficPolicyInstanceErrorModeled::NoSuchHostedZone(no_such_hosted_zone(
+                &input.hosted_zone_id,
+            ))
+        })?;
+        let zone_name = zone.name.clone();
+        let zone_record_count = zone.records.len();
+
+        // The record sets are generated from ONE VERSION of the policy, and
+        // that version's document is what fixes the `RRType` they carry
+        // (`TrafficPolicyInstance$TrafficPolicyType`), so the type is read off
+        // the stored policy version rather than taken from the request, which
+        // carries no type at all. A policy id the account does not hold and a
+        // version that policy does not hold are the same refusal: there is no
+        // such traffic policy version to generate record sets from.
+        let traffic_policy_type = store
+            .traffic_policies
+            .get(&input.traffic_policy_id)
+            .and_then(|policy| policy.versions.get(&input.traffic_policy_version))
+            .map(|version| version.record_type.clone())
+            .ok_or_else(|| {
+                CreateTrafficPolicyInstanceErrorModeled::NoSuchTrafficPolicy(
+                    no_such_traffic_policy(
+                        &input.traffic_policy_id,
+                        Some(input.traffic_policy_version),
+                    ),
+                )
+            })?;
+
+        // The record sets are created IN that hosted zone, so the name they
+        // answer for has to be one the zone owns — the same rule, and the same
+        // sentence, a change batch writing a record set is held to.
+        if !name_is_in_zone(&name, &zone_name) {
+            return Err(CreateTrafficPolicyInstanceErrorModeled::InvalidInput(
+                InvalidInput {
+                    message: Some(name_not_permitted_in_zone_message(&name, &zone_name)),
+                },
+            )
+            .into());
+        }
+
+        // The account's own quota: a caller chooses the name freely, so without
+        // this the store would grow for every distinct one it sends.
+        if store.traffic_policy_instances.len() >= MAX_TRAFFIC_POLICY_INSTANCES {
+            return Err(
+                CreateTrafficPolicyInstanceErrorModeled::TooManyTrafficPolicyInstances(
+                    TooManyTrafficPolicyInstances {
+                        message: Some(format!(
+                            "the current account has reached the limit of \
+                             {MAX_TRAFFIC_POLICY_INSTANCES} traffic policy instances"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // An instance owns the record sets it generated, and a zone holds at
+        // most one record set at a given name and type, so an instance already
+        // answering for this name and type in this zone leaves a second one
+        // with no record set to create. The refusal names what the REQUEST
+        // asked for — the zone, the name and the type — and not the id of the
+        // instance already holding them: that id is server-generated, so a
+        // refusal quoting it would differ on every run, and the instance
+        // holding the name is in state, where a traffic-policy-instance read
+        // reports it.
+        if store
+            .traffic_policy_instance_for(&zone_id, &name, &traffic_policy_type)
+            .is_some()
+        {
+            return Err(
+                CreateTrafficPolicyInstanceErrorModeled::TrafficPolicyInstanceAlreadyExists(
+                    TrafficPolicyInstanceAlreadyExists {
+                        message: Some(format!(
+                            "A traffic policy instance already exists with DNS name {name} and \
+                             type {traffic_policy_type} in hosted zone {zone_id}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A record set this instance did NOT generate — one a change batch
+        // wrote — occupies the same (name, type) identity, so there is no
+        // record set for this instance to create either. Reported through the
+        // one sentence this service refuses a create over an existing record
+        // set with. The generated record set is the single one at that name and
+        // type, so it carries no `SetIdentifier` to tell it from siblings.
+        let record_key = RecordKey::of(&name, &traffic_policy_type, None);
+        if store
+            .zones
+            .get(&zone_id)
+            .is_some_and(|zone| zone.records.contains_key(&record_key))
+        {
+            return Err(CreateTrafficPolicyInstanceErrorModeled::InvalidInput(
+                InvalidInput {
+                    message: Some(record_set_already_exists_message(
+                        &name,
+                        &traffic_policy_type,
+                        None,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The zone's own quota, the same one a change batch is held to: a zone
+        // cannot be grown past it by repeated creates.
+        if zone_record_count + 1 > MAX_RECORD_SETS_PER_ZONE {
+            return Err(CreateTrafficPolicyInstanceErrorModeled::InvalidInput(
+                InvalidInput {
+                    message: Some(zone_record_set_limit_message(
+                        &input.hosted_zone_id,
+                        zone_record_count + 1,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_traffic_policy_instance_id();
+
+        // The record sets the instance generates, which is what this operation
+        // DOES: "Creates resource record sets in a specified hosted zone based
+        // on the settings in a specified traffic policy version." One record
+        // set at the name and type the instance answers for, cached for the
+        // instance's own TTL — `TrafficPolicyInstance$TTL` is "the TTL that
+        // Amazon Route 53 assigned to all of the resource record sets that it
+        // created in the specified hosted zone" — and carrying the id of the
+        // instance it belongs to: `ResourceRecordSet$TrafficPolicyInstanceId`
+        // is exactly that, "When you create a traffic policy instance, Amazon
+        // Route 53 automatically creates a resource record set.
+        // TrafficPolicyInstanceId is the ID of the traffic policy instance that
+        // Route 53 created this resource record set for." It is therefore
+        // reported by the same `ListResourceRecordSets` the zone's other record
+        // sets are, and is the record set a later delete of the instance takes
+        // away. The record DATA stays absent rather than being invented: the
+        // endpoints the policy document routes to are chosen by its rule graph,
+        // which this emulator does not evaluate.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTrafficPolicyInstance"))
+        // Written BEFORE the instance record, so an instance is never persisted
+        // without the record set it owns: the zone was read under this same
+        // lock, so this lookup resolves, and a request that somehow found no
+        // zone here is refused with nothing written rather than half of it.
+        let zone = store.zones.get_mut(&zone_id).ok_or_else(|| {
+            CreateTrafficPolicyInstanceErrorModeled::NoSuchHostedZone(no_such_hosted_zone(
+                &input.hosted_zone_id,
+            ))
+        })?;
+        zone.records.insert(
+            record_key,
+            ResourceRecordSet {
+                name: name.clone(),
+                r#type: traffic_policy_type.clone(),
+                ttl: Some(input.ttl),
+                traffic_policy_instance_id: Some(id.clone()),
+                ..ResourceRecordSet::default()
+            },
+        );
+
+        store.traffic_policy_instances.insert(
+            id.clone(),
+            StoredTrafficPolicyInstance {
+                id: id.clone(),
+                hosted_zone_id: zone_id.clone(),
+                name: name.clone(),
+                ttl: input.ttl,
+                traffic_policy_id: input.traffic_policy_id,
+                traffic_policy_version: input.traffic_policy_version,
+                traffic_policy_type: traffic_policy_type.clone(),
+                // The transition this create owes: the record sets are in place
+                // once Route 53 has finished creating them, so a caller reading
+                // the instance straight back still sees it `Creating`.
+                applied_at: Instant::now() + TRAFFIC_POLICY_INSTANCE_PROPAGATION,
+            },
+        );
+
+        // Read the response back out of the store, so what the caller is told
+        // is what a later GetTrafficPolicyInstance will tell it.
+        let traffic_policy_instance = store
+            .traffic_policy_instances
+            .get(&id)
+            .map(StoredTrafficPolicyInstance::to_traffic_policy_instance)
+            .expect("the traffic policy instance just inserted must be present");
+        Ok(CreateTrafficPolicyInstanceOutput {
+            location: resource_location(ctx, &format!("trafficpolicyinstance/{id}")),
+            traffic_policy_instance,
+        })
     }
 }

@@ -107,9 +107,11 @@
 use super::types::*;
 
 use crate::state::{
-    canonical_dns_name, dns_name_fault, dns_sort_key, name_is_in_zone, no_such_hosted_zone,
-    normalize_zone_id, DnsNameFault, DnsNameKey, RecordKey, MAX_CHANGES_PER_BATCH,
-    MAX_RECORD_SETS_PER_ZONE, MAX_REPORTED_CHANGE_PROBLEMS,
+    canonical_dns_name, dns_name_fault, dns_sort_key, name_is_in_zone,
+    name_not_permitted_in_zone_message, no_such_hosted_zone, normalize_zone_id,
+    record_set_already_exists_message, record_set_label, zone_record_set_limit_message,
+    DnsNameFault, DnsNameKey, RecordKey, MAX_CHANGES_PER_BATCH, MAX_RECORD_SETS_PER_ZONE,
+    MAX_REPORTED_CHANGE_PROBLEMS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -176,13 +178,7 @@ impl Problems {
 /// sentence the label sits in, and a member the request did not give is not
 /// reported as a literal `null`.
 fn change_label(record: &ResourceRecordSet) -> String {
-    let set_identifier = set_identifier_of(record)
-        .map(|id| format!(", set-identifier='{id}'"))
-        .unwrap_or_default();
-    format!(
-        "[name='{}', type='{}'{set_identifier}]",
-        record.name, record.r#type
-    )
+    record_set_label(&record.name, &record.r#type, set_identifier_of(record))
 }
 
 /// The `SetIdentifier` a record set carries, if it carries one.
@@ -767,10 +763,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let key = RecordKey::of_record(&record);
 
             if !name_is_in_zone(&record.name, &zone_name) {
-                problems.push(format!(
-                    "RRSet with DNS name {} is not permitted in zone {zone_name}",
-                    record.name
-                ));
+                problems.push(name_not_permitted_in_zone_message(&record.name, &zone_name));
                 continue;
             }
 
@@ -818,9 +811,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             match action {
                 "CREATE" => {
                     if current.is_some() {
-                        problems.push(format!(
-                            "Tried to create resource record set {} but it already exists",
-                            change_label(&record)
+                        problems.push(record_set_already_exists_message(
+                            &record.name,
+                            &record.r#type,
+                            set_identifier_of(&record),
                         ));
                     } else {
                         record_count += 1;
@@ -932,10 +926,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The zone's own quota: a zone cannot be grown past it by repeated
         // CREATE/UPSERT.
         if record_count > MAX_RECORD_SETS_PER_ZONE {
-            problems.push(format!(
-                "The hosted zone {} would hold {record_count} resource record sets, more than \
-                 the maximum of {MAX_RECORD_SETS_PER_ZONE} per hosted zone",
-                input.hosted_zone_id
+            problems.push(zone_record_set_limit_message(
+                &input.hosted_zone_id,
+                record_count,
             ));
         }
 

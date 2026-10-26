@@ -40,8 +40,9 @@ use crate::ops::types::shared_types::{
     ChangeInfo, ConflictingDomainExists, DelegationSet, HealthCheck, HealthCheckConfig,
     HealthCheckObservation, HostedZone, HostedZoneConfig, HostedZoneFeatures,
     InvalidPaginationToken, InvalidTrafficPolicyDocument, KeySigningKey, NoSuchDelegationSet,
-    NoSuchHealthCheck, NoSuchHostedZone, NoSuchTrafficPolicy, ResourceRecordSet, StatusReport, Tag,
-    TrafficPolicy, VPC, HEALTH_CHECK_REGION_VALUES, R_R_TYPE_VALUES, V_P_C_REGION_VALUES,
+    NoSuchHealthCheck, NoSuchHostedZone, NoSuchTrafficPolicy, NoSuchTrafficPolicyInstance,
+    ResourceRecordSet, StatusReport, Tag, TrafficPolicy, TrafficPolicyInstance, VPC,
+    HEALTH_CHECK_REGION_VALUES, R_R_TYPE_VALUES, V_P_C_REGION_VALUES,
 };
 
 /// How long after a change is submitted it reaches `INSYNC`.
@@ -381,6 +382,35 @@ pub const FIRST_TRAFFIC_POLICY_POSITION: u64 = 1;
 /// the same ceiling `TrafficPolicyVersion` (`range 1..1000`) allows a version
 /// number to carry.
 pub const MAX_TRAFFIC_POLICY_VERSION: i32 = 1000;
+
+/// How long after a traffic policy instance is created or updated Route 53 has
+/// finished creating the resource record sets it generates.
+///
+/// `CreateTrafficPolicyInstance`'s own model documentation: "After you submit an
+/// CreateTrafficPolicyInstance request, there's a brief delay while Amazon Route
+/// 53 creates the resource record sets that are specified in the traffic policy
+/// definition. Use GetTrafficPolicyInstance with the id of new traffic policy
+/// instance to confirm that the CreateTrafficPolicyInstance request completed
+/// successfully." Nothing publishes how long that delay is, so the span is this
+/// emulator's own: short, but NEVER zero — a caller that reads the instance
+/// straight back still observes the `Creating` state the documentation tells it
+/// to poll out of, exactly as it would against Route 53.
+pub const TRAFFIC_POLICY_INSTANCE_PROPAGATION: Duration = Duration::from_millis(500);
+
+/// The `State` of a traffic policy instance whose record sets are still being
+/// created.
+///
+/// `TrafficPolicyInstance$State`'s own documentation: "Creating: Route 53 is
+/// creating the resource record sets. Use GetTrafficPolicyInstance to confirm
+/// that the CreateTrafficPolicyInstance request completed successfully."
+pub const TRAFFIC_POLICY_INSTANCE_CREATING: &str = "Creating";
+
+/// The `State` of a traffic policy instance whose record sets are in place.
+///
+/// `TrafficPolicyInstance$State`'s own documentation: "Applied: Amazon Route 53
+/// has finished creating resource record sets, and changes have propagated to
+/// all Route 53 edge locations."
+pub const TRAFFIC_POLICY_INSTANCE_APPLIED: &str = "Applied";
 
 /// The `AWSPolicyFormatVersion` a traffic policy document declares.
 ///
@@ -1343,6 +1373,79 @@ impl StoredTrafficPolicy {
     }
 }
 
+/// A traffic policy instance: the hosted zone, DNS name and TTL one version of
+/// one traffic policy was applied to, and the instant its record sets are in
+/// place.
+///
+/// The POLICY is not copied in — only its id, version and the `RRType` that
+/// version's document names, which is the type the generated record sets carry
+/// (`TrafficPolicyInstance$TrafficPolicyType`): the document itself stays in
+/// [`ComAmazonawsRoute53Awsdnsv20130401State::traffic_policies`], so an instance
+/// and the policy it was created from cannot disagree about it.
+#[derive(Debug, Clone)]
+pub struct StoredTrafficPolicyInstance {
+    /// The instance id, which is also this record's key in
+    /// [`ComAmazonawsRoute53Awsdnsv20130401State::traffic_policy_instances`].
+    pub id: String,
+    /// The BARE id of the hosted zone the record sets were created in.
+    pub hosted_zone_id: String,
+    /// The DNS name the record sets answer for, in the canonical form
+    /// [`canonical_dns_name`] gives — the same form the record sets themselves
+    /// are stored under.
+    pub name: String,
+    /// The `TTL` the generated record sets are cached for.
+    pub ttl: i64,
+    /// The id of the traffic policy the record sets were generated from.
+    pub traffic_policy_id: String,
+    /// The version of that policy the record sets were generated from.
+    pub traffic_policy_version: i32,
+    /// The `RRType` that policy version's document names, which is the type of
+    /// every record set generated for this instance.
+    pub traffic_policy_type: String,
+    /// The instant the generated record sets are in place; see
+    /// [`TRAFFIC_POLICY_INSTANCE_PROPAGATION`].
+    pub applied_at: Instant,
+}
+
+impl StoredTrafficPolicyInstance {
+    /// The modelled `TrafficPolicyInstance` for this record.
+    ///
+    /// The ONE projection every traffic-policy-instance response is built from,
+    /// so a create and a later read cannot report one instance differently.
+    pub fn to_traffic_policy_instance(&self) -> TrafficPolicyInstance {
+        TrafficPolicyInstance {
+            id: self.id.clone(),
+            hosted_zone_id: self.hosted_zone_id.clone(),
+            name: self.name.clone(),
+            ttl: self.ttl,
+            state: self.state().to_string(),
+            // "If `State` is `Failed`, an explanation of the reason for the
+            // failure. If `State` is another value, `Message` is empty"
+            // (`TrafficPolicyInstance$Message`). No instance this store holds
+            // failed — a request whose record sets cannot be created is refused
+            // before the instance exists — so the explanation is empty.
+            message: String::new(),
+            traffic_policy_id: self.traffic_policy_id.clone(),
+            traffic_policy_version: self.traffic_policy_version,
+            traffic_policy_type: self.traffic_policy_type.clone(),
+        }
+    }
+
+    /// The `State` a read reports: `Creating` until the record sets are in
+    /// place, `Applied` from then on.
+    ///
+    /// Derived from the clock, so the transition the create owes comes due by
+    /// itself: no read has to be told about it, and reporting the state leaves
+    /// the store exactly as it was.
+    pub fn state(&self) -> &'static str {
+        if Instant::now() >= self.applied_at {
+            TRAFFIC_POLICY_INSTANCE_APPLIED
+        } else {
+            TRAFFIC_POLICY_INSTANCE_CREATING
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-route53-awsdnsv20130401. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsRoute53Awsdnsv20130401State {
@@ -1363,6 +1466,10 @@ pub struct ComAmazonawsRoute53Awsdnsv20130401State {
     /// over a stable total order of policy ids. Bounded by
     /// [`MAX_TRAFFIC_POLICIES`].
     pub traffic_policies: BTreeMap<String, StoredTrafficPolicy>,
+    /// Every traffic policy instance of the account's, keyed by its id. A
+    /// `BTreeMap` so a listing pages over a stable total order of instance ids.
+    /// Bounded by [`MAX_TRAFFIC_POLICY_INSTANCES`].
+    pub traffic_policy_instances: BTreeMap<String, StoredTrafficPolicyInstance>,
     /// Every health check of the account's, keyed by its id. A `BTreeMap` so a
     /// listing pages over a stable total order of health-check ids. Bounded by
     /// [`MAX_HEALTH_CHECKS`].
@@ -1407,6 +1514,7 @@ impl Default for ComAmazonawsRoute53Awsdnsv20130401State {
             changes: HashMap::new(),
             change_order: VecDeque::new(),
             traffic_policies: BTreeMap::new(),
+            traffic_policy_instances: BTreeMap::new(),
             health_checks: BTreeMap::new(),
             health_check_by_caller_reference: HashMap::new(),
             delegation_sets: BTreeMap::new(),
@@ -1439,6 +1547,18 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
         loop {
             let id = self.ids.mint_uuid();
             if !self.traffic_policies.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// Mint a traffic policy instance id: 8-4-4-4-12 lowercase hex, the form
+    /// Route 53 returns for one (`TrafficPolicyInstanceId` is `len 1..36`,
+    /// which is that form's length). Retried until it is unused.
+    pub fn mint_traffic_policy_instance_id(&mut self) -> String {
+        loop {
+            let id = self.ids.mint_uuid();
+            if !self.traffic_policy_instances.contains_key(&id) {
                 return id;
             }
         }
@@ -1554,6 +1674,31 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
             .find(|policy| policy.name == name)
     }
 
+    /// The traffic policy instance that already answers for `name` at
+    /// `rr_type` in the hosted zone `zone_id`, if the account holds one.
+    ///
+    /// An instance OWNS the record sets it generated
+    /// (`ResourceRecordSet$TrafficPolicyInstanceId`), and a zone holds at most
+    /// one record set at a given name and type, so a second instance over the
+    /// same name and type in the same zone would have no record set to create:
+    /// that is the request `TrafficPolicyInstanceAlreadyExists` refuses.
+    /// Compared by the name's IDENTITY, so every spelling of one DNS name finds
+    /// the same instance, and searched off the store rather than tracked beside
+    /// it, so an instance that is deleted frees its name by itself.
+    pub fn traffic_policy_instance_for(
+        &self,
+        zone_id: &str,
+        name: &str,
+        rr_type: &str,
+    ) -> Option<&StoredTrafficPolicyInstance> {
+        let name_key = dns_sort_key(name);
+        self.traffic_policy_instances.values().find(|instance| {
+            instance.hosted_zone_id == zone_id
+                && instance.traffic_policy_type == rr_type
+                && dns_sort_key(&instance.name) == name_key
+        })
+    }
+
     /// The creation position the account's NEXT traffic policy takes: one past
     /// the highest any policy it holds carries.
     ///
@@ -1649,11 +1794,10 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
             ACCOUNT_LIMIT_MAX_REUSABLE_DELEGATION_SETS => {
                 (MAX_REUSABLE_DELEGATION_SETS, self.delegation_sets.len())
             }
-            // `CreateTrafficPolicyInstance` is still a scaffold, so nothing can
-            // bring a traffic policy instance into being and the account holds
-            // none; the count comes from the collection this struct grows when
-            // that create is implemented.
-            ACCOUNT_LIMIT_MAX_TRAFFIC_POLICY_INSTANCES => (MAX_TRAFFIC_POLICY_INSTANCES, 0),
+            ACCOUNT_LIMIT_MAX_TRAFFIC_POLICY_INSTANCES => (
+                MAX_TRAFFIC_POLICY_INSTANCES,
+                self.traffic_policy_instances.len(),
+            ),
             _ => return None,
         };
         Some((count_as_i64(limit), count_as_i64(count)))
@@ -2100,6 +2244,84 @@ pub fn no_such_traffic_policy(
             None => format!("No traffic policy exists with ID {requested_id}"),
         }),
     }
+}
+
+/// The modelled `NoSuchTrafficPolicyInstance` (HTTP 404) for a request that
+/// names no traffic policy instance in this store.
+///
+/// The ONE place this service words that refusal, beside
+/// [`no_such_traffic_policy`], so every operation addressed at a traffic policy
+/// instance answers a missing one identically. REQUEST-DERIVED: it names the id
+/// the request asked about, which is what lets a caller tell which of a batch of
+/// ids was the missing one. The shape's own documentation states the rule it
+/// reports: "No traffic policy instance exists with the specified ID."
+pub fn no_such_traffic_policy_instance(requested_id: &str) -> NoSuchTrafficPolicyInstance {
+    NoSuchTrafficPolicyInstance {
+        message: Some(format!(
+            "No traffic policy instance exists with ID {requested_id}"
+        )),
+    }
+}
+
+/// The one sentence this service refuses a DNS name that the hosted zone the
+/// request names does not own with.
+///
+/// A zone answers only for names inside it ([`name_is_in_zone`]), so a record
+/// set — whether a change batch writes it or a traffic policy instance
+/// generates it — can only be created at a name the zone owns. REQUEST-DERIVED:
+/// it names the name that was asked for and the zone that does not own it. One
+/// sentence, so the change path and the traffic-policy-instance path cannot
+/// word one rule differently.
+pub fn name_not_permitted_in_zone_message(name: &str, zone_name: &str) -> String {
+    format!("RRSet with DNS name {name} is not permitted in zone {zone_name}")
+}
+
+/// How a refusal names the record set it is about: `[name='<name>',
+/// type='<type>']`, and `set-identifier='<id>'` as well when the record set
+/// carries one.
+///
+/// A record set is named by what IDENTIFIES it — the name it answers for, its
+/// record type and, for a member of a routing group, the identifier that tells
+/// it from its siblings. One helper, so every refusal about a record set names
+/// it the same way, whichever operation raises it.
+pub fn record_set_label(name: &str, rr_type: &str, set_identifier: Option<&str>) -> String {
+    let set_identifier = set_identifier
+        .filter(|id| !id.is_empty())
+        .map(|id| format!(", set-identifier='{id}'"))
+        .unwrap_or_default();
+    format!("[name='{name}', type='{rr_type}'{set_identifier}]")
+}
+
+/// The one sentence this service refuses a create over a record set a zone
+/// already holds with.
+///
+/// A zone holds at most one record set per `(name, type, set identifier)`, so a
+/// create over one that is already there has nothing to create — whether a
+/// change batch or a traffic policy instance asked for it. REQUEST-DERIVED: it
+/// names the record set that was asked for and nothing else.
+pub fn record_set_already_exists_message(
+    name: &str,
+    rr_type: &str,
+    set_identifier: Option<&str>,
+) -> String {
+    format!(
+        "Tried to create resource record set {} but it already exists",
+        record_set_label(name, rr_type, set_identifier)
+    )
+}
+
+/// The one sentence this service refuses a zone that would be grown past
+/// [`MAX_RECORD_SETS_PER_ZONE`] with.
+///
+/// The zone's own quota, whichever operation would add the record set, so both
+/// the change path and the traffic-policy-instance create word it identically.
+/// REQUEST-DERIVED: it names the zone id as the request wrote it and how many
+/// record sets that request would leave the zone holding.
+pub fn zone_record_set_limit_message(requested_zone_id: &str, would_hold: usize) -> String {
+    format!(
+        "The hosted zone {requested_zone_id} would hold {would_hold} resource record sets, more \
+         than the maximum of {MAX_RECORD_SETS_PER_ZONE} per hosted zone"
+    )
 }
 
 /// The modelled `InvalidTrafficPolicyDocument` (HTTP 400) for a document the
