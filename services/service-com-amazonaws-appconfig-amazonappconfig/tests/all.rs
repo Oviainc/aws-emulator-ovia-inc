@@ -55,6 +55,8 @@ mod extension_associations;
 mod extensions;
 #[path = "all/feature_flag_metadata.rs"]
 mod feature_flag_metadata;
+#[path = "all/get_configuration.rs"]
+mod get_configuration;
 #[path = "all/list_applications.rs"]
 mod list_applications;
 #[path = "all/list_configuration_profiles.rs"]

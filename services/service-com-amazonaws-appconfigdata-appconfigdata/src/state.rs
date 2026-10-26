@@ -24,7 +24,8 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use ::service_com_amazonaws_appconfig_amazonappconfig::state::{
-    ComAmazonawsAppconfigAmazonappconfigState as AppConfigState, Deployment, DEPLOYMENT_COMPLETE,
+    configuration_version_not_hosted, no_deployed_configuration,
+    ComAmazonawsAppconfigAmazonappconfigState as AppConfigState,
 };
 
 /// How long a configuration token stays usable after it is minted.
@@ -449,29 +450,24 @@ pub fn served_configuration<Eng: Send + Sync + 'static>(
     // copy up to date leaves the stored record untouched.
     let mut environment = environment.clone();
     environment.materialize(now);
-    let in_force = environment
-        .deployments
-        .values()
-        .filter(|deployment| {
-            deployment.configuration_profile_id == resolved.configuration_profile_id
-                && configuration_is_in_force(deployment)
-        })
-        .max_by_key(|deployment| deployment.deployment_number);
 
-    let Some(deployment) = in_force else {
-        return Some(Err(UnresolvedResource::configuration(format!(
-            "No deployed configuration found for application '{application_identifier}', \
-             environment '{environment_identifier}' and configuration profile \
-             '{configuration_profile_identifier}'."
-        ))));
+    let Some(deployment) = environment.in_force_deployment(&resolved.configuration_profile_id)
+    else {
+        return Some(Err(UnresolvedResource::configuration(
+            no_deployed_configuration(
+                application_identifier,
+                environment_identifier,
+                configuration_profile_identifier,
+            ),
+        )));
     };
     let Some(version) = profile.resolve_hosted_version(&deployment.configuration_version) else {
-        return Some(Err(UnresolvedResource::configuration(format!(
-            "Configuration version '{version}' of configuration profile \
-             '{configuration_profile_identifier}' is not held in the AppConfig hosted \
-             configuration store.",
-            version = deployment.configuration_version,
-        ))));
+        return Some(Err(UnresolvedResource::configuration(
+            configuration_version_not_hosted(
+                configuration_profile_identifier,
+                &deployment.configuration_version,
+            ),
+        )));
     };
     Some(Ok(ServedConfiguration {
         // What the profile's `Type` makes of the stored bytes: the control plane owns that
@@ -481,13 +477,6 @@ pub fn served_configuration<Eng: Send + Sync + 'static>(
         version_label: version.version_label.clone(),
         version: version.version_number.to_string(),
     }))
-}
-
-/// Whether the configuration a deployment deployed is the one AppConfig is serving: it
-/// is from the moment the rollout begins (`DEPLOYING`, then `BAKING`, then `COMPLETE`),
-/// and stops being so once a caller's stop starts rolling it back.
-fn configuration_is_in_force(deployment: &Deployment) -> bool {
-    deployment.is_in_flight() || deployment.state == DEPLOYMENT_COMPLETE
 }
 
 /// The ids a triple resolves to inside an already-locked AppConfig store.

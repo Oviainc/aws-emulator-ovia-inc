@@ -1483,6 +1483,24 @@ impl Environment {
         self.deployments.values().find(|d| d.is_active())
     }
 
+    /// The deployment whose configuration is in force for `configuration_profile_id`:
+    /// the most recent deployment of that profile into this environment whose
+    /// configuration AppConfig is still serving
+    /// ([`Deployment::serves_the_configuration`]), or `None` when that profile has
+    /// nothing deployed here.
+    ///
+    /// Reads the records as they stand, so a caller that wants the clock's effect on
+    /// them calls [`Self::materialize`] first.
+    pub fn in_force_deployment(&self, configuration_profile_id: &str) -> Option<&Deployment> {
+        self.deployments
+            .values()
+            .filter(|deployment| {
+                deployment.configuration_profile_id == configuration_profile_id
+                    && deployment.serves_the_configuration()
+            })
+            .max_by_key(|deployment| deployment.deployment_number)
+    }
+
     /// Store a new deployment and answer the stored record.
     ///
     /// Only [`MAX_RETAINED_DEPLOYMENTS_PER_ENVIRONMENT`] records are kept: the oldest
@@ -2058,6 +2076,22 @@ impl Deployment {
         self.state == DEPLOYMENT_ROLLING_BACK
     }
 
+    /// Whether the configuration this deployment deployed is the one AppConfig serves
+    /// for its configuration profile.
+    ///
+    /// It is from the moment the rollout begins (`DEPLOYING`, then `BAKING`, then
+    /// `COMPLETE`) and stops being so once a caller's stop starts rolling it back: a
+    /// rollback is returning to, or has returned to, the configuration that preceded
+    /// this one, so a rolled-back or reverted deployment's own version is not what a
+    /// consumer is served.
+    ///
+    /// The one place this service decides it, so every reader of a deployed
+    /// configuration — this service's own `GetConfiguration` and the `appconfigdata`
+    /// poll — agrees about which deployment is in force.
+    pub fn serves_the_configuration(&self) -> bool {
+        self.is_in_flight() || self.state == DEPLOYMENT_COMPLETE
+    }
+
     /// Whether the deployment has not yet reached a state it can no longer leave: it is
     /// rolling out, baking or rolling back, so the service is still working on it.
     pub fn is_active(&self) -> bool {
@@ -2544,6 +2578,44 @@ pub fn hosted_configuration_version_not_found(
         ],
         AccountClause::Reported,
         NOT_FOUND_NO_FULL_STOP,
+    )
+}
+
+/// `Message` for a triple whose three levels all resolve but which has no configuration
+/// deployed into it — nothing was ever deployed for that configuration profile into that
+/// environment, or every deployment of it has since been rolled back or reverted.
+///
+/// Derived from the request: each level is echoed as the caller addressed it, by name or
+/// by id. Shared by every reader of a deployed configuration — this service's
+/// `GetConfiguration` and the `appconfigdata` poll — so one missing deployment is
+/// reported one way.
+pub fn no_deployed_configuration(
+    application_identifier: &str,
+    environment_identifier: &str,
+    configuration_profile_identifier: &str,
+) -> String {
+    format!(
+        "No deployed configuration found for application '{application_identifier}', \
+         environment '{environment_identifier}' and configuration profile \
+         '{configuration_profile_identifier}'."
+    )
+}
+
+/// `Message` for a configuration version a deployment names and AppConfig's hosted
+/// configuration store does not hold, which is every configuration profile whose
+/// `LocationUri` is some other store: the control plane holds the deployment, and the
+/// bytes it deployed live somewhere this emulator cannot read.
+///
+/// Derived from the request and the deployment that was read, and shared with the
+/// `appconfigdata` poll for the same reason [`no_deployed_configuration`] is.
+pub fn configuration_version_not_hosted(
+    configuration_profile_identifier: &str,
+    configuration_version: &str,
+) -> String {
+    format!(
+        "Configuration version '{configuration_version}' of configuration profile \
+         '{configuration_profile_identifier}' is not held in the AppConfig hosted \
+         configuration store."
     )
 }
 

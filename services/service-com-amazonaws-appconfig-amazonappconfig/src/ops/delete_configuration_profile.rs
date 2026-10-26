@@ -183,13 +183,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // runs. What that check looks at is configuration-read activity for this profile
         // inside the account's protection period, and it skips a profile created in the
         // past hour unless the caller asked for `APPLY` (the model's
-        // `DeletionProtectionSettings` documentation). Neither read that records such
-        // activity leaves a mark on this service's state: `GetLatestConfiguration` belongs
-        // to the `appconfigdata` service, and this service's own deprecated
-        // `GetConfiguration` is still a scaffold. So the check has nothing to protect for
-        // any profile here and refuses nothing, whichever value the caller sent — the same
-        // reading `DeleteEnvironment` applies to its own copy of this header. Once a
-        // configuration read is recorded against a profile, the refusal belongs here.
+        // `DeletionProtectionSettings` documentation). No configuration read records such
+        // activity here: neither `appconfigdata`'s `GetLatestConfiguration` nor this
+        // service's own deprecated configuration read marks the profile it served, both
+        // being reporting calls over the deployments already stored. So the check has
+        // nothing to protect for any profile here and refuses nothing, whichever value the
+        // caller sent — the same reading `DeleteEnvironment` applies to its own copy of
+        // this header. Once a configuration read is recorded against a profile, the
+        // refusal belongs here.
         let _requested_check = input.deletion_protection_check;
 
         // A configuration profile only exists under an application, so the parent is

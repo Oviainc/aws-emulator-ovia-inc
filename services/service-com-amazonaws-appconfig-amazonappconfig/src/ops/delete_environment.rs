@@ -182,12 +182,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `DeletionProtectionCheck` asks for deletion protection to be bypassed, applied
         // or left to the account setting. Protection refuses a delete only when the
-        // environment served a configuration inside the protected interval; the call that
-        // would record that (`GetLatestConfiguration`) belongs to the `appconfigdata`
-        // service, so this service observes no such activity. The account-level setting
-        // `GetAccountSettings` reports is stored here, but with no observed activity to
-        // measure against it there is nothing to refuse on, whichever value the caller
-        // sent.
+        // environment served a configuration inside the protected interval, and no
+        // configuration read records that it did: neither `appconfigdata`'s
+        // `GetLatestConfiguration` nor this service's own deprecated configuration read
+        // marks the environment it served, both being reporting calls over the
+        // deployments already stored. The account-level setting `GetAccountSettings`
+        // reports is stored here, but with no recorded activity to measure against it
+        // there is nothing to refuse on, whichever value the caller sent.
         let _requested_check = input.deletion_protection_check;
 
         // An environment only exists under an application, so the parent is resolved

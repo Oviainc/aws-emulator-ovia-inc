@@ -15,10 +15,11 @@
 //! `APPLY` runs the check anyway, `BYPASS` skips it, `ACCOUNT_DEFAULT` follows the
 //! account).
 //!
-//! No configuration read of any profile is on record in this service — the retrieval call
-//! the protection period watches is `appconfigdata`'s `GetLatestConfiguration`, and this
-//! service's own deprecated `GetConfiguration` is still a scaffold — so for every profile
-//! here the check finds no activity to protect, whichever of the three values asks for it.
+//! No configuration read of any profile is on record in this service — no suite here
+//! retrieves a deployed configuration, and the retrieval calls the protection period
+//! watches are `appconfigdata`'s `GetLatestConfiguration` and this service's own
+//! deprecated configuration read — so for every profile here the check finds no activity
+//! to protect, whichever of the three values asks for it.
 //! What the delete then answers is decided by the profile's OWN stored state and nothing
 //! else: 404 when the store does not hold the profile, 400 while hosted configuration
 //! versions remain under it, 204 once neither is true. A delete also writes nothing into

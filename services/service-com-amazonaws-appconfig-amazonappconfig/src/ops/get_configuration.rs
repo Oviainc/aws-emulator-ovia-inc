@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: answers the configuration currently in force for one (application,
+//! environment, configuration profile) triple, read out of the deployments the control
+//! plane holds for that environment.
 //!
 //! ## Shape of an operation
 //!
@@ -132,6 +126,25 @@ impl From<GetConfigurationErrorModeled> for GetConfigurationError {
     }
 }
 
+/// A `ResourceNotFoundException` (HTTP 404) naming the resource that could not be
+/// resolved.
+fn not_found(message: String, resource_name: String) -> GetConfigurationError {
+    GetConfigurationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+        resource_name: Some(resource_name),
+    })
+    .into()
+}
+
+/// An `InternalServerException` (HTTP 500) for a record that resolved a moment ago and
+/// could not be read back under the same guard.
+fn internal(message: &str) -> GetConfigurationError {
+    GetConfigurationErrorModeled::InternalServerException(InternalServerException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
 /// The `GetConfiguration` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -166,20 +179,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal("AppConfig state is not reachable on this engine"));
+        };
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // `ClientId` identifies the client asking, which is what AppConfig paces a
+        // gradual rollout by. What is in force for a configuration profile is ONE record
+        // of this service's state — the deployment the control plane holds — so every
+        // client is served that record, exactly as the `appconfigdata` poll over the same
+        // deployment is; how far the rollout has got is reported by the deployment's own
+        // `PercentageComplete` rather than by picking a different version per client.
+        // Nothing about the client is stored: a read records no caller.
+
+        // Each of the three path members is documented as "the <level> name or the
+        // <level> ID", so each resolves either way, and the levels are resolved
+        // outermost first: an environment and a configuration profile are children of
+        // the application, so a request naming an application that does not exist is
+        // refused on the application rather than on its children.
+        let Some(application_id) = store.resolve_application_id(&input.application) else {
+            return Err(not_found(
+                crate::state::application_not_found(&input.application),
+                input.application,
+            ));
+        };
+        let Some(application) = store.application_mut(&application_id) else {
+            return Err(internal(
+                "The application could not be re-read while reading its configuration",
+            ));
+        };
+        let Some(environment_id) = application
+            .resolve_environment(&input.environment)
+            .map(|environment| environment.id.clone())
+        else {
+            return Err(not_found(
+                crate::state::environment_not_found(&application_id, &input.environment),
+                input.environment,
+            ));
+        };
+        let Some(profile_id) = application
+            .resolve_profile(&input.configuration)
+            .map(|profile| profile.id.clone())
+        else {
+            return Err(not_found(
+                crate::state::configuration_profile_not_found(
+                    &application_id,
+                    &input.configuration,
+                ),
+                input.configuration,
+            ));
+        };
+
+        // The environment is brought up to the state the CLOCK already owes it before
+        // its deployments are read: a deployment whose rollout window and bake time have
+        // both elapsed is `COMPLETE` whether or not anybody called, and a rollback a
+        // caller started has finished once its own window has passed. Nothing else about
+        // the environment is written, so this read leaves every record where the clock
+        // had already put it.
+        let Some(environment) = application.environments.get_mut(&environment_id) else {
+            return Err(internal(
+                "The environment could not be re-read while reading its configuration",
+            ));
+        };
+        environment.materialize(now);
+        let in_force = environment
+            .in_force_deployment(&profile_id)
+            .map(|deployment| deployment.configuration_version.clone());
+        let Some(deployed_version) = in_force else {
+            return Err(not_found(
+                crate::state::no_deployed_configuration(
+                    &input.application,
+                    &input.environment,
+                    &input.configuration,
+                ),
+                input.configuration,
+            ));
+        };
+
+        let Some(profile) = application.profiles.get(&profile_id) else {
+            return Err(internal(
+                "The configuration profile could not be re-read while reading its \
+                 configuration",
+            ));
+        };
+        // The deployment records the version it deployed as the caller spelled it — a
+        // hosted version number or that version's label — so it is resolved through the
+        // profile's own lookup, the one every reader of a deployed configuration uses.
+        let Some(version) = profile.resolve_hosted_version(&deployed_version) else {
+            return Err(not_found(
+                crate::state::configuration_version_not_hosted(
+                    &input.configuration,
+                    &deployed_version,
+                ),
+                input.configuration,
+            ));
+        };
+        // `ConfigurationVersion` identifies the version this answer carries, and
+        // `ClientConfigurationVersion` is "the configuration version returned in the most
+        // recent GetConfiguration response", so the two are the same spelling: the stored
+        // version number.
+        let configuration_version = version.version_number.to_string();
+        let content_type = version.content_type.clone();
+        // What the stored bytes MEAN is the profile's `Type`, so the content served is the
+        // profile's own projection of them rather than the bytes themselves — the same
+        // projection the `appconfigdata` poll serves for the same deployment.
+        let content = profile.served_content(&version.content);
+
+        // "The Content attribute only contains data if the system finds new or updated
+        // configuration data. If there is no new or updated data and
+        // ClientConfigurationVersion matches the version of the current configuration …
+        // the Content value will be empty." The comparison is between two stored values:
+        // the version the client says it holds and the one in force now.
+        let client_holds_this_version =
+            input.client_configuration_version.as_deref() == Some(configuration_version.as_str());
+
+        Ok(GetConfigurationOutput {
+            // Empty rather than absent when the client already holds this version: the
+            // member is the response's `@httpPayload`, so an absent one would leave the
+            // protocol's JSON object as the body where AppConfig sends no content at all.
+            // The accompanying HTTP 204 is not reachable from a handler — the status is
+            // this operation's modelled `@http(code: 200)` and the `Configuration` shape
+            // binds no `@httpResponseCode` member for a handler to answer through.
+            content: Some(if client_holds_this_version {
+                Vec::new()
+            } else {
+                content
+            }),
+            configuration_version: Some(configuration_version),
+            content_type: Some(content_type),
+        })
     }
 }
