@@ -39,7 +39,7 @@ const REGISTRATION_KIND: &str = "transit-gateway-registration";
 const ARN_MEMBER: &str = "transitGatewayArn";
 
 /// `RegisterTransitGateway` on `network` for `arn`.
-async fn register(emulator: &Emulator, network: &str, arn: &str) -> (u16, Value) {
+pub(crate) async fn register(emulator: &Emulator, network: &str, arn: &str) -> (u16, Value) {
     emulator
         .post(
             &format!("/global-networks/{network}/transit-gateway-registrations"),
@@ -60,7 +60,11 @@ async fn deregister(emulator: &Emulator, network: &str, arn: &str) -> (u16, Valu
 }
 
 /// `GetTransitGatewayRegistrations` on `network` with `query` appended to the URI.
-async fn get_registrations(emulator: &Emulator, network: &str, query: &str) -> (u16, Value) {
+pub(crate) async fn get_registrations(
+    emulator: &Emulator,
+    network: &str,
+    query: &str,
+) -> (u16, Value) {
     let uri = if query.is_empty() {
         format!("/global-networks/{network}/transit-gateway-registrations")
     } else {
@@ -70,7 +74,7 @@ async fn get_registrations(emulator: &Emulator, network: &str, query: &str) -> (
 }
 
 /// The `TransitGatewayArn`s a reader page lists, in the order returned.
-fn arns_of(body: &Value) -> Vec<String> {
+pub(crate) fn arns_of(body: &Value) -> Vec<String> {
     body["TransitGatewayRegistrations"]
         .as_array()
         .unwrap_or_else(|| panic!("expected a TransitGatewayRegistrations array in {body}"))
