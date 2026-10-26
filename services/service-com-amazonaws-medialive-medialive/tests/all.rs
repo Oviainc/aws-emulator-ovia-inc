@@ -170,6 +170,9 @@ mod input_endpoint_release;
 #[path = "all/input_lifecycle.rs"]
 mod input_lifecycle;
 
+#[path = "all/input_listing.rs"]
+mod input_listing;
+
 #[path = "all/input_push_endpoints.rs"]
 mod input_push_endpoints;
 
