@@ -285,10 +285,9 @@
 //! instance is stored. A group resolves the instance it is created on there, so an id that
 //! names no instance of the account is refused
 //! ([`invalid_verified_access_instance_id_not_found`]) rather than stored as a dangling
-//! reference. The store starts EMPTY and that writer sits ahead of the operation that will
-//! call it — `CreateVerifiedAccessInstance` is still a scaffold stub with its own open issue
-//! — exactly as [`ComAmazonawsEc2Amazonec2State::insert_network_interface`] stands ahead of
-//! `CreateNetworkInterface`.
+//! reference. The store starts EMPTY — a fresh account has created no Verified Access
+//! instance — and `CreateVerifiedAccessInstance` is what lands on that writer, so the
+//! instance a caller created is the one every reader of an instance resolves.
 //!
 //! [`ComAmazonawsEc2Amazonec2State::verified_access_groups`] holds the account's Verified
 //! Access groups as [`VerifiedAccessGroupRecord`]s, keyed by `VerifiedAccessGroupId`, and
@@ -2484,6 +2483,10 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// module docs. Ordered by id, the order a describe of the instances reports and pages
     /// over.
     pub verified_access_instances: BTreeMap<String, crate::ops::types::VerifiedAccessInstance>,
+    /// A `CreateVerifiedAccessInstance` `ClientToken` and the instance id it minted, so a
+    /// repeat of the same request answers with that instance instead of creating a second
+    /// one.
+    pub verified_access_instance_client_tokens: HashMap<String, String>,
     /// Every Verified Access group the account holds, by `VerifiedAccessGroupId`, as
     /// [`VerifiedAccessGroupRecord`]s — see the module docs. Ordered by id, the order a
     /// describe of the groups reports and pages over.
@@ -3181,6 +3184,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // A fresh account has created no Verified Access instance, no group on one and
             // no endpoint on a group.
             verified_access_instances: BTreeMap::new(),
+            verified_access_instance_client_tokens: HashMap::new(),
             verified_access_groups: BTreeMap::new(),
             verified_access_group_client_tokens: HashMap::new(),
             verified_access_endpoints: BTreeMap::new(),
@@ -12883,6 +12887,28 @@ impl ComAmazonawsEc2Amazonec2State {
 /// [`ComAmazonawsEc2Amazonec2State::next_id`] mints them.
 pub const VERIFIED_ACCESS_INSTANCE_ID_PREFIX: &str = "vai";
 
+/// The one `ResourceType` a `CreateVerifiedAccessInstance` tag specification may name: "The
+/// tags to assign to the Verified Access instance"
+/// (`CreateVerifiedAccessInstanceRequest$TagSpecifications`), spelled as the modelled
+/// `ResourceType` enum spells it (`smithy_query(query="shape",shape="ResourceType")`).
+pub const VERIFIED_ACCESS_INSTANCE_TAGGABLE_RESOURCE: &str = "verified-access-instance";
+
+/// How many Verified Access instances this emulator stores before
+/// `CreateVerifiedAccessInstance` is refused.
+///
+/// CHOSEN, like [`MAX_VERIFIED_ACCESS_GROUPS`] and for the same reason: nothing in this
+/// emulator reclaims a stored instance, so the store needs a ceiling that is not the
+/// process's memory. Well above the published per-Region Verified Access quota a test would
+/// exercise. A count ceiling is not a memory bound on its own — see [`MAX_STORED_BYTES`] —
+/// so the caller-chosen bytes of each record are charged against that budget too
+/// ([`verified_access_instance_payload_bytes`]).
+pub const MAX_VERIFIED_ACCESS_INSTANCES: usize = 1_000;
+
+/// EC2's quota code for one Verified Access instance too many, named the way every other
+/// per-resource EC2 quota code is (`VerifiedAccessGroupLimitExceeded`,
+/// `VerifiedAccessEndpointLimitExceeded`).
+pub const VERIFIED_ACCESS_INSTANCE_LIMIT_EXCEEDED: &str = "VerifiedAccessInstanceLimitExceeded";
+
 /// The id prefix a Verified Access group is minted under: EC2 names a group's ids
 /// `vagr-<hex>`, the same `<prefix>-<hex>` form every other EC2 resource id takes, so
 /// [`ComAmazonawsEc2Amazonec2State::next_id`] mints them.
@@ -13114,10 +13140,16 @@ pub fn verified_access_group_payload_bytes(
 }
 
 /// The caller-chosen bytes one stored Verified Access instance holds for the process's
-/// lifetime: its tags, its description and the custom subdomain it was given. The id and
-/// the timestamps are the service's own, so they are bounded already and not counted here.
+/// lifetime: its tags, its description, the custom subdomain it was given and the client
+/// token the token map keeps. The id and the timestamps are the service's own, so they are
+/// bounded already and not counted here.
+///
+/// ONE definition of the charge, computed identically by the create's ceiling pre-check and
+/// by [`ComAmazonawsEc2Amazonec2State::insert_verified_access_instance`], so a writer cannot
+/// store bytes the store's budget never saw.
 pub fn verified_access_instance_payload_bytes(
     instance: &crate::ops::types::VerifiedAccessInstance,
+    client_token: Option<&str>,
 ) -> usize {
     let text = |value: &Option<String>| value.as_ref().map_or(0, String::len);
     tag_list_bytes(instance.tags.as_deref().unwrap_or_default())
@@ -13128,6 +13160,7 @@ pub fn verified_access_instance_payload_bytes(
                 .as_ref()
                 .map_or(0, |subdomain| text(&subdomain.sub_domain)),
         )
+        .saturating_add(client_token.map_or(0, str::len))
 }
 
 /// The caller-chosen bytes one stored Verified Access endpoint holds for the process's
@@ -13269,23 +13302,56 @@ pub fn verified_access_endpoint_limit_exceeded<E>(
     )
 }
 
+/// Refuse a create that would take the store past [`MAX_VERIFIED_ACCESS_INSTANCES`]: HTTP
+/// 400 [`VERIFIED_ACCESS_INSTANCE_LIMIT_EXCEEDED`].
+pub fn verified_access_instance_limit_exceeded<E>(
+    message: impl Into<String>,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        VERIFIED_ACCESS_INSTANCE_LIMIT_EXCEEDED,
+        400,
+        message,
+    )
+}
+
 impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another Verified Access instance fits inside the store's ceiling
+    /// ([`MAX_VERIFIED_ACCESS_INSTANCES`]).
+    ///
+    /// The same contract as [`Self::has_verified_access_group_capacity`]: a create asks
+    /// first and refuses with [`verified_access_instance_limit_exceeded`] when it answers
+    /// `false`.
+    pub fn has_verified_access_instance_capacity(&self) -> bool {
+        self.verified_access_instances.len() < MAX_VERIFIED_ACCESS_INSTANCES
+    }
+
     /// Store `instance` under a freshly minted `VerifiedAccessInstanceId`, write that id onto
-    /// the record, charge the caller-chosen bytes it retains against the store's byte budget,
-    /// and answer the id it was given.
+    /// the record, charge the caller-chosen bytes it and `client_token` retain against the
+    /// store's byte budget, and answer the id it was given.
     ///
     /// The one way an instance is stored, so two writers cannot report one instance
-    /// differently. `CreateVerifiedAccessInstance` is still a scaffold stub with its own open
-    /// issue; this seam is what it will call, and what a test seeds an instance through,
-    /// exactly as [`Self::insert_network_interface`] stands ahead of
-    /// `CreateNetworkInterface`.
+    /// differently: `CreateVerifiedAccessInstance` lands here, and a test seeds an instance
+    /// through the same seam. The charge happens at the insert the way
+    /// [`Self::insert_verified_access_group`] charges a group's, so no path can store those
+    /// bytes uncharged, and it is the SAME figure
+    /// [`verified_access_instance_payload_bytes`] gives the create's pre-check — so a create
+    /// still asks [`Self::has_verified_access_instance_capacity`] and
+    /// [`Self::would_exceed_stored_bytes`] first and cannot overshoot either ceiling.
     pub fn insert_verified_access_instance(
         &mut self,
         mut instance: crate::ops::types::VerifiedAccessInstance,
+        client_token: Option<&str>,
     ) -> String {
         let instance_id = self.next_id(VERIFIED_ACCESS_INSTANCE_ID_PREFIX);
         instance.verified_access_instance_id = Some(instance_id.clone());
-        self.add_stored_bytes(verified_access_instance_payload_bytes(&instance));
+        self.add_stored_bytes(verified_access_instance_payload_bytes(
+            &instance,
+            client_token,
+        ));
+        if let Some(token) = client_token {
+            self.verified_access_instance_client_tokens
+                .insert(token.to_string(), instance_id.clone());
+        }
         self.verified_access_instances
             .insert(instance_id.clone(), instance);
         instance_id

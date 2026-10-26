@@ -511,3 +511,8 @@ mod create_fpga_image;
 // `DescribeFpgaImageAttribute` reports out of the stored AFI, and what it refuses.
 #[path = "all/describe_fpga_image_attribute.rs"]
 mod describe_fpga_image_attribute;
+// Declared LAST for the reason the header gives: the sorted region of this file is where
+// every new ec2 suite inserts its lines. The Verified Access INSTANCE slice: what
+// `CreateVerifiedAccessInstance` mints and persists, and the group create that resolves it.
+#[path = "all/verified_access_instances.rs"]
+mod verified_access_instances;

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVerifiedAccessInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVerifiedAccessInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVerifiedAccessInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints a regional Verified Access instance from the request and stores it, so
+//! every operation that resolves an instance — a group created on it, and the readers of one
+//! — sees what this call created. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +137,156 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVerifiedAccessInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVerifiedAccessInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVerifiedAccessInstance"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            iso8601_utc, require_service_state, tags_from_specifications,
+            verified_access_instance_limit_exceeded, verified_access_instance_payload_bytes,
+            MAX_CLIENT_TOKEN_CHARS, MAX_STORED_BYTES, MAX_VERIFIED_ACCESS_INSTANCES,
+            VERIFIED_ACCESS_INSTANCE_TAGGABLE_RESOURCE,
+        };
+
+        // `ctx` carries request metadata only, and nothing this record holds names a Region:
+        // the modelled `VerifiedAccessInstance` carries no ARN and no zone, so there is
+        // nothing on it to read off the request.
+        let _ = ctx;
+
+        // "The tags to assign to the Verified Access instance"
+        // (`CreateVerifiedAccessInstanceRequest$TagSpecifications`): the instance is the only
+        // resource this call creates, so a specification naming any other resource type is
+        // refused rather than accepted and discarded. Read through the crate's ONE reading of
+        // a create's tag specifications, so this operation bounds and validates a tag payload
+        // exactly as every other create does.
+        let tags = tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            VERIFIED_ACCESS_INSTANCE_TAGGABLE_RESOURCE,
+            Self::NAME,
+        )?;
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        // "The custom subdomain" (`CreateVerifiedAccessInstanceRequest$
+        // CidrEndpointsCustomSubDomain`) is the name the network CIDR endpoints of this
+        // instance are reached under, so a value naming no domain at all is refused rather
+        // than stored as a subdomain of the empty name. A request that names none leaves the
+        // instance without one.
+        let custom_sub_domain = input.cidr_endpoints_custom_sub_domain.as_deref();
+        if custom_sub_domain.is_some_and(|sub_domain| sub_domain.trim().is_empty()) {
+            return Err(Scaffolded::invalid_parameter_value(
+                "cidrEndpointsCustomSubDomain must name a subdomain",
+            ));
+        }
+
+        // The record this call would store, built BEFORE the store is locked. Every member is
+        // either taken from the request or derived here; the id is derived by the store at
+        // the insert, so an id is never chosen twice.
+        let created_at = iso8601_utc(::std::time::SystemTime::now());
+        let instance = VerifiedAccessInstance {
+            // Minted by the store at the insert.
+            verified_access_instance_id: None,
+            description: input.description.clone(),
+            // "The IDs of the Amazon Web Services Verified Access trust providers"
+            // (`VerifiedAccessInstance$VerifiedAccessTrustProviders`): a create attaches
+            // none, so a fresh instance reports the EMPTY set until
+            // `AttachVerifiedAccessTrustProvider` puts one on it.
+            verified_access_trust_providers: Some(Vec::new()),
+            // An instance is created and updated in the same instant; a later modify is what
+            // carries `LastUpdatedTime` on.
+            creation_time: Some(created_at.clone()),
+            last_updated_time: Some(created_at),
+            tags: Some(tags),
+            // "Enable or disable support for Federal Information Processing Standards (FIPS)
+            // on the instance" (`CreateVerifiedAccessInstanceRequest$FIPSEnabled`): the
+            // instance reports whether that support is on, so a request that asked for
+            // neither answer gets it off.
+            fips_enabled: Some(input.fips_enabled.unwrap_or(false)),
+            cidr_endpoints_custom_sub_domain: custom_sub_domain.map(|sub_domain| {
+                VerifiedAccessInstanceCustomSubDomain {
+                    sub_domain: Some(sub_domain.to_string()),
+                    // "The name servers"
+                    // (`VerifiedAccessInstanceCustomSubDomain$Nameservers`) are the servers
+                    // of the zone the subdomain is delegated to. This emulator delegates no
+                    // zone and answers no DNS query, so that set is EMPTY rather than a name
+                    // that resolves nowhere.
+                    nameservers: Some(Vec::new()),
+                }
+            }),
+        };
+        // The caller-chosen bytes this create would retain for the process's lifetime,
+        // counted by the ONE definition of that charge, so the figure checked here is exactly
+        // the one the insert charges.
+        let payload_bytes =
+            verified_access_instance_payload_bytes(&instance, input.client_token.as_deref());
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // Idempotency: "A unique, case-sensitive token that you provide to ensure idempotency
+        // of your modification request" (`CreateVerifiedAccessInstanceRequest$ClientToken`) —
+        // one token names the one instance it minted, so a replay reports that instance and
+        // creates nothing. Read here, answered below the DryRun check, because a replay
+        // stores nothing and so passes the ceilings a fresh create has to clear.
+        let replayed = input.client_token.as_deref().and_then(|token| {
+            store
+                .verified_access_instance_client_tokens
+                .get(token)
+                .cloned()
+        });
+
+        // Both ceilings are asked only of a create that would STORE something: a replay
+        // stores nothing, so it passes the ceilings a fresh create has to clear. A COUNT
+        // ceiling admits gigabytes on its own, because the record holds strings the caller
+        // chose the length of (the description, the tags and the subdomain), so both are
+        // asked.
+        if replayed.is_none() {
+            if !store.has_verified_access_instance_capacity() {
+                return Err(verified_access_instance_limit_exceeded(format!(
+                    "This emulator holds {MAX_VERIFIED_ACCESS_INSTANCES} Verified Access \
+                     instances, which is as many as it stores"
+                )));
+            }
+            if store.would_exceed_stored_bytes(payload_bytes) {
+                return Err(verified_access_instance_limit_exceeded(format!(
+                    "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                     caller-supplied data, so it cannot store {payload_bytes} more",
+                    store.stored_bytes()
+                )));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let instance_id = match replayed {
+            Some(instance_id) => instance_id,
+            None => store.insert_verified_access_instance(instance, input.client_token.as_deref()),
+        };
+
+        // Read the response back OUT of the store, so the caller sees what a later read of
+        // the instance will see rather than the request object.
+        store
+            .verified_access_instances
+            .get(&instance_id)
+            .cloned()
+            .map(|verified_access_instance| CreateVerifiedAccessInstanceOutput {
+                verified_access_instance: Some(verified_access_instance),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the newly created Verified Access instance '{instance_id}' could not be \
+                     read back"
+                ))
+            })
     }
 }

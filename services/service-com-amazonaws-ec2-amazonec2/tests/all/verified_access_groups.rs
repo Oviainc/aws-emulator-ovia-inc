@@ -28,9 +28,8 @@
 //!
 //! The instances the groups hang off are seeded through
 //! [`ec2::state::ComAmazonawsEc2Amazonec2State::insert_verified_access_instance`], the writer
-//! seam `CreateVerifiedAccessInstance` will land on — that operation is still a scaffold stub
-//! with its own open issue — the way the subnet and image suites seed through their own
-//! insert seams.
+//! seam `CreateVerifiedAccessInstance` lands on too — the way the subnet and image suites
+//! seed through their own insert seams.
 
 use ec2::ops::types::{VerifiedAccessGroup, VerifiedAccessInstance};
 use ec2::state::{
@@ -82,10 +81,13 @@ fn seed(engine: &engine::InMemoryEngine) -> Fixture {
     let instance_ids: Vec<String> = ["the sales applications", "the support applications"]
         .into_iter()
         .map(|description| {
-            guard.insert_verified_access_instance(VerifiedAccessInstance {
-                description: Some(description.to_string()),
-                ..VerifiedAccessInstance::default()
-            })
+            guard.insert_verified_access_instance(
+                VerifiedAccessInstance {
+                    description: Some(description.to_string()),
+                    ..VerifiedAccessInstance::default()
+                },
+                None,
+            )
         })
         .collect();
 
