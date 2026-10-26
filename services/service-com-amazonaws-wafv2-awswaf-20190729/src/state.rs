@@ -23,15 +23,15 @@ use ::aws_smithy_schema_server::constraints::{
 
 use crate::ops::types::{
     BlockAction, ChallengeAction, ChallengeConfig, CountAction, IPSet, LabelSummary,
-    LoggingConfiguration, ManagedProductDescriptor, ManagedRuleSet, MonetizationFilter,
-    OnSourceDDoSProtectionConfig, RegexPatternSet, Rule, RuleAction, RuleGroup, RuleSummary,
-    SettlementRecord, Statement, Tag, TimeWindow, WAFAssociatedItemException,
+    LoggingConfiguration, ManagedProductDescriptor, ManagedRuleSet, MobileSdkRelease,
+    MonetizationFilter, OnSourceDDoSProtectionConfig, RegexPatternSet, Rule, RuleAction, RuleGroup,
+    RuleSummary, SettlementRecord, Statement, Tag, TimeWindow, WAFAssociatedItemException,
     WAFDuplicateItemException, WAFExpiredManagedRuleGroupVersionException,
     WAFFeatureNotIncludedInPricingPlanException, WAFInvalidOperationException,
     WAFInvalidParameterException, WAFInvalidPermissionPolicyException, WAFLimitsExceededException,
-    WAFNonexistentItemException, WAFOptimisticLockException,
+    WAFNonexistentItemException, WAFOptimisticLockException, WAFTagOperationException,
     WAFUnsupportedAggregateKeyTypeException, WebACL, BLOCKCHAIN_CHAIN_VALUES,
-    CURRENCY_MODE_VALUES, CURRENCY_VALUES, SETTLEMENT_STATUS_VALUES,
+    CURRENCY_MODE_VALUES, CURRENCY_VALUES, PLATFORM_VALUES, SETTLEMENT_STATUS_VALUES,
 };
 
 /// The `Scope` values the model declares
@@ -258,6 +258,135 @@ pub fn invalid_permission_policy_exception() -> WAFInvalidPermissionPolicyExcept
         message: Some(INVALID_PERMISSION_POLICY_MESSAGE.to_string()),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tag keys AWS keeps for itself
+// ---------------------------------------------------------------------------
+
+/// The tag-key prefix that belongs to AWS: a key beginning with it names a SYSTEM
+/// tag, which a caller may neither set nor change.
+///
+/// `TagKey`'s own `@pattern` admits it (`:` is one of the characters the pattern
+/// allows), so a key under this prefix reaches a handler and the handler is what
+/// refuses it.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// The sentence a tagging refusal carries when a request names a key under
+/// [`RESERVED_TAG_KEY_PREFIX`]: the wire wording WAF answers with, as the recorded
+/// wafv2 responses show it.
+///
+/// `WAFTagOperationException` is "an error occurred during the tagging operation"
+/// — one class covering several tagging failures — so, unlike the one-sentence
+/// exceptions above, its wording names WHICH tagging rule the request broke. The
+/// sentence carries no key from the request: it states the rule, and the caller
+/// already knows which keys it sent.
+pub const RESERVED_TAG_KEY_MESSAGE: &str = "You tried to tag your resources with \
+     system tag keys. These tags have an aws: prefix and are reserved by AWS. \
+     Change your tag keys, and try again.";
+
+/// `true` when `key` is a system tag key — one under
+/// [`RESERVED_TAG_KEY_PREFIX`].
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.starts_with(RESERVED_TAG_KEY_PREFIX)
+}
+
+/// The first key of `tags` that is a system tag key, or `None` when none of them
+/// is.
+///
+/// What every operation that ACCEPTS tags asks before it stores anything, so one
+/// reading of the reserved prefix serves the tagging operation and each create
+/// that takes a `TagList`.
+pub fn reserved_tag_key(tags: &[Tag]) -> Option<&str> {
+    tags.iter()
+        .map(|tag| tag.key.as_str())
+        .find(|key| is_reserved_tag_key(key))
+}
+
+/// `WAFTagOperationException` as WAF returns it for a key under the reserved
+/// prefix: nothing but [`RESERVED_TAG_KEY_MESSAGE`].
+pub fn reserved_tag_key_exception() -> WAFTagOperationException {
+    WAFTagOperationException {
+        message: Some(RESERVED_TAG_KEY_MESSAGE.to_string()),
+    }
+}
+
+/// Apply the tags of a tagging request to the tags a resource already carries.
+///
+/// A tag is a key:value PAIR identified by its key ("you can use a tag key to
+/// describe a category of information", `Tag$Key`), so applying one that the
+/// resource already carries REPLACES that key's value rather than adding a second
+/// pair under the same key, and applying a new key appends it. The keys already
+/// there keep their order, so a resource's tag collection reads in the order its
+/// keys were first set.
+pub fn apply_tags(stored: &mut Vec<Tag>, requested: &[Tag]) {
+    for tag in requested {
+        match stored.iter_mut().find(|held| held.key == tag.key) {
+            Some(held) => held.value = tag.value.clone(),
+            None => stored.push(tag.clone()),
+        }
+    }
+}
+
+/// How many tags a resource holding `stored` would carry once `requested` is
+/// applied to it: the keys it already has, plus the requested keys it does not.
+///
+/// What a tagging operation asks before it applies anything, because replacing the
+/// value of a key already held adds no tag (see [`apply_tags`]) and so can never
+/// take a resource past [`MAX_TAGS_PER_RESOURCE`].
+pub fn tags_after_applying(stored: &[Tag], requested: &[Tag]) -> usize {
+    let added = requested
+        .iter()
+        .filter(|tag| !stored.iter().any(|held| held.key == tag.key))
+        .map(|tag| tag.key.as_str())
+        .collect::<::std::collections::BTreeSet<&str>>()
+        .len();
+    stored.len() + added
+}
+
+/// The most tags one resource carries.
+///
+/// Source: `TagResource`'s own documentation — "You can specify one or more tags
+/// to add to each Amazon Web Services resource, up to 50 tags for a resource."
+/// Enforced where a request ADDS tags, so no caller can grow one resource's tag
+/// collection without limit.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+// ---------------------------------------------------------------------------
+// The mobile SDK release catalogue
+// ---------------------------------------------------------------------------
+
+/// The sentence the mobile-SDK operations' `WAFInvalidOperationException` carries
+/// when the account may not use the mobile SDK: the wire wording WAF answers with,
+/// as the recorded wafv2 responses show it.
+///
+/// `WAFInvalidOperationException` is the refusal for a call the operation's own
+/// preconditions forbid ([`invalid_operation_exception`] carries the sentence the
+/// shape documents for the class); this is the sentence WAF words it with for the
+/// one precondition the mobile-SDK family has, so a caller can tell an
+/// unentitled account from any other invalid operation.
+pub const MOBILE_SDK_NOT_AUTHORIZED_MESSAGE: &str = "This account is not authorized \
+     to use Mobile-SDK";
+
+/// `WAFInvalidOperationException` as WAF returns it for an account that may not
+/// use the mobile SDK: nothing but [`MOBILE_SDK_NOT_AUTHORIZED_MESSAGE`].
+pub fn mobile_sdk_not_authorized_exception() -> WAFInvalidOperationException {
+    WAFInvalidOperationException {
+        message: Some(MOBILE_SDK_NOT_AUTHORIZED_MESSAGE.to_string()),
+    }
+}
+
+/// `true` when `value` is one of the device platforms the model declares
+/// (`smithy_query(query="shape",shape="Platform")` → `IOS`, `ANDROID`).
+pub fn is_known_platform(value: &str) -> bool {
+    PLATFORM_VALUES.contains(&value)
+}
+
+/// The `Reason` a refusal carries for a `Platform` the model does not declare.
+///
+/// One wording for the whole mobile-SDK family, so its three operations cannot
+/// drift apart in what they say about the same member.
+pub const PLATFORM_NOT_VALID_REASON: &str = "the platform names the device platform \
+     the releases are published for, and is one of ANDROID or IOS";
 
 /// A WebACL as stored: the modelled shape plus the bookkeeping WAFv2 keeps beside
 /// it.
@@ -846,6 +975,16 @@ pub struct ComAmazonawsWafv2Awswaf20190729State {
     pub rule_group_names: HashMap<(String, String), String>,
     /// Managed rule sets by `(Scope, Id)`. See [`ManagedRuleSetEntry`].
     pub managed_rule_sets: HashMap<(String, String), ManagedRuleSetEntry>,
+    /// The mobile SDK releases this account holds, by
+    /// `(Platform, ReleaseVersion)`.
+    ///
+    /// An entry stores the MODELLED `MobileSdkRelease` the catalogue publishes, so
+    /// `GetMobileSdkRelease` hands back exactly what was published and a listing
+    /// summarises the same record. Empty for an account that was never granted the
+    /// mobile SDK, which is what every mobile-SDK operation's entitlement gate
+    /// reads (see
+    /// [`ComAmazonawsWafv2Awswaf20190729State::uses_mobile_sdk`]).
+    pub mobile_sdk_releases: HashMap<(String, String), MobileSdkRelease>,
     /// The logging configuration of each web ACL, by
     /// `(LoggingConfiguration$ResourceArn, LogScope)`.
     ///
@@ -1571,7 +1710,178 @@ impl ComAmazonawsWafv2Awswaf20190729State {
         self.logging_configurations
             .remove(&logging_configuration_key(resource_arn, log_scope))
     }
+
+    /// The tags the resource `arn` carries, or `None` when it names no taggable
+    /// resource this service holds.
+    ///
+    /// "You can tag the Amazon Web Services resources that you manage through WAF:
+    /// web ACLs, rule groups, IP sets, and regex pattern sets" (`TagResource`'s own
+    /// doc) — the four kinds [`ResourceRef`] resolves — and every tagging operation
+    /// addresses one by its ARN alone, so the resolution lives here once instead of
+    /// in each of them.
+    pub fn tags_by_arn(&self, arn: &str) -> Option<&Vec<Tag>> {
+        match self.arn_index.get(arn)? {
+            ResourceRef::WebAcl { scope, id } => self
+                .web_acls
+                .get(&(scope.clone(), id.clone()))
+                .map(|entry| &entry.tags),
+            ResourceRef::IpSet { scope, id } => self
+                .ip_sets
+                .get(&(scope.clone(), id.clone()))
+                .map(|entry| &entry.tags),
+            ResourceRef::RegexPatternSet { scope, id } => self
+                .regex_pattern_sets
+                .get(&(scope.clone(), id.clone()))
+                .map(|entry| &entry.tags),
+            ResourceRef::RuleGroup { scope, id } => self
+                .rule_groups
+                .get(&(scope.clone(), id.clone()))
+                .map(|entry| &entry.tags),
+        }
+    }
+
+    /// [`Self::tags_by_arn`] for a caller that WRITES the collection, handing back
+    /// the resource's identity beside it: the one lookup gives a tagging mutation
+    /// both the tags it applies to and the `(Scope, Id)` it records in the audit
+    /// trail.
+    pub fn taggable_resource_mut(
+        &mut self,
+        arn: &str,
+    ) -> Option<(String, String, &mut Vec<Tag>)> {
+        match self.arn_index.get(arn)?.clone() {
+            ResourceRef::WebAcl { scope, id } => self
+                .web_acls
+                .get_mut(&(scope.clone(), id.clone()))
+                .map(|entry| (scope, id, &mut entry.tags)),
+            ResourceRef::IpSet { scope, id } => self
+                .ip_sets
+                .get_mut(&(scope.clone(), id.clone()))
+                .map(|entry| (scope, id, &mut entry.tags)),
+            ResourceRef::RegexPatternSet { scope, id } => self
+                .regex_pattern_sets
+                .get_mut(&(scope.clone(), id.clone()))
+                .map(|entry| (scope, id, &mut entry.tags)),
+            ResourceRef::RuleGroup { scope, id } => self
+                .rule_groups
+                .get_mut(&(scope.clone(), id.clone()))
+                .map(|entry| (scope, id, &mut entry.tags)),
+        }
+    }
+
+    /// Provision one release of the mobile SDK for `platform`, and answer it as it
+    /// was stored.
+    ///
+    /// The seam that gives an account ACCESS to the mobile SDK (see
+    /// [`Self::uses_mobile_sdk`]): "the mobile SDK is not generally available"
+    /// (every mobile-SDK operation's own doc), and no operation of this model
+    /// publishes a release — a release catalogue appears for an account because WAF
+    /// granted that account the mobile SDK, which is not an API call. So an account
+    /// holds no release until one is provisioned here, exactly as it holds no
+    /// managed rule set until [`Self::insert_managed_rule_set`] provisions one.
+    ///
+    /// Provisioning a version the platform already holds REPLACES it: a
+    /// `(Platform, ReleaseVersion)` names one release.
+    pub fn insert_mobile_sdk_release(
+        &mut self,
+        platform: &str,
+        release_version: &str,
+        timestamp_millis: i64,
+        release_notes: Option<String>,
+        tags: Vec<Tag>,
+    ) -> MobileSdkRelease {
+        let release = MobileSdkRelease {
+            release_version: Some(release_version.to_string()),
+            timestamp: Some(::aws_smithy_types::DateTime::from_millis(timestamp_millis)),
+            release_notes,
+            tags: (!tags.is_empty()).then_some(tags),
+        };
+        self.mobile_sdk_releases.insert(
+            (platform.to_string(), release_version.to_string()),
+            release.clone(),
+        );
+        release
+    }
+
+    /// `true` when this account may use the mobile SDK.
+    ///
+    /// One gate for the whole mobile-SDK family, so listing the catalogue, reading
+    /// one release and generating a download URL can never disagree about whether
+    /// the account is allowed to see it. The mobile SDK is granted per ACCOUNT
+    /// rather than per platform, so a granted account may hold releases for one
+    /// platform and none for the other — which is an empty listing, not a refusal.
+    pub fn uses_mobile_sdk(&self) -> bool {
+        !self.mobile_sdk_releases.is_empty()
+    }
+
+    /// Every release this account holds for `platform`, ordered by release version
+    /// so a listing enumerates them the same way round on every call and a
+    /// pagination marker names the same position.
+    pub fn mobile_sdk_releases_for(&self, platform: &str) -> Vec<&MobileSdkRelease> {
+        let mut releases: Vec<&MobileSdkRelease> = self
+            .mobile_sdk_releases
+            .iter()
+            .filter(|((held, _), _)| held == platform)
+            .map(|(_, release)| release)
+            .collect();
+        releases.sort_by(|left, right| {
+            release_version_of(left).cmp(release_version_of(right))
+        });
+        releases
+    }
+
+    /// The release `release_version` of `platform`, or `None` when this account
+    /// holds no such release.
+    ///
+    /// [`LATEST_RELEASE_VERSION`] resolves to the most recently released version of
+    /// the platform — "for the latest available version, specify LATEST"
+    /// (`GetMobileSdkReleaseRequest$ReleaseVersion` and the same member of
+    /// `GenerateMobileSdkReleaseUrlRequest`) — so both operations that take a
+    /// version read it the same way.
+    pub fn mobile_sdk_release(
+        &self,
+        platform: &str,
+        release_version: &str,
+    ) -> Option<&MobileSdkRelease> {
+        if release_version == LATEST_RELEASE_VERSION {
+            return self.latest_mobile_sdk_release(platform);
+        }
+        self.mobile_sdk_releases
+            .get(&(platform.to_string(), release_version.to_string()))
+    }
+
+    /// The most recently released version of `platform`: the greatest release
+    /// instant, and the greater version key when two releases carry the same
+    /// instant.
+    fn latest_mobile_sdk_release(&self, platform: &str) -> Option<&MobileSdkRelease> {
+        self.mobile_sdk_releases_for(platform)
+            .into_iter()
+            .max_by_key(|release| {
+                (
+                    release
+                        .timestamp
+                        .as_ref()
+                        .map_or(i64::MIN, date_time_millis),
+                    release_version_of(release),
+                )
+            })
+    }
 }
+
+/// The version key a stored release carries. `MobileSdkRelease$ReleaseVersion` is
+/// optional in the model, and every release
+/// [`ComAmazonawsWafv2Awswaf20190729State::insert_mobile_sdk_release`] stores
+/// carries one, so the absent case orders before every real key instead of
+/// panicking.
+fn release_version_of(release: &MobileSdkRelease) -> &str {
+    release.release_version.as_deref().unwrap_or_default()
+}
+
+/// The `ReleaseVersion` value that names a platform's newest release rather than
+/// one particular version.
+///
+/// Source: `GetMobileSdkReleaseRequest$ReleaseVersion`'s own documentation — "The
+/// release version. For the latest available version, specify `LATEST`."
+pub const LATEST_RELEASE_VERSION: &str = "LATEST";
 
 /// The `LogScope` value a request that names none addresses.
 ///

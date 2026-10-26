@@ -348,6 +348,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // A tag key under the prefix AWS reserves for its own system tags is refused
+        // before anything is created, and so is a request carrying more tags than one
+        // resource may hold: the same two judgements `TagResource` makes about the
+        // same member, so a reserved key cannot enter the store through a create.
+        let requested_tags = input.tags.clone().unwrap_or_default();
+        if crate::state::reserved_tag_key(&requested_tags).is_some() {
+            return Err(CreateWebACLErrorModeled::WAFTagOperationException(
+                crate::state::reserved_tag_key_exception(),
+            )
+            .into());
+        }
+        if crate::state::tags_after_applying(&[], &requested_tags)
+            > crate::state::MAX_TAGS_PER_RESOURCE
+        {
+            return Err(CreateWebACLErrorModeled::WAFLimitsExceededException(
+                crate::state::limits_exceeded_exception(),
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateWebACLErrorModeled::WAFInternalErrorException(
                 WAFInternalErrorException {

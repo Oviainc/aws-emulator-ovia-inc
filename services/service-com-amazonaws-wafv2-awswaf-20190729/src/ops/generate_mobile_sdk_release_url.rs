@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GenerateMobileSdkReleaseUrl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GenerateMobileSdkReleaseUrl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GenerateMobileSdkReleaseUrl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers the download URL of one release of the mobile SDK this account holds —
+//! or refuses the call when the account may not use the mobile SDK, the same gate
+//! `ListMobileSdkReleases` consults, so no URL is ever handed to an account that is
+//! refused the catalogue. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +150,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GenerateMobileSdkReleaseUrl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GenerateMobileSdkReleaseUrlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GenerateMobileSdkReleaseUrl"))
+        // `Platform` is an enum, and an enum value the model does not declare reaches
+        // a handler, so the handler is what refuses it.
+        if !crate::state::is_known_platform(&input.platform) {
+            return Err(
+                GenerateMobileSdkReleaseUrlErrorModeled::WAFInvalidParameterException(
+                    crate::state::invalid_parameter_exception_without_field(
+                        &input.platform,
+                        crate::state::PLATFORM_NOT_VALID_REASON,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GenerateMobileSdkReleaseUrlErrorModeled::WAFInternalErrorException(
+                    WAFInternalErrorException {
+                        message: Some("the wafv2 store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let state = state.lock();
+
+        // "The mobile SDK is not generally available …": an account that was never
+        // granted it may not download a release either, and this is the SAME gate
+        // `ListMobileSdkReleases` consults — so a URL is never minted for an account
+        // that is refused the catalogue.
+        if !state.uses_mobile_sdk() {
+            return Err(
+                GenerateMobileSdkReleaseUrlErrorModeled::WAFInvalidOperationException(
+                    crate::state::mobile_sdk_not_authorized_exception(),
+                )
+                .into(),
+            );
+        }
+
+        // A version this account's catalogue does not publish for the platform names
+        // a resource that doesn't exist. `LATEST` names the platform's newest release,
+        // resolved in `crate::state` for both operations that take a version — and
+        // the URL below names the version that was RESOLVED, not the word the request
+        // carried.
+        let Some(release) = state.mobile_sdk_release(&input.platform, &input.release_version)
+        else {
+            return Err(
+                GenerateMobileSdkReleaseUrlErrorModeled::WAFNonexistentItemException(
+                    crate::state::nonexistent_item_exception(),
+                )
+                .into(),
+            );
+        };
+        let release_version = release
+            .release_version
+            .clone()
+            .unwrap_or_else(|| input.release_version.clone());
+
+        Ok(GenerateMobileSdkReleaseUrlOutput {
+            url: download_url(request_endpoint(ctx), &input.platform, &release_version),
+        })
     }
+}
+
+/// The endpoint this request arrived at, or `None` when it names none.
+fn request_endpoint(ctx: &smithy_server_runtime::OperationContext<'_>) -> Option<String> {
+    ctx.parts()
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| ctx.parts().uri.authority().map(::http::uri::Authority::as_str))
+        .map(ToString::to_string)
+}
+
+/// Where a client downloads `release_version` of the mobile SDK for `platform`.
+///
+/// AWS answers a presigned S3 URL here. This emulator has no object data plane, so
+/// the URL names THAT RELEASE on the endpoint THIS REQUEST ARRIVED AT: it is a
+/// locator built from the request's own host and the release the catalogue
+/// resolved, and no operation of this service serves it — never a stand-in for SDK
+/// bytes this emulator holds. When the request names no host there is no endpoint
+/// to point at, so `None` comes back rather than a baked-in AWS endpoint, which
+/// would send a following client to the real service.
+fn download_url(
+    endpoint: Option<String>,
+    platform: &str,
+    release_version: &str,
+) -> Option<String> {
+    endpoint.map(|host| {
+        format!(
+            "https://{host}/mobile-sdk/{}/{release_version}/aws-waf-sdk.zip",
+            platform.to_lowercase()
+        )
+    })
 }

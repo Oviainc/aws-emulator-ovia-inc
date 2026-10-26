@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associates the tags of the request with the resource its `ResourceARN` names: a
+//! key the resource already carries takes the new value and a key it does not
+//! carry is added, while a key under the prefix AWS reserves for its own system
+//! tags is refused before anything is stored. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +161,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // A mutation: it writes the tags `ListTagsForResource` reports. `ctx` carries
+        // only request metadata — the resource is addressed by the `ResourceARN` the
+        // request names, so nothing here depends on the endpoint.
+        let _ = ctx;
+
+        // An ARN that is not even shaped like one of this service's resource ARNs is
+        // the malformed-ARN parameter failure, as every operation here that takes an
+        // ARN reports it.
+        if !crate::state::is_wafv2_resource_arn(&input.resource_arn) {
+            return Err(TagResourceErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_arn_exception(&input.resource_arn),
+            )
+            .into());
+        }
+
+        // The keys AWS keeps for itself are refused, and refused BEFORE the store is
+        // touched — so a request carrying one reserved key among acceptable ones
+        // leaves the resource's tags exactly as they were. The same judgement, in the
+        // same position, as every create of this service that takes a `TagList`.
+        if crate::state::reserved_tag_key(&input.tags).is_some() {
+            crate::state::audit("TagResource", "", "", "", "WAFTagOperationException");
+            return Err(TagResourceErrorModeled::WAFTagOperationException(
+                crate::state::reserved_tag_key_exception(),
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // A well-formed ARN naming no taggable resource of this account — one that
+        // was never created, one of a kind WAF does not tag, or one carrying another
+        // Region — references a resource that doesn't exist.
+        let Some((scope, id, stored)) = state.taggable_resource_mut(&input.resource_arn) else {
+            crate::state::audit("TagResource", "", "", "", "WAFNonexistentItemException");
+            return Err(TagResourceErrorModeled::WAFNonexistentItemException(
+                crate::state::nonexistent_item_exception(),
+            )
+            .into());
+        };
+
+        // "You can specify one or more tags to add to each Amazon Web Services
+        // resource, up to 50 tags for a resource" (this operation's own doc): a
+        // request that would take the resource past that quota is refused and stores
+        // nothing, so one resource's tag collection cannot grow without limit.
+        if crate::state::tags_after_applying(stored, &input.tags)
+            > crate::state::MAX_TAGS_PER_RESOURCE
+        {
+            crate::state::audit("TagResource", &scope, "", &id, "WAFLimitsExceededException");
+            return Err(TagResourceErrorModeled::WAFLimitsExceededException(
+                crate::state::limits_exceeded_exception(),
+            )
+            .into());
+        }
+
+        crate::state::apply_tags(stored, &input.tags);
+        crate::state::audit("TagResource", &scope, "", &id, "tags applied");
+
+        Ok(TagResourceOutput {})
     }
 }

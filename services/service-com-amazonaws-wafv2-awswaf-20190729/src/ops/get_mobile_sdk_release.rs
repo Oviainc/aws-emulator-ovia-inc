@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMobileSdkRelease
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMobileSdkRelease`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMobileSdkRelease::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one release of the mobile SDK this account holds — or refuses the call
+//! when the account may not use the mobile SDK, the same gate
+//! `ListMobileSdkReleases` consults. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +151,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMobileSdkRelease` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMobileSdkReleaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMobileSdkRelease"))
+        // A read: `ctx` carries only request metadata, which this operation does not
+        // need — the release belongs to the account, not to an endpoint — and nothing
+        // here writes to the store.
+        let _ = ctx;
+
+        // `Platform` is an enum, and an enum value the model does not declare reaches
+        // a handler, so the handler is what refuses it.
+        if !crate::state::is_known_platform(&input.platform) {
+            return Err(GetMobileSdkReleaseErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception_without_field(
+                    &input.platform,
+                    crate::state::PLATFORM_NOT_VALID_REASON,
+                ),
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetMobileSdkReleaseErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // "The mobile SDK is not generally available …": an account that was never
+        // granted it may not read a release either, and this is the SAME gate
+        // `ListMobileSdkReleases` consults — so no release record is ever handed to an
+        // account that is refused the catalogue.
+        if !state.uses_mobile_sdk() {
+            return Err(GetMobileSdkReleaseErrorModeled::WAFInvalidOperationException(
+                crate::state::mobile_sdk_not_authorized_exception(),
+            )
+            .into());
+        }
+
+        // A version this account's catalogue does not publish for the platform —
+        // including a platform it holds no release for at all — names a resource that
+        // doesn't exist. `LATEST` names the platform's newest release, which
+        // `crate::state` resolves for both operations that take a version.
+        let Some(release) = state.mobile_sdk_release(&input.platform, &input.release_version)
+        else {
+            return Err(GetMobileSdkReleaseErrorModeled::WAFNonexistentItemException(
+                crate::state::nonexistent_item_exception(),
+            )
+            .into());
+        };
+
+        Ok(GetMobileSdkReleaseOutput {
+            mobile_sdk_release: Some(release.clone()),
+        })
     }
 }

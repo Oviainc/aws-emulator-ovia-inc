@@ -709,7 +709,10 @@ impl Provisioner {
     /// run — and Amazon Data Firehose's `CreateDeliveryStream`, whose `TagKey` shape is
     /// modelled with the reserved prefix excluded, the same check its `TagDeliveryStream`
     /// makes. CodeCommit's `CreateRepository` is in the same position: a tag key in that
-    /// namespace is its `InvalidSystemTagUsageException`.
+    /// namespace is its `InvalidSystemTagUsageException`. AWS WAF's four WAFv2 entity
+    /// creates are the same case again: each takes a `TagList` and refuses a key in the
+    /// reserved namespace in its own crate's tag validation, the one check `TagResource`
+    /// runs too.
     fn applicable_tags(self, propagated: &[(String, String)]) -> Vec<(String, String)> {
         let refuses_reserved_keys = matches!(
             self,
@@ -725,6 +728,10 @@ impl Provisioner {
                 | Self::MskServerlessCluster
                 | Self::SqsQueue
                 | Self::CodeCommitRepository
+                | Self::Wafv2WebAcl
+                | Self::Wafv2RuleGroup
+                | Self::Wafv2IpSet
+                | Self::Wafv2RegexPatternSet
         );
         propagated
             .iter()

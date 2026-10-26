@@ -53,6 +53,8 @@ mod managed_rule_group_versions;
 mod managed_rule_groups;
 #[path = "all/managed_rule_sets.rs"]
 mod managed_rule_sets;
+#[path = "all/mobile_sdk_releases.rs"]
+mod mobile_sdk_releases;
 #[path = "all/parameter_validation.rs"]
 mod parameter_validation;
 #[path = "all/permission_policy.rs"]
@@ -67,6 +69,8 @@ mod regex_pattern_set_lifecycle;
 mod regex_pattern_set_listing;
 #[path = "all/regex_pattern_set_updates.rs"]
 mod regex_pattern_set_updates;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/response_members.rs"]
 mod response_members;
 #[path = "all/rule_evaluation_order.rs"]

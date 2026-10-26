@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMobileSdkReleases
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMobileSdkReleases`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMobileSdkReleases::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the mobile SDK releases this account holds for the device platform the
+//! request names, one page at a time — or refuses the call when the account may not
+//! use the mobile SDK, which is the one gate the whole mobile-SDK family consults
+//! ([`crate::state::ComAmazonawsWafv2Awswaf20190729State::uses_mobile_sdk`]). This
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +158,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMobileSdkReleases` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMobileSdkReleasesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMobileSdkReleases"))
+        // A read: `ctx` carries only request metadata, which this operation does not
+        // need — the catalogue belongs to the account, not to an endpoint — and
+        // nothing here writes to the store.
+        let _ = ctx;
+
+        // `Platform` is an enum, and an enum value the model does not declare reaches
+        // a handler, so the handler is what refuses it (the same stance every
+        // operation of this service takes for `Scope`).
+        if !crate::state::is_known_platform(&input.platform) {
+            return Err(ListMobileSdkReleasesErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception_without_field(
+                    &input.platform,
+                    crate::state::PLATFORM_NOT_VALID_REASON,
+                ),
+            )
+            .into());
+        }
+
+        // Absent `Limit`, a page holds as many as the model's `PaginationLimit` range
+        // allows; a `Limit` outside that range is refused rather than clamped. That
+        // reading of the range is `crate::state::page_size`, shared with every other
+        // paginated operation of this service.
+        let page_size = crate::state::page_size(input.limit, "summaries")
+            .map_err(ListMobileSdkReleasesErrorModeled::WAFInvalidParameterException)?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListMobileSdkReleasesErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // "The mobile SDK is not generally available. Customers who have access to
+        // the mobile SDK can use it …": an account that was never granted it may not
+        // see the catalogue at all, and the family's three operations read this ONE
+        // gate, so none of them can answer for an account the others refuse.
+        if !state.uses_mobile_sdk() {
+            return Err(ListMobileSdkReleasesErrorModeled::WAFInvalidOperationException(
+                crate::state::mobile_sdk_not_authorized_exception(),
+            )
+            .into());
+        }
+
+        // The platform's releases, in release-version order so a marker names the
+        // same position on every call. `NextMarker` is the version of the last summary
+        // of the previous page, so this page starts at the first version after it.
+        let mut releases = state.mobile_sdk_releases_for(&input.platform);
+        if let Some(marker) = input.next_marker.as_deref() {
+            releases.retain(|release| {
+                release.release_version.as_deref().unwrap_or_default() > marker
+            });
+        }
+        releases.truncate(page_size);
+
+        // WAF answers every non-empty page with a `NextMarker` — the version of the
+        // LAST summary on the page even when the page is not full, so a client resumes
+        // from it and learns it reached the end from the empty page that follows. An
+        // empty page carries no marker, which is also what ends a paginator's loop.
+        let next_marker = releases
+            .last()
+            .and_then(|release| release.release_version.clone());
+        let release_summaries = releases
+            .into_iter()
+            .map(|release| ReleaseSummary {
+                release_version: release.release_version.clone(),
+                timestamp: release.timestamp,
+            })
+            .collect();
+
+        Ok(ListMobileSdkReleasesOutput {
+            release_summaries: Some(release_summaries),
+            next_marker,
+        })
     }
 }

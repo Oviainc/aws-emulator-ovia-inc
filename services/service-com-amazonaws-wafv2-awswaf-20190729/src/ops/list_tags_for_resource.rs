@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags the resource its `ResourceARN` names carries, one page at a
+//! time. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +168,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // A read: `ctx` carries only request metadata, which this operation does not
+        // need — the resource is addressed by the `ResourceARN` the request names —
+        // and nothing here writes to the store.
+        let _ = ctx;
+
+        // The malformed-ARN parameter failure, as every operation here that takes an
+        // ARN reports it.
+        if !crate::state::is_wafv2_resource_arn(&input.resource_arn) {
+            return Err(ListTagsForResourceErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_arn_exception(&input.resource_arn),
+            )
+            .into());
+        }
+
+        // Absent `Limit`, a page holds as many as the model's `PaginationLimit` range
+        // allows; a `Limit` outside that range is refused rather than clamped. That
+        // reading of the range is `crate::state::page_size`, shared with every other
+        // paginated operation of this service.
+        let page_size = crate::state::page_size(input.limit, "tags")
+            .map_err(ListTagsForResourceErrorModeled::WAFInvalidParameterException)?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // A well-formed ARN naming no taggable resource of this account references a
+        // resource that doesn't exist, exactly as the tagging mutation reports it.
+        let Some(tags) = state.tags_by_arn(&input.resource_arn) else {
+            return Err(ListTagsForResourceErrorModeled::WAFNonexistentItemException(
+                crate::state::nonexistent_item_exception(),
+            )
+            .into());
+        };
+
+        // A resource's tags are reported in KEY order, the stable order every
+        // paginated listing of this service enumerates in, so a marker names the same
+        // position on every call: `NextMarker` is the key of the last tag of the
+        // previous page, and this page starts at the first key after it — the reading
+        // `ListIPSets` and `ListMobileSdkReleases` take of their own markers.
+        let mut page: Vec<&Tag> = tags.iter().collect();
+        page.sort_by(|left, right| left.key.cmp(&right.key));
+        if let Some(marker) = input.next_marker.as_deref() {
+            page.retain(|tag| tag.key.as_str() > marker);
+        }
+        page.truncate(page_size);
+
+        // WAF answers every non-empty page with a `NextMarker` — the key of the LAST
+        // tag on the page even when the page is not full, so a client resumes from it
+        // and learns it reached the end from the empty page that follows. A page with
+        // no last key carries no marker, which is also what ends a paginator's loop.
+        let next_marker = page.last().map(|tag| tag.key.clone());
+        let tag_list: Vec<Tag> = page.into_iter().cloned().collect();
+
+        Ok(ListTagsForResourceOutput {
+            next_marker,
+            tag_info_for_resource: Some(TagInfoForResource {
+                resource_arn: Some(input.resource_arn.clone()),
+                tag_list: Some(tag_list),
+            }),
+        })
     }
 }
