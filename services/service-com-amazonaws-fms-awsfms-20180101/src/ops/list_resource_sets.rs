@@ -217,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resource_sets: Vec<ResourceSetSummary> = remaining
             .by_ref()
             .take(page_size)
-            .map(|(_, record)| record.summary())
+            .map(|(_, record)| record.summary(store.resource_set_status(record)))
             .collect();
         // A token only when a resource set is left AFTER this page, so the last
         // page carries none.

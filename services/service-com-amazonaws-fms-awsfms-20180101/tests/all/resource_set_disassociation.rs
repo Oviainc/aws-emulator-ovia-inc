@@ -636,6 +636,7 @@ async fn disassociating_is_administrator_gated_and_removes_nothing_when_refused(
             state::ResourceSetRecord {
                 id: seeded.to_string(),
                 arn: state::resource_set_arn(REGION, seeded),
+                region: REGION.to_string(),
                 update_token: state::mint_identifier(),
                 resource_set: ResourceSet {
                     name: "seeded-set".to_string(),

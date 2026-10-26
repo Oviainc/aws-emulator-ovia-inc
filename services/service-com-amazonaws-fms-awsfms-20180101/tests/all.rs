@@ -95,6 +95,8 @@ mod resource_set_disassociation;
 mod resource_set_listing;
 #[path = "all/resource_set_resources.rs"]
 mod resource_set_resources;
+#[path = "all/resource_set_status_derivation.rs"]
+mod resource_set_status_derivation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_list_duplicate_keys_on_writers.rs"]

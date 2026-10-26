@@ -197,8 +197,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The SERVICE-OWNED members are taken out of the stored copy:
         // `ResourceSetRecord` is the single source of truth for the `Id`, the
-        // `UpdateToken`, the `LastUpdateTime` and the `ResourceSetStatus`, and
-        // `ResourceSetRecord::resource_set()` overlays them for every reader.
+        // `UpdateToken` and the `LastUpdateTime`, and the `ResourceSetStatus` is
+        // derived from the administrative scope governing the set on every read,
+        // so a status a caller sent is dropped rather than stored.
+        // `ResourceSetRecord::resource_set()` overlays all four for every reader.
         let mut resource_set = input.resource_set.clone();
         let requested_id = resource_set.id.take();
         let requested_token = resource_set.update_token.take();
@@ -267,6 +269,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::ResourceSetRecord {
                     id,
                     arn: existing.arn.clone(),
+                    // The Region the set belongs to is the one it was created
+                    // in: an update rewrites the document, not where the
+                    // resource lives.
+                    region: existing.region.clone(),
                     // A successful write makes the caller's token stale, so the
                     // next conditional update has to read the current one back.
                     update_token: crate::state::mint_identifier(),
@@ -315,6 +321,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::ResourceSetRecord {
                     arn: crate::state::resource_set_arn(&region, &id),
                     id,
+                    region: region.clone(),
                     update_token: crate::state::mint_identifier(),
                     resource_set,
                     // A new resource carries only the tags the create sent.
@@ -327,8 +334,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let arn = record.arn.clone();
+        // Derived from the administrative scope governing the resource set, on
+        // this read of it, exactly as `GetResourceSet` and the `ListResourceSets`
+        // summary derive it: a write does not get to report a status of its own.
+        let resource_set_status = store.resource_set_status(&record);
         let output = PutResourceSetOutput {
-            resource_set: record.resource_set(),
+            resource_set: record.resource_set(resource_set_status),
             resource_set_arn: record.arn.clone(),
         };
         store.resource_sets.insert(record.id.clone(), record);

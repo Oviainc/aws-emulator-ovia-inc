@@ -169,8 +169,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // `ResourceSetStatus` is DERIVED on this read, from the administrative
+        // scope governing the resource set — never read back off the stored
+        // document.
+        let resource_set_status = store.resource_set_status(record);
         Ok(GetResourceSetOutput {
-            resource_set: record.resource_set(),
+            resource_set: record.resource_set(resource_set_status),
             resource_set_arn: record.arn.clone(),
         })
     }

@@ -422,6 +422,7 @@ async fn delete_resource_set_is_administrator_gated_and_deletes_nothing_when_ref
             state::ResourceSetRecord {
                 id: seeded.to_string(),
                 arn: seeded_arn.clone(),
+                region: REGION.to_string(),
                 update_token: state::mint_identifier(),
                 resource_set: ResourceSet {
                     name: "seeded-set".to_string(),

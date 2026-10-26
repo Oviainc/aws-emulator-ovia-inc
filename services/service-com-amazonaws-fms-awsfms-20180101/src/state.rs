@@ -243,10 +243,18 @@ pub const POLICY_STATUS_ACTIVE: &str = "ACTIVE";
 /// [`crate::ops::types::CUSTOMER_POLICY_STATUS_VALUES`].
 pub const POLICY_STATUS_OUT_OF_ADMIN_SCOPE: &str = "OUT_OF_ADMIN_SCOPE";
 
-/// The default `ResourceSetStatus` of a resource set an administrator created:
-/// it is in the administrator's Region scope, so the administrator can manage
-/// and delete it. One of [`crate::ops::types::RESOURCE_SET_STATUS_VALUES`].
+/// The `ResourceSetStatus` of a resource set that IS in the Region scope of the
+/// administrative scope governing it: "the administrator can manage and delete
+/// the resource set" (`ResourceSet$ResourceSetStatus`). One of
+/// [`crate::ops::types::RESOURCE_SET_STATUS_VALUES`].
 pub const RESOURCE_SET_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The `ResourceSetStatus` of a resource set that is OUTSIDE the Region scope of
+/// the administrative scope governing it: "the administrator can view the
+/// resource set, but they can't edit or delete the resource set"
+/// (`ResourceSet$ResourceSetStatus`). One of
+/// [`crate::ops::types::RESOURCE_SET_STATUS_VALUES`].
+pub const RESOURCE_SET_STATUS_OUT_OF_ADMIN_SCOPE: &str = "OUT_OF_ADMIN_SCOPE";
 
 /// `ThirdPartyFirewallAssociationStatus` of a third-party firewall that was
 /// never associated with this organisation. One of
@@ -391,10 +399,18 @@ pub struct NotificationChannelRecord {
 /// `resources` is a `BTreeSet`: associating a URI twice is the same association
 /// (the set is the membership, not a log of calls), and the total order makes a
 /// later page of `ListResourceSetResources` resumable from a key.
+///
+/// `region` is the Region the resource set was created in — the one its ARN
+/// names. It is held as a field rather than read back out of the ARN for the
+/// same reason [`PolicyRecord::region`] is: a resource set is a regional
+/// resource, and whether it is in an administrator's Region scope
+/// ([`ComAmazonawsFmsAwsfms20180101State::resource_set_status`]) is decided from
+/// it.
 #[derive(Debug, Clone)]
 pub struct ResourceSetRecord {
     pub id: String,
     pub arn: String,
+    pub region: String,
     pub update_token: String,
     pub resource_set: ResourceSet,
     pub tags: Vec<Tag>,
@@ -405,25 +421,34 @@ pub struct ResourceSetRecord {
 
 impl ResourceSetRecord {
     /// The stored resource set as `PutResourceSet` / `GetResourceSet` report it:
-    /// the caller's own members, with the service-owned `Id`, `UpdateToken`,
-    /// `LastUpdateTime` and `ResourceSetStatus` filled in from the record, so a
-    /// read never reports a stale token or a status the caller invented.
-    pub fn resource_set(&self) -> ResourceSet {
+    /// the caller's own members, with the service-owned `Id`, `UpdateToken` and
+    /// `LastUpdateTime` filled in from the record, and the service-derived
+    /// `ResourceSetStatus` the caller passes in, so a read never reports a stale
+    /// token or a status the caller invented.
+    ///
+    /// `resource_set_status` is a PARAMETER rather than a stored member for the
+    /// same reason [`PolicyRecord::policy`] takes one: the service derives it
+    /// from the administrative scope governing the resource set
+    /// ([`ComAmazonawsFmsAwsfms20180101State::resource_set_status`]), which lives
+    /// beside the resource set rather than inside it, so taking it here is what
+    /// stops a reader reporting a status that is not derived at all.
+    pub fn resource_set(&self, resource_set_status: &str) -> ResourceSet {
         let mut resource_set = self.resource_set.clone();
         resource_set.id = Some(self.id.clone());
         resource_set.update_token = Some(self.update_token.clone());
         resource_set.last_update_time = Some(::aws_smithy_types::DateTime::from(self.updated_at));
-        resource_set.resource_set_status = Some(RESOURCE_SET_STATUS_ACTIVE.to_string());
+        resource_set.resource_set_status = Some(resource_set_status.to_string());
         resource_set
     }
 
     /// The `ResourceSetSummary` projection `ListResourceSets` reports: every
-    /// member read off this record, so a summary cannot disagree with the
-    /// `ResourceSet` [`Self::resource_set`] reports for the same id. The summary
-    /// shape carries no `UpdateToken` and no `ResourceTypeList`, which is why it
-    /// is a projection rather than the whole document.
-    pub fn summary(&self) -> ResourceSetSummary {
-        let resource_set = self.resource_set();
+    /// member read off this record, with the same derived `ResourceSetStatus`
+    /// [`Self::resource_set`] reports, so a summary cannot disagree with the
+    /// `ResourceSet` a reader gets for the same id. The summary shape carries no
+    /// `UpdateToken` and no `ResourceTypeList`, which is why it is a projection
+    /// rather than the whole document.
+    pub fn summary(&self, resource_set_status: &str) -> ResourceSetSummary {
+        let resource_set = self.resource_set(resource_set_status);
         ResourceSetSummary {
             id: resource_set.id,
             name: Some(resource_set.name),
@@ -1564,6 +1589,43 @@ impl ComAmazonawsFmsAwsfms20180101State {
             POLICY_STATUS_ACTIVE
         } else {
             POLICY_STATUS_OUT_OF_ADMIN_SCOPE
+        }
+    }
+
+    /// The `ResourceSetStatus` of one stored resource set: SERVICE-DERIVED, from
+    /// the administrative scope that governs the resource set rather than from
+    /// anything a caller sent.
+    ///
+    /// `ResourceSet$ResourceSetStatus` "indicates whether the resource set is in
+    /// or out of an admin's Region scope": [`RESOURCE_SET_STATUS_ACTIVE`] while
+    /// that scope covers the Region the resource set lives in — "the
+    /// administrator can manage and delete the resource set" — and
+    /// [`RESOURCE_SET_STATUS_OUT_OF_ADMIN_SCOPE`] otherwise, where "the
+    /// administrator can view the resource set, but they can't edit or delete
+    /// the resource set".
+    ///
+    /// The REGION SCOPE alone decides it, which is where this differs from
+    /// [`Self::policy_status`]: a resource set carries no policy type, and the
+    /// member's own documentation names only "an admin's Region scope".
+    ///
+    /// The governing scope is resolved exactly as a policy's is: the CALLING
+    /// account's own `AdminScope` when `PutAdminAccount` configured one for it,
+    /// and otherwise the full scope of the organization's default administrator
+    /// ([`default_admin_scope`]), which nothing can narrow — so every resource
+    /// set is in it.
+    ///
+    /// Derived on every read, so narrowing an administrator's scope moves the
+    /// resource sets it no longer covers out of scope and widening it moves them
+    /// back, and no two readers of one resource set can report different
+    /// statuses.
+    pub fn resource_set_status(&self, record: &ResourceSetRecord) -> &'static str {
+        let Some(admin) = self.organization_admins.get(::engine::emulator_account_id()) else {
+            return RESOURCE_SET_STATUS_ACTIVE;
+        };
+        if admin_scope_manages_region(&admin.admin_scope, &record.region) {
+            RESOURCE_SET_STATUS_ACTIVE
+        } else {
+            RESOURCE_SET_STATUS_OUT_OF_ADMIN_SCOPE
         }
     }
 
