@@ -63,6 +63,8 @@ mod redshift_idc_applications;
 mod resource_tags;
 #[path = "all/reserved_node_offerings.rs"]
 mod reserved_node_offerings;
+#[path = "all/reserved_nodes.rs"]
+mod reserved_nodes;
 #[path = "all/reset_cluster_parameter_group.rs"]
 mod reset_cluster_parameter_group;
 #[path = "all/snapshot_access.rs"]

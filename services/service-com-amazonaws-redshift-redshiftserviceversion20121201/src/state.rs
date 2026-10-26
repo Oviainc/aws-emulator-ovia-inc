@@ -42,7 +42,7 @@ use crate::ops::types::{
     HsmConfiguration, MaintenanceTrack,
     NamespaceIdentifierUnion,
     NetworkInterface, Parameter, PendingModifiedValues, Qev2IdcApplication, RecurringCharge,
-    RedshiftIdcApplication, ReservedNodeOffering, Snapshot, SnapshotCopyGrant, Subnet,
+    RedshiftIdcApplication, ReservedNode, ReservedNodeOffering, Snapshot, SnapshotCopyGrant, Subnet,
     SupportedOperation,
     SupportedPlatform, UpdateTarget,
     VpcEndpoint, VpcSecurityGroupMembership,
@@ -1091,6 +1091,102 @@ pub fn published_reserved_node_offerings() -> Vec<ReservedNodeOffering> {
         }
     }
     offerings
+}
+
+/// The `State` a reservation a purchase just recorded reports: the sale is
+/// approved, the payment is not confirmed yet.
+///
+/// Source: `smithy_query(query="doc", shape="ReservedNode", member="State")` —
+/// "pending-payment-This reserved node has recently been purchased, and the sale
+/// has been approved, but payment has not yet been confirmed."
+pub const RESERVED_NODE_STATE_PENDING_PAYMENT: &str = "pending-payment";
+
+/// The `State` a reservation reports once its payment is confirmed, from the
+/// same documented value list as [`RESERVED_NODE_STATE_PENDING_PAYMENT`]:
+/// "active-This reserved node is owned by the caller and is available for use."
+pub const RESERVED_NODE_STATE_ACTIVE: &str = "active";
+
+/// How long after the purchase that starts it the payment confirmation falls
+/// due: a reservation reported [`RESERVED_NODE_STATE_PENDING_PAYMENT`] becomes
+/// [`RESERVED_NODE_STATE_ACTIVE`] this long after the
+/// `PurchaseReservedNodeOffering` call that recorded it.
+///
+/// The span is the emulator's own choice — Amazon Redshift documents no
+/// confirmation duration — and is deliberately non-zero, for the same reason as
+/// [`PROVISIONING_SPAN`]: a caller that reads the reservation straight after
+/// buying it still observes the transient state the purchase reported. The due
+/// instant is stored and nothing ever sleeps for it.
+pub const RESERVED_NODE_PAYMENT_SPAN: Duration = Duration::from_millis(500);
+
+/// How many nodes a purchase reserves when the request names no `NodeCount`.
+///
+/// Source: `smithy_query(query="doc",
+/// shape="PurchaseReservedNodeOfferingMessage", member="NodeCount")` — "The
+/// number of reserved nodes that you want to purchase. Default: 1".
+pub const DEFAULT_RESERVED_NODE_COUNT: i32 = 1;
+
+/// How many reserved compute nodes the store holds before
+/// `PurchaseReservedNodeOffering` refuses with the modelled
+/// `ReservedNodeQuotaExceededFault`.
+///
+/// The same reasoning as [`CLUSTER_QUOTA`]: Amazon Redshift publishes an
+/// adjustable compute-node quota per account per Region, and this emulator
+/// models neither Service Quotas nor an account's adjustments — so this is the
+/// emulator's OWN bound on
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::reserved_nodes`]
+/// rather than a claim about any account's limit. It bounds NODES rather than
+/// reservations, because the fault it raises is about the "compute node quota"
+/// and one reservation may hold many nodes.
+pub const RESERVED_NODE_QUOTA: i32 = 10_000;
+
+/// A fresh `ReservedNodeId`.
+///
+/// "The unique identifier for the reservation" (`smithy_query(query="shape",
+/// shape="ReservedNode")`) is minted by the service and carries nothing from the
+/// request — two purchases of the SAME offering are two reservations — so it is
+/// drawn per call, exactly like [`new_usage_limit_id`], and the minted id is
+/// STORED so every later read of that reservation reports the same one.
+pub fn new_reserved_node_id() -> String {
+    crate::service::query_error_envelope::new_request_id()
+}
+
+/// The reservation a purchase of `offering` for `node_count` nodes records.
+///
+/// ONE rule for what a reservation reports: it carries its offering's own
+/// dimensions and per-node charges verbatim — node type, term, currency,
+/// offering type, utilization class and prices are the offering's, which is what
+/// makes a reservation and the offering it was bought from agree — and adds what
+/// belongs to the reservation alone: the id this purchase minted for it, when its
+/// term started, how many nodes it holds, and the state of its payment.
+pub fn reserved_node_of_offering(
+    reserved_node_id: String,
+    offering: &ReservedNodeOffering,
+    node_count: i32,
+    start_time: ::aws_smithy_types::DateTime,
+) -> ReservedNode {
+    ReservedNode {
+        reserved_node_id: Some(reserved_node_id),
+        reserved_node_offering_id: offering.reserved_node_offering_id.clone(),
+        node_type: offering.node_type.clone(),
+        start_time: Some(start_time),
+        duration: offering.duration,
+        fixed_price: offering.fixed_price,
+        usage_price: offering.usage_price,
+        currency_code: offering.currency_code.clone(),
+        node_count: Some(node_count),
+        state: Some(RESERVED_NODE_STATE_PENDING_PAYMENT.to_string()),
+        offering_type: offering.offering_type.clone(),
+        recurring_charges: offering.recurring_charges.clone(),
+        reserved_node_offering_type: offering.reserved_node_offering_type.clone(),
+    }
+}
+
+/// What an operation naming a `ReservedNodeId` answers when the account holds no
+/// reservation under it: ONE sentence naming the resource that was not found and
+/// the identifier the request asked for, worded like the sibling refusal for an
+/// offering id the catalog does not publish.
+pub fn reserved_node_not_found_message(reserved_node_id: &str) -> String {
+    format!("Reserved node not found: '{reserved_node_id}'.")
 }
 
 /// The default number of days automated snapshots are retained.
@@ -2483,6 +2579,20 @@ pub struct StoredHsmConfiguration {
     pub hsm_partition_password: String,
 }
 
+/// A reserved node as this service stores it: the modelled projection a response
+/// is built from, plus when the payment confirmation its purchase started falls
+/// due.
+#[derive(Debug, Clone)]
+pub struct StoredReservedNode {
+    /// Exactly what `DescribeReservedNodes` reports, so a read never recomputes
+    /// it.
+    pub node: ReservedNode,
+    /// When the clock-owed [`RESERVED_NODE_STATE_PENDING_PAYMENT`] ->
+    /// [`RESERVED_NODE_STATE_ACTIVE`] transition falls due. See
+    /// [`RESERVED_NODE_PAYMENT_SPAN`].
+    pub active_at: Instant,
+}
+
 /// Per-service state for com-amazonaws-redshift-redshiftserviceversion20121201. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
@@ -2567,6 +2677,11 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// operation adds to or removes from the list (see
     /// [`published_reserved_node_offerings`]).
     pub reserved_node_offerings: Vec<ReservedNodeOffering>,
+    /// Every reservation `PurchaseReservedNodeOffering` bought, keyed by
+    /// `ReservedNodeId`, in purchase order — unlike the offering catalog above,
+    /// which is seeded and never grows, this collection starts empty and a
+    /// purchase is the only thing that adds to it.
+    pub reserved_nodes: Vec<StoredReservedNode>,
     /// Every namespace registration `RegisterNamespace` recorded, keyed by the
     /// (namespace, consumer account) pair it is a registration of, in
     /// registration order.
@@ -2632,6 +2747,7 @@ impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             maintenance_tracks: published_maintenance_tracks(),
             account_attributes: published_account_attributes(),
             reserved_node_offerings: published_reserved_node_offerings(),
+            reserved_nodes: Vec::new(),
             namespace_registrations: Vec::new(),
             event_subscriptions: Vec::new(),
             authentication_profiles: Vec::new(),
@@ -2723,6 +2839,16 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             // derived from that period and the snapshot's own creation time, so
             // it falls with the clock whether or not anybody called.
             refresh_manual_retention(&mut stored.snapshot, wall);
+        }
+        // A reservation whose payment its purchase left unconfirmed is active
+        // once that purchase's span has passed: the confirmation was due at this
+        // instant whether or not anybody called.
+        for stored in &mut self.reserved_nodes {
+            if stored.node.state.as_deref() == Some(RESERVED_NODE_STATE_PENDING_PAYMENT)
+                && now >= stored.active_at
+            {
+                stored.node.state = Some(RESERVED_NODE_STATE_ACTIVE.to_string());
+            }
         }
         // A registration a deregister reported as leaving is GONE once that
         // call's span has passed: the namespace is registered to that consumer
@@ -2879,6 +3005,23 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         self.reserved_node_offerings
             .iter()
             .find(|offering| offering.reserved_node_offering_id.as_deref() == Some(offering_id))
+    }
+
+    /// The stored reservation with this `ReservedNodeId`, if the account holds
+    /// one.
+    pub fn reserved_node(&self, reserved_node_id: &str) -> Option<&StoredReservedNode> {
+        self.reserved_nodes
+            .iter()
+            .find(|stored| stored.node.reserved_node_id.as_deref() == Some(reserved_node_id))
+    }
+
+    /// How many reserved compute NODES the account holds in all, across every
+    /// reservation: what [`RESERVED_NODE_QUOTA`] bounds.
+    pub fn reserved_node_count(&self) -> i32 {
+        self.reserved_nodes
+            .iter()
+            .map(|stored| stored.node.node_count.unwrap_or_default())
+            .sum()
     }
 
     /// The published maintenance track with this name, if the catalog has one.

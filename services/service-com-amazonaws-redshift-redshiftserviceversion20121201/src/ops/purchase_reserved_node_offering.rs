@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PurchaseReservedNodeOffering
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PurchaseReservedNodeOffering`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PurchaseReservedNodeOffering::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reserves nodes from one published offering: the call records a reservation of
+//! `NodeCount` nodes against the offering the request names, and that record is
+//! what `DescribeReservedNodes` reports from then on. The reservation's payment
+//! is unconfirmed when the purchase returns and is confirmed by the clock (see
+//! `crate::state::RESERVED_NODE_PAYMENT_SPAN`).
 //!
 //! ## Shape of an operation
 //!
@@ -92,13 +89,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `PurchaseReservedNodeOfferingError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#PurchaseReservedNodeOffering")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#PurchaseReservedNodeOffering",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum PurchaseReservedNodeOfferingErrorModeled {
     ReservedNodeAlreadyExistsFault(ReservedNodeAlreadyExistsFault),
     ReservedNodeOfferingNotFoundFault(ReservedNodeOfferingNotFoundFault),
     ReservedNodeQuotaExceededFault(ReservedNodeQuotaExceededFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -150,20 +151,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PurchaseReservedNodeOffering` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PurchaseReservedNodeOfferingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PurchaseReservedNodeOffering"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                PurchaseReservedNodeOfferingErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let started = ::std::time::Instant::now();
+
+        // "The number of reserved nodes that you want to purchase. Default: 1":
+        // an absent member takes that default, and a count that reserves no node
+        // at all describes no purchase. The model declares no range on the
+        // member for the framework to refuse it earlier.
+        let node_count = input.node_count.unwrap_or(st::DEFAULT_RESERVED_NODE_COUNT);
+        if node_count < 1 {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Invalid value for NodeCount: {node_count}. The number of nodes to reserve must be a positive number."
+            )));
+        }
+
+        let mut store = state.lock();
+        store.settle(started);
+
+        // "You can call this API by providing a specific reserved node offering
+        // and the number of nodes you want to reserve": the offering is what is
+        // being bought, so an id the catalog does not publish is the modelled
+        // "Specified offering does not exist" — worded exactly as
+        // `DescribeReservedNodeOfferings` words it, the two reading one catalog.
+        let Some(offering) = store
+            .reserved_node_offering(&input.reserved_node_offering_id)
+            .cloned()
+        else {
+            return Err(
+                PurchaseReservedNodeOfferingErrorModeled::ReservedNodeOfferingNotFoundFault(
+                    ReservedNodeOfferingNotFoundFault {
+                        message: Some(format!(
+                            "Reserved node offering not found: '{}'.",
+                            input.reserved_node_offering_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The compute-node quota the modelled fault names counts NODES, so a
+        // purchase is refused when the nodes it would add take the account past
+        // the bound.
+        if store.reserved_node_count().saturating_add(node_count) > st::RESERVED_NODE_QUOTA {
+            return Err(
+                PurchaseReservedNodeOfferingErrorModeled::ReservedNodeQuotaExceededFault(
+                    ReservedNodeQuotaExceededFault {
+                        message: Some(format!(
+                            "The request would exceed the allowed number of reserved compute nodes ({}).",
+                            st::RESERVED_NODE_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A reservation's identity is the id this call mints for it, not the
+        // offering it was bought from: buying the same offering twice is two
+        // reservations, each under its own id. The generator mints a distinct id
+        // per call, so no reservation this store holds can already carry it —
+        // which leaves this operation's `ReservedNodeAlreadyExistsFault` ("User
+        // already has a reservation with the given identifier") with no
+        // condition a caller can reach, the request naming no id at all.
+        let reserved_node_id = st::new_reserved_node_id();
+
+        // "You purchase a reserved node offering for a duration. This is the
+        // start time of that duration": the term starts with this call.
+        let node = st::reserved_node_of_offering(
+            reserved_node_id,
+            &offering,
+            node_count,
+            ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()),
+        );
+        store.reserved_nodes.push(st::StoredReservedNode {
+            node: node.clone(),
+            active_at: started + st::RESERVED_NODE_PAYMENT_SPAN,
+        });
+
+        Ok(PurchaseReservedNodeOfferingOutput {
+            reserved_node: Some(node),
+        })
     }
 }

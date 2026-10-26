@@ -21,7 +21,7 @@
 
 use service_com_amazonaws_redshift_redshiftserviceversion20121201::state;
 
-use crate::cluster_lifecycle::{all_text, Answer, Emulator};
+use crate::cluster_lifecycle::{all_text, element_blocks, Answer, Emulator};
 
 /// The hourly rate the catalog publishes for one node of each offered node type,
 /// in the order the catalog offers them.
@@ -141,37 +141,10 @@ fn price(case: &str, block: &str, tag: &str) -> f64 {
 }
 
 /// The inner XML of every `<ReservedNodeOffering>` element in a response body,
-/// in document order.
-///
-/// Written here rather than taken from `all_text`, because the framework's
-/// serializer writes the service's XML namespace onto the FIRST member of a
-/// list, so that member's open tag carries an attribute an exact `<tag>` match
-/// never sees. `ReservedNodeOfferings` and `ReservedNodeOfferingId` share the
-/// element name's prefix, so only a `>` or a space may follow it.
+/// in document order — the harness's shared element scanner, named for the one
+/// element this suite reads.
 fn offering_blocks(xml: &str) -> Vec<String> {
-    const OPEN: &str = "<ReservedNodeOffering";
-    const CLOSE: &str = "</ReservedNodeOffering>";
-    let mut blocks = Vec::new();
-    let mut rest = xml;
-    while let Some(start) = rest.find(OPEN) {
-        let after = &rest[start + OPEN.len()..];
-        let Some(open_end) = after.find('>') else {
-            break;
-        };
-        let attributes = &after[..open_end];
-        if !(attributes.is_empty() || attributes.starts_with(' ')) {
-            // A longer element name that merely starts the same way.
-            rest = &after[open_end..];
-            continue;
-        }
-        let inner = &after[open_end + 1..];
-        let Some(end) = inner.find(CLOSE) else {
-            break;
-        };
-        blocks.push(inner[..end].to_string());
-        rest = &inner[end + CLOSE.len()..];
-    }
-    blocks
+    element_blocks(xml, "ReservedNodeOffering")
 }
 
 /// Every offering a `DescribeReservedNodeOfferings` body carries, in document

@@ -202,6 +202,44 @@ fn first_text(xml: &str, tag: &str) -> Option<String> {
     all_text(xml, tag).into_iter().next()
 }
 
+/// The inner XML of every `<name>…</name>` element in a body, in document order.
+///
+/// Needed beside [`all_text`] for a STRUCTURE rather than a scalar, and written
+/// with two allowances an exact `<name>` match cannot make: the framework's
+/// serializer writes the service's XML namespace onto the FIRST member of a
+/// list, so that member's open tag carries an attribute, and a list's wrapper
+/// shares its entries' element-name prefix (`<ReservedNodes>` around
+/// `<ReservedNode>`) — so only a `>` or a space may follow the name.
+///
+/// `pub(crate)` for the same reason as the harness above: a sibling suite under
+/// `tests/all/` reads a served structure through this one scanner rather than
+/// keeping a second copy of it.
+pub(crate) fn element_blocks(xml: &str, name: &str) -> Vec<String> {
+    let open = format!("<{name}");
+    let close = format!("</{name}>");
+    let mut blocks = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(&open) {
+        let after = &rest[start + open.len()..];
+        let Some(open_end) = after.find('>') else {
+            break;
+        };
+        let attributes = &after[..open_end];
+        if !(attributes.is_empty() || attributes.starts_with(' ')) {
+            // A longer element name that merely starts the same way.
+            rest = &after[open_end..];
+            continue;
+        }
+        let inner = &after[open_end + 1..];
+        let Some(end) = inner.find(&close) else {
+            break;
+        };
+        blocks.push(inner[..end].to_string());
+        rest = &inner[end + close.len()..];
+    }
+    blocks
+}
+
 /// The `<ClusterIdentifier>` of every cluster a `DescribeClusters` body carries,
 /// in the order the page lists them.
 fn listed_clusters(xml: &str) -> Vec<String> {

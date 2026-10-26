@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeReservedNodes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeReservedNodes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeReservedNodes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the reservations this account holds: every reserved node
+//! `PurchaseReservedNodeOffering` bought, in purchase order, under the shared
+//! `MaxRecords` window and `Marker` cursor. `ReservedNodeId` selects the one
+//! reservation it names, and an id the account holds no reservation under is
+//! refused with the modelled `ReservedNodeNotFoundFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -151,20 +148,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeReservedNodes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeReservedNodesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeReservedNodes"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribeReservedNodesErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let read_at = ::std::time::Instant::now();
+
+        let mut store = state.lock();
+        // "Returns the descriptions of the reserved nodes": a reporting
+        // operation. The ONE write it makes is materialising the state change the
+        // clock already owed each reservation — the payment confirmation was due
+        // at this instant whether or not anybody called.
+        store.settle(read_at);
+
+        // "Identifier for the node reservation": an id names ONE reservation, so
+        // a request carrying one reports just that reservation, and an id this
+        // account holds no reservation under is refused with the modelled
+        // `ReservedNodeNotFoundFault` ("The specified reserved compute node not
+        // found") rather than served as an empty list.
+        let reservations: Vec<ReservedNode> = match input.reserved_node_id.as_deref() {
+            Some(reserved_node_id) => match store.reserved_node(reserved_node_id) {
+                Some(stored) => vec![stored.node.clone()],
+                None => {
+                    return Err(DescribeReservedNodesErrorModeled::ReservedNodeNotFoundFault(
+                        ReservedNodeNotFoundFault {
+                            message: Some(st::reserved_node_not_found_message(reserved_node_id)),
+                        },
+                    )
+                    .into());
+                }
+            },
+            None => store
+                .reserved_nodes
+                .iter()
+                .map(|stored| stored.node.clone())
+                .collect(),
+        };
+
+        // The same `MaxRecords` window and opaque cursor every paginated Redshift
+        // `Describe*` shares, so a marker one page hands out resumes the next.
+        let (start, end, next_marker) = match st::page_bounds(
+            input.marker.as_deref(),
+            input.max_records,
+            reservations.len(),
+        ) {
+            Ok(page) => page,
+            Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+        };
+
+        Ok(DescribeReservedNodesOutput {
+            reserved_nodes: Some(reservations[start..end].to_vec()),
+            marker: next_marker,
+        })
     }
 }
