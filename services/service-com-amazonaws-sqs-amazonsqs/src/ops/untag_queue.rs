@@ -173,13 +173,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let _ = ctx;
         // "The list of tags to be removed from the specified queue": a list that names no
-        // tag removes nothing, a request this operation models no error for — so it rides
-        // the 400 `ValidationException` channel, exactly as an empty `Tags` map does in
-        // `TagQueue`.
+        // tag removes nothing, so the parameter the call requires was not really
+        // supplied.
         if input.tag_keys.is_empty() {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "TagKeys must name at least one tag to remove",
-            ));
+            return Err(crate::scaffolded::Scaffolded::missing_parameter("TagKeys"));
         }
 
         let store = state::service_state(&*self.engine).ok_or_else(|| {

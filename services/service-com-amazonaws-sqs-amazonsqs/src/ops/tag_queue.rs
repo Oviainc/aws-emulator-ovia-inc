@@ -173,14 +173,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state;
 
         let _ = ctx;
-        // "The list of tags to be added to the specified queue": a map that names no
-        // tag adds nothing, a request this operation models no error for — so it rides
-        // the 400 `ValidationException` channel, exactly as an empty `Attributes` map
-        // does in `SetQueueAttributes`.
+        // "The list of tags to be added to the specified queue": a map that names no tag
+        // adds nothing, so the parameter the call requires was not really supplied.
         if input.tags.is_empty() {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "Tags must name at least one tag to add",
-            ));
+            return Err(crate::scaffolded::Scaffolded::missing_parameter("Tags"));
         }
 
         let store = state::service_state(&*self.engine).ok_or_else(|| {
@@ -206,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // VALUE this service does not take, which is what `InvalidParameterValue`
         // reports; the empty map above is a different refusal — the member names nothing
         // at all.
-        if let Some(why) = state::tag_refusal(&queue.tags, &input.tags) {
+        if let Some(why) = state::tag_refusal(&name, &queue.tags, &input.tags) {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
         }
 

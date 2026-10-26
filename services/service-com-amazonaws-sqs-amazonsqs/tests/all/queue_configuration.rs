@@ -657,8 +657,8 @@ async fn set_queue_attributes_changes_exactly_the_attributes_it_names() {
     .await;
     assert_eq!(
         (status, error_code(&parsed).as_str()),
-        (400, "ValidationException"),
-        "case an empty Attributes map: expected a 400 ValidationException, got {status} with {parsed}"
+        (400, "MissingParameter"),
+        "case an empty Attributes map: expected a 400 MissingParameter, got {status} with {parsed}"
     );
 }
 
@@ -790,13 +790,15 @@ async fn a_queue_name_is_accepted_only_in_the_documented_form() {
         } else {
             assert_eq!(
                 (status, error_code(&parsed).as_str()),
-                (400, "ValidationException"),
-                "case {case} ({name}): expected a 400 ValidationException, got {status} with {parsed}"
+                (400, "InvalidParameterValue"),
+                "case {case} ({name}): expected a 400 InvalidParameterValue, got {status} with {parsed}"
             );
         }
     }
 
-    // Designating a queue FIFO is only consistent with a name that carries the suffix.
+    // Designating a queue FIFO is only consistent with a name that carries the suffix:
+    // the fault is in the NAME the request supplied, so it is refused as that
+    // parameter's value and not as the attribute's.
     let (status, parsed) = create(
         &router,
         "not-suffixed",
@@ -805,8 +807,8 @@ async fn a_queue_name_is_accepted_only_in_the_documented_form() {
     .await;
     assert_eq!(
         (status, error_code(&parsed).as_str()),
-        (400, "InvalidAttributeValue"),
-        "case FifoQueue=true on a name without the .fifo suffix: expected a 400 InvalidAttributeValue, got {status} with {parsed}"
+        (400, "InvalidParameterValue"),
+        "case FifoQueue=true on a name without the .fifo suffix: expected a 400 InvalidParameterValue, got {status} with {parsed}"
     );
 }
 

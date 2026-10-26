@@ -192,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.entries.is_empty() {
             return Err(DeleteMessageBatchErrorModeled::EmptyBatchRequest(
                 EmptyBatchRequest {
-                    message: Some("The batch request doesn't contain any entries.".to_string()),
+                    message: Some(sqs::empty_batch_message("DeleteMessageBatch")),
                 },
             )
             .into());
