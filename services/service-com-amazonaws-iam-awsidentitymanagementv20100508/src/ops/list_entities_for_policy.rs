@@ -282,7 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !aws_managed && store.policy_by_arn(&input.policy_arn).is_none() {
             return Err(ListEntitiesForPolicyErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
-                    message: Some(format!("Policy {} does not exist.", input.policy_arn)),
+                    message: Some(crate::state::policy_not_found(&input.policy_arn)),
                 },
             )
             .into());
