@@ -66,7 +66,10 @@ const RULE: &str = "quarterly-access-review";
 const NOT_A_PROCESS_CHECK: &str = "not-a-process-check";
 
 /// The `PutConfigRule` body for a Config Process Check rule named `name`.
-fn process_check_rule(name: &str) -> Value {
+///
+/// `pub(crate)` because a suite about what happens to a rule's DELIVERED verdicts needs
+/// exactly this rule kind to seed one from outside Config.
+pub(crate) fn process_check_rule(name: &str) -> Value {
     json!({
         "ConfigRule": {
             "ConfigRuleName": name,

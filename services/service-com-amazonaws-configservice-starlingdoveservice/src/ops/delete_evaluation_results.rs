@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEvaluationResults
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteEvaluationResults`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteEvaluationResults::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deleting a rule's evaluation results discards every verdict recorded against that
+//! rule ([`crate::state::ConfigRuleEntry::evaluation_results`]), whichever writer
+//! recorded it and whichever resource or evaluation mode it is about. The rule itself
+//! survives, so every compliance surface that reads those verdicts reports a rule
+//! nothing has evaluated: an empty page of evaluation details and a roll-up of
+//! `INSUFFICIENT_DATA`. The rule's invocation-and-evaluation history is untouched —
+//! that is what the rule was INVOKED for, not what it found — so the rule stays
+//! eligible for the next evaluation pass ("After you delete the evaluation results, you
+//! can call the StartConfigRulesEvaluation API to start evaluating your … resources
+//! against the rule").
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +94,10 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-configservice-starlingd
 #[derive(Debug)]
 pub enum DeleteEvaluationResultsErrorModeled {
     NoSuchConfigRuleException(NoSuchConfigRuleException),
+    // `ResourceInUseException` is declared for this operation but has no state in this
+    // emulator that can raise it: the cases the shape documents are all about a rule or
+    // pack whose own creation or deletion is still running, and `DeleteConfigRule`
+    // removes a rule outright here, so no rule is ever observed mid-delete.
     ResourceInUseException(ResourceInUseException),
 }
 
@@ -146,18 +152,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteEvaluationResults` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteEvaluationResultsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteEvaluationResults"))
+        // `ctx` carries request metadata only; the results to delete are in state.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // Keyed on the TRIMMED name, the way a rule is stored (`PutConfigRule`) and the
+        // way the other single-name rule handlers look one up.
+        let name = input.config_rule_name.trim();
+        let mut store = state.lock();
+
+        // "You can specify one Config rule per request": a name this account holds no
+        // rule under is a failure, so nothing is deleted, and the refusal quotes the
+        // name the caller sent because the rule was named by a single-name member.
+        let Some(rule) = store.config_rules.get_mut(name) else {
+            return Err(
+                DeleteEvaluationResultsErrorModeled::NoSuchConfigRuleException(
+                    NoSuchConfigRuleException {
+                        message: Some(crate::state::no_such_config_rule_message(name)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every verdict recorded against the rule goes, whichever resource, evaluation
+        // mode or writer it came from: what the rule found is discarded while the rule
+        // and its invocation history stay. Each compliance surface computes its answer
+        // from this map, so they all report an unevaluated rule from here on, and a
+        // repeat of this call is a no-op rather than a failure — there is nothing left
+        // to delete.
+        rule.evaluation_results.clear();
+
+        Ok(DeleteEvaluationResultsOutput {})
     }
 }

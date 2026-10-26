@@ -140,3 +140,5 @@ mod recorded_refusal_wording;
 mod put_remediation_exceptions;
 #[path = "all/describe_conformance_packs.rs"]
 mod describe_conformance_packs;
+#[path = "all/delete_evaluation_results.rs"]
+mod delete_evaluation_results;
