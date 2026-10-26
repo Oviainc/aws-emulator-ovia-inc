@@ -237,6 +237,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // So is a signing certificate: this operation's own documentation lists
+        // "Signing certificate (DeleteSigningCertificate)" among the items to remove
+        // before deleting a user, so a user that still holds one is refused rather than
+        // having the certificate dropped behind the caller's back.
+        // `UploadSigningCertificate` is what fills that map.
+        if store.signing_certificates_held_by(&key) > 0 {
+            return Err(DeleteUserErrorModeled::DeleteConflictException(
+                DeleteConflictException {
+                    message: Some(
+                        "Cannot delete entity, must delete signing certificates first."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
         // So is the user's console password: this operation's own documentation
         // lists "Password (DeleteLoginProfile)" among the items to remove before
         // deleting a user, so a user that still has a login profile is refused

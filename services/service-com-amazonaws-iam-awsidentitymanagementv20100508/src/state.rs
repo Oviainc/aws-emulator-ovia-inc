@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::ops::types::{
     AttachedPermissionsBoundary, DelegationRequest, Group, InstanceProfile, LoginProfile, Policy,
     PolicyVersion, Role, SAMLPrivateKey, ServerCertificateMetadata,
-    ServiceSpecificCredentialMetadata, Tag, User,
+    ServiceSpecificCredentialMetadata, SigningCertificate, Tag, User,
 };
 
 pub mod authorization;
@@ -193,6 +193,12 @@ pub const ACCESS_KEY_ACTIVE_STATUS: &str = "Active";
 /// with `LimitExceededException`, whose documentation says "the error message
 /// describes the limit exceeded".
 pub const MAX_ACCESS_KEYS_PER_USER: usize = 2;
+
+/// How many X.509 signing certificates one IAM user may hold. AWS's "IAM and STS
+/// quotas" page gives the quota "Signing certificates per IAM user: 2", and an
+/// upload past it is refused with `LimitExceededException`, whose documentation says
+/// "the error message describes the limit exceeded".
+pub const MAX_SIGNING_CERTIFICATES_PER_USER: usize = 2;
 
 /// The aggregate size, in characters, of all inline policies embedded in one IAM
 /// user. AWS's "IAM and STS quotas" page gives the quota "User policy size cannot
@@ -402,6 +408,16 @@ pub const MAX_TAGS_PER_ENTITY: usize = 50;
 /// How many base32 characters follow the prefix in a minted unique id.
 const UNIQUE_ID_SUFFIX_LEN: usize = 17;
 
+/// How many base32 characters one mixed 64-bit word of a minted unique id spells
+/// out: five bits per character, so thirteen characters carry all 64 bits.
+const BASE32_CHARACTERS_PER_WORD: usize = 13;
+
+/// How many characters a minted `CertificateId` carries. A signing certificate's id
+/// has no entity-type prefix, so the whole value is base32 characters, and 32 of them
+/// sit inside `certificateIdType`'s length 24..128
+/// (`smithy_query(query="shape", shape="certificateIdType")`).
+const SIGNING_CERTIFICATE_ID_CHARACTERS: usize = 32;
+
 /// What every pagination `Marker` this service issues carries, inside the encoded
 /// payload, so a token it did not issue is recognised as foreign rather than read
 /// as a position in the store. The SCOPE each marker is minted with follows it
@@ -514,6 +530,12 @@ pub const MARKER_SCOPE_SERVICE_SPECIFIC_CREDENTIALS: &str = "service-specific-cr
 /// the same key order (the access key id) whichever user it reports on — the
 /// user selects within the order rather than changing it.
 pub const MARKER_SCOPE_ACCESS_KEYS: &str = "access-keys";
+
+/// The marker scope of the account's signing certificates, which
+/// `ListSigningCertificates` pages over. One scope covers the whole collection for
+/// the same reason [`MARKER_SCOPE_ACCESS_KEYS`] does: that operation pages over the
+/// same key order (the certificate id) whichever user it reports on.
+pub const MARKER_SCOPE_SIGNING_CERTIFICATES: &str = "signing-certificates";
 
 /// The marker scope of a policy simulation's evaluation results, which
 /// `SimulatePrincipalPolicy` pages over. Unlike the other scopes this one names a
@@ -768,6 +790,57 @@ pub struct AccessKeyRecord {
     pub create_date: ::aws_smithy_types::DateTime,
 }
 
+/// One X.509 signing certificate an IAM user holds, keyed in
+/// [`ComAmazonawsIamAwsidentitymanagementv20100508State::signing_certificates`] by its
+/// `CertificateId` — the handle every other operation on one takes
+/// (`UpdateSigningCertificate` and `DeleteSigningCertificate` name the certificate by
+/// id, and `ListSigningCertificates` reports it).
+///
+/// The owning user's NAME is not copied in: it is read from the user the record's
+/// [`user_key`](SigningCertificateRecord::user_key) names, so the name lives in
+/// exactly one place and a user renamed by an update does not leave a stale copy here.
+#[derive(Debug, Clone)]
+pub struct SigningCertificateRecord {
+    /// [`name_key`] of the IAM user that holds the certificate.
+    pub user_key: String,
+    /// "The contents of the signing certificate"
+    /// (`SigningCertificate$CertificateBody`), verbatim as the upload carried it.
+    pub certificate_body: String,
+    /// The DER encoding the body decodes to: what tells one certificate from another,
+    /// independently of the whitespace that framed it.
+    ///
+    /// Kept beside the body so recognising a repeat upload costs one comparison per held
+    /// certificate instead of re-reading every held body. It is DERIVED from
+    /// [`certificate_body`](Self::certificate_body) and reported by nothing: no modelled
+    /// member carries it.
+    pub certificate_der: Vec<u8>,
+    /// The certificate's `statusType` value: [`CREDENTIAL_STATUS_ACTIVE`] when it was
+    /// uploaded ("when you upload the certificate, its default status is Active",
+    /// `UploadSigningCertificate`), until an update moves it.
+    pub status: String,
+    /// "The date when the signing certificate was uploaded"
+    /// (`SigningCertificate$UploadDate`), reported unchanged by every later read.
+    pub upload_date: ::aws_smithy_types::DateTime,
+}
+
+impl SigningCertificateRecord {
+    /// This record as the one modelled shape every operation reports a signing
+    /// certificate through, under the id it is keyed by and the user name as the
+    /// account holds it.
+    ///
+    /// ONE place builds the shape, so the upload response and every later list report
+    /// the same certificate identically.
+    pub fn report(&self, certificate_id: &str, user_name: &str) -> SigningCertificate {
+        SigningCertificate {
+            user_name: user_name.to_string(),
+            certificate_id: certificate_id.to_string(),
+            certificate_body: self.certificate_body.clone(),
+            status: self.status.clone(),
+            upload_date: Some(self.upload_date),
+        }
+    }
+}
+
 /// One IAM OpenID Connect (OIDC) identity provider the account holds, keyed in
 /// [`ComAmazonawsIamAwsidentitymanagementv20100508State::open_id_connect_providers`]
 /// by its ARN — the handle every other operation on one takes
@@ -985,6 +1058,13 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// owns it. `GetUser` with no `UserName` resolves the caller through this map,
     /// and `CreateAccessKey` is what populates it.
     pub access_keys: BTreeMap<String, AccessKeyRecord>,
+    /// `CertificateId` -> the signing certificate's record, including [`name_key`] of
+    /// the user that holds it. `UploadSigningCertificate` is what fills this map,
+    /// `ListSigningCertificates` pages over it, `UpdateSigningCertificate` moves one
+    /// record's status and `DeleteSigningCertificate` empties it. Keyed by the id
+    /// (rather than held on the user) so enumeration order is total and stable, which
+    /// is what lets the list hand out a resumable marker.
+    pub signing_certificates: BTreeMap<String, SigningCertificateRecord>,
     /// The persisted login profiles, keyed by [`name_key`] of the user name — the
     /// same key [`Self::users`] uses, because a user has AT MOST ONE login profile
     /// ("a login profile is created when you create a password for the user",
@@ -1121,6 +1201,9 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// Monotonic counter feeding
     /// [`next_server_certificate_id`](Self::next_server_certificate_id).
     pub server_certificate_id_seq: u64,
+    /// Monotonic counter feeding
+    /// [`next_signing_certificate_id`](Self::next_signing_certificate_id).
+    pub signing_certificate_id_seq: u64,
 }
 
 impl ComAmazonawsIamAwsidentitymanagementv20100508State {
@@ -1188,6 +1271,36 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             SERVER_CERTIFICATE_ID_PREFIX,
             self.server_certificate_id_seq,
         )
+    }
+
+    /// Mint the next signing certificate's `CertificateId`.
+    ///
+    /// Unique and stable for the same reason [`next_user_id`](Self::next_user_id) is:
+    /// the counter is bijectively mixed into the id, and the id is minted once and then
+    /// stored with the certificate, so "the ID for the signing certificate"
+    /// (`SigningCertificate$CertificateId`) is what every later read reports. It
+    /// carries no entity-type prefix — AWS publishes none for a signing certificate —
+    /// so the whole id is [`SIGNING_CERTIFICATE_ID_CHARACTERS`] base32 characters,
+    /// inside `certificateIdType`'s len 24..128 and `^[\w]+$`.
+    pub fn next_signing_certificate_id(&mut self) -> String {
+        self.signing_certificate_id_seq += 1;
+        unique_id_of_length(
+            "",
+            self.signing_certificate_id_seq,
+            SIGNING_CERTIFICATE_ID_CHARACTERS,
+        )
+    }
+
+    /// How many signing certificates the user keyed by `user_key` holds.
+    ///
+    /// This is the measure IAM's signing-certificates-per-user quota
+    /// ([`MAX_SIGNING_CERTIFICATES_PER_USER`]) is taken against, and what tells a user
+    /// delete that certificates still depend on the user.
+    pub fn signing_certificates_held_by(&self, user_key: &str) -> usize {
+        self.signing_certificates
+            .values()
+            .filter(|record| record.user_key == user_key)
+            .count()
     }
 
     /// How many access keys the user keyed by `user_key` holds.
@@ -2988,20 +3101,33 @@ pub fn listed_instance_profile(instance_profile: InstanceProfile) -> InstancePro
 /// A unique entity id: `prefix` followed by [`UNIQUE_ID_SUFFIX_LEN`] base32
 /// characters that spell out `seq` mixed through SplitMix64.
 ///
-/// The mix is a bijection on `u64` and the first 13 suffix characters carry all
-/// 64 of its bits, so distinct `seq` values always yield distinct ids. The
-/// remaining characters come from a second, independently mixed word purely so
-/// the id has the shape and entropy of an AWS unique id rather than a visible
-/// counter.
+/// The mix is a bijection on `u64` and the first [`BASE32_CHARACTERS_PER_WORD`]
+/// suffix characters carry all 64 of its bits, so distinct `seq` values always
+/// yield distinct ids. The remaining characters come from a second, independently
+/// mixed word purely so the id has the shape and entropy of an AWS unique id
+/// rather than a visible counter.
 fn unique_id(prefix: &str, seq: u64) -> String {
-    let mut id = String::with_capacity(prefix.len() + UNIQUE_ID_SUFFIX_LEN);
+    unique_id_of_length(prefix, seq, UNIQUE_ID_SUFFIX_LEN)
+}
+
+/// [`unique_id`] over a suffix of `suffix_len` characters, for an id whose modelled
+/// length constraint asks for more or fewer than [`UNIQUE_ID_SUFFIX_LEN`].
+///
+/// Unique for the same reason: the first [`BASE32_CHARACTERS_PER_WORD`] characters
+/// carry all 64 bits of the bijectively mixed counter, and every further word is
+/// keyed to its own position so no two positions repeat one word's characters.
+fn unique_id_of_length(prefix: &str, seq: u64, suffix_len: usize) -> String {
+    // The same golden-ratio odd constant SplitMix64's step adds, used here to key each
+    // word to the position it fills.
+    const WORD_KEY: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    let mut id = String::with_capacity(prefix.len() + suffix_len);
     id.push_str(prefix);
-    let mut word = splitmix64(seq);
-    for i in 0..UNIQUE_ID_SUFFIX_LEN {
-        // 13 base32 characters cover all 64 bits of the first word; after that,
-        // continue from a second word keyed to the same counter.
-        if i == 13 {
-            word = splitmix64(seq ^ 0x9E37_79B9_7F4A_7C15);
+    let mut word = 0;
+    for i in 0..suffix_len {
+        if i.is_multiple_of(BASE32_CHARACTERS_PER_WORD) {
+            let position = (i / BASE32_CHARACTERS_PER_WORD) as u64;
+            word = splitmix64(seq ^ position.wrapping_mul(WORD_KEY));
         }
         id.push(BASE32_ALPHABET[(word & 31) as usize] as char);
         word >>= 5;

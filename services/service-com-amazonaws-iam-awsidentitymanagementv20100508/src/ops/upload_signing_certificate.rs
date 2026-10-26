@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UploadSigningCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UploadSigningCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UploadSigningCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores an X.509 signing certificate under one IAM user: the certificate is named by
+//! an id minted here, its body is kept verbatim, its status starts out `Active`, and the
+//! record this writes is what `ListSigningCertificates` reports,
+//! `UpdateSigningCertificate` moves and `DeleteSigningCertificate` removes.
 //!
 //! ## Shape of an operation
 //!
@@ -107,6 +103,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::x509_cert::der::{DecodePem, Encode};
+// The modelled `SigningCertificate` shape comes in through the glob above, so the X.509
+// object is named apart from it.
+use ::x509_cert::Certificate as X509Certificate;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -182,18 +183,226 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UploadSigningCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UploadSigningCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UploadSigningCertificateErrorModeled::ServiceFailureException(
+                    ServiceFailureException {
+                        message: Some("the IAM store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "Uploads an X.509 signing certificate" (this operation's documentation), so a
+        // `CertificateBody` that is not one "was malformed" — the modelled
+        // `MalformedCertificateException`, which is how `UploadServerCertificate` refuses
+        // the same member. The certificate is read here, before anything is written, and
+        // the DER it decodes to is what tells a repeat upload from a fresh one below.
+        let Some(uploaded_der) = certificate_der(&input.certificate_body) else {
+            return Err(malformed(
+                "CertificateBody",
+                "the value must be one PEM-encoded X.509 certificate",
+            )
+            .into());
+        };
+
+        // A mutation: the operation "uploads an X.509 signing certificate and associates
+        // it with the specified IAM user", so the lock is held for write across the
+        // duplicate and quota checks and the insert.
+        let mut store = state.lock();
+
+        // The access key id the request was signed with: the caller's identity when the
+        // request names no user, and the acting principal the audit records below are
+        // attributed to.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+
+        // With no `UserName`, "the IAM user name is determined implicitly based on the
+        // Amazon Web Services access key ID used to sign the request", resolved through
+        // the same binding `GetUser` and `CreateAccessKey` resolve a nameless caller
+        // through. A caller whose credentials belong to no IAM user is refused rather
+        // than having an identity invented for it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UploadSigningCertificate"))
+        // LIMITATION, stated so the refusal is not mistaken for IAM's behaviour: real IAM
+        // also serves a nameless call made with ACCOUNT ROOT credentials ("you can use
+        // this operation to manage Amazon Web Services account root user credentials even
+        // if the Amazon Web Services account has no associated users"). This emulator
+        // holds no root user entity to associate a certificate with — `CreateAccessKey`
+        // declines that path for the same reason — so such a call is refused instead of
+        // served.
+        let user_key = match &input.user_name {
+            Some(user_name) => crate::state::name_key(user_name),
+            None => match store.access_keys.get(&caller_akid) {
+                Some(record) => record.user_key.clone(),
+                None => {
+                    // No modelled client error fits: the request named no entity to be
+                    // missing and no quota was reached, so the refusal goes through the
+                    // crate's generic client-input channel (HTTP 400, code
+                    // `ValidationException`), exactly as `CreateAccessKey` refuses the
+                    // same request.
+                    ::tracing::info!(
+                        audit = true,
+                        operation = "UploadSigningCertificate",
+                        outcome = "refused_no_caller_identity",
+                        caller_akid = %caller_akid,
+                        "no signing certificate was stored"
+                    );
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "Must specify userName when calling with non-User credentials",
+                    ));
+                }
+            },
+        };
+
+        // The certificate is associated with an IAM user the account holds;
+        // `SigningCertificate$UserName` is reported in the case that user was created
+        // with, not the case the request happened to spell, since IAM names "are not
+        // distinguished by case".
+        let Some(user) = store.users.get(&user_key) else {
+            ::tracing::info!(
+                audit = true,
+                operation = "UploadSigningCertificate",
+                outcome = "refused_no_such_user",
+                caller_akid = %caller_akid,
+                "no signing certificate was stored"
+            );
+            return Err(UploadSigningCertificateErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The user with name {} cannot be found.",
+                        input.user_name.as_deref().unwrap_or(&user_key)
+                    )),
+                },
+            )
+            .into());
+        };
+        let user_name = user.user_name.clone();
+
+        // One certificate is held once in the account: "the same certificate is
+        // associated with an IAM user in the account" is the modelled
+        // `DuplicateCertificateException`. Sameness is of the CERTIFICATE, not of the
+        // text that framed it, so the comparison is on the DER both bodies decode to — a
+        // re-framed PEM of a held certificate is the same certificate and is refused,
+        // and the held record is left as it stands.
+        let held_already = store
+            .signing_certificates
+            .iter()
+            .find(|(_, record)| record.certificate_der == uploaded_der);
+        if let Some((certificate_id, _)) = held_already {
+            let certificate_id = certificate_id.clone();
+            ::tracing::info!(
+                audit = true,
+                operation = "UploadSigningCertificate",
+                outcome = "refused_duplicate_certificate",
+                caller_akid = %caller_akid,
+                certificate_id = %certificate_id,
+                "no signing certificate was stored"
+            );
+            return Err(
+                UploadSigningCertificateErrorModeled::DuplicateCertificateException(
+                    DuplicateCertificateException {
+                        message: Some(format!(
+                            "The Certificate with id {certificate_id} already exists."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A user holds a bounded number of signing certificates, so a caller cannot grow
+        // one user's set without limit; past the quota IAM refuses the upload and stores
+        // nothing.
+        if store.signing_certificates_held_by(&user_key)
+            >= crate::state::MAX_SIGNING_CERTIFICATES_PER_USER
+        {
+            ::tracing::info!(
+                audit = true,
+                operation = "UploadSigningCertificate",
+                outcome = "refused_quota_exceeded",
+                caller_akid = %caller_akid,
+                "no signing certificate was stored"
+            );
+            return Err(
+                UploadSigningCertificateErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "Cannot exceed quota for SigningCertificatesPerUser: {}",
+                            crate::state::MAX_SIGNING_CERTIFICATES_PER_USER
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let certificate_id = store.next_signing_certificate_id();
+        let record = crate::state::SigningCertificateRecord {
+            user_key,
+            // "The contents of the signing certificate" are kept verbatim, so a later
+            // read reports the body the upload carried byte for byte.
+            certificate_body: input.certificate_body,
+            certificate_der: uploaded_der,
+            // "When you upload the certificate, its default status is Active."
+            status: crate::state::CREDENTIAL_STATUS_ACTIVE.to_string(),
+            // "The date when the signing certificate was uploaded"
+            // (`SigningCertificate$UploadDate`).
+            upload_date: crate::state::now(),
+        };
+        let reported = record.report(&certificate_id, &user_name);
+        store
+            .signing_certificates
+            .insert(certificate_id.clone(), record);
+
+        // Audit record for a state-changing call that adds material later signatures are
+        // validated against: who asked, what was stored, how it ended. Only wire metadata
+        // and the server-minted id — never the certificate material.
+        ::tracing::info!(
+            audit = true,
+            operation = "UploadSigningCertificate",
+            outcome = "stored",
+            caller_akid = %caller_akid,
+            certificate_id = %certificate_id,
+            "signing certificate stored"
+        );
+
+        // The response reports the stored record, so a caller sees exactly what a later
+        // `ListSigningCertificates` reports.
+        Ok(UploadSigningCertificateOutput {
+            certificate: reported,
+        })
     }
+}
+
+/// The DER encoding of the one X.509 certificate a `CertificateBody` carries, or `None`
+/// when the value is not one.
+///
+/// The comparison that tells a repeat upload from a fresh one is of the CERTIFICATE, not
+/// of the text that framed it, so it is made on this encoding: two bodies that decode to
+/// the same DER carry the same certificate. The surrounding whitespace a caller's file or
+/// form field may have added is not part of the PEM either (RFC 7468 section 2 frames the
+/// encoding between its BEGIN and END lines), so it is left out of the reading — while
+/// the body itself is stored verbatim.
+fn certificate_der(certificate_body: &str) -> Option<Vec<u8>> {
+    X509Certificate::from_pem(certificate_body.trim().as_bytes())
+        .and_then(|certificate| certificate.to_der())
+        .ok()
+}
+
+/// The modelled refusal of material that is not what its member says it is: "the
+/// certificate was malformed … the error message describes the specific error"
+/// (`MalformedCertificateException`), worded as this service words the refusal of an
+/// input member's value — `Invalid <member>: <what the value has to be>`, the form
+/// `UploadServerCertificate` refuses the same member with.
+///
+/// The other modelled refusal of the body, `InvalidCertificateException`, is not reached:
+/// a body that cannot be read as a certificate at all is the malformed case, and nothing
+/// beyond the encoding is judged here, so no request arrives at a refusal that would be
+/// "invalid" rather than malformed.
+fn malformed(member: &str, reason: &str) -> UploadSigningCertificateErrorModeled {
+    UploadSigningCertificateErrorModeled::MalformedCertificateException(
+        MalformedCertificateException {
+            message: Some(format!("Invalid {member}: {reason}")),
+        },
+    )
 }

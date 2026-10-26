@@ -153,6 +153,8 @@ mod service_specific_credential_reset;
 mod service_specific_credential_status;
 #[path = "all/service_specific_credentials.rs"]
 mod service_specific_credentials;
+#[path = "all/signing_certificates.rs"]
+mod signing_certificates;
 #[path = "all/simulated_principal_sources.rs"]
 mod simulated_principal_sources;
 #[path = "all/simulated_resource_policy.rs"]
