@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBuild
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBuild`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBuild::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists a custom game build record for the game server binaries the request points at
+//! — "if successful, this operation creates a new build resource with a unique build ID
+//! and places it in `INITIALIZED` status" — and reports the stored record, which
+//! `DescribeBuild` serves back unchanged.
 //!
 //! ## Shape of an operation
 //!
@@ -211,18 +207,256 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBuild` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBuildErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use ::emulator_server::aws_credentials::{AWS_SESSION, SECRET_ACCESS_KEY, SESSION_TOKEN};
+        use crate::state::{
+            BUILD_STATUS_INITIALIZED, DEFAULT_SERVER_SDK_VERSION, MAX_BUILDS_PER_ACCOUNT,
+            WORKFLOW_DELAY,
+        };
+
+        let invalid = |message: String| -> Self::Error {
+            CreateBuildErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+        let internal = |message: &str| -> Self::Error {
+            CreateBuildErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some(message.to_string()),
+            })
+            .into()
+        };
+
+        // `OperatingSystem`: "The operating system that your game server binaries run on.
+        // ... You must specify a valid operating system in this request. There is no
+        // default value." The member is modelled optional, so the documented requirement
+        // is enforced where the request is served; a value outside the modelled enum is
+        // already refused by the boundary walk.
+        let Some(operating_system) = input.operating_system.clone() else {
+            return Err(invalid(
+                "OperatingSystem is required to create a build: the operating system your game \
+                 server binaries run on has no default value."
+                    .to_string(),
+            ));
+        };
+
+        // "The storage location must specify an Amazon S3 bucket name and key. The location
+        // must also specify a role ARN that you set up to allow Amazon GameLift Servers to
+        // access your Amazon S3 bucket." The modelled `S3Location` leaves all three members
+        // optional, so the documented requirement is enforced here — and only for a request
+        // that names a location at all, since the member itself is optional ("use this
+        // parameter only when creating a build with files stored in an Amazon S3 bucket that
+        // you own").
+        let requested_location = input.storage_location.as_ref();
+        if let Some(location) = requested_location {
+            for (member, value) in [
+                ("Bucket", &location.bucket),
+                ("Key", &location.key),
+                ("RoleArn", &location.role_arn),
+            ] {
+                if value.as_ref().is_none_or(|value| value.trim().is_empty()) {
+                    return Err(invalid(format!(
+                        "StorageLocation must specify {member}: a storage location names the S3 \
+                         bucket, the build file key, and the role ARN that lets Amazon GameLift \
+                         Servers read it."
+                    )));
+                }
+            }
+        }
+
+        // A resource's tags are a key-value MAP ("Tags are developer defined key-value
+        // pairs"), so one key cannot carry two values; `TaggingFailedException`'s doc: "This
+        // may be due to invalid tag format". The modelled `TagList` length (0..200) and each
+        // tag's own lengths are refused by the boundary walk before this handler runs.
+        let tags = input.tags.clone().unwrap_or_default();
+        let mut keys = ::std::collections::HashSet::new();
+        if let Some(duplicate) = tags.iter().find(|tag| !keys.insert(tag.key.clone())) {
+            return Err(CreateBuildErrorModeled::TaggingFailedException(
+                TaggingFailedException {
+                    message: Some(format!(
+                        "Tags assigns the key {} more than once; a resource's tags carry each key \
+                         at most once.",
+                        duplicate.key
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "This operation creates a new build resource and also returns an Amazon S3
+        // location with temporary access credentials. Use the credentials to manually upload
+        // your build files to the specified Amazon S3 location." So a request that names no
+        // storage location of its own is handed one, with the credentials that authorise the
+        // upload to it; a request that names its own bucket uploads nothing and is handed no
+        // credentials ("this element is returned only when the operation is called without a
+        // storage location").
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBuild"))
+        // The credential material comes from the emulator's credential store, the only thing
+        // that creates credentials: the id, the secret and the session token are values a
+        // later signed request verifies against, never values this handler made up. It is
+        // minted BEFORE the build store is locked, so no other component's lock is taken
+        // while that guard is held; a request that is then refused withdraws the credential
+        // again, so a refusal leaves nothing signable behind.
+        let credentials = ctx.credential_store();
+        let minted = requested_location
+            .is_none()
+            .then(|| credentials.create(&AWS_SESSION));
+        let withdraw = |why: &'static str| {
+            let Some(minted) = minted.as_ref() else {
+                return;
+            };
+            // A credential no build kept is one nothing can be attributed to, so it is
+            // forgotten again rather than left signable. A failed withdrawal would leave an
+            // orphaned credential record, so say so rather than dropping the result.
+            if let Err(error) = credentials.delete(&minted.id) {
+                ::tracing::warn!(
+                    operation = Self::NAME,
+                    reason = ?error,
+                    why,
+                    "an unattributed build upload credential could not be withdrawn from the \
+                     credential store"
+                );
+            }
+        };
+
+        let region = crate::state::request_region(ctx);
+        // The location the response hands back has to REACH something, or the credentials
+        // minted with it could upload nowhere: the bucket behind a service-owned location is
+        // stood up as part of creating the build, in the one object store this emulator
+        // holds. Like the credential, it is claimed BEFORE the build store is locked, so no
+        // other component's lock is taken while that guard is held. Its name is fixed, so
+        // this records at most that ONE bucket however many builds are created, and a name
+        // held by a bucket that is not this service's refuses the create rather than vending
+        // an upload into it. A caller that named its own bucket needs none of this: those
+        // files are already where they belong.
+        if requested_location.is_none()
+            && crate::state::provision_build_upload_bucket(&*self.engine) != Some(true)
+        {
+            withdraw("the upload location's object store could not be stood up");
+            return Err(internal(
+                "the Amazon S3 location for the build upload could not be stood up",
+            ));
+        }
+
+        // Whether the build files are THERE decides what the clock owes the build, so it is
+        // read from the object store before the build store is locked (the same lock order).
+        // A caller-named location that holds no object is a build whose files nobody has
+        // uploaded; a service-owned location never holds one yet, since the key names a
+        // build that is being created in this call.
+        let files_present = requested_location
+            .is_some_and(|location| crate::state::build_files_present(&*self.engine, location));
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            withdraw("the service state is unavailable");
+            return Err(internal("the GameLift emulator state is unavailable"));
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.tick(now);
+
+        // A build record lives until `DeleteBuild` removes it, so the account's build quota
+        // is what keeps the store bounded as well as what makes a modelled refusal
+        // reachable: `CreateBuild` models no `LimitExceededException`, and
+        // `ConflictException` is "the requested operation would cause a conflict with the
+        // current state of a service resource associated with the request" — the account's
+        // build collection being full is exactly such a state.
+        if state.builds.len() >= MAX_BUILDS_PER_ACCOUNT {
+            withdraw("the account's build quota is reached");
+            return Err(CreateBuildErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "The account already holds the maximum of {MAX_BUILDS_PER_ACCOUNT} builds; \
+                     delete a build before creating another."
+                )),
+            })
+            .into());
+        }
+
+        // `BuildId` matches the modelled `^build-\S+$`, and the ARN the form the model
+        // declares for `Build$BuildArn` (`^arn:.*:build\/build-\S+$`), whose "resource ID
+        // matches the BuildId value". "Build names do not need to be unique", so a name
+        // another build already carries is NOT refused here.
+        let build_id = format!(
+            "build-{}",
+            crate::state::mint_uuid(&mut state.minted_ids, "build")
+        );
+        let build_arn = crate::state::gamelift_arn(&region, &format!("build/{build_id}"));
+
+        // The two upload paths differ in WHO holds the files, and what the clock owes the
+        // build follows from whether the files are there to be read. The service reads the
+        // files it finds at the location the request named, and the build becomes `READY` —
+        // "the game build has been successfully uploaded[;] you can now create new fleets
+        // for this build" — once it has. A location holding nothing, and a service-owned
+        // location the caller has yet to upload to, leave the build `INITIALIZED` ("a new
+        // build has been defined, but no files have been uploaded") with nothing owed.
+        let (storage_location, ready_at) = match requested_location {
+            Some(location) => (
+                location.clone(),
+                files_present.then(|| now + WORKFLOW_DELAY),
+            ),
+            None => (
+                crate::state::service_owned_build_location(&build_id),
+                None,
+            ),
+        };
+
+        // A credential without its secrets cannot sign the upload it was minted for, and
+        // the store never hands them back after the create, so no later call could supply
+        // them: the credential is withdrawn and the build is not recorded against it.
+        let upload_credentials = match minted.as_ref() {
+            Some(minted) => {
+                let (Some(secret_access_key), Some(session_token)) = (
+                    minted.secret(SECRET_ACCESS_KEY).map(str::to_string),
+                    minted.secret(SESSION_TOKEN).map(str::to_string),
+                ) else {
+                    withdraw("minted without the secrets an upload is signed with");
+                    return Err(internal(
+                        "the build upload credentials were minted without their secrets",
+                    ));
+                };
+                Some(AwsCredentials {
+                    access_key_id: Some(minted.id.clone()),
+                    secret_access_key: Some(secret_access_key),
+                    session_token: Some(session_token),
+                })
+            }
+            None => None,
+        };
+
+        let record = crate::state::BuildRecord {
+            build_id: build_id.clone(),
+            build_arn,
+            name: input.name.clone(),
+            version: input.version.clone(),
+            // "If successful, this operation creates a new build resource with a unique
+            // build ID and places it in INITIALIZED status."
+            status: BUILD_STATUS_INITIALIZED.to_string(),
+            operating_system,
+            // "A server SDK version you used when integrating your game server build with
+            // Amazon GameLift Servers. ... By default Amazon GameLift Servers sets this
+            // value to 4.0.2." A build created without the member carries that default, a
+            // decision the SERVICE made, which is why the stored record reports it.
+            server_sdk_version: input
+                .server_sdk_version
+                .clone()
+                .unwrap_or_else(|| DEFAULT_SERVER_SDK_VERSION.to_string()),
+            creation_time: now,
+            storage_location,
+            ready_at,
+            upload_credential_id: minted.as_ref().map(|minted| minted.id.clone()),
+            tags,
+            region,
+        };
+        state.builds.insert(build_id.clone(), record);
+
+        // Report the STORED record, so this response and every later read of the same build
+        // can only agree.
+        let Some(stored) = state.builds.get(&build_id) else {
+            withdraw("the new build could not be read back");
+            return Err(internal("the new build could not be read back"));
+        };
+        Ok(CreateBuildOutput {
+            build: Some(stored.to_modelled()),
+            storage_location: Some(stored.storage_location.clone()),
+            upload_credentials,
+        })
     }
 }
