@@ -84,13 +84,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// How this operation words `NoRunningConfigurationRecorderException`, a paraphrase
-/// of the shape's own doc ("There is no configuration recorder running") naming the
-/// operation that turns one on. AWS publishes no text for this refusal, so the
-/// requirement is the HTTP 400 and the error code; this message is the emulator's.
+/// How Config words `NoRunningConfigurationRecorderException` for a snapshot delivery
+/// asked for while the customer managed configuration recorder is turned off.
+///
+/// RECORDED behaviour: this is the sentence pair AWS answers for this refusal class —
+/// the state the recorder is in, and the change the caller has to make — and it carries
+/// no part of the request, so every such refusal reads the same.
 const NO_RUNNING_RECORDER_TO_DELIVER: &str =
-    "there is no configuration recorder running; use StartConfigurationRecorder to turn \
-     one on before delivering a configuration snapshot";
+    "Configuration recorder is turned off. Turn on configuration recorder.";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the

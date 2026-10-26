@@ -266,7 +266,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let fifo_requested = attributes
             .get(FIFO_TOPIC_ATTRIBUTE)
-            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+            .is_some_and(|value| state::flag_attribute_enabled(value));
         let is_fifo = fifo_requested || input.name.ends_with(FIFO_SUFFIX);
         if is_fifo && !input.name.ends_with(FIFO_SUFFIX) {
             return Err(CreateTopicErrorModeled::InvalidParameterException(

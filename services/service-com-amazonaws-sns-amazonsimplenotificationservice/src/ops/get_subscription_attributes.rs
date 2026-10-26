@@ -241,17 +241,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         // The retry policy a delivery to this subscription is actually run under: the
-        // system defaults, with the topic's delivery policy and then the subscription's
-        // own laid over them. Only a protocol a delivery policy governs has one.
-        if state::protocol_has_delivery_policy(&subscription.protocol) {
-            attributes.insert(
-                state::EFFECTIVE_DELIVERY_POLICY_ATTRIBUTE.to_string(),
-                state::effective_subscription_delivery_policy(
-                    store.topics.get(&subscription.topic_arn),
-                    subscription,
-                ),
-            );
-        }
+        // account system defaults, with the topic's delivery policy and then the
+        // subscription's own laid over them. Every subscription delivers under one, and
+        // the model lists it among the attributes a subscription's map carries with no
+        // protocol qualifying it.
+        attributes.insert(
+            state::EFFECTIVE_DELIVERY_POLICY_ATTRIBUTE.to_string(),
+            state::effective_subscription_delivery_policy(
+                store.topics.get(&subscription.topic_arn),
+                subscription,
+            ),
+        );
         // Every attribute the subscription holds — a filter policy and its scope, a
         // delivery or redrive or replay policy, a Firehose role ARN — reported because
         // its owner set it, and with the value its owner set.

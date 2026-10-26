@@ -16,6 +16,15 @@
 //! bus ([`crate::state::publish_service_event`]) — the only carrier of the verdict the
 //! resource changed FROM.
 //!
+//! The two refusals this operation can answer are about different things and are kept
+//! apart, which is RECORDED behaviour: a `ConfigRuleName` this account holds no rule
+//! under is `NoSuchConfigRuleException`, while a rule that exists and is not a process
+//! check is `InvalidParameterValueException` — the rule is of the wrong kind for this
+//! call, not missing, and the recorded unit asserts that distinction ("the rule exists,
+//! so the refusal is about its type, not NoSuchConfigRuleException, which is reserved for
+//! a rule name that does not exist at all"). Both are decided before any value of the
+//! delivered evaluation is judged.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -74,6 +83,29 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// How this operation words `InvalidParameterValueException` for a rule that EXISTS but
+/// is not a Config Process Check rule.
+///
+/// RECORDED behaviour decides WHICH code this condition carries, and it is this one, not
+/// `NoSuchConfigRuleException`: the recorded unit states it in its own assertion —
+/// "PutExternalEvaluation against an existing non-process-check rule must be rejected
+/// with InvalidParameterValueException (measured on real AWS -- the rule exists, so the
+/// refusal is about its type, not NoSuchConfigRuleException, which is reserved for a rule
+/// name that does not exist at all)". `NoSuchConfigRuleException`'s documented sentence
+/// mentions the process check because the two conditions are neighbours on this
+/// operation, not because one code covers both.
+///
+/// The MESSAGE is therefore the sentence the model states for THIS error class
+/// (`InvalidParameterValueException`: "One or more of the specified parameters are not
+/// valid. Verify that your parameters are valid and try again."), reproduced verbatim. It
+/// is FIXED and carries no part of the request: which parameter was not valid is what the
+/// operation itself says — it "checks if the rule is a process check when the name of the
+/// Config rule is provided" — and a name no rule answers to carries the other code
+/// instead.
+const NOT_A_PROCESS_CHECK_MESSAGE: &str =
+    "One or more of the specified parameters are not valid. Verify that your parameters \
+     are valid and try again.";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -149,69 +181,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let delivered = input.external_evaluation;
+        let recorded_at = ::std::time::SystemTime::now();
 
-        // A process check evaluates the ACCOUNT, so the only resource type Config
-        // accepts here is the account one, and the only resource id is an account id —
-        // and the only account one engine's store stands for is its own, so an
-        // evaluation can only be delivered for that account. That is what bounds the
-        // results a rule can hold to ONE per rule: a caller cannot name a new key.
-        if delivered.compliance_resource_type != crate::state::EXTERNAL_EVALUATION_RESOURCE_TYPE {
-            return Err(
-                PutExternalEvaluationErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        message: Some(crate::state::unaccepted_value_message(
-                            "ExternalEvaluation.ComplianceResourceType",
-                            &delivered.compliance_resource_type,
-                            &[crate::state::EXTERNAL_EVALUATION_RESOURCE_TYPE],
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-        let evaluated_account = ::emulator_server::emulator_account_id();
-        if delivered.compliance_resource_id != evaluated_account {
-            return Err(
-                PutExternalEvaluationErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        message: Some(crate::state::unaccepted_value_message(
-                            "ExternalEvaluation.ComplianceResourceId",
-                            &delivered.compliance_resource_id,
-                            &[evaluated_account],
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
+        // ONE lock scope does the write: the rule is resolved and the result recorded
+        // against the rule the same guard resolved. The notification is published AFTER
+        // the guard is released, because publishing calls another service. Only the two
+        // fields the notification names are copied out of the store, so no request
+        // copies a rule's evaluation results.
+        let (rule_name, rule_arn, recorded, replaced) = {
+            let mut store = state.lock();
 
-        // `INSUFFICIENT_DATA` is what Config derives for a rule it could not evaluate,
-        // never a verdict a caller delivers, so it is a bad parameter here even though
-        // the enum publishes it.
-        if !crate::state::EXTERNAL_EVALUATION_COMPLIANCE_TYPES
-            .contains(&delivered.compliance_type.as_str())
-        {
-            return Err(
-                PutExternalEvaluationErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        message: Some(crate::state::unaccepted_value_message(
-                            "ExternalEvaluation.ComplianceType",
-                            &delivered.compliance_type,
-                            &crate::state::EXTERNAL_EVALUATION_COMPLIANCE_TYPES,
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
+            // The RULE is resolved first, because the two refusals it can produce are
+            // about different things and a caller has to be able to tell them apart: a
+            // name this account holds no rule under exists nowhere, which is
+            // `NoSuchConfigRuleException` ("Verify ... that the rule name is correct"),
+            // while a rule that DOES exist and is not a Config Process Check rule is a
+            // rule of the wrong KIND for this operation — "[t]his API checks if the rule
+            // is a process check when the name of the Config rule is provided" — which
+            // is a bad parameter value, not a missing rule. The two demand different
+            // remediation, so neither stands in for the other, and both are decided
+            // before any value of the delivered evaluation is judged.
+            let Some(rule) = store.config_rules.get_mut(&input.config_rule_name) else {
+                return Err(
+                    PutExternalEvaluationErrorModeled::NoSuchConfigRuleException(
+                        NoSuchConfigRuleException {
+                            message: Some(crate::state::no_such_config_rule_message(
+                                &input.config_rule_name,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            if !rule.is_process_check() {
+                return Err(
+                    PutExternalEvaluationErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(NOT_A_PROCESS_CHECK_MESSAGE.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
 
-        // The ordering timestamp has to be placeable as an instant before anything is
-        // written: the wire accepts any numeric epoch, and an instant is what this
-        // service stores. Converted BEFORE the store guard is taken, so no conversion
-        // of request data happens inside the critical section.
-        let ordered_at = match crate::state::instant(delivered.ordering_timestamp) {
-            Some(ordered_at) => ordered_at,
-            None => {
+            // A process check evaluates the ACCOUNT, so the only resource type Config
+            // accepts here is the account one, and the only resource id is an account id —
+            // and the only account one engine's store stands for is its own, so an
+            // evaluation can only be delivered for that account. That is what bounds the
+            // results a rule can hold to ONE per rule: a caller cannot name a new key.
+            if delivered.compliance_resource_type
+                != crate::state::EXTERNAL_EVALUATION_RESOURCE_TYPE
+            {
+                return Err(
+                    PutExternalEvaluationErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(crate::state::unaccepted_value_message(
+                                "ExternalEvaluation.ComplianceResourceType",
+                                &delivered.compliance_resource_type,
+                                &[crate::state::EXTERNAL_EVALUATION_RESOURCE_TYPE],
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            let evaluated_account = ::emulator_server::emulator_account_id();
+            if delivered.compliance_resource_id != evaluated_account {
+                return Err(
+                    PutExternalEvaluationErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(crate::state::unaccepted_value_message(
+                                "ExternalEvaluation.ComplianceResourceId",
+                                &delivered.compliance_resource_id,
+                                &[evaluated_account],
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // `INSUFFICIENT_DATA` is what Config derives for a rule it could not
+            // evaluate, never a verdict a caller delivers, so it is a bad parameter here
+            // even though the enum publishes it.
+            if !crate::state::EXTERNAL_EVALUATION_COMPLIANCE_TYPES
+                .contains(&delivered.compliance_type.as_str())
+            {
+                return Err(
+                    PutExternalEvaluationErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(crate::state::unaccepted_value_message(
+                                "ExternalEvaluation.ComplianceType",
+                                &delivered.compliance_type,
+                                &crate::state::EXTERNAL_EVALUATION_COMPLIANCE_TYPES,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // The ordering timestamp has to be placeable as an instant before anything
+            // is written: the wire accepts any numeric epoch, and an instant is what this
+            // service stores. It is one of the delivered evaluation's VALUES, so it is
+            // judged here with the others, after the rule — a request that names no rule
+            // AND carries an unplaceable timestamp is answered for the rule.
+            let Some(ordered_at) = crate::state::instant(delivered.ordering_timestamp)
+            else {
                 return Err(
                     PutExternalEvaluationErrorModeled::InvalidParameterValueException(
                         InvalidParameterValueException {
@@ -223,39 +299,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into(),
                 );
-            }
-        };
+            };
 
-        let recorded_at = ::std::time::SystemTime::now();
-
-        // ONE lock scope does the write: the rule is resolved and the result recorded
-        // against the rule the same guard resolved. The notification is published AFTER
-        // the guard is released, because publishing calls another service. Only the two
-        // fields the notification names are copied out of the store, so no request
-        // copies a rule's evaluation results.
-        let (rule_name, rule_arn, recorded, replaced) = {
-            let mut store = state.lock();
-
-            // The rule has to be one this account holds AND a process check: every other
-            // rule is evaluated by Config itself, so there is no external verdict to
-            // record against it. Both read as the same refusal, which is what
-            // `NoSuchConfigRuleException` documents on this path ("Verify that the rule is
-            // an Config Process Check rule, that the rule name is correct").
-            let rule = store
-                .config_rules
-                .get_mut(&input.config_rule_name)
-                .filter(|rule| rule.is_process_check())
-                .ok_or_else(|| {
-                    PutExternalEvaluationError::from(
-                        PutExternalEvaluationErrorModeled::NoSuchConfigRuleException(
-                            NoSuchConfigRuleException {
-                                message: Some(crate::state::no_such_config_rule_message(
-                                    &input.config_rule_name,
-                                )),
-                            },
-                        ),
-                    )
-                })?;
+            // Resolved ONCE under this guard: `rule` is the same binding every refusal
+            // above was decided from and the result below is recorded against, so no
+            // second lookup can disagree with the first and nothing has to assume one
+            // succeeds.
 
             // One result per evaluated resource per evaluation mode: delivering again for
             // the same resource REPLACES the verdict ("Add or updates the evaluations for

@@ -181,22 +181,17 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Does `requested` ask for the message attribute (or system attribute) `name`?
 ///
-/// The forms Amazon SQS accepts in `MessageAttributeNames`: `All` and `.*` select every
-/// attribute, `prefix.*` selects every attribute whose name starts with `prefix.`, and
-/// anything else is an exact name.
+/// The forms Amazon SQS accepts in `MessageAttributeNames`: `All` selects every
+/// attribute, and a name ending in `.*` is a PREFIX selector — it selects every
+/// attribute whose name begins with what stands before the `.*`, so a bare `.*` selects
+/// everything. Anything else is an exact name.
 fn selects(requested: &[String], name: &str) -> bool {
     requested.iter().any(|pattern| {
-        if pattern == sqs::ALL_ATTRIBUTES || pattern == ".*" {
+        if pattern == sqs::ALL_ATTRIBUTES {
             return true;
         }
-        // The documented selector forms are `All`, `.*` and `prefix.*`; anything else
-        // is an exact name. The `*` alone is stripped, so the `.` stays part of the
-        // prefix: `bar.*` selects `bar.baz`, while `bar*` is an exact name.
-        match pattern
-            .strip_suffix('*')
-            .filter(|prefix| prefix.len() > 1 && prefix.ends_with('.'))
-        {
-            Some(prefix) => name.starts_with(prefix) && name.len() > prefix.len(),
+        match pattern.strip_suffix(".*") {
+            Some(prefix) => name.starts_with(prefix),
             None => pattern == name,
         }
     })
@@ -609,11 +604,11 @@ fn wire_message(
 /// selects.
 ///
 /// Only the attributes the emulator genuinely records are reported: `SentTimestamp`,
-/// `ApproximateReceiveCount`, `ApproximateFirstReceiveTimestamp` and, for a message
-/// that carries them, `MessageGroupId`, `MessageDeduplicationId` and `SequenceNumber`.
-/// The rest of the `MessageSystemAttributeName` set belongs to behaviour that is not
-/// implemented (X-Ray trace headers, dead-letter redrive, caller principals), so it is
-/// omitted rather than invented.
+/// `ApproximateReceiveCount`, `ApproximateFirstReceiveTimestamp`, the `AWSTraceHeader` a
+/// send carried in `MessageSystemAttributes` and, for a message that carries them,
+/// `MessageGroupId`, `MessageDeduplicationId` and `SequenceNumber`. The rest of the
+/// `MessageSystemAttributeName` set belongs to behaviour that is not implemented
+/// (dead-letter redrive, caller principals), so it is omitted rather than invented.
 fn system_attributes(
     message: &sqs::StoredMessage,
     requested: &[String],
@@ -631,6 +626,14 @@ fn system_attributes(
     );
     if let Some(first) = message.first_received_at {
         offer("ApproximateFirstReceiveTimestamp", sqs::epoch_millis(first));
+    }
+    // What the send stored in `MessageSystemAttributes`: "AWSTraceHeader - Returns the
+    // X-Ray trace header string", reported under the name it was sent under and only
+    // for a message whose send carried it.
+    for (name, value) in &message.message_system_attributes {
+        if let Some(string_value) = &value.string_value {
+            offer(name, string_value.clone());
+        }
     }
     // The three a FIFO send records. "The MessageDeduplicationId is available to the
     // consumer of the message", and a consumer of several interleaved streams needs the

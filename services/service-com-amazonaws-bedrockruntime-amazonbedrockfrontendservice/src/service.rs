@@ -42,6 +42,7 @@
 
 use crate::ops::converse_stream::ConverseStream;
 use crate::ops::invoke_model_with_response_stream::InvokeModelWithResponseStream;
+use aws_smithy_schema_server::{Violation, ViolationKind};
 use service_common::event_stream::EventStreamRoute;
 // `request_path`: the one reader of a request URI's path, shared rather than inlined
 // again here.
@@ -67,6 +68,65 @@ fn inference_route(path: &str) -> Option<&str> {
         return None;
     };
     (!model_id.is_empty() && !tail.is_empty()).then_some(tail)
+}
+
+/// `refusal` with every ENUM requirement's value set quoted in the order this
+/// service quotes that member's values in (`crate::state::service_value_order`),
+/// and everything else untouched.
+///
+/// A refusal names the values a member admits, and the ORDER it names them in is
+/// the service's, not the model's: the model's declaration order is an artefact of
+/// how the model was written. The lookup is by the MEMBER being refused, so a
+/// member this service states no order for is left exactly as it arrived.
+fn in_service_value_order(refusal: &Refusal) -> Refusal {
+    let Refusal::Invalid(violations) = refusal else {
+        return refusal.clone();
+    };
+    Refusal::Invalid(
+        violations
+            .iter()
+            .map(|violation| match &violation.kind {
+                ViolationKind::EnumValue(values) => Violation {
+                    kind: ViolationKind::EnumValue(
+                        crate::state::service_value_order(&violation.path, values)
+                            .unwrap_or_else(|| values.clone()),
+                    ),
+                    path: violation.path.clone(),
+                    value: violation.value.clone(),
+                },
+                _ => violation.clone(),
+            })
+            .collect(),
+    )
+}
+
+/// The service's own wording for a boundary refusal that lands on a member
+/// naming a GUARDRAIL the operation is to apply, or `None` when no violation
+/// names one.
+///
+/// The references are walked in the order the service reads them
+/// (`crate::state::RESOURCE_REFERENCES`), not in the order the violations
+/// arrived, so a request wrong in more than one reference is refused on the
+/// first one READ — which is what decides the wording. Which members are
+/// references, and why `modelId` and `invocationArn` are not among them, is
+/// stated on that table.
+///
+/// The code travels with the message: `ValidationException` is the code AWS
+/// answers a readable-but-rejected request with on this restJson1 service, and
+/// the code the framework's own default picks, so the choice changes only the
+/// words.
+fn resource_reference_refusal(refusal: &Refusal) -> Option<Refused> {
+    let Refusal::Invalid(violations) = refusal else {
+        return None;
+    };
+    let message = crate::state::RESOURCE_REFERENCES
+        .iter()
+        .find(|(member, _)| violations.iter().any(|violation| violation.path == *member))
+        .map(|(_, message)| *message)?;
+    Some(Refused {
+        code: "ValidationException".to_owned(),
+        message: message.to_owned(),
+    })
 }
 
 /// The `com-amazonaws-bedrockruntime-amazonbedrockfrontendservice` emulated service: the generated [`ServiceDefinition`] plus
@@ -159,6 +219,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
+        // FIRST: a refusal that lands on a member naming the GUARDRAIL the
+        // operation is to apply. Bedrock refuses a guardrail reference it cannot
+        // read in its own words for that reference rather than with the per-member
+        // constraint envelope below, which is what a BODY member outside its
+        // constraints gets. `crate::state::RESOURCE_REFERENCES` is the one table of
+        // those references, in the order the service reads them.
+        if let Some(stated) = resource_reference_refusal(refusal) {
+            return Some(stated);
+        }
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) before any handler
         // runs. This service is `restJson1`, where AWS answers such a refusal as
@@ -172,7 +241,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // model's pattern as written; only the rendering drops them, and it is the
         // one shared implementation in `service_common`, so this service cannot
         // drift from the others.
-        service_common::validation_message::aws_validation_refusal(refusal)
+        //
+        // The value set of an ENUM requirement is listed in the order this service
+        // lists those values in, which is not the order the model happens to declare
+        // them in (`in_service_value_order`).
+        service_common::validation_message::aws_validation_refusal(&in_service_value_order(refusal))
     }
 
     fn override_routing_error(

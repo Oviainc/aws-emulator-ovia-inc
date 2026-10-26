@@ -25,8 +25,9 @@
 //!    404 `NotFoundException` with the identifier echo of the member it arrived in,
 //!    a task of another Outpost is not reachable under this one's route, and the
 //!    Outpost going away takes its tasks with it.
-//! 5. A DRY RUN is answered 501 `NotImplemented` and persists nothing — the verdict
-//!    it asks for is about installed instance capacity this emulator does not model.
+//! 5. A DRY RUN creates no task: it is answered 200 with the verdict on the capacity
+//!    it asked about and persists nothing, so the Outpost it named can still take a
+//!    task. What that verdict is, is [`crate::capacity_task_dry_run`]'s.
 //! 6. The store a task lands in is bounded: at the emulator's entry ceiling a start
 //!    is refused and nothing is stored.
 //! 7. The two optional references a task carries name OTHER resources, each resolved
@@ -837,7 +838,7 @@ struct Refused {
     message: Option<String>,
 }
 
-/// Rule 4 and rule 5: every refusal the capacity-task routes state, each with the
+/// Rule 4: every refusal the capacity-task routes state, each with the
 /// status, wire error code and — for the two message rules this service words its
 /// refusals by — the exact body.
 #[tokio::test]
@@ -948,15 +949,6 @@ async fn capacity_task_refusals_name_the_identifier_and_the_constraint() {
             code: "ValidationException",
             message: None,
         },
-        Refused {
-            case: "StartCapacityTask as a dry run",
-            method: "POST",
-            path: capacity_route(&other_outpost),
-            body: Some(json!({ "InstancePools": [pool("m5.4xlarge", 1)], "DryRun": true })),
-            status: 501,
-            code: "NotImplemented",
-            message: None,
-        },
     ];
 
     for expected in &cases {
@@ -989,8 +981,18 @@ async fn capacity_task_refusals_name_the_identifier_and_the_constraint() {
         }
     }
 
-    // Rule 5: the dry run changed nothing — the Outpost it named can still take a
-    // task, which it could not if the dry run had left one active.
+    // Rule 5: a dry run creates no task, so the Outpost it named can still take one —
+    // which it could not if the dry run had left one active.
+    let dry_run = start_ok(
+        &outposts,
+        &other_outpost,
+        &json!({ "InstancePools": [pool("m5.4xlarge", 1)], "DryRun": true }),
+    )
+    .await;
+    assert!(
+        dry_run.get("CapacityTaskId").is_none(),
+        "a dry run creates no task, so it mints no CapacityTaskId, got {dry_run}"
+    );
     let after_dry_run = start_ok(&outposts, &other_outpost, &request).await;
     assert!(
         is_capacity_task_id(&text(&after_dry_run, "CapacityTaskId")),

@@ -754,15 +754,15 @@ async fn md5_of_message_attributes_matches_the_documented_byte_layout() {
         ),
         (
             "a Number attribute (DataType is part of the digest)",
-            json!({ "colour": { "DataType": "Number", "StringValue": "green" } }),
+            json!({ "colour": { "DataType": "Number", "StringValue": "42" } }),
             [
                 &[0, 0, 0, 6][..],
                 b"colour",
                 &[0, 0, 0, 6][..],
                 b"Number",
                 &[1][..],
-                &[0, 0, 0, 5][..],
-                b"green",
+                &[0, 0, 0, 2][..],
+                b"42",
             ]
             .concat(),
         ),
@@ -859,8 +859,8 @@ async fn md5_of_message_attributes_matches_the_documented_byte_layout() {
     );
 }
 
-/// `MessageAttributeNames` selects by exact name, by `prefix.*`, or everything with
-/// `All`/`.*` — and an absent list selects nothing.
+/// `MessageAttributeNames` selects by exact name, by the `prefix.*` wildcard, or
+/// everything with `All`/`.*` — and an absent list selects nothing.
 #[tokio::test]
 async fn message_attribute_names_select_exactly_what_was_asked_for() {
     let sqs = Emulator::new();
@@ -883,10 +883,11 @@ async fn message_attribute_names_select_exactly_what_was_asked_for() {
     let cases: [(Vec<&str>, Vec<&str>); 8] = [
         (vec!["All"], vec!["bar.baz", "barbaz", "qux"]),
         (vec![".*"], vec!["bar.baz", "barbaz", "qux"]),
-        // The `.` belongs to the prefix, so `barbaz` is NOT selected by `bar.*`.
-        (vec!["bar.*"], vec!["bar.baz"]),
-        // The documented selector forms are only `All`, `.*` and `prefix.*`: `bar*` and
-        // a bare `*` are exact names, which nothing here is called.
+        // `bar.*` selects every name starting with `bar`, the `.` being the wildcard's
+        // own separator — so `barbaz` is selected too.
+        (vec!["bar.*"], vec!["bar.baz", "barbaz"]),
+        // The wildcard form is `prefix.*`: `bar*` and a bare `*` are exact names, which
+        // nothing here is called.
         (vec!["bar*"], vec![]),
         (vec!["*"], vec![]),
         (vec!["qux"], vec!["qux"]),
@@ -915,8 +916,8 @@ async fn message_attribute_names_select_exactly_what_was_asked_for() {
 
 /// Members `SendMessage` cannot honour are refused by name, not accepted and silently
 /// dropped on a 200: the list-valued message attributes and the value-less one the model
-/// documents as "Not implemented. Reserved for future use.", the FIFO-only member a
-/// standard queue has no meaning for, and the trace-header member.
+/// documents as "Not implemented. Reserved for future use.", and the FIFO-only member a
+/// standard queue has no meaning for.
 #[tokio::test]
 async fn send_message_refuses_the_members_it_cannot_honour() {
     let sqs = Emulator::new();
@@ -954,24 +955,12 @@ async fn send_message_refuses_the_members_it_cannot_honour() {
     }
 
     // `(label, the extra members, the code the refusal carries)`: a member that applies
-    // only to the other queue type is a fault in that parameter's value, while a member
-    // this emulator does not honour at all is not a parameter fault.
-    let unsupported: [(&str, Value, &str); 2] = [
-        (
-            "MessageDeduplicationId",
-            json!({ "MessageDeduplicationId": "dedup-1" }),
-            "InvalidParameterValue",
-        ),
-        (
-            "MessageSystemAttributes",
-            json!({
-                "MessageSystemAttributes": {
-                    "AWSTraceHeader": { "DataType": "String", "StringValue": "Root=1-00-00" },
-                },
-            }),
-            "UnsupportedOperation",
-        ),
-    ];
+    // only to the other queue type is a fault in that parameter's value.
+    let unsupported: [(&str, Value, &str); 1] = [(
+        "MessageDeduplicationId",
+        json!({ "MessageDeduplicationId": "dedup-1" }),
+        "InvalidParameterValue",
+    )];
     for (label, extra, code) in &unsupported {
         let mut body = json!({ "QueueUrl": url, "MessageBody": "payload" });
         for (member, value) in extra.as_object().expect("an object of members") {

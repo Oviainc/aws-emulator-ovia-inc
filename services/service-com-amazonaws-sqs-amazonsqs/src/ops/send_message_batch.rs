@@ -303,29 +303,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let fifo = queue.is_fifo();
 
-        // A member this emulator does not honour is refused rather than silently dropped
-        // on a 200: `MessageSystemAttributes` carries the X-Ray trace header, which
-        // nothing here propagates. It is the whole request that is refused, because the
-        // emulator cannot honour the member for ANY entry.
-        if let Some(entry) = input.entries.iter().find(|entry| {
-            entry
-                .message_system_attributes
-                .as_ref()
-                .is_some_and(|attributes| !attributes.is_empty())
-        }) {
-            return Err(SendMessageBatchErrorModeled::UnsupportedOperation(
-                UnsupportedOperation {
-                    message: Some(format!(
-                        "Entry {} includes MessageSystemAttributes, which this emulator does not \
-                         support yet: it carries the X-Ray trace header, which nothing here \
-                         propagates.",
-                        entry.id
-                    )),
-                },
-            )
-            .into());
-        }
-
+        // `MessageSystemAttributes` is honoured per entry, exactly as `SendMessage`
+        // honours it, by `prepare` below.
+        //
         // A parameter the queue's TYPE does not take cannot be satisfied by ANY entry of
         // this batch — every entry addresses the one queue — so it is the whole request
         // that is refused, before anything is enqueued, exactly as `SendMessage` refuses
@@ -358,10 +338,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Everything each message carries counts toward the batch's payload, attributes
-        // included: "all parts of a message are included in the ... size limit: the
-        // message body, the message attributes".
-        let mut sized: Vec<(BTreeMap<String, MessageAttributeValue>, usize)> =
-            Vec::with_capacity(input.entries.len());
+        // included: "all parts of the message attribute, including Name, Type, and Value,
+        // are part of the message size restriction". The system attributes do not count
+        // toward it — "the size of a message system attribute doesn't count towards the
+        // total size of a message" — but they are part of what the store retains, so each
+        // entry is measured both ways.
+        let mut sized: Vec<MeasuredEntry> = Vec::with_capacity(input.entries.len());
         let mut total_bytes = 0usize;
         for entry in &input.entries {
             let attributes: BTreeMap<String, MessageAttributeValue> = entry
@@ -370,12 +352,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_default()
                 .into_iter()
                 .collect();
+            let system_attributes: BTreeMap<String, MessageSystemAttributeValue> = entry
+                .message_system_attributes
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
             let bytes = entry
                 .message_body
                 .len()
                 .saturating_add(sqs::message_attribute_bytes(&attributes));
+            let retained = bytes
+                .saturating_add(sqs::message_system_attribute_bytes(&system_attributes));
             total_bytes = total_bytes.saturating_add(bytes);
-            sized.push((attributes, bytes));
+            sized.push(MeasuredEntry {
+                attributes,
+                system_attributes,
+                retained,
+            });
         }
         // The sum of the batched messages is bounded by the same `MaximumMessageSize` as
         // one message, so a single entry over that bound is refused here as well.
@@ -398,7 +392,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .entries
             .iter()
             .zip(sized)
-            .map(|(entry, (attributes, bytes))| prepare(queue, entry, attributes, bytes))
+            .map(|(entry, sized)| prepare(queue, entry, sized))
             .collect();
 
         // What this in-memory store can be made to hold is bounded, and the batch is
@@ -447,7 +441,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message_id: admitted.message_id.clone(),
                     md5_of_message_body: prepared.md5_of_body,
                     md5_of_message_attributes: prepared.md5_of_attributes,
-                    md5_of_message_system_attributes: None,
+                    md5_of_message_system_attributes: prepared.md5_of_system_attributes,
                     sequence_number: Some(admitted.sequence_number.clone()),
                 });
                 continue;
@@ -462,6 +456,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 body: prepared.body,
                 md5_of_body: prepared.md5_of_body.clone(),
                 message_attributes: prepared.attributes,
+                message_system_attributes: prepared.system_attributes,
                 message_group_id: prepared.group_id,
                 message_deduplication_id: prepared.deduplication_id,
                 sequence_number: sequence_number.clone(),
@@ -490,13 +485,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message_id,
                 md5_of_message_body: prepared.md5_of_body,
                 md5_of_message_attributes: prepared.md5_of_attributes,
-                md5_of_message_system_attributes: None,
+                md5_of_message_system_attributes: prepared.md5_of_system_attributes,
                 sequence_number,
             });
         }
 
         Ok(SendMessageBatchOutput { successful, failed })
     }
+}
+
+/// One batch entry's attribute maps and the bytes it retains, measured once for the
+/// batch's payload bound and reused by [`prepare`].
+struct MeasuredEntry {
+    attributes: BTreeMap<String, MessageAttributeValue>,
+    system_attributes: BTreeMap<String, MessageSystemAttributeValue>,
+    retained: usize,
 }
 
 /// A batch entry the queue will take, with everything the store and the result entry
@@ -506,8 +509,10 @@ struct Prepared {
     id: String,
     body: String,
     attributes: BTreeMap<String, MessageAttributeValue>,
+    system_attributes: BTreeMap<String, MessageSystemAttributeValue>,
     md5_of_body: String,
     md5_of_attributes: Option<String>,
+    md5_of_system_attributes: Option<String>,
     group_id: Option<String>,
     deduplication_id: Option<String>,
     delay: i64,
@@ -518,14 +523,18 @@ struct Prepared {
 /// answering either what the store needs or the result entry reporting why this entry
 /// alone was not taken.
 ///
-/// `attributes` and `bytes` are the entry's message attributes and the bytes it retains,
-/// already measured for the batch's payload bound.
+/// `sized` carries the entry's attribute maps and the bytes it retains, already measured
+/// for the batch's payload bound.
 fn prepare(
     queue: &sqs::Queue,
     entry: &SendMessageBatchRequestEntry,
-    attributes: BTreeMap<String, MessageAttributeValue>,
-    bytes: usize,
+    sized: MeasuredEntry,
 ) -> Result<Prepared, BatchResultErrorEntry> {
+    let MeasuredEntry {
+        mut attributes,
+        system_attributes,
+        retained,
+    } = sized;
     let fifo = queue.is_fifo();
 
     // An entry whose `MessageBody` holds no character leaves out a member it had to
@@ -644,17 +653,30 @@ fn prepare(
     {
         return Err(refused(entry, INVALID_PARAMETER_VALUE, reason));
     }
+    // "Currently, the only supported message system attribute is AWSTraceHeader", judged
+    // by the same rule `SendMessage` applies to the member.
+    if let Some(reason) = system_attributes
+        .iter()
+        .find_map(|(name, value)| sqs::message_system_attribute_refusal(name, value))
+    {
+        return Err(refused(entry, INVALID_PARAMETER_VALUE, reason));
+    }
+    // A `Number` attribute carries a number, and the queue holds the number rather than
+    // the text the entry wrote it as — exactly as `SendMessage` holds it.
+    sqs::store_message_attributes_canonically(&mut attributes);
 
     Ok(Prepared {
         id: entry.id.clone(),
         md5_of_body: sqs::md5_hex(entry.message_body.as_bytes()),
         md5_of_attributes: sqs::md5_of_message_attributes(&attributes),
+        md5_of_system_attributes: sqs::md5_of_message_system_attributes(&system_attributes),
         body: entry.message_body.clone(),
         attributes,
+        system_attributes,
         group_id,
         deduplication_id,
         delay,
-        bytes,
+        bytes: retained,
     })
 }
 

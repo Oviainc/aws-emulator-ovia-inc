@@ -233,6 +233,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
+        // What the task excludes, read once rather than per instance (see
+        // `crate::state::ExcludedInstances`).
+        let exclude = crate::state::ExcludedInstances::of(task.instances_to_exclude.as_ref());
         // The boundary this list pages on is an instance's POSITION in the Outpost's
         // recorded order: an instance carries no creation sequence of its own, and that
         // order is the one stable order the whole list is reported in — the same rule
@@ -243,7 +246,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .instances
                 .iter()
                 .enumerate()
-                .filter(|(_, instance)| blocks(instance, task))
+                // Which instances a task would need stopped is the rule
+                // `crate::state::instance_can_be_stopped` states, and the same one
+                // the dry-run capacity verdict reads: an instance this task could
+                // stop is one it recommends stopping.
+                .filter(|(_, instance)| {
+                    crate::state::instance_can_be_stopped(instance, &exclude)
+                })
                 .map(|(position, instance)| (position as u64, projection(instance))),
             after,
             size,
@@ -258,50 +267,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token,
         })
     }
-}
-
-/// Whether a recorded instance is one `task` would need stopped.
-///
-/// Two conditions, both from what AWS documents for this list:
-///
-/// * it belongs to "the account that initiated the capacity task". A capacity task is
-///   started by the caller of `StartCapacityTask`, and every request this emulator
-///   serves is the one emulator account's (`engine::emulator_account_id`, the account id
-///   `Outpost$OwnerId` and `Site$AccountId` carry), so that is the account a task was
-///   initiated by. An instance recorded as another account's — one the Outpost is shared
-///   with — is on the Outpost but not this caller's to stop, so it is not reported here;
-///   `ListAssetInstances`, the list "belonging to all accounts", is the one that reports
-///   it. An instance whose owning account was never recorded matches no account, so it is
-///   narrowed out the same way a `ListAssets` filter narrows out an asset with no value
-///   for the filtered member.
-/// * the task does not exclude it. `InstancesToExclude` is "user-specified instances
-///   that must not be stopped. These instances will not appear in the list of instances
-///   that Amazon Web Services recommends to stop in order to free up capacity" — so an
-///   excluded instance is absent from this list however it was named.
-fn blocks(instance: &AssetInstance, task: &crate::state::CapacityTaskRecord) -> bool {
-    instance.account_id.as_deref() == Some(::engine::emulator_account_id())
-        && !excluded(instance, task.instances_to_exclude.as_ref())
-}
-
-/// Whether `exclude` names `instance` through ANY of its three sub-lists.
-///
-/// The model gives `InstancesToExclude` three of them, each naming instances that must
-/// not be stopped by a different attribute: `Instances` by instance id, `AccountIds` by
-/// "IDs of the accounts that own each instance that must not be stopped", and `Services`
-/// by "names of the services that own each instance that must not be stopped". They are
-/// alternatives, so an instance any one of them names is excluded; a sub-list that is
-/// absent (or empty) excludes nothing, and a member an instance has no recorded value
-/// for is named by no list.
-fn excluded(instance: &AssetInstance, exclude: Option<&InstancesToExclude>) -> bool {
-    let Some(exclude) = exclude else {
-        return false;
-    };
-    let names = |excluded: Option<&Vec<String>>, value: Option<&String>| {
-        excluded.is_some_and(|excluded| value.is_some_and(|value| excluded.contains(value)))
-    };
-    names(exclude.instances.as_ref(), instance.instance_id.as_ref())
-        || names(exclude.account_ids.as_ref(), instance.account_id.as_ref())
-        || names(exclude.services.as_ref(), instance.aws_service_name.as_ref())
 }
 
 /// The `BlockingInstance` projection of a recorded instance.

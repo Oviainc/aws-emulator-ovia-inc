@@ -299,7 +299,12 @@ async fn a_delete_moves_any_status_to_delete_pending_then_the_clock_owes_deleted
         );
         // And the delete touched nothing else the create stored.
         for member in ["name", "format", "location", "expectedBucketOwner", "tags"] {
-            let expected = request.get(member).cloned().unwrap_or(Value::Null);
+            // A read always reports a tag map, empty when the create named none.
+            let expected = request.get(member).cloned().unwrap_or(if member == "tags" {
+                json!({})
+            } else {
+                Value::Null
+            });
             assert_eq!(
                 pending[member], expected,
                 "case {case:?}: member {member} must survive the delete, got {:?}",

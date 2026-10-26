@@ -185,63 +185,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::Instant::now();
         let mut store = state.lock();
 
-        if let Some(record) = store.resolver_dnssec_configs.get_mut(&input.resource_id) {
-            // "Updates an existing DNSSEC validation configuration": the
-            // configuration keeps its `Id` and its owner, and only the
-            // validation setting moves. A request asking for the setting the
-            // configuration is already settled in, or already moving to,
-            // writes nothing — so it neither drives a settled configuration
-            // back out of its settled status nor pushes the move an earlier
-            // call made due back into the future.
-            if record.settled_status != settled {
-                record.status = in_flight.to_string();
-                record.settled_status = settled.to_string();
-                record.settled_at = now + crate::state::PROVISIONING_DELAY;
-            }
+        // "Updates an existing DNSSEC validation configuration. If there is no
+        // existing DNSSEC validation configuration, one is created": the
+        // configuration is a per-VPC singleton, so this call moves the
+        // validation setting of the one that VPC already has — its identity
+        // (`Id`, `ResourceId`, `OwnerId`) unchanged — and reports it back.
+        let mut record = store.resolver_dnssec_config(&input.resource_id);
+
+        // A request asking for the setting the configuration is already settled
+        // in, or already moving to, writes nothing — so it neither drives a
+        // settled configuration back out of its settled status nor pushes the
+        // move an earlier call made due back into the future.
+        if record.settled_status == settled {
             return Ok(UpdateResolverDnssecConfigOutput {
                 resolver_dnssec_config: Some(record.to_dnssec_config(now)),
             });
         }
 
-        // The store is bounded: a request that would carry it past the bound is
-        // refused before anything is written. An update of a `ResourceId`
-        // already stored is handled above and so is never refused here.
-        if !store.can_store_another_dnssec_config() {
-            return Err(
-                UpdateResolverDnssecConfigErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(format!(
-                            "This emulator stores at most {} configurations for DNSSEC validation; update one of the resources it already holds a configuration for",
-                            crate::state::MAX_STORED_DNSSEC_CONFIGS
-                        )),
-                    },
-                )
-                .into(),
-            );
+        if record.seq == 0 {
+            // A VPC the store holds no record for needs one allocated, and the
+            // store is bounded: a request that would carry it past the bound is
+            // refused before anything is written. An update of a `ResourceId`
+            // already stored allocates nothing, so it is never refused here.
+            if !store.can_store_another_dnssec_config() {
+                return Err(
+                    UpdateResolverDnssecConfigErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(format!(
+                                "This emulator stores at most {} configurations for DNSSEC validation; update one of the resources it already holds a configuration for",
+                                crate::state::MAX_STORED_DNSSEC_CONFIGS
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            record.seq = store.next_seq();
         }
 
-        // "If there is no existing DNSSEC validation configuration, one is
-        // created": the VPC gets a configuration whose status is the transient
-        // one, and the move to the settled status is the one the clock owes, so
-        // a caller reading straight after this call still observes the
-        // transient status.
-        let seq = store.next_seq();
-        let record = crate::state::ResolverDnssecConfigRecord {
-            seq,
-            id: crate::state::mint_dnssec_config_id(seq),
-            owner_id: ::engine::emulator_account_id().to_string(),
-            resource_id: input.resource_id.clone(),
-            status: in_flight.to_string(),
-            settled_status: settled.to_string(),
-            settled_at: now + crate::state::PROVISIONING_DELAY,
-        };
-        let reported = record.to_dnssec_config(now);
+        // The move to the settled status is the one the clock owes, so a caller
+        // reading straight after this call still observes the transient status.
+        record.status = in_flight.to_string();
+        record.settled_status = settled.to_string();
+        record.settled_at = now + crate::state::PROVISIONING_DELAY;
         store
             .resolver_dnssec_configs
-            .insert(input.resource_id.clone(), record);
+            .insert(record.resource_id.clone(), record.clone());
 
         Ok(UpdateResolverDnssecConfigOutput {
-            resolver_dnssec_config: Some(reported),
+            resolver_dnssec_config: Some(record.to_dnssec_config(now)),
         })
     }
 }

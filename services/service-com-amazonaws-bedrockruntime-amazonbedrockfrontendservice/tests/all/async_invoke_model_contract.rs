@@ -747,6 +747,9 @@ fn pattern_rows() -> Vec<PatternRow> {
             pattern: r"[!-~]*",
         },
         PatternRow {
+            // `modelId` is a BODY member here, and the label of five inference
+            // URIs. A body member outside its constraints keeps this envelope,
+            // which is what this row holds the line on.
             case: "the model identifier",
             body: Some(json!({
                 "modelId": "not a model id!",
@@ -760,21 +763,18 @@ fn pattern_rows() -> Vec<PatternRow> {
             value: "not a model id!",
             pattern: r"[a-zA-Z_\.\-/0-9:]+",
         },
-        PatternRow {
-            case: "the invocation ARN read back",
-            body: None,
-            path: "/async-invoke/not-an-arn",
-            member: "invocationArn",
-            value: "not-an-arn",
-            pattern: r"arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:async-invoke/[a-z0-9]{12}",
-        },
     ]
 }
 
 /// RULE: a boundary refusal of a `@pattern` is `400 ValidationException` whose
 /// message quotes the model's expression WITHOUT the anchors a whole-value
 /// pattern wraps it in — so no `^`/`$` reaches the client-facing text — for
-/// every member of this surface that carries one.
+/// every member of this surface that carries one, body member and URI label
+/// alike.
+///
+/// The `invocationArn` of `/async-invoke/{invocationArn}` is NOT in this table:
+/// that reference is resolved by its own operation, which is the rule the
+/// `resource_reference_refusals` suite asserts.
 #[tokio::test]
 async fn a_pattern_constraint_is_quoted_without_the_anchors_that_wrap_it() {
     let router = emulator();

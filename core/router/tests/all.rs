@@ -42,6 +42,10 @@ mod pi_resource_metadata_reflects_rds_configuration;
 // Out of order for the same reason as the two entries above it.
 #[path = "all/redshift_cluster_iam_role_poll_lifecycle.rs"]
 mod redshift_cluster_iam_role_poll_lifecycle;
+// At the head for the same reason: the `c…` span of the sorted list is where the
+// cloudformation suites land, and the appended tail is where every concurrent suite does.
+#[path = "all/cloudformation_updates_iam_roles.rs"]
+mod cloudformation_updates_iam_roles;
 #[path = "all/amplifybackend_app_registration.rs"]
 mod amplifybackend_app_registration;
 #[path = "all/apigateway_signing_name_routing.rs"]

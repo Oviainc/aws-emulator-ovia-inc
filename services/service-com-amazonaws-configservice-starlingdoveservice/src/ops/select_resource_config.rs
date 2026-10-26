@@ -98,11 +98,11 @@ use super::types::*;
 // `SelectResourceConfigError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-configservice-starlingdoveservice.json");
 
-/// The largest page of results a request may ask for (`Limit`, range 0..100: "The
-/// maximum number of query results returned on each page"), which is also the page a
-/// request that asks for none gets ([`crate::state::SELECT_RESULTS_PAGE_SIZE`]), so the
-/// modelled maximum is stated in one place.
-const MAX_LIMIT: usize = crate::state::SELECT_RESULTS_PAGE_SIZE;
+/// The page size a request that asks for none gets: the largest page the model lets one
+/// response carry (`Limit`, range 0..100 — [`crate::state::SELECT_RESULTS_PAGE_SIZE`]).
+/// The range itself is enforced by the rule both select operations share
+/// ([`crate::state::requested_page_size`]).
+const DEFAULT_PAGE_SIZE: usize = crate::state::SELECT_RESULTS_PAGE_SIZE;
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
@@ -172,49 +172,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
         })?;
 
-        // "The maximum number of query results returned on each page." The modelled
-        // range (0..100) is refused at the request boundary where the boundary enforces
-        // it; the check stands so a limit outside it answers this operation's own
-        // modelled `InvalidLimitException` either way, with a message BUILT FROM THE
-        // REQUEST. A limit of 0 is the modelled default — "unspecified" — which is the
-        // largest page the model lets one response carry.
-        let requested = input.limit;
-        if requested < 0 || usize::try_from(requested).unwrap_or(usize::MAX) > MAX_LIMIT {
-            return Err(SelectResourceConfigErrorModeled::InvalidLimitException(
-                InvalidLimitException {
-                    message: Some(format!(
-                        "Value '{requested}' at 'limit' failed to satisfy constraint: Member \
-                         must be between 0 and {MAX_LIMIT}"
-                    )),
+        // "The maximum number of query results returned on each page", judged by the one
+        // rule both select operations apply (`crate::state::requested_page_size`): a
+        // value outside the modelled range is this operation's own modelled
+        // `InvalidLimitException`, and the modelled default of 0 is "unspecified", which
+        // leaves the page size to the one this operation serves.
+        let page_size = crate::state::requested_page_size("limit", input.limit)
+            .map_err(|message| {
+                SelectResourceConfigErrorModeled::InvalidLimitException(InvalidLimitException {
+                    message: Some(message),
+                })
+            })?
+            .unwrap_or(DEFAULT_PAGE_SIZE);
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let Some(resume_at) = crate::state::select_resume_at(input.next_token.as_deref()) else {
+            return Err(SelectResourceConfigErrorModeled::InvalidNextTokenException(
+                InvalidNextTokenException {
+                    message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
                 },
             )
             .into());
-        }
-        let page_size = match usize::try_from(requested).unwrap_or_default() {
-            0 => crate::state::SELECT_RESULTS_PAGE_SIZE,
-            limit => limit,
-        };
-
-        // The token is opaque: anything this operation did not issue is malformed. It
-        // names how many results of this query were already answered, which is what
-        // makes the next page the rows after them.
-        let resume_at = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => match crate::state::decode_page_token(token)
-                .and_then(|resume_at| resume_at.parse::<usize>().ok())
-            {
-                Some(resume_at) => resume_at,
-                None => {
-                    return Err(SelectResourceConfigErrorModeled::InvalidNextTokenException(
-                        InvalidNextTokenException {
-                            message: Some(
-                                crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
-                            ),
-                        },
-                    )
-                    .into());
-                }
-            },
         };
 
         // An expression that is not a Config query is refused BEFORE anything is read
@@ -234,32 +212,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let documents = crate::state::resource_configuration_item_documents(&store, &region);
         let results = query.run(&documents);
-
-        // "Returns the results for the SQL query": each result is one JSON document of
-        // the properties the query selected.
-        let page: Vec<String> = results
-            .iter()
-            .skip(resume_at)
-            .take(page_size)
-            .map(::serde_json::Value::to_string)
-            .collect();
-        let answered = resume_at.saturating_add(page.len());
-        let next_token =
-            (answered < results.len()).then(|| crate::state::encode_page_token(&answered.to_string()));
+        let (page, next_token) =
+            crate::state::select_results_page(&results, resume_at, page_size);
 
         Ok(SelectResourceConfigOutput {
             results: Some(page),
-            // "Returns the QueryInfo object": the fields this query selected, in the
-            // order it selected them.
-            query_info: Some(QueryInfo {
-                select_fields: Some(
-                    query
-                        .field_names()
-                        .into_iter()
-                        .map(|name| FieldInfo { name: Some(name) })
-                        .collect(),
-                ),
-            }),
+            query_info: Some(crate::state::select_query_info(&query)),
             next_token,
         })
     }

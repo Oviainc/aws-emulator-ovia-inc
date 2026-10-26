@@ -155,18 +155,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // A pure read: the reported `ValidationStatus` is computed from the
-        // stored status pair and the due instant, so nothing about the
-        // configuration changes for the next caller.
+        // "Gets DNSSEC validation information for a specified resource": the
+        // configuration is a per-VPC singleton the service maintains itself, so
+        // every VPC has one and a VPC nothing has written to reports the default
+        // configuration (validation off) rather than a refusal. A pure read —
+        // the reported `ValidationStatus` is computed from the stored status
+        // pair and the due instant, and a VPC with no record is not given one,
+        // so nothing about the configuration changes for the next caller.
         let store = state.lock();
-        let Some(record) = store.resolver_dnssec_configs.get(&input.resource_id) else {
-            return Err(
-                GetResolverDnssecConfigErrorModeled::ResourceNotFoundException(
-                    crate::state::resolver_dnssec_config_not_found(&input.resource_id),
-                )
-                .into(),
-            );
-        };
+        let record = store.resolver_dnssec_config(&input.resource_id);
 
         Ok(GetResolverDnssecConfigOutput {
             resolver_dnssec_config: Some(record.to_dnssec_config(::std::time::Instant::now())),
