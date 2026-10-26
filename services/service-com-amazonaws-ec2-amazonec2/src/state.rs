@@ -352,6 +352,19 @@
 //! its own open issue — so the create lands on this one record rather than on a second copy
 //! of an interface beside it.
 //!
+//! [`ComAmazonawsEc2Amazonec2State::network_interface_permissions`] holds the permissions the
+//! account has granted over those interfaces, as the modelled [`NetworkInterfacePermission`]
+//! shape itself, keyed by `NetworkInterfacePermissionId` in a [`BTreeMap`] for the same
+//! reason every other store here is: one stable order a pagination token can name a position
+//! in. A permission is recorded in the non-terminal `pending` state, so the clock owes it
+//! `granted` one [`TRANSITION_DELAY`] later; the due instant sits beside the record in
+//! [`ComAmazonawsEc2Amazonec2State::network_interface_permission_granted_at`], the way a
+//! `pending` VPC's does, and [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]
+//! applies it. A permission names an interface, so
+//! [`ComAmazonawsEc2Amazonec2State::remove_network_interface`] drops the permissions over the
+//! interface it removes rather than leaving a grant over something the account no longer
+//! holds.
+//!
 //! ## BYOIP address ranges
 //!
 //! [`ComAmazonawsEc2Amazonec2State::byoip_cidrs`] holds the address ranges the account has
@@ -1189,7 +1202,8 @@ use crate::ops::types::{
     InstanceState, InstanceTypeOffering, InterruptionInfo, IpPermission, IpRange, Ipv6Range,
     LOCATION_TYPE_VALUES,
     LaunchTemplate, MacHost, Monitoring, NatGateway, NetworkInsightsAccessScope,
-    NetworkInsightsAccessScopeAnalysis, NetworkInterface, NetworkInterfacePrivateIpAddress,
+    NetworkInsightsAccessScopeAnalysis, NetworkInterface, NetworkInterfacePermission,
+    NetworkInterfacePermissionState, NetworkInterfacePrivateIpAddress,
     OperatorResponse, PeeringAttachmentStatus, Placement,
     PlacementGroup, PrefixListId,
     PrivateDnsNameOptionsOnLaunch, ReferencedSecurityGroup, SecurityGroupRule,
@@ -1717,6 +1731,35 @@ pub const OPT_IN_NOT_REQUIRED: &str = "opt-in-not-required";
 /// [`crate::scaffolded::Scaffolded::service_error`].
 /// EC2's error code for a request member whose value is not valid.
 pub const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
+
+/// EC2's error code for a `MaxResults` the operation will not page with — "InvalidMaxResults"
+/// (EC2 API error codes), the code EC2 answers rather than a generic model-constraint one
+/// when a request asks for a page smaller than the smallest the operation publishes.
+/// Answered through [`override_refusal`](crate::service) for the modelled `@range` the
+/// boundary walk reports, and through [`max_results_below_minimum_message`] for its wording.
+pub const INVALID_MAX_RESULTS: &str = "InvalidMaxResults";
+
+/// The path the boundary's constraint walk reports a `MaxResults` violation under: the
+/// member's own name in lowerCamel, which is how
+/// `aws_smithy_schema_server::constraints::path` spells a member. Named here so the one
+/// place that reads a violation path and the one that words the refusal cannot drift apart.
+pub const MAX_RESULTS_MEMBER_PATH: &str = "maxResults";
+
+/// How EC2 states a `MaxResults` below the smallest page an operation serves: the value the
+/// request sent and the bound it has to reach, in the sentence EC2 words every refused
+/// `maxResults` with — "Value ( `<value>` ) for parameter maxResults is invalid. Expecting a
+/// value greater than or equal to `<minimum>`."
+///
+/// Both variable parts come from the request and the model: the value as the caller sent it
+/// (already elided by the constraint walk, so echoing it cannot amplify a request into an
+/// arbitrarily long response) and the minimum off the member's own `@range`, so an operation
+/// whose published minimum differs is refused with its own bound rather than a copied number.
+pub fn max_results_below_minimum_message(value: &str, minimum: &str) -> String {
+    format!(
+        "Value ( {value} ) for parameter maxResults is invalid. Expecting a value greater \
+         than or equal to {minimum}."
+    )
+}
 
 /// EC2's error code for a `Filters` entry naming a filter the operation does not document —
 /// "The specified filter is not valid" (EC2 API error codes). Answered through
@@ -2553,6 +2596,24 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// A `CreateNetworkInterface` `ClientToken` and the interface id it minted, so a repeat
     /// of the same request answers with that interface instead of creating a second one.
     pub network_interface_client_tokens: HashMap<String, String>,
+    /// Every permission the account has granted over one of its network interfaces, by
+    /// `NetworkInterfacePermissionId`, as the modelled [`NetworkInterfacePermission`] shape
+    /// itself — the one `DescribeNetworkInterfacePermissions` reports — so a member a writer
+    /// sets round-trips through that describe without a field-by-field copy that can
+    /// silently drop one. Ordered by id, which is the order the describe reports and pages
+    /// over.
+    ///
+    /// A fresh account holds NONE: a permission exists only once something grants one, and
+    /// it goes when the interface it is over goes
+    /// ([`Self::remove_network_interface`]).
+    pub network_interface_permissions: BTreeMap<String, NetworkInterfacePermission>,
+    /// When a `pending` network interface permission's `granted` move falls due, by
+    /// `NetworkInterfacePermissionId` — the permission counterpart of
+    /// [`Self::vpc_available_at`], on the same monotonic clock and the same
+    /// [`TRANSITION_DELAY`]: a permission is recorded `pending` and the clock owes it
+    /// `granted` whether or not anybody calls again.
+    /// [`Self::materialize_due_transitions`] applies it.
+    pub network_interface_permission_granted_at: BTreeMap<String, Instant>,
     /// Every security group rule the account holds, by `SecurityGroupRuleId`.
     ///
     /// "When you add a rule to a security group, it is assigned a unique ID"
@@ -3236,6 +3297,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             security_groups: BTreeMap::new(),
             network_interfaces: BTreeMap::new(),
             network_interface_client_tokens: HashMap::new(),
+            // A fresh account has granted nothing over an interface it does not have yet.
+            network_interface_permissions: BTreeMap::new(),
+            network_interface_permission_granted_at: BTreeMap::new(),
             security_group_rules: BTreeMap::new(),
             launch_templates: BTreeMap::new(),
             launch_template_client_tokens: HashMap::new(),
@@ -5810,7 +5874,8 @@ impl ComAmazonawsEc2Amazonec2State {
     /// analysis reaching its terminal `AnalysisStatus`. So is an `associating` local gateway
     /// route table / VPC association reaching `associated`, an `associating` local gateway
     /// route table / virtual interface group association reaching it too, and a Client VPN
-    /// target network association moving `associating` -> `associated`.
+    /// target network association moving `associating` -> `associated`. So is a `pending`
+    /// permission over a network interface reaching `granted`.
     pub fn materialize_due_transitions(&mut self) {
         let now = Instant::now();
         // The one clock-owed REMOVAL: a recycled AMI whose retention period has run out was
@@ -5863,6 +5928,30 @@ impl ComAmazonawsEc2Amazonec2State {
                     }
                 }
                 // The transition is applied once; nothing is owed on this gateway any more.
+                false
+            });
+        // A permission granted over a network interface is recorded `pending` and reaches
+        // `granted` at its due instant, whether or not anybody called — the permission
+        // counterpart of the moves above.
+        let network_interface_permissions = &mut self.network_interface_permissions;
+        self.network_interface_permission_granted_at
+            .retain(|network_interface_permission_id, due_at| {
+                if now < *due_at {
+                    return true;
+                }
+                if let Some(permission) =
+                    network_interface_permissions.get_mut(network_interface_permission_id)
+                {
+                    if let Some(state) = permission.permission_state.as_mut() {
+                        if state.state.as_deref()
+                            == Some(NETWORK_INTERFACE_PERMISSION_STATE_PENDING)
+                        {
+                            state.state =
+                                Some(NETWORK_INTERFACE_PERMISSION_STATE_GRANTED.to_string());
+                        }
+                    }
+                }
+                // The move is applied once; nothing is owed on this permission any more.
                 false
             });
         let subnets = &mut self.subnets;
@@ -20758,6 +20847,13 @@ impl ComAmazonawsEc2Amazonec2State {
                     .saturating_add(given_back),
             );
         }
+        // A permission is a grant over THIS interface, so it cannot outlive it: each one
+        // goes with the interface, bytes and all, the way the client token above does.
+        for network_interface_permission_id in
+            self.network_interface_permissions_over(network_interface_id)
+        {
+            self.remove_network_interface_permission(&network_interface_permission_id);
+        }
         Some(interface)
     }
 
@@ -20777,6 +20873,242 @@ impl ComAmazonawsEc2Amazonec2State {
             .attachment
             .as_ref()
             .filter(|attachment| !attachment_is_detached(attachment))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Network interface permissions: what the account has granted another account
+// over one of its network interfaces, and what reports it
+// ---------------------------------------------------------------------------
+//
+// A permission is a resource of its own — "Describes a permission for a network
+// interface" (`NetworkInterfacePermission`), minted with its own
+// `NetworkInterfacePermissionId` and reported by `DescribeNetworkInterfacePermissions`.
+// What the writer and the reporter share — the id mint, the state the clock owes, the
+// capacity ceiling and the error codes a refusal carries — lives here, so the two cannot
+// disagree about one permission.
+
+/// The id prefix EC2 mints a network interface permission with, as
+/// [`network_interface_permission_id_is_well_formed`] reads one (`eni-perm-…`, the form the
+/// EC2 CLI and console report a `NetworkInterfacePermissionId` under), carried here without
+/// the separator [`ComAmazonawsEc2Amazonec2State::next_id`] adds.
+pub const NETWORK_INTERFACE_PERMISSION_ID_PREFIX: &str = "eni-perm";
+
+/// A permission that has been recorded but is not in force yet: the
+/// `NetworkInterfacePermissionStateCode` enum's `pending` member
+/// (`smithy_query(query="shape",shape="NetworkInterfacePermissionStateCode")`), the
+/// non-terminal state a permission sits in until [`TRANSITION_DELAY`] has passed.
+pub const NETWORK_INTERFACE_PERMISSION_STATE_PENDING: &str = "pending";
+
+/// A permission that is in force: that enum's `granted` member, the state the clock owes a
+/// `pending` permission [`TRANSITION_DELAY`] after it was recorded.
+pub const NETWORK_INTERFACE_PERMISSION_STATE_GRANTED: &str = "granted";
+
+/// The largest number of network interface permissions this in-memory store holds.
+///
+/// A capacity bound in the same style as [`MAX_NETWORK_INTERFACES`], not an AWS quota: each
+/// permission is a record in this process's memory, so the number a caller can create has to
+/// be finite. [`ComAmazonawsEc2Amazonec2State::has_network_interface_permission_capacity`]
+/// is the predicate a writer asks before inserting.
+pub const MAX_NETWORK_INTERFACE_PERMISSIONS: usize = 1_000;
+
+/// EC2's error code for a request that named a network interface permission id this account
+/// holds no permission for, in the form EC2 names every such refusal with
+/// (`InvalidNetworkInterfaceID.NotFound`, `InvalidCarrierGatewayID.NotFound`):
+/// `Invalid<Kind>ID.NotFound`.
+pub const INVALID_NETWORK_INTERFACE_PERMISSION_ID_NOT_FOUND: &str =
+    "InvalidNetworkInterfacePermissionID.NotFound";
+
+/// EC2's error code for a request whose network interface permission id is not an id of
+/// that kind at all, answered BEFORE the id is looked up — the counterpart of
+/// [`INVALID_NETWORK_INTERFACE_PERMISSION_ID_NOT_FOUND`], so a caller can tell "not an id of
+/// this kind" from "no such permission" (the same pair
+/// [`INVALID_NETWORK_INTERFACE_ID_MALFORMED`] and
+/// [`INVALID_NETWORK_INTERFACE_ID_NOT_FOUND`] form for the interface itself).
+pub const INVALID_NETWORK_INTERFACE_PERMISSION_ID_MALFORMED: &str =
+    "InvalidNetworkInterfacePermissionID.Malformed";
+
+/// Whether `id` is a well-formed network interface permission id:
+/// [`NETWORK_INTERFACE_PERMISSION_ID_PREFIX`] followed by 8 or 17 lowercase hexadecimal
+/// digits, the two EC2 resource id forms [`prefixed_id_is_well_formed`] reads.
+pub fn network_interface_permission_id_is_well_formed(id: &str) -> bool {
+    prefixed_id_is_well_formed(NETWORK_INTERFACE_PERMISSION_ID_PREFIX, id)
+}
+
+/// Refuse a request that named something that is not a network interface permission id:
+/// HTTP 400 `InvalidNetworkInterfacePermissionID.Malformed`, with the message EC2 builds
+/// from the id the request named.
+pub fn invalid_network_interface_permission_id_malformed<E>(
+    network_interface_permission_id: &str,
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_NETWORK_INTERFACE_PERMISSION_ID_MALFORMED,
+        400,
+        format!("Invalid id: '{network_interface_permission_id}'"),
+    )
+}
+
+/// Refuse a request that named a network interface permission id this account holds no
+/// permission for: HTTP 400 `InvalidNetworkInterfacePermissionID.NotFound`, with the message
+/// EC2 builds from the id the request named — it spells the resource with the modelled
+/// shape's own name (`NetworkInterfacePermission`), as the real service does.
+pub fn invalid_network_interface_permission_id_not_found<E>(
+    network_interface_permission_id: &str,
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_NETWORK_INTERFACE_PERMISSION_ID_NOT_FOUND,
+        400,
+        format!(
+            "The NetworkInterfacePermission ID '{network_interface_permission_id}' does not \
+             exist"
+        ),
+    )
+}
+
+/// What one network interface permission is granted with, beyond everything the service
+/// itself derives ([`ComAmazonawsEc2Amazonec2State::insert_network_interface_permission`]
+/// mints the id and the state the clock then moves).
+///
+/// The grantee is EITHER an account — "the Amazon Web Services account ID"
+/// (`NetworkInterfacePermission$AwsAccountId`) — OR a service
+/// (`NetworkInterfacePermission$AwsService`), which is why both are optional here: the
+/// record carries the one the writer named.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkInterfacePermissionSpec {
+    /// "The ID of the network interface" the permission is over
+    /// (`NetworkInterfacePermission$NetworkInterfaceId`).
+    pub network_interface_id: String,
+    /// "The Amazon Web Services account ID" the permission is granted to
+    /// (`NetworkInterfacePermission$AwsAccountId`).
+    pub aws_account_id: Option<String>,
+    /// "The Amazon Web Services service" the permission is granted to
+    /// (`NetworkInterfacePermission$AwsService`).
+    pub aws_service: Option<String>,
+    /// "The type of permission" (`NetworkInterfacePermission$Permission`), an
+    /// `InterfacePermissionType` value
+    /// ([`crate::ops::types::INTERFACE_PERMISSION_TYPE_VALUES`]).
+    pub permission: String,
+}
+
+/// The caller-chosen bytes a stored network interface permission retains: the grantee the
+/// writer named. Everything else on the record — the id, the interface id, the permission
+/// type and the state — is derived by this module or bounded by the model, so it is
+/// fixed-size.
+///
+/// The ONE definition of that charge, the way [`network_interface_payload_bytes`] is for an
+/// interface: a writer asks it before the write,
+/// [`ComAmazonawsEc2Amazonec2State::insert_network_interface_permission`] charges exactly it
+/// and [`ComAmazonawsEc2Amazonec2State::remove_network_interface_permission`] gives exactly
+/// it back.
+pub fn network_interface_permission_payload_bytes(
+    aws_account_id: Option<&str>,
+    aws_service: Option<&str>,
+) -> usize {
+    aws_account_id
+        .map_or(0, str::len)
+        .saturating_add(aws_service.map_or(0, str::len))
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another network interface permission fits inside the store's ceiling
+    /// ([`MAX_NETWORK_INTERFACE_PERMISSIONS`]).
+    ///
+    /// The same contract as [`Self::has_network_interface_capacity`]: a writer asks this
+    /// first and refuses when it answers `false`.
+    pub fn has_network_interface_permission_capacity(&self) -> bool {
+        self.network_interface_permissions.len() < MAX_NETWORK_INTERFACE_PERMISSIONS
+    }
+
+    /// Record a permission over a network interface and answer the
+    /// `NetworkInterfacePermissionId` it was given, or `None` when the store is full.
+    ///
+    /// The ONE writer seam, the way [`Self::insert_network_interface`] is for an interface:
+    /// everything the service owns is derived here rather than taken from a caller — the id
+    /// and the `pending` state the clock then moves to `granted` one [`TRANSITION_DELAY`]
+    /// later — so two writers cannot report one permission differently. The caller-chosen
+    /// bytes the record retains ([`network_interface_permission_payload_bytes`]) are charged
+    /// against the store's byte budget here, so a writer cannot store them uncharged, and
+    /// both ceilings are enforced here rather than trusted to the caller.
+    pub fn insert_network_interface_permission(
+        &mut self,
+        spec: NetworkInterfacePermissionSpec,
+    ) -> Option<String> {
+        if !self.has_network_interface_permission_capacity()
+            || self.network_interface_permissions.len() >= MAX_STORED_RECORDS_PER_STORE
+        {
+            return None;
+        }
+        let payload_bytes = network_interface_permission_payload_bytes(
+            spec.aws_account_id.as_deref(),
+            spec.aws_service.as_deref(),
+        );
+        if self.would_exceed_stored_bytes(payload_bytes) {
+            return None;
+        }
+        let network_interface_permission_id = self.next_id(NETWORK_INTERFACE_PERMISSION_ID_PREFIX);
+        let permission = NetworkInterfacePermission {
+            network_interface_permission_id: Some(network_interface_permission_id.clone()),
+            network_interface_id: Some(spec.network_interface_id),
+            aws_account_id: spec.aws_account_id,
+            aws_service: spec.aws_service,
+            permission: Some(spec.permission),
+            // "Information about the state of the permission"
+            // (`NetworkInterfacePermission$PermissionState`): a permission starts out
+            // `pending` and the clock owes it `granted`, so a caller that reads straight
+            // after the write still sees the transient state.
+            permission_state: Some(NetworkInterfacePermissionState {
+                state: Some(NETWORK_INTERFACE_PERMISSION_STATE_PENDING.to_string()),
+                status_message: None,
+            }),
+        };
+        self.add_stored_bytes(payload_bytes.saturating_add(STORED_RECORD_OVERHEAD_BYTES));
+        self.network_interface_permission_granted_at.insert(
+            network_interface_permission_id.clone(),
+            due_instant(TRANSITION_DELAY),
+        );
+        self.network_interface_permissions
+            .insert(network_interface_permission_id.clone(), permission);
+        Some(network_interface_permission_id)
+    }
+
+    /// Remove the permission `network_interface_permission_id` and answer it as it was last
+    /// reported, or `None` when the store holds no such permission.
+    ///
+    /// The exact reverse of [`Self::insert_network_interface_permission`]: the record's
+    /// bytes go back to the store's budget and the move the clock still owed it goes with
+    /// it, so a grant followed by its removal leaves the store exactly where it started.
+    pub fn remove_network_interface_permission(
+        &mut self,
+        network_interface_permission_id: &str,
+    ) -> Option<NetworkInterfacePermission> {
+        let permission = self
+            .network_interface_permissions
+            .remove(network_interface_permission_id)?;
+        self.release_stored_bytes(
+            network_interface_permission_payload_bytes(
+                permission.aws_account_id.as_deref(),
+                permission.aws_service.as_deref(),
+            )
+            .saturating_add(STORED_RECORD_OVERHEAD_BYTES),
+        );
+        self.network_interface_permission_granted_at
+            .remove(network_interface_permission_id);
+        Some(permission)
+    }
+
+    /// The ids of every permission the store holds over the network interface
+    /// `network_interface_id`, in the store's own id order.
+    ///
+    /// A READ ONLY: what a writer asks to find the grants that are already over one
+    /// interface, and what [`Self::remove_network_interface`] asks to take them with it.
+    pub fn network_interface_permissions_over(&self, network_interface_id: &str) -> Vec<String> {
+        self.network_interface_permissions
+            .iter()
+            .filter(|(_, permission)| {
+                permission.network_interface_id.as_deref() == Some(network_interface_id)
+            })
+            .map(|(network_interface_permission_id, _)| network_interface_permission_id.clone())
+            .collect()
     }
 }
 

@@ -836,18 +836,29 @@ async fn the_answer_pages_in_id_order_with_a_token_that_advances() {
 
 /// A `MaxResults` outside the range the model publishes (`TransitGatewayMaxResults`,
 /// `range 5..1000`) is refused at the boundary, one past each published bound, while each
-/// bound itself is served. The refusal is the boundary validator's `ValidationError`, whose
-/// message names the member it rejected — asserted, so a 400 for some other reason could not
-/// pass for it.
+/// bound itself is served. A page size below the smallest the operation serves carries EC2's
+/// own `InvalidMaxResults`; one above the largest keeps the boundary validator's
+/// `ValidationError`. Either way the message names the member it rejected — asserted, so a
+/// 400 for some other reason could not pass for it.
 #[tokio::test]
 async fn a_page_size_outside_the_published_range_is_refused() {
     let (router, _engine, _ids) = seeded();
 
-    for (case, page_size, expected_status) in [
-        ("one below the published minimum", 4, 400),
-        ("the published minimum", 5, 200),
-        ("the published maximum", 1000, 200),
-        ("one above the published maximum", 1001, 400),
+    for (case, page_size, expected_status, expected_code) in [
+        (
+            "one below the published minimum",
+            4,
+            400,
+            INVALID_MAX_RESULTS,
+        ),
+        ("the published minimum", 5, 200, ""),
+        ("the published maximum", 1000, 200, ""),
+        (
+            "one above the published maximum",
+            1001,
+            400,
+            BOUNDARY_VALIDATION_ERROR,
+        ),
     ] {
         let (status, body) =
             describe(&router, &[param("MaxResults", &page_size.to_string())]).await;
@@ -858,8 +869,8 @@ async fn a_page_size_outside_the_published_range_is_refused() {
         if expected_status == 400 {
             assert_eq!(
                 error_code(&body),
-                BOUNDARY_VALIDATION_ERROR,
-                "case {case:?}: expected {BOUNDARY_VALIDATION_ERROR}, got {body}"
+                expected_code,
+                "case {case:?}: expected {expected_code}, got {body}"
             );
             let message = unescaped(&element(&body, "Message").unwrap_or_default());
             assert!(
@@ -871,9 +882,14 @@ async fn a_page_size_outside_the_published_range_is_refused() {
 }
 
 /// The wire error code the boundary validator refuses a request with when a modelled
-/// constraint rejects it before the handler runs — as `MaxResults` outside
-/// `TransitGatewayMaxResults`' published range is.
+/// constraint rejects it before the handler runs — as `MaxResults` ABOVE
+/// `TransitGatewayMaxResults`' published maximum is.
 const BOUNDARY_VALIDATION_ERROR: &str = "ValidationError";
+
+/// EC2's own code for a page size below the smallest the operation serves, which this
+/// service answers in place of the boundary validator's generic one (the service's
+/// `INVALID_MAX_RESULTS`).
+const INVALID_MAX_RESULTS: &str = "InvalidMaxResults";
 
 /// A `NextToken` this service did not mint is refused rather than read as an id, whatever
 /// else the request names.

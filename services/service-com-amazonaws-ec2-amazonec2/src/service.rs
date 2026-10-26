@@ -125,8 +125,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             // operation), so what it answers is a CODE, and this service states that code
             // only where EC2's own words for the refusal are known: a value outside a
             // modelled catalog this service has recorded wording for is EC2's
-            // `InvalidParameterValue` with the sentence EC2 words for that parameter TYPE
-            // ([`ec2_value_refusal`]).
+            // `InvalidParameterValue` with the sentence EC2 words for that parameter TYPE,
+            // and a page size below the smallest its `@range` publishes is EC2's
+            // `InvalidMaxResults` ([`ec2_value_refusal`]).
             //
             // Every other framework refusal answers `None`, which keeps the framework's own
             // code and its request-built clause in AWS's validation envelope
@@ -141,11 +142,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             Refusal::Invalid(violations) => {
                 // EC2 reports ONE parameter at a time, so a request that also failed other
                 // constraints is still refused with this parameter's own sentence.
-                let message = violations.iter().find_map(ec2_value_refusal)?;
-                Some(Refused {
-                    code: crate::state::INVALID_PARAMETER_VALUE.to_string(),
-                    message,
-                })
+                violations.iter().find_map(ec2_value_refusal)
             }
             // Authentication is the framework's answer to give, not this service's, and a
             // refusal carrying no violation has nothing for this service to name.
@@ -511,8 +508,8 @@ impl ServerProtocol for Ec2QueryEnvelope {
     }
 }
 
-/// EC2's own sentence for a value this service knows how EC2 refuses, or `None` when the
-/// refusal has no recorded EC2 wording.
+/// EC2's own code and sentence for a value this service knows how EC2 refuses, or `None`
+/// when the refusal has no recorded EC2 wording.
 ///
 /// EC2 words a refused value per parameter TYPE rather than as a validation clause —
 /// "`<value>` is not a valid value for RoleType. Specify either odcr-owner or
@@ -522,16 +519,37 @@ impl ServerProtocol for Ec2QueryEnvelope {
 /// member is refused in the same words and nothing here keys on an operation or a request's
 /// shape. A type whose EC2 wording this service has not recorded answers `None` and keeps
 /// the framework's own clause.
-fn ec2_value_refusal(violation: &aws_smithy_schema_server::Violation) -> Option<String> {
+///
+/// A `MaxResults` below the smallest page the operation publishes is the other refusal this
+/// service states: EC2 answers its own `InvalidMaxResults` for it, naming the value and the
+/// bound ([`crate::state::max_results_below_minimum_message`]). It is keyed on the member
+/// the constraint walk reports and on the bound it failed, so every paged operation of this
+/// service answers one code for a page size under its own published minimum — the minimum
+/// comes from the violation, never from a number written here.
+fn ec2_value_refusal(violation: &aws_smithy_schema_server::Violation) -> Option<Refused> {
     use aws_smithy_schema_server::ViolationKind;
 
     match &violation.kind {
         ViolationKind::EnumValue(allowed) if crate::state::is_caller_role_catalog(allowed) => {
             // Already elided to the framework's `MAX_ECHOED_VALUE`, so echoing it cannot
             // amplify a request into an arbitrarily long response.
-            Some(crate::state::caller_role_refusal_message(
-                violation.value.as_deref().unwrap_or_default(),
-            ))
+            Some(Refused {
+                code: crate::state::INVALID_PARAMETER_VALUE.to_string(),
+                message: crate::state::caller_role_refusal_message(
+                    violation.value.as_deref().unwrap_or_default(),
+                ),
+            })
+        }
+        ViolationKind::MinValue(minimum)
+            if violation.path == crate::state::MAX_RESULTS_MEMBER_PATH =>
+        {
+            Some(Refused {
+                code: crate::state::INVALID_MAX_RESULTS.to_string(),
+                message: crate::state::max_results_below_minimum_message(
+                    violation.value.as_deref().unwrap_or_default(),
+                    minimum,
+                ),
+            })
         }
         _ => None,
     }

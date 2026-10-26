@@ -1103,10 +1103,19 @@ async fn max_results_is_accepted_at_its_bounds_and_refused_past_them() {
              body {body}"
         );
         if expected_status == 400 {
+            // Which code the BOUNDARY answers is one rule for the whole service: a page
+            // size below the smallest the operation serves carries EC2's own
+            // `InvalidMaxResults`, one above the largest the boundary validator's generic
+            // code.
+            let expected_code = if max_results < 1 {
+                "InvalidMaxResults"
+            } else {
+                "ValidationError"
+            };
             assert_eq!(
                 error_code(&body),
-                "ValidationError",
-                "case MaxResults={max_results}: expected the boundary's refusal, got {body}"
+                expected_code,
+                "case MaxResults={max_results}: expected {expected_code}, got {body}"
             );
             assert!(
                 elements(&body, "capacityReservationId").is_empty(),

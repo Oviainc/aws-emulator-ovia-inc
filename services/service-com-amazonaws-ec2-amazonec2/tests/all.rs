@@ -279,6 +279,8 @@ mod network_insights_access_scope_analyses;
 mod network_insights_access_scopes;
 #[path = "all/network_interfaces.rs"]
 mod network_interfaces;
+#[path = "all/network_interface_permissions.rs"]
+mod network_interface_permissions;
 #[path = "all/network_performance_data.rs"]
 mod network_performance_data;
 #[path = "all/network_performance_subscriptions.rs"]
