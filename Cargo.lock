@@ -12042,12 +12042,15 @@ dependencies = [
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
  "bytes",
+ "csv",
  "hex",
  "http",
+ "regex",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
  "tracing",
+ "yaml-rust2",
 ]
 
 [[package]]

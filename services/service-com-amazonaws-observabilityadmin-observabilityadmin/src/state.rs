@@ -1680,7 +1680,7 @@ pub fn telemetry_rule_rejection(rule: &TelemetryRule, home_region: &str) -> Opti
 
 /// Why a member that targets a modelled enum is unacceptable. A member the request
 /// omits is one the model admits, so it is not refused here.
-fn enum_rejection(member: &str, value: Option<&str>, catalog: &[&str]) -> Option<String> {
+pub fn enum_rejection(member: &str, value: Option<&str>, catalog: &[&str]) -> Option<String> {
     let supplied = value?;
     if catalog.contains(&supplied) {
         return None;

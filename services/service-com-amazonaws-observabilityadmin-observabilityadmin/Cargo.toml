@@ -23,6 +23,19 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Encodes/decodes the opaque `NextToken` the list operations hand out.
 hex = { workspace = true }
+# Reads the caller-supplied telemetry pipeline configuration document, which is YAML
+# (or the JSON that YAML 1.2 is a superset of). yaml-rust2 is the pure-Rust YAML 1.2
+# implementation the sibling apigateway, cloudformation and amp crates already read
+# caller-supplied documents with, and it exposes the parser's EVENT stream, which is
+# where an alias can be refused instead of expanded.
+yaml-rust2 = { version = "0.10", default-features = false }
+# Reads one CSV row for the `csv` processor, so a quoted field carrying the delimiter
+# or a newline is one field as CSV defines it.
+csv = "1.3"
+# Compiles the `substitute_string` processor's pattern. The crate matches in time
+# linear in the subject and takes a compile-time size limit, so a caller-supplied
+# pattern cannot make one record's match unbounded.
+regex = "1.12"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

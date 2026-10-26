@@ -28,3 +28,6 @@ mod telemetry_pipelines;
 
 #[path = "all/telemetry_rules.rs"]
 mod telemetry_rules;
+
+#[path = "all/test_telemetry_pipeline.rs"]
+mod test_telemetry_pipeline;
