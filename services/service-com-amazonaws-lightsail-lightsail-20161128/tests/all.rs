@@ -147,6 +147,8 @@ mod instance_snapshot_listing;
 mod instance_snapshot_read;
 #[path = "all/instance_start_addresses.rs"]
 mod instance_start_addresses;
+#[path = "all/key_pair_delete.rs"]
+mod key_pair_delete;
 #[path = "all/load_balancer_delete.rs"]
 mod load_balancer_delete;
 #[path = "all/load_balancer_instance_attachment.rs"]

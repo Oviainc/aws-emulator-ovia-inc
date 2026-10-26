@@ -21,7 +21,9 @@
 //! copy of one) and the **event log** each database carries of what the service
 //! has done to it, the **load balancer** (a regional resource that spreads
 //! HTTP traffic across the instances attached to it), the **static IP** (a public
-//! IPv4 address the account reserves and attaches to an instance), the **CDN
+//! IPv4 address the account reserves and attaches to an instance), the **SSH key
+//! pair** (the public half of a key pair the account holds, which an instance's
+//! `sshKeyName` names), the **CDN
 //! distribution** (a global resource that caches and serves the content of an
 //! origin resource) together with the **certificate** (an SSL/TLS certificate
 //! the account requests for a domain, which is attached to a distribution so it
@@ -77,7 +79,7 @@ use crate::ops::types::{
     ExportSnapshotRecordSourceInfo,
     Instance,
     InstanceHardware, InstanceHealthSummary, InstanceMetadataOptions, InstanceNetworking,
-    InstancePortInfo, InstanceState, LightsailDistribution, LoadBalancer,
+    InstancePortInfo, InstanceState, KeyPair, LightsailDistribution, LoadBalancer,
     LoadBalancerTlsCertificateSummary,
     MonitoredResourceInfo, MonthlyTransfer, Operation, Origin, PartnerInfo, PrivateRegistryAccess,
     Region,
@@ -230,6 +232,16 @@ pub const STATIC_IP_ARN_RESOURCE_PREFIX: &str = "StaticIp/";
 /// `StaticIp$resourceType` documentation ("the resource type (usually
 /// `StaticIp`)") and the same modelled `ResourceType` enum.
 pub const RESOURCE_TYPE_STATIC_IP: &str = "StaticIp";
+
+/// The `resourceType` an SSH key pair and its operations report, from the
+/// modelled `KeyPair$resourceType` documentation ("The resource type (usually
+/// `KeyPair`)") and the same modelled `ResourceType` enum.
+pub const RESOURCE_TYPE_KEY_PAIR: &str = "KeyPair";
+
+/// The resource portion a key pair ARN carries before its id, from the modelled
+/// `KeyPair$arn` documentation
+/// (`arn:aws:lightsail:us-east-2:123456789101:KeyPair/05859e3d-…`).
+pub const KEY_PAIR_ARN_RESOURCE_PREFIX: &str = "KeyPair/";
 
 /// The `resourceType` an alarm and its operations report, from the same modelled
 /// `ResourceType` enum — the value the modelled `Alarm$resourceType` member
@@ -729,6 +741,16 @@ pub const OPERATION_TYPE_DELETE_DOMAIN: &str = "DeleteDomain";
 /// wire (a client has to tolerate a value it does not know), so the honest entry
 /// names the operation that ran, exactly as every other value here does.
 pub const OPERATION_TYPE_EXPORT_SNAPSHOT: &str = "ExportSnapshot";
+/// The `operationType` the log entry of a `DeleteKeyPair` call carries.
+///
+/// The modelled `OperationType` enum carries no member for any of the key pair
+/// calls — it has `DeleteKnownHostKeys` but neither `DeleteKeyPair` nor
+/// `CreateKeyPair` — exactly as it carries none for the Amazon EC2 export family
+/// (see [`OPERATION_TYPE_EXPORT_SNAPSHOT`], where the same reasoning is spelled
+/// out), and no member it does carry states what deleting a key pair did. A
+/// Smithy enum is open on the wire, so the honest entry names the operation that
+/// ran.
+pub const OPERATION_TYPE_DELETE_KEY_PAIR: &str = "DeleteKeyPair";
 /// The `operationType` the log entry of a `PeerVpc` call carries.
 ///
 /// The modelled `OperationType` enum carries no member for either VPC peering
@@ -5878,6 +5900,60 @@ impl StoredStaticIp {
 }
 
 // ---------------------------------------------------------------------------
+// SSH key pairs
+// ---------------------------------------------------------------------------
+
+/// One stored SSH key pair: the PUBLIC half Lightsail holds for the account,
+/// under the name an instance's `sshKeyName` names it by.
+///
+/// Lightsail holds only the public half — the modelled `DeleteKeyPair`
+/// documentation deletes a key pair "by removing the public key from Amazon
+/// Lightsail" — so that is all a record here holds beside what the service
+/// assigned it. The private half is handed to the caller by the call that
+/// created the pair and is never stored.
+#[derive(Debug, Clone)]
+pub struct StoredKeyPair {
+    /// The key pair name the request named, kept verbatim — it is this record's
+    /// store key and the `name` every read reports.
+    pub name: String,
+    pub arn: String,
+    pub support_code: String,
+    pub created_at_ms: i64,
+    pub location: StoredLocation,
+    pub tags: Vec<Tag>,
+    /// The fingerprint of the public half: "The RSA fingerprint of the key pair"
+    /// (`KeyPair$fingerprint`). It is what a delete's `expectedFingerprint`
+    /// states it expects to be deleting.
+    pub fingerprint: String,
+}
+
+impl StoredKeyPair {
+    /// This record as the modelled `KeyPair`.
+    pub fn view(&self) -> KeyPair {
+        KeyPair {
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            support_code: Some(self.support_code.clone()),
+            created_at: Some(timestamp(self.created_at_ms)),
+            location: Some(self.location.view()),
+            resource_type: Some(RESOURCE_TYPE_KEY_PAIR.to_string()),
+            tags: Some(self.tags.clone()),
+            fingerprint: Some(self.fingerprint.clone()),
+        }
+    }
+
+    /// Whether this is the account's Lightsail DEFAULT key pair — the one
+    /// [`DEFAULT_SSH_KEY_NAME`] names, which an instance created without a key
+    /// pair of its own is launched with.
+    ///
+    /// The record's NAME is what decides, because that name is how every
+    /// Lightsail operation addresses the default pair.
+    pub fn is_default(&self) -> bool {
+        self.name == DEFAULT_SSH_KEY_NAME
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Managed relational databases
 // ---------------------------------------------------------------------------
 
@@ -8347,6 +8423,33 @@ pub const MAX_REGISTRY_UPLOADS_PER_REGION: usize = 64;
 /// The entry dropped is the oldest registration.
 pub const MAX_CONTAINER_IMAGES_PER_SERVICE: usize = 500;
 
+/// What ONE entry of a region's registry costs this process beyond the bytes it
+/// holds: the map node it lives in, the headers of its owned `String`s and
+/// `Vec`s, and its fixed fields.
+///
+/// Deliberately a generous over-estimate of that overhead (a one-byte blob
+/// really costs this process on the order of 140 bytes: a 71-character digest
+/// key plus two allocation headers, a timestamp and a tree node), so the
+/// accounting errs towards refusing rather than towards holding more than
+/// [`MAX_REGISTRY_BYTES_PER_REGION`] says. Charging it is what makes that bound
+/// a bound on MEMORY and on the entry COUNT: every entry costs at least this
+/// much, so one region's registry holds at most
+/// `MAX_REGISTRY_BYTES_PER_REGION / REGISTRY_ENTRY_OVERHEAD_BYTES` entries
+/// however small the content pushed into them is.
+pub const REGISTRY_ENTRY_OVERHEAD_BYTES: usize = 128;
+
+/// What an entry whose owned bytes are `parts` costs a region's registry: those
+/// bytes together with [`REGISTRY_ENTRY_OVERHEAD_BYTES`].
+///
+/// The ONE place an entry's cost is worked out, so what
+/// [`StoredImageRegistry::bytes_held`] accounts for and what a write is refused
+/// for passing cannot drift apart.
+fn registry_entry_bytes(parts: &[usize]) -> usize {
+    parts.iter().fold(REGISTRY_ENTRY_OVERHEAD_BYTES, |total, part| {
+        total.saturating_add(*part)
+    })
+}
+
 /// One blob the registry holds: the bytes that were pushed, and when they
 /// arrived.
 #[derive(Debug, Clone)]
@@ -8445,31 +8548,55 @@ impl StoredImageRegistry {
     /// How many bytes this registry holds: its blobs, its manifests, the tags
     /// pointing at them, and what its in-flight uploads have taken so far.
     ///
-    /// A tag is counted too, because a tag pointing at a manifest the registry
-    /// already holds costs no manifest bytes — so without counting them a
-    /// client could grow this registry by tagging one manifest over and over.
+    /// Every entry is charged what it costs this PROCESS rather than only the
+    /// content it was pushed: the string it is keyed by (a digest, or a
+    /// repository and a tag), the owned strings on the record itself, and
+    /// [`REGISTRY_ENTRY_OVERHEAD_BYTES`] for the rest of it. Otherwise a client
+    /// pushing a stream of distinct one-byte blobs — each one a digest of its
+    /// own, so none of them is the blob already there — would be charged a byte
+    /// for an entry costing a hundred times that, and
+    /// [`MAX_REGISTRY_BYTES_PER_REGION`] would bound neither this process's
+    /// memory nor the number of entries one caller can make it hold.
+    ///
+    /// A tag is counted for the reason it always was: a tag pointing at a
+    /// manifest the registry already holds costs no manifest bytes, so without
+    /// counting it a client could grow this registry by tagging one manifest
+    /// over and over.
     pub fn bytes_held(&self) -> usize {
         let blobs: usize = self
             .blobs
-            .values()
-            .map(|blob| blob.content.len())
+            .iter()
+            .map(|(digest, blob)| registry_entry_bytes(&[digest.len(), blob.content.len()]))
             .fold(0, usize::saturating_add);
         let manifests: usize = self
             .manifests
-            .values()
-            .map(|manifest| manifest.content.len())
+            .iter()
+            .map(|(digest, manifest)| {
+                registry_entry_bytes(&[
+                    digest.len(),
+                    manifest.content.len(),
+                    manifest.repository.len(),
+                    manifest.media_type.len(),
+                ])
+            })
             .fold(0, usize::saturating_add);
         let tags: usize = self
             .tags
             .iter()
             .map(|((repository, tag), digest)| {
-                repository.len().saturating_add(tag.len()).saturating_add(digest.len())
+                registry_entry_bytes(&[repository.len(), tag.len(), digest.len()])
             })
             .fold(0, usize::saturating_add);
         let uploads: usize = self
             .uploads
-            .values()
-            .map(|upload| upload.content.len())
+            .iter()
+            .map(|(session, upload)| {
+                registry_entry_bytes(&[
+                    session.len(),
+                    upload.repository.len(),
+                    upload.content.len(),
+                ])
+            })
             .fold(0, usize::saturating_add);
         blobs
             .saturating_add(manifests)
@@ -8545,7 +8672,10 @@ impl StoredImageRegistry {
         if self.blobs.contains_key(&digest) {
             return RegistryWrite::Stored(digest);
         }
-        if !self.can_hold(content.len()) {
+        // What the ENTRY costs, not only what was pushed: the same accounting
+        // `bytes_held` reports, so a push is refused exactly when holding it
+        // would take this region past its bound.
+        if !self.can_hold(registry_entry_bytes(&[digest.len(), content.len()])) {
             return RegistryWrite::OutOfSpace {
                 limit: MAX_REGISTRY_BYTES_PER_REGION,
             };
@@ -8580,15 +8710,22 @@ impl StoredImageRegistry {
         let fresh_tag = tag_key
             .as_ref()
             .is_some_and(|key| !self.tags.contains_key(key));
-        let needed = if fresh_manifest { content.len() } else { 0 }.saturating_add(
+        let needed = if fresh_manifest {
+            registry_entry_bytes(&[
+                digest.len(),
+                content.len(),
+                repository.len(),
+                media_type.len(),
+            ])
+        } else {
+            0
+        }
+        .saturating_add(
             tag_key
                 .as_ref()
                 .filter(|_| fresh_tag)
                 .map_or(0, |(repository, tag)| {
-                    repository
-                        .len()
-                        .saturating_add(tag.len())
-                        .saturating_add(digest.len())
+                    registry_entry_bytes(&[repository.len(), tag.len(), digest.len()])
                 }),
         );
         if !self.can_hold(needed) {
@@ -11200,6 +11337,19 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// `GetStaticIps` walks a stable, total order and a page token can name the
     /// next static IP.
     pub static_ips: BTreeMap<String, StoredStaticIp>,
+    /// Every SSH key pair, keyed by its key pair name — the identifier every key
+    /// pair operation takes. A `BTreeMap` so `GetKeyPairs` walks a stable, total
+    /// order and a page token can name the next key pair.
+    ///
+    /// Keyed by name alone, like the instance whose `sshKeyName` names one:
+    /// both are served by name whichever Region the request is made from. That
+    /// is this store's existing shape for a resource an instance refers to, and
+    /// it is a DEVIATION worth knowing about — against AWS a key pair belongs to
+    /// one Region, so a pair held in another Region is not addressable from this
+    /// endpoint. The key to revisit is here, together with `GetKeyPairs`'
+    /// Region-scoped listing, once the calls that create a key pair are
+    /// implemented.
+    pub key_pairs: BTreeMap<String, StoredKeyPair>,
     /// Every alarm, keyed by its name — the identifier every alarm operation
     /// takes, and the one `PutAlarm` creates or updates a record under. A
     /// `BTreeMap` so `GetAlarms` walks a stable, total order and a page token can
@@ -12109,6 +12259,27 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// Remove the alarm `name` names, answering it. `None` when nothing matched.
     pub fn remove_alarm(&mut self, name: &str) -> Option<StoredAlarm> {
         self.alarms.remove(name)
+    }
+
+    /// The SSH key pair `name` names, for a reporting operation.
+    pub fn key_pair(&self, name: &str) -> Option<&StoredKeyPair> {
+        self.key_pairs.get(name)
+    }
+
+    /// Store a newly created or imported SSH key pair.
+    pub fn insert_key_pair(&mut self, key_pair: StoredKeyPair) {
+        self.key_pairs.insert(key_pair.name.clone(), key_pair);
+    }
+
+    /// Remove the SSH key pair `name` names, answering it. `None` when nothing
+    /// matched.
+    ///
+    /// Removing the record is what removes the public key from the service,
+    /// which is the whole of what the modelled `DeleteKeyPair` deletes: an
+    /// instance launched with that pair keeps the `sshKeyName` its own record
+    /// carries, because the pair is named there rather than referenced.
+    pub fn remove_key_pair(&mut self, name: &str) -> Option<StoredKeyPair> {
+        self.key_pairs.remove(name)
     }
 
     /// How many alarms other than `excluding` already watch `metric` on the
@@ -13172,6 +13343,7 @@ impl ComAmazonawsLightsailLightsail20161128State {
         names.extend(self.relational_database_snapshots.keys().cloned());
         names.extend(self.static_ips.keys().cloned());
         names.extend(self.alarms.keys().cloned());
+        names.extend(self.key_pairs.keys().cloned());
         names.extend(self.distributions.keys().cloned());
         names.extend(self.certificates.keys().cloned());
         // The maps keyed by the Region together with the name.
@@ -13254,6 +13426,11 @@ impl ComAmazonawsLightsailLightsail20161128State {
         }
         if let Some(record) = self.alarms.get_mut(name) {
             return Some(body(record, RESOURCE_TYPE_ALARM));
+        }
+        // A key pair is held under its name alone, the name every key pair
+        // operation addresses it by, so a tag change resolves it that way too.
+        if let Some(record) = self.key_pairs.get_mut(name) {
+            return Some(body(record, RESOURCE_TYPE_KEY_PAIR));
         }
         if let Some(record) = self.distributions.get_mut(name) {
             return Some(body(record, RESOURCE_TYPE_DISTRIBUTION));
@@ -13479,6 +13656,7 @@ tagged_records!(
     StoredRelationalDatabase,
     StoredRelationalDatabaseSnapshot,
     StoredAlarm,
+    StoredKeyPair,
     StoredContactMethod,
     StoredDistribution,
     StoredCertificate,
@@ -13993,6 +14171,15 @@ pub fn relational_database_snapshot_arn(region: &str, id: &str) -> String {
     )
 }
 
+/// The ARN of the SSH key pair `id` in `region`.
+pub fn key_pair_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{KEY_PAIR_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
 /// The ARN of the alarm `id` in `region`.
 pub fn alarm_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(
@@ -14264,16 +14451,22 @@ mod tests {
         );
     }
 
-    /// RULE: what one region's registry holds is accounted for in BYTES —
-    /// content it already holds and a tag it already has cost it nothing, and a
-    /// fresh tag of a manifest it already holds costs what that tag takes — so
-    /// nothing a client repeats grows it without bound.
+    /// RULE: what one region's registry holds is accounted for in BYTES — every
+    /// entry charged what it costs this process, content it already holds and a
+    /// tag it already has costing it nothing, and a fresh tag of a manifest it
+    /// already holds costing what that tag takes — so nothing a client repeats
+    /// grows it without bound.
     #[test]
     fn a_registry_accounts_for_every_byte_it_holds() {
         let mut registry = StoredImageRegistry::default();
         let layer = b"a layer of image content".to_vec();
         let manifest = br#"{"schemaVersion":2,"layers":[]}"#.to_vec();
-        let (layer_len, manifest_len) = (layer.len(), manifest.len());
+        let media_type = "application/vnd.oci.image.manifest.v1+json";
+        let layer_digest = registry_digest(&layer);
+        // One entry's cost: its own bytes, the string it is keyed by, and the
+        // fixed overhead every entry carries.
+        let blob_bytes =
+            REGISTRY_ENTRY_OVERHEAD_BYTES + layer_digest.len() + layer.len();
 
         assert_eq!(
             registry.bytes_held(),
@@ -14283,52 +14476,52 @@ mod tests {
         let stored = registry.put_blob(layer.clone(), CREATED_AT_MS);
         assert_eq!(
             (stored, registry.bytes_held()),
-            (
-                RegistryWrite::Stored(registry_digest(&layer)),
-                layer_len
-            ),
-            "case one pushed layer: expected its own bytes to be held under its own digest"
+            (RegistryWrite::Stored(layer_digest.clone()), blob_bytes),
+            "case one pushed layer: expected its own bytes, its digest key and one entry's \
+             overhead to be held under its own digest"
         );
         // The SAME bytes again are the blob that is already there.
         registry.put_blob(layer.clone(), CREATED_AT_MS + 1);
         assert_eq!(
             (registry.blobs.len(), registry.bytes_held()),
-            (1, layer_len),
+            (1, blob_bytes),
             "case the same layer pushed twice: expected one blob and no growth"
         );
 
         let digest = registry_digest(&manifest);
+        let manifest_bytes = REGISTRY_ENTRY_OVERHEAD_BYTES
+            + digest.len()
+            + manifest.len()
+            + "app".len()
+            + media_type.len();
+        let tag_bytes = |tag: &str| {
+            REGISTRY_ENTRY_OVERHEAD_BYTES + "app".len() + tag.len() + digest.len()
+        };
         for (case, tag, want_tags, want_bytes) in [
             (
                 "the manifest under its first tag",
                 "latest",
                 1,
-                layer_len + manifest_len + "app".len() + "latest".len() + digest.len(),
+                blob_bytes + manifest_bytes + tag_bytes("latest"),
             ),
             (
                 "the same manifest under the same tag again",
                 "latest",
                 1,
-                layer_len + manifest_len + "app".len() + "latest".len() + digest.len(),
+                blob_bytes + manifest_bytes + tag_bytes("latest"),
             ),
             (
                 "the same manifest under a second tag",
                 "v1",
                 2,
-                layer_len
-                    + manifest_len
-                    + "app".len()
-                    + "latest".len()
-                    + "app".len()
-                    + "v1".len()
-                    + 2 * digest.len(),
+                blob_bytes + manifest_bytes + tag_bytes("latest") + tag_bytes("v1"),
             ),
         ] {
             let stored = registry.put_manifest(
                 "app",
                 Some(tag),
                 manifest.clone(),
-                "application/vnd.oci.image.manifest.v1+json",
+                media_type,
                 CREATED_AT_MS,
             );
             assert_eq!(
@@ -14342,6 +14535,47 @@ mod tests {
                 "case {case}: expected one manifest, {want_tags} tags and {want_bytes} bytes"
             );
         }
+    }
+
+    /// RULE: a registry entry is charged what it costs this process, so the
+    /// per-region byte bound bounds the ENTRY COUNT too — a client pushing
+    /// distinct one-byte blobs is refused after at most
+    /// `MAX_REGISTRY_BYTES_PER_REGION / REGISTRY_ENTRY_OVERHEAD_BYTES` of them,
+    /// rather than after the hundred million the content alone would admit.
+    #[test]
+    fn a_registry_charges_every_entry_its_own_footprint() {
+        // Distinct one-byte blobs: the cheapest content a client can push, and
+        // each one a digest of its own, so none of them is the blob that is
+        // already there.
+        let digest_len = registry_digest(&[0]).len();
+        for count in [1usize, 2, 8, 64] {
+            let mut registry = StoredImageRegistry::default();
+            for index in 0..count {
+                let content = vec![u8::try_from(index).expect("the table stays under 256")];
+                assert_eq!(
+                    registry.put_blob(content.clone(), CREATED_AT_MS),
+                    RegistryWrite::Stored(registry_digest(&content)),
+                    "case {count} one-byte blobs: expected blob {index} to be held"
+                );
+            }
+            let want = count * (REGISTRY_ENTRY_OVERHEAD_BYTES + digest_len + 1);
+            assert_eq!(
+                (registry.blobs.len(), registry.bytes_held()),
+                (count, want),
+                "case {count} one-byte blobs: expected each to be charged its digest key and \
+                 its own overhead, not just its one byte"
+            );
+        }
+
+        // The bound that follows: every entry costs at least the per-entry
+        // overhead, so one region's registry holds at most this many entries
+        // however small the content pushed into them is.
+        let ceiling = MAX_REGISTRY_BYTES_PER_REGION / REGISTRY_ENTRY_OVERHEAD_BYTES;
+        assert!(
+            ceiling <= 1_048_576,
+            "expected the per-region bound to admit at most a million entries whatever their \
+             content, got {ceiling}"
+        );
     }
 
     /// RULE: the store's own per-region bound keeps the blob uploads in flight

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteKeyPair
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteKeyPair`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deleting an SSH key pair removes the PUBLIC key this service holds for the
+//! account under that name, and nothing else: the account's other key pairs, and
+//! every instance that was launched with this one, are exactly as they were.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteKeyPair::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +166,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteKeyPair` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteKeyPairErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteKeyPair"))
+        // A key pair is addressed by name — the store holds it under that name
+        // alone, exactly as it holds the instance whose `sshKeyName` names one —
+        // so nothing here comes from the request metadata `ctx` carries.
+        let _ = ctx;
+
+        // `keyPairName` is a modelled `@required` member carrying the modelled
+        // `ResourceName` pattern, so the centralized walk refused an absent or
+        // malformed one before this body ran. `expectedFingerprint` is optional
+        // and carries no modelled constraint: what it means is this handler's.
+        let name = input.key_pair_name;
+        let expected_fingerprint = input.expected_fingerprint;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // The record is READ first and removed only once the request's
+            // preconditions hold, so a refused delete removes nothing.
+            let Some(held) = store.key_pair(&name) else {
+                return Err(not_found(&name));
+            };
+            // "The expectedFingerprint parameter is required only when
+            // specifying to delete a Lightsail default key pair": the default
+            // pair is the one a caller deletes by accident — every instance
+            // launched without a key pair of its own is launched with it — so a
+            // delete of THAT pair is served only when the request states the
+            // fingerprint it expects to be deleting and that is the fingerprint
+            // this service holds. For every other key pair the member is not a
+            // precondition at all, so one that disagrees is ignored rather than
+            // refused.
+            if held.is_default() {
+                match expected_fingerprint.as_deref() {
+                    None => {
+                        return Err(invalid(format!(
+                            "expectedFingerprint is required to delete the Lightsail default \
+                             key pair '{name}'"
+                        )))
+                    }
+                    Some(expected) if expected != held.fingerprint => {
+                        return Err(invalid(format!(
+                            "expectedFingerprint '{expected}' is not the fingerprint of the \
+                             key pair named '{name}'"
+                        )))
+                    }
+                    Some(_) => {}
+                }
+            }
+            // The public key is gone as this call returns — a `KeyPair` carries
+            // no status member, so there is nothing for the clock to settle
+            // later — which is why the operation it logs is answered terminal.
+            // The entry is written against the removed record's own location,
+            // for the same reason every other delete in this crate does so: the
+            // log says where the resource was.
+            let location = held.location.clone();
+            // The read above resolved this record under the same exclusive hold
+            // on the store, so this removes exactly the record whose
+            // preconditions were checked.
+            store.remove_key_pair(&name);
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_DELETE_KEY_PAIR,
+                crate::state::RESOURCE_TYPE_KEY_PAIR,
+                &name,
+                &location,
+                None,
+            );
+            Ok(DeleteKeyPairOutput {
+                operation: Some(operation.view()),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// No key pair of that name is stored, so this delete has no public key to
+/// remove: Lightsail's `DoesNotExist` rejection — HTTP 400, wire error
+/// `NotFoundException`, body `code` `DoesNotExist` and a message naming the
+/// resource type and the requested name. Deleting a key pair twice therefore
+/// fails the second time rather than reporting a deletion that did not happen.
+fn not_found(name: &str) -> DeleteKeyPairError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_KEY_PAIR,
+        name,
+    )
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> DeleteKeyPairError {
+    DeleteKeyPairErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> DeleteKeyPairError {
+    DeleteKeyPairErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail key pair store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
