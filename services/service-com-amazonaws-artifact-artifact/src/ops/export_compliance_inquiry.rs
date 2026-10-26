@@ -200,11 +200,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // had already made due. The export below is a new resource, not a change to it.
         inquiry.materialise(now);
 
-        let owned: Vec<i32> = inquiry
-            .queries
-            .iter()
-            .map(|query| query.identifier)
-            .collect();
         // Read off the one stored record through the one tags projection every inquiry
         // operation answers with ([`crate::state::ComplianceInquiry::reported_tags`]), so
         // the tags this answers with are the tags the create and the metadata read report.
@@ -214,7 +209,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // queries the request named, or every query the inquiry owns when it named none.
         let covered = match input.query_identifiers {
             Some(requested) if !requested.is_empty() => {
-                if requested.iter().any(|id| !owned.contains(id)) {
+                // The ownership rule asked of the inquiry itself
+                // ([`crate::state::ComplianceInquiry::owns_query`]) — the same predicate
+                // `PutComplianceInquiryFeedback` refuses its `queryIdentifier` against.
+                if requested.iter().any(|id| !inquiry.owns_query(*id)) {
                     ::tracing::info!(
                         operation = "ExportComplianceInquiry",
                         compliance_inquiry_id = %input.compliance_inquiry_id,
@@ -227,15 +225,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 }
-                // Ascending and without repeats: which queries an export covers is a SET,
-                // so neither the order a request listed them in nor a repeat is part of
-                // it.
-                let mut covered = requested;
-                covered.sort_unstable();
-                covered.dedup();
-                covered
+                // Which queries an export covers is a SET, so the list the request carried
+                // is normalised the one way this service normalises such a member
+                // ([`crate::state::request_set`]).
+                crate::state::request_set(requested)
             }
-            _ => owned,
+            _ => inquiry.query_identifiers(),
         };
 
         let include_citations = input.include_citations.unwrap_or(false);

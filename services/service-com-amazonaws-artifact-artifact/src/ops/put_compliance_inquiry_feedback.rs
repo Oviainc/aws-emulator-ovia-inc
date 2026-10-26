@@ -208,13 +208,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
 
-        // "The reason codes that describe why you rated the response": ascending and
-        // without repeats, because which reasons were given is a SET — neither the order
-        // the request listed them in nor a repeat is part of it. The same treatment
-        // `ExportComplianceInquiry` gives its `queryIdentifiers`.
-        let mut reason_codes = input.reason_codes.clone().unwrap_or_default();
-        reason_codes.sort_unstable();
-        reason_codes.dedup();
+        // "The reason codes that describe why you rated the response": which reasons were
+        // given is a SET, so the list the request carried is normalised the one way this
+        // service normalises such a member ([`crate::state::request_set`]) — the same
+        // treatment `ExportComplianceInquiry` gives its `queryIdentifiers`.
+        let reason_codes = crate::state::request_set(input.reason_codes.clone().unwrap_or_default());
 
         // What this request's `clientToken` identifies: every member that shapes the
         // feedback recorded, so a token replayed on a different request can be told from a
@@ -245,13 +243,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The sequential identifier of the query to provide feedback on": a query of THIS
         // inquiry, so an identifier it does not own is refused with the modelled
-        // `ValidationException` naming the member.
+        // `ValidationException` naming the member. The ownership rule is asked of the
+        // inquiry itself ([`crate::state::ComplianceInquiry::owns_query`]) — the same
+        // predicate `ExportComplianceInquiry` refuses its `queryIdentifiers` against.
         if let Some(identifier) = input.query_identifier {
-            if !inquiry
-                .queries
-                .iter()
-                .any(|query| query.identifier == identifier)
-            {
+            if !inquiry.owns_query(identifier) {
                 ::tracing::info!(
                     operation = "PutComplianceInquiryFeedback",
                     compliance_inquiry_id = %input.compliance_inquiry_id,

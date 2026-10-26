@@ -1061,6 +1061,27 @@ impl ComplianceInquiry {
         }
     }
 
+    /// Every query identifier this inquiry OWNS, in the ascending order its queries are
+    /// held in.
+    ///
+    /// What `ExportComplianceInquiry` covers when the request named no `queryIdentifiers`:
+    /// the whole set [`owns_query`](Self::owns_query) is the membership test for.
+    pub fn query_identifiers(&self) -> Vec<i32> {
+        self.queries.iter().map(|query| query.identifier).collect()
+    }
+
+    /// Whether `identifier` names a query of THIS inquiry.
+    ///
+    /// The ownership rule both operations taking a query identifier are refused against —
+    /// `ExportComplianceInquiry`'s `queryIdentifiers` and
+    /// `PutComplianceInquiryFeedback`'s `queryIdentifier`. One rule, applied in one place,
+    /// so the two cannot disagree about which queries an inquiry owns.
+    pub fn owns_query(&self, identifier: i32) -> bool {
+        self.queries
+            .iter()
+            .any(|query| query.identifier == identifier)
+    }
+
     /// The feedback this inquiry already holds for `target`, if any.
     ///
     /// What makes a second submission against ONE response revision a conflict rather than
@@ -2391,6 +2412,18 @@ fn clause_without_rejected_value(violation: &Violation) -> String {
         Some(rest) => format!("Value at {rest}"),
         None => rendered,
     }
+}
+
+/// The SET a request's list member denotes: `values` ascending and without repeats.
+///
+/// Decided in ONE place for every list member of this service that names a set rather
+/// than a sequence — the queries an export covers, the reasons a feedback submission
+/// gives — because neither the order a request listed such values in nor a repeat of one
+/// is part of what it named.
+pub fn request_set<Value: Ord>(mut values: Vec<Value>) -> Vec<Value> {
+    values.sort_unstable();
+    values.dedup();
+    values
 }
 
 /// The page size a paginated operation of this service serves for `max_results`.
