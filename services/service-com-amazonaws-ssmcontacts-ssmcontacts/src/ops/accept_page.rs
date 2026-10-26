@@ -13,10 +13,10 @@
 //! The refusals come in this order, and none of them records anything:
 //!
 //! 1. the account-level Incident Manager precondition
-//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set_for`])
-//!    — this operation's whole subject is one resource ARN, so with no ACTIVE replication set
-//!    the account has no home Region for it and the ARN resolves to nothing: the modelled
-//!    `ValidationException` (HTTP 400), BEFORE the page is looked up;
+//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`])
+//!    — with no ACTIVE replication set the account has no entry in Incident Manager's
+//!    registry, so the modelled `ValidationException` (HTTP 400) reports the ACCOUNT,
+//!    BEFORE the page is looked up;
 //! 2. an `AcceptType` or `AcceptCodeValidation` outside the model's value set for it — an
 //!    enum member reaches a handler as a plain string, so the value set is checked here (HTTP
 //!    400), also before the page is looked up;
@@ -204,9 +204,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         // The account gate comes FIRST, before `PageId` is resolved, so a non-onboarded
-        // account is refused identically whether or not the page it named exists.
+        // account is refused identically whether or not the page it named exists, and about
+        // its own missing registry entry rather than about anything the request named.
         state
-            .require_active_replication_set_for(&input.page_id)
+            .require_active_replication_set()
             .map_err(account_precondition_failed)?;
 
         // An enum member arrives as a plain string: the boundary validator enforces
