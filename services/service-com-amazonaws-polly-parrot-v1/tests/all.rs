@@ -46,3 +46,5 @@ mod task_retention;
 mod voice_catalog;
 #[path = "all/voice_catalog_is_not_paged.rs"]
 mod voice_catalog_is_not_paged;
+#[path = "all/voice_engine_compatibility.rs"]
+mod voice_engine_compatibility;
