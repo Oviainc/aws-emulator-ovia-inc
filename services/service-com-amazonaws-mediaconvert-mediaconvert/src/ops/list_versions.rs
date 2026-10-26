@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(ListVersionsOutput {
             next_token: page.next_token,
-            versions: Some(page.versions.iter().map(|record| record.view()).collect()),
+            versions: Some(page.records.iter().map(|record| record.view()).collect()),
         })
     }
 }

@@ -2,6 +2,13 @@
 
 //! @op ListJobTemplates
 //!
+//! Reports the account's stored job templates of the kind `listBy` selects, narrowed to
+//! `category` when the caller names one, ordered on the key `listBy` names in the
+//! direction `order` names, in pages of at most `maxResults` with an opaque `nextToken`
+//! that resumes immediately after the last template of the page just returned. Every value
+//! is projected from a record in [`crate::state`], through the one paging helper
+//! [`crate::state::page_of_job_templates`] that this service's job-template listing owns.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -167,60 +174,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let region = crate::state::request_region(ctx.parts());
-        // Reporting only, and nothing about a job template is owed by the clock, so this
-        // handler takes the store to read it and writes nothing at all.
-        let state = state.lock();
-
-        // `listBy` chooses BOTH which templates are listed and how they are ordered: its
-        // `SYSTEM` value selects the built-in templates, which `JobTemplate$Type`
-        // describes as the ones a user "can't modify or delete", while `NAME` and
-        // `CREATION_DATE` list the account's own templates on that key.
-        let list_by = input
-            .list_by
-            .as_deref()
-            .unwrap_or(crate::state::LIST_BY_NAME);
-        let wanted_type = if list_by == crate::state::LIST_BY_SYSTEM {
-            crate::state::TYPE_SYSTEM
-        } else {
-            crate::state::TYPE_CUSTOM
-        };
-        // `JobTemplateListBy`: "If you don't specify, the service will list them by name."
-        let sort_key = crate::state::ListBySortKey::from_list_by(
-            Some(list_by),
-            crate::state::ListBySortKey::Name,
-        );
-
-        // `category`: "specify a job template category to limit responses to only job
-        // templates from that category" — so a template with no category matches no
-        // category the caller can name.
-        let category = input.category.as_deref();
-        let mut matching: Vec<&crate::state::JobTemplateRecord> = state
-            .job_templates
-            .values()
-            .filter(|record| record.template_type == wanted_type)
-            .filter(|record| {
-                category.is_none_or(|want| record.category.as_deref() == Some(want))
-            })
-            .collect();
-        matching
-            .sort_by(|left, right| sort_key.compare(left.ordering_key(), right.ordering_key()));
-        // "Default varies by resource": a job template listing runs up the key it is
-        // ordered on — alphabetically from the start of the alphabet, chronologically
-        // from the oldest — unless the caller asks for DESCENDING.
-        let order = input
-            .order
-            .as_deref()
-            .unwrap_or(crate::state::ORDER_ASCENDING);
-        let ascending = order != crate::state::ORDER_DESCENDING;
-        if !ascending {
-            matching.reverse();
-        }
-
-        let start = match input.next_token.as_deref() {
-            None => 0,
+        // A `nextToken` is decoded BEFORE the store is touched: a token this service never
+        // issued is a bad request, and the same refusal every paged reader in this crate
+        // answers with.
+        let resume_from = match input.next_token.as_deref() {
+            None => None,
             Some(token) => {
-                let Some((nanos, name)) = crate::state::decode_cursor(token) else {
+                let Some(cursor) = crate::state::decode_cursor(token) else {
                     return Err(ListJobTemplatesErrorModeled::BadRequestException(
                         BadRequestException {
                             message: Some(
@@ -230,40 +190,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 };
-                let anchor = (nanos, name.as_str());
-                // Resume at the first template strictly past the anchor key in this
-                // direction. The anchor itself need not still be stored, so a template
-                // deleted between pages is skipped rather than failing the token.
-                matching
-                    .iter()
-                    .position(|record| {
-                        let side = sort_key.compare(record.ordering_key(), anchor);
-                        if ascending {
-                            side == ::std::cmp::Ordering::Greater
-                        } else {
-                            side == ::std::cmp::Ordering::Less
-                        }
-                    })
-                    .unwrap_or(matching.len())
+                Some(cursor)
             }
         };
 
-        // `maxResults` carries the model's own 1..20 range, so the framework has already
-        // refused anything outside it; the fallback only covers the absent case.
-        let page_size =
-            usize::try_from(input.max_results.unwrap_or(crate::state::DEFAULT_PAGE_SIZE))
-                .unwrap_or(crate::state::DEFAULT_PAGE_SIZE as usize);
-        let page = &matching[start.min(matching.len())..];
-        let page = &page[..page_size.min(page.len())];
-        // A token only when there is a further page to fetch.
-        let next_token = (start + page.len() < matching.len())
-            .then(|| page.last().map(|record| record.cursor()))
-            .flatten();
-        let job_templates = page.iter().map(|record| record.view(&region)).collect();
+        let region = crate::state::request_region(ctx.parts());
+        // Reporting only, and nothing about a job template is owed by the clock, so this
+        // handler takes the store to read it and writes nothing at all.
+        let state = state.lock();
+
+        // `listBy` chooses BOTH which templates are listed and how they are ordered: its
+        // `SYSTEM` value selects the built-in templates, which `JobTemplate$Type`
+        // describes as the ones a user "can't modify or delete", while `NAME` and
+        // `CREATION_DATE` list the account's own templates on that key.
+        let list_by = input.list_by.as_deref();
+        let wanted_type = if list_by == Some(crate::state::LIST_BY_SYSTEM) {
+            crate::state::TYPE_SYSTEM
+        } else {
+            crate::state::TYPE_CUSTOM
+        };
+
+        // `category`: "specify a job template category to limit responses to only job
+        // templates from that category" — so a template with no category matches no
+        // category the caller can name.
+        let category = input.category.as_deref();
+        let page = crate::state::page_of_job_templates(
+            state
+                .job_templates
+                .values()
+                .filter(|record| record.template_type == wanted_type)
+                .filter(|record| {
+                    category.is_none_or(|want| record.category.as_deref() == Some(want))
+                }),
+            list_by,
+            input.order.as_deref(),
+            resume_from.as_ref(),
+            input.max_results,
+        );
+        let job_templates = page
+            .records
+            .iter()
+            .map(|record| record.view(&region))
+            .collect();
 
         Ok(ListJobTemplatesOutput {
             job_templates: Some(job_templates),
-            next_token,
+            next_token: page.next_token,
         })
     }
 }

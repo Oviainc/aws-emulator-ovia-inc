@@ -83,6 +83,8 @@ mod resource_projection_defaults;
 mod resource_share;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/shared_paging.rs"]
+mod shared_paging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/system_job_templates.rs"]

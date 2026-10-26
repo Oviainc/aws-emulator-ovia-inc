@@ -221,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.max_results,
         );
         let presets = page
-            .presets
+            .records
             .iter()
             .map(|record| record.view(&region))
             .collect();

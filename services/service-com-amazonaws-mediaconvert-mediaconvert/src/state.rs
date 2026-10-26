@@ -62,10 +62,13 @@
 //!   set ONCE, when the query is started, evaluating at most [`MAX_JOBS_QUERY_TERMS`]
 //!   filter terms per record, and stores only the one page of ids it selected; no later
 //!   call re-runs that match, so no request's cost grows with the number of stored
-//!   queries. `ListJobTemplates` orders the job templates the same way and pages them the
-//!   same way, and `ListQueues` orders and pages the queues through [`page_of_queues`],
-//!   over at most [`MAX_QUEUES`] records. `ListPresets` orders and pages the presets
-//!   through [`page_of_presets`], over at most [`MAX_PRESETS`] records.
+//!   queries. `ListJobTemplates` orders and pages the job templates through
+//!   [`page_of_job_templates`], over at most [`MAX_JOB_TEMPLATES`] records, `ListQueues`
+//!   the queues through [`page_of_queues`], over at most [`MAX_QUEUES`] records, and
+//!   `ListPresets` the presets through [`page_of_presets`], over at most [`MAX_PRESETS`]
+//!   records. Each of those is a thin statement of its own documented defaults over
+//!   [`page_of_records`], which is where the ordering, the cursor and the page size
+//!   actually live, for every kind of record this service lists.
 //! * [`ComAmazonawsMediaconvertMediaconvertState::rearm_queue`] — the one other walk over
 //!   the job set — runs only when `UpdateQueue` sets a queue back to `ACTIVE`, and is
 //!   likewise bounded by `MAX_JOBS`, as `job_counts` is.
@@ -1424,6 +1427,23 @@ pub fn decode_cursor(token: &str) -> Option<(u128, String)> {
     Some((nanos.parse().ok()?, id.to_string()))
 }
 
+/// What a paged listing needs of ONE record: the key it is ordered and resumed on, and
+/// the cursor that resumes after it.
+///
+/// Every record type a paged reader of this service reports implements it, so
+/// [`page_of_records`] — the one place that owns the ordering, the cursor and the page size
+/// — is written once rather than once per record type.
+pub trait PagedRecord {
+    /// The `(creation instant in epoch nanoseconds, id)` pair a listing orders this record
+    /// on. The second half is unique within the set, so the pair is a total order and a
+    /// page boundary can neither repeat nor skip a record.
+    fn ordering_key(&self) -> (u128, &str);
+
+    /// This record's [`encode_cursor`] token: the `nextToken` a caller hands back to
+    /// resume after it.
+    fn cursor(&self) -> String;
+}
+
 /// One transcoding queue.
 ///
 /// The ARN is NOT stored: it is derived from the region of the request that reads the
@@ -1472,24 +1492,24 @@ impl QueueRecord {
         }
     }
 
-    /// The pair a paged listing orders this queue on: its creation instant and its name,
-    /// which is unique within the account ("Each name must be unique within your
-    /// account"), so the pair is a total order.
-    pub fn ordering_key(&self) -> (u128, &str) {
-        (epoch_nanos(self.created_at), self.name.as_str())
-    }
-
-    /// This queue's [`encode_cursor`] token.
-    pub fn cursor(&self) -> String {
-        encode_cursor(self.created_at, &self.name)
-    }
-
     /// The number of RTS this queue's stored reservation plan reserves, or `None` for a
     /// queue that has no plan — which is what an on-demand queue is.
     pub fn reserved_slots(&self) -> Option<i32> {
         self.reservation_plan
             .as_ref()
             .and_then(|plan| plan.reserved_slots)
+    }
+}
+
+impl PagedRecord for QueueRecord {
+    /// Its creation instant and its name, which is unique within the account ("Each name
+    /// must be unique within your account").
+    fn ordering_key(&self) -> (u128, &str) {
+        (epoch_nanos(self.created_at), self.name.as_str())
+    }
+
+    fn cursor(&self) -> String {
+        encode_cursor(self.created_at, &self.name)
     }
 }
 
@@ -1533,17 +1553,6 @@ impl PresetRecord {
         }
     }
 
-    /// The pair a paged listing orders this preset on: its creation instant and its name,
-    /// which is unique within the account, so the pair is a total order.
-    pub fn ordering_key(&self) -> (u128, &str) {
-        (epoch_nanos(self.created_at), self.name.as_str())
-    }
-
-    /// This preset's [`encode_cursor`] token.
-    pub fn cursor(&self) -> String {
-        encode_cursor(self.created_at, &self.name)
-    }
-
     /// The modelled `Preset`.
     pub fn view(&self, region: &str) -> Preset {
         Preset {
@@ -1556,6 +1565,17 @@ impl PresetRecord {
             settings: self.settings.clone(),
             r#type: Some(self.preset_type.clone()),
         }
+    }
+}
+
+impl PagedRecord for PresetRecord {
+    /// Its creation instant and its name, which is unique within the account.
+    fn ordering_key(&self) -> (u128, &str) {
+        (epoch_nanos(self.created_at), self.name.as_str())
+    }
+
+    fn cursor(&self) -> String {
+        encode_cursor(self.created_at, &self.name)
     }
 }
 
@@ -2318,15 +2338,15 @@ impl JobTemplateRecord {
             r#type: Some(self.template_type.clone()),
         }
     }
+}
 
-    /// The pair a paged listing orders this template on: its creation instant and its
-    /// name, which is unique within the account, so the pair is a total order.
-    pub fn ordering_key(&self) -> (u128, &str) {
+impl PagedRecord for JobTemplateRecord {
+    /// Its creation instant and its name, which is unique within the account.
+    fn ordering_key(&self) -> (u128, &str) {
         (epoch_nanos(self.created_at), self.name.as_str())
     }
 
-    /// This template's [`encode_cursor`] token.
-    pub fn cursor(&self) -> String {
+    fn cursor(&self) -> String {
         encode_cursor(self.created_at, &self.name)
     }
 }
@@ -2748,18 +2768,18 @@ impl JobTiming {
     }
 }
 
-impl JobRecord {
-    /// The pair a paged listing orders this job on: its creation instant and its id,
-    /// which is unique, so the pair is a total order.
-    pub fn ordering_key(&self) -> (u128, &str) {
+impl PagedRecord for JobRecord {
+    /// Its creation instant and its id, which is unique.
+    fn ordering_key(&self) -> (u128, &str) {
         (epoch_nanos(self.created_at), self.id.as_str())
     }
 
-    /// This job's [`encode_cursor`] token.
-    pub fn cursor(&self) -> String {
+    fn cursor(&self) -> String {
         encode_cursor(self.created_at, &self.id)
     }
+}
 
+impl JobRecord {
     /// Whether this job matches ONE `(key, value)` pair of a jobs query's filter list.
     ///
     /// Each `JobsQueryFilterKey` is read off THIS record — the same state [`Self::view`]
@@ -2988,65 +3008,69 @@ impl JobsQueryRecord {
     }
 }
 
-/// One page of jobs and the cursor that resumes after it.
+/// One page of records and the cursor that resumes after it.
 #[derive(Debug)]
-pub struct JobPage<'a> {
-    pub jobs: Vec<&'a JobRecord>,
-    /// The [`encode_cursor`] token of the last job of the page, and only when a further
+pub struct Page<'a, R> {
+    pub records: Vec<&'a R>,
+    /// The [`encode_cursor`] token of the last record of the page, and only when a further
     /// page exists.
     pub next_token: Option<String>,
 }
 
-/// The page of `jobs` a paged jobs reader reports.
+/// The page of records EVERY paged reader in this service reports.
 ///
-/// Every paged reader of the job set goes through this one function — `ListJobs` and the
-/// page a jobs query matches — so the ordering, the cursor and the page size cannot drift
-/// apart between them. "Your most recently created jobs": ordered by creation time,
-/// newest first unless the caller asked for [`ORDER_ASCENDING`], with the id breaking
-/// ties so the order is total and a page boundary cannot repeat or skip a job.
+/// ONE place that owns the ordering, the cursor and the page size, whatever kind of record
+/// is being listed, so no paged reader can drift from another: a change to the anchor
+/// comparison, the page-size fallback or the token condition lands in all of them at once.
+/// A listing runs UP the key it is ordered on — alphabetically from the start of the
+/// alphabet, chronologically from the oldest — unless the caller asks for
+/// [`ORDER_DESCENDING`]; `Order`'s doc says only "Default varies by resource", so each
+/// listing passes the `default_order` its own member documents, for the request that
+/// states none.
+///
+/// `records` is whatever set the handler selected (a `Type`, a category, a filter):
+/// choosing the set is the handler's business, ordering and paging it is this function's.
 ///
 /// `resume_from` is the ordering key a caller's `nextToken` decoded to; a token that
 /// decodes to nothing is refused by the handler that read it, with its modelled
 /// `BadRequestException`, so there is no failure left to answer here.
-pub fn page_of_jobs<'a>(
-    jobs: impl Iterator<Item = &'a JobRecord>,
+pub fn page_of_records<'a, R: PagedRecord>(
+    records: impl Iterator<Item = &'a R>,
+    sort_key: ListBySortKey,
     order: Option<&str>,
+    default_order: &str,
     resume_from: Option<&(u128, String)>,
     max_results: Option<i32>,
-) -> JobPage<'a> {
-    let mut matching: Vec<&JobRecord> = jobs.collect();
-    matching.sort_by(|left, right| {
-        left.created_at
-            .cmp(&right.created_at)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    let order = order.unwrap_or(ORDER_DESCENDING);
-    if order == ORDER_DESCENDING {
+) -> Page<'a, R> {
+    let ascending = order.unwrap_or(default_order) != ORDER_DESCENDING;
+    let mut matching: Vec<&R> = records.collect();
+    matching.sort_by(|left, right| sort_key.compare(left.ordering_key(), right.ordering_key()));
+    if !ascending {
         matching.reverse();
     }
-    let ascending = order == ORDER_ASCENDING;
 
     let start = match resume_from {
         None => 0,
         Some((nanos, id)) => {
             let anchor = (*nanos, id.as_str());
-            // Resume at the first job strictly past the anchor key in this direction.
-            // The anchor itself need not still be in the result set, so a job whose
-            // status changed between pages is skipped, not an error.
+            // Resume at the first record strictly past the anchor key in this direction.
+            // The anchor itself need not still be in the result set, so a record deleted or
+            // changed between two pages is skipped rather than failing the token.
             matching
                 .iter()
-                .position(|job| {
+                .position(|record| {
+                    let side = sort_key.compare(record.ordering_key(), anchor);
                     if ascending {
-                        job.ordering_key() > anchor
+                        side == ::std::cmp::Ordering::Greater
                     } else {
-                        job.ordering_key() < anchor
+                        side == ::std::cmp::Ordering::Less
                     }
                 })
                 .unwrap_or(matching.len())
         }
     };
 
-    // Both `maxResults` members carry the model's own 1..20 range, so the framework has
+    // Every `maxResults` member carries the model's own 1..20 range, so the framework has
     // already refused anything outside it; the fallback only covers the absent case.
     let page_size = usize::try_from(max_results.unwrap_or(DEFAULT_PAGE_SIZE))
         .unwrap_or(DEFAULT_PAGE_SIZE as usize);
@@ -3054,12 +3078,36 @@ pub fn page_of_jobs<'a>(
     let page = &page[..page_size.min(page.len())];
     // A token only when there is a further page to fetch.
     let next_token = (start + page.len() < matching.len())
-        .then(|| page.last().map(|job| job.cursor()))
+        .then(|| page.last().map(|record| record.cursor()))
         .flatten();
-    JobPage {
-        jobs: page.to_vec(),
+    Page {
+        records: page.to_vec(),
         next_token,
     }
+}
+
+/// The page of `jobs` a paged jobs reader reports, through [`page_of_records`].
+///
+/// Every paged reader of the job set goes through this one function — `ListJobs`, `SearchJobs`
+/// and the page a jobs query matches — so they all state the one default this listing
+/// documents. "Your most recently created jobs": ordered by creation time, newest first
+/// unless the caller asked for [`ORDER_ASCENDING`], with the id breaking ties.
+///
+/// `resume_from` is the ordering key a caller's `nextToken` decoded to.
+pub fn page_of_jobs<'a>(
+    jobs: impl Iterator<Item = &'a JobRecord>,
+    order: Option<&str>,
+    resume_from: Option<&(u128, String)>,
+    max_results: Option<i32>,
+) -> Page<'a, JobRecord> {
+    page_of_records(
+        jobs,
+        ListBySortKey::CreationDate,
+        order,
+        ORDER_DESCENDING,
+        resume_from,
+        max_results,
+    )
 }
 
 /// Which key a `listBy`-ordered listing is ordered on, as `listBy` chooses it. Every
@@ -3099,157 +3147,88 @@ impl ListBySortKey {
     }
 }
 
-/// One page of queues and the cursor that resumes after it.
-#[derive(Debug)]
-pub struct QueuePage<'a> {
-    pub queues: Vec<&'a QueueRecord>,
-    /// The [`encode_cursor`] token of the last queue of the page, and only when a further
-    /// page exists.
-    pub next_token: Option<String>,
-}
-
 /// The page of `queues` `ListQueues` reports, ordered on the key `list_by` names in the
-/// direction `order` names.
+/// direction `order` names, through [`page_of_records`].
 ///
-/// The queue listing's own [`page_of_jobs`]: ONE place that owns the ordering, the cursor
-/// and the page size, so a later paged queue reader cannot drift from this one. A queue
-/// listing runs UP its key — alphabetically from the start of the alphabet,
-/// chronologically from the oldest, which is the account's built-in `Default` queue —
-/// unless the caller asks for [`ORDER_DESCENDING`]; `Order`'s doc says only "Default
-/// varies by resource".
+/// `QueueListBy`: "you can choose to list them alphabetically by NAME or chronologically
+/// by CREATION_DATE. If you don't specify, the service will list them by creation date" —
+/// so this listing's default key is the creation-date one, whose oldest record is the
+/// account's built-in `Default` queue. Everything else about the page is
+/// [`page_of_records`]'s.
 ///
-/// `resume_from` is the ordering key a caller's `nextToken` decoded to; a token that
-/// decodes to nothing is refused by the handler that read it, with its modelled
-/// `BadRequestException`, so there is no failure left to answer here.
+/// `resume_from` is the ordering key a caller's `nextToken` decoded to.
 pub fn page_of_queues<'a>(
     queues: impl Iterator<Item = &'a QueueRecord>,
     list_by: Option<&str>,
     order: Option<&str>,
     resume_from: Option<&(u128, String)>,
     max_results: Option<i32>,
-) -> QueuePage<'a> {
-    // `QueueListBy`: "If you don't specify, the service will list them by creation date."
-    let sort_key = ListBySortKey::from_list_by(list_by, ListBySortKey::CreationDate);
-    let mut matching: Vec<&QueueRecord> = queues.collect();
-    matching.sort_by(|left, right| sort_key.compare(left.ordering_key(), right.ordering_key()));
-    let ascending = order.unwrap_or(ORDER_ASCENDING) != ORDER_DESCENDING;
-    if !ascending {
-        matching.reverse();
-    }
-
-    let start = match resume_from {
-        None => 0,
-        Some((nanos, name)) => {
-            let anchor = (*nanos, name.as_str());
-            // Resume at the first queue strictly past the anchor key in this direction.
-            // The anchor itself need not still be stored, so a queue deleted between two
-            // pages is skipped rather than failing the token.
-            matching
-                .iter()
-                .position(|queue| {
-                    let side = sort_key.compare(queue.ordering_key(), anchor);
-                    if ascending {
-                        side == ::std::cmp::Ordering::Greater
-                    } else {
-                        side == ::std::cmp::Ordering::Less
-                    }
-                })
-                .unwrap_or(matching.len())
-        }
-    };
-
-    // `maxResults` carries the model's own 1..20 range, so the framework has already
-    // refused anything outside it; the fallback only covers the absent case.
-    let page_size = usize::try_from(max_results.unwrap_or(DEFAULT_PAGE_SIZE))
-        .unwrap_or(DEFAULT_PAGE_SIZE as usize);
-    let page = &matching[start.min(matching.len())..];
-    let page = &page[..page_size.min(page.len())];
-    // A token only when there is a further page to fetch.
-    let next_token = (start + page.len() < matching.len())
-        .then(|| page.last().map(|queue| queue.cursor()))
-        .flatten();
-    QueuePage {
-        queues: page.to_vec(),
-        next_token,
-    }
-}
-
-/// One page of presets and the cursor that resumes after it.
-#[derive(Debug)]
-pub struct PresetPage<'a> {
-    pub presets: Vec<&'a PresetRecord>,
-    /// The [`encode_cursor`] token of the last preset of the page, and only when a further
-    /// page exists.
-    pub next_token: Option<String>,
+) -> Page<'a, QueueRecord> {
+    page_of_records(
+        queues,
+        ListBySortKey::from_list_by(list_by, ListBySortKey::CreationDate),
+        order,
+        ORDER_ASCENDING,
+        resume_from,
+        max_results,
+    )
 }
 
 /// The page of `presets` `ListPresets` reports, ordered on the key `list_by` names in the
-/// direction `order` names.
+/// direction `order` names, through [`page_of_records`].
 ///
-/// The preset listing's own [`page_of_queues`]: ONE place that owns the ordering, the
-/// cursor and the page size. `PresetListBy`: "you can choose to list them alphabetically
-/// by NAME or chronologically by CREATION_DATE. If you don't specify, the service will
-/// list them by name" — so the default key here is the NAME one, which is the only way
-/// this differs from the queue listing. A listing runs UP its key — alphabetically from
-/// the start of the alphabet, chronologically from the oldest — unless the caller asks for
-/// [`ORDER_DESCENDING`]; `Order`'s doc says only "Default varies by resource".
+/// `PresetListBy`: "you can choose to list them alphabetically by NAME or chronologically
+/// by CREATION_DATE. If you don't specify, the service will list them by name" — so this
+/// listing's default key is the NAME one, which is the only way it differs from the queue
+/// listing.
 ///
 /// `presets` is whatever set the handler selected (a `Type`, a category): choosing the set
-/// is the handler's business, ordering and paging it is this function's.
+/// is the handler's business, ordering and paging it is [`page_of_records`]'s.
 ///
-/// `resume_from` is the ordering key a caller's `nextToken` decoded to; a token that
-/// decodes to nothing is refused by the handler that read it, with its modelled
-/// `BadRequestException`, so there is no failure left to answer here.
+/// `resume_from` is the ordering key a caller's `nextToken` decoded to.
 pub fn page_of_presets<'a>(
     presets: impl Iterator<Item = &'a PresetRecord>,
     list_by: Option<&str>,
     order: Option<&str>,
     resume_from: Option<&(u128, String)>,
     max_results: Option<i32>,
-) -> PresetPage<'a> {
-    let sort_key = ListBySortKey::from_list_by(list_by, ListBySortKey::Name);
-    let mut matching: Vec<&PresetRecord> = presets.collect();
-    matching.sort_by(|left, right| sort_key.compare(left.ordering_key(), right.ordering_key()));
-    let ascending = order.unwrap_or(ORDER_ASCENDING) != ORDER_DESCENDING;
-    if !ascending {
-        matching.reverse();
-    }
+) -> Page<'a, PresetRecord> {
+    page_of_records(
+        presets,
+        ListBySortKey::from_list_by(list_by, ListBySortKey::Name),
+        order,
+        ORDER_ASCENDING,
+        resume_from,
+        max_results,
+    )
+}
 
-    let start = match resume_from {
-        None => 0,
-        Some((nanos, name)) => {
-            let anchor = (*nanos, name.as_str());
-            // Resume at the first preset strictly past the anchor key in this direction.
-            // The anchor itself need not still be stored, so a preset deleted between two
-            // pages is skipped rather than failing the token.
-            matching
-                .iter()
-                .position(|preset| {
-                    let side = sort_key.compare(preset.ordering_key(), anchor);
-                    if ascending {
-                        side == ::std::cmp::Ordering::Greater
-                    } else {
-                        side == ::std::cmp::Ordering::Less
-                    }
-                })
-                .unwrap_or(matching.len())
-        }
-    };
-
-    // `maxResults` carries the model's own 1..20 range, so the framework has already
-    // refused anything outside it; the fallback only covers the absent case.
-    let page_size = usize::try_from(max_results.unwrap_or(DEFAULT_PAGE_SIZE))
-        .unwrap_or(DEFAULT_PAGE_SIZE as usize);
-    let page = &matching[start.min(matching.len())..];
-    let page = &page[..page_size.min(page.len())];
-    // A token only when there is a further page to fetch.
-    let next_token = (start + page.len() < matching.len())
-        .then(|| page.last().map(|preset| preset.cursor()))
-        .flatten();
-    PresetPage {
-        presets: page.to_vec(),
-        next_token,
-    }
+/// The page of job templates `ListJobTemplates` reports, ordered on the key `list_by`
+/// names in the direction `order` names, through [`page_of_records`].
+///
+/// `JobTemplateListBy`: "you can choose to list them alphabetically by NAME or
+/// chronologically by CREATION_DATE. If you don't specify, the service will list them by
+/// name" — so this listing's default key is the NAME one, as the preset listing's is.
+///
+/// `job_templates` is whatever set the handler selected (a `Type`, a category): choosing
+/// the set is the handler's business, ordering and paging it is [`page_of_records`]'s.
+///
+/// `resume_from` is the ordering key a caller's `nextToken` decoded to.
+pub fn page_of_job_templates<'a>(
+    job_templates: impl Iterator<Item = &'a JobTemplateRecord>,
+    list_by: Option<&str>,
+    order: Option<&str>,
+    resume_from: Option<&(u128, String)>,
+    max_results: Option<i32>,
+) -> Page<'a, JobTemplateRecord> {
+    page_of_records(
+        job_templates,
+        ListBySortKey::from_list_by(list_by, ListBySortKey::Name),
+        order,
+        ORDER_ASCENDING,
+        resume_from,
+        max_results,
+    )
 }
 
 /// One Job engine version of the account's catalogue: "periodically grouped MediaConvert
@@ -3300,15 +3279,15 @@ impl JobEngineVersionRecord {
             version: Some(self.version.clone()),
         }
     }
+}
 
-    /// The pair a paged listing orders this version on: its release instant and its label,
-    /// which is this catalogue's key, so the pair is a total order.
-    pub fn ordering_key(&self) -> (u128, &str) {
+impl PagedRecord for JobEngineVersionRecord {
+    /// Its release instant and its label, which is this catalogue's key.
+    fn ordering_key(&self) -> (u128, &str) {
         (epoch_nanos(self.released_at), self.version.as_str())
     }
 
-    /// This version's [`encode_cursor`] token.
-    pub fn cursor(&self) -> String {
+    fn cursor(&self) -> String {
         encode_cursor(self.released_at, &self.version)
     }
 }
@@ -3329,61 +3308,25 @@ fn job_engine_version_label(at: SystemTime) -> String {
     rendered.get(..10).unwrap_or(&rendered).to_string()
 }
 
-/// One page of Job engine versions and the cursor that resumes after it.
-#[derive(Debug)]
-pub struct JobEngineVersionPage<'a> {
-    pub versions: Vec<&'a JobEngineVersionRecord>,
-    /// The [`encode_cursor`] token of the last version of the page, and only when a
-    /// further page exists.
-    pub next_token: Option<String>,
-}
-
-/// The page of Job engine versions `ListVersions` reports.
+/// The page of Job engine versions `ListVersions` reports, through [`page_of_records`].
 ///
-/// The version catalogue's own [`page_of_queues`]: ONE place that owns the ordering, the
-/// cursor and the page size. `ListVersions` models neither a sort key nor an `Order`, so
-/// the one ordering is CHOSEN — chronological by release, oldest first, with the label
-/// breaking ties so the order is total and a page boundary cannot repeat or skip an entry.
+/// `ListVersions` models neither a sort key nor an `Order`, so the one ordering is CHOSEN —
+/// chronological by release, oldest first, with the label breaking ties.
 ///
-/// `resume_from` is the ordering key a caller's `nextToken` decoded to; a token that
-/// decodes to nothing is refused by the handler that read it, with its modelled
-/// `BadRequestException`, so there is no failure left to answer here.
+/// `resume_from` is the ordering key a caller's `nextToken` decoded to.
 pub fn page_of_versions<'a>(
     versions: impl Iterator<Item = &'a JobEngineVersionRecord>,
     resume_from: Option<&(u128, String)>,
     max_results: Option<i32>,
-) -> JobEngineVersionPage<'a> {
-    let mut matching: Vec<&JobEngineVersionRecord> = versions.collect();
-    matching.sort_by(|left, right| left.ordering_key().cmp(&right.ordering_key()));
-
-    let start = match resume_from {
-        None => 0,
-        Some((nanos, version)) => {
-            let anchor = (*nanos, version.as_str());
-            // Resume at the first version strictly past the anchor key. The anchor itself
-            // need not still be listed, so a version that expired between two pages is
-            // skipped rather than failing the token.
-            matching
-                .iter()
-                .position(|record| record.ordering_key() > anchor)
-                .unwrap_or(matching.len())
-        }
-    };
-
-    // `maxResults` carries the model's own 1..20 range, so the framework has already
-    // refused anything outside it; the fallback only covers the absent case.
-    let page_size = usize::try_from(max_results.unwrap_or(DEFAULT_PAGE_SIZE))
-        .unwrap_or(DEFAULT_PAGE_SIZE as usize);
-    let page = &matching[start.min(matching.len())..];
-    let page = &page[..page_size.min(page.len())];
-    // A token only when there is a further page to fetch.
-    let next_token = (start + page.len() < matching.len())
-        .then(|| page.last().map(|record| record.cursor()))
-        .flatten();
-    JobEngineVersionPage {
-        versions: page.to_vec(),
-        next_token,
-    }
+) -> Page<'a, JobEngineVersionRecord> {
+    page_of_records(
+        versions,
+        ListBySortKey::CreationDate,
+        None,
+        ORDER_ASCENDING,
+        resume_from,
+        max_results,
+    )
 }
 
 /// The account's input policy: the decision the caller stated for each kind of job
@@ -4214,7 +4157,7 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         // SUBMITTED is not terminal, so the clock owes this query its completion.
         record.status = JOBS_QUERY_STATUS_SUBMITTED.to_string();
         record.completes_at = Some(due);
-        record.matched = page.jobs.iter().map(|job| job.id.clone()).collect();
+        record.matched = page.records.iter().map(|job| job.id.clone()).collect();
         record.result_next_token = page.next_token;
         self.pending_queries.insert((due, id.clone()));
         self.jobs_queries.insert(id.clone(), record);

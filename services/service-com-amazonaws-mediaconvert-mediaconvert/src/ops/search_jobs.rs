@@ -226,7 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.max_results,
         );
 
-        let jobs = page.jobs.iter().map(|job| job.view(&region)).collect();
+        let jobs = page.records.iter().map(|job| job.view(&region)).collect();
 
         Ok(SearchJobsOutput {
             jobs: Some(jobs),

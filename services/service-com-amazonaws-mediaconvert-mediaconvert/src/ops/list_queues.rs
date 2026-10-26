@@ -213,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.max_results,
         );
         let queues = page
-            .queues
+            .records
             .iter()
             .map(|record| {
                 let (submitted, progressing) = state.job_counts(&record.name);
