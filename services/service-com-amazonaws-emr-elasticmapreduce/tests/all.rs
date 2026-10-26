@@ -23,6 +23,8 @@ mod enum_refusal_identity;
 mod input_refusals;
 #[path = "all/instance_groups.rs"]
 mod instance_groups;
+#[path = "all/instance_store_catalog.rs"]
+mod instance_store_catalog;
 #[path = "all/job_flow_lifecycle.rs"]
 mod job_flow_lifecycle;
 #[path = "all/job_flow_role.rs"]
@@ -41,6 +43,8 @@ mod refusal_messages;
 mod release_label_catalog;
 #[path = "all/release_labels.rs"]
 mod release_labels;
+#[path = "all/resource_not_found_code.rs"]
+mod resource_not_found_code;
 #[path = "all/security_configurations.rs"]
 mod security_configurations;
 #[path = "all/state_roundtrip.rs"]

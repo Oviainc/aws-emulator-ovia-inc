@@ -30,23 +30,33 @@ const UNKNOWN_CLUSTER_IDS: &[&str] = &[
 ];
 
 /// Studio ids no Studio carries, spanning the same classes.
-const UNKNOWN_STUDIO_IDS: &[&str] = &["es-NOPE", "es-ZZZZZZZZZZZZZ", "es-", "", "studio"];
+///
+/// `pub(crate)` so a sibling suite refuses the same ids through one list rather than its
+/// own copy.
+pub(crate) const UNKNOWN_STUDIO_IDS: &[&str] = &["es-NOPE", "es-ZZZZZZZZZZZZZ", "es-", "", "studio"];
 
 /// The message of a refusal: the modelled shapes carry it as `Message`, the framework's
 /// `ValidationException` channel as `message`, and a client reads whichever its service
-/// sends.
-fn message(case: &str, payload: &Value) -> String {
-    for member in ["Message", "message"] {
-        if let Some(text) = at(payload, &[member]).as_str() {
-            return text.to_string();
-        }
-    }
-    panic!("case {case:?}: a refusal must carry a message, got {payload}")
+/// sends. A refusal that carries neither fails the case rather than comparing against an
+/// empty string.
+///
+/// `pub(crate)` so a sibling suite reads a refusal's message through one helper rather
+/// than its own copy.
+pub(crate) fn message(case: &str, payload: &Value) -> String {
+    let said = crate::input_refusals::error_message(payload);
+    assert!(
+        !said.is_empty(),
+        "case {case:?}: a refusal must carry a message, got {payload}"
+    );
+    said
 }
 
 /// The members `CreateStudio` requires, with every network id in the form Amazon EC2
 /// gives that resource.
-fn studio_request(name: &str) -> Value {
+///
+/// `pub(crate)` so a sibling suite creates a Studio through one request shape rather than
+/// its own copy.
+pub(crate) fn studio_request(name: &str) -> Value {
     json!({
         "Name": name,
         "AuthMode": "IAM",

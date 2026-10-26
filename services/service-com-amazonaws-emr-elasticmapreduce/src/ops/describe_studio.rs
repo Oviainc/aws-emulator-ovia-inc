@@ -148,10 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(studio) = store.studios.get(&input.studio_id) else {
             return Err(DescribeStudioErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    error_code: None,
-                    message: Some(crate::state::unknown_studio_message()),
-                },
+                crate::state::resource_not_found(crate::state::unknown_studio_message()),
             )
             .into());
         };

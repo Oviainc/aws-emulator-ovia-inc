@@ -29,12 +29,15 @@ const MAX_PAGES: usize = 20;
 static NULL: Value = Value::Null;
 
 /// One emulator: a router carrying only this service, over one shared engine.
-struct Emr {
+///
+/// `pub(crate)` so a sibling suite walks the catalog through the SAME marker-following
+/// harness rather than growing its own copy.
+pub(crate) struct Emr {
     router: MultiServiceRouter,
 }
 
 impl Emr {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -42,7 +45,7 @@ impl Emr {
         Self { router }
     }
 
-    async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -63,7 +66,7 @@ impl Emr {
         (status, payload)
     }
 
-    async fn ok(&self, operation: &str, body: Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: Value) -> Value {
         let (status, payload) = self.call(operation, body.clone()).await;
         assert_eq!(
             status, 200,
@@ -73,7 +76,7 @@ impl Emr {
     }
 
     /// One page of `ListSupportedInstanceTypes`.
-    async fn page(&self, release: &str, marker: Option<&str>) -> (u16, Value) {
+    pub(crate) async fn page(&self, release: &str, marker: Option<&str>) -> (u16, Value) {
         let mut body = json!({ "ReleaseLabel": release });
         if let Some(marker) = marker {
             body["Marker"] = json!(marker);
@@ -86,7 +89,7 @@ impl Emr {
     /// Asserts the pagination contract on the way: no page is longer than the page
     /// size, the marker of a page is the `Type` of the first row of the NEXT page, and
     /// the last page carries no marker.
-    async fn all_supported(&self, release: &str) -> Vec<Value> {
+    pub(crate) async fn all_supported(&self, release: &str) -> Vec<Value> {
         let mut rows: Vec<Value> = Vec::new();
         let mut marker: Option<String> = None;
         for page_number in 0..MAX_PAGES {
@@ -134,7 +137,7 @@ impl Emr {
 }
 
 /// Walk a JSON path, answering `null` for anything absent.
-fn at<'a>(value: &'a Value, path: &[&str]) -> &'a Value {
+pub(crate) fn at<'a>(value: &'a Value, path: &[&str]) -> &'a Value {
     let mut cursor = value;
     for key in path {
         cursor = cursor.get(*key).unwrap_or(&NULL);
@@ -143,7 +146,7 @@ fn at<'a>(value: &'a Value, path: &[&str]) -> &'a Value {
 }
 
 /// The `Type` of every row, in the order the service reported them.
-fn types(rows: &[Value]) -> Vec<String> {
+pub(crate) fn types(rows: &[Value]) -> Vec<String> {
     rows.iter()
         .map(|row| {
             at(row, &["Type"])
@@ -155,7 +158,7 @@ fn types(rows: &[Value]) -> Vec<String> {
 }
 
 /// The row for `instance_type`, if the release reported it.
-fn row_for<'a>(rows: &'a [Value], instance_type: &str) -> Option<&'a Value> {
+pub(crate) fn row_for<'a>(rows: &'a [Value], instance_type: &str) -> Option<&'a Value> {
     rows.iter()
         .find(|row| at(row, &["Type"]).as_str() == Some(instance_type))
 }
@@ -174,7 +177,8 @@ fn assert_refused(case: &str, status: u16, payload: &Value) {
 
 /// Which release each instance family became supported in, as the catalog records it,
 /// probed one release BELOW and one AT the introduction point. Rows differ along the
-/// release (5.x, 6.x, 7.x), the family (general purpose, compute and memory optimised)
+/// release (5.x, 6.x, 7.x), the family (general purpose, compute, memory and storage
+/// optimised, accelerated), the generation (current and previous)
 /// and the architecture (x86-64 and Graviton), which is what the filter generalises
 /// over. SOURCE: the Amazon EMR Management Guide's "Supported instance types" table,
 /// mirrored by `crate::state::INSTANCE_FAMILIES`.
@@ -207,10 +211,29 @@ const RELEASE_FILTER: &[(&str, &str, bool)] = &[
     ("emr-7.5.0", "c7g.16xlarge", true),
     ("emr-7.0.0", "m7i.24xlarge", true),
     // A family this catalog does not publish is reported by no release: the
-    // instance-store and burstable families are outside it.
+    // instance-store variants of the EBS-only families and the burstable ones are
+    // outside it.
     ("emr-7.5.0", "m5d.xlarge", false),
     ("emr-7.5.0", "t3.xlarge", false),
-    ("emr-6.15.0", "i3.4xlarge", false),
+    // The storage-optimised and accelerated families are published, from the release
+    // each became supported in.
+    ("emr-6.15.0", "i3.4xlarge", true),
+    ("emr-6.15.0", "i3en.3xlarge", true),
+    ("emr-6.4.0", "d3.2xlarge", false),
+    ("emr-6.5.0", "d3.2xlarge", true),
+    ("emr-6.15.0", "g4dn.8xlarge", true),
+    ("emr-6.8.0", "g5.12xlarge", false),
+    ("emr-6.9.0", "g5.12xlarge", true),
+    ("emr-6.15.0", "p3.8xlarge", true),
+    // The previous-generation families EMR still lists.
+    ("emr-6.15.0", "m4.10xlarge", true),
+    ("emr-6.15.0", "r4.16xlarge", true),
+    // The families the 7.x series added, which the last 6.x release predates.
+    ("emr-6.15.0", "m7a.xlarge", false),
+    ("emr-7.0.0", "m7a.xlarge", true),
+    ("emr-6.15.0", "c7a.2xlarge", false),
+    ("emr-7.5.0", "c7a.2xlarge", true),
+    ("emr-7.5.0", "r7a.48xlarge", true),
 ];
 
 #[tokio::test]
@@ -233,9 +256,10 @@ async fn a_release_reports_the_families_it_supports() {
 /// per-family constant number of GiB per vCPU (4 general purpose, 2 compute optimised,
 /// 8 memory optimised). `InstanceFamilyId` is "the Amazon EC2 family and generation" as
 /// EMR reports it: the family's workload class and its generation, never the family part
-/// of the type name. Rows span both architectures, all three memory ratios, all three
-/// classes the catalogue publishes and the bottom, middle and top of several size
-/// ladders.
+/// of the type name. Rows span both architectures, all three memory ratios of the
+/// EBS-only families, the three classes those families belong to and the bottom, middle
+/// and top of several size ladders; the storage-optimised and accelerated families are
+/// pinned by `instance_store_catalog.rs`.
 const INSTANCE_FACTS: &[(&str, &str, i64, f64, &str, &str)] = &[
     // (release, type, vCPU, MemoryGB, InstanceFamilyId, Architecture)
     ("emr-7.5.0", "m5.large", 2, 8.0, "GENERAL_CURRENT_GEN", "X86_64"),
@@ -369,8 +393,9 @@ async fn a_row_reports_the_facts_of_its_instance_type() {
             Some(*architecture),
             "case {case:?}: expected Architecture {architecture}, got {row}"
         );
-        // Every catalogued family is EBS-only: "StorageGB … is 0 for Amazon EBS-only
-        // instance types", and so is NumberOfDisks.
+        // Every family in the table above is EBS-only: "StorageGB … is 0 for Amazon
+        // EBS-only instance types", and so is NumberOfDisks. The instance-store
+        // families carry their disks instead, which `instance_store_catalog.rs` pins.
         assert_eq!(
             at(row, &["StorageGB"]).as_i64(),
             Some(0),
@@ -409,20 +434,32 @@ async fn a_row_reports_the_facts_of_its_instance_type() {
 const FAMILY_CLASSES: &[&str] = &["GENERAL", "COMPUTE", "HI_MEM", "STORAGE", "GPU"];
 const FAMILY_GENERATIONS: &[&str] = &["CURRENT", "PREVIOUS"];
 
-/// The `InstanceFamilyId` a row's own facts imply: the workload class follows the GiB of
-/// memory per vCPU (4 general purpose, 2 compute optimised, 8 memory optimised), which is
-/// what makes a family general purpose, compute or memory optimised.
-fn class_for_memory_ratio(case: &str, memory_gb: f64, vcpu: i64) -> &'static str {
+/// Every GiB-per-vCPU ratio the catalogue publishes, paired with the workload class it
+/// implies where it implies one: an Amazon EBS-only family of 4, 2 or 8 GiB per vCPU is
+/// general purpose, compute optimised or memory optimised respectively, while the
+/// Xen-generation 7.625 is shared by more than one class and implies nothing. A ratio
+/// outside this closed set is a typo in the catalogue, so it fails the case rather than
+/// skipping the assertion.
+const MEMORY_RATIOS: &[(f64, Option<&str>)] = &[
+    (4.0, Some("GENERAL")),
+    (2.0, Some("COMPUTE")),
+    (8.0, Some("HI_MEM")),
+    (7.625, None),
+];
+
+/// The workload class a row's memory ratio implies, for the rows whose class it DOES
+/// imply. `None` where the ratio implies no single class; a storage-optimised or
+/// accelerated family is classified by the hardware it carries rather than by its ratio,
+/// so the caller applies this to the Amazon EBS-only rows.
+fn class_for_memory_ratio(case: &str, memory_gb: f64, vcpu: i64) -> Option<&'static str> {
     let ratio = memory_gb / vcpu as f64;
-    if (ratio - 4.0).abs() < 0.001 {
-        "GENERAL"
-    } else if (ratio - 2.0).abs() < 0.001 {
-        "COMPUTE"
-    } else if (ratio - 8.0).abs() < 0.001 {
-        "HI_MEM"
-    } else {
-        panic!("case {case:?}: expected a catalogued memory ratio, got {ratio} GiB per vCPU")
-    }
+    MEMORY_RATIOS
+        .iter()
+        .find(|(catalogued, _)| (ratio - catalogued).abs() < 0.001)
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected a catalogued memory ratio, got {ratio} GiB per vCPU")
+        })
+        .1
 }
 
 /// THE RULE: `InstanceFamilyId` is the family's workload class and generation, drawn from
@@ -470,13 +507,21 @@ async fn every_row_reports_its_family_and_generation_class() {
 
             let vcpu = at(row, &["VCPU"]).as_i64().unwrap_or_default();
             let memory_gb = at(row, &["MemoryGB"]).as_f64().unwrap_or_default();
-            let expected = class_for_memory_ratio(&case, memory_gb, vcpu);
-            assert_eq!(
-                family_id,
-                format!("{expected}_CURRENT_GEN"),
-                "case {case:?}: a family of {memory_gb} GiB over {vcpu} vCPUs is \
-                 {expected}, got {family_id:?}"
-            );
+            let ebs_only = at(row, &["EbsStorageOnly"]).as_bool().unwrap_or_default();
+            // Called for EVERY row, so an uncatalogued ratio fails the case; the class
+            // it implies is asserted on the Amazon EBS-only rows, the ones whose class
+            // the ratio decides.
+            if let Some(expected) =
+                class_for_memory_ratio(&case, memory_gb, vcpu).filter(|_| ebs_only)
+            {
+                assert_eq!(
+                    family_id.strip_suffix("_CURRENT_GEN").or_else(|| family_id
+                        .strip_suffix("_PREVIOUS_GEN")),
+                    Some(expected),
+                    "case {case:?}: an EBS-only family of {memory_gb} GiB over {vcpu} vCPUs is \
+                     {expected}, got {family_id:?}"
+                );
+            }
 
             match by_family.get(&family) {
                 Some(already) => assert_eq!(

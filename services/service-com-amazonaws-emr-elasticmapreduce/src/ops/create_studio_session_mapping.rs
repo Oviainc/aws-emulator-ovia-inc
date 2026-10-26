@@ -184,6 +184,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into()
         };
+        // The refusal for a Studio this account holds none of: an ABSENT resource,
+        // which is the one refusal class this service gives a discriminator, so a
+        // caller can tell it from the input rejection, the already-mapped conflict and
+        // the quota below.
+        let not_found = |message: String| -> Self::Error {
+            CreateStudioSessionMappingErrorModeled::InvalidRequestException(
+                crate::state::resource_not_found(message),
+            )
+            .into()
+        };
 
         // "Either `IdentityName` or `IdentityId` must be specified, but not both."
         // (`CreateStudioSessionMapping$IdentityId` doc.)
@@ -209,7 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A mapping belongs to a studio, so the studio is resolved before anything is
         // stored: an unknown studio id maps nothing.
         if !store.studios.contains_key(&input.studio_id) {
-            return Err(refuse(crate::state::unknown_studio_message()));
+            return Err(not_found(crate::state::unknown_studio_message()));
         }
 
         let key =

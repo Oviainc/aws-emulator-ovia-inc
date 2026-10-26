@@ -163,10 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if store.studios.remove(&input.studio_id).is_none() {
             return Err(DeleteStudioErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    error_code: None,
-                    message: Some(crate::state::unknown_studio_message()),
-                },
+                crate::state::resource_not_found(crate::state::unknown_studio_message()),
             )
             .into());
         }

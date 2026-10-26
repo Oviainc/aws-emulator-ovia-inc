@@ -145,18 +145,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // Deleting removes the name from the store, so a repeated delete has nothing
-        // left to delete and is refused rather than answered empty.
+        // left to delete and is refused rather than answered empty. The name is an
+        // ABSENT resource by then, so the refusal carries that class's discriminator —
+        // which is what an idempotent teardown swallows instead of re-raising.
         if store.security_configurations.remove(&input.name).is_none() {
             crate::state::audit(Self::NAME, &input.name, ctx, AuditOutcome::NotFound);
             return Err(
                 DeleteSecurityConfigurationErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        error_code: None,
-                        message: Some(format!(
-                            "Security configuration with name '{}' does not exist.",
-                            input.name
-                        )),
-                    },
+                    crate::state::resource_not_found(format!(
+                        "Security configuration with name '{}' does not exist.",
+                        input.name
+                    )),
                 )
                 .into(),
             );

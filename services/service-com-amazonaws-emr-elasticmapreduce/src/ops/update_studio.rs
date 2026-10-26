@@ -179,6 +179,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into()
         };
+        // The refusal for a Studio id this account holds no Studio for: an ABSENT
+        // resource, which is the one refusal class this service gives a discriminator,
+        // so a caller can tell it from the input rejections above.
+        let not_found = |message: String| -> Self::Error {
+            UpdateStudioErrorModeled::InvalidRequestException(crate::state::resource_not_found(
+                message,
+            ))
+            .into()
+        };
 
         // The same network and storage rules `CreateStudio` applies, on the members
         // this operation may change. "A Studio can have a maximum of 5 subnets."
@@ -218,7 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         let Some(studio) = store.studios.get_mut(&input.studio_id) else {
-            return Err(refuse(crate::state::unknown_studio_message()));
+            return Err(not_found(crate::state::unknown_studio_message()));
         };
 
         // Only what the request carried changes; everything else keeps the value the

@@ -25,7 +25,7 @@ use crate::ops::types::{
     Cluster, ClusterStateChangeReason, ClusterStatus, ClusterSummary, ClusterTimeline,
     Configuration, EbsBlockDevice, Ec2InstanceAttributes, HadoopStepConfig, InstanceFleetConfig,
     InstanceGroup, InstanceGroupConfig, InstanceGroupStateChangeReason, InstanceGroupStatus,
-    InstanceGroupTimeline, JobFlowInstancesConfig, KerberosAttributes,
+    InstanceGroupTimeline, InvalidRequestException, JobFlowInstancesConfig, KerberosAttributes,
     ManagedScalingPolicy, MonitoringConfiguration, NotebookExecution, NotebookExecutionSummary,
     NotebookS3LocationForOutput, OSRelease, OutputNotebookS3LocationForOutput, PersistentAppUI,
     PlacementGroupConfig, PortRange, Session, SessionMappingDetail, ShrinkPolicy,
@@ -190,6 +190,37 @@ pub mod auth_mode {
 /// `com.amazonaws.emr#ClusterStateChangeReasonCode`, for the codes this emulator sets.
 pub mod cluster_state_change_reason_code {
     pub const USER_REQUEST: &str = "USER_REQUEST";
+}
+
+/// `com.amazonaws.emr#InvalidRequestException$ErrorCode` — "the error code associated
+/// with the exception" — for the refusal classes this service answers with a
+/// discriminator.
+///
+/// Amazon EMR funnels every bad request through one exception shape, so this member is
+/// the only thing beside prose that tells one refusal class from another. A class AWS
+/// publishes no code for carries none: the member stays absent rather than being given
+/// a value this emulator invented.
+pub mod error_code {
+    /// The code for a request that names a resource the service holds none of, which is
+    /// what lets a caller tell "gone" from "malformed" — an idempotent teardown that
+    /// swallows exactly this code and re-raises every other refusal.
+    pub const RESOURCE_NOT_FOUND: &str = "ResourceNotFound";
+}
+
+/// The refusal for a request that names a resource this service holds none of: the
+/// absent-resource discriminator ([`error_code::RESOURCE_NOT_FOUND`]) beside the
+/// sentence that states which resource is absent.
+///
+/// Every operation that reports a named resource as absent refuses it through here, so
+/// the discriminator is the same whichever resource and whichever operation the caller
+/// asked about. A refusal of another class — an identifier Amazon EMR rejects as not
+/// valid, a quota, a conflict, a state — is built at its own call site and carries no
+/// code.
+pub fn resource_not_found(message: String) -> InvalidRequestException {
+    InvalidRequestException {
+        error_code: Some(error_code::RESOURCE_NOT_FOUND.to_string()),
+        message: Some(message),
+    }
 }
 
 /// How a cluster-scoped operation refuses a `ClusterId` the service holds no cluster
@@ -3307,6 +3338,9 @@ pub struct InstanceFamilySpec {
     /// GiB of memory per vCPU — the constant that makes this family general purpose
     /// (4), compute optimised (2) or memory optimised (8).
     pub memory_gb_per_vcpu: f32,
+    /// The instance-store disks each size of this family is attached, or an EMPTY slice
+    /// for an Amazon EBS-only family. See [`InstanceStoreDisks`].
+    pub instance_store: &'static [InstanceStoreDisks],
     /// The [`family_class`] value of this family's workload class.
     pub class: &'static str,
     /// Whether Amazon EC2 offers this family as a current generation, which is the
@@ -3323,6 +3357,29 @@ pub struct InstanceFamilySpec {
     /// `emr-6.1.0`, so it carries both, and a family a major series never offered
     /// simply has no entry for it. See [`InstanceFamilySpec::supported_by`].
     pub introduced_in: &'static [(u32, u32, u32)],
+}
+
+/// The instance-store disks ONE size of a family is attached: how many, and the
+/// capacity of each.
+///
+/// A size's `StorageGB` is the capacity the instance type carries
+/// (`number_of_disks * gb_per_disk`), and `NumberOfDisks` is `number_of_disks`; both
+/// are 0 for an Amazon EBS-only type, which is a family declaring no disks at all.
+/// Instance-store capacity does NOT follow the size ladder the way vCPUs and memory do
+/// — `i3.large` carries one 475 GB disk and `i3.xlarge` one 950 GB disk, and a family
+/// jumps from one disk to several part way up its ladder — so it is declared per size
+/// rather than derived.
+#[derive(Debug, Clone, Copy)]
+pub struct InstanceStoreDisks {
+    /// The size this row is for, as it appears on the family's [size ladder].
+    ///
+    /// [size ladder]: InstanceFamilySpec::sizes
+    pub size: &'static str,
+    /// How many instance-store disks that size is attached:
+    /// `SupportedInstanceType$NumberOfDisks`.
+    pub number_of_disks: i32,
+    /// The capacity of ONE of those disks, in GB, as Amazon EC2 publishes it.
+    pub gb_per_disk: i32,
 }
 
 impl InstanceFamilySpec {
@@ -3373,36 +3430,63 @@ impl InstanceFamilySpec {
                     self.family
                 );
                 let vcpu = scaled?;
+                // "StorageGB represents the storage capacity … This value is 0 for
+                // Amazon EBS-only instance types", and "Number of disks … This value
+                // is 0 for Amazon EBS-only instance types": a family declaring no
+                // instance-store disks reports both as 0 and is EBS storage only, and
+                // one declaring them reports what the SIZE carries.
+                let disks = self.disks_of(size);
+                let number_of_disks = disks.map_or(0, |disks| disks.number_of_disks);
+                let storage_gb = disks.map_or(0, |disks| disks.number_of_disks * disks.gb_per_disk);
                 Some(SupportedInstanceType {
                     r#type: Some(format!("{}.{size}", self.family)),
                     memory_gb: Some(vcpu as f32 * self.memory_gb_per_vcpu),
-                    // "StorageGB represents the storage capacity … This value is 0
-                    // for Amazon EBS-only instance types." Every family in this
-                    // catalog is EBS-only, so is every row.
-                    storage_gb: Some(0),
+                    storage_gb: Some(storage_gb),
                     vcpu: Some(vcpu),
                     // Every family here runs a 64-bit processor only.
                     is64_bits_only: Some(true),
                     instance_family_id: Some(self.instance_family_id()),
                     ebs_optimized_available: Some(true),
                     ebs_optimized_by_default: Some(self.ebs_optimized_by_default),
-                    // "Number of disks … This value is 0 for Amazon EBS-only
-                    // instance types."
-                    number_of_disks: Some(0),
-                    ebs_storage_only: Some(true),
+                    number_of_disks: Some(number_of_disks),
+                    // Read off the SAME lookup as the two members above, so the three
+                    // always agree: a type carrying disks is not EBS storage only.
+                    ebs_storage_only: Some(disks.is_none()),
                     architecture: Some(self.architecture.to_string()),
                 })
             })
             .collect()
     }
+
+    /// The instance-store disks the size `size` of this family carries, or `None` when
+    /// it carries none: every size of an Amazon EBS-only family.
+    fn disks_of(&self, size: &str) -> Option<&'static InstanceStoreDisks> {
+        // An instance-store family declares one row per size on its ladder, so a size
+        // with no row in a non-empty table is a hole in the table rather than an
+        // EBS-only size, and a typo in it fails the tests rather than reporting a
+        // storage-optimised type as EBS-only.
+        debug_assert!(
+            self.instance_store.is_empty()
+                || self.instance_store.iter().any(|disks| disks.size == size),
+            "catalog family {} declares instance-store disks but none for size {size:?}",
+            self.family
+        );
+        self.instance_store.iter().find(|disks| disks.size == size)
+    }
 }
 
-/// GiB of memory per vCPU of a general-purpose (`m`) family.
+/// GiB of memory per vCPU of a general-purpose (`m`) family, and of the accelerated
+/// (`g`) families, which carry the same ratio.
 const MEMORY_GENERAL_PURPOSE: f32 = 4.0;
 /// GiB of memory per vCPU of a compute-optimised (`c`) family.
 const MEMORY_COMPUTE_OPTIMIZED: f32 = 2.0;
-/// GiB of memory per vCPU of a memory-optimised (`r`) family.
+/// GiB of memory per vCPU of a memory-optimised (`r`) family, and of the Nitro
+/// storage-optimised families (`i3en`, `d3`), which carry the same ratio.
 const MEMORY_MEMORY_OPTIMIZED: f32 = 8.0;
+/// GiB of memory per vCPU of the Xen-generation memory-, storage- and
+/// accelerator-optimised families (`r4`, `i3`, `p3`), which carry 7.625 rather than the
+/// round 8 their Nitro successors do — `i3.large`'s 15.25 GiB over 2 vCPUs.
+const MEMORY_XEN_MEMORY_OPTIMIZED: f32 = 7.625;
 
 /// The size ladder of the fifth-generation Intel families (`m5`, `r5`) and the AMD
 /// ones (`m5a`, `r5a`).
@@ -3424,6 +3508,10 @@ const SIZES_6TH_GENERATION_AMD: &[&str] = &[
     "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge", "24xlarge",
     "32xlarge", "48xlarge",
 ];
+/// The seventh-generation AMD ladder (`m7a`, `c7a`, `r7a`), which is the sixth's. The
+/// sub-`large` `medium` size these families also come in is outside this catalog, the
+/// same way Graviton's is.
+const SIZES_7TH_GENERATION_AMD: &[&str] = SIZES_6TH_GENERATION_AMD;
 /// The seventh-generation Intel ladder (`m7i`, `c7i`, `r7i`), which steps from
 /// `24xlarge` to `48xlarge`.
 const SIZES_7TH_GENERATION_INTEL: &[&str] = &[
@@ -3436,29 +3524,123 @@ const SIZES_7TH_GENERATION_INTEL: &[&str] = &[
 const SIZES_GRAVITON: &[&str] = &[
     "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge",
 ];
+/// The Xen-generation ladder of `r4` and `i3`, which doubles from `large` to
+/// `16xlarge`.
+const SIZES_LARGE_TO_16XLARGE: &[&str] = &[
+    "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "16xlarge",
+];
+/// The `m4` ladder, which steps through `10xlarge`.
+const SIZES_M4: &[&str] = &[
+    "large", "xlarge", "2xlarge", "4xlarge", "10xlarge", "16xlarge",
+];
+/// The `i3en` ladder, which steps through `3xlarge` and `6xlarge` and tops out at
+/// `24xlarge`.
+const SIZES_I3EN: &[&str] = &[
+    "large", "xlarge", "2xlarge", "3xlarge", "6xlarge", "12xlarge", "24xlarge",
+];
+/// The dense-HDD `d3` ladder, which starts at `xlarge`.
+const SIZES_D3: &[&str] = &["xlarge", "2xlarge", "4xlarge", "8xlarge"];
+/// The `g4dn` ladder, which starts at `xlarge` and tops out at `16xlarge`.
+const SIZES_G4DN: &[&str] = &[
+    "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge",
+];
+/// The `g5` ladder, which carries on past `16xlarge` to `24xlarge` and `48xlarge`.
+const SIZES_G5: &[&str] = &[
+    "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge", "24xlarge", "48xlarge",
+];
+/// The `p3` ladder: three sizes, the smallest `2xlarge`.
+const SIZES_P3: &[&str] = &["2xlarge", "8xlarge", "16xlarge"];
+
+/// The NVMe SSD disks each `i3` size carries (`i3.4xlarge`: 2 × 1,900 GB).
+const DISKS_I3: &[InstanceStoreDisks] = &[
+    disks("large", 1, 475),
+    disks("xlarge", 1, 950),
+    disks("2xlarge", 1, 1900),
+    disks("4xlarge", 2, 1900),
+    disks("8xlarge", 4, 1900),
+    disks("16xlarge", 8, 1900),
+];
+/// The NVMe SSD disks each `i3en` size carries.
+const DISKS_I3EN: &[InstanceStoreDisks] = &[
+    disks("large", 1, 1250),
+    disks("xlarge", 1, 2500),
+    disks("2xlarge", 2, 2500),
+    disks("3xlarge", 1, 7500),
+    disks("6xlarge", 2, 7500),
+    disks("12xlarge", 4, 7500),
+    disks("24xlarge", 8, 7500),
+];
+/// The HDD disks each `d3` size carries: `1,980 GB` spindles, three per `xlarge`.
+const DISKS_D3: &[InstanceStoreDisks] = &[
+    disks("xlarge", 3, 1980),
+    disks("2xlarge", 6, 1980),
+    disks("4xlarge", 12, 1980),
+    disks("8xlarge", 24, 1980),
+];
+/// The NVMe SSD disk each `g4dn` size carries: one, growing with the size.
+const DISKS_G4DN: &[InstanceStoreDisks] = &[
+    disks("xlarge", 1, 125),
+    disks("2xlarge", 1, 225),
+    disks("4xlarge", 1, 225),
+    disks("8xlarge", 1, 900),
+    disks("12xlarge", 1, 900),
+    disks("16xlarge", 1, 900),
+];
+/// The NVMe SSD disks each `g5` size carries.
+const DISKS_G5: &[InstanceStoreDisks] = &[
+    disks("xlarge", 1, 250),
+    disks("2xlarge", 1, 450),
+    disks("4xlarge", 1, 600),
+    disks("8xlarge", 1, 900),
+    disks("12xlarge", 1, 3800),
+    disks("16xlarge", 1, 1900),
+    disks("24xlarge", 1, 3800),
+    disks("48xlarge", 2, 3800),
+];
+
+/// One row of a family's instance-store disk table, so the tables above read as the
+/// published "<n> × <capacity>" pairs.
+const fn disks(size: &'static str, number_of_disks: i32, gb_per_disk: i32) -> InstanceStoreDisks {
+    InstanceStoreDisks {
+        size,
+        number_of_disks,
+        gb_per_disk,
+    }
+}
 
 /// The instance families this emulator's EMR catalog publishes, each with the sizes
-/// it is offered in, its memory ratio, its architecture and the release it became
-/// supported in.
+/// it is offered in, its memory ratio, the instance-store disks its sizes carry, its
+/// architecture and the release it became supported in.
 ///
 /// SOURCE: the Amazon EMR Management Guide's "Supported instance types" table (which
 /// instance types each release supports) crossed with each family's published EC2
-/// size ladder above. Membership and the introduction points are catalog data, not
-/// modelled facts: the model enumerates no instance type at all. Refresh them from
-/// that page.
+/// size ladder and instance-store configuration above. Membership, the introduction
+/// points and the hardware facts are catalog data, not modelled facts: the model
+/// enumerates no instance type at all. Refresh them from that page.
 ///
-/// What is deliberately OUTSIDE it: instance-store families (`m5d`, `i3`, `d3`, `z1d`
-/// …) and the GPU/accelerator families, because this catalog publishes no per-size
-/// instance-store disk table and would have to invent `StorageGB`/`NumberOfDisks` for
-/// them; burstable (`t`) families and sizes below `large`, which EMR does not run
-/// cluster nodes on; previous-generation families (`m1`…`m4`, `c1`…`c4`, `r3`, `r4`);
-/// and bare-metal sizes.
+/// The five workload classes of [`family_class`] are all published, each under the
+/// generation its families belong to: the EBS-only general-purpose, compute- and
+/// memory-optimised families; the instance-store storage-optimised ones (`i3`, `i3en`,
+/// `d3`), whose sizes report the disks they carry; the accelerated ones (`g4dn`, `g5`,
+/// `p3`); and the previous-generation families EMR still lists (`m4`, `r4`). A release
+/// supports the families its OWN series reached, so the newest 7.x catalogue is not the
+/// newest 6.x one: the seventh-generation AMD families arrived after the final 6.x
+/// release.
+///
+/// What is deliberately OUTSIDE it: the instance-store variants of the EBS-only
+/// families (`m5d`, `c5d`, `r5d`, `z1d`), which add no workload class or generation
+/// this catalog does not already publish; burstable (`t`) families and sizes below
+/// `large`, which EMR does not run cluster nodes on; bare-metal sizes; and the
+/// families whose published ladder does NOT scale vCPUs and memory uniformly with the
+/// size (`c4` and `d2`, whose `8xlarge` carries 36 vCPUs, and `p2`), which this
+/// catalog cannot state without a per-size vCPU table.
 pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
     // General purpose, x86-64.
     InstanceFamilySpec {
         family: "m5",
         sizes: SIZES_5TH_GENERATION,
         memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        instance_store: &[],
         class: family_class::GENERAL,
         current_generation: true,
         architecture: architecture::X86_64,
@@ -3469,6 +3651,7 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "m5a",
         sizes: SIZES_5TH_GENERATION,
         memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        instance_store: &[],
         class: family_class::GENERAL,
         current_generation: true,
         architecture: architecture::X86_64,
@@ -3479,6 +3662,7 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "m6i",
         sizes: SIZES_6TH_GENERATION_INTEL,
         memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        instance_store: &[],
         class: family_class::GENERAL,
         current_generation: true,
         architecture: architecture::X86_64,
@@ -3489,6 +3673,7 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "m6a",
         sizes: SIZES_6TH_GENERATION_AMD,
         memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        instance_store: &[],
         class: family_class::GENERAL,
         current_generation: true,
         architecture: architecture::X86_64,
@@ -3499,6 +3684,7 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "m7i",
         sizes: SIZES_7TH_GENERATION_INTEL,
         memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        instance_store: &[],
         class: family_class::GENERAL,
         current_generation: true,
         architecture: architecture::X86_64,
@@ -3510,6 +3696,7 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "m6g",
         sizes: SIZES_GRAVITON,
         memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        instance_store: &[],
         class: family_class::GENERAL,
         current_generation: true,
         architecture: architecture::AARCH64,
@@ -3520,6 +3707,7 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "m7g",
         sizes: SIZES_GRAVITON,
         memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        instance_store: &[],
         class: family_class::GENERAL,
         current_generation: true,
         architecture: architecture::AARCH64,
@@ -3531,6 +3719,7 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "c5",
         sizes: SIZES_C5,
         memory_gb_per_vcpu: MEMORY_COMPUTE_OPTIMIZED,
+        instance_store: &[],
         class: family_class::COMPUTE,
         current_generation: true,
         architecture: architecture::X86_64,
@@ -3541,6 +3730,7 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "c6i",
         sizes: SIZES_6TH_GENERATION_INTEL,
         memory_gb_per_vcpu: MEMORY_COMPUTE_OPTIMIZED,
+        instance_store: &[],
         class: family_class::COMPUTE,
         current_generation: true,
         architecture: architecture::X86_64,
@@ -3551,6 +3741,7 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "c7i",
         sizes: SIZES_7TH_GENERATION_INTEL,
         memory_gb_per_vcpu: MEMORY_COMPUTE_OPTIMIZED,
+        instance_store: &[],
         class: family_class::COMPUTE,
         current_generation: true,
         architecture: architecture::X86_64,
@@ -3561,6 +3752,7 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "c6g",
         sizes: SIZES_GRAVITON,
         memory_gb_per_vcpu: MEMORY_COMPUTE_OPTIMIZED,
+        instance_store: &[],
         class: family_class::COMPUTE,
         current_generation: true,
         architecture: architecture::AARCH64,
@@ -3571,6 +3763,7 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "c7g",
         sizes: SIZES_GRAVITON,
         memory_gb_per_vcpu: MEMORY_COMPUTE_OPTIMIZED,
+        instance_store: &[],
         class: family_class::COMPUTE,
         current_generation: true,
         architecture: architecture::AARCH64,
@@ -3582,6 +3775,7 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "r5",
         sizes: SIZES_5TH_GENERATION,
         memory_gb_per_vcpu: MEMORY_MEMORY_OPTIMIZED,
+        instance_store: &[],
         class: family_class::HI_MEM,
         current_generation: true,
         architecture: architecture::X86_64,
@@ -3592,6 +3786,7 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "r6i",
         sizes: SIZES_6TH_GENERATION_INTEL,
         memory_gb_per_vcpu: MEMORY_MEMORY_OPTIMIZED,
+        instance_store: &[],
         class: family_class::HI_MEM,
         current_generation: true,
         architecture: architecture::X86_64,
@@ -3602,6 +3797,7 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "r6g",
         sizes: SIZES_GRAVITON,
         memory_gb_per_vcpu: MEMORY_MEMORY_OPTIMIZED,
+        instance_store: &[],
         class: family_class::HI_MEM,
         current_generation: true,
         architecture: architecture::AARCH64,
@@ -3612,11 +3808,141 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "r7g",
         sizes: SIZES_GRAVITON,
         memory_gb_per_vcpu: MEMORY_MEMORY_OPTIMIZED,
+        instance_store: &[],
         class: family_class::HI_MEM,
         current_generation: true,
         architecture: architecture::AARCH64,
         ebs_optimized_by_default: true,
         introduced_in: &[(6, 15, 0)],
+    },
+    // Storage optimised: instance-store families, so every size reports the disks it
+    // carries rather than 0.
+    InstanceFamilySpec {
+        family: "i3",
+        sizes: SIZES_LARGE_TO_16XLARGE,
+        memory_gb_per_vcpu: MEMORY_XEN_MEMORY_OPTIMIZED,
+        instance_store: DISKS_I3,
+        class: family_class::STORAGE,
+        current_generation: true,
+        architecture: architecture::X86_64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(5, 9, 0)],
+    },
+    InstanceFamilySpec {
+        family: "i3en",
+        sizes: SIZES_I3EN,
+        memory_gb_per_vcpu: MEMORY_MEMORY_OPTIMIZED,
+        instance_store: DISKS_I3EN,
+        class: family_class::STORAGE,
+        current_generation: true,
+        architecture: architecture::X86_64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(5, 25, 0)],
+    },
+    InstanceFamilySpec {
+        family: "d3",
+        sizes: SIZES_D3,
+        memory_gb_per_vcpu: MEMORY_MEMORY_OPTIMIZED,
+        instance_store: DISKS_D3,
+        class: family_class::STORAGE,
+        current_generation: true,
+        architecture: architecture::X86_64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(6, 5, 0)],
+    },
+    // Accelerated computing: the GPU families. `g4dn` and `g5` carry instance-store
+    // NVMe, `p3` is EBS-only.
+    InstanceFamilySpec {
+        family: "g4dn",
+        sizes: SIZES_G4DN,
+        memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        instance_store: DISKS_G4DN,
+        class: family_class::GPU,
+        current_generation: true,
+        architecture: architecture::X86_64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(5, 30, 0)],
+    },
+    InstanceFamilySpec {
+        family: "g5",
+        sizes: SIZES_G5,
+        memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        instance_store: DISKS_G5,
+        class: family_class::GPU,
+        current_generation: true,
+        architecture: architecture::X86_64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(6, 9, 0)],
+    },
+    InstanceFamilySpec {
+        family: "p3",
+        sizes: SIZES_P3,
+        memory_gb_per_vcpu: MEMORY_XEN_MEMORY_OPTIMIZED,
+        instance_store: &[],
+        class: family_class::GPU,
+        current_generation: true,
+        architecture: architecture::X86_64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(5, 10, 0)],
+    },
+    // The previous-generation families Amazon EMR still lists, which is the other half
+    // of every `InstanceFamilyId`: a workload class crossed with its generation.
+    InstanceFamilySpec {
+        family: "m4",
+        sizes: SIZES_M4,
+        memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        instance_store: &[],
+        class: family_class::GENERAL,
+        current_generation: false,
+        architecture: architecture::X86_64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(5, 0, 0)],
+    },
+    InstanceFamilySpec {
+        family: "r4",
+        sizes: SIZES_LARGE_TO_16XLARGE,
+        memory_gb_per_vcpu: MEMORY_XEN_MEMORY_OPTIMIZED,
+        instance_store: &[],
+        class: family_class::HI_MEM,
+        current_generation: false,
+        architecture: architecture::X86_64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(5, 0, 0)],
+    },
+    // The families the 7.x series added, which no 6.x release offers: the final 6.x
+    // release predates them.
+    InstanceFamilySpec {
+        family: "m7a",
+        sizes: SIZES_7TH_GENERATION_AMD,
+        memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        instance_store: &[],
+        class: family_class::GENERAL,
+        current_generation: true,
+        architecture: architecture::X86_64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(7, 0, 0)],
+    },
+    InstanceFamilySpec {
+        family: "c7a",
+        sizes: SIZES_7TH_GENERATION_AMD,
+        memory_gb_per_vcpu: MEMORY_COMPUTE_OPTIMIZED,
+        instance_store: &[],
+        class: family_class::COMPUTE,
+        current_generation: true,
+        architecture: architecture::X86_64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(7, 0, 0)],
+    },
+    InstanceFamilySpec {
+        family: "r7a",
+        sizes: SIZES_7TH_GENERATION_AMD,
+        memory_gb_per_vcpu: MEMORY_MEMORY_OPTIMIZED,
+        instance_store: &[],
+        class: family_class::HI_MEM,
+        current_generation: true,
+        architecture: architecture::X86_64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(7, 0, 0)],
     },
 ];
 

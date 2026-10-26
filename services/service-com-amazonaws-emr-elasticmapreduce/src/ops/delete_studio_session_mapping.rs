@@ -173,6 +173,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into()
         };
+        // The refusal for a Studio or a mapping this account holds none of: an ABSENT
+        // resource, which is the one refusal class this service gives a discriminator,
+        // so a teardown that repeats this delete can swallow exactly that class.
+        let not_found = |message: String| -> Self::Error {
+            DeleteStudioSessionMappingErrorModeled::InvalidRequestException(
+                crate::state::resource_not_found(message),
+            )
+            .into()
+        };
 
         // "Either `IdentityName` or `IdentityId` must be specified, but not both."
         let Some((_, _, identity)) = crate::state::session_mapping_identity(
@@ -195,13 +204,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         if !store.studios.contains_key(&input.studio_id) {
-            return Err(refuse(crate::state::unknown_studio_message()));
+            return Err(not_found(crate::state::unknown_studio_message()));
         }
 
         let key =
             crate::state::session_mapping_key(&input.studio_id, &input.identity_type, &identity);
         if store.studio_session_mappings.remove(&key).is_none() {
-            return Err(refuse(format!(
+            return Err(not_found(format!(
                 "Studio '{}' has no session mapping for {} '{identity}'.",
                 input.studio_id, input.identity_type
             )));

@@ -155,16 +155,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same creation instant.
         let store = state.lock();
 
+        // A name the store holds nothing for is an ABSENT resource, so the refusal
+        // carries the discriminator for that class beside its sentence: a caller that
+        // branches on "gone" rather than "malformed" reads it off the exception.
         let Some(record) = store.security_configurations.get(&input.name) else {
             return Err(
                 DescribeSecurityConfigurationErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        error_code: None,
-                        message: Some(format!(
-                            "Security configuration with name '{}' does not exist.",
-                            input.name
-                        )),
-                    },
+                    crate::state::resource_not_found(format!(
+                        "Security configuration with name '{}' does not exist.",
+                        input.name
+                    )),
                 )
                 .into(),
             );

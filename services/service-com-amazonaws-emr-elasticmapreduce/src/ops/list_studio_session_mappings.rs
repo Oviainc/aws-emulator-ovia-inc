@@ -174,7 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let studio_id = input.studio_id.filter(|id| !id.is_empty());
         if let Some(studio_id) = studio_id.as_deref() {
             if !store.studios.contains_key(studio_id) {
-                return Err(refuse(crate::state::unknown_studio_message()));
+                return Err(not_found(crate::state::unknown_studio_message()));
             }
         }
 
@@ -243,6 +243,16 @@ fn refuse(message: String) -> ListStudioSessionMappingsError {
         error_code: None,
         message: Some(message),
     })
+    .into()
+}
+
+/// Refuse the request because the Studio it names is ABSENT: the same HTTP 400 client
+/// error, carrying the discriminator for that class so a caller can tell it from the
+/// marker rejection.
+fn not_found(message: String) -> ListStudioSessionMappingsError {
+    ListStudioSessionMappingsErrorModeled::InvalidRequestException(
+        crate::state::resource_not_found(message),
+    )
     .into()
 }
 
