@@ -26,6 +26,9 @@ tracing = { workspace = true }
 # rendering. Both are already in this crate's dependency closure.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `ipnet`: the ONE reading of an IP address or range in CIDR notation, which a
+# receipt IP address filter's `Cidr` is documented as carrying.
+ipnet = "2"
 # `email_address`: the ONE reading of a caller-supplied email address and domain name,
 # shared with every other service whose model documents a member as one — the form this
 # service documents (`UserName@[SubDomain.]Domain.TopLevelDomain`) is read through it

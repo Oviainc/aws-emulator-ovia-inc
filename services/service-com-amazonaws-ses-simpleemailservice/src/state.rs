@@ -17,7 +17,8 @@
 //! entries, each identity's sending-authorization policies at
 //! [`MAX_IDENTITY_POLICIES`] documents of [`MAX_POLICY_BYTES`], the configuration
 //! sets at [`MAX_CONFIGURATION_SETS`], the receipt rule sets at
-//! [`MAX_RECEIPT_RULE_SETS`], and the send log
+//! [`MAX_RECEIPT_RULE_SETS`], the receipt IP address filters at
+//! [`MAX_RECEIPT_FILTERS`], and the send log
 //! at the account's own 24-hour quota, with the window's expiry applied on
 //! append ([`ComAmazonawsSesSimpleemailserviceState::log_sent_message`]) and
 //! [`MAX_SENT_LOG_ENTRIES`] as the backstop. The text one log entry keeps is
@@ -92,6 +93,19 @@ pub const MAX_RECEIPT_RULE_SETS: usize = 20;
 /// `CreateReceiptRuleSetRequest$RuleSetName`): the name must "Contain 64
 /// characters or fewer".
 pub const MAX_RECEIPT_RULE_SET_NAME: usize = 64;
+
+/// The receipt IP address filters one account may hold, and so the ceiling on
+/// the filter store: SES documents a limit of 100 receipt filters per AWS
+/// account, and a create past it is refused with the modelled `LimitExceeded`
+/// rather than letting caller input grow this store without end.
+pub const MAX_RECEIPT_FILTERS: usize = 100;
+
+/// The longest name a receipt IP address filter may carry.
+///
+/// `ReceiptFilter$Name` documents the same ceiling the rule and rule set names
+/// carry ("Contain 64 characters or fewer"), so this is that constant rather
+/// than a second copy of the number.
+pub const MAX_RECEIPT_FILTER_NAME: usize = MAX_RECEIPT_RULE_SET_NAME;
 
 /// The email templates one account may hold, and so the ceiling on the template
 /// store: SES documents a limit of 10,000 email templates per account, and a
@@ -487,6 +501,13 @@ pub struct ComAmazonawsSesSimpleemailserviceState {
     /// The receipt rule sets, keyed by name. A `BTreeMap` so every listing is in
     /// one stable (lexicographic) order. Bounded at [`MAX_RECEIPT_RULE_SETS`].
     pub receipt_rule_sets: BTreeMap<String, ReceiptRuleSet>,
+    /// The receipt IP address filters, keyed by name, held as the modelled
+    /// [`crate::ops::types::ReceiptFilter`] shape so a filter a caller wrote is
+    /// reported back unchanged instead of being projected through a second copy
+    /// of the same structure. A `BTreeMap` so every listing is in one stable
+    /// (lexicographic) order. Grown ONLY through [`Self::add_receipt_filter`],
+    /// which is where its ceiling ([`MAX_RECEIPT_FILTERS`]) is applied.
+    pub receipt_filters: BTreeMap<String, crate::ops::types::ReceiptFilter>,
     /// The email templates, keyed by name. A `BTreeMap` so every listing is in
     /// one stable (lexicographic) order, which is what makes `ListTemplates`'
     /// pagination resumable. Bounded at [`MAX_TEMPLATES`].
@@ -829,6 +850,25 @@ impl ComAmazonawsSesSimpleemailserviceState {
                 }),
         )
     }
+
+    /// Record the receipt IP address filter `filter` under its own name.
+    ///
+    /// The caller has already decided that the name is free — a name already in
+    /// the store is a naming conflict, which the creating operation answers with
+    /// its modelled `AlreadyExists` — so this only applies the account's own
+    /// ceiling: `false`, having stored nothing, when the store already holds
+    /// [`MAX_RECEIPT_FILTERS`] filters, which the caller refuses with the
+    /// modelled `LimitExceeded` rather than growing the store past the limit.
+    pub fn add_receipt_filter(&mut self, filter: crate::ops::types::ReceiptFilter) -> bool {
+        // A name the store already holds would be replaced rather than added, so
+        // it does not grow the store and the ceiling does not apply to it.
+        let held = self.receipt_filters.contains_key(&filter.name);
+        if !held && self.receipt_filters.len() >= MAX_RECEIPT_FILTERS {
+            return false;
+        }
+        self.receipt_filters.insert(filter.name.clone(), filter);
+        true
+    }
 }
 
 /// Whether `value` is a receipt rule or rule set name in the form SES documents.
@@ -850,6 +890,35 @@ pub fn is_receipt_rule_set_name(value: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
         && first.is_ascii_alphanumeric()
         && last.is_ascii_alphanumeric()
+}
+
+/// Whether `value` is a receipt IP address filter name in the form SES
+/// documents.
+///
+/// `ReceiptFilter$Name` states the same three clauses the receipt rule and rule
+/// set names carry — ASCII letters, numbers, underscores or dashes only, a
+/// letter or number at each end, and [`MAX_RECEIPT_FILTER_NAME`] characters or
+/// fewer — so the value is read through [`is_receipt_rule_set_name`] instead of
+/// repeating them.
+pub fn is_receipt_filter_name(value: &str) -> bool {
+    is_receipt_rule_set_name(value)
+}
+
+/// The IPv4 address or range `value` names, or `None` when it is neither.
+///
+/// `ReceiptIpFilter$Cidr` documents the form: "A single IP address or a range of
+/// IP addresses to block or allow, specified in Classless Inter-Domain Routing
+/// (CIDR) notation. An example of a single email address is 10.0.0.1. An example
+/// of a range of IP addresses is 10.0.0.1/24." A bare address is the range that
+/// holds only it, so it reads as a `/32`; a range carries its own prefix length,
+/// which `ipnet` accepts only within the address family's width. Both examples
+/// the member gives are IPv4, and an IPv4 address is the only form it documents,
+/// so an address of another family is one of the values this reads as neither.
+pub fn parse_receipt_filter_cidr(value: &str) -> Option<::ipnet::Ipv4Net> {
+    if let Ok(address) = value.parse::<std::net::Ipv4Addr>() {
+        return Some(::ipnet::Ipv4Net::from(address));
+    }
+    value.parse::<::ipnet::Ipv4Net>().ok()
 }
 
 /// The listing name stamped into a `ListTemplates` page token, so a cursor cut

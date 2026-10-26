@@ -23,6 +23,8 @@ mod identity_notification_topics;
 mod ses_identity_policies;
 #[path = "all/ses_identity_send_loop.rs"]
 mod ses_identity_send_loop;
+#[path = "all/ses_receipt_filters.rs"]
+mod ses_receipt_filters;
 #[path = "all/ses_receipt_rule_set_listing.rs"]
 mod ses_receipt_rule_set_listing;
 #[path = "all/ses_receipt_rule_sets.rs"]

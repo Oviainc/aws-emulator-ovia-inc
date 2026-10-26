@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateReceiptFilter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateReceiptFilter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateReceiptFilter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records one receipt IP address filter under the requested name, so long as
+//! the name is of the documented form and free, the `Cidr` names an IP address
+//! or range, and the account is under its filter limit.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +134,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateReceiptFilter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateReceiptFilterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateReceiptFilter"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+        let filter = input.filter;
+
+        // `ReceiptFilterName` is only a string in the model, so a name outside
+        // the form `ReceiptFilter$Name` documents reaches here; this operation
+        // models no error for one, so it is refused through the service's 400
+        // channel rather than recording a filter under a name SES would never
+        // accept.
+        if !crate::state::is_receipt_filter_name(&filter.name) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                format!(
+                    "Filter name must contain only ASCII letters, numbers, underscores or \
+                     dashes, start and end with a letter or number, and contain {} characters \
+                     or fewer, got {:?}",
+                    crate::state::MAX_RECEIPT_FILTER_NAME, filter.name
+                ),
+            ));
+        }
+        // `Cidr` is only a string in the model too: a value naming neither an IP
+        // address nor a range of them is one no mail can be matched against, so
+        // it is refused instead of being stored as a filter that can never fire.
+        if crate::state::parse_receipt_filter_cidr(&filter.ip_filter.cidr).is_none() {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                format!("Invalid CIDR block: {}", filter.ip_filter.cidr),
+            ));
+        }
+        // `ReceiptFilterPolicy` is an enum, so the boundary validator refuses a
+        // value outside it before this handler runs; the check stands for the
+        // rule that only the two documented policies are ever stored.
+        if !RECEIPT_FILTER_POLICY_VALUES.contains(&filter.ip_filter.policy.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                format!(
+                    "Policy must be one of {}, got {:?}",
+                    RECEIPT_FILTER_POLICY_VALUES.join(", "),
+                    filter.ip_filter.policy
+                ),
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `create_receipt_rule_set.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and every error this
+            // operation models is a client error, so none of them fits.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateReceiptFilter",
+            ));
+        };
+        let mut state = state.lock();
+
+        if state.receipt_filters.contains_key(&filter.name) {
+            return Err(CreateReceiptFilterErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    name: Some(filter.name.clone()),
+                    message: Some(format!("Filter already exists: {}", filter.name)),
+                },
+            )
+            .into());
+        }
+        if !state.add_receipt_filter(filter) {
+            return Err(CreateReceiptFilterErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Filter limit exceeded: this account may hold {} receipt filters.",
+                        crate::state::MAX_RECEIPT_FILTERS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        Ok(CreateReceiptFilterOutput {})
     }
 }
