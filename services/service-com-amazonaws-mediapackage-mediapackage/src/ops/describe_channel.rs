@@ -146,7 +146,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // MediaPackage is regional: this read resolves only the channels of the Region
+        // its own request is served in.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeChannelErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -156,9 +158,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = state.lock();
 
-        // The request addressed a Channel by id: a miss is `NotFoundException` (404)
+        // The request addressed a Channel by id: a miss — including an id only another
+        // Region holds, which is not a channel of this one — is `NotFoundException` (404)
         // keyed, in the body's `errors` map, by the RESOURCE TYPE that is missing.
-        let Some(record) = state.channels.get(&input.id) else {
+        let Some(record) = state.channel(&region, &input.id) else {
             return Err(crate::state::channel_not_found(&input.id).into());
         };
 

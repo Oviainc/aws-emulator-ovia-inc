@@ -158,7 +158,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // MediaPackage is regional: this read resolves only the harvest jobs of the
+        // Region its own request is served in.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeHarvestJobErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -171,7 +173,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // made due, so a read reports what the clock decided and advances nothing itself.
         state.settle_harvest_jobs(std::time::SystemTime::now());
 
-        let Some(record) = state.harvest_jobs.get(&input.id) else {
+        // An id this Region holds no job under — including one only another Region holds
+        // — is the addressed resource missing: 404.
+        let Some(record) = state.harvest_job(&region, &input.id) else {
             return Err(crate::state::harvest_job_not_found(&input.id).into());
         };
 

@@ -149,9 +149,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing about a log subscription depends on the request beyond its deserialized
-        // input: the channel it names was created by an earlier call.
-        let _ = ctx;
+        // The channel a log subscription belongs to was created by an earlier call; the
+        // request's own Region is what decides WHICH channel this call reaches, because
+        // MediaPackage is regional.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ConfigureLogsErrorModeled::InternalServerErrorException(InternalServerErrorException {
                 message: Some("the mediapackage state store is unavailable".into()),
@@ -160,9 +161,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         // Log subscription is a property OF a channel, so there is nothing to configure
-        // for an id this service does not hold; the target is resolved before the request
-        // is judged.
-        if !state.channels.contains_key(&input.id) {
+        // for an id this REGION does not hold — an id only another Region holds is not a
+        // channel of this one; the target is resolved before the request is judged.
+        if !state.has_channel(&region, &input.id) {
             return Err(crate::state::channel_not_found(&input.id).into());
         }
 
@@ -182,8 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?;
 
         let record = state
-            .channels
-            .get_mut(&input.id)
+            .channel_mut(&region, &input.id)
             .expect("the channel resolved above, under this one hold of the lock");
 
         // `PUT /channels/{Id}/configure_logs` carries the channel's whole log

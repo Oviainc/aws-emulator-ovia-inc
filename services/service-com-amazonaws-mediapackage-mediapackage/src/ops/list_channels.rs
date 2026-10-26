@@ -144,7 +144,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // MediaPackage is regional: a listing reports only the channels of the Region its
+        // own request is served in.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListChannelsErrorModeled::InternalServerErrorException(InternalServerErrorException {
                 message: Some("the mediapackage state store is unavailable".into()),
@@ -163,14 +165,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let page_size = crate::state::page_size(input.max_results);
 
+        // One Region's channels are a contiguous id-ordered range of the store, so this
+        // is one stable order across pages; a channel of another Region is not reported
+        // here at all.
         let (keys, next_token) = crate::state::paginate(
-            state.channels.keys().map(String::as_str),
+            state.channels_in(&region).map(|record| record.id.as_str()),
             start.as_deref(),
             page_size,
         );
         let channels = keys
             .iter()
-            .filter_map(|key| state.channels.get(*key))
+            .filter_map(|key| state.channel(&region, key))
             .map(crate::state::ChannelRecord::to_channel)
             .collect();
 
