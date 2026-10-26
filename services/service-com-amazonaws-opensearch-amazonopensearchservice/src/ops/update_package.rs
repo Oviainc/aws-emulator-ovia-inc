@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePackage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePackage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePackage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Puts a new version of a stored [`crate::state::Package`]'s content in place: the
+//! update records the next numbered version of the package's content, leaves the
+//! package copying that content out of the Amazon S3 location the request named, and
+//! answers the package through the same `PackageDetails` projection the create and
+//! every read report it with.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +84,17 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    package_not_found, OwedStatus, PACKAGE_STATUS_AVAILABLE, PACKAGE_STATUS_COPYING,
+    PACKAGE_VERSION_QUOTA, PROVISIONING,
+};
+
+/// The refusal a package that is not in a state to take new content gets.
+///
+/// The service names neither the package nor the status it is in: what it says is that
+/// the operation cannot be performed on a package in the state this one is in.
+const NOT_IN_DESIRED_STATE: &str = "Operation not allowed. The package is not in desired state.";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,18 +168,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePackage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePackageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePackage"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // The record this call changes is first brought to the status the clock already
+        // owed it at this instant, so a package whose copy has fallen due is updated —
+        // and answered — in the status it is then in.
+        store.settle_packages(now);
+
+        // `PackageID` is "the unique identifier for the package": an id that names no
+        // package of this account is the modelled not-found refusal rather than a
+        // package this call would create.
+        let package = store.packages.get_mut(&input.package_id).ok_or_else(|| {
+            UpdatePackageErrorModeled::ResourceNotFoundException(package_not_found(
+                &input.package_id,
+            ))
+        })?;
+
+        // An update replaces the package's content, which the service does by COPYING
+        // the new content out of the Amazon S3 location named: a package whose previous
+        // copy has not landed yet is not in a state to take another one, so the call is
+        // refused and the package keeps the version and the copy it already had. That
+        // is what serialises concurrent updates of one package — the first takes the
+        // next version number and the rest are refused — rather than letting two copies
+        // of different content race for the same version. The refusal is this
+        // operation's `BaseException`, the error it models for a request that is well
+        // formed and names a package that exists.
+        if package.status != PACKAGE_STATUS_AVAILABLE {
+            return Err(UpdatePackageErrorModeled::BaseException(BaseException {
+                message: Some(NOT_IN_DESIRED_STATE.to_string()),
+            })
+            .into());
+        }
+
+        // A package's version history only grows, so it is bounded: past the bound
+        // another version is refused rather than recorded, which is what stops a caller
+        // looping updates from growing the stored log — and the history every read of
+        // this package answers with — without end. A version is a sub-resource of the
+        // package, so `LimitExceededException` ("trying to create more than the allowed
+        // number of resources or sub-resources") is the modelled refusal.
+        if package.versions.len() >= PACKAGE_VERSION_QUOTA {
+            return Err(UpdatePackageErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Package {} already holds the maximum of {PACKAGE_VERSION_QUOTA} versions",
+                        package.package_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Every optional member of the request is a NEW value for the package — "a new
+        // description of the package", "the updated configuration details for a
+        // package" — so one the request leaves out asks for no change to it and the
+        // stored value stands. `PackageSource` is required, so an update always names
+        // the location the content it imports comes from.
+        package.source = input.package_source;
+        if input.package_description.is_some() {
+            package.description = input.package_description;
+        }
+        if input.package_configuration.is_some() {
+            package.configuration = input.package_configuration;
+        }
+        if input.package_encryption_options.is_some() {
+            package.encryption_options = input.package_encryption_options;
+        }
+
+        // The content this call imports is the next numbered version of the package's
+        // content, carrying the commit message the request gave it — "a message
+        // associated with the package version when it was uploaded", which
+        // `GetPackageVersionHistory` reports — and the configuration the package holds
+        // for that version.
+        let configuration = package.configuration.clone();
+        package.add_version(input.commit_message, configuration, now);
+
+        // The new content is not in place the instant this call returns: it is being
+        // copied out of the Amazon S3 location the request named, and the clock owes
+        // the package the status that copy leaves it in — at which point the version
+        // just recorded becomes the version the package has available.
+        package.status = PACKAGE_STATUS_COPYING.to_string();
+        package.owed = Some(OwedStatus {
+            status: PACKAGE_STATUS_AVAILABLE.to_string(),
+            message: None,
+            due: now + PROVISIONING,
+        });
+        package.updated_at = now;
+
+        // Answered from the STORED record, through the projection every read path
+        // reports a package with.
+        Ok(UpdatePackageOutput {
+            package_details: Some(package.to_details()),
+        })
     }
 }

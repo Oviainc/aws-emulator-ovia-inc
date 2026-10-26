@@ -71,6 +71,8 @@ mod package_registry;
 mod package_scope;
 #[path = "all/package_version_history.rs"]
 mod package_version_history;
+#[path = "all/package_versions.rs"]
+mod package_versions;
 #[path = "all/reserved_instance_offerings.rs"]
 mod reserved_instance_offerings;
 #[path = "all/reserved_instances.rs"]

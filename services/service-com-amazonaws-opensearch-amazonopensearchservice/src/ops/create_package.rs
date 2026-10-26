@@ -92,9 +92,8 @@
 use super::types::*;
 
 use crate::state::{
-    new_package_id, package_name_exists, OwedStatus, Package, PackageVersionRecord,
-    FIRST_PACKAGE_VERSION, PACKAGE_QUOTA, PACKAGE_STATUS_AVAILABLE, PACKAGE_STATUS_COPYING,
-    PACKAGE_TYPE_ZIP_PLUGIN, PROVISIONING,
+    new_package_id, package_name_exists, OwedStatus, Package, FIRST_PACKAGE_VERSION, PACKAGE_QUOTA,
+    PACKAGE_STATUS_AVAILABLE, PACKAGE_STATUS_COPYING, PACKAGE_TYPE_ZIP_PLUGIN, PROVISIONING,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -227,17 +226,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The create IMPORTS the package's content, which is what makes its first
         // numbered version — the entry `GetPackageVersionHistory` reports and the
-        // version later reads call the package's available one, recorded together so
-        // the two cannot disagree. `CreatePackageRequest` declares no `CommitMessage`,
-        // so this first version carries none.
-        let first_version = PackageVersionRecord {
-            version: FIRST_PACKAGE_VERSION,
-            commit_message: None,
-            created_at: now,
-            configuration: input.package_configuration.clone(),
-        };
+        // version later reads call the package's available one. The configuration the
+        // create carries belongs to the package AND to that first version, which the
+        // history reports per version, so it is read once here and held for both.
+        let configuration = input.package_configuration;
 
-        let package = Package {
+        let mut package = Package {
             package_id: new_package_id(),
             package_name: input.package_name,
             package_type: input.package_type,
@@ -253,10 +247,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: None,
                 due: now + PROVISIONING,
             }),
-            version: first_version.version,
-            versions: vec![first_version],
+            version: FIRST_PACKAGE_VERSION,
+            versions: Vec::new(),
             engine_version: input.engine_version,
-            configuration: input.package_configuration,
+            configuration: configuration.clone(),
             vending_options: input.package_vending_options,
             encryption_options: input.package_encryption_options,
             // Which accounts the package is vended to is set by a later scope update;
@@ -268,6 +262,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             updated_at: now,
         };
+
+        // The content this create imports is the FIRST numbered version of the
+        // package's content, so the version history a later read reports begins with
+        // it. A create carries no commit message — `CreatePackageRequest` declares no
+        // such member — so that version has none.
+        package.add_version(None, configuration, now);
 
         // Answered from the STORED record, through the projection every read path
         // reports a package with.

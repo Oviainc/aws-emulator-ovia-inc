@@ -4531,6 +4531,20 @@ pub const PACKAGE_QUOTA: usize = 25;
 /// user's access.
 pub const PACKAGE_SCOPE_QUOTA: usize = 100;
 
+/// How many numbered versions of its content one package holds before
+/// `UpdatePackage` refuses to put another in place.
+///
+/// The emulator's OWN bound, like [`PACKAGE_QUOTA`], and not a published service
+/// quota: the service documents no limit on how many versions of its content one
+/// package may have had. A package's version sequence only ever grows — an import adds
+/// a version and nothing removes one — so without a bound a caller looping updates
+/// could grow the stored sequence, and the `PackageVersionHistoryList` every read of
+/// that history answers with, without end. A package version is a sub-resource of the
+/// package, so the bound is the modelled `LimitExceededException` ("trying to create
+/// more than the allowed number of resources or sub-resources"), and the whole
+/// sequence is released by deleting the package.
+pub const PACKAGE_VERSION_QUOTA: usize = 50;
+
 /// One version of a package's content, as this emulator persists it.
 ///
 /// A package's content is imported, and each import is a new numbered version of it,
@@ -4597,14 +4611,16 @@ pub struct Package {
     pub status: String,
     /// The status move the clock owes this package, if any is outstanding.
     pub owed: Option<OwedStatus>,
-    /// Which numbered version of its content the package currently has, counting
-    /// from [`FIRST_PACKAGE_VERSION`].
+    /// Which numbered version of its content the package currently has IN PLACE —
+    /// the version a read reports as available and an association puts on a domain,
+    /// counting from [`FIRST_PACKAGE_VERSION`]. A version whose content is still
+    /// being copied is not in place yet, so this moves to it when that copy lands.
     pub version: u32,
     /// Every version of this package's content, oldest first — the sequence
-    /// `GetPackageVersionHistory` reports. The newest entry is the version
-    /// [`Self::version`] names, because the two are written by the same import: a
-    /// package is minted with its first version recorded here and each later import
-    /// of content appends the next.
+    /// `GetPackageVersionHistory` reports. A package is minted with its first version
+    /// recorded here and each later import of content appends the next, so the newest
+    /// entry is the version [`Self::version`] names once that import's copy has
+    /// landed. Bounded by [`PACKAGE_VERSION_QUOTA`].
     pub versions: Vec<PackageVersionRecord>,
     /// `PackageDetails$EngineVersion`, absent for a package that is not tied to one.
     pub engine_version: Option<String>,
@@ -4642,6 +4658,40 @@ impl Package {
         };
         self.status = owed.status;
         self.updated_at = owed.due;
+        // A copy is what puts a version's content in place, so the newest version the
+        // history holds becomes the one the package carries once that copy has landed —
+        // which is what the move to the available status says has happened.
+        if self.status == PACKAGE_STATUS_AVAILABLE {
+            if let Some(latest) = self.versions.last() {
+                self.version = latest.version;
+            }
+        }
+    }
+
+    /// Record the NEXT numbered version of this package's content, as the call that
+    /// put it in place carried it.
+    ///
+    /// The ONE writer of the package's version sequence, so the numbering is the same
+    /// whichever call adds a version: the first content is
+    /// [`FIRST_PACKAGE_VERSION`] and each one after it is one past the version before
+    /// it, whatever happened to the versions in between. The version this adds is not
+    /// in place until its copy lands ([`Self::settle`]), which is why this does not
+    /// move [`Self::version`].
+    pub fn add_version(
+        &mut self,
+        commit_message: Option<String>,
+        configuration: Option<PackageConfiguration>,
+        created_at: SystemTime,
+    ) {
+        let version = self.versions.last().map_or(FIRST_PACKAGE_VERSION, |latest| {
+            latest.version.saturating_add(1)
+        });
+        self.versions.push(PackageVersionRecord {
+            version,
+            commit_message,
+            created_at,
+            configuration,
+        });
     }
 
     /// This record as `PackageDetails` — the shape `CreatePackage` answers with and

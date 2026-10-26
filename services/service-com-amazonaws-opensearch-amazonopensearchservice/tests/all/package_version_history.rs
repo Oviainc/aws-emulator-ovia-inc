@@ -15,9 +15,9 @@
 //!   the commit message, creation instant and configuration stored WITH that version
 //!   and no plugin properties, over a table of creates spanning package types, the
 //!   configuration container present and absent, and both engine lines;
-//! * the history is a SEQUENCE: it is reported oldest version first and paged through
-//!   without repeating or skipping a version, whatever page size is asked for, over a
-//!   table crossing the page size with a history longer than it;
+//! * the history is a SEQUENCE: it is reported MOST RECENT VERSION FIRST and paged
+//!   through without repeating or skipping a version, whatever page size is asked for,
+//!   over a table crossing the page size with a history longer than it;
 //! * a page size outside the range the model publishes for `MaxResults`, a token that
 //!   names no version of the package, and an id that names no package at all are each
 //!   refused with the error the model declares, over a table spanning both ends of the
@@ -286,9 +286,10 @@ fn seeded_configuration(version: u32) -> PackageConfiguration {
 /// Put the further versions of `package_id`'s content in the store the way a handler
 /// reaches it.
 ///
-/// `UpdatePackage`, the operation that imports another version of a package's
-/// content, is still a scaffold stub, so a history longer than the one version a
-/// create imports is written here — the same seam
+/// `UpdatePackage` imports another version of a package's content over the wire, but
+/// each import it serves is stamped with the instant it was made; these cases assert
+/// the RELATION between the instants of versions imported minutes apart, so the
+/// versions are written here with instants of this suite's choosing — the same seam
 /// [`super::package_associations`] uses for a newer package version.
 fn seed_versions(emulator: &Emulator, package_id: &str, versions: &[Seeded]) {
     let store = emulator.store();
@@ -437,7 +438,7 @@ async fn the_history_a_package_carries_does_not_change_when_its_copy_lands() {
 }
 
 #[tokio::test]
-async fn the_history_reports_every_stored_version_oldest_first() {
+async fn the_history_reports_every_stored_version_newest_first() {
     let emulator = Emulator::new();
     let row = &rows()[0];
     let id = created(&emulator, row).await;
@@ -453,17 +454,18 @@ async fn the_history_reports_every_stored_version_oldest_first() {
         "case {case}: expected every stored version, got {reported:?}"
     );
 
-    // Row 0 is the version the create imported; the rest are the seeded ones, in the
-    // order they were imported.
+    // The history is reported most recent version first, so row 0 is the newest
+    // seeded version and the last row is the version the create imported.
+    let newest = FIRST_PACKAGE_VERSION + u32::try_from(versions.len()).unwrap_or_default();
     for (index, entry) in reported.iter().enumerate() {
-        let number = FIRST_PACKAGE_VERSION + u32::try_from(index).unwrap_or_default();
+        let number = newest - u32::try_from(index).unwrap_or_default();
         let case = format!("{case} (version {number})");
         assert_eq!(
             entry["PackageVersion"].as_str(),
             Some(number.to_string().as_str()),
-            "case {case}: expected the history oldest version first, got {reported:?}"
+            "case {case}: expected the history most recent version first, got {reported:?}"
         );
-        let Some(seeded) = versions.get(index.wrapping_sub(1)) else {
+        let Some(seeded) = versions.get((number as usize).wrapping_sub(2)) else {
             continue;
         };
         assert_eq!(
@@ -495,7 +497,10 @@ async fn paging_the_history_reports_every_version_exactly_once() {
     let versions = seeded();
     seed_versions(&emulator, &id, &versions);
 
+    // Every version the package has had, in the order a read reports them: most
+    // recent first.
     let whole: Vec<String> = (0..=versions.len())
+        .rev()
         .map(|index| (FIRST_PACKAGE_VERSION as usize + index).to_string())
         .collect();
 
@@ -515,7 +520,7 @@ async fn paging_the_history_reports_every_version_exactly_once() {
         let walked = walk(&emulator, &id, page_size, &case).await;
         assert_eq!(
             walked, whole,
-            "case {case}: expected every version exactly once, in version order, got {walked:?}"
+            "case {case}: expected every version exactly once, most recent first, got {walked:?}"
         );
     }
 

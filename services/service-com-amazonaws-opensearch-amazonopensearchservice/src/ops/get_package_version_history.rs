@@ -3,10 +3,10 @@
 //! @op GetPackageVersionHistory
 //!
 //! Reports the versions of ONE package's content: the sequence this service persisted
-//! on [`crate::state::Package::versions`], oldest first, paged by `MaxResults` and
-//! `NextToken`. The history belongs to the package the `PackageID` names, so an id
-//! naming no package of this account is the modelled not-found refusal rather than an
-//! empty history.
+//! on [`crate::state::Package::versions`], MOST RECENT VERSION FIRST, paged by
+//! `MaxResults` and `NextToken`. The history belongs to the package the `PackageID`
+//! names, so an id naming no package of this account is the modelled not-found refusal
+//! rather than an empty history.
 //!
 //! A REPORT: it writes nothing, because a package's version history has no status the
 //! clock can move.
@@ -202,9 +202,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // The versions of the content a package has had are a SEQUENCE numbered from
-        // one, and the store holds them in the order they were imported — so two reads
-        // report the same order and a token names the same place in it.
-        let history = package.versions.as_slice();
+        // one, and the store holds them in the order they were imported — a history is
+        // reported MOST RECENT VERSION FIRST, so the stored sequence is read back to
+        // front. Order-stable either way, which is what lets two reads report the same
+        // order and a token name the same place in it, and bounded by
+        // [`crate::state::PACKAGE_VERSION_QUOTA`]. Read through a reversed iterator over
+        // the stored slice rather than a reversed copy of it, so reporting a history
+        // allocates nothing per request beyond the page it answers with.
+        let history = || package.versions.iter().rev();
 
         // The token names the version the next page starts AT, so a caller resumes
         // exactly where the previous page stopped rather than at an offset a newer
@@ -215,8 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ValidationException`.
         let start = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
             None => 0,
-            Some(token) => history
-                .iter()
+            Some(token) => history()
                 .position(|version| version.version.to_string() == token)
                 .ok_or_else(|| {
                     GetPackageVersionHistoryErrorModeled::ValidationException(invalid_next_token())
@@ -233,23 +237,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Ok(0) | Err(_) => MAX_PAGE,
             Ok(size) => size.min(MAX_PAGE),
         };
-        let end = start.saturating_add(page_size).min(history.len());
 
         Ok(GetPackageVersionHistoryOutput {
             // Answered from the STORED record's own id, so the history and the package
             // it is reported for cannot disagree.
             package_id: Some(package.package_id.clone()),
             package_version_history_list: Some(
-                history[start..end]
-                    .iter()
+                history()
+                    .skip(start)
+                    .take(page_size)
                     .map(|version| version.to_history())
                     .collect(),
             ),
             // "When nextToken is returned, there are more results available": the token
             // is the next version in the history, and there is none once this page
             // ended it.
-            next_token: history
-                .get(end)
+            next_token: history()
+                .nth(start.saturating_add(page_size))
                 .map(|version| version.version.to_string()),
         })
     }
