@@ -510,6 +510,25 @@
 //! [`ComAmazonawsEc2Amazonec2State::vpc_endpoint_connection_moves`] holds the instant the
 //! clock owes it `Available`.
 //!
+//! ## Connection notifications for endpoints and endpoint services
+//!
+//! [`ComAmazonawsEc2Amazonec2State::vpc_endpoint_connection_notifications`] holds the
+//! account's connection notifications — "the connection notifications for VPC endpoints and
+//! VPC endpoint services" (`DescribeVpcEndpointConnectionNotifications`) — as the modelled
+//! [`ConnectionNotification`] shape itself, keyed by `ConnectionNotificationId` in a
+//! [`BTreeMap`], for the same reasons the connection store above holds
+//! [`VpcEndpointConnection`]s: the id names the resource, every member a writer sets
+//! round-trips through the describe, and the map's order is the one order that describe
+//! reports and pages over. A notification is a resource a request creates, so a fresh
+//! account holds none and the store starts empty.
+//! [`ComAmazonawsEc2Amazonec2State::insert_vpc_endpoint_connection_notification`] is the one
+//! way one is stored, and it mints the id itself rather than taking it from a caller; it
+//! answers `None` past [`MAX_STORED_RECORDS_PER_STORE`] and charges
+//! [`connection_notification_payload_bytes`] against the byte budget, so repeated writes
+//! cannot grow the store for free. A notification has no non-terminal state — it is
+//! `Enabled` or `Disabled`, and only `ModifyVpcEndpointConnectionNotification` moves it —
+//! so nothing beside the store records a clock-owed transition for one.
+//!
 //! That pair of bounds — a count ceiling the writer itself re-checks, and a per-record byte
 //! floor so a record carrying no tags is not free — is the rule for EVERY store nothing in
 //! this emulator reclaims, not just this one. The writers of the transit gateway
@@ -1148,7 +1167,7 @@ use crate::ops::types::{
     AttachVolumeOutput,
     AttributeValue,
     AvailabilityZone, AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates,
-    Byoasn, ByoipCidr,
+    Byoasn, ByoipCidr, ConnectionNotification,
     DhcpConfiguration, DhcpOptions,
     CapacityBlock, CapacityReservation, CapacityReservationBillingRequest,
     CapacityReservationCommitmentInfo, CapacityReservationInfo, ExportTask, FpgaImage,
@@ -2857,6 +2876,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// "Unique, case-sensitive identifier that you provide to ensure the idempotency of the
     /// request" (`CreateVpcEndpointRequest$ClientToken`).
     pub vpc_endpoint_client_tokens: HashMap<String, String>,
+    /// Every connection notification the account holds, by `ConnectionNotificationId`, as
+    /// the modelled [`ConnectionNotification`] shape itself — see the module docs. Ordered
+    /// by that id, which is the order `DescribeVpcEndpointConnectionNotifications` reports
+    /// and pages over.
+    pub vpc_endpoint_connection_notifications: BTreeMap<String, ConnectionNotification>,
     /// Every Site-to-Site VPN connection the account holds, by `VpnConnectionId`, as
     /// [`VpnConnectionRecord`]s — the modelled [`VpnConnection`] every operation that reports
     /// one answers with, plus the move the clock owes each static route that is not in a
@@ -3249,6 +3273,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpc_endpoints: BTreeMap::new(),
             vpc_endpoint_moves: BTreeMap::new(),
             vpc_endpoint_client_tokens: HashMap::new(),
+            vpc_endpoint_connection_notifications: BTreeMap::new(),
             vpn_connections: BTreeMap::new(),
             transit_gateway_attachments: BTreeMap::new(),
             transit_gateway_multicast_domains: BTreeMap::new(),
@@ -22037,6 +22062,156 @@ pub fn dns_entry_list_bytes(entries: &[DnsEntry]) -> usize {
                 + entry.hosted_zone_id.as_deref().unwrap_or_default().len()
         })
         .sum()
+}
+
+// =============================================================================
+// VPC endpoint connection notifications
+// =============================================================================
+
+/// The id prefix a stored connection notification is minted with.
+///
+/// The model publishes no pattern for `ConnectionNotificationId` (it is a plain `String` —
+/// `smithy_query(query="shape",shape="ConnectionNotificationId")`), so the id takes EC2's
+/// own `<prefix>-<hex>` form through [`ComAmazonawsEc2Amazonec2State::next_id`], with the
+/// prefix AWS names a connection notification with. It is minted by the store and never
+/// taken from a request.
+pub const CONNECTION_NOTIFICATION_ID_PREFIX: &str = "vpce-nfn";
+
+/// `InvalidConnectionNotificationId.NotFound` (HTTP 400): the request named a connection
+/// notification id this account holds no notification for — EC2's `Invalid<Member>.NotFound`
+/// for the member that named it, as [`INVALID_VPC_ENDPOINT_ID_NOT_FOUND`] is for
+/// `VpcEndpointId`.
+pub const INVALID_CONNECTION_NOTIFICATION_ID_NOT_FOUND: &str =
+    "InvalidConnectionNotificationId.NotFound";
+
+/// `InvalidConnectionNotificationId.Malformed` (HTTP 400): the request named something that
+/// is not a connection notification id at all, so there is nothing to look up.
+pub const INVALID_CONNECTION_NOTIFICATION_ID_MALFORMED: &str =
+    "InvalidConnectionNotificationId.Malformed";
+
+/// How [`id_not_found`] names this resource in the sentence it refuses with.
+pub const CONNECTION_NOTIFICATION_KIND: &str = "connection notification ID";
+
+/// Refuse a connection notification id this account holds no notification for, or one that
+/// is not such an id at all — the malformed question first, so "not an id of this kind" is
+/// never reported as "no such resource" ([`require_well_formed_id`]).
+pub fn require_known_connection_notification_id<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    connection_notification_id: &str,
+) -> Result<(), Scaffolded<E>> {
+    require_well_formed_id(
+        CONNECTION_NOTIFICATION_ID_PREFIX,
+        connection_notification_id,
+        INVALID_CONNECTION_NOTIFICATION_ID_MALFORMED,
+    )?;
+    if store
+        .vpc_endpoint_connection_notifications
+        .contains_key(connection_notification_id)
+    {
+        return Ok(());
+    }
+    Err(id_not_found(
+        INVALID_CONNECTION_NOTIFICATION_ID_NOT_FOUND,
+        CONNECTION_NOTIFICATION_KIND,
+        connection_notification_id,
+    ))
+}
+
+/// What one stored connection notification is created with, beside the id the store mints
+/// itself — the spec of the resource, in the same shape [`VpcEndpointConnectionSpec`] has
+/// for a connection, so the id, the stored key and the byte charge are decided in exactly
+/// one place.
+#[derive(Debug, Clone)]
+pub struct ConnectionNotificationSpec {
+    /// "The ID of the endpoint service" the notification is for
+    /// (`ConnectionNotification$ServiceId`), or `None` for a notification of an endpoint.
+    pub service_id: Option<String>,
+    /// "The ID of the VPC endpoint" the notification is for
+    /// (`ConnectionNotification$VpcEndpointId`), or `None` for one of an endpoint service.
+    pub vpc_endpoint_id: Option<String>,
+    /// "The type of notification" (`ConnectionNotification$ConnectionNotificationType`), a
+    /// member of the `ConnectionNotificationType` enum
+    /// ([`crate::ops::types::CONNECTION_NOTIFICATION_TYPE_VALUES`]).
+    pub connection_notification_type: String,
+    /// "The ARN of the SNS topic for the notification"
+    /// (`ConnectionNotification$ConnectionNotificationArn`).
+    pub connection_notification_arn: String,
+    /// "The events for the notification"
+    /// (`ConnectionNotification$ConnectionEvents`).
+    pub connection_events: Vec<String>,
+    /// "The state of the notification"
+    /// (`ConnectionNotification$ConnectionNotificationState`), a member of the
+    /// `ConnectionNotificationState` enum
+    /// ([`crate::ops::types::CONNECTION_NOTIFICATION_STATE_VALUES`]).
+    pub connection_notification_state: String,
+    /// "The Region for the endpoint service" (`ConnectionNotification$ServiceRegion`).
+    pub service_region: String,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another connection notification fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_transit_gateway_attachment_capacity`].
+    pub fn has_vpc_endpoint_connection_notification_capacity(&self) -> bool {
+        self.vpc_endpoint_connection_notifications.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Store a connection notification and answer the `ConnectionNotificationId` it was
+    /// given — or `None` when the store is at its ceiling and nothing was stored.
+    ///
+    /// The id is minted here rather than taken from `spec`, the way
+    /// [`Self::insert_vpc_endpoint_connection`] mints a connection id, and the
+    /// caller-chosen bytes the record holds are charged here
+    /// ([`connection_notification_payload_bytes`]), so no path can store them uncharged.
+    pub fn insert_vpc_endpoint_connection_notification(
+        &mut self,
+        spec: ConnectionNotificationSpec,
+    ) -> Option<String> {
+        if !self.has_vpc_endpoint_connection_notification_capacity() {
+            return None;
+        }
+        let connection_notification_id = self.next_id(CONNECTION_NOTIFICATION_ID_PREFIX);
+        let notification = ConnectionNotification {
+            connection_notification_id: Some(connection_notification_id.clone()),
+            service_id: spec.service_id,
+            vpc_endpoint_id: spec.vpc_endpoint_id,
+            connection_notification_type: Some(spec.connection_notification_type),
+            connection_notification_arn: Some(spec.connection_notification_arn),
+            connection_events: Some(spec.connection_events),
+            connection_notification_state: Some(spec.connection_notification_state),
+            service_region: Some(spec.service_region),
+        };
+        self.add_stored_bytes(connection_notification_payload_bytes(&notification));
+        self.vpc_endpoint_connection_notifications
+            .insert(connection_notification_id.clone(), notification);
+        Some(connection_notification_id)
+    }
+}
+
+/// The bytes one stored connection notification holds: the fixed overhead of the record and
+/// the key it is stored under, plus the caller-chosen parts — the SNS topic ARN and the
+/// event names. The ids, the state, the type and the Region are derived by this module or
+/// bounded by the model, so they are fixed-size, which is what the overhead constant stands
+/// for.
+///
+/// The ONE definition of that charge, the way [`vpc_endpoint_connection_payload_bytes`] is
+/// for a connection: a writer charges exactly it, and a removal path must give back the same
+/// number.
+pub fn connection_notification_payload_bytes(notification: &ConnectionNotification) -> usize {
+    let text_bytes = |value: Option<&String>| -> usize { value.map_or(0, String::len) };
+    let event_bytes: usize = notification
+        .connection_events
+        .iter()
+        .flatten()
+        .map(String::len)
+        .sum();
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(text_bytes(notification.connection_notification_id.as_ref()))
+        .saturating_add(text_bytes(notification.connection_notification_arn.as_ref()))
+        .saturating_add(text_bytes(notification.service_id.as_ref()))
+        .saturating_add(text_bytes(notification.vpc_endpoint_id.as_ref()))
+        .saturating_add(text_bytes(notification.service_region.as_ref()))
+        .saturating_add(event_bytes)
 }
 
 // =============================================================================
