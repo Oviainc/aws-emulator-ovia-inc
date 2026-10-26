@@ -47,6 +47,8 @@ mod forced_state_actions;
 mod harness;
 #[path = "all/insight_rules.rs"]
 mod insight_rules;
+#[path = "all/list_metric_streams.rs"]
+mod list_metric_streams;
 #[path = "all/log_alarms.rs"]
 mod log_alarms;
 #[path = "all/managed_insight_rules.rs"]

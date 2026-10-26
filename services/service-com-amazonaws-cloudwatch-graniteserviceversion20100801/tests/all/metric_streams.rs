@@ -579,6 +579,23 @@ async fn get_metric_stream_reports_a_stream_that_was_never_configured_as_missing
             (404, "ResourceNotFoundException"),
             "case {name:?}: expected HTTP 404 ResourceNotFoundException, got {status} {body}"
         );
+        // The refusal names the resource through the two members that carry it, and its
+        // message is empty whichever name was asked for: nothing of the request is echoed
+        // back in a sentence.
+        assert_eq!(
+            (
+                text(&body, "ResourceType"),
+                text(&body, "ResourceId"),
+                text(&body, "Message")
+            ),
+            (
+                Some("MetricStream".to_string()),
+                Some(name.to_string()),
+                Some(String::new())
+            ),
+            "case {name:?}: expected the refusal to name the missing stream with an empty \
+             message, got {body}"
+        );
     }
 }
 

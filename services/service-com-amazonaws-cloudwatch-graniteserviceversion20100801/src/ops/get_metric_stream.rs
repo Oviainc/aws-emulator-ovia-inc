@@ -179,10 +179,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let stored = store.metric_streams.get(&input.name).ok_or_else(|| {
+            // "The named resource does not exist." is what the SHAPE documents, and the
+            // refusal itself carries an EMPTY message: the recorded refusal's `Message`
+            // member is present and empty, and the resource is named by the two members
+            // that carry it rather than by a sentence. The `Some(String::new())` is that
+            // empty member rather than an absent one.
             GetMetricStreamErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 resource_type: Some("MetricStream".to_string()),
                 resource_id: Some(input.name.clone()),
-                message: Some(format!("the metric stream {} does not exist", input.name)),
+                message: Some(String::new()),
             })
         })?;
         Ok(stored.stream.clone())

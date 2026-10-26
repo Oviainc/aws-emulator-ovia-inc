@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMetricStreams
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMetricStreams`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMetricStreams::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports every metric stream this service's store holds, a page at a time. Implemented
+//! here, and the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +142,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMetricStreams` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMetricStreamsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMetricStreams"))
+        // A pure read: every stream is reported exactly as `PutMetricStream` /
+        // `StartMetricStreams` / `StopMetricStreams` last left it, and nothing is written.
+        // The streams are keyed by name in one store, so nothing here reads the Region the
+        // request was signed for either — each entry carries the ARN its own writer minted.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListMetricStreamsErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch metric stream store is unavailable".into()),
+            })
+        })?;
+
+        // "The maximum number of results to return in one operation."
+        // (`ListMetricStreamsInput$MaxResults`), whose modelled range is 1..500 — so the
+        // boundary validator has already refused anything outside it, and the widest page
+        // the member can ask for is what an omitted value gets. A value that somehow
+        // arrives outside that range is read at the nearest modelled bound rather than
+        // dropped, so a zero can never make the page empty and the paging non-terminating.
+        const MAX_PAGE_SIZE: usize = 500;
+        const MIN_PAGE_SIZE: usize = 1;
+        let page_size = match input.max_results {
+            None => MAX_PAGE_SIZE,
+            Some(requested) => usize::try_from(requested)
+                .unwrap_or(MIN_PAGE_SIZE)
+                .clamp(MIN_PAGE_SIZE, MAX_PAGE_SIZE),
+        };
+
+        // "Include this value, if it was returned by the previous call, to get the next set
+        // of metric streams." (`ListMetricStreamsInput$NextToken`) — a token this service
+        // did not issue names no page, which is the `InvalidNextToken` this operation
+        // models.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListMetricStreamsErrorModeled::InvalidNextToken(InvalidNextToken {
+                    message: Some(INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+                })
+            })?),
+        };
+
+        let store = state.lock();
+        // Ordered by stream name so repeated calls report the same order, and so a token
+        // can simply name the stream the next page starts at: a page boundary keeps naming
+        // the same stream even when streams are created or deleted between two calls.
+        let mut names: Vec<&String> = store.metric_streams.keys().collect();
+        names.sort_unstable();
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => names.partition_point(|name| name.as_str() < cursor),
+        };
+        let page = names.get(from..).unwrap_or_default();
+        // "The token that marks the start of the next batch of returned results."
+        // (`ListMetricStreamsOutput$NextToken`) — present only when a stream is left over,
+        // so the last page terminates the walk.
+        let next_token = page
+            .get(page_size)
+            .map(|name| crate::state::encode_page_token(name));
+
+        let entries: Vec<MetricStreamEntry> = page
+            .iter()
+            .take(page_size)
+            .filter_map(|name| store.metric_streams.get(*name))
+            .map(|stored| entry_of(&stored.stream))
+            .collect();
+
+        Ok(ListMetricStreamsOutput {
+            entries: Some(entries),
+            next_token,
+        })
+    }
+}
+
+/// How CloudWatch words this operation's refusal of a `NextToken` it did not issue: one
+/// fixed sentence naming the member and carrying nothing of the request — neither the token
+/// nor why it was rejected.
+///
+/// This is the wording MEASURED for this operation, which is not the `InvalidNextToken`
+/// shape's documentation sentence ("The next token specified is invalid."): the refusal's
+/// wording is per operation, and the other refusal of this service that has been measured
+/// carries an EMPTY message instead (`crate::ops::get_metric_data`), so neither is copied
+/// onto the other.
+const INVALID_NEXT_TOKEN_MESSAGE: &str = "Invalid NextToken";
+
+/// The listing of one stored metric stream.
+///
+/// `MetricStreamEntry` is the SUBSET of a stream's configuration this listing carries —
+/// "This structure contains the configuration information about one metric stream."
+/// (`MetricStreamEntry`) — so each member it models is copied from the stored stream, and
+/// the configuration it does not model (the namespace filters, the statistics
+/// configurations, the IAM role and whether source-account metrics are included) is left to
+/// `GetMetricStream`, the reader that does model it.
+fn entry_of(stream: &GetMetricStreamOutput) -> MetricStreamEntry {
+    MetricStreamEntry {
+        arn: stream.arn.clone(),
+        creation_date: stream.creation_date,
+        last_update_date: stream.last_update_date,
+        name: stream.name.clone(),
+        firehose_arn: stream.firehose_arn.clone(),
+        state: stream.state.clone(),
+        output_format: stream.output_format.clone(),
     }
 }
