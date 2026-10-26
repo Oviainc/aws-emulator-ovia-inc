@@ -22,7 +22,7 @@ use crate::ops::types::{
     AssetSummary, DomainDescription, DomainEntryPoint, DomainSummary, PackageGroupDescription,
     PackageGroupOriginConfiguration, PackageGroupOriginRestriction, PackageGroupReference,
     PackageGroupSummary, PackageOriginConfiguration, PackageOriginRestrictions, PackageSummary,
-    PackageVersionDescription, PackageVersionOrigin, RepositoryDescription,
+    PackageVersionDescription, PackageVersionOrigin, PackageVersionSummary, RepositoryDescription,
     RepositoryExternalConnectionInfo, RepositorySummary, ResourcePolicy, Tag,
     UpstreamRepositoryInfo, ValidationException, PACKAGE_GROUP_ORIGIN_RESTRICTION_TYPE_VALUES,
 };
@@ -1381,6 +1381,39 @@ impl Package {
         self.origin_restrictions.publish != ORIGIN_RESTRICTION_BLOCK
     }
 
+    /// `defaultDisplayVersion`: the version of this package a client should DISPLAY, or
+    /// `None` when the package holds none to display.
+    ///
+    /// The member's own documentation gives the rule per format: "For Maven and PyPI
+    /// packages, it's the most recently published package version. For npm packages, it's
+    /// the version referenced by the latest tag. If the latest tag is not set, it's the
+    /// most recently published package version"
+    /// (`smithy_query(query="doc",shape="ListPackageVersionsResult",member="defaultDisplayVersion")`).
+    /// No version this service holds carries a dist-tag — versions are published through
+    /// `PublishPackageVersion`, which takes generic assets and no package metadata — so
+    /// every format falls to the same branch: the most recently published version.
+    ///
+    /// Only a version in [`PACKAGE_VERSION_STATUS_PUBLISHED`] is a candidate, because that
+    /// is the one status in which a version is both listed and resolvable: an `Unlisted`
+    /// version is by its own definition not displayed, and an `Archived`, `Disposed` or
+    /// `Unfinished` one is not a version a client can resolve. A package holding no such
+    /// version therefore reports no display version rather than naming one a client could
+    /// not fetch.
+    ///
+    /// Ties are broken by the greater version string, so the answer is a function of the
+    /// stored records and not of the order they were walked in.
+    pub fn default_display_version(&self) -> Option<String> {
+        self.versions
+            .values()
+            .filter(|version| version.status == PACKAGE_VERSION_STATUS_PUBLISHED)
+            .max_by(|left, right| {
+                left.published_time
+                    .cmp(&right.published_time)
+                    .then_with(|| left.version.cmp(&right.version))
+            })
+            .map(|version| version.version.clone())
+    }
+
     /// The total size of every asset this package's versions hold.
     pub fn asset_size_bytes(&self) -> i64 {
         self.versions.values().fold(0i64, |total, version| {
@@ -1477,11 +1510,75 @@ impl PackageVersion {
         }
     }
 
+    /// The modelled `PackageVersionSummary` for this record — what `ListPackageVersions`
+    /// returns, the listing projection of the same record [`Self::description`] reports.
+    ///
+    /// Every member is derived from the stored version, so a summary can never disagree
+    /// with the description of the same version: the `revision` is the same derived token
+    /// ([`Self::revision`]) and the `origin` is the same entry point and origin type. The
+    /// coordinate members a description carries (`format`, `namespace`, `packageName`) are
+    /// NOT repeated per summary — the listing reports the package's coordinate once,
+    /// beside the page.
+    pub fn summary(&self) -> PackageVersionSummary {
+        PackageVersionSummary {
+            version: self.version.clone(),
+            revision: Some(self.revision()),
+            status: self.status.clone(),
+            origin: Some(PackageVersionOrigin {
+                domain_entry_point: Some(DomainEntryPoint {
+                    repository_name: Some(self.entry_point_repository.clone()),
+                    // Set only for a version pulled through an external connection.
+                    external_connection_name: None,
+                }),
+                origin_type: Some(self.origin_type.clone()),
+            }),
+        }
+    }
+
     /// The total size of this version's assets.
     pub fn asset_size_bytes(&self) -> i64 {
         self.assets.values().fold(0i64, |total, asset| {
             total.saturating_add(asset.size_bytes())
         })
+    }
+}
+
+/// The `PackageVersionSortType` value that orders a version listing by when each version
+/// was published. The enum models exactly this one value
+/// (`smithy_query(query="shape",shape="PackageVersionSortType")`), so a listing is ordered
+/// either by it or by the stored version order.
+pub const PACKAGE_VERSION_SORT_PUBLISHED_TIME: &str = "PUBLISHED_TIME";
+
+/// How many decimal digits [`package_version_order_key`] pads an inverted instant to:
+/// enough for every value of the `u64` nanosecond counter it inverts, so the padded
+/// numbers compare as numbers do when compared as text.
+const INVERTED_INSTANT_DIGITS: usize = 20;
+
+/// The key a package version is ORDERED (and therefore paginated) under in a
+/// `ListPackageVersions` page, for the `sortBy` the request asked for.
+///
+/// `None` is the stored order: the version string, which is the key the version is held
+/// under. [`PACKAGE_VERSION_SORT_PUBLISHED_TIME`] orders the MOST RECENTLY PUBLISHED
+/// version first — the direction the operation's own `defaultDisplayVersion` names ("the
+/// most recently published package version") — by inverting the publish instant into a
+/// fixed-width decimal, so text order is reverse time order. The version string is
+/// appended to keep the key unique when two versions carry the same instant, so no page
+/// can drop or repeat a version whatever the clock resolution was.
+pub fn package_version_order_key(version: &PackageVersion, sort_by: Option<&str>) -> String {
+    match sort_by {
+        Some(PACKAGE_VERSION_SORT_PUBLISHED_TIME) => {
+            let nanos = version
+                .published_time
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos());
+            let inverted = u128::from(u64::MAX).saturating_sub(nanos);
+            format!(
+                "{inverted:0width$}/{}",
+                version.version,
+                width = INVERTED_INSTANT_DIGITS
+            )
+        }
+        _ => version.version.clone(),
     }
 }
 
@@ -1618,6 +1715,26 @@ pub fn asset_cursor_scope(
     format!(
         "assets/{domain}/{repository}/{}/{version}",
         package_key(format, namespace, package)
+    )
+}
+
+/// The cursor scope of `ListPackageVersions` for one package, in one ordering. Scoped per
+/// repository AND per package coordinate ([`package_key`] carries the format and the
+/// namespace) AND per `sortBy`, because the cursor names a place in the ORDER the page was
+/// built in: a cursor minted while listing in publish-time order must not resolve as a key
+/// in the stored version order, nor in another package's or repository's listing.
+pub fn package_version_cursor_scope(
+    domain: &str,
+    repository: &str,
+    format: &str,
+    namespace: Option<&str>,
+    package: &str,
+    sort_by: Option<&str>,
+) -> String {
+    format!(
+        "package-versions/{domain}/{repository}/{}/{}",
+        package_key(format, namespace, package),
+        sort_by.unwrap_or("STORED_ORDER")
     )
 }
 

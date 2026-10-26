@@ -145,7 +145,7 @@ async fn update_package_group(
 
 /// `UpdatePackageVersionsStatus` for the package a [`Publish`] addresses: the coordinate is
 /// `httpQuery`-bound, the versions and the preconditions travel in the BODY.
-async fn update_versions_status(
+pub(crate) async fn update_versions_status(
     router: &MultiServiceRouter,
     request: &Publish,
     versions: &[&str],
@@ -210,7 +210,7 @@ async fn dispose_versions(
 }
 
 /// `PutPackageOriginConfiguration` for the package a [`Publish`] addresses.
-async fn put_origin_configuration(
+pub(crate) async fn put_origin_configuration(
     router: &MultiServiceRouter,
     request: &Publish,
     publish_mode: &str,

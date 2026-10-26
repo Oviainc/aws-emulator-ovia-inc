@@ -71,3 +71,5 @@ mod package_version_asset_listing;
 mod sub_package_group_listing;
 #[path = "all/authorization_token.rs"]
 mod authorization_token;
+#[path = "all/package_version_listing.rs"]
+mod package_version_listing;

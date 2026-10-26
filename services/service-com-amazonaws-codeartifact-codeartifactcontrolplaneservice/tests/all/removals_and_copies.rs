@@ -21,8 +21,9 @@
 //!    * `DeletePackageGroup` removes the group, so `DescribePackageGroup` for its pattern
 //!      is refused `ResourceNotFoundException` (404) and the pattern can be created again.
 //!    * `DeletePackageVersions` removes the named versions, so `DescribePackageVersion` is
-//!      refused for each; and a package the delete leaves with no versions is removed with
-//!      them, so `DescribePackage` for it is refused too.
+//!      refused for each; the PACKAGE survives even when its last version goes, because
+//!      deleting every version of a package is not deleting the package (that is
+//!      `DeletePackage`), so `DescribePackage` still answers for it.
 //! 2. A removal removes ONLY what it names: the tags, groups, versions and packages the
 //!    request did not name read back exactly as before.
 //! 3. A per-version answer reports each named version in exactly one of the two modelled
@@ -884,15 +885,15 @@ struct DeleteCase {
 }
 
 /// RULES 1, 2 and 3: a delete removes the versions it names, reports each named version in
-/// exactly one map, and leaves the rest readable — and the package goes when its last
-/// version does.
+/// exactly one map, and leaves the rest readable — and the PACKAGE survives, however many
+/// of its versions went.
 ///
 /// Rows differ along what the rules generalise over: how many versions the package holds
 /// (1, 3), how many the request names (1, 2, all, one that is not held), whether a named
 /// version exists, whether an `expectedStatus` is pinned and whether it matches, and
 /// whether the package has a namespace.
 #[tokio::test]
-async fn deleting_package_versions_commits_and_prunes_an_emptied_package() {
+async fn deleting_package_versions_commits_and_keeps_the_package() {
     let cases = vec![
         DeleteCase {
             label: "the only version",
@@ -1052,24 +1053,16 @@ async fn deleting_package_versions_commits_and_prunes_an_emptied_package() {
             }
         }
 
-        // RULE 1: a package the delete left with no versions is gone with them; one that
-        // still holds a version is still there.
+        // RULE 1: the package itself is NOT what a version delete removes — it keeps
+        // answering whether or not it has versions left (`DeletePackage` is the operation
+        // that removes a package).
         let versions_left = case.published.len() - removed.len();
         let described = describe_package(&router, &pkg).await;
-        if versions_left == 0 {
-            assert_eq!(
-                (described.status, described.code()),
-                (404, "ResourceNotFoundException".to_string()),
-                "case {:?}: the package held no versions, so DescribePackage must be 404, got {described:?}",
-                case.label
-            );
-        } else {
-            assert_eq!(
-                described.status, 200,
-                "case {:?}: the package still holds {versions_left} version(s), so it must read back, got {described:?}",
-                case.label
-            );
-        }
+        assert_eq!(
+            described.status, 200,
+            "case {:?}: the package holds {versions_left} version(s) and must still read back, got {described:?}",
+            case.label
+        );
 
         // The domain's derived assetSizeBytes follows the assets that are left.
         let domain = call(&router, "GET", "/v1/domain?domain=version-removal", None).await;
@@ -1089,13 +1082,13 @@ async fn deleting_package_versions_commits_and_prunes_an_emptied_package() {
     }
 }
 
-/// RULE 1's boundary: the prune is tied to the REMOVAL, not to the version count. A
-/// package `PutPackageOriginConfiguration` created with no versions ("When called on a
-/// package that does not exist, a package is created in the repository with no versions
-/// and the requested restrictions are set on the package") stays readable across a delete
+/// RULE 1 for a package that holds no versions at all: a package
+/// `PutPackageOriginConfiguration` created ("When called on a package that does not exist,
+/// a package is created in the repository with no versions and the requested restrictions
+/// are set on the package") keeps both its record and its restrictions across a delete
 /// that removed nothing.
 #[tokio::test]
-async fn a_delete_that_removed_nothing_prunes_nothing() {
+async fn a_delete_that_removed_nothing_changes_nothing() {
     let router = emulator_with_repositories("prune-bounds", &["repo"]).await;
     let pkg = Pkg::new("prune-bounds", "repo", "configured-only");
 

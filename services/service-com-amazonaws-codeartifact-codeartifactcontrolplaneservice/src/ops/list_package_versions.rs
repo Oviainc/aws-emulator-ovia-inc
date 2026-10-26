@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPackageVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPackageVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPackageVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the versions the addressed package HOLDS as `PackageVersionSummary`, filtered by
+//! `status` and `originType` (both exact, both closed enums), ordered by `sortBy`
+//! ([`crate::state::package_version_order_key`]) and paginated with the opaque cursor
+//! [`crate::state::encode_token`] mints, beside the package's own coordinate and its
+//! `defaultDisplayVersion` ([`crate::state::Package::default_display_version`]). A pure
+//! read.
 //!
 //! ## Shape of an operation
 //!
@@ -196,20 +193,149 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPackageVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPackageVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListPackageVersionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the CodeArtifact store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        // A read: the guard is taken immutably, so no later caller sees anything move
+        // because this package's versions were listed.
+        let store = state.lock();
+
+        let Some(domain) = store.domain(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(not_found(
+                crate::state::domain_not_found_message(&input.domain, input.domain_owner.as_deref()),
+                &input.domain,
+                crate::state::DOMAIN_RESOURCE_TYPE,
+            ));
+        };
+        let Some(repository) = domain.repositories.get(&input.repository) else {
+            return Err(not_found(
+                crate::state::repository_not_found_message(
+                    &input.domain,
+                    input.domain_owner.as_deref(),
+                    &input.repository,
+                ),
+                &input.repository,
+                crate::state::REPOSITORY_RESOURCE_TYPE,
+            ));
+        };
+        // A package is identified by its whole `(format, namespace, name)` triple: the same
+        // name in another format, or under another namespace, is another package, and a
+        // repository that holds no such package has no versions to list — reported as the
+        // missing PACKAGE, the resource the request addressed. A package the repository DOES
+        // hold lists what it holds, even when that is nothing: a package outlives its
+        // versions (`DeletePackage`, not `DeletePackageVersions`, is what removes one).
+        let Some(package) =
+            repository.package(&input.format, input.namespace.as_deref(), &input.package)
+        else {
+            return Err(not_found(
+                crate::state::package_not_found_message(&input.package, &input.repository),
+                &input.package,
+                crate::state::PACKAGE_RESOURCE_TYPE,
+            ));
+        };
+
+        // A `nextToken` this service did not mint for THIS package's listing, in THIS
+        // order, cannot name a place in it. Read AFTER the coordinate resolves, so a
+        // request naming a resource this service does not hold is answered as not-found
+        // whatever its cursor says.
+        let scope = crate::state::package_version_cursor_scope(
+            &input.domain,
+            &input.repository,
+            &input.format,
+            input.namespace.as_deref(),
+            &input.package,
+            input.sort_by.as_deref(),
+        );
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_token(&scope, token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(ListPackageVersionsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: "nextToken is not a pagination token this service issued \
+                                      for this listing"
+                                .to_string(),
+                            reason: Some(crate::state::VALIDATION_REASON_FIELD_FAILED.to_string()),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        // The versions re-keyed by the order this request asked for, which is the order the
+        // page is cut from and the order its cursor names a place in: the stored version
+        // order by default, most recently published first under `sortBy`.
+        let ordered: ::std::collections::BTreeMap<String, &crate::state::PackageVersion> = package
+            .versions
+            .values()
+            .map(|version| {
+                (
+                    crate::state::package_version_order_key(version, input.sort_by.as_deref()),
+                    version,
+                )
+            })
+            .collect();
+
+        // Filter first, then page: a page is `maxResults` MATCHING versions, so a filter
+        // that excludes most of the package does not return short pages.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPackageVersions"))
+        // Both filters the model declares are ANDed and matched EXACTLY against the stored
+        // record — `status` and `originType` are closed enums, and each selects the versions
+        // carrying that value ("only package versions with the provided originType will be
+        // returned"). Neither is defaulted: "package versions of all statuses will be
+        // returned by default when calling list-package-versions with no status parameter".
+        let (versions, next_token) = crate::state::page_of(
+            &ordered,
+            &scope,
+            cursor.as_deref(),
+            input.max_results,
+            |_key, version| {
+                input
+                    .status
+                    .as_deref()
+                    .is_none_or(|status| status == version.status)
+                    && input
+                        .origin_type
+                        .as_deref()
+                        .is_none_or(|origin_type| origin_type == version.origin_type)
+            },
+            |version| version.summary(),
+        );
+
+        Ok(ListPackageVersionsOutput {
+            // The STORED coordinate, not the requested strings — the lookup is exact, so
+            // they agree, and the answer reports the record.
+            format: Some(package.format.clone()),
+            namespace: package.namespace.clone(),
+            package: Some(package.name.clone()),
+            // A property of the PACKAGE, so it is the same whatever this request filtered
+            // or paged to: a client reading page two still learns which version to display.
+            default_display_version: package.default_display_version(),
+            next_token,
+            // Present even when empty: a client iterating `versions` must see "no version
+            // matched", not "no information".
+            versions: Some(versions),
+        })
     }
+}
+
+/// A `ResourceNotFoundException` (404) naming the resource that was addressed, so a caller
+/// can tell an unknown domain or repository from an unknown package. Each `resourceType` is
+/// one of the modelled `ResourceType` values this service names once, in [`crate::state`].
+fn not_found(message: String, resource_id: &str, resource_type: &str) -> ListPackageVersionsError {
+    ListPackageVersionsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+        resource_id: Some(resource_id.to_string()),
+        resource_type: Some(resource_type.to_string()),
+    })
+    .into()
 }

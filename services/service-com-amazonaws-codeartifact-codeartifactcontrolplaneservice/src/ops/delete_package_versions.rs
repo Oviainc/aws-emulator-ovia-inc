@@ -18,12 +18,14 @@
 //! * the removal is committed to the store, so neither `DescribePackageVersion` nor
 //!   `ListPackageVersions` can still report a deleted version, and the domain's derived
 //!   `assetSizeBytes` drops by what its assets held;
-//! * a package the delete leaves holding NO versions is removed with them: the record
-//!   exists to hold a package's versions, so once the last one is deleted the package is
-//!   no longer in the repository and `DescribePackage` for it answers 404. A package that
-//!   already held no versions (one `PutPackageOriginConfiguration` created) is untouched —
-//!   this delete removed nothing, and a reporting path may not prune what it did not
-//!   change.
+//! * the PACKAGE itself survives, even when this call removed its last version: deleting
+//!   every version of a package is not deleting the package, which is what the separate
+//!   `DeletePackage` operation does ("Deletes a package and all associated package
+//!   versions. A deleted package cannot be restored. To delete one or more package
+//!   versions, use the DeletePackageVersions API" — that operation's own documentation).
+//!   So `DescribePackage` keeps answering for an emptied package, with the origin
+//!   configuration it carried, and `ListPackageVersions` keeps answering 200 with an empty
+//!   `versions` list.
 //!
 //! ## Shape of an operation
 //!
@@ -301,14 +303,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // A package record holds a package's versions; once this delete removed the last
-        // one, the package is no longer in the repository and `DescribePackage` for it
-        // answers 404. Guarded on having actually deleted something, so a call that
-        // removed nothing cannot prune a package that legitimately holds no versions (the
-        // record `PutPackageOriginConfiguration` creates for a package with none).
-        if !successful.is_empty() && package.versions.is_empty() {
-            repository.packages.remove(&key);
-        }
+        // The package record stays, however many versions this call removed: a package is
+        // a resource of its own, carrying the origin configuration that decides what may
+        // enter it, and the operation that deletes it is `DeletePackage` ("Deletes a
+        // package and all associated package versions … To delete one or more package
+        // versions, use the DeletePackageVersions API"). Pruning it here would make this
+        // operation the other one for its last version, and would lose the configuration a
+        // caller set on the package.
 
         Ok(DeletePackageVersionsOutput {
             successful_versions: Some(successful),
