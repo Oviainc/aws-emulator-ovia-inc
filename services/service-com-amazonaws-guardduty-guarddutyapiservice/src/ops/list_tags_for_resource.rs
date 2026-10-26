@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the tags the resource its `ResourceArn` names carries, and
+//! persists nothing — this is a pure report.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The ARN is resolved — not parsed and trusted — through
+//! [`crate::state::ComAmazonawsGuarddutyGuarddutyapiserviceState::tagged_resource_tags`],
+//! the read-only twin of the seam `TagResource` and `UntagResource` write through, so
+//! what this reports is the map those two left on the resource's OWN record, and agrees
+//! with the `Tags` member of that resource's `Get`/`Describe`.
+//!
+//! The `Tags` member is ALWAYS reported, through the one tag-map rule every read of
+//! this service shares ([`crate::state::reported_tags`]): a resource nothing tagged
+//! reports an EMPTY map rather than no member at all.
+//!
+//! An ARN this endpoint resolves no resource for is refused with HTTP 400 under the
+//! `InvalidInputException` class rather than answered with an empty map.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +151,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListTagsForResourceErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+
+        // A pure report: the lock is taken IMMUTABLY, so nothing a later caller
+        // reads can move here.
+        let state = state.lock();
+        let Some(tags) = state.tagged_resource_tags(&region, &input.resource_arn) else {
+            // Classified from the REQUEST, the way every other unresolvable
+            // reference on this service is classified, and without echoing the ARN.
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::resource_arn_rejection(&input.resource_arn),
+            ));
+        };
+
+        // "When invoked, this operation returns all assigned tags for a given
+        // resource" (this operation's own documentation): every key the resource
+        // carries, with the value it carries, and nothing of any other resource's.
+        Ok(ListTagsForResourceOutput {
+            // Projected through the ONE tag-map rule every read of this service
+            // shares ([`crate::state::reported_tags`]): the member is always
+            // reported, empty when nothing tagged the resource.
+            tags: crate::state::reported_tags(tags),
+        })
     }
 }

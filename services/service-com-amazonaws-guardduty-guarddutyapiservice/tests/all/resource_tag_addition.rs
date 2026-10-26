@@ -73,7 +73,7 @@ fn merged_with(added: &[(&str, &str)]) -> Value {
 ///
 /// `/tags/{ResourceArn}` binds a NON-GREEDY URI label and `Tags` travels in the body
 /// under the `jsonName` `tags` (`smithy_query(operation="TagResource")`).
-async fn tag_in(router: &Router, region: &str, arn: &str, tags: &Value) -> (u16, Value) {
+pub(crate) async fn tag_in(router: &Router, region: &str, arn: &str, tags: &Value) -> (u16, Value) {
     call_in(
         router,
         region,

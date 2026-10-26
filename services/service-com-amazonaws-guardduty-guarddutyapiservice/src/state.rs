@@ -7847,6 +7847,47 @@ pub fn tag_limit_message() -> String {
 
 impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// The tag map of the resource `arn` names, as `region`'s endpoint holds it,
+    /// for an operation that only REPORTS tags.
+    ///
+    /// Resolution is exactly [`Self::tagged_resource_tags_mut`]'s — same scope
+    /// check, same records — so a report and a write cannot disagree about which
+    /// ARN names which resource; this one borrows the store immutably, so
+    /// reporting tags cannot move anything a later caller reads.
+    pub fn tagged_resource_tags(
+        &self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&BTreeMap<String, String>> {
+        let resource = parse_tagged_resource_arn(arn)?;
+        if resource.partition != PARTITION
+            || resource.region != region
+            || resource.account_id != ::engine::emulator_account_id()
+        {
+            return None;
+        }
+        let detector = self.detector_in(region, &resource.detector_id)?;
+        let Some((sub_resource, id)) = &resource.sub_resource else {
+            return Some(&detector.tags);
+        };
+        match sub_resource {
+            TaggedSubResource::Filter => detector.filters.get(id).map(|f| &f.tags),
+            TaggedSubResource::IpSet => detector.ip_sets.get(id).map(|s| &s.tags),
+            TaggedSubResource::ThreatIntelSet => {
+                detector.threat_intel_sets.get(id).map(|s| &s.tags)
+            }
+            TaggedSubResource::TrustedEntitySet => {
+                detector.trusted_entity_sets.get(id).map(|s| &s.tags)
+            }
+            TaggedSubResource::ThreatEntitySet => {
+                detector.threat_entity_sets.get(id).map(|s| &s.tags)
+            }
+            TaggedSubResource::PublishingDestination => {
+                detector.publishing_destinations.get(id).map(|d| &d.tags)
+            }
+        }
+    }
+
+    /// The tag map of the resource `arn` names, as `region`'s endpoint holds it,
     /// for an operation that WRITES tags.
     ///
     /// `None` unless the ARN names a resource this endpoint serves: the scope it

@@ -283,7 +283,7 @@ pub(crate) async fn tagged_resources(
 }
 
 /// Remove `keys` from the resource `arn` names, through `region`'s endpoint.
-async fn untag_in(router: &Router, region: &str, arn: &str, keys: &[&str]) -> (u16, Value) {
+pub(crate) async fn untag_in(router: &Router, region: &str, arn: &str, keys: &[&str]) -> (u16, Value) {
     let query = keys
         .iter()
         .map(|key| format!("tagKeys={}", query_value(key)))

@@ -145,6 +145,8 @@ mod publishing_destination_update;
 mod request_region_partition_bounds;
 #[path = "all/resource_tag_addition.rs"]
 mod resource_tag_addition;
+#[path = "all/resource_tag_listing.rs"]
+mod resource_tag_listing;
 #[path = "all/resource_tag_removal.rs"]
 mod resource_tag_removal;
 #[path = "all/sample_finding_catalog.rs"]
