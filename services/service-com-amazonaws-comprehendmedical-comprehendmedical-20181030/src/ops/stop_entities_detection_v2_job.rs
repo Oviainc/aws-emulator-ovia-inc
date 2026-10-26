@@ -4,7 +4,8 @@
 //!
 //! IMPLEMENTED. A job still running is moved to `STOP_REQUESTED`, from where the clock
 //! owes its move to `STOPPED` with an `EndTime`; a job that already reached a terminal
-//! status keeps it. The stored job is what a later describe or list reports.
+//! status keeps it and the stop is refused with `InvalidRequestException`. The stored job
+//! is what a later describe or list reports.
 //!
 //! ## Shape of an operation
 //!
@@ -168,10 +169,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         // Apply what the clock owes first: a job that finished before the stop could
-        // take effect keeps the status it reached. "Stops a medical entities detection
-        // job in progress" — only a job still running has a stop to request.
+        // take effect keeps the status it reached, and a stop naming a job that already
+        // finished is refused rather than answered as though it took effect. "Stops a
+        // medical entities detection job in progress" — only a job still running has a
+        // stop to request.
         job.advance(now);
-        job.request_stop(now);
+        if let Err(already_terminal) = job.request_stop(now) {
+            return Err(
+                StopEntitiesDetectionV2JobErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(already_terminal.message().to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
 
         Ok(StopEntitiesDetectionV2JobOutput {
             job_id: Some(input.job_id),

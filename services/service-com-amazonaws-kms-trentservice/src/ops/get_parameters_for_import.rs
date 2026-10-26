@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetParametersForImport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetParametersForImport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: generates the wrapping key pair and the import token a caller needs to
+//! import key material for the KMS key a `KeyId` names. This is the ONLY file to touch
+//! for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetParametersForImport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The `PublicKey` is the public half, as X.509 `SubjectPublicKeyInfo` DER, of an RSA
+//! key pair generated here for this one request; the PRIVATE half is persisted against
+//! the import token ([`crate::state::ImportParameters`]) and never leaves this process,
+//! which is what lets `ImportKeyMaterial` open the key material a caller wraps with the
+//! public half. The key pair comes from `aws-lc-rs`, so the public key really is a
+//! wrapping key and not a blob shaped like one.
+//!
+//! Importing key material only applies to a key created with no key material, so this
+//! operation's precondition is the key's ORIGIN: a key whose material KMS generated has
+//! nothing to import, and is refused without being touched.
 //!
 //! ## Shape of an operation
 //!
@@ -221,18 +226,178 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetParametersForImport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetParametersForImportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetParametersForImport"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal("the KMS state store is unavailable"));
+        };
+
+        let region = crate::state::request_region(ctx);
+
+        // "Specify the key ID or key ARN of the KMS key"
+        // (`smithy_query(query="doc",shape="GetParametersForImportRequest",member="KeyId")`):
+        // an alias is not an identifier this operation accepts, which is what its
+        // modelled `InvalidArnException` reports — as it does for an ARN that is not a
+        // KMS ARN at all.
+        if crate::state::names_an_alias(&input.key_id) {
+            return Err(invalid_arn(&input.key_id));
+        }
+
+        // Every check is made against the store BEFORE the key pair is generated, and
+        // the lock is released with this block: generating an RSA key pair is seconds of
+        // CPU for the longest spec, and it must hold no other request out of the KMS
+        // state while it runs.
+        let now = ::std::time::SystemTime::now();
+        let (key_arn, key_id) = {
+            let state = state.lock();
+            let key = match state.resolve(&region, &input.key_id) {
+                crate::state::KeyRef::Found(key) => key,
+                crate::state::KeyRef::UnauthorizedAccount => {
+                    return Err(crate::state::unauthorized_account(
+                        Self::NAME,
+                        &input.key_id,
+                    ));
+                }
+                crate::state::KeyRef::MalformedArn => {
+                    return Err(invalid_arn(&input.key_id));
+                }
+                crate::state::KeyRef::NotFound => {
+                    return Err(GetParametersForImportErrorModeled::NotFoundException(
+                        NotFoundException {
+                            message: Some(crate::state::key_not_found_message(
+                                &region,
+                                &input.key_id,
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            };
+
+            // "Before calling GetParametersForImport, use the CreateKey operation with
+            // an Origin value of EXTERNAL to create a KMS key with no key material"
+            // (the operation doc): a key whose material KMS generated, or one backed by
+            // a key store KMS does not hold the material of, has no key material to
+            // import, so it is "a specified resource [that] is not valid for this
+            // operation" — the modelled `UnsupportedOperationException`. The message
+            // names the key and the origin that refuses the call, built from the key the
+            // request resolved to, and nothing about the key is changed.
+            if key.origin != crate::state::ORIGIN_EXTERNAL {
+                return Err(GetParametersForImportErrorModeled::UnsupportedOperationException(
+                    UnsupportedOperationException {
+                        message: Some(format!(
+                            "{} origin is {} which is not valid for this operation.",
+                            key.arn, key.origin
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // "The KMS key that you use for this operation must be in a compatible key
+            // state" (the operation doc): a key awaiting deletion is not, and neither is
+            // a disabled one — which is what this operation's `KMSInvalidStateException`
+            // reports, since it models no `DisabledException`. A key in `PendingImport`
+            // is exactly the key this operation exists for, so that state is compatible.
+            if key.reported_key_state() != crate::state::KEY_STATE_PENDING_IMPORT
+                && !key.is_usable()
+            {
+                return Err(GetParametersForImportErrorModeled::KMSInvalidStateException(
+                    KMSInvalidStateException {
+                        message: Some(crate::state::invalid_state_message(key)),
+                    },
+                )
+                .into());
+            }
+
+            // "The type of RSA public key to return in the response"
+            // (`smithy_query(query="doc",shape="GetParametersForImportRequest",member="WrappingKeySpec")`).
+            // `SM2` is the one modelled value that is not an RSA key pair — an SM2 key
+            // pair, available in China Regions — and this service generates none, so the
+            // request is answered as not implemented rather than with a key pair of
+            // another kind.
+            if !crate::state::generates_wrapping_key(&input.wrapping_key_spec) {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "GetParametersForImport with a {} wrapping key",
+                    input.wrapping_key_spec
+                )));
+            }
+
+            // A key pair per call, so the store cannot be grown without end by a loop of
+            // valid calls; the pairs the clock has already expired do not count, and are
+            // dropped when the new one is remembered.
+            if state.usable_import_parameters(now) >= crate::state::MAX_IMPORT_PARAMETERS {
+                return Err(internal(
+                    "too many import parameter sets are outstanding; retry after the \
+                     outstanding ones expire",
+                ));
+            }
+
+            (key.arn.clone(), key.key_id.clone())
+        };
+
+        // The key pair itself: generated on tokio's BOUNDED blocking pool, so a long
+        // key generation does not starve the runtime that has to stay able to time out
+        // and shut down, and holds no lock while it runs.
+        let wrapping_key_spec = input.wrapping_key_spec.clone();
+        let generated = ::tokio::task::spawn_blocking(move || {
+            crate::state::mint_wrapping_key(&wrapping_key_spec)
+        })
+        .await;
+        let Ok(Some((public_key, private_key_pkcs8))) = generated else {
+            return Err(internal("the wrapping key pair could not be generated"));
+        };
+        let Some(import_token) = crate::state::mint_import_token() else {
+            return Err(internal("the import token could not be generated"));
+        };
+        // "Each public key and import token set is valid for 24 hours. The expiration
+        // date and time appear in the ParametersValidTo field" (the operation doc), so
+        // the instant is stored with the pair and reported from the same value. The
+        // addition is CHECKED: `SystemTime`'s `+` panics on overflow, and a clock no
+        // instant 24 hours ahead can be represented from is this emulator's failure
+        // rather than a bad request.
+        let Some(valid_to) = now.checked_add(crate::state::IMPORT_PARAMETERS_VALIDITY) else {
+            return Err(internal(
+                "the host clock cannot represent the instant these import parameters \
+                 expire at",
+            ));
+        };
+        // The pair is remembered under a freshly taken lock, since the one above was
+        // released for the generation.
+        state.lock().insert_import_parameters(
+            ::hex::encode(&import_token),
+            crate::state::ImportParameters {
+                key_id,
+                wrapping_algorithm: input.wrapping_algorithm.clone(),
+                wrapping_key_spec: input.wrapping_key_spec.clone(),
+                private_key_pkcs8,
+                valid_to,
+            },
+        );
+
+        Ok(GetParametersForImportOutput {
+            // "The Amazon Resource Name (key ARN) of the KMS key to use in a subsequent
+            // ImportKeyMaterial request. This is the same KMS key specified in the
+            // GetParametersForImport request."
+            key_id: Some(key_arn),
+            import_token: Some(import_token),
+            public_key: Some(public_key),
+            parameters_valid_to: Some(crate::state::date_time(valid_to)),
+        })
     }
+}
+
+/// Refuse an identifier this operation cannot resolve to a key: `InvalidArnException`
+/// names the identifier the request gave.
+fn invalid_arn(requested: &str) -> GetParametersForImportError {
+    GetParametersForImportErrorModeled::InvalidArnException(InvalidArnException {
+        message: Some(crate::state::invalid_arn_message(requested)),
+    })
+    .into()
+}
+
+/// Answer a failure of this emulator itself, never a malformed request.
+fn internal(message: impl Into<String>) -> GetParametersForImportError {
+    GetParametersForImportErrorModeled::KMSInternalException(KMSInternalException {
+        message: Some(message.into()),
+    })
+    .into()
 }

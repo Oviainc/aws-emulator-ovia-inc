@@ -118,7 +118,11 @@ fn list(value: &Value, name: &str) -> Value {
 ///
 /// A scope the request left out stays out: an administrator granted no
 /// `RegionScope` is not the same as one granted an empty one.
-fn normalize_scope(scope: &Value) -> Value {
+///
+/// `pub(crate)` so the sibling suite asserting what `GetAdminScope` reports
+/// across the administrator lifecycle compares wire scopes through the SAME
+/// normalisation rather than keeping a second copy of it.
+pub(crate) fn normalize_scope(scope: &Value) -> Value {
     let mut normalized = Map::new();
     if let Some(accounts) = member(scope, "AccountScope") {
         normalized.insert(
@@ -164,7 +168,10 @@ fn normalize_scope(scope: &Value) -> Value {
 
 /// `GetAdminScope` for `account`, as `(http status, error code or "", scope,
 /// status)`.
-async fn admin_scope(
+///
+/// `pub(crate)` so the sibling suite asserting the lifecycle status this
+/// operation reports drives it through the same reader.
+pub(crate) async fn admin_scope(
     router: &smithy_server_runtime::MultiServiceRouter,
     account: &str,
 ) -> (u16, String, Value, String) {
@@ -177,6 +184,23 @@ async fn admin_scope(
     let scope = normalize_scope(&body["AdminScope"]);
     let organization_status = body["Status"].as_str().unwrap_or_default().to_string();
     (status, code, scope, organization_status)
+}
+
+/// The `AdminScope` of the organization's DEFAULT administrator: "full
+/// administrative scope that allows administration of all policy types,
+/// accounts, organizational units, and Regions" (`AssociateAdminAccount`), which
+/// is every "all … enabled" member of `AdminScope`'s four scopes.
+///
+/// `pub(crate)` so the sibling suite that reads the default administrator's
+/// scope through the administrator lifecycle expects the same full scope here
+/// rather than restating it.
+pub(crate) fn full_admin_scope() -> Value {
+    json!({
+        "AccountScope": { "AllAccountsEnabled": true },
+        "OrganizationalUnitScope": { "AllOrganizationalUnitsEnabled": true },
+        "RegionScope": { "AllRegionsEnabled": true },
+        "PolicyTypeScope": { "AllPolicyTypesEnabled": true },
+    })
 }
 
 /// One row of the scope table: a name for the assertion messages, and the
@@ -492,12 +516,7 @@ async fn a_second_put_admin_account_updates_the_scope_in_place() {
 /// reads as the full one.
 #[tokio::test]
 async fn the_default_administrator_has_full_scope_and_cannot_be_rescoped() {
-    let full = json!({
-        "AccountScope": { "AllAccountsEnabled": true },
-        "OrganizationalUnitScope": { "AllOrganizationalUnitsEnabled": true },
-        "RegionScope": { "AllRegionsEnabled": true },
-        "PolicyTypeScope": { "AllPolicyTypesEnabled": true },
-    });
+    let full = full_admin_scope();
 
     for region in [REGION, OTHER_REGION] {
         let router = emulator();

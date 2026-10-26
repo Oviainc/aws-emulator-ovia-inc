@@ -85,6 +85,8 @@ mod ip_set_update_and_delete;
 mod malware_protection_plan;
 #[path = "all/malware_protection_plan_delete.rs"]
 mod malware_protection_plan_delete;
+#[path = "all/malware_protection_plan_listing.rs"]
+mod malware_protection_plan_listing;
 #[path = "all/malware_protection_plan_update.rs"]
 mod malware_protection_plan_update;
 #[path = "all/malware_scan.rs"]

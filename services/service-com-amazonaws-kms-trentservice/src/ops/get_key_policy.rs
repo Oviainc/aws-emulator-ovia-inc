@@ -184,6 +184,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
         let key = match state.resolve(&region, &input.key_id) {
             crate::state::KeyRef::Found(key) => key,
+            crate::state::KeyRef::UnauthorizedAccount => {
+                return Err(crate::state::unauthorized_account(
+                    Self::NAME,
+                    &input.key_id,
+                ));
+            }
             crate::state::KeyRef::MalformedArn => {
                 return Err(GetKeyPolicyErrorModeled::InvalidArnException(InvalidArnException {
                     message: Some(crate::state::invalid_arn_message(&input.key_id)),

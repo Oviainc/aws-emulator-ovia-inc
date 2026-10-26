@@ -53,6 +53,8 @@ mod instrumentation_configuration_status;
 mod instrumentation_configuration_tags;
 #[path = "all/instrumentation_configurations.rs"]
 mod instrumentation_configurations;
+#[path = "all/instrumentation_status_minute.rs"]
+mod instrumentation_status_minute;
 #[path = "all/list_service_states.rs"]
 mod list_service_states;
 #[path = "all/list_services.rs"]

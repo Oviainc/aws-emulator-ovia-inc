@@ -61,7 +61,10 @@ async fn list_configs(router: &MultiServiceRouter, query: &str) -> Answer {
 
 /// Percent-encode a query value, so a configuration name of any shape — punctuation or
 /// non-ASCII — travels in the request URI as the one value the service decodes back.
-fn encode_query(value: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite whose operation binds an input member to a query string
+/// parameter encodes its value the same way rather than carrying a copy of this.
+pub(crate) fn encode_query(value: &str) -> String {
     value
         .bytes()
         .map(|byte| match byte {

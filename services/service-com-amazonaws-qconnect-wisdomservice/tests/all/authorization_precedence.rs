@@ -3,25 +3,33 @@
 //! Where this endpoint makes an AUTHORIZATION decision, that decision is reached BEFORE
 //! the request's members are validated against the model's constraints.
 //!
-//! The rule under test: a caller this service cannot authorize for the resource a
-//! request's path names is refused with the operation's modelled authorization error —
-//! HTTP 401 `UnauthorizedException` — whatever else the same request violates (a path
-//! label outside its `@pattern`, a body member outside its `@pattern` or `@length`, an
-//! absent `@required` member). The answer therefore does not depend on which of the two
-//! faults the request carries, so a client refused for permissions is never told its
-//! input is malformed instead. `CreateSession` is the one operation this service decides
-//! authorization for: it answers the modelled `UnauthorizedException` (HTTP 401) for a
-//! parent assistant the account does not hold
-//! (`smithy_query(query="operation",operation="CreateSession")` lists it beside
-//! `ValidationException`), while every other operation resolves its resource instead and
-//! answers `ResourceNotFoundException` — a resource decision, which stays BEHIND
-//! validation.
+//! The rule under test: a request whose path label names no resource IDENTITY of this
+//! account — a label that is not an id of this service, or an ARN of another partition,
+//! account or service — is refused with the operation's modelled authorization error,
+//! HTTP 401 `UnauthorizedException`, whatever else the same request violates (a body
+//! member outside its `@pattern` or `@length`, an absent `@required` member) and whether
+//! or not the label itself satisfies the modelled `UuidOrArn` pattern. The answer
+//! therefore does not depend on which of the two faults the request carries, so a client
+//! refused for permissions is never told its input is malformed instead.
+//! `CreateSession` is the one operation this service decides authorization for
+//! (`smithy_query(query="operation",operation="CreateSession")` lists
+//! `UnauthorizedException` beside `ValidationException`).
 //!
-//! The table's rows differ along what the rule generalises over: the FORM of the
-//! unauthorized label (malformed in several ways, well-formed but naming nothing, an ARN
-//! of this account, of another account and of another partition) crossed with WHICH
-//! constraint the rest of the request breaks (none, a `@pattern`, a `@length`, an absent
-//! `@required` member). Every row must answer the one authorization refusal.
+//! The other side of the same rule: a label that COULD name an assistant of this account
+//! but names none is authorized, resolved, and reported absent with the modelled
+//! `ResourceNotFoundException` (HTTP 404) — a RESOURCE decision, which stays behind
+//! validation, as it does for every other operation.
+//!
+//! The table's rows differ along what the rule generalises over: the FORM of the label
+//! (malformed in several ways, an ARN of another account and of another partition — and,
+//! for the not-found side, a well-formed absent id and this account's ARN for one)
+//! crossed with WHICH constraint the rest of the request breaks (none, a `@pattern`, a
+//! `@length`, an absent `@required` member).
+//!
+//! The controls pin the rest: for a caller that IS authorized each of those classes is
+//! refused with the code that class carries, a valid create still succeeds and reads back,
+//! and an operation whose refusal is a RESOURCE decision (`GetAssistant`) keeps validation
+//! in front of it.
 //!
 //! The controls pin the other side of the rule: for a caller that IS authorized the
 //! modelled `ValidationException` still answers input the model refuses, a valid create
@@ -49,8 +57,16 @@ const ABSENT_UUID: &str = "00000000-0000-0000-0000-000000000000";
 /// The modelled error codes under test, written out rather than imported: a test that
 /// imported the handler's own constants could not fail if they changed.
 const UNAUTHORIZED: &str = "UnauthorizedException";
-const VALIDATION: &str = "ValidationException";
 const NOT_FOUND: &str = "ResourceNotFoundException";
+
+/// The modelled error a constraint on a value that travelled in the request URI keeps:
+/// the body-schema check never sees it, so it is the service's own refusal.
+const VALIDATION: &str = "ValidationException";
+
+/// The code this endpoint answers a BODY value outside a modelled `@length` bound with.
+/// It is not a modelled operation error: the check is made where the body is read, in
+/// front of the service's own validation.
+const BAD_REQUEST: &str = "BadRequestException";
 
 /// One wire answer, reduced to what a client branches on.
 #[derive(Debug)]
@@ -151,13 +167,14 @@ fn create_session_uri(label: &str) -> String {
     format!("/assistants/{}/sessions", encode_label(label))
 }
 
-/// Every form an `assistantId` label can take that this account is not authorized for,
-/// whether or not the modelled `UuidOrArn` pattern would admit it.
+/// Every form an `assistantId` label can take that names no resource identity of this
+/// account, and so is refused for permissions before anything is validated.
 ///
 /// The pattern is
 /// `^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$|^arn:[a-z-]*?:wisdom:[a-z0-9-]*?:[0-9]{12}:[a-z-]*?/<uuid>(?:/<uuid>){0,2}$`
-/// (`smithy_query(query="shape",shape="UuidOrArn")`), so the first five rows are
-/// labels it REFUSES and the last three are labels it admits that name nothing here.
+/// (`smithy_query(query="shape",shape="UuidOrArn")`), so the first five rows are labels it
+/// REFUSES and the last two are labels it admits whose ARN names another account or
+/// another partition — no resource this account could hold either way.
 fn unauthorized_labels() -> Vec<(&'static str, String)> {
     vec![
         // Outside the modelled pattern — the class the authorization decision must get
@@ -179,15 +196,8 @@ fn unauthorized_labels() -> Vec<(&'static str, String)> {
                 account = engine::EMULATOR_ACCOUNT_ID
             ),
         ),
-        // Admitted by the pattern, and naming no assistant this account holds.
-        ("a well-formed absent uuid", ABSENT_UUID.to_string()),
-        (
-            "this account's arn for an absent uuid",
-            format!(
-                "arn:aws:wisdom:{REGION}:{account}:assistant/{ABSENT_UUID}",
-                account = engine::EMULATOR_ACCOUNT_ID
-            ),
-        ),
+        // Admitted by the pattern, and naming a resource of another account or another
+        // partition — not one of this account's.
         (
             "another account's arn",
             format!("arn:aws:wisdom:{REGION}:123456789012:assistant/{ABSENT_UUID}"),
@@ -202,31 +212,52 @@ fn unauthorized_labels() -> Vec<(&'static str, String)> {
     ]
 }
 
+/// Every form an `assistantId` label can take that COULD name an assistant of this
+/// account but names none: authorized, resolved, and reported absent.
+fn absent_labels() -> Vec<(&'static str, String)> {
+    vec![
+        ("a well-formed absent uuid", ABSENT_UUID.to_string()),
+        (
+            "this account's arn for an absent uuid",
+            format!(
+                "arn:aws:wisdom:{REGION}:{account}:assistant/{ABSENT_UUID}",
+                account = engine::EMULATOR_ACCOUNT_ID
+            ),
+        ),
+    ]
+}
+
 /// Request bodies spanning what else a `CreateSession` can get wrong, from nothing at
 /// all to each constraint class the model declares for it
 /// (`name` **required**, `Name` len 1..255 pattern `^[a-zA-Z0-9\s_.,-]+`; `description`
 /// len 1..255 with the same pattern; `contactArn` len 1..2048 pattern
 /// `^arn:[a-z-]+?:[a-z-]+?:[a-z0-9-]*?:([0-9]{12})?:[a-zA-Z0-9-:/]+$`;
-/// `clientToken` len 1..4096).
-fn create_session_bodies() -> Vec<(&'static str, Value)> {
+/// `clientToken` len 1..4096), with the code an AUTHORIZED caller gets for each: the
+/// boundary's `BadRequestException` for a body value outside a `@length` bound, and the
+/// modelled `ValidationException` for every class the service validates itself.
+fn create_session_bodies() -> Vec<(&'static str, Value, &'static str)> {
     vec![
-        ("a body the model accepts", json!({ "name": "a-session" })),
-        ("the required name absent", json!({})),
+        ("a body the model accepts", json!({ "name": "a-session" }), ""),
+        ("the required name absent", json!({}), VALIDATION),
         (
             "a name outside the Name pattern",
             json!({ "name": "!!!" }),
+            VALIDATION,
         ),
         (
             "a description under the Description minimum length",
             json!({ "name": "a-session", "description": "" }),
+            BAD_REQUEST,
         ),
         (
             "a contactArn outside the GenericArn pattern",
             json!({ "name": "a-session", "contactArn": "not-an-arn" }),
+            VALIDATION,
         ),
         (
             "a clientToken under the ClientToken minimum length",
             json!({ "name": "a-session", "clientToken": "" }),
+            BAD_REQUEST,
         ),
     ]
 }
@@ -238,7 +269,7 @@ async fn an_unauthorized_create_session_is_refused_before_its_input_is_validated
     let emulator = Emulator::new();
 
     for (label_case, label) in unauthorized_labels() {
-        for (body_case, body) in create_session_bodies() {
+        for (body_case, body, _) in create_session_bodies() {
             let case = format!("{label_case} + {body_case}");
             let reply = emulator
                 .send("POST", &create_session_uri(&label), Some(body))
@@ -261,9 +292,35 @@ async fn an_unauthorized_create_session_is_refused_before_its_input_is_validated
     }
 }
 
-/// For a caller that IS authorized, validation still answers: the modelled
-/// `ValidationException` refuses input the model rejects, and a request the model
-/// accepts creates a session that reads back through `GetSession`.
+/// A label that COULD name an assistant of this account but names none is authorized and
+/// reported absent — the other side of the rule above — for a body the model accepts.
+#[tokio::test]
+async fn a_create_session_under_an_absent_assistant_is_reported_not_found() {
+    let emulator = Emulator::new();
+
+    for (label_case, label) in absent_labels() {
+        let reply = emulator
+            .send(
+                "POST",
+                &create_session_uri(&label),
+                Some(json!({ "name": "a-session" })),
+            )
+            .await;
+        assert_eq!(
+            (reply.status, reply.code().as_str()),
+            (404, NOT_FOUND),
+            "case {label_case:?}: expected HTTP 404 {NOT_FOUND}, got {} {:?} ({})",
+            reply.status,
+            reply.code(),
+            reply.body
+        );
+    }
+}
+
+/// For a caller that IS authorized, the request's input is still checked: each class is
+/// refused with the code that class carries — the boundary's for a body value outside a
+/// modelled `@length` bound, the modelled `ValidationException` for the rest — and a
+/// request the model accepts creates a session that reads back through `GetSession`.
 #[tokio::test]
 async fn an_authorized_create_session_still_validates_its_input() {
     let emulator = Emulator::new();
@@ -279,21 +336,21 @@ async fn an_authorized_create_session_still_validates_its_input() {
         .string("/assistant/assistantId")
         .unwrap_or_else(|| panic!("setup: no assistantId in {}", created.body));
 
-    // Every body the model refuses is refused with the modelled validation error now
+    // Every body the model refuses is refused for the reason its own class carries now
     // that the caller is authorized for the parent — the same bodies that answered 401
     // above.
-    for (body_case, body) in create_session_bodies()
+    for (body_case, body, expected_code) in create_session_bodies()
         .into_iter()
-        .filter(|(case, _)| *case != "a body the model accepts")
+        .filter(|(case, _, _)| *case != "a body the model accepts")
     {
         let reply = emulator
             .send("POST", &create_session_uri(&assistant_id), Some(body))
             .await;
         assert_eq!(
             (reply.status, reply.code().as_str()),
-            (400, VALIDATION),
+            (400, expected_code),
             "case {body_case:?} under an authorized parent: expected HTTP 400 \
-             {VALIDATION}, got {} {:?} ({})",
+             {expected_code}, got {} {:?} ({})",
             reply.status,
             reply.code(),
             reply.body

@@ -25,6 +25,8 @@ mod caller_reference_immutable;
 mod connection_function_lifecycle;
 #[path = "all/connection_function_publish.rs"]
 mod connection_function_publish;
+#[path = "all/connection_group_by_routing_endpoint.rs"]
+mod connection_group_by_routing_endpoint;
 #[path = "all/connection_group_tags.rs"]
 mod connection_group_tags;
 #[path = "all/connection_groups.rs"]
