@@ -25,6 +25,8 @@ mod bedrock_runtime_request_claim;
 mod bedrock_runtime_streaming;
 #[path = "all/converse_tool_choice.rs"]
 mod converse_tool_choice;
+#[path = "all/guardrail_checks_evaluation.rs"]
+mod guardrail_checks_evaluation;
 #[path = "all/guardrail_checks_inline.rs"]
 mod guardrail_checks_inline;
 #[path = "all/resource_reference_refusals.rs"]

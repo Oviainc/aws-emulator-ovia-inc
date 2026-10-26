@@ -45,6 +45,10 @@ use crate::ops::types::{
 /// `usage` it reports inline.
 pub mod invocation_metrics;
 
+/// The inline guardrail checks `InvokeGuardrailChecks` evaluates, and the
+/// text-unit accounting it reports for them.
+pub mod guardrail_checks;
+
 /// The most async-invoke records this emulator retains.
 ///
 /// AWS publishes no retention for them, so this is the EMULATOR's bound, and it
@@ -87,6 +91,10 @@ pub struct ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState {
     /// The inference log: one entry per served inference call, as a ring buffer
     /// of the most recent [`MAX_INVOCATION_LOG_ENTRIES`].
     pub invocations: VecDeque<InvocationLogEntry>,
+    /// The inline guardrail evaluations `InvokeGuardrailChecks` served, as a ring
+    /// buffer of the most recent [`MAX_INVOCATION_LOG_ENTRIES`]: one entry per
+    /// call, carrying the text units it consumed per configured check.
+    pub guardrail_check_evaluations: VecDeque<guardrail_checks::EvaluationLogEntry>,
     /// Monotonic counter mixed into every id this service mints (an async
     /// invocation's, a tool request's).
     pub next_id: u64,
@@ -103,6 +111,7 @@ impl Default for ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState {
             async_invokes: BTreeMap::new(),
             idempotency_index: HashMap::new(),
             invocations: VecDeque::new(),
+            guardrail_check_evaluations: VecDeque::new(),
             next_id: 0,
         }
     }
@@ -325,6 +334,15 @@ impl ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState {
         self.invocations.push_back(entry);
         while self.invocations.len() > MAX_INVOCATION_LOG_ENTRIES {
             self.invocations.pop_front();
+        }
+    }
+
+    /// Record one served inline guardrail evaluation, keeping that log at most
+    /// [`MAX_INVOCATION_LOG_ENTRIES`] entries long for the same reason.
+    pub fn log_guardrail_checks(&mut self, entry: guardrail_checks::EvaluationLogEntry) {
+        self.guardrail_check_evaluations.push_back(entry);
+        while self.guardrail_check_evaluations.len() > MAX_INVOCATION_LOG_ENTRIES {
+            self.guardrail_check_evaluations.pop_front();
         }
     }
 }
@@ -1008,6 +1026,25 @@ pub const CONTENT_FILTER_CATEGORY_ORDER: [&str; 5] =
 /// the categories above, the order is stated here and the MEMBERSHIP stays the
 /// model's.
 pub const MESSAGE_ROLE_ORDER: [&str; 3] = ["user", "system", "assistant"];
+
+/// The check types a `GuardrailChecksConfig` admits, in the order this service
+/// reads them.
+///
+/// The three members of the modelled structure
+/// (`smithy_query(query="shape",shape="GuardrailChecksConfig")`), by their wire
+/// names: a request configuring none of them is refused
+/// ([`EMPTY_CHECK_CONFIG_MESSAGE`]), and the results and usage a served
+/// evaluation reports carry exactly the ones it configured.
+pub const GUARDRAIL_CHECK_TYPES: [&str; 3] =
+    ["contentFilter", "promptAttack", "sensitiveInformation"];
+
+/// The service's message for a `checks` configuring no check at all.
+///
+/// The modelled structure marks none of its three members required
+/// (`smithy_query(query="shape",shape="GuardrailChecksConfig")`), so the boundary
+/// validator admits an empty one; there is then nothing for the service to
+/// evaluate, and it says so in the service's own words for that refusal.
+pub const EMPTY_CHECK_CONFIG_MESSAGE: &str = "At least one check type must be configured";
 
 /// Every MEMBER this service quotes a value set for in an order of its own, as
 /// (the member path's leading segments, its trailing segments, the order).

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op InvokeGuardrailChecks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `InvokeGuardrailChecks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`InvokeGuardrailChecks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Every check the request configures is evaluated IN PROCESS over the
+//! submitted messages and reported for that check alone: the sensitive-information
+//! check by the PII recognizer this emulator serves Comprehend's PII family from,
+//! the content filter by the profanity/abuse engine its toxicity analysis runs, and
+//! the prompt-attack check by a rule recognizer over the same text (see
+//! [`crate::state::guardrail_checks`]). A `checks` configuring no check at all is
+//! refused with the modelled `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +86,20 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::guardrail_checks;
+
+/// How long a caller waits for the checks to answer before the request is failed.
+///
+/// Orders of magnitude above what evaluating a conversation at the size ceiling
+/// costs, so it never fires for a request the recognizers are simply working
+/// through. It bounds what the CALLER waits for, not the work: a blocking task
+/// cannot be cancelled from outside, so when the budget fires the evaluation runs to
+/// its natural end and releases its blocking-pool slot then. What bounds the WORK is
+/// the refusal below of a request carrying more than
+/// [`guardrail_checks::MAX_SUBMITTED_CHARACTERS`] of text, applied before any
+/// analysis starts.
+const EVALUATION_TIME_BUDGET: ::std::time::Duration = ::std::time::Duration::from_secs(5);
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,18 +172,204 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `InvokeGuardrailChecks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(InvokeGuardrailChecksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("InvokeGuardrailChecks"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(InvokeGuardrailChecksErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Bedrock Runtime emulator has no state store".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The checks the request configured, each with the categories or entity
+        // types it named. The modelled structure marks none of its members
+        // required, so a request can reach here configuring nothing at all — and
+        // then there is nothing to evaluate.
+        let requested = requested_checks(&input.checks);
+        if requested.is_empty() {
+            return Err(InvokeGuardrailChecksErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::EMPTY_CHECK_CONFIG_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Every text block of the conversation, with where it sits in the request:
+        // that position is what a sensitive-information finding reports beside the
+        // offsets inside the block.
+        let texts: Vec<guardrail_checks::CheckedText> = input
+            .messages
+            .iter()
+            .enumerate()
+            .flat_map(|(message_index, message)| {
+                message
+                    .content
+                    .iter()
+                    .enumerate()
+                    .map(move |(content_index, block)| {
+                        let GuardrailChecksContentBlock::Text(text) = block;
+                        guardrail_checks::CheckedText {
+                            message_index,
+                            content_index,
+                            text: text.clone(),
+                        }
+                    })
+            })
+            .collect();
+
+        // The recognizers are linear in the submitted text, so the text one request
+        // may have evaluated is bounded BEFORE any of them is started: a request
+        // past the ceiling is refused rather than occupying a blocking-pool slot
+        // for as long as its body is.
+        let characters = guardrail_checks::submitted_characters(&texts);
+        if characters > guardrail_checks::MAX_SUBMITTED_CHARACTERS {
+            return Err(InvokeGuardrailChecksErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(guardrail_checks::too_much_text_message(characters)),
+                },
+            )
+            .into());
+        }
+
+        // The recognizers are synchronous, CPU-bound work over caller-supplied text
+        // and have no await of their own, so they run on the blocking pool: the
+        // worker serving this request is released while they do, and the wait is
+        // bounded by EVALUATION_TIME_BUDGET.
+        let evaluation = match ::tokio::time::timeout(
+            EVALUATION_TIME_BUDGET,
+            ::tokio::task::spawn_blocking(move || guardrail_checks::evaluate(&requested, &texts)),
+        )
+        .await
+        {
+            Ok(Ok(evaluation)) => evaluation,
+            // Nothing was evaluated, so there is no verdict to report: the service's
+            // own server error says so rather than an empty set of findings.
+            Ok(Err(error)) => {
+                return Err(InvokeGuardrailChecksErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(format!(
+                            "the guardrail check evaluation did not complete: {error}"
+                        )),
+                    },
+                )
+                .into())
+            }
+            Err(_) => {
+                return Err(InvokeGuardrailChecksErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(format!(
+                            "the guardrail check evaluation did not complete within {} seconds",
+                            EVALUATION_TIME_BUDGET.as_secs()
+                        )),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // The evaluation consumed text units for each check it ran: record it the
+        // way a served inference call is recorded.
+        state
+            .lock()
+            .log_guardrail_checks(evaluation.log_entry(crate::state::now_millis()));
+
+        Ok(InvokeGuardrailChecksOutput {
+            results: GuardrailChecksResults {
+                content_filter: evaluation.content_filter.as_ref().map(|findings| {
+                    GuardrailChecksContentFilterResult {
+                        results: findings
+                            .iter()
+                            .map(|finding| GuardrailChecksContentFilterResultEntry {
+                                category: finding.category.to_string(),
+                                severity_score: finding.severity_score,
+                            })
+                            .collect(),
+                    }
+                }),
+                prompt_attack: evaluation.prompt_attack.as_ref().map(|findings| {
+                    GuardrailChecksPromptAttackResult {
+                        results: findings
+                            .iter()
+                            .map(|finding| GuardrailChecksPromptAttackResultEntry {
+                                category: finding.category.to_string(),
+                                severity_score: finding.severity_score,
+                            })
+                            .collect(),
+                    }
+                }),
+                sensitive_information: evaluation.sensitive_information.as_ref().map(|found| {
+                    GuardrailChecksSensitiveInformationResult {
+                        results: found
+                            .findings
+                            .iter()
+                            .map(|finding| GuardrailChecksSensitiveInformationResultEntry {
+                                r#type: finding.entity_type.to_string(),
+                                confidence_score: finding.confidence_score,
+                                begin_offset: finding.begin_offset,
+                                end_offset: finding.end_offset,
+                                message_index: finding.message_index,
+                                content_index: finding.content_index,
+                            })
+                            .collect(),
+                        truncated: Some(found.truncated),
+                    }
+                }),
+            },
+            // One usage entry per check that ran, each carrying what that check
+            // read: every check reads the whole conversation.
+            usage: GuardrailChecksUsageResults {
+                content_filter: evaluation.content_filter.as_ref().map(|_| {
+                    GuardrailChecksContentFilterUsage {
+                        text_units: evaluation.text_units,
+                    }
+                }),
+                prompt_attack: evaluation.prompt_attack.as_ref().map(|_| {
+                    GuardrailChecksPromptAttackUsage {
+                        text_units: evaluation.text_units,
+                    }
+                }),
+                sensitive_information: evaluation.sensitive_information.as_ref().map(|_| {
+                    GuardrailChecksSensitiveInformationUsage {
+                        text_units: evaluation.text_units,
+                    }
+                }),
+            },
+        })
+    }
+}
+
+/// The checks `config` configures, each with the categories or entity types it
+/// named.
+///
+/// A check the request leaves out stays `None`, which is what keeps it out of both
+/// the results and the usage. The named values are taken as given but collected into
+/// a SET: the boundary validator has already refused any value outside the member's
+/// modelled enum, so what arrives here is a (possibly repeated) subset of that enum,
+/// and each named value is answered once however often it was named.
+fn requested_checks(config: &GuardrailChecksConfig) -> guardrail_checks::RequestedChecks {
+    guardrail_checks::RequestedChecks {
+        content_filter: config.content_filter.as_ref().map(|check| {
+            check
+                .categories
+                .iter()
+                .map(|category| category.category.clone())
+                .collect()
+        }),
+        prompt_attack: config.prompt_attack.as_ref().map(|check| {
+            check
+                .categories
+                .iter()
+                .map(|category| category.category.clone())
+                .collect()
+        }),
+        sensitive_information: config.sensitive_information.as_ref().map(|check| {
+            check
+                .entities
+                .iter()
+                .map(|entity| entity.r#type.clone())
+                .collect()
+        }),
     }
 }

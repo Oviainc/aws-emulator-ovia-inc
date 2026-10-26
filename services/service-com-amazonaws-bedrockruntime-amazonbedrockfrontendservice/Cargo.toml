@@ -19,7 +19,9 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# `time` beyond the workspace's own features: `InvokeGuardrailChecks` bounds the wait
+# for its (blocking-pool) check evaluation with `tokio::time::timeout`.
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -38,6 +40,22 @@ hex = { workspace = true }
 # and `GetMetricStatistics` / `ListMetrics` read, which is reached through the shared
 # engine and needs the owning service's state TYPE.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+
+# The PII recognizer behind the sensitive-information guardrail check
+# (`state::guardrail_checks`): this emulator already has ONE rule set placing every
+# PII entity type, the one Comprehend's `DetectPiiEntities` answers from
+# (`ops::contains_pii_entities::detect_pii_spans`), so the check reads it rather than
+# growing a second copy of the same 30-odd published forms.
+service-com-amazonaws-comprehend-comprehend-20171127 = { workspace = true }
+# Toxicity engine behind the content-filter guardrail check: an English
+# profanity/abuse analyser that classifies a string into categories (offensive,
+# mean, sexual) each at a mild/moderate/severe level. The same engine this
+# emulator's Comprehend toxicity analysis runs.
+rustrict = "0.7"
+# Regular-expression engine behind the prompt-attack rules in
+# `state::guardrail_checks`: it matches each published attack form over the
+# submitted messages in linear time, so no message can make one request backtrack.
+regex = "1.12"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -3,10 +3,10 @@
 //! How `InvokeGuardrailChecks` refuses an inline check configuration it cannot
 //! read, end to end over the router.
 //!
-//! The operation itself is still a scaffold (it answers `501 NotImplemented`: no
-//! classifier runs in this emulator, so it has no verdict to report), but its
-//! INPUT surface is modelled and is refused before any handler runs. Two rules,
-//! each asserted over a SET of requests:
+//! The operation's INPUT surface is modelled, so a value outside it is refused
+//! before the handler runs at all — which is what this suite is about; what the
+//! handler then evaluates is asserted in `guardrail_checks_evaluation.rs`. Two
+//! rules, each asserted over a SET of requests:
 //!
 //! 1. **An enum requirement names every value the member admits.** A value
 //!    outside a modelled value set is refused `400 ValidationException` whose
