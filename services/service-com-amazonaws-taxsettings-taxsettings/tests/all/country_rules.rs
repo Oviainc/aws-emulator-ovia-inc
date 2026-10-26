@@ -72,7 +72,12 @@ fn refusal(answer: &Answer) -> (u16, String, Option<String>, Vec<String>) {
 }
 
 /// A certificate document, as `VerificationDetails` carries one.
-fn document() -> Value {
+///
+/// `pub(crate)` because `tests/all/pending_trn_conflict.rs` stores an entry
+/// carrying one, to assert that a refused write leaves the document access
+/// tokens the stored record's own write minted alone: one document, so the two
+/// suites cannot submit two different shapes of one.
+pub(crate) fn document() -> Value {
     json!({
         "taxRegistrationDocuments": [
             { "file": { "fileName": "certificate.pdf", "fileContent": "aGVsbG8=" } },

@@ -14,13 +14,16 @@
 //! The tables span the classes the rule generalises over: both writers, on each
 //! side of the setup and of the refused write; every value of the model's
 //! `TaxRegistrationStatus` enum, so that the refusal is pinned to `Pending`
-//! alone; several entries; and, for the batch, the mix of pending, settled and
-//! unregistered accounts one request can name, over several counts.
+//! alone; several entries; the document shapes a stored record can carry, whose
+//! reported access tokens the refused write must leave naming the documents the
+//! stored record's own write minted them for; and, for the batch, the mix of
+//! pending, settled and unregistered accounts one request can name, over several
+//! counts.
 //!
 //! The harness (`emulator_with_engine`, `call`, `make_validations_due`) lives in
-//! `tax_registration_lifecycle.rs`, the writer fan-out (`WRITERS`, `write`) in
-//! `country_rules.rs` and the status catalog in `fidelity_rules.rs`; nothing here
-//! builds a second one.
+//! `tax_registration_lifecycle.rs`, the writer fan-out (`WRITERS`, `write`) and
+//! the certificate document (`document`) in `country_rules.rs` and the status
+//! catalog in `fidelity_rules.rs`; nothing here builds a second one.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,7 +34,7 @@ use service_com_amazonaws_taxsettings_taxsettings::state::{
     STATUS_PENDING,
 };
 
-use crate::country_rules::{write, WRITERS};
+use crate::country_rules::{document, write, WRITERS};
 use crate::fidelity_rules::REGISTRATION_STATUSES;
 use crate::tax_registration_lifecycle::{call, emulator_with_engine, make_validations_due, Answer};
 
@@ -146,6 +149,58 @@ pub(crate) fn error_rows(answer: &Answer) -> Vec<(String, String, String)> {
                             .to_string()
                     };
                     (member("accountId"), member("code"), member("message"))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `verificationDetails` a stored record can carry: the rows differ in how
+/// many documents it holds and in the form each was submitted in (an inline
+/// file, an S3 location), none of which the rule depends on.
+fn document_rows() -> Vec<(&'static str, Value)> {
+    vec![
+        ("one inline file", document()),
+        (
+            "one S3 location",
+            json!({
+                "taxRegistrationDocuments": [
+                    { "s3Location": { "bucket": "trn-docs", "key": "vat-certificate.pdf" } },
+                ],
+            }),
+        ),
+        (
+            "two documents, one of each form",
+            json!({
+                "taxRegistrationDocuments": [
+                    { "s3Location": { "bucket": "trn-docs", "key": "vat-certificate.pdf" } },
+                    { "file": { "fileName": "director-id.png", "fileContent": "aGVsbG8=" } },
+                ],
+            }),
+        ),
+    ]
+}
+
+/// The `(taxDocumentName, taxDocumentAccessToken)` of every document a read
+/// reports for the account's stored registration, in the order the response
+/// carries them.
+fn document_metadata(answer: &Answer) -> Vec<(String, String)> {
+    answer
+        .body
+        .pointer("/taxRegistration/taxDocumentMetadatas")
+        .and_then(Value::as_array)
+        .map(|documents| {
+            documents
+                .iter()
+                .map(|reported| {
+                    let member = |name: &str| {
+                        reported
+                            .get(name)
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    (member("taxDocumentName"), member("taxDocumentAccessToken"))
                 })
                 .collect()
         })
@@ -328,6 +383,72 @@ async fn only_an_outstanding_trn_refuses_the_write() {
                     .and_then(Value::as_str),
                 submitted_entry.get("registrationId").and_then(Value::as_str),
                 "case {case:?}: the account must hold the rewritten entry, got {:?}",
+                after.body
+            );
+        }
+    }
+}
+
+/// RULE: the record a refused write leaves untouched is untouched for its
+/// DOCUMENTS too — the access tokens the write that stored it minted still name
+/// its documents, because the refusal bumped no revision.
+///
+/// The rows are the document shapes a stored record can carry, driven through
+/// both writers. The entry the refused write submits carries no documents at
+/// all, so a write that went through would empty the reported metadata.
+#[tokio::test]
+async fn a_refused_write_keeps_the_stored_records_document_metadata() {
+    let account_id = "000000000001";
+    let (_, stored_entry, submitted_entry) = entry_pairs()
+        .into_iter()
+        .next()
+        .expect("the table has rows");
+    for (documents, verification) in document_rows() {
+        let submitted_count = verification
+            .get("taxRegistrationDocuments")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        for writer in WRITERS {
+            let case = format!("{documents}, rewritten via {writer}");
+            let (router, engine) = emulator_with_engine();
+            let mut stored = stored_entry.clone();
+            stored["verificationDetails"] = verification.clone();
+            let setup = write(&router, "PutTaxRegistration", account_id, &stored).await;
+            assert_eq!(
+                setup.status, 200,
+                "case {case:?}: the setup write must succeed, got {setup:?}"
+            );
+            hold_open(&engine, account_id);
+
+            let before = read(&router, account_id).await;
+            let reported = document_metadata(&before);
+            assert_eq!(
+                reported.len(),
+                submitted_count,
+                "case {case:?}: expected {submitted_count} document(s) reported, got {reported:?}"
+            );
+            assert!(
+                reported
+                    .iter()
+                    .all(|(name, token)| !name.is_empty() && !token.is_empty()),
+                "case {case:?}: every reported document needs a name and an access token, got \
+                 {reported:?}"
+            );
+
+            let answer = write(&router, writer, account_id, &submitted_entry).await;
+            assert_refused(&case, writer, &answer, account_id);
+
+            let after = read(&router, account_id).await;
+            assert_eq!(
+                document_metadata(&after),
+                reported,
+                "case {case:?}: the refused write must leave the stored document tokens alone, \
+                 got {:?}",
+                document_metadata(&after)
+            );
+            assert_eq!(
+                after.body, before.body,
+                "case {case:?}: the refused write must leave the record untouched, got {:?}",
                 after.body
             );
         }
