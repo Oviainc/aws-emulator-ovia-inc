@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TestDNSAnswer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TestDNSAnswer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TestDNSAnswer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -112,6 +103,397 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::state::{
+    canonical_dns_name, name_is_in_zone, no_such_hosted_zone, normalize_zone_id,
+    ComAmazonawsRoute53Awsdnsv20130401State, StoredZone,
+};
+
+/// The transport the simulated query is answered over (`TransportProtocol`).
+///
+/// `Protocol`'s own documentation: "The protocol that Amazon Route 53 used to
+/// respond to the request, either UDP or TCP." A DNS query is carried over UDP,
+/// which is the transport the checking tool simulates a resolver's query with.
+const PROTOCOL_UDP: &str = "UDP";
+
+/// The response code of a query the zone answers (`DNSRCode`).
+///
+/// `ResponseCode`'s own documentation: "The most common response code is
+/// NOERROR, meaning that the request is valid." It is also the code of a valid
+/// query the zone holds no record data for — the name exists, the asked-for type
+/// does not.
+const RESPONSE_CODE_NOERROR: &str = "NOERROR";
+
+/// The response code of a query for a name the zone holds no record set at.
+///
+/// `ResponseCode` points at the IANA DNS RCODE registry for the codes it may
+/// carry; `NXDOMAIN` is that registry's code for a name that does not exist in
+/// the zone the answering name servers are authoritative for.
+const RESPONSE_CODE_NXDOMAIN: &str = "NXDOMAIN";
+
+/// The `CountryCode` of the geolocation record set that answers a query the
+/// service cannot place.
+///
+/// `GeoLocation`'s own documentation: "The value `*` in the `CountryCode`
+/// element matches all geographic locations that aren't specified in other
+/// geolocation resource record sets … Two groups of queries are routed to the
+/// resource that you specify in this record: queries that come from locations
+/// for which you haven't created geolocation resource record sets and queries
+/// from IP addresses that aren't mapped to a location. If you don't create a `*`
+/// resource record set, Route 53 returns a "no answer" response for queries from
+/// those locations."
+const UNPLACEABLE_COUNTRY_CODE: &str = "*";
+
+/// The `LocationName` of the CIDR record set that answers a query from an
+/// address no CIDR block in the collection holds.
+///
+/// `CidrRoutingConfig$LocationName`'s own documentation calls `*` the default
+/// location, which is the same role `*` plays for a geolocation group.
+const DEFAULT_CIDR_LOCATION: &str = "*";
+
+/// The `Failover` of the record set a failover group answers from while it is
+/// healthy.
+///
+/// `Failover`'s own documentation: "When the primary resource record set is
+/// healthy, Route 53 responds to DNS queries with the applicable value from the
+/// primary resource record set regardless of the health of the secondary
+/// resource record set."
+const FAILOVER_PRIMARY: &str = "PRIMARY";
+
+/// The most record sets a multivalue answer query is answered from.
+///
+/// `MultiValueAnswer`'s own documentation: "Route 53 responds to DNS queries
+/// with up to eight healthy records; if you have eight or fewer healthy records,
+/// Route 53 responds to all DNS queries with all the healthy records."
+const MAX_MULTIVALUE_ANSWERS: usize = 8;
+
+/// The Amazon EC2 Region the resolver the checking tool simulates sits in when
+/// the request names no resolver of its own.
+///
+/// The operation's own documentation: "If you omit this value, TestDnsAnswer
+/// uses the IP address of a DNS resolver in the Amazon Web Services US East (N.
+/// Virginia) Region (us-east-1)."
+const DEFAULT_RESOLVER_REGION: &str = "us-east-1";
+
+/// The widest `EDNS0ClientSubnetMask` an IPv4 client subnet may be queried with.
+///
+/// `EDNS0ClientSubnetMask`'s own documentation: "The range of valid values
+/// depends on whether edns0clientsubnetip is an IPv4 or an IPv6 address: IPv4:
+/// Specify a value between 0 and 32. IPv6: Specify a value between 0 and 128."
+const MAX_IPV4_SUBNET_MASK: u32 = 32;
+
+/// The widest `EDNS0ClientSubnetMask` an IPv6 client subnet may be queried with
+/// (same documentation as [`MAX_IPV4_SUBNET_MASK`]).
+const MAX_IPV6_SUBNET_MASK: u32 = 128;
+
+/// How many alias hops one answer is resolved through.
+///
+/// An alias record set may target another record set, which may itself be an
+/// alias, so resolving an answer walks a CHAIN: one record set per hop, never a
+/// tree, so the work of one answer is the chain's length and not a product of
+/// the groups along it. The length is bounded, and a chain that comes back to a
+/// record set it already resolved stops there, so no stored arrangement of alias
+/// record sets can make one query spin.
+const MAX_ALIAS_HOPS: usize = 8;
+
+/// The most `RecordDataEntry` values one answer carries.
+///
+/// A DNS answer is one message, so the answer to one simulated query is bounded
+/// rather than left to grow with however many record sets the zone holds at a
+/// name. The bound is this emulator's own and is far above any record set a zone
+/// realistically holds — a multivalue answer group answers from at most eight
+/// members ([`MAX_MULTIVALUE_ANSWERS`]) — so it caps only the worst case.
+const MAX_RECORD_DATA_ENTRIES: usize = 1_000;
+
+/// Why the EDNS0 client subnet the request names is not one a query can be
+/// simulated from, if it is not.
+///
+/// The model bounds the mask's LENGTH (`SubnetMask`, len 0..3) but not what it
+/// may say, so the documented RANGE — 0 to 32 bits of an IPv4 address, 0 to 128
+/// of an IPv6 one ([`MAX_IPV4_SUBNET_MASK`]) — is enforced here. A mask sent
+/// without an address names no bits of anything, so there is no range for it to
+/// be outside of: the documentation makes the mask an option ON an address ("If
+/// you specify an IP address for edns0clientsubnetip, you can optionally specify
+/// the number of bits …").
+fn client_subnet_problem(input: &TestDNSAnswerInput) -> Option<String> {
+    let mask = input
+        .edns0_client_subnet_mask
+        .as_deref()
+        .filter(|mask| !mask.is_empty())?;
+    let ip = input
+        .edns0_client_subnet_ip
+        .as_deref()
+        .filter(|ip| !ip.is_empty())?;
+    let limit = if ip.parse::<Ipv4Addr>().is_ok() {
+        MAX_IPV4_SUBNET_MASK
+    } else {
+        MAX_IPV6_SUBNET_MASK
+    };
+    match mask.parse::<u32>() {
+        Ok(bits) if bits <= limit => None,
+        _ => Some(format!(
+            "Invalid value for parameter edns0clientsubnetmask: {mask}; \
+             specify a value between 0 and {limit} for the address {ip}"
+        )),
+    }
+}
+
+/// A uniform draw below `bound`, which is what makes a weighted group's answer
+/// fall to one member "based on the ratio of a resource's weight to the total"
+/// (`Weight`'s own documentation) rather than always to the same one.
+///
+/// The draw is mixed by the maintained `sha2` digest over a per-process counter
+/// and the instant of the query — the counter is what makes two queries in the
+/// same nanosecond draw differently, the instant is what keeps two runs of this
+/// emulator from drawing the same sequence. Nothing authenticates with it, so an
+/// unbiased cryptographic draw is not what it has to be; what it has to be is a
+/// choice no caller can predict and that visits every member in proportion.
+fn draw_below(bound: u64) -> u64 {
+    use sha2::{Digest, Sha256};
+
+    static DRAWN: AtomicU64 = AtomicU64::new(0);
+
+    if bound == 0 {
+        return 0;
+    }
+    let counter = DRAWN.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since_epoch| since_epoch.as_nanos());
+    let mut digest = Sha256::new();
+    digest.update(counter.to_be_bytes());
+    digest.update(nanos.to_be_bytes());
+    let mut eight = [0u8; 8];
+    eight.copy_from_slice(&digest.finalize()[..8]);
+    u64::from_be_bytes(eight) % bound
+}
+
+/// A record set's `Weight` as the proportion it answers in.
+///
+/// `Weight` is modelled `range 0..255`, so a value below zero is one no request
+/// can carry; it counts as no weight at all rather than as a negative share.
+fn weight_of(record: &ResourceRecordSet) -> u64 {
+    u64::try_from(record.weight.unwrap_or(0)).unwrap_or(0)
+}
+
+/// The member of a weighted group this query falls to.
+///
+/// `Weight`'s own documentation: "Route 53 calculates the sum of the weights for
+/// the resource record sets that have the same combination of DNS name and type.
+/// Route 53 then responds to queries based on the ratio of a resource's weight
+/// to the total … if you set Weight to 0 for a resource record set, Route 53
+/// never responds to queries with the applicable value for that resource record
+/// set. However, if you set Weight to 0 for all resource record sets that have
+/// the same combination of DNS name and type, traffic is routed to all resources
+/// with equal probability."
+fn weighted_member<'a>(group: &[&'a ResourceRecordSet]) -> Option<&'a ResourceRecordSet> {
+    let total: u64 = group.iter().copied().map(weight_of).sum();
+    if total == 0 {
+        // Every weight is zero: equal probability over the whole group.
+        let pick = usize::try_from(draw_below(group.len() as u64)).unwrap_or(0);
+        return group.get(pick).copied();
+    }
+    let mut draw = draw_below(total);
+    for record in group {
+        let share = weight_of(record);
+        if draw < share {
+            return Some(record);
+        }
+        draw -= share;
+    }
+    // Unreachable: the shares sum to `total` and the draw is below it.
+    group.last().copied()
+}
+
+/// The record set(s) a query at one name and type is answered from, chosen by
+/// the routing policy the group at that name and type carries.
+///
+/// One name and type are served either by a single record set with no routing
+/// policy, or by a group whose members each carry the member that selects the
+/// policy (`SetIdentifier`'s own documentation). The policy decides WHICH member
+/// answers:
+///
+/// * weighted — one member, in proportion to its `Weight` ([`weighted_member`]);
+/// * failover — the `PRIMARY` member while it is healthy, and this emulator runs
+///   no health checks, so a record set it holds is healthy ("If you don't
+///   associate a health check with a … record, Route 53 always considers the
+///   record to be healthy");
+/// * multivalue answer — up to eight members, all of them when the group is
+///   that small ([`MAX_MULTIVALUE_ANSWERS`]);
+/// * geolocation — the member whose location covers the query's origin. Mapping
+///   an address to a location is something this emulator cannot do, so every
+///   query is one "from [an IP address] that [isn't] mapped to a location",
+///   which `GeoLocation`'s documentation routes to the `*` member, and to a "no
+///   answer" response when the group has none ([`UNPLACEABLE_COUNTRY_CODE`]);
+/// * latency — the member in the resolver's own Region, which is `us-east-1` for
+///   the resolver the checking tool simulates by default
+///   ([`DEFAULT_RESOLVER_REGION`]). Latency to the other Regions is not
+///   something this emulator can measure, so a group holding no member in that
+///   Region answers from its first member;
+/// * IP-based — the member for the default location, the same role `*` plays for
+///   a geolocation group ([`DEFAULT_CIDR_LOCATION`]);
+/// * geoproximity, and a group that carries no policy member at all — the first
+///   record set at that name and type, since a group with no rule to apply has
+///   nothing to choose between its members by.
+fn answering_members<'a>(
+    group: &[&'a ResourceRecordSet],
+    resolver_region: Option<&str>,
+) -> Vec<&'a ResourceRecordSet> {
+    let one = |record: Option<&'a ResourceRecordSet>| record.into_iter().collect();
+    if group.iter().any(|record| record.weight.is_some()) {
+        return one(weighted_member(group));
+    }
+    if group.iter().any(|record| record.failover.is_some()) {
+        let primary = group
+            .iter()
+            .copied()
+            .find(|record| record.failover.as_deref() == Some(FAILOVER_PRIMARY));
+        return one(primary.or_else(|| group.first().copied()));
+    }
+    if group.iter().any(|record| record.multi_value_answer.is_some()) {
+        return group
+            .iter()
+            .copied()
+            .take(MAX_MULTIVALUE_ANSWERS)
+            .collect();
+    }
+    if group.iter().any(|record| record.geo_location.is_some()) {
+        return one(group.iter().copied().find(|record| {
+            record
+                .geo_location
+                .as_ref()
+                .and_then(|location| location.country_code.as_deref())
+                == Some(UNPLACEABLE_COUNTRY_CODE)
+        }));
+    }
+    if group.iter().any(|record| record.region.is_some()) {
+        let in_region = resolver_region.and_then(|region| {
+            group
+                .iter()
+                .copied()
+                .find(|record| record.region.as_deref() == Some(region))
+        });
+        return one(in_region.or_else(|| group.first().copied()));
+    }
+    if group
+        .iter()
+        .any(|record| record.cidr_routing_config.is_some())
+    {
+        return one(group.iter().copied().find(|record| {
+            record
+                .cidr_routing_config
+                .as_ref()
+                .is_some_and(|config| config.location_name == DEFAULT_CIDR_LOCATION)
+        }));
+    }
+    one(group.first().copied())
+}
+
+/// The values one record set answers with.
+///
+/// `RecordDataEntry`'s own documentation states the three cases: a record set of
+/// its own carries "one value in the resource record set [and] if the resource
+/// record set contains multiple values, the response includes one
+/// `RecordDataEntry` element for each value"; an alias "that [refers] to other
+/// resource record sets" carries "one value from the referenced resource record
+/// set", which is why an alias inside a hosted zone this store holds is resolved
+/// THROUGH that zone, by the routing the referenced group carries; and an alias
+/// to an Amazon Web Services resource carries "an IP address or a domain name
+/// for the … resource", which for a resource outside this emulator is the
+/// target's domain name.
+///
+/// Because an alias answers from the ONE referenced record set, the walk down a
+/// chain of aliases follows one record set per hop — the one the target's own
+/// routing answers with — rather than branching into every member of the group
+/// it lands in. The work of one answer is therefore the chain's length, bounded
+/// by [`MAX_ALIAS_HOPS`], and a hop that returns to a (zone, name, type) this
+/// walk already resolved ends it, so a cycle costs one pass rather than looping.
+fn record_data<'a>(
+    store: &'a ComAmazonawsRoute53Awsdnsv20130401State,
+    record: &'a ResourceRecordSet,
+    resolver_region: Option<&str>,
+) -> Vec<String> {
+    let mut current = record;
+    // At most one entry per hop, so the walk's own bookkeeping is bounded by
+    // `MAX_ALIAS_HOPS` as well.
+    let mut resolved: Vec<(&str, String, &str)> = Vec::new();
+    for _ in 0..=MAX_ALIAS_HOPS {
+        let Some(alias) = current.alias_target.as_ref() else {
+            return current
+                .resource_records
+                .iter()
+                .flatten()
+                .take(MAX_RECORD_DATA_ENTRIES)
+                .map(|resource_record| resource_record.value.clone())
+                .collect();
+        };
+        let target_name = canonical_dns_name(&alias.dns_name);
+        let target_zone_id = normalize_zone_id(&alias.hosted_zone_id);
+        let Some(target_zone) = store.zones.get(target_zone_id) else {
+            return vec![target_name];
+        };
+        let hop = (target_zone_id, target_name, current.r#type.as_str());
+        if resolved.contains(&hop) {
+            return Vec::new();
+        }
+        let group = target_zone.records_at(&hop.1, hop.2);
+        let Some(next) = answering_members(&group, resolver_region)
+            .into_iter()
+            .next()
+        else {
+            return Vec::new();
+        };
+        resolved.push(hop);
+        current = next;
+    }
+    // A chain longer than the bound answers with nothing rather than with a
+    // value from halfway down it.
+    Vec::new()
+}
+
+/// The answer a zone gives for one name and type: the response code, and the
+/// record data that goes with it.
+///
+/// Three outcomes, which are the DNS answers the zone's name servers hold for a
+/// query, and the operation returns "information similar to what you would
+/// expect from the answer section of the dig command":
+///
+/// * a record set at that name and type — the values the routing policy there
+///   answers with, under `NOERROR`;
+/// * a name the zone holds other records at, but none of the asked-for type —
+///   `NOERROR` with no record data, since the name exists and the type does not;
+/// * a name the zone holds no record at, including a name outside the zone the
+///   name servers are authoritative for — `NXDOMAIN`.
+fn answer(
+    store: &ComAmazonawsRoute53Awsdnsv20130401State,
+    zone: &StoredZone,
+    name: &str,
+    rr_type: &str,
+    resolver_region: Option<&str>,
+) -> (&'static str, Vec<String>) {
+    if !name_is_in_zone(name, &zone.name) {
+        return (RESPONSE_CODE_NXDOMAIN, Vec::new());
+    }
+    let group = zone.records_at(name, rr_type);
+    if group.is_empty() {
+        let code = if zone.holds_record_name(name) {
+            RESPONSE_CODE_NOERROR
+        } else {
+            RESPONSE_CODE_NXDOMAIN
+        };
+        return (code, Vec::new());
+    }
+    let values = answering_members(&group, resolver_region)
+        .into_iter()
+        .flat_map(|record| record_data(store, record, resolver_region))
+        .take(MAX_RECORD_DATA_ENTRIES)
+        .collect();
+    (RESPONSE_CODE_NOERROR, values)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -179,20 +561,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TestDNSAnswer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TestDNSAnswerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TestDNSAnswer"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            TestDNSAnswerErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        // A fault in the request itself, decided before any zone is read.
+        if let Some(problem) = client_subnet_problem(&input) {
+            return Err(TestDNSAnswerErrorModeled::InvalidInput(InvalidInput {
+                message: Some(problem),
+            })
+            .into());
+        }
+
+        // "If you omit this value, TestDnsAnswer uses the IP address of a DNS
+        // resolver in the … us-east-1 … Region." A resolver the request DOES
+        // name sits wherever its address does, which is not something this
+        // emulator can place, so its Region is unknown.
+        let resolver_region = input
+            .resolver_ip
+            .as_deref()
+            .filter(|ip| !ip.is_empty())
+            .is_none()
+            .then_some(DEFAULT_RESOLVER_REGION);
+
+        let store = state.lock();
+        let zone = store
+            .zones
+            .get(normalize_zone_id(&input.hosted_zone_id))
+            .ok_or_else(|| {
+                TestDNSAnswerErrorModeled::NoSuchHostedZone(no_such_hosted_zone(
+                    &input.hosted_zone_id,
+                ))
+            })?;
+        // The operation's own documentation: "This call only supports querying
+        // public hosted zones." A private zone answers queries from inside the
+        // VPCs it is associated with, which no simulated resolver is in.
+        if zone.private_zone {
+            return Err(TestDNSAnswerErrorModeled::InvalidInput(InvalidInput {
+                message: Some(format!(
+                    "The hosted zone {} is a private hosted zone; TestDNSAnswer only \
+                     supports querying public hosted zones",
+                    zone.id
+                )),
+            })
+            .into());
+        }
+
+        let record_name = canonical_dns_name(&input.record_name);
+        let (response_code, record_data) = answer(
+            &store,
+            zone,
+            &record_name,
+            &input.record_type,
+            resolver_region,
+        );
+
+        Ok(TestDNSAnswerOutput {
+            // A query reaches ONE of the zone's four authoritative name servers,
+            // and the answer names the one that served it. Read off the zone's
+            // delegation set, so the name server a caller is told answered is
+            // always one of the four the zone's `NS` record delegates to.
+            nameserver: zone.name_servers.first().cloned().unwrap_or_default(),
+            record_name,
+            record_type: input.record_type,
+            record_data,
+            response_code: response_code.to_string(),
+            protocol: PROTOCOL_UDP.to_string(),
+        })
     }
 }
