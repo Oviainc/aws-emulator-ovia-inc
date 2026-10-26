@@ -102,7 +102,8 @@
 //! back, so the mode one request sets is the mode the next request reports.
 //!
 //! And it holds the application inference profiles `ops/create_inference_profile.rs`
-//! mints, `ops/get_inference_profile.rs` reads back and `ops/delete_inference_profile.rs`
+//! mints, `ops/get_inference_profile.rs` reads back,
+//! `ops/list_inference_profiles.rs` reports and `ops/delete_inference_profile.rs`
 //! removes, each holding the foundation models that profile tracks metrics and costs for.
 //!
 //! And it holds the batch inference jobs `ops/create_model_invocation_job.rs` submits,
@@ -113,7 +114,10 @@
 //! And it holds the published foundation model catalog — the base models
 //! `ops/list_foundation_models.rs` reports and `ops/get_foundation_model.rs` resolves one
 //! row of — which is seeded with the store and never written, because no operation of this
-//! service creates a foundation model.
+//! service creates a foundation model. The cross-region inference profiles Amazon Bedrock
+//! publishes over those models ([`system_defined_inference_profiles`], which
+//! `ops/list_inference_profiles.rs` reports beside the account's own profiles) are
+//! published the same way, so they are constants rather than part of the store at all.
 //!
 //! And it holds the resource policies `ops/put_resource_policy.rs` attaches,
 //! `ops/get_resource_policy.rs` reports and `ops/delete_resource_policy.rs` takes away,
@@ -158,7 +162,8 @@ use crate::ops::types::{
     GuardrailSensitiveInformationPolicyConfig, GuardrailTopic, GuardrailTopicConfig,
     GuardrailTopicPolicy, GuardrailTopicPolicyConfig, GuardrailTopicsTier,
     GuardrailTopicsTierConfig, GuardrailWord, GuardrailWordConfig, GuardrailWordPolicy,
-    GuardrailWordPolicyConfig, InferenceProfileModel, LoggingConfig, MarketplaceModelEndpoint,
+    GuardrailWordPolicyConfig, InferenceProfileModel, InferenceProfileSummary, LoggingConfig,
+    MarketplaceModelEndpoint,
     ModelConfiguration, ModelDataSource, ModelEnforcement, OutputDataConfig,
     PromptRouterTargetModel,
     ProvisionedModelSummary, RoutingCriteria, SelectiveContentGuarding, Tag, TrainingDataConfig,
@@ -824,9 +829,17 @@ pub const INFERENCE_PROFILE_ACTIVE: &str = "ACTIVE";
 /// The enum is `[SYSTEM_DEFINED, APPLICATION]`, and `APPLICATION` is documented as "the
 /// inference profile was created by a user"
 /// (`smithy_query(query="shape",shape="InferenceProfileSummary")`), which is every profile
-/// this store holds: `SYSTEM_DEFINED` profiles are the ones Amazon Bedrock itself defines,
-/// and no operation of this service creates one.
+/// this store holds: `SYSTEM_DEFINED` profiles are the ones Amazon Bedrock itself defines
+/// ([`system_defined_inference_profiles`]), and no operation of this service creates one.
 pub const INFERENCE_PROFILE_TYPE_APPLICATION: &str = "APPLICATION";
+
+/// What Amazon Bedrock states when an `inferenceProfileIdentifier` names no inference
+/// profile: the message every 404 `ResourceNotFoundException` of this resource carries.
+///
+/// Stated once here because the read and the delete answer the same refusal for the same
+/// identifier, and two spellings of it could drift. It names no identifier: the wording is
+/// the error class's, with nothing of the request in it.
+pub const INFERENCE_PROFILE_NOT_FOUND: &str = "Inference profile not found.";
 
 /// The most application inference profiles this account may hold at once, across every
 /// region it has created one in, past which a create is refused with
@@ -4824,9 +4837,11 @@ pub fn date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
 // =============================================================================
 //
 // `ops/list_provisioned_model_throughputs.rs` and `ops/list_custom_models.rs` sort by the
-// one instant their `sortBy` admits and page with a `nextToken`, so they need the SAME
-// cursor: stated once here, because two renderings of it could drift and a token issued by
-// one shape would then not resume the listing it came from.
+// one instant their `sortBy` admits and page with a `nextToken`, and
+// `ops/list_inference_profiles.rs` pages the same way over the instant its profiles were
+// created, so they need the SAME cursor: stated once here, because two renderings of it
+// could drift and a token issued by one shape would then not resume the listing it came
+// from.
 
 /// The number of decimal digits a listing cursor's instant half carries.
 ///
@@ -5588,6 +5603,170 @@ pub fn foundation_model_details(model: &FoundationModel, region: &str) -> Founda
         inference_types_supported: summary.inference_types_supported,
         model_lifecycle: summary.model_lifecycle,
     }
+}
+
+// =============================================================================
+// The published cross-region inference profile catalog
+// =============================================================================
+//
+// Amazon Bedrock publishes the SYSTEM_DEFINED inference profiles itself — "the inference
+// profile is defined by Amazon Bedrock. You can route inference requests across regions
+// with these inference profiles"
+// (`smithy_query(query="shape",shape="InferenceProfileSummary")`) — and there is no
+// operation that creates one, so these rows are published data the same way
+// [`FOUNDATION_MODELS`] is: the same for every account, written by no handler.
+
+/// `InferenceProfileType` — the type of a profile Amazon Bedrock itself defines.
+///
+/// The other of the two values `InferenceProfileType` carries, beside
+/// [`INFERENCE_PROFILE_TYPE_APPLICATION`].
+pub const INFERENCE_PROFILE_TYPE_SYSTEM_DEFINED: &str = "SYSTEM_DEFINED";
+
+/// One geography a cross-region inference profile routes invocations within.
+///
+/// A geography is the unit the published profiles are cut along: a profile exists once per
+/// geography per model, is offered in that geography's regions, and routes requests to
+/// those same regions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InferenceProfileGeography {
+    /// The leading dot-separated segment of the published `inferenceProfileId`
+    /// (`us.<modelId>`), which is also what `ops/create_inference_profile.rs` reads back
+    /// off such an id to find the model behind it.
+    pub prefix: &'static str,
+    /// How the published `inferenceProfileName` spells the geography. Spelled without a
+    /// `.` so a published name stays inside `InferenceProfileName`'s pattern
+    /// (`^([0-9a-zA-Z][ _-]?)+$`).
+    pub label: &'static str,
+    /// The regions of the geography: where the profile is offered, and where it routes
+    /// invocations to. At most five, because `InferenceProfileModels` is
+    /// `@length(min: 1, max: 5)` and a published profile reports one model per region.
+    pub regions: &'static [&'static str],
+}
+
+/// The geographies this emulator's Amazon Bedrock publishes cross-region profiles for, in
+/// `prefix` order — the order their profile ids sort in.
+///
+/// The prefixes and the regions are the ones AWS publishes in "Supported Regions and
+/// models for inference profiles": a geography's profile routes to the commercial regions
+/// of that geography. A SUBSET of what AWS offers, spanning geographies of three different
+/// sizes, because the listing rule — not the catalog's size — is what this emulator has to
+/// get right.
+pub const INFERENCE_PROFILE_GEOGRAPHIES: &[InferenceProfileGeography] = &[
+    InferenceProfileGeography {
+        prefix: "apac",
+        label: "APAC",
+        regions: &[
+            "ap-northeast-1",
+            "ap-northeast-2",
+            "ap-south-1",
+            "ap-southeast-1",
+            "ap-southeast-2",
+        ],
+    },
+    InferenceProfileGeography {
+        prefix: "eu",
+        label: "EU",
+        regions: &["eu-central-1", "eu-north-1", "eu-west-1", "eu-west-3"],
+    },
+    InferenceProfileGeography {
+        prefix: "us",
+        label: "US",
+        regions: &["us-east-1", "us-east-2", "us-west-2"],
+    },
+];
+
+/// One base model Amazon Bedrock publishes a cross-region inference profile for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrossRegionModel {
+    /// `BedrockModelId` — the base model the profile routes invocations of, and the rest
+    /// of the published `inferenceProfileId` behind its geography prefix. Every id here is
+    /// a row of [`FOUNDATION_MODELS`], so the two catalogs agree about which models exist.
+    pub model_id: &'static str,
+    /// How the published `inferenceProfileName` spells the model, after the geography's
+    /// own label.
+    pub label: &'static str,
+}
+
+/// The base models this emulator's Amazon Bedrock publishes a cross-region profile for, in
+/// `model_id` order.
+///
+/// The models AWS lists as supported for cross-region inference on "Supported Regions and
+/// models for inference profiles", restricted to the ids [`FOUNDATION_MODELS`] carries so
+/// no published profile routes to a model this control plane does not offer. A SUBSET of
+/// what AWS offers, spanning two providers.
+pub const CROSS_REGION_MODELS: &[CrossRegionModel] = &[
+    CrossRegionModel {
+        model_id: "amazon.nova-lite-v1:0",
+        label: "Nova Lite",
+    },
+    CrossRegionModel {
+        model_id: "amazon.nova-micro-v1:0",
+        label: "Nova Micro",
+    },
+    CrossRegionModel {
+        model_id: "amazon.nova-pro-v1:0",
+        label: "Nova Pro",
+    },
+    CrossRegionModel {
+        model_id: "anthropic.claude-3-haiku-20240307-v1:0",
+        label: "Anthropic Claude 3 Haiku",
+    },
+    CrossRegionModel {
+        model_id: "anthropic.claude-3-sonnet-20240229-v1:0",
+        label: "Anthropic Claude 3 Sonnet",
+    },
+];
+
+/// The ARN of a system-defined inference profile in `region`:
+/// `arn:aws:bedrock:<region>:<account>:inference-profile/<id>`.
+///
+/// `inference-profile` is the resource type `InferenceProfileArn`'s pattern admits beside
+/// `application-inference-profile` (see [`application_inference_profile_arn`]), and it is
+/// the one the profiles Amazon Bedrock publishes carry.
+#[must_use]
+pub fn system_defined_inference_profile_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("inference-profile/{id}"))
+}
+
+/// Every system-defined inference profile Amazon Bedrock publishes in `region`, as the
+/// `InferenceProfileSummary` a listing carries, in `inferenceProfileId` order.
+///
+/// A profile is published in the regions of its own geography, so a region belonging to no
+/// geography this catalog carries has none. Each one reports one model per region of that
+/// geography — the base model it routes invocations to there — and no `createdAt` or
+/// `updatedAt`: those two members are optional, and nothing publishes an instant for a
+/// profile no caller created.
+#[must_use]
+pub fn system_defined_inference_profiles(region: &str) -> Vec<InferenceProfileSummary> {
+    let Some(geography) = INFERENCE_PROFILE_GEOGRAPHIES
+        .iter()
+        .find(|geography| geography.regions.contains(&region))
+    else {
+        return Vec::new();
+    };
+    CROSS_REGION_MODELS
+        .iter()
+        .map(|model| {
+            let id = format!("{}.{}", geography.prefix, model.model_id);
+            InferenceProfileSummary {
+                inference_profile_name: format!("{} {}", geography.label, model.label),
+                description: None,
+                created_at: None,
+                updated_at: None,
+                inference_profile_arn: system_defined_inference_profile_arn(region, &id),
+                models: geography
+                    .regions
+                    .iter()
+                    .map(|routed| InferenceProfileModel {
+                        model_arn: Some(foundation_model_arn(routed, model.model_id)),
+                    })
+                    .collect(),
+                inference_profile_id: id,
+                status: INFERENCE_PROFILE_ACTIVE.to_string(),
+                r#type: INFERENCE_PROFILE_TYPE_SYSTEM_DEFINED.to_string(),
+            }
+        })
+        .collect()
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

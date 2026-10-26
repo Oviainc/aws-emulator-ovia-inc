@@ -146,10 +146,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(DeleteInferenceProfileErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no inference profile {} exists in this account",
-                        input.inference_profile_identifier
-                    )),
+                    message: Some(crate::state::INFERENCE_PROFILE_NOT_FOUND.to_string()),
                 },
             )
             .into());

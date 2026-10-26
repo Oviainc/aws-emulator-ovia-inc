@@ -26,7 +26,14 @@ pub struct ListInferenceProfilesOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#InferenceProfileSummary")]
+/// `InferenceProfileSummary`. Its schema and codec come from [`bedrock_schema_and_codec!`]
+/// rather than `#[smithy_macros::smithy(shape = ...)]` because `createdAt` and `updatedAt`
+/// carry `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="InferenceProfileSummary")`), which the derive does
+/// not put on a member schema — see `types/date_time_wire.rs` for that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone, Default)]
 pub struct InferenceProfileSummary {
     pub inference_profile_name: String,
@@ -39,4 +46,49 @@ pub struct InferenceProfileSummary {
     pub status: String,
     pub r#type: String,
 }
+
+bedrock_schema_and_codec!(
+    InferenceProfileSummary,
+    INFERENCE_PROFILE_SUMMARY_SCHEMA,
+    "com.amazonaws.bedrock#InferenceProfileSummary",
+    "com.amazonaws.bedrock",
+    "InferenceProfileSummary",
+    (
+        M_INFERENCE_PROFILE_NAME,
+        inference_profile_name,
+        "inferenceProfileName",
+        0,
+        req,
+        string
+    ),
+    (M_DESCRIPTION, description, "description", 1, opt, string),
+    (M_CREATED_AT, created_at, "createdAt", 2, opt, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 3, opt, date_time),
+    (
+        M_INFERENCE_PROFILE_ARN,
+        inference_profile_arn,
+        "inferenceProfileArn",
+        4,
+        req,
+        string
+    ),
+    (
+        M_MODELS,
+        models,
+        "models",
+        5,
+        req,
+        list_of_struct(InferenceProfileModel)
+    ),
+    (
+        M_INFERENCE_PROFILE_ID,
+        inference_profile_id,
+        "inferenceProfileId",
+        6,
+        req,
+        string
+    ),
+    (M_STATUS, status, "status", 7, req, string),
+    (M_TYPE, r#type, "type", 8, req, string),
+);
 
