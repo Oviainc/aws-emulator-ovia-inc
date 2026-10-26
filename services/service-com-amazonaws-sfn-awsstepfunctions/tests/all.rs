@@ -35,6 +35,8 @@ mod client_error_wrappers;
 mod definition_path_diagnostics;
 #[path = "all/definition_validation.rs"]
 mod definition_validation;
+#[path = "all/describe_state_machine_for_execution.rs"]
+mod describe_state_machine_for_execution;
 #[path = "all/error_messages.rs"]
 mod error_messages;
 #[path = "all/execution_alias_routing.rs"]

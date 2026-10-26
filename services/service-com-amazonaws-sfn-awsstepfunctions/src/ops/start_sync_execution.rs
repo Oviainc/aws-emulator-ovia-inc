@@ -342,12 +342,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let crate::state::RunTarget {
             state_machine_arn: machine_arn,
             name: machine_name,
-            definition,
-            role_arn,
+            configuration,
             version_arn,
             alias_arn,
             ..
         } = target;
+        // What this run interprets, kept on the record exactly as `StartExecution`
+        // keeps it: the configuration the start resolved, not what the state machine
+        // holds by the time anybody reads the execution back.
+        let definition = configuration.definition.clone();
+        let role_arn = configuration.role_arn.clone();
 
         // The execution ARN is built in the state machine's OWN region, so the two
         // ARNs always agree however the request was signed.
@@ -458,6 +462,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // either, so they are what the stored record attributes the run by.
             state_machine_version_arn: version_arn.clone(),
             state_machine_alias_arn: alias_arn.clone(),
+            ran: configuration,
             redrive_count: 0,
             redrive_date: None,
             redrive_tokens: Vec::new(),

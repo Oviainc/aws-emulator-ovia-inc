@@ -284,12 +284,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // rules the unqualified record below is: the three configuration
             // structures at their effective values, the definition as
             // `includedData` asks for it, and the variables its states reference.
-            let variable_references = if included_data.is_metadata_only() {
-                None
-            } else {
-                let references = crate::state::asl::variable_references(&version.definition);
-                (!references.is_empty()).then(|| references.into_iter().collect())
-            };
+            let variable_references = crate::state::reported_variable_references(
+                &version.definition,
+                included_data,
+            );
             return Ok(DescribeStateMachineOutput {
                 state_machine_arn: version.arn.clone(),
                 name: version.name.clone(),
@@ -324,12 +322,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // read — which does not report the definition — reports nothing derived from
         // it either. An empty map is no member at all: "states that do not use
         // variable references will not be shown in the response".
-        let variable_references = if included_data.is_metadata_only() {
-            None
-        } else {
-            let references = crate::state::asl::variable_references(&machine.definition);
-            (!references.is_empty()).then(|| references.into_iter().collect())
-        };
+        let variable_references =
+            crate::state::reported_variable_references(&machine.definition, included_data);
 
         Ok(DescribeStateMachineOutput {
             state_machine_arn: machine.arn.clone(),

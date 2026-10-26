@@ -391,11 +391,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state_machine_arn: machine_arn,
             name: machine_name,
             sm_type: machine_type,
-            definition,
-            role_arn,
+            configuration,
             version_arn,
             alias_arn,
         } = target;
+        // The configuration this start resolved is what the walk below interprets AND
+        // what the record keeps, so the execution reports and redrives the definition
+        // it actually ran however the state machine moves after this call.
+        let definition = configuration.definition.clone();
+        let role_arn = configuration.role_arn.clone();
 
         let region = crate::state::arn_region(&machine_arn);
 
@@ -470,6 +474,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `ListExecutions` on a qualified ARN selects by.
             state_machine_version_arn: version_arn.clone(),
             state_machine_alias_arn: alias_arn.clone(),
+            ran: configuration,
             redrive_count: 0,
             redrive_date: None,
             redrive_tokens: Vec::new(),

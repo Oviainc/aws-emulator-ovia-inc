@@ -26,7 +26,10 @@
 //! * an **execution**, keyed by its own ARN
 //!   (`arn:aws:states:<region>:<account>:execution:<stateMachineName>:<executionName>`),
 //!   with `executions_by_sm` listing one state machine's executions in start order so
-//!   `ListExecutions` pages without walking the whole store;
+//!   `ListExecutions` pages without walking the whole store. Each execution carries
+//!   the state machine configuration it RAN ([`RanConfiguration`]), because an update
+//!   to the state machine leaves an execution already started on "the previous
+//!   definition and roleArn";
 //! * a **map run**, the resource a Distributed Map state starts, keyed by its own ARN
 //!   (`arn:aws:states:<region>:<account>:mapRun:<stateMachineName>/<label>:<id>`),
 //!   with `map_runs_by_execution` listing one execution's map runs in the order their
@@ -851,7 +854,7 @@ pub struct StateMachineReference {
 }
 
 /// What a start operation needs to run ONE execution: the state machine the
-/// request's ARN resolved to, the definition that execution interprets, and the
+/// request's ARN resolved to, the configuration that execution interprets, and the
 /// version and alias the execution is associated with.
 ///
 /// A version is "a numbered snapshot of a state machine", so an execution started
@@ -866,15 +869,80 @@ pub struct RunTarget {
     pub name: String,
     /// `STANDARD` or `EXPRESS`.
     pub sm_type: String,
-    /// The definition this run interprets.
-    pub definition: String,
-    pub role_arn: String,
+    /// The configuration this run interprets, recorded onto the execution as
+    /// [`Execution::ran`].
+    pub configuration: RanConfiguration,
     /// The version this run is attributed to, if any — see
     /// [`Execution::state_machine_version_arn`].
     pub version_arn: Option<String>,
     /// The alias this run was started through, if any — see
     /// [`Execution::state_machine_alias_arn`].
     pub alias_arn: Option<String>,
+}
+
+/// The state machine configuration ONE execution runs, as it stood when that
+/// execution started.
+///
+/// An execution is PINNED to it: an update to the state machine "will not affect
+/// currently running executions", which keep "the previous definition and roleArn",
+/// so what an execution runs is recorded on the execution itself rather than read
+/// back from a record that has since moved on. That is what
+/// `DescribeStateMachineForExecution` reports, and what a redrive — which "uses the
+/// same state machine definition [...] as the original execution attempt" — re-runs.
+#[derive(Debug, Clone)]
+pub struct RanConfiguration {
+    /// The Amazon States Language definition this execution interprets.
+    pub definition: String,
+    /// The execution role it runs under.
+    pub role_arn: String,
+    /// The revision of the state machine this configuration IS, which is what lets a
+    /// caller "compare the revision of a state machine with the configuration of the
+    /// state machine used for executions"; `None` while nothing has revised it.
+    pub revision_id: Option<String>,
+    /// The instant this configuration was written: the state machine's own
+    /// `update_date` when the start resolved the state machine itself, and the
+    /// version's creation date when it resolved a version — a version being a
+    /// snapshot nothing updates after the publish that took it.
+    pub update_date: SystemTime,
+    pub logging_configuration: Option<LoggingConfiguration>,
+    pub tracing_configuration: Option<TracingConfiguration>,
+    pub encryption_configuration: Option<EncryptionConfiguration>,
+}
+
+impl RanConfiguration {
+    /// The configuration the state machine `machine` currently holds.
+    pub fn of_state_machine(machine: &StateMachine) -> Self {
+        Self {
+            definition: machine.definition.clone(),
+            role_arn: machine.role_arn.clone(),
+            revision_id: machine.revision_id.clone(),
+            update_date: machine.update_date,
+            logging_configuration: machine.logging_configuration.clone(),
+            tracing_configuration: machine.tracing_configuration.clone(),
+            encryption_configuration: machine.encryption_configuration.clone(),
+        }
+    }
+
+    /// The configuration the published version `version` holds.
+    pub fn of_version(version: &StateMachineVersion) -> Self {
+        Self {
+            definition: version.definition.clone(),
+            role_arn: version.role_arn.clone(),
+            revision_id: version.revision_id.clone(),
+            update_date: version.creation_date,
+            logging_configuration: version.logging_configuration.clone(),
+            tracing_configuration: version.tracing_configuration.clone(),
+            encryption_configuration: version.encryption_configuration.clone(),
+        }
+    }
+
+    /// The caller-sized bytes this snapshot retains, for the record carrying it; the
+    /// layout itself is counted by that record's own `size_of`.
+    pub fn measure(&self) -> usize {
+        self.definition.len()
+            + self.role_arn.len()
+            + self.revision_id.as_ref().map_or(0, String::len)
+    }
 }
 
 /// One stored activity: every member `DescribeActivity` reports, plus the tag set
@@ -1269,6 +1337,15 @@ pub struct Execution {
     /// which it "doesn't associate [...] with any aliases that point to that
     /// version", and for one started with an unqualified ARN.
     pub state_machine_alias_arn: Option<String>,
+    /// The state machine configuration this execution RUNS, recorded by the start
+    /// that resolved it.
+    ///
+    /// An execution is pinned to it — "all currently running executions will
+    /// continue to use the previous definition and roleArn" when the state machine is
+    /// updated — so this is what `DescribeStateMachineForExecution` reports and what
+    /// a redrive re-runs, however the state machine (or the version it was published
+    /// from) has moved since.
+    pub ran: RanConfiguration,
     pub redrive_count: i32,
     /// The instant the last successful `RedriveExecution` redrove this execution;
     /// `None` until one has, which is what `redriveDate`'s own documentation says it
@@ -1329,6 +1406,7 @@ impl Execution {
                 .as_ref()
                 .map_or(0, String::len)
             + self.state_machine_alias_arn.as_ref().map_or(0, String::len)
+            + self.ran.measure()
             + redrive_tokens_bytes(&self.redrive_tokens)
             + history_bytes(&self.history)
             + self.redrive_step.as_ref().map_or(0, asl::RedriveStep::measure)
@@ -3109,8 +3187,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
                 state_machine_arn: version.state_machine_arn.clone(),
                 name: version.name.clone(),
                 sm_type: version.sm_type.clone(),
-                definition: version.definition.clone(),
-                role_arn: version.role_arn.clone(),
+                configuration: RanConfiguration::of_version(version),
                 version_arn: Some(version.arn.clone()),
                 alias_arn,
             });
@@ -3120,8 +3197,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             state_machine_arn: machine.arn.clone(),
             name: machine.name.clone(),
             sm_type: machine.sm_type.clone(),
-            definition: machine.definition.clone(),
-            role_arn: machine.role_arn.clone(),
+            configuration: RanConfiguration::of_state_machine(machine),
             version_arn: None,
             alias_arn: None,
         })
@@ -5334,6 +5410,30 @@ pub fn reported_definition(definition: &str, included_data: IncludedData) -> Str
     } else {
         definition.to_string()
     }
+}
+
+/// The `variableReferences` a read reports for `definition`, given its
+/// `includedData`.
+///
+/// Two rules the member documents, applied in ONE place so every read that reports
+/// a state machine's configuration — the state machine itself, a published version
+/// of it, or the configuration an execution ran — reports them the same way:
+///
+/// * "states that do not use variable references will not be shown in the
+///   response", so a definition whose states reference none is no member at all
+///   rather than an empty map;
+/// * the member is read OUT OF the definition, so a metadata-only read — which
+///   reports no definition ([`reported_definition`]) — reports nothing derived from
+///   one either.
+pub fn reported_variable_references(
+    definition: &str,
+    included_data: IncludedData,
+) -> Option<HashMap<String, Vec<String>>> {
+    if included_data.is_metadata_only() {
+        return None;
+    }
+    let references = asl::variable_references(definition);
+    (!references.is_empty()).then(|| references.into_iter().collect())
 }
 
 // ---------------------------------------------------------------------------

@@ -291,21 +291,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 execution_name: execution.name.clone(),
                 state_machine_arn: machine.arn.clone(),
                 state_machine_name: machine.name.clone(),
-                role_arn: machine.role_arn.clone(),
+                // The role this execution runs under is the one it started with, for
+                // the same reason the definition below is.
+                role_arn: execution.ran.role_arn.clone(),
                 // This call begins the NEXT attempt, so the states it runs read the
                 // count this redrive takes the record to — the same one
                 // `DescribeExecution` projects once it is recorded below.
                 redrive_count: execution.redrive_count.saturating_add(1),
             };
-            // "Redriven executions use the same state machine definition" — which for
-            // an execution started through a version ARN, or through an alias that
-            // routed to a version, is that version's immutable snapshot and not what
-            // the state machine has been updated to since.
-            let definition = execution
-                .state_machine_version_arn
-                .as_deref()
-                .and_then(|version_arn| store.state_machine_versions.get(version_arn))
-                .map_or_else(|| machine.definition.clone(), |version| version.definition.clone());
+            // "Redriven executions use the same state machine definition [...] as the
+            // original execution attempt": the configuration the record was started
+            // with, which is not what the state machine — or the version it was
+            // published from — may hold by now.
+            let definition = execution.ran.definition.clone();
             (
                 definition,
                 execution.input.clone(),

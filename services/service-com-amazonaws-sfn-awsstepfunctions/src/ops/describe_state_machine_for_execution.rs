@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeStateMachineForExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeStateMachineForExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: a REPORTING operation. It answers from the execution record a start
+//! stored and from the state machine configuration that execution RAN — the
+//! definition, role and configuration recorded on the execution when it started,
+//! which an update to the state machine does not move — never from this request and
+//! never from a canned value. The only write it makes is materialising what the
+//! clock has already made due.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeStateMachineForExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request this operation cannot serve is refused with one of the operation's own
+//! modelled errors; it never answers 501.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +185,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeStateMachineForExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeStateMachineForExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeStateMachineForExecution"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The ARN is validated BEFORE the lookup: a malformed ARN, an ARN of another
+        // service and an ARN of another region are defects in the REQUEST, which
+        // `InvalidArn` reports, not an execution that is absent here.
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        if let Err(message) =
+            crate::state::read_execution_arn(&input.execution_arn, &endpoint_region)
+        {
+            return Err(
+                DescribeStateMachineForExecutionErrorModeled::InvalidArn(InvalidArn {
+                    message: Some(message),
+                })
+                .into(),
+            );
+        }
+
+        // `includedData` is `ALL_DATA | METADATA_ONLY`; the `definition` output
+        // member documents what the latter reports. A value outside the modelled
+        // enum is a bad request this operation models no error for, so it goes out
+        // through the one non-modelled channel the crate has.
+        let Some(included_data) =
+            crate::state::IncludedData::from_wire(input.included_data.as_deref())
+        else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "includedData must be one of [{}], got '{}'",
+                INCLUDED_DATA_VALUES.join(", "),
+                input.included_data.unwrap_or_default()
+            )));
+        };
+
+        let now = crate::state::now();
+        let mut store = state.lock();
+        // Materialising what the clock already owes — a terminal execution status, a
+        // started deletion — is the one write a report may make: it was due at the
+        // same instant whether or not anybody called this operation.
+        store.settle(now);
+
+        let absent = || {
+            DescribeStateMachineForExecutionErrorModeled::ExecutionDoesNotExist(
+                ExecutionDoesNotExist {
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::EXECUTION_DOES_NOT_EXIST,
+                        &input.execution_arn,
+                    )),
+                },
+            )
+        };
+
+        let Some(execution) = store.executions.get(&input.execution_arn) else {
+            return Err(absent().into());
+        };
+        // An execution never outlives the state machine it runs (deleting one removes
+        // its executions), so a record with no state machine behind it is an
+        // execution there is nothing to report for.
+        let Some(machine) = store.state_machines.get(&execution.state_machine_arn) else {
+            return Err(absent().into());
+        };
+
+        // "This API action is not supported by EXPRESS state machines": an Express
+        // execution this emulator started was not dispatched by a Map Run, so there
+        // is nothing for this operation to report about it — the same refusal
+        // `DescribeExecution` gives for one, worded the way the service words it.
+        if machine.sm_type == crate::state::STATE_MACHINE_TYPE_EXPRESS {
+            return Err(absent().into());
+        }
+
+        // What this operation reports is the configuration THAT EXECUTION RAN, which
+        // the start recorded on the execution: an execution is pinned to the
+        // definition, role and configuration that were in effect when it started, so
+        // an update to the state machine — or the deletion of the version it was
+        // published from — moves nothing about an execution already started. That
+        // pinning is also why `revisionId` is here at all: it lets a caller "compare
+        // the revision of a state machine with the configuration of the state machine
+        // used for executions".
+        let ran = &execution.ran;
+
+        Ok(DescribeStateMachineForExecutionOutput {
+            // `stateMachineArn` is "the state machine associated with the execution" —
+            // the UNQUALIFIED ARN the execution record carries, which is what
+            // `DescribeExecution` reports for the same execution and what every other
+            // read of this service means by that member.
+            state_machine_arn: execution.state_machine_arn.clone(),
+            // "The name of the state machine associated with the execution": a name
+            // is fixed at creation, so the state machine's own record carries it for
+            // every configuration of it.
+            name: machine.name.clone(),
+            definition: crate::state::reported_definition(&ran.definition, included_data),
+            role_arn: ran.role_arn.clone(),
+            update_date: crate::state::to_date_time(ran.update_date),
+            // The three configuration structures report what the execution's state
+            // machine is EFFECTIVELY configured with: one no create or update set is
+            // reported at its own modelled default, not omitted.
+            logging_configuration: Some(crate::state::reported_logging_configuration(
+                ran.logging_configuration.as_ref(),
+            )),
+            tracing_configuration: Some(crate::state::reported_tracing_configuration(
+                ran.tracing_configuration.as_ref(),
+            )),
+            // `mapRunArn` and `label` are "returned only if the executionArn is a
+            // child workflow execution that was started by a Distributed Map state".
+            // A Map Run in this store belongs to the execution that ENTERED the
+            // Distributed Map state, and no Map Run here dispatches a child workflow
+            // execution of its own, so no stored execution is one.
+            map_run_arn: None,
+            label: None,
+            revision_id: ran.revision_id.clone(),
+            encryption_configuration: Some(crate::state::reported_encryption_configuration(
+                ran.encryption_configuration.as_ref(),
+            )),
+            variable_references: crate::state::reported_variable_references(
+                &ran.definition,
+                included_data,
+            ),
+        })
     }
 }
