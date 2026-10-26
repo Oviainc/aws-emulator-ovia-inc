@@ -149,18 +149,7 @@ impl Emulator {
 
     /// Every key `bucket` holds, read through `ListObjectsV2`.
     async fn keys(&self, bucket: &str) -> Vec<String> {
-        let answer = self.s3("GET", &format!("/{bucket}?list-type=2")).await;
-        assert_eq!(
-            answer.status,
-            200,
-            "list {bucket}: got {}",
-            String::from_utf8_lossy(&answer.body)
-        );
-        elements(&answer.body)
-            .into_iter()
-            .filter(|(element, _)| element == "Key")
-            .map(|(_, key)| key)
-            .collect()
+        self.keys_under(bucket, "").await
     }
 
     /// The bytes `bucket` holds at `key`, read through `GetObject`.
@@ -178,7 +167,25 @@ impl Emulator {
     /// Create a stream whose only destination is `member`: `config`, and wait for it to
     /// be `ACTIVE` — a put is accepted only then.
     async fn create_active_stream(&self, stream: &str, member: &str, config: Value) {
+        self.create_active_stream_typed(stream, None, member, config)
+            .await;
+    }
+
+    /// The same, naming the `DeliveryStreamType` the create asks for. `None` leaves the
+    /// member out, which is the same source: a stream a provider application writes to
+    /// directly ("`DirectPut`: Provider applications access the Firehose stream directly"
+    /// — `CreateDeliveryStreamInput$DeliveryStreamType`).
+    async fn create_active_stream_typed(
+        &self,
+        stream: &str,
+        stream_type: Option<&str>,
+        member: &str,
+        config: Value,
+    ) {
         let mut request = json!({ "DeliveryStreamName": stream });
+        if let Some(stream_type) = stream_type {
+            request["DeliveryStreamType"] = json!(stream_type);
+        }
         request[member] = config;
         self.firehose_ok("CreateDeliveryStream", request).await;
         tokio::time::sleep(PAST_THE_TRANSITION).await;
@@ -195,6 +202,75 @@ impl Emulator {
             json!({ "DeliveryStreamName": stream, "Records": entries }),
         )
         .await
+    }
+
+    /// `PutRecord` with `data` as the one record — what a producer writing its records
+    /// one at a time calls.
+    async fn put_record(&self, stream: &str, data: &[u8]) -> (u16, Value) {
+        self.firehose(
+            "PutRecord",
+            json!({
+                "DeliveryStreamName": stream,
+                "Record": { "Data": base64(data) },
+            }),
+        )
+        .await
+    }
+
+    /// Every key under `prefix`, read through a `ListObjectsV2` that names NO delimiter —
+    /// the recursive read a client makes for a prefix whose objects sit under further
+    /// segments of their own. An empty `prefix` lists the whole bucket.
+    async fn keys_under(&self, bucket: &str, prefix: &str) -> Vec<String> {
+        let answer = self
+            .s3(
+                "GET",
+                &format!("/{bucket}?list-type=2&prefix={}", query_value(prefix)),
+            )
+            .await;
+        assert_eq!(
+            answer.status,
+            200,
+            "list {bucket} under {prefix:?}: got {}",
+            String::from_utf8_lossy(&answer.body)
+        );
+        elements(&answer.body)
+            .into_iter()
+            .filter(|(element, _)| element == "Key")
+            .map(|(_, key)| key)
+            .collect()
+    }
+
+    /// What a `/`-delimited `ListObjectsV2` at `prefix` reports: the keys it lists AT that
+    /// level, and how many entries the page holds in all — `KeyCount`, which counts each
+    /// rolled-up common prefix as one.
+    async fn delimited_listing(&self, bucket: &str, prefix: &str) -> (Vec<String>, usize) {
+        let answer = self
+            .s3(
+                "GET",
+                &format!(
+                    "/{bucket}?list-type=2&delimiter=/&prefix={}",
+                    query_value(prefix)
+                ),
+            )
+            .await;
+        assert_eq!(
+            answer.status,
+            200,
+            "delimited list {bucket} at {prefix:?}: got {}",
+            String::from_utf8_lossy(&answer.body)
+        );
+        let read = elements(&answer.body);
+        let keys: Vec<String> = read
+            .iter()
+            .filter(|(element, _)| element == "Key")
+            .map(|(_, key)| key.clone())
+            .collect();
+        let entries = read
+            .iter()
+            .find(|(element, _)| element == "KeyCount")
+            .and_then(|(_, count)| count.parse().ok())
+            .unwrap_or(0);
+        (keys, entries)
     }
 
     /// Every key under `bucket` once the bucket holds at least `want` of them, or a
@@ -234,6 +310,21 @@ fn authorization(service: &str) -> String {
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/{service}/aws4_request, \
          SignedHeaders=host, Signature=not-verified"
     )
+}
+
+/// `value` as a query-string value, for the reads that scope a listing to a prefix.
+///
+/// The harness interpolates it as written, so this is where a value that would have to be
+/// encoded first fails loudly rather than silently listing something else: the prefixes
+/// read here are object-key prefixes made of the unreserved characters and the delimiter.
+fn query_value(value: &str) -> &str {
+    assert!(
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.~/".contains(&byte)),
+        "a prefix read through the query string must need no encoding, got {value:?}"
+    );
+    value
 }
 
 /// `data` as the base64 the `awsJson1_1` wire carries a blob as.
@@ -1439,6 +1530,322 @@ async fn a_refused_put_delivers_nothing_while_a_sibling_put_in_the_same_window_a
             arrived,
             row.accepted.len(),
             "case {:?}: every record of the accepted put is delivered",
+            row.case
+        );
+    }
+}
+
+/// How the records of a [`StaticPrefixRow`] reach the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Put {
+    /// One `PutRecord` call per record, which is how a producer that writes its records
+    /// one at a time reaches the stream.
+    OneCallEach,
+    /// One `PutRecordBatch` carrying every record.
+    OneBatch,
+}
+
+/// One delivery case for a stream whose destination names a STATIC prefix — one carrying
+/// no `!{...}` expression of any kind.
+struct StaticPrefixRow {
+    case: &'static str,
+    /// The `DeliveryStreamType` the create names, or `None` to leave the member out.
+    stream_type: Option<&'static str>,
+    /// The destination `Prefix`, with `{stream}` standing for the row's own stream name;
+    /// `None` leaves the member out.
+    prefix: Option<&'static str>,
+    /// The destination `BufferingHints`, or `None` for the modelled defaults.
+    hints: Option<Value>,
+    /// Whether the destination configures [`ERROR_OUTPUT_PREFIX`], which — with no dynamic
+    /// partitioning for a record to fail — must take nothing.
+    error_output: bool,
+    put: Put,
+    /// The records put, in arrival order.
+    records: Vec<&'static str>,
+}
+
+/// The static-prefix cases.
+///
+/// The rows differ along what the rule generalises over: whether the create names
+/// `DeliveryStreamType` at all, the FORM of the static prefix (named for the stream, a
+/// nested path, one not ending in the delimiter, and none at all), the `BufferingHints`
+/// (the published bounds of `SizeInMBs`/`IntervalInSeconds` and the defaults), how the
+/// records are put (a call each or one batch), the record count, and whether an
+/// `ErrorOutputPrefix` is configured.
+fn static_prefix_rows() -> Vec<StaticPrefixRow> {
+    // One JSON object per record, newline terminated, as a producer writing a queryable
+    // raw-JSON prefix puts them.
+    let lines = vec![
+        "{\"id\":1,\"event\":\"created\"}\n",
+        "{\"id\":2,\"event\":\"updated\"}\n",
+        "{\"id\":3,\"event\":\"renamed\"}\n",
+        "{\"id\":4,\"event\":\"deleted\"}\n",
+        "{\"id\":5,\"event\":\"restored\"}\n",
+    ];
+    vec![
+        StaticPrefixRow {
+            case: "a stream written to one record at a time, under a prefix named for it",
+            stream_type: Some("DirectPut"),
+            prefix: Some("{stream}/"),
+            hints: Some(json!({ "SizeInMBs": 1, "IntervalInSeconds": 60 })),
+            error_output: true,
+            put: Put::OneCallEach,
+            records: lines.clone(),
+        },
+        StaticPrefixRow {
+            case: "the same destination reached with one batch instead of a call per record",
+            stream_type: Some("DirectPut"),
+            prefix: Some("{stream}/"),
+            hints: Some(json!({ "SizeInMBs": 1, "IntervalInSeconds": 60 })),
+            error_output: true,
+            put: Put::OneBatch,
+            records: lines.clone(),
+        },
+        StaticPrefixRow {
+            case: "a nested static prefix, the default buffering hints, and no stream type",
+            stream_type: None,
+            prefix: Some("raw/events/json/"),
+            hints: None,
+            error_output: true,
+            put: Put::OneCallEach,
+            records: vec![lines[0]],
+        },
+        StaticPrefixRow {
+            case: "a static prefix that does not end in the delimiter",
+            stream_type: Some("DirectPut"),
+            prefix: Some("{stream}-"),
+            hints: Some(json!({ "SizeInMBs": 128, "IntervalInSeconds": 900 })),
+            error_output: true,
+            put: Put::OneCallEach,
+            records: vec![lines[1], lines[2]],
+        },
+        StaticPrefixRow {
+            case: "no prefix at all, so the automatic segments are the whole key",
+            stream_type: Some("DirectPut"),
+            prefix: None,
+            hints: Some(json!({ "SizeInMBs": 1, "IntervalInSeconds": 0 })),
+            error_output: false,
+            put: Put::OneCallEach,
+            records: vec![lines[3], lines[4]],
+        },
+    ]
+}
+
+/// The literal part of [`ERROR_OUTPUT_PREFIX`], before its first expression: the prefix a
+/// client lists to see whether ANYTHING was diverted to the error output.
+fn error_output_root() -> &'static str {
+    ERROR_OUTPUT_PREFIX.split("!{").next().unwrap_or_default()
+}
+
+/// A stream whose destination names a static prefix delivers its buffered records under
+/// that prefix followed by the service's own date segments, and diverts nothing to its
+/// error output.
+///
+/// The rule: for a destination whose `Prefix` carries no expression, the key of a
+/// delivered object is that prefix followed by the automatic `YYYY/MM/DD/HH/` segments
+/// ("The \"YYYY/MM/DD/HH\" time format prefix is automatically used for delivered Amazon
+/// S3 files" — `Prefix`) and then the object's own name, whichever put accepted the
+/// records; and a destination with no dynamic partitioning writes nothing under its
+/// `ErrorOutputPrefix`, which is for "failed records" only (`ErrorOutputPrefix`). So the
+/// objects sit strictly BELOW the configured prefix and a client reading that prefix must
+/// recurse to find them.
+#[tokio::test]
+async fn a_static_prefix_takes_the_automatic_date_segments_and_nothing_goes_to_the_error_output() {
+    for (ordinal, row) in static_prefix_rows().into_iter().enumerate() {
+        let emulator = Emulator::new();
+        let bucket = format!("static-prefix-bucket-{ordinal}");
+        let stream = format!("static-prefix-stream-{ordinal}");
+        emulator.create_bucket(&bucket).await;
+
+        let prefix = row
+            .prefix
+            .map(|prefix| prefix.replace("{stream}", &stream))
+            .unwrap_or_default();
+        let mut config = s3_destination(&bucket, row.prefix.map(|_| prefix.as_str()));
+        if let Some(hints) = &row.hints {
+            config["BufferingHints"] = hints.clone();
+        }
+        if row.error_output {
+            config["ErrorOutputPrefix"] = json!(ERROR_OUTPUT_PREFIX);
+        }
+        emulator
+            .create_active_stream_typed(
+                &stream,
+                row.stream_type,
+                "ExtendedS3DestinationConfiguration",
+                config,
+            )
+            .await;
+
+        // The data plane is reachable only once the stream reports itself ACTIVE, and a
+        // create naming no type made a stream a producer writes to directly.
+        let described = emulator
+            .firehose_ok(
+                "DescribeDeliveryStream",
+                json!({ "DeliveryStreamName": &stream }),
+            )
+            .await;
+        let description = &described["DeliveryStreamDescription"];
+        assert_eq!(
+            description["DeliveryStreamStatus"],
+            json!("ACTIVE"),
+            "case {:?}: the stream must reach ACTIVE, got {description:?}",
+            row.case
+        );
+        assert_eq!(
+            description["DeliveryStreamType"],
+            json!("DirectPut"),
+            "case {:?}: a create naming {:?} makes a DirectPut stream, got {description:?}",
+            row.case,
+            row.stream_type
+        );
+
+        let records: Vec<Vec<u8>> = row
+            .records
+            .iter()
+            .map(|record| record.as_bytes().to_vec())
+            .collect();
+        match row.put {
+            Put::OneCallEach => {
+                let mut ids = std::collections::BTreeSet::new();
+                for record in &records {
+                    let (status, answered) = emulator.put_record(&stream, record).await;
+                    assert_eq!(
+                        status, 200,
+                        "case {:?}: PutRecord got {status} {answered:?}",
+                        row.case
+                    );
+                    let id = answered["RecordId"].as_str().unwrap_or_default().to_string();
+                    assert!(
+                        !id.is_empty(),
+                        "case {:?}: PutRecord answers a RecordId, got {answered:?}",
+                        row.case
+                    );
+                    assert!(
+                        ids.insert(id.clone()),
+                        "case {:?}: each accepted record gets its own RecordId, got {id:?} twice",
+                        row.case
+                    );
+                }
+            }
+            Put::OneBatch => {
+                let (status, answered) = emulator.put_batch(&stream, &records).await;
+                assert_eq!(
+                    status, 200,
+                    "case {:?}: PutRecordBatch got {status} {answered:?}",
+                    row.case
+                );
+                assert_eq!(
+                    answered["FailedPutCount"],
+                    json!(0),
+                    "case {:?}: every record was accepted, got {answered:?}",
+                    row.case
+                );
+            }
+        }
+
+        // Wait for the delivery the put promised: every byte the records hold is readable
+        // out of the destination under the configured prefix.
+        let expected: String = row.records.concat();
+        let deadline = Instant::now() + DELIVERY_DEADLINE;
+        let delivered = loop {
+            let mut bodies: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+            for key in emulator.keys_under(&bucket, &prefix).await {
+                let body = emulator.object(&bucket, &key).await;
+                bodies.insert(key, body);
+            }
+            let held: usize = bodies.values().map(Vec::len).sum();
+            if held >= expected.len() {
+                break bodies;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {:?}: expected {} delivered byte(s) under {prefix:?}, got {:?}",
+                row.case,
+                expected.len(),
+                bodies.keys().collect::<Vec<_>>()
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        };
+        assert!(
+            !delivered.is_empty(),
+            "case {:?}: the buffered records are delivered under {prefix:?}",
+            row.case
+        );
+
+        for (key, body) in &delivered {
+            assert!(
+                carries_time_prefix(key, &prefix),
+                "case {:?}: expected the automatic yyyy/MM/dd/HH segments after {prefix:?}, \
+                 got {key:?}",
+                row.case
+            );
+            let name = key[prefix.len()..].splitn(5, '/').nth(4).unwrap_or_default();
+            assert!(
+                !name.is_empty(),
+                "case {:?}: an object name follows the date segments, got {key:?}",
+                row.case
+            );
+            let text = String::from_utf8_lossy(body).into_owned();
+            assert!(
+                !text.is_empty() && expected.contains(&text),
+                "case {:?}: {key:?} holds a non-empty run of the buffered records in arrival \
+                 order, got {text:?}",
+                row.case
+            );
+        }
+
+        // Exactly the records put, each delivered once.
+        let joined: String = delivered
+            .values()
+            .map(|body| String::from_utf8_lossy(body).into_owned())
+            .collect();
+        assert_eq!(
+            joined.len(),
+            expected.len(),
+            "case {:?}: the delivered objects hold exactly the records put, got {joined:?}",
+            row.case
+        );
+        for record in &row.records {
+            assert_eq!(
+                joined.matches(record).count(),
+                1,
+                "case {:?}: {record:?} is delivered exactly once, got {joined:?}",
+                row.case
+            );
+        }
+
+        // Nothing is diverted to the error output: there is no dynamic partitioning here
+        // for a record to fail.
+        if row.error_output {
+            let errored = emulator.keys_under(&bucket, error_output_root()).await;
+            assert!(
+                errored.is_empty(),
+                "case {:?}: a destination with no dynamic partitioning diverts nothing to \
+                 its ErrorOutputPrefix, got {errored:?}",
+                row.case
+            );
+        }
+
+        // The objects sit BELOW the date segments, so reading the configured prefix has to
+        // recurse: a `/`-delimited listing at that prefix reports no object of its own,
+        // only the rolled-up date segment.
+        let (at_level, entries) = emulator.delimited_listing(&bucket, &prefix).await;
+        assert!(
+            at_level.is_empty() && entries > 0,
+            "case {:?}: expected the delivered objects below the date segments, a delimited \
+             listing at {prefix:?} reported keys {at_level:?} and {entries} entry/entries",
+            row.case
+        );
+
+        // A delivered buffer is not delivered again.
+        tokio::time::sleep(POLL_INTERVAL * 20).await;
+        let mut settled = emulator.keys_under(&bucket, &prefix).await;
+        settled.sort();
+        let expected_keys: Vec<String> = delivered.keys().cloned().collect();
+        assert_eq!(
+            settled, expected_keys,
+            "case {:?}: a delivered buffer is not delivered again",
             row.case
         );
     }
