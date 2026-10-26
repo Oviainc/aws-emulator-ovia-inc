@@ -31,10 +31,14 @@ mod enum_membership_refusals;
 mod job_definition_deregistration;
 #[path = "all/job_definition_registry.rs"]
 mod job_definition_registry;
+#[path = "all/job_definition_validation.rs"]
+mod job_definition_validation;
 #[path = "all/job_lifecycle.rs"]
 mod job_lifecycle;
 #[path = "all/job_queue_updates.rs"]
 mod job_queue_updates;
+#[path = "all/job_rests_in_runnable.rs"]
+mod job_rests_in_runnable;
 #[path = "all/job_state_change_events.rs"]
 mod job_state_change_events;
 #[path = "all/quota_share_listing.rs"]

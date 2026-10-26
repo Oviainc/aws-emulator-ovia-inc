@@ -14,7 +14,16 @@
 //! applied are the ones this service's own model documents — among them the
 //! `executionRoleArn` doc, "For jobs that run on Fargate resources, you must provide
 //! an execution role", which is checked for EVERY container-properties object a job
-//! definition carries, not only the top-level one.
+//! definition carries, not only the top-level one; the `RetryStrategy$attempts` range
+//! ("You can specify between 1 and 10 attempts"); the `NodeProperties$mainNode` relation
+//! to `numNodes` ("This node index value must be fewer than the number of nodes"); and
+//! the `ResourceRequirement$value` pairing of `VCPU` with `MEMORY` for a definition that
+//! runs on Fargate, which binds to every container-properties object the same way the
+//! execution role does.
+//!
+//! What IS stored is normalised first: an environment variable stated with an empty value
+//! says nothing about the name it carries, so AWS Batch keeps no such variable and neither
+//! does the revision written here ([`crate::state::normalize_environments`]).
 //!
 //! The per-node-range requirement — every `nodeProperties.nodeRangeProperties` entry must
 //! carry the containers its nodes run — is checked BEFORE the properties
@@ -400,6 +409,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "The number of times to move a job to the RUNNABLE status. You can specify
+        // between 1 and 10 attempts" (`RetryStrategy$attempts`). The member targets a
+        // plain `Integer`, so the framework enforces no range.
+        if let Some(attempts) = input
+            .retry_strategy
+            .as_ref()
+            .and_then(|strategy| strategy.attempts)
+        {
+            if !(crate::state::MIN_RETRY_ATTEMPTS..=crate::state::MAX_RETRY_ATTEMPTS)
+                .contains(&attempts)
+            {
+                return Err(client_exception(&format!(
+                    "RetryAttempts must be between {} and {}.",
+                    crate::state::MIN_RETRY_ATTEMPTS,
+                    crate::state::MAX_RETRY_ATTEMPTS
+                )));
+            }
+        }
+
+        // "Specifies the node index for the main node of a multi-node parallel job. This
+        // node index value must be fewer than the number of nodes"
+        // (`NodeProperties$mainNode`). Both members target a plain `Integer`, so neither
+        // the index nor its relation to `numNodes` is enforced at the boundary.
+        if let Some(node_properties) = input.node_properties.as_ref() {
+            if node_properties.main_node >= node_properties.num_nodes {
+                return Err(client_exception(&format!(
+                    "nodeProperties.mainNode {} must be fewer than nodeProperties.numNodes {}",
+                    node_properties.main_node, node_properties.num_nodes
+                )));
+            }
+        }
+
+        // THE FARGATE RESERVATION: "For jobs that are running on Fargate resources, then
+        // value must match one of the supported values and the MEMORY values must be one
+        // of the values supported for that VCPU value" (`ResourceRequirement$value`). Like
+        // the execution role above, it binds to every container-properties object the
+        // definition carries.
+        if on_fargate {
+            let reservations = crate::state::resource_requirements_of(
+                input.container_properties.as_ref(),
+                input.node_properties.as_ref(),
+                input.ecs_properties.as_ref(),
+            );
+            if let Some(detail) = reservations
+                .iter()
+                .find_map(|requirements| crate::state::fargate_reservation_refusal(requirements))
+            {
+                return Err(client_exception(&detail));
+            }
+        }
+
+        // An environment variable stated with an EMPTY value says nothing about the name
+        // it carries, and AWS Batch stores no such variable, so the revision is normalised
+        // BEFORE it is stored and every later read reports what was really kept.
+        let mut container_properties = input.container_properties;
+        let mut node_properties = input.node_properties;
+        let mut ecs_properties = input.ecs_properties;
+        crate::state::normalize_environments(
+            container_properties.as_mut(),
+            node_properties.as_mut(),
+            ecs_properties.as_mut(),
+        );
+
         let mut store = state.lock();
         // The store is in memory and every request adds to it, so the number of
         // revisions it keeps is bounded; AWS enforces its own per-account quota and
@@ -430,13 +502,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             scheduling_priority: input.scheduling_priority,
             parameters: input.parameters,
             retry_strategy: input.retry_strategy,
-            container_properties: input.container_properties,
+            container_properties,
             timeout: input.timeout,
-            node_properties: input.node_properties,
+            node_properties,
             tags: input.tags,
             propagate_tags: input.propagate_tags,
             platform_capabilities: input.platform_capabilities,
-            ecs_properties: input.ecs_properties,
+            ecs_properties,
             eks_properties: input.eks_properties,
             // "The valid values are ECS (default) or EKS"
             // (`containerOrchestrationType`).

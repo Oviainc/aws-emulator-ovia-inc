@@ -354,7 +354,7 @@ async fn a_resting_service_job_reads_every_submitted_member_back_unchanged() {
         (
             "both members on their published minima, a decimal in the payload",
             i64::from(state::MIN_SCHEDULING_PRIORITY),
-            i64::from(state::MIN_SERVICE_JOB_RETRY_ATTEMPTS),
+            i64::from(state::MIN_RETRY_ATTEMPTS),
             1,
             "s",
             r#"{"ResourceConfig":{"InstanceCount":9,"KeepAlivePeriodInSeconds":1800},"HyperParameters":{"lr":0.000012345678901234567}}"#
@@ -363,7 +363,7 @@ async fn a_resting_service_job_reads_every_submitted_member_back_unchanged() {
         (
             "both members on their published maxima, a long integer and an exponent",
             i64::from(state::MAX_SCHEDULING_PRIORITY),
-            i64::from(state::MAX_SERVICE_JOB_RETRY_ATTEMPTS),
+            i64::from(state::MAX_RETRY_ATTEMPTS),
             86400,
             "shareWithALongerName",
             r#"{"ResourceConfig":{"InstanceCount":3,"VolumeSizeInGB":12345678901234567890},"StoppingCondition":{"MaxRuntimeInSeconds":1.0e3}}"#

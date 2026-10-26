@@ -203,9 +203,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     status_reason: job.status_reason.clone(),
                     created_at: Some(job.created_at),
                     retry_strategy: job.retry_strategy.clone(),
-                    // Modelled as required, so it is always serialized; 0 until the job
-                    // starts, which a job whose container never ran never does.
-                    started_at: job.started_at.unwrap_or_default(),
                     stopped_at: job.stopped_at,
                     depends_on: job.depends_on.clone(),
                     job_definition: job.job_definition_arn.clone(),

@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TerminateJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TerminateJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TerminateJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The bulk `TerminateJob`: every job id the request names is ended through the SAME state
+//! machinery the singular operation uses ([`crate::state::ComAmazonawsBatchAwsbatchv20160810State::terminate_job`]),
+//! so a bulk request cannot end a job differently from one call per job.
+//!
+//! The result is reported PER JOB rather than as the call's status: "The response returns
+//! an HTTP status code of 200 even when some jobs encountered errors, so check the errors
+//! list", and "Jobs that can't be found are treated as successfully processed" — so an id
+//! the store holds no job for is `successful` too. A request naming more jobs than the
+//! documented maximum ([`crate::state::limits::MAX_BULK_JOBS`]) is refused whole, with the
+//! modelled `ClientException` (HTTP 400): nothing in it is processed.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +161,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TerminateJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TerminateJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TerminateJobs"))
+        use crate::state as batch;
+
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(
+                TerminateJobsErrorModeled::ServerException(batch::unreachable_state()).into(),
+            );
+        };
+        // "An array of up to 50 Batch job IDs of the jobs to terminate" (`jobs`): a
+        // request past the bound is refused whole, so one call can never end an unbounded
+        // number of jobs.
+        if input.jobs.len() > batch::limits::MAX_BULK_JOBS {
+            return Err(TerminateJobsErrorModeled::ClientException(batch::client_exception(
+                batch::quota_message("job IDs for one TerminateJobs request", batch::limits::MAX_BULK_JOBS),
+            ))
+            .into());
+        }
+        let now = batch::now_millis();
+        // The store's lock lives in THIS block and no longer, so nothing holds it while
+        // the state changes below are published (that call reaches another service
+        // in-process).
+        let successful = {
+            let mut state = state.lock();
+            // Materialise what the clock owed BEFORE terminating, so each job is judged on
+            // the status it has at `now`, exactly as the singular operation judges it.
+            state.materialize_due(now);
+            let mut successful: Vec<String> = Vec::new();
+            for job in &input.jobs {
+                // "Jobs that can't be found are treated as successfully processed", so the
+                // answer is the same whether or not the store held the job: what differs
+                // is only whether anything changed.
+                let _existed = state.terminate_job(job, &input.reason, now);
+                if !successful.iter().any(|seen| seen == job) {
+                    successful.push(job.clone());
+                }
+            }
+            successful
+        };
+        batch::publish_job_state_changes(ctx, &*self.engine, &batch::request_region(ctx)).await;
+
+        Ok(TerminateJobsOutput {
+            successful,
+            // Every id this service could address was processed, so there is nothing to
+            // report here: the list is present and empty, as the member is modelled
+            // required.
+            errors: Vec::new(),
+        })
     }
 }

@@ -641,13 +641,28 @@ async fn a_disabled_queue_accepts_no_new_jobs() {
     }
 
     // "jobs already in the queue can finish": the job submitted while the queue was
-    // enabled keeps advancing on the clock.
+    // enabled keeps advancing on the clock, out of SUBMITTED and into RUNNABLE, where it
+    // rests like every other job here rather than being frozen by the queue's state.
     let span = u64::try_from(state::JOB_PHASE_MILLIS).unwrap_or(500);
     tokio::time::sleep(Duration::from_millis(span * 6)).await;
     let detail = describe_job(&batch, &queued).await;
-    let status = detail["status"].as_str().unwrap_or_default();
+    assert_eq!(
+        detail["status"].as_str(),
+        Some(state::JOB_RUNNABLE),
+        "case a job already in a disabled queue: expected it to have advanced to RUNNABLE, \
+         got {detail}"
+    );
+    // And a caller can still end it, which is what "can finish" means for a job the
+    // disabled queue no longer accepts siblings for.
+    batch
+        .ok(
+            "/v1/terminatejob",
+            json!({"jobId": &queued, "reason": "end the job in the disabled queue"}),
+        )
+        .await;
+    let ended = describe_job(&batch, &queued).await;
     assert!(
-        state::is_terminal_status(status),
-        "case a job already in a disabled queue: expected a terminal status, got {detail}"
+        state::is_terminal_status(ended["status"].as_str().unwrap_or_default()),
+        "case a job already in a disabled queue: a terminate still ends it, got {ended}"
     );
 }

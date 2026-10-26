@@ -23,7 +23,18 @@ pub struct DescribeJobsOutput {
     pub jobs: Option<Vec<JobDetail>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.batch#JobDetail")]
+// `JobDetail` models `startedAt` @required, but AWS Batch does not put it on the wire for
+// a job that never reached `RUNNING`: the member is documented as "when the job
+// transitioned from the STARTING state to the RUNNING state", and every recorded detail of
+// a job that was not placed carries `createdAt` and no `startedAt` at all. Nothing in this
+// emulator places a job on compute capacity, so no response it can produce has a start
+// instant; the member is therefore declared unsupported, which keeps it out of the shape's
+// schema and so out of the body the framework writes, rather than filling it with a 0 a
+// client would read as "started at the epoch".
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.batch#JobDetail",
+    unsupported = ["startedAt"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct JobDetail {
     pub job_arn: Option<String>,
@@ -37,7 +48,6 @@ pub struct JobDetail {
     pub status_reason: Option<String>,
     pub created_at: Option<i64>,
     pub retry_strategy: Option<RetryStrategy>,
-    pub started_at: i64,
     pub stopped_at: Option<i64>,
     pub depends_on: Option<Vec<JobDependency>>,
     pub job_definition: String,

@@ -248,7 +248,8 @@ use super::provisioning::{
     xml_scalar_children, Created, Refusal, AWS_JSON_1_0, AWS_JSON_1_1,
 };
 use super::template::{
-    ACM_ACME_ENDPOINT, AOSS_COLLECTION, AOSS_SECURITY_POLICY, CLOUDWATCH_DASHBOARD,
+    ACM_ACME_ENDPOINT, AOSS_COLLECTION, AOSS_SECURITY_POLICY, BATCH_COMPUTE_ENVIRONMENT,
+    BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, CLOUDWATCH_DASHBOARD,
     CLOUDWATCH_METRIC_STREAM, CODEDEPLOY_APPLICATION, CODEDEPLOY_DEPLOYMENT_CONFIG,
     CODEDEPLOY_DEPLOYMENT_GROUP,
     COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, ECR_PUBLIC_REPOSITORY, ECS_CLUSTER,
@@ -351,6 +352,9 @@ pub(super) enum Provisioner {
     CodeDeployApplication,
     CodeDeployDeploymentGroup,
     CodeDeployDeploymentConfig,
+    BatchComputeEnvironment,
+    BatchJobQueue,
+    BatchServiceEnvironment,
     EksAccessEntry,
 }
 
@@ -403,6 +407,9 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         CODEDEPLOY_APPLICATION => Some(Provisioner::CodeDeployApplication),
         CODEDEPLOY_DEPLOYMENT_GROUP => Some(Provisioner::CodeDeployDeploymentGroup),
         CODEDEPLOY_DEPLOYMENT_CONFIG => Some(Provisioner::CodeDeployDeploymentConfig),
+        BATCH_COMPUTE_ENVIRONMENT => Some(Provisioner::BatchComputeEnvironment),
+        BATCH_JOB_QUEUE => Some(Provisioner::BatchJobQueue),
+        BATCH_SERVICE_ENVIRONMENT => Some(Provisioner::BatchServiceEnvironment),
         EKS_ACCESS_ENTRY => Some(Provisioner::EksAccessEntry),
         _ => None,
     }
@@ -570,6 +577,13 @@ impl Provisioner {
             // propagated to a deployment configuration.
             Self::CodeDeployDeploymentConfig => {
                 create_codedeploy_deployment_config(ctx, region, resource).await
+            }
+            Self::BatchComputeEnvironment => {
+                create_compute_environment(ctx, region, resource, propagated).await
+            }
+            Self::BatchJobQueue => create_job_queue(ctx, region, resource, propagated).await,
+            Self::BatchServiceEnvironment => {
+                create_service_environment(ctx, region, resource, propagated).await
             }
             Self::EksAccessEntry => create_access_entry(ctx, region, resource, propagated).await,
         }
@@ -884,6 +898,15 @@ impl Provisioner {
             Self::CodeDeployDeploymentConfig => {
                 delete_codedeploy_deployment_config(ctx, region, physical_resource_id).await
             }
+            Self::BatchComputeEnvironment => {
+                delete_batch_compute_environment(ctx, region, physical_resource_id).await
+            }
+            Self::BatchJobQueue => {
+                delete_batch_job_queue(ctx, region, physical_resource_id).await
+            }
+            Self::BatchServiceEnvironment => {
+                delete_batch_service_environment(ctx, region, physical_resource_id).await
+            }
             // The delete addresses the entry by the PAIR Amazon EKS keys one by, both
             // halves of which are on the resource's own declaration.
             Self::EksAccessEntry => delete_access_entry(ctx, region, resource).await,
@@ -1029,6 +1052,39 @@ impl Provisioner {
             }
             Self::CodeDeployDeploymentConfig => {
                 describe_codedeploy_deployment_config(ctx, region, physical_resource_id).await
+            }
+            // Batch's readers take a LIST and answer the records they found, so "no longer
+            // held" is an empty list rather than a modelled not-found code
+            // ([`batch_described`]).
+            Self::BatchComputeEnvironment => {
+                batch_described(
+                    ctx,
+                    region,
+                    BATCH_DESCRIBE_COMPUTE_ENVIRONMENTS_URI,
+                    "computeEnvironments",
+                    physical_resource_id,
+                )
+                .await
+            }
+            Self::BatchJobQueue => {
+                batch_described(
+                    ctx,
+                    region,
+                    BATCH_DESCRIBE_JOB_QUEUES_URI,
+                    "jobQueues",
+                    physical_resource_id,
+                )
+                .await
+            }
+            Self::BatchServiceEnvironment => {
+                batch_described(
+                    ctx,
+                    region,
+                    BATCH_DESCRIBE_SERVICE_ENVIRONMENTS_URI,
+                    "serviceEnvironments",
+                    physical_resource_id,
+                )
+                .await
             }
             // Read back by the same cluster-and-principal pair the delete uses.
             Self::EksAccessEntry => describe_access_entry(ctx, region, resource).await,
@@ -10256,6 +10312,613 @@ async fn call_transfer(
         request,
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// AWS Batch: AWS::Batch::ComputeEnvironment, AWS::Batch::JobQueue,
+//            AWS::Batch::ServiceEnvironment
+// ---------------------------------------------------------------------------
+
+/// AWS Batch's signing name, from its model (`sigv4Name: batch`). It speaks `restJson1`,
+/// so each call below is a method and a URI rather than an `X-Amz-Target`.
+const BATCH_SIGNING_NAME: &str = "batch";
+
+/// The URIs the calls these three types need are bound to, from the Batch model's own
+/// `@http` traits.
+const BATCH_CREATE_COMPUTE_ENVIRONMENT_URI: &str = "/v1/createcomputeenvironment";
+const BATCH_UPDATE_COMPUTE_ENVIRONMENT_URI: &str = "/v1/updatecomputeenvironment";
+const BATCH_DELETE_COMPUTE_ENVIRONMENT_URI: &str = "/v1/deletecomputeenvironment";
+const BATCH_DESCRIBE_COMPUTE_ENVIRONMENTS_URI: &str = "/v1/describecomputeenvironments";
+const BATCH_CREATE_JOB_QUEUE_URI: &str = "/v1/createjobqueue";
+const BATCH_UPDATE_JOB_QUEUE_URI: &str = "/v1/updatejobqueue";
+const BATCH_DELETE_JOB_QUEUE_URI: &str = "/v1/deletejobqueue";
+const BATCH_DESCRIBE_JOB_QUEUES_URI: &str = "/v1/describejobqueues";
+const BATCH_CREATE_SERVICE_ENVIRONMENT_URI: &str = "/v1/createserviceenvironment";
+const BATCH_UPDATE_SERVICE_ENVIRONMENT_URI: &str = "/v1/updateserviceenvironment";
+const BATCH_DELETE_SERVICE_ENVIRONMENT_URI: &str = "/v1/deleteserviceenvironment";
+const BATCH_DESCRIBE_SERVICE_ENVIRONMENTS_URI: &str = "/v1/describeserviceenvironments";
+
+/// The `JQState`/`CEState` a resource has to be in before AWS Batch will delete it:
+/// `DeleteJobQueue`'s own doc ("you must first disable submissions for a queue with the
+/// UpdateJobQueue operation") and `DeleteComputeEnvironment`'s ("Before you can delete a
+/// compute environment, you must set its state to DISABLED").
+const BATCH_STATE_DISABLED: &str = "DISABLED";
+
+/// The `CEStatus`/`JQStatus` of a compute environment or job queue AWS Batch has finished
+/// creating, and the one it reports for a configuration it could not accept.
+const BATCH_STATUS_VALID: &str = "VALID";
+const BATCH_STATUS_INVALID: &str = "INVALID";
+
+/// The `AWS::Batch::ComputeEnvironment` properties `CreateComputeEnvironment` takes whose
+/// value goes through unchanged under its lower-camel member name.
+///
+/// Source: AWS's CloudFormation resource reference for the type against the
+/// `CreateComputeEnvironmentRequest` shape. `ComputeEnvironmentName` is not here because it
+/// is the name CloudFormation decides, and `Tags` is not because the type spells it as a
+/// map of tag keys the template chose. `ReplaceComputeEnvironment` and `UpdatePolicy` are
+/// not members of the CREATE at all — they govern how a later deployment applies a change
+/// — so they are not sent.
+const BATCH_COMPUTE_ENVIRONMENT_MEMBERS: &[(&str, &str)] = &[
+    ("Type", "type"),
+    ("State", "state"),
+    ("ServiceRole", "serviceRole"),
+    ("UnmanagedvCpus", "unmanagedvCpus"),
+    ("Context", "context"),
+];
+
+/// The `AWS::Batch::JobQueue` properties `CreateJobQueue` takes whose value goes through
+/// unchanged under its lower-camel member name.
+///
+/// Source: the same pairing of the type's resource reference with
+/// `CreateJobQueueRequest`. `JobQueueName` is the name CloudFormation decides and `Tags` is
+/// a map of the template's own keys, so neither is here; the three LIST-valued properties
+/// are mapped entry by entry below, their own members being modelled structures.
+const BATCH_JOB_QUEUE_MEMBERS: &[(&str, &str)] = &[
+    ("Priority", "priority"),
+    ("State", "state"),
+    ("SchedulingPolicyArn", "schedulingPolicyArn"),
+    ("JobQueueType", "jobQueueType"),
+];
+
+/// The members of one `ComputeEnvironmentOrder` entry of a job queue's
+/// `ComputeEnvironmentOrder`.
+const BATCH_COMPUTE_ENVIRONMENT_ORDER_MEMBERS: &[(&str, &str)] =
+    &[("ComputeEnvironment", "computeEnvironment"), ("Order", "order")];
+
+/// The members of one `ServiceEnvironmentOrder` entry.
+const BATCH_SERVICE_ENVIRONMENT_ORDER_MEMBERS: &[(&str, &str)] =
+    &[("ServiceEnvironment", "serviceEnvironment"), ("Order", "order")];
+
+/// The members of one `JobStateTimeLimitAction` entry.
+const BATCH_JOB_STATE_TIME_LIMIT_ACTION_MEMBERS: &[(&str, &str)] = &[
+    ("Action", "action"),
+    ("MaxTimeSeconds", "maxTimeSeconds"),
+    ("Reason", "reason"),
+    ("State", "state"),
+];
+
+/// The `AWS::Batch::ServiceEnvironment` properties `CreateServiceEnvironment` takes whose
+/// value goes through unchanged under its lower-camel member name.
+///
+/// `ServiceEnvironmentName` is the name CloudFormation decides, `CapacityLimits` is a list
+/// of modelled structures mapped entry by entry, and `Tags` is a map of the template's own
+/// keys, so none of the three is here.
+const BATCH_SERVICE_ENVIRONMENT_MEMBERS: &[(&str, &str)] =
+    &[("ServiceEnvironmentType", "serviceEnvironmentType"), ("State", "state")];
+
+/// The members of one `CapacityLimit` entry of a service environment's `CapacityLimits`.
+const BATCH_CAPACITY_LIMIT_MEMBERS: &[(&str, &str)] =
+    &[("MaxCapacity", "maxCapacity"), ("CapacityUnit", "capacityUnit")];
+
+/// How long to wait between re-reads while a Batch resource the stack asked to delete is
+/// still on its way out, and how many of those re-reads to make.
+///
+/// A deleted job queue leaves AWS Batch a moment after `DeleteJobQueue` answers, and a
+/// compute environment cannot be deleted while a queue still orders it
+/// (`DeleteComputeEnvironment`: "you must first remove it from a job queue"). The stack
+/// deletes its resources newest first, so the queue's delete is asked for before the
+/// environment's: this is what lets the queue actually go before the environment is asked
+/// for, rather than reporting a stack deletion as failed over an ordering the caller has
+/// no part in.
+const BATCH_DELETION_CHECK_INTERVAL: ::std::time::Duration =
+    ::std::time::Duration::from_millis(50);
+const BATCH_DELETION_CHECKS: usize = 40;
+
+/// The resource NAME an `arn:aws:batch:…:<kind>/<name>` names.
+///
+/// Both types' `Ref` is the resource's ARN, so that is the record's physical id — and the
+/// name AWS Batch keys the resource by is its last segment, whether the template declared
+/// the name or CloudFormation generated it.
+fn batch_resource_name(arn: &str) -> &str {
+    arn.rsplit('/').next().unwrap_or(arn)
+}
+
+/// Create the compute environment an `AWS::Batch::ComputeEnvironment` declares, so a
+/// client that reads the stack's output can call AWS Batch with it
+/// (`DescribeComputeEnvironments`, `CreateJobQueue`) rather than being handed an ARN Batch
+/// never minted.
+///
+/// `computeEnvironmentName` is the name CloudFormation decided — the declared
+/// `ComputeEnvironmentName`, or the generated one — read back off the ARN that is this
+/// resource's physical id. `computeResources` and `eksConfiguration` are the create's own
+/// nested structures with every member's initial letter lower-cased ([`camel_cased`]),
+/// which is the whole difference between the type's spelling and the API's; the TAG MAPS
+/// inside them are lifted out first, their keys being the template's own.
+async fn create_compute_environment(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let properties = resource
+        .properties
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Map::new);
+    let mut request = Map::new();
+    request.insert(
+        "computeEnvironmentName".to_string(),
+        Value::String(batch_resource_name(&resource.physical_resource_id).to_string()),
+    );
+    copy_members(&properties, BATCH_COMPUTE_ENVIRONMENT_MEMBERS, &mut request);
+    if let Some(resources) = properties.get("ComputeResources") {
+        request.insert(
+            "computeResources".to_string(),
+            batch_nested(resources, "Tags")?,
+        );
+    }
+    if let Some(configuration) = properties.get("EksConfiguration") {
+        request.insert("eksConfiguration".to_string(), camel_cased(configuration, 0)?);
+    }
+    let tags = tags_as_map(&tags_of(&resource.properties, propagated));
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), Value::Object(tags));
+    }
+    let reported = call_rest_json(
+        ctx,
+        BATCH_SIGNING_NAME,
+        region,
+        "POST",
+        BATCH_CREATE_COMPUTE_ENVIRONMENT_URI,
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    let mut attributes = BTreeMap::new();
+    if let Some(arn) = reported
+        .get("computeEnvironmentArn")
+        .and_then(Value::as_str)
+    {
+        attributes.insert("ComputeEnvironmentArn".to_string(), arn.to_string());
+    }
+    // AWS Batch returns a fresh environment `CREATING`, and the resource is not created
+    // until it is `VALID`: "Compute environments must be created and valid before
+    // attaching them to a job queue" is what the NEXT resource of this stack depends on,
+    // so the wait belongs here rather than in the queue that orders it.
+    batch_await_valid(
+        ctx,
+        region,
+        BATCH_DESCRIBE_COMPUTE_ENVIRONMENTS_URI,
+        "computeEnvironments",
+        &resource.physical_resource_id,
+    )
+    .await?;
+    Ok(Created {
+        physical_resource_id: None,
+        attributes,
+    })
+}
+
+/// Create the job queue an `AWS::Batch::JobQueue` declares, so the queue the stack's
+/// output names is one `batch describe-job-queues` and `batch submit-job` find.
+///
+/// `jobQueueName` is the name CloudFormation decided, as above. The three list-valued
+/// properties are modelled structures of their own, so each entry is mapped member by
+/// member rather than passed through.
+async fn create_job_queue(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let properties = resource
+        .properties
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Map::new);
+    let mut request = Map::new();
+    request.insert(
+        "jobQueueName".to_string(),
+        Value::String(batch_resource_name(&resource.physical_resource_id).to_string()),
+    );
+    copy_members(&properties, BATCH_JOB_QUEUE_MEMBERS, &mut request);
+    for (property, member, members) in [
+        (
+            "ComputeEnvironmentOrder",
+            "computeEnvironmentOrder",
+            BATCH_COMPUTE_ENVIRONMENT_ORDER_MEMBERS,
+        ),
+        (
+            "ServiceEnvironmentOrder",
+            "serviceEnvironmentOrder",
+            BATCH_SERVICE_ENVIRONMENT_ORDER_MEMBERS,
+        ),
+        (
+            "JobStateTimeLimitActions",
+            "jobStateTimeLimitActions",
+            BATCH_JOB_STATE_TIME_LIMIT_ACTION_MEMBERS,
+        ),
+    ] {
+        if let Some(Value::Array(entries)) = properties.get(property) {
+            let entries: Vec<Value> = entries
+                .iter()
+                .map(|entry| mapped_members(entry, members))
+                .collect();
+            request.insert(member.to_string(), Value::Array(entries));
+        }
+    }
+    let tags = tags_as_map(&tags_of(&resource.properties, propagated));
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), Value::Object(tags));
+    }
+    let reported = call_rest_json(
+        ctx,
+        BATCH_SIGNING_NAME,
+        region,
+        "POST",
+        BATCH_CREATE_JOB_QUEUE_URI,
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    let mut attributes = BTreeMap::new();
+    if let Some(arn) = reported.get("jobQueueArn").and_then(Value::as_str) {
+        attributes.insert("JobQueueArn".to_string(), arn.to_string());
+    }
+    // A fresh queue is `CREATING` too, and a client that submits into it as soon as the
+    // stack completes needs it `VALID`, so the resource is not created until it is.
+    batch_await_valid(
+        ctx,
+        region,
+        BATCH_DESCRIBE_JOB_QUEUES_URI,
+        "jobQueues",
+        &resource.physical_resource_id,
+    )
+    .await?;
+    Ok(Created {
+        physical_resource_id: None,
+        attributes,
+    })
+}
+
+/// One nested structure of a Batch declaration as the create takes it: every member's
+/// initial letter lower-cased, with the MAP member `keyed` (a tag map, whose keys are the
+/// template's own) carried through exactly as the template wrote it.
+fn batch_nested(declared: &Value, keyed: &str) -> Result<Value, Refusal> {
+    let kept = declared.get(keyed).cloned();
+    let mut mapped = camel_cased(declared, 0)?;
+    if let (Some(kept), Value::Object(members)) = (kept, &mut mapped) {
+        members.remove(&lower_initial(keyed));
+        members.insert(lower_initial(keyed), kept);
+    }
+    Ok(mapped)
+}
+
+/// Create the service environment an `AWS::Batch::ServiceEnvironment` declares, so the
+/// environment a `SAGEMAKER_TRAINING` job queue of the same stack orders is one AWS Batch
+/// really holds — a queue cannot attach one that does not exist ("Service environments must
+/// be created and valid before attaching them to a job queue").
+///
+/// The type's properties are `CreateServiceEnvironment`'s own members spelled with an
+/// upper-case initial, including the `CapacityLimits` entries, so the declared document is
+/// re-cased rather than mapped member by member; its `Tags` map is the create's own member,
+/// beside the tags CloudFormation propagates.
+async fn create_service_environment(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let properties = resource
+        .properties
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Map::new);
+    let mut request = Map::new();
+    request.insert(
+        "serviceEnvironmentName".to_string(),
+        Value::String(batch_resource_name(&resource.physical_resource_id).to_string()),
+    );
+    copy_members(&properties, BATCH_SERVICE_ENVIRONMENT_MEMBERS, &mut request);
+    if let Some(Value::Array(limits)) = properties.get("CapacityLimits") {
+        let limits: Vec<Value> = limits
+            .iter()
+            .map(|limit| mapped_members(limit, BATCH_CAPACITY_LIMIT_MEMBERS))
+            .collect();
+        request.insert("capacityLimits".to_string(), Value::Array(limits));
+    }
+    let tags = tags_as_map(&tags_of(&resource.properties, propagated));
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), Value::Object(tags));
+    }
+    let reported = call_rest_json(
+        ctx,
+        BATCH_SIGNING_NAME,
+        region,
+        "POST",
+        BATCH_CREATE_SERVICE_ENVIRONMENT_URI,
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    let mut attributes = BTreeMap::new();
+    if let Some(arn) = reported
+        .get("serviceEnvironmentArn")
+        .and_then(Value::as_str)
+    {
+        attributes.insert("ServiceEnvironmentArn".to_string(), arn.to_string());
+    }
+    Ok(Created {
+        physical_resource_id: None,
+        attributes,
+    })
+}
+
+/// Delete the service environment a stack created, by the ARN that is its physical id —
+/// the same two steps the job queue below takes ("set it to DISABLED with
+/// UpdateServiceEnvironment first").
+async fn delete_batch_service_environment(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    if batch_described(
+        ctx,
+        region,
+        BATCH_DESCRIBE_SERVICE_ENVIRONMENTS_URI,
+        "serviceEnvironments",
+        physical_resource_id,
+    )
+    .await?
+    .is_none()
+    {
+        return Ok(());
+    }
+    call_rest_json(
+        ctx,
+        BATCH_SIGNING_NAME,
+        region,
+        "POST",
+        BATCH_UPDATE_SERVICE_ENVIRONMENT_URI,
+        Some(&serde_json::json!({
+            "serviceEnvironment": physical_resource_id,
+            "state": BATCH_STATE_DISABLED,
+        })),
+    )
+    .await?;
+    call_rest_json(
+        ctx,
+        BATCH_SIGNING_NAME,
+        region,
+        "POST",
+        BATCH_DELETE_SERVICE_ENVIRONMENT_URI,
+        Some(&serde_json::json!({"serviceEnvironment": physical_resource_id})),
+    )
+    .await?;
+    batch_await_gone(
+        ctx,
+        region,
+        BATCH_DESCRIBE_SERVICE_ENVIRONMENTS_URI,
+        "serviceEnvironments",
+        physical_resource_id,
+    )
+    .await
+}
+
+/// Delete the job queue a stack created, by the ARN that is its physical id.
+///
+/// AWS Batch takes a queue out of service in two steps, and a client has to make both:
+/// "you must first disable submissions for a queue with the UpdateJobQueue operation",
+/// then `DeleteJobQueue`. The deletion is then not instantaneous, so this waits for the
+/// queue to actually go — the compute environment the stack deletes NEXT cannot be deleted
+/// while a queue still orders it.
+async fn delete_batch_job_queue(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    if batch_described(
+        ctx,
+        region,
+        BATCH_DESCRIBE_JOB_QUEUES_URI,
+        "jobQueues",
+        physical_resource_id,
+    )
+    .await?
+    .is_none()
+    {
+        return Ok(());
+    }
+    call_rest_json(
+        ctx,
+        BATCH_SIGNING_NAME,
+        region,
+        "POST",
+        BATCH_UPDATE_JOB_QUEUE_URI,
+        Some(&serde_json::json!({
+            "jobQueue": physical_resource_id,
+            "state": BATCH_STATE_DISABLED,
+        })),
+    )
+    .await?;
+    call_rest_json(
+        ctx,
+        BATCH_SIGNING_NAME,
+        region,
+        "POST",
+        BATCH_DELETE_JOB_QUEUE_URI,
+        Some(&serde_json::json!({"jobQueue": physical_resource_id})),
+    )
+    .await?;
+    batch_await_gone(
+        ctx,
+        region,
+        BATCH_DESCRIBE_JOB_QUEUES_URI,
+        "jobQueues",
+        physical_resource_id,
+    )
+    .await
+}
+
+/// Delete the compute environment a stack created, by the ARN that is its physical id —
+/// the same two steps the queue above takes ("Before you can delete a compute environment,
+/// you must set its state to DISABLED").
+async fn delete_batch_compute_environment(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    if batch_described(
+        ctx,
+        region,
+        BATCH_DESCRIBE_COMPUTE_ENVIRONMENTS_URI,
+        "computeEnvironments",
+        physical_resource_id,
+    )
+    .await?
+    .is_none()
+    {
+        return Ok(());
+    }
+    call_rest_json(
+        ctx,
+        BATCH_SIGNING_NAME,
+        region,
+        "POST",
+        BATCH_UPDATE_COMPUTE_ENVIRONMENT_URI,
+        Some(&serde_json::json!({
+            "computeEnvironment": physical_resource_id,
+            "state": BATCH_STATE_DISABLED,
+        })),
+    )
+    .await?;
+    call_rest_json(
+        ctx,
+        BATCH_SIGNING_NAME,
+        region,
+        "POST",
+        BATCH_DELETE_COMPUTE_ENVIRONMENT_URI,
+        Some(&serde_json::json!({"computeEnvironment": physical_resource_id})),
+    )
+    .await?;
+    batch_await_gone(
+        ctx,
+        region,
+        BATCH_DESCRIBE_COMPUTE_ENVIRONMENTS_URI,
+        "computeEnvironments",
+        physical_resource_id,
+    )
+    .await
+}
+
+/// Wait, bounded, until a Batch `Describe*` reports `identifier` as `VALID`.
+///
+/// AWS Batch returns a compute environment and a job queue in a transient status
+/// (`CREATING`), and CloudFormation reports a resource CREATE_COMPLETE only once its
+/// service has really created it — which for both of these types is `VALID`. An `INVALID`
+/// status is that service's own refusal of the configuration the template declared, and is
+/// reported as the failure it is rather than waited out.
+async fn batch_await_valid(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    uri: &str,
+    member: &str,
+    identifier: &str,
+) -> Result<(), Refusal> {
+    for _ in 0..BATCH_DELETION_CHECKS {
+        let status = batch_described(ctx, region, uri, member, identifier)
+            .await?
+            .as_ref()
+            .and_then(|record| record.get("status"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        match status.as_deref() {
+            Some(BATCH_STATUS_VALID) => return Ok(()),
+            Some(BATCH_STATUS_INVALID) => {
+                return Err(Refusal {
+                    code: "ClientException".to_string(),
+                    message: format!("{identifier} is INVALID"),
+                })
+            }
+            _ => ::tokio::time::sleep(BATCH_DELETION_CHECK_INTERVAL).await,
+        }
+    }
+    Err(Refusal {
+        code: "ClientException".to_string(),
+        message: format!("{identifier} did not become {BATCH_STATUS_VALID}"),
+    })
+}
+
+/// The ONE record a Batch `Describe*` answers for `identifier`, or `None` when it holds
+/// none.
+///
+/// Batch's readers take a LIST and answer the records they found, so a resource the service
+/// no longer holds comes back as an empty list rather than as a modelled not-found error:
+/// that empty list is what "no longer there" is read off here.
+async fn batch_described(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    uri: &str,
+    member: &str,
+    identifier: &str,
+) -> Result<Option<Value>, Refusal> {
+    // Each of these readers names its list identically on the way in and on the way out
+    // (`DescribeJobQueues$jobQueues`, `DescribeComputeEnvironments$computeEnvironments`,
+    // `DescribeServiceEnvironments$serviceEnvironments`), so one member name does both.
+    let mut request = Map::new();
+    request.insert(
+        member.to_string(),
+        Value::Array(vec![Value::String(identifier.to_string())]),
+    );
+    let answer = call_rest_json(
+        ctx,
+        BATCH_SIGNING_NAME,
+        region,
+        "POST",
+        uri,
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    Ok(answer
+        .get(member)
+        .and_then(Value::as_array)
+        .and_then(|records| records.first())
+        .cloned())
+}
+
+/// Wait, bounded, until a Batch `Describe*` holds no record for `identifier`.
+///
+/// A deletion AWS Batch accepted is owed rather than immediate, and the stack's next
+/// delete depends on this one having completed, so the wait is here rather than left to
+/// the caller — bounded by [`BATCH_DELETION_CHECKS`], after which the resource is reported
+/// as still there and the stack says so.
+async fn batch_await_gone(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    uri: &str,
+    member: &str,
+    identifier: &str,
+) -> Result<(), Refusal> {
+    for _ in 0..BATCH_DELETION_CHECKS {
+        if batch_described(ctx, region, uri, member, identifier)
+            .await?
+            .is_none()
+        {
+            return Ok(());
+        }
+        ::tokio::time::sleep(BATCH_DELETION_CHECK_INTERVAL).await;
+    }
+    Err(Refusal {
+        code: "ResourceInUseException".to_string(),
+        message: format!("{identifier} is still being deleted"),
+    })
 }
 
 // ---------------------------------------------------------------------------

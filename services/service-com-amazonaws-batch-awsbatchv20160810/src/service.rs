@@ -45,6 +45,10 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+pub mod request_id_header;
+
+use request_id_header::RequestIdHeaderOperation;
+
 // The code a refusal of this service's TAG MAP carries is the tag frontend's, not Batch's
 // own: one definition, in `crate::scaffolded`, which the handlers on the tagging endpoint
 // answer through as well, so the boundary and the handlers cannot drift to two codes for
@@ -97,6 +101,9 @@ fn enum_membership_message(violation: &Violation) -> Option<String> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// Serves every routable request through the generated routing table and then reports
+    /// the request id its document states; see [`request_id_header`].
+    request_id_header: RequestIdHeaderOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -106,6 +113,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            request_id_header: RequestIdHeaderOperation,
         }
     }
 }
@@ -132,12 +140,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Every request the generated routing table can serve is served through the
+        // header wrapper, which delegates to that same table entry and then reports the
+        // answer's own request id in the header AWS carries it in (see
+        // [`request_id_header`]). The routing stays the model's: a request whose target
+        // names no modelled operation is declined here, so the framework answers it as
+        // the unroutable request it is.
+        let routes = self
+            .entry
+            .protocol()
+            .routing_key(req)
+            .ok()
+            .and_then(|key| self.entry.routing_table().get(key))
+            .is_some();
+        routes.then_some(&self.request_id_header as _)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

@@ -2233,6 +2233,13 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // lowercase), numbers, underscores, and hyphens are allowed" (Amazon ECS API
         // reference) — ECS's model carries no `@length` for it.
         ECS_CLUSTER => rules(255, Characters::AsGenerated),
+        // AWS Batch `CreateComputeEnvironment.computeEnvironmentName` and
+        // `CreateJobQueue.jobQueueName`: each "can be up to 128 characters long. It can
+        // contain uppercase and lowercase letters, numbers, hyphens (-), and underscores
+        // (_)" (those members' own docs) — Batch's model types both as plain strings.
+        BATCH_COMPUTE_ENVIRONMENT | BATCH_JOB_QUEUE | BATCH_SERVICE_ENVIRONMENT => {
+            rules(128, Characters::AsGenerated)
+        }
         // Elastic Load Balancing `CreateLoadBalancer.Name` and
         // `CreateTargetGroup.Name`: each "can have a maximum of 32 characters" (Elastic
         // Load Balancing API reference) — the ELBv2 model carries no `@length` for either.
@@ -2664,6 +2671,9 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     APIGATEWAY_DEPLOYMENT,
     APIGATEWAY_RESOURCE,
     APIGATEWAY_REST_API,
+    BATCH_COMPUTE_ENVIRONMENT,
+    BATCH_JOB_QUEUE,
+    BATCH_SERVICE_ENVIRONMENT,
     "AWS::BedrockAgentCore::Browser",
     "AWS::BedrockAgentCore::CodeInterpreter",
     "AWS::BedrockAgentCore::Gateway",
@@ -3138,6 +3148,42 @@ fn return_values(
                 ::emulator_server::emulator_arn("ecs", region, &format!("cluster/{name}")),
             );
             (name.to_string(), attributes)
+        }
+        // "Ref returns the compute environment ARN"; Fn::GetAtt: ComputeEnvironmentArn.
+        // This is the type `super::provisioning` creates in AWS Batch itself, so the
+        // environment a stack's output names is one `batch describe-compute-environments`
+        // finds — under the same ARN that service mints from the Region and the name
+        // (`compute_environment_arn` in its own state module).
+        BATCH_COMPUTE_ENVIRONMENT => {
+            let arn = ::emulator_server::emulator_arn(
+                BATCH_ARN_NAMESPACE,
+                region,
+                &format!("compute-environment/{name}"),
+            );
+            attributes.insert("ComputeEnvironmentArn".to_string(), arn.clone());
+            (arn, attributes)
+        }
+        // "Ref returns the job queue ARN"; Fn::GetAtt: JobQueueArn. The same shape one
+        // type along, on the ARN AWS Batch mints for a queue (`job_queue_arn`).
+        BATCH_JOB_QUEUE => {
+            let arn = ::emulator_server::emulator_arn(
+                BATCH_ARN_NAMESPACE,
+                region,
+                &format!("job-queue/{name}"),
+            );
+            attributes.insert("JobQueueArn".to_string(), arn.clone());
+            (arn, attributes)
+        }
+        // And one more: "Ref returns the service environment ARN"; Fn::GetAtt:
+        // ServiceEnvironmentArn (`service_environment_arn`).
+        BATCH_SERVICE_ENVIRONMENT => {
+            let arn = ::emulator_server::emulator_arn(
+                BATCH_ARN_NAMESPACE,
+                region,
+                &format!("service-environment/{name}"),
+            );
+            attributes.insert("ServiceEnvironmentArn".to_string(), arn.clone());
+            (arn, attributes)
         }
         // "Ref returns the Amazon Resource Name (ARN) of the task definition";
         // Fn::GetAtt: TaskDefinitionArn.
@@ -3685,6 +3731,9 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         FIREHOSE_DELIVERY_STREAM => &["Arn"],
         ECR_REPOSITORY => &["Arn", "RepositoryUri"],
         ECS_CLUSTER => &["Arn"],
+        BATCH_COMPUTE_ENVIRONMENT => &["ComputeEnvironmentArn"],
+        BATCH_JOB_QUEUE => &["JobQueueArn"],
+        BATCH_SERVICE_ENVIRONMENT => &["ServiceEnvironmentArn"],
         ECS_TASK_DEFINITION => &["TaskDefinitionArn"],
         ELB_LOAD_BALANCER => &["DNSName", "LoadBalancerFullName", "LoadBalancerName"],
         ELB_TARGET_GROUP => &["TargetGroupArn", "TargetGroupFullName", "TargetGroupName"],
@@ -3957,6 +4006,19 @@ pub const ELASTIC_BEANSTALK_ENVIRONMENT: &str = "AWS::ElasticBeanstalk::Environm
 
 /// An Amazon ECS task definition's resource type.
 pub const ECS_TASK_DEFINITION: &str = "AWS::ECS::TaskDefinition";
+
+/// An AWS Batch compute environment's resource type (that model:
+/// `cloudFormationName: Batch`). "Ref returns the compute environment ARN"; `Fn::GetAtt`:
+/// `ComputeEnvironmentArn`.
+pub const BATCH_COMPUTE_ENVIRONMENT: &str = "AWS::Batch::ComputeEnvironment";
+/// An AWS Batch job queue's resource type. "Ref returns the job queue ARN";
+/// `Fn::GetAtt`: `JobQueueArn`.
+pub const BATCH_JOB_QUEUE: &str = "AWS::Batch::JobQueue";
+/// An AWS Batch service environment's resource type. "Ref returns the service environment
+/// ARN"; `Fn::GetAtt`: `ServiceEnvironmentArn`.
+pub const BATCH_SERVICE_ENVIRONMENT: &str = "AWS::Batch::ServiceEnvironment";
+/// AWS Batch's ARN namespace, from its model's `awsService.arnNamespace`.
+const BATCH_ARN_NAMESPACE: &str = "batch";
 
 /// The three CodeDeploy resource types `super::provisioning` creates in CodeDeploy itself
 /// (that model: `cloudFormationName: CodeDeploy`).

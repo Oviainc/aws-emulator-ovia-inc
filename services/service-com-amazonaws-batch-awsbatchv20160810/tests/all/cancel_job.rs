@@ -16,8 +16,8 @@
 //! cancel arrives, the size and alphabet of the `reason`, whether a cancel was asked for
 //! at all, and the form of an unknown `jobId`.
 //!
-//! `STARTING` and `RUNNING` are modelled but unreachable in this emulator (nothing runs a
-//! container, so a job never leaves `RUNNABLE` except to fail), so no row can put a job
+//! `STARTING` and `RUNNING` are modelled but unreachable in this emulator (nothing places
+//! a job, so a job rests in `RUNNABLE` until a caller ends it), so no row can put a job
 //! in them; the handler's own case for them is covered by the state machinery it shares
 //! with `TerminateJob`.
 
@@ -35,6 +35,9 @@ use crate::job_lifecycle::{
 /// parameter has a limit of 1024 characters"
 /// (`smithy_query(query="doc", shape="CancelJobRequest", member="reason")`).
 const MAX_REASON_CHARS: usize = 1024;
+
+/// The `reason` the rows that pre-end a job through `TerminateJob` pass.
+const TERMINATE_REASON: &str = "ended before the cancel arrived";
 
 /// One emulator with a queue and a job definition to submit into.
 struct Fixture {
@@ -106,6 +109,20 @@ async fn poll_until_terminal(batch: &Batch, job_id: &str) -> Value {
     detail
 }
 
+/// `TerminateJob` on `job_id` with `reason`, asserting the 200 the operation answers.
+///
+/// How a row reaches a TERMINAL job: nothing here places a job, so a job rests in
+/// `RUNNABLE` and only a caller ends it.
+async fn terminate(batch: &Batch, case: &str, job_id: &str, reason: &str) {
+    let (status, body) = batch
+        .call("/v1/terminatejob", json!({"jobId": job_id, "reason": reason}))
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case}: expected TerminateJob to succeed with 200, got {status} {body}"
+    );
+}
+
 /// Poll `job_id` until it reports `status`, and answer its last `JobDetail`. Driven off
 /// OBSERVED state rather than a fixed sleep, so a slow machine delays a case instead of
 /// breaking it.
@@ -171,13 +188,20 @@ async fn cancel_and_check_rule(batch: &Batch, case: &str, job_id: &str, reason: 
     );
     let created_at = before["createdAt"].as_i64().unwrap_or_default();
     assert!(
-        after["stoppedAt"]
-            .as_i64()
-            .is_some_and(|stopped| stopped >= created_at),
-        "case {case}: expected stoppedAt at or after createdAt {created_at}, got {after}"
+        created_at > 0,
+        "case {case}: a stored job carries createdAt, got {before}"
     );
-    assert!(
-        after["startedAt"].as_i64().is_some_and(|started| started == 0),
+    // `stoppedAt` is "when the job transitioned from the RUNNING state to a terminal
+    // state": a job cancelled before it ever ran made no such transition, so AWS reports
+    // none even once the job is FAILED — and no `startedAt` either.
+    assert_eq!(
+        after["stoppedAt"],
+        Value::Null,
+        "case {case}: a job cancelled before it ran reports no stoppedAt, got {after}"
+    );
+    assert_eq!(
+        after["startedAt"],
+        Value::Null,
         "case {case}: nothing ran, so no startedAt is invented, got {after}"
     );
 }
@@ -187,8 +211,8 @@ async fn cancel_and_check_rule(batch: &Batch, case: &str, job_id: &str, reason: 
 enum Start {
     /// Just submitted: the job has not progressed past `RUNNABLE`.
     NotPastRunnable,
-    /// Polled until the clock took it to a terminal status.
-    EndedByTheClock,
+    /// Already ended by `TerminateJob`, which is what makes a job terminal here.
+    EndedByTerminate,
     /// Already cancelled by an earlier `CancelJob` (the idempotence row).
     AlreadyCancelled,
 }
@@ -217,8 +241,8 @@ async fn cancel_job_ends_a_job_that_has_not_progressed_past_runnable() {
             "arrêt immédiat ✋ 停止".to_string(),
         ),
         (
-            "a job the clock already ended",
-            Start::EndedByTheClock,
+            "a job TerminateJob already ended",
+            Start::EndedByTerminate,
             "too late".to_string(),
         ),
         (
@@ -233,13 +257,14 @@ async fn cancel_job_ends_a_job_that_has_not_progressed_past_runnable() {
         let job_id = submit(&fixture, "j-cancel", Value::Null).await;
         match start {
             Start::NotPastRunnable => {}
-            Start::EndedByTheClock => {
+            Start::EndedByTerminate => {
+                terminate(&fixture.batch, case, &job_id, TERMINATE_REASON).await;
                 let ended = poll_until_terminal(&fixture.batch, &job_id).await;
-                // The clock's own reason, which the cancel below must not overwrite.
+                // The terminate's own reason, which the cancel below must not overwrite.
                 assert_eq!(
                     ended["statusReason"].as_str(),
-                    Some(state::NO_CONTAINER_RUNTIME_REASON),
-                    "case {case}: the clock ends the job with its own reason, got {ended}"
+                    Some(TERMINATE_REASON),
+                    "case {case}: the terminate's reason is what the job records, got {ended}"
                 );
             }
             Start::AlreadyCancelled => {
@@ -277,13 +302,14 @@ enum Waiting {
 
 /// RULE: a cancel asked for while a job is `PENDING` on the jobs it depends on does not
 /// end it there and then — "A PENDING job is cancelled after all dependency jobs are
-/// completed" — and when they complete the job ends `FAILED` carrying the CANCEL's reason
-/// and `isCancelled`, never passing through `RUNNABLE`. Two rows over one dependency: the
-/// dependent that was cancelled while waiting, and the one that was left alone (which
-/// ends with the dependency's own reason instead).
+/// completed" — though the job reports `isCancelled` straight away; when they complete the
+/// job ends `FAILED` carrying the CANCEL's reason, never passing through `RUNNABLE`. Two
+/// rows over one dependency: the dependent that was cancelled while waiting, and the one
+/// that was left alone (which ends with the dependency's own reason instead).
 #[tokio::test]
 async fn a_cancel_asked_for_while_pending_falls_due_with_the_dependencies() {
     const REASON: &str = "cancel me when my dependency is done";
+    const DEPENDENCY_REASON: &str = "end the dependency the dependents wait on";
 
     let fixture = fixture("pending").await;
     let dependency = submit(&fixture, "j-dependency", Value::Null).await;
@@ -315,34 +341,42 @@ async fn a_cancel_asked_for_while_pending_falls_due_with_the_dependencies() {
         }
 
         cancel(&fixture.batch, "cancel a PENDING job", id, REASON).await;
-        // DEFERRED: the job is still waiting, unless its dependency finished in the
-        // meantime — in which case the cancel has already fallen due.
+        // DEFERRED: the job is still waiting on its dependency, which nothing has ended
+        // yet, so the cancel is recorded rather than applied.
         let immediately = describe_job(&fixture.batch, id).await;
-        let status = immediately["status"].as_str().unwrap_or_default();
-        assert!(
-            status == state::JOB_PENDING || status == state::JOB_FAILED,
-            "case {row:?}: a cancelled PENDING job waits for its dependency or is \
-             already FAILED, never anything else, got {immediately}"
+        assert_eq!(
+            immediately["status"].as_str(),
+            Some(state::JOB_PENDING),
+            "case {row:?}: a cancelled PENDING job stays PENDING while it waits, got \
+             {immediately}"
         );
-        if status == state::JOB_PENDING {
-            assert_eq!(
-                immediately["statusReason"],
-                Value::Null,
-                "case {row:?}: nothing is recorded on the job until the cancel falls due, \
-                 got {immediately}"
-            );
-            assert_eq!(
-                immediately["isCancelled"].as_bool(),
-                Some(false),
-                "case {row:?}: the job is not cancelled yet, got {immediately}"
-            );
-            assert_eq!(
-                immediately["stoppedAt"],
-                Value::Null,
-                "case {row:?}: a job that has not ended has no stoppedAt, got {immediately}"
-            );
-        }
+        assert_eq!(
+            immediately["statusReason"],
+            Value::Null,
+            "case {row:?}: nothing terminal is recorded until the cancel falls due, got \
+             {immediately}"
+        );
+        assert_eq!(
+            immediately["isCancelled"].as_bool(),
+            Some(true),
+            "case {row:?}: the cancel is reported on the job at once, got {immediately}"
+        );
+        assert_eq!(
+            immediately["stoppedAt"],
+            Value::Null,
+            "case {row:?}: a job that has not ended has no stoppedAt, got {immediately}"
+        );
     }
+
+    // The dependency rests in RUNNABLE until a caller ends it, and that is what releases
+    // the jobs waiting on it.
+    terminate(
+        &fixture.batch,
+        "end the dependency",
+        &dependency,
+        DEPENDENCY_REASON,
+    )
+    .await;
 
     for (row, id) in &dependents {
         let ended = poll_until_terminal(&fixture.batch, id).await;
@@ -372,18 +406,18 @@ async fn a_cancel_asked_for_while_pending_falls_due_with_the_dependencies() {
         );
     }
 
-    // The dependency itself ended on the clock, untouched by the cancel of a job that
-    // merely waited on it.
+    // The dependency carries the reason of the TERMINATE that ended it, untouched by the
+    // cancel of a job that merely waited on it.
     let dependency_detail = describe_job(&fixture.batch, &dependency).await;
     assert_eq!(
         dependency_detail["statusReason"].as_str(),
-        Some(state::NO_CONTAINER_RUNTIME_REASON),
+        Some(DEPENDENCY_REASON),
         "case the dependency: cancelling a dependent must not touch it, got {dependency_detail}"
     );
     assert_eq!(
-        dependency_detail["isCancelled"].as_bool(),
-        Some(false),
-        "case the dependency: it was never cancelled, got {dependency_detail}"
+        dependency_detail["status"].as_str(),
+        Some(state::JOB_FAILED),
+        "case the dependency: the terminate is what ended it, got {dependency_detail}"
     );
 }
 

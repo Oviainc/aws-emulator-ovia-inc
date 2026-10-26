@@ -320,16 +320,16 @@ pub(crate) async fn describe_job(batch: &Batch, job_id: &str) -> Value {
 }
 
 /// How long to wait for every clock-owed job transition to fall due. Each one takes
-/// [`state::JOB_PHASE_MILLIS`]; a job with no dependencies makes two (SUBMITTED ->
-/// RUNNABLE -> terminal), and the margin covers a slow machine.
-async fn wait_for_terminal() {
+/// [`state::JOB_PHASE_MILLIS`]; a job with no dependencies makes ONE (SUBMITTED ->
+/// RUNNABLE) and then RESTS there, and the margin covers a slow machine.
+async fn wait_for_resting() {
     let span = u64::try_from(state::JOB_PHASE_MILLIS).unwrap_or(500);
     tokio::time::sleep(Duration::from_millis(span * 3)).await;
 }
 
 /// The lifecycle the issue names, end to end: compute environment -> queue -> job
-/// definition -> submit -> describe to a terminal state -> terminate a second job, with
-/// every body checked rather than just the status code.
+/// definition -> submit -> describe until the job rests in RUNNABLE -> terminate it and a
+/// second job, with every body checked rather than just the status code.
 #[tokio::test]
 async fn job_submission_lifecycle_round_trips_through_persisted_state() {
     let batch = Batch::new();
@@ -568,8 +568,9 @@ async fn job_submission_lifecycle_round_trips_through_persisted_state() {
         );
     }
 
-    // 6. The clock, not the reader, moves the job to a terminal status.
-    wait_for_terminal().await;
+    // 6. The clock, not the reader, moves the job out of SUBMITTED — and it parks it in
+    //    RUNNABLE, where a job waits to be placed on compute capacity.
+    wait_for_resting().await;
     // ... and by the same clock the environment and the queue have become VALID.
     for (case, uri, request, field) in [
         (
@@ -593,30 +594,60 @@ async fn job_submission_lifecycle_round_trips_through_persisted_state() {
         );
     }
     let detail = describe_job(&batch, &job_id).await;
-    let terminal = detail["status"].as_str().unwrap_or_default().to_string();
+    let resting = detail["status"].as_str().unwrap_or_default().to_string();
     assert_eq!(
-        status_rank(&terminal),
-        5,
-        "case describe after the lifecycle span: expected a terminal status, got {detail}"
+        status_rank(&resting),
+        status_rank(state::JOB_RUNNABLE),
+        "case describe after the lifecycle span: expected the job to rest in RUNNABLE, got \
+         {detail}"
+    );
+    assert_eq!(
+        detail["statusReason"],
+        Value::Null,
+        "case resting job: nothing is reported for work nothing ran, got {detail}"
+    );
+    assert_eq!(
+        detail["stoppedAt"],
+        Value::Null,
+        "case resting job: a job that has not ended has no stoppedAt, got {detail}"
     );
     assert!(
-        !detail["statusReason"].as_str().unwrap_or_default().is_empty(),
-        "case terminal job: statusReason must say why, got {detail}"
+        detail["attempts"].is_null(),
+        "case resting job: no attempt is invented for a job nothing placed, got {detail}"
     );
-    assert!(
-        detail["stoppedAt"].as_i64().unwrap_or_default() > 0,
-        "case terminal job: stoppedAt must be set, got {detail}"
-    );
-    // A terminal status is final, and a second read answers identically.
+    // Resting is stable: a second read answers identically.
     let again = describe_job(&batch, &job_id).await;
     assert_eq!(
         again["status"].as_str(),
         detail["status"].as_str(),
-        "case re-describe a terminal job: a read must not change it, got {again}"
+        "case re-describe a resting job: a read must not change it, got {again}"
     );
     assert_eq!(
-        again["stoppedAt"], detail["stoppedAt"],
-        "case re-describe a terminal job: stoppedAt must be stable, got {again}"
+        again["createdAt"], detail["createdAt"],
+        "case re-describe a resting job: createdAt must be stable, got {again}"
+    );
+    // Only a caller ends it, and then it is terminal and final.
+    batch
+        .ok(
+            "/v1/terminatejob",
+            json!({"jobId": &job_id, "reason": "end the resting job"}),
+        )
+        .await;
+    let ended = describe_job(&batch, &job_id).await;
+    assert_eq!(
+        status_rank(ended["status"].as_str().unwrap_or_default()),
+        5,
+        "case terminate the resting job: expected a terminal status, got {ended}"
+    );
+    assert_eq!(
+        ended["statusReason"].as_str(),
+        Some("end the resting job"),
+        "case terminal job: the caller's reason is what it records, got {ended}"
+    );
+    assert_eq!(
+        ended["stoppedAt"],
+        Value::Null,
+        "case terminal job: a job nothing ran reports no stoppedAt, got {ended}"
     );
 
     // 7. Terminating a second job is observed by the following describe.
@@ -650,9 +681,10 @@ async fn job_submission_lifecycle_round_trips_through_persisted_state() {
         Some("stop it"),
         "case terminate: the caller's reason is the statusReason, got {detail}"
     );
-    assert!(
-        detail["stoppedAt"].as_i64().unwrap_or_default() > 0,
-        "case terminate: stoppedAt must be set, got {detail}"
+    assert_eq!(
+        detail["stoppedAt"],
+        Value::Null,
+        "case terminate: a job nothing ran reports no stoppedAt, got {detail}"
     );
     assert_eq!(
         detail["isCancelled"].as_bool(),
@@ -961,9 +993,10 @@ async fn container_overrides_merge_into_the_definition() {
 }
 
 /// RULE (invariant): a job's status only ever moves FORWARD through the modelled
-/// `JobStatus` order, it moves with the clock rather than with a read, and a terminal
-/// status is final. Checked over a job with no dependencies and a job that depends on
-/// it, polled repeatedly.
+/// `JobStatus` order, it moves with the clock rather than with a read, and where it comes
+/// to rest is stable. Checked over a job with no dependencies and a job that depends on
+/// it, polled repeatedly: the independent job rests in `RUNNABLE`, the dependent one in
+/// `PENDING` behind it, and a terminal status only a caller can write is final.
 #[tokio::test]
 async fn job_status_only_moves_forward_and_never_because_of_a_read() {
     let batch = Batch::new();
@@ -1007,8 +1040,14 @@ async fn job_status_only_moves_forward_and_never_because_of_a_read() {
         );
     }
 
-    // Poll both jobs to the end, checking the rank never goes backwards.
+    // Poll both jobs until the clock owes them nothing, checking the rank never goes
+    // backwards. Nothing places a job here, so the independent job comes to rest in
+    // RUNNABLE and the dependent one waits behind it in PENDING.
     let mut ranks = [0_u8, 0_u8];
+    let resting = [
+        status_rank(state::JOB_RUNNABLE),
+        status_rank(state::JOB_PENDING),
+    ];
     let span = u64::try_from(state::JOB_PHASE_MILLIS).unwrap_or(500);
     for _ in 0..12 {
         for (index, job_id) in [&first_id, &dependent_id].into_iter().enumerate() {
@@ -1021,33 +1060,70 @@ async fn job_status_only_moves_forward_and_never_because_of_a_read() {
             );
             ranks[index] = rank;
         }
-        if ranks.iter().all(|rank| *rank == 5) {
+        if ranks == resting {
             break;
         }
         tokio::time::sleep(Duration::from_millis(span / 2)).await;
     }
     assert_eq!(
-        ranks,
-        [5, 5],
-        "case poll to the end: both jobs must reach a terminal status, got {ranks:?}"
+        ranks, resting,
+        "case poll until the clock owes nothing: expected the independent job to rest in \
+         RUNNABLE and the dependent one in PENDING, got {ranks:?}"
     );
 
-    let dependent_detail = describe_job(&batch, &dependent_id).await;
-    assert!(
-        !dependent_detail["statusReason"]
-            .as_str()
-            .unwrap_or_default()
-            .is_empty(),
+    // Resting is where they STAY: another span of the clock moves neither.
+    tokio::time::sleep(Duration::from_millis(span * 3)).await;
+    for (case, job_id, expected) in [
+        ("independent", &first_id, state::JOB_RUNNABLE),
+        ("dependent", &dependent_id, state::JOB_PENDING),
+    ] {
+        let detail = describe_job(&batch, job_id).await;
+        assert_eq!(
+            detail["status"].as_str(),
+            Some(expected),
+            "case {case} after a further span: expected {expected}, got {detail}"
+        );
+        assert_eq!(
+            detail["stoppedAt"],
+            Value::Null,
+            "case {case}: a job nothing ended carries no stoppedAt, got {detail}"
+        );
+        // Nothing ran, so no attempt and no exit code are reported for it.
+        assert!(
+            detail["attempts"].is_null(),
+            "case {case}: no attempt is invented for work nothing ran, got {detail}"
+        );
+        assert!(
+            detail["container"]["exitCode"].is_null(),
+            "case {case}: no exit code is invented, got {detail}"
+        );
+    }
+
+    // Only a caller takes a job terminal, and then it is final: the dependent one fails
+    // with the reason AWS Batch gives a job its dependency failed.
+    batch
+        .ok(
+            "/v1/terminatejob",
+            json!({"jobId": &first_id, "reason": "end the resting job"}),
+        )
+        .await;
+    let mut dependent_detail = describe_job(&batch, &dependent_id).await;
+    for _ in 0..12 {
+        if state::is_terminal_status(dependent_detail["status"].as_str().unwrap_or_default()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(span / 2)).await;
+        dependent_detail = describe_job(&batch, &dependent_id).await;
+    }
+    assert_eq!(
+        dependent_detail["status"].as_str(),
+        Some(state::JOB_FAILED),
+        "case dependent job: its dependency failed, so it fails too, got {dependent_detail}"
+    );
+    assert_eq!(
+        dependent_detail["statusReason"].as_str(),
+        Some(state::DEPENDENT_JOB_FAILED_REASON),
         "case dependent job: a terminal job says why, got {dependent_detail}"
-    );
-    // Nothing ran, so no attempt and no exit code are reported for it.
-    assert!(
-        dependent_detail["attempts"].is_null(),
-        "case dependent job: no attempt is invented for work nothing ran, got {dependent_detail}"
-    );
-    assert!(
-        dependent_detail["container"]["exitCode"].is_null(),
-        "case dependent job: no exit code is invented, got {dependent_detail}"
     );
 }
 
@@ -1325,14 +1401,15 @@ async fn paging_sees_every_item_exactly_once() {
 /// How a job's dependency reached a terminal status, and when.
 #[derive(Debug, Clone, Copy)]
 enum DependencyEnd {
-    /// The clock ends it (nothing runs the container, so it fails on its own).
-    ByClock,
     /// `TerminateJob` ends it while the dependent is still `SUBMITTED`.
     TerminatedWhileDependentIsSubmitted,
     /// `TerminateJob` ends it after the dependent has already reached `PENDING` — the case
     /// where the dependent is out of the clock's due index and must be woken by the
     /// dependency finishing.
     TerminatedWhileDependentIsPending,
+    /// `CancelJob` ends it after the dependent has already reached `PENDING`: the other
+    /// route a caller has to a terminal dependency.
+    CancelledWhileDependentIsPending,
 }
 
 /// Poll `job_id` until it reaches a terminal status, and answer its last `JobDetail`.
@@ -1351,15 +1428,15 @@ async fn poll_until_terminal(batch: &Batch, job_id: &str) -> Value {
 }
 
 /// RULE: a job waiting on another is released by the dependency reaching a terminal
-/// status, whatever ROUTE took it there — the clock or `TerminateJob` — and whether or not
-/// the waiting job had already left `SUBMITTED`; a dependency that failed fails the job
+/// status, whatever ROUTE took it there — `TerminateJob` or `CancelJob` — and whether or
+/// not the waiting job had already left `SUBMITTED`; a dependency that failed fails the job
 /// that waited on it, with the reason AWS Batch gives.
 #[tokio::test]
 async fn a_dependent_job_is_released_however_its_dependency_ended() {
     for case in [
-        DependencyEnd::ByClock,
         DependencyEnd::TerminatedWhileDependentIsSubmitted,
         DependencyEnd::TerminatedWhileDependentIsPending,
+        DependencyEnd::CancelledWhileDependentIsPending,
     ] {
         let batch = Batch::new();
         let environment_arn = compute_environment(&batch, "ce-depends").await;
@@ -1387,56 +1464,43 @@ async fn a_dependent_job_is_released_however_its_dependency_ended() {
         let dependent_id = dependent["jobId"].as_str().unwrap_or_default().to_string();
 
         let span = u64::try_from(state::JOB_PHASE_MILLIS).unwrap_or(500);
-        // What the dependency's own `statusReason` must say once it is terminal. For a
-        // terminated row it is the caller's reason — unless the dependency's own
-        // clock-owed failure got there first on a loaded machine, which makes that row
-        // behave like the ByClock one, so the row is read off observed state rather than
-        // assumed from the wall clock.
-        let mut expected_dependency_reason = state::NO_CONTAINER_RUNTIME_REASON;
-        match case {
-            DependencyEnd::ByClock => {}
-            DependencyEnd::TerminatedWhileDependentIsSubmitted => {
-                let before = describe_job(&batch, &dependency_id).await;
-                if before["status"].as_str() != Some(state::JOB_FAILED) {
-                    expected_dependency_reason = "stop the dependency";
+        // What the dependency's own `statusReason` must say once it is terminal: the
+        // reason of the call that ended it. Nothing here places a job, so a job rests in
+        // `RUNNABLE` and ONLY a caller can take it terminal.
+        let expected_dependency_reason = "stop the dependency";
+        // The two rows that end the dependency once the dependent is already `PENDING`
+        // first wait for it to get there. Driven off OBSERVED state, not a fixed sleep,
+        // so a slow machine delays the case instead of breaking it.
+        let wait_for_pending = !matches!(
+            case,
+            DependencyEnd::TerminatedWhileDependentIsSubmitted
+        );
+        if wait_for_pending {
+            let mut waiting = describe_job(&batch, &dependent_id).await;
+            for _ in 0..40 {
+                let status = waiting["status"].as_str().unwrap_or_default();
+                if status != state::JOB_SUBMITTED {
+                    break;
                 }
-                batch
-                    .ok(
-                        "/v1/terminatejob",
-                        json!({"jobId": &dependency_id, "reason": "stop the dependency"}),
-                    )
-                    .await;
+                tokio::time::sleep(Duration::from_millis((span / 10).max(1))).await;
+                waiting = describe_job(&batch, &dependent_id).await;
             }
-            DependencyEnd::TerminatedWhileDependentIsPending => {
-                // Driven off OBSERVED state, not a fixed sleep: poll until the dependent
-                // reports PENDING — where it waits with nothing owed by the clock — so a
-                // slow machine delays the case instead of breaking it.
-                let mut waiting = describe_job(&batch, &dependent_id).await;
-                for _ in 0..40 {
-                    let status = waiting["status"].as_str().unwrap_or_default();
-                    if status != state::JOB_SUBMITTED {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis((span / 10).max(1))).await;
-                    waiting = describe_job(&batch, &dependent_id).await;
-                }
-                assert_eq!(
-                    waiting["status"].as_str(),
-                    Some(state::JOB_PENDING),
-                    "case {case:?}: the dependent must be waiting in PENDING first, got {waiting}"
-                );
-                let before = describe_job(&batch, &dependency_id).await;
-                if before["status"].as_str() != Some(state::JOB_FAILED) {
-                    expected_dependency_reason = "stop the dependency";
-                }
-                batch
-                    .ok(
-                        "/v1/terminatejob",
-                        json!({"jobId": &dependency_id, "reason": "stop the dependency"}),
-                    )
-                    .await;
-            }
+            assert_eq!(
+                waiting["status"].as_str(),
+                Some(state::JOB_PENDING),
+                "case {case:?}: the dependent must be waiting in PENDING first, got {waiting}"
+            );
         }
+        let ending = match case {
+            DependencyEnd::CancelledWhileDependentIsPending => "/v1/canceljob",
+            _ => "/v1/terminatejob",
+        };
+        batch
+            .ok(
+                ending,
+                json!({"jobId": &dependency_id, "reason": expected_dependency_reason}),
+            )
+            .await;
 
         let detail = poll_until_terminal(&batch, &dependent_id).await;
         assert_eq!(
@@ -1449,15 +1513,16 @@ async fn a_dependent_job_is_released_however_its_dependency_ended() {
             Some(state::DEPENDENT_JOB_FAILED_REASON),
             "case {case:?}: expected the documented dependency reason, got {detail}"
         );
-        assert!(
-            detail["stoppedAt"].as_i64().unwrap_or_default() > 0,
-            "case {case:?}: a terminal job carries stoppedAt, got {detail}"
-        );
-        // `JobDetail$startedAt` is @required, so a value is always serialized; nothing
-        // ran, so it is the 0 sentinel rather than an invented start instant.
+        // `stoppedAt` is the RUNNING -> terminal transition, which a job nothing ran never
+        // made, so it is absent even on a terminal job — as is `startedAt`.
         assert_eq!(
-            detail["startedAt"].as_i64(),
-            Some(0),
+            detail["stoppedAt"],
+            Value::Null,
+            "case {case:?}: a job nothing ran reports no stoppedAt, got {detail}"
+        );
+        assert_eq!(
+            detail["startedAt"],
+            Value::Null,
             "case {case:?}: no startedAt is invented for work nothing ran, got {detail}"
         );
         assert!(

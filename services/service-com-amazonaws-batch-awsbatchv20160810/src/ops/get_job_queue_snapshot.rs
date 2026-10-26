@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetJobQueueSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetJobQueueSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetJobQueueSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers the snapshot from [`crate::state`]: the `RUNNABLE` jobs of the queue the
+//! request names, in the order that queue dispatches them, plus the capacity its
+//! dispatched jobs are using. A queue this service holds nothing for is refused with the
+//! modelled `ClientException` (HTTP 400).
+//!
+//! This is a REPORTING operation: it materialises what the clock already owed
+//! ([`crate::state::ComAmazonawsBatchAwsbatchv20160810State::materialize_due`]) and writes
+//! nothing else, so two reads at the same instant answer identically.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +152,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetJobQueueSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetJobQueueSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetJobQueueSnapshot"))
+        use crate::state as batch;
+
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(
+                GetJobQueueSnapshotErrorModeled::ServerException(batch::unreachable_state()).into(),
+            );
+        };
+        let now = batch::now_millis();
+        let snapshot = {
+            let mut state = state.lock();
+            // A reporting operation materialises what the clock already owed, so the
+            // snapshot is of the queue as it is at `now` rather than as it was when it was
+            // last looked at.
+            state.materialize_due(now);
+
+            // `jobQueue`: "The job queue’s name or full queue Amazon Resource Name (ARN)".
+            let Some(queue) = state.job_queue(&input.job_queue) else {
+                return Err(GetJobQueueSnapshotErrorModeled::ClientException(
+                    batch::client_exception(format!("JobQueue {} not found.", input.job_queue)),
+                )
+                .into());
+            };
+            let queue_arn = queue.arn.clone();
+            // Whether this queue's scheduling policy is a QUOTA-SHARE one, which is what
+            // decides whether `frontOfQuotaShares` is reported at all ("For job queues
+            // with an attached quota-share policy, the first RUNNABLE job in each quota
+            // share is also listed").
+            let on_quota_shares = queue
+                .scheduling_policy_arn
+                .as_deref()
+                .and_then(|arn| state.scheduling_policy(arn))
+                .is_some_and(|policy| policy.quota_share_policy.is_some());
+
+            let queued = state.runnable_jobs_of_queue(&queue_arn);
+            // "The first 100 RUNNABLE jobs in the job queue are listed in order of
+            // dispatch."
+            let jobs: Vec<FrontOfQueueJobSummary> = queued
+                .iter()
+                .take(batch::MAX_FRONT_OF_QUEUE_JOBS)
+                .map(|job| FrontOfQueueJobSummary {
+                    job_arn: Some(job.job_arn.clone()),
+                    earliest_time_at_position: job.at_position_since,
+                })
+                .collect();
+            // The first RUNNABLE job of each share, in the same dispatch order: a share is
+            // named by the job's own `shareIdentifier`, and a job that names none is in no
+            // share.
+            let quota_shares = on_quota_shares.then(|| {
+                let mut firsts: ::std::collections::HashMap<
+                    String,
+                    Vec<FrontOfQuotaShareJobSummary>,
+                > = ::std::collections::HashMap::new();
+                for job in &queued {
+                    let Some(share) = job.share_identifier.clone() else {
+                        continue;
+                    };
+                    firsts
+                        .entry(share)
+                        .or_insert_with(|| {
+                            vec![FrontOfQuotaShareJobSummary {
+                                job_arn: Some(job.job_arn.clone()),
+                                earliest_time_at_position: job.at_position_since,
+                            }]
+                        });
+                }
+                firsts
+            });
+
+            GetJobQueueSnapshotOutput {
+                front_of_queue: Some(FrontOfQueueDetail {
+                    jobs: Some(jobs),
+                    last_updated_at: Some(now),
+                }),
+                front_of_quota_shares: quota_shares.map(|quota_shares| {
+                    FrontOfQuotaSharesDetail {
+                        quota_shares: Some(quota_shares),
+                        last_updated_at: Some(now),
+                    }
+                }),
+                // "capacity utilization for already dispatched jobs": nothing in this
+                // emulator dispatches a job — a job rests in `RUNNABLE` until a caller
+                // ends it (`crate::state`) — so no capacity is in use, and the breakdowns
+                // per share report nothing rather than a quantity nothing consumed.
+                queue_utilization: Some(QueueSnapshotUtilizationDetail {
+                    total_capacity_usage: Some(Vec::new()),
+                    fairshare_utilization: None,
+                    quota_share_utilization: None,
+                    last_updated_at: Some(now),
+                }),
+            }
+        };
+        batch::publish_job_state_changes(ctx, &*self.engine, &batch::request_region(ctx)).await;
+
+        Ok(snapshot)
     }
 }

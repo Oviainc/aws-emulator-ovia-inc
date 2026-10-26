@@ -301,8 +301,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             let Some(queue) = state.job_queue(&input.job_queue) else {
+                // The detail AWS is recorded to state for a queue it holds nothing for,
+                // worded from the reference the request gave, and BARE: this refusal is
+                // not one Batch's frontend wraps.
                 return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
-                    format!("Job queue {} does not exist", input.job_queue),
+                    format!("JobQueue {} not found.", input.job_queue),
                 ))
                 .into());
             };
@@ -314,6 +317,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if queue.state == batch::STATE_DISABLED {
                 return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
                     format!("Job queue {queue_arn} is DISABLED and can't accept new jobs"),
+                ))
+                .into());
+            }
+
+            // `RetryStrategy$attempts`: "The number of times to move a job to the RUNNABLE
+            // status. You can specify between 1 and 10 attempts." A submit's own retry
+            // strategy "overrides the retry strategy defined" in the job definition, so
+            // the same bound binds here; the member targets a plain `Integer`.
+            if let Some(attempts) = input
+                .retry_strategy
+                .as_ref()
+                .and_then(|strategy| strategy.attempts)
+                .filter(|attempts| {
+                    !(batch::MIN_RETRY_ATTEMPTS..=batch::MAX_RETRY_ATTEMPTS).contains(attempts)
+                })
+            {
+                return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
+                    format!(
+                        "retryStrategy.attempts {attempts} must be between {} and {}",
+                        batch::MIN_RETRY_ATTEMPTS, batch::MAX_RETRY_ATTEMPTS
+                    ),
                 ))
                 .into());
             }
@@ -358,6 +382,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 created_at: now,
                 started_at: None,
                 stopped_at: None,
+                ended_at: None,
+                at_position_since: None,
                 next_phase_due_at: Some(now + batch::JOB_PHASE_MILLIS),
                 is_cancelled: false,
                 is_terminated: false,

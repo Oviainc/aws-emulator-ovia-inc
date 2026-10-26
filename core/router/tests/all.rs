@@ -25,6 +25,11 @@ mod kinesisvideo_signing_name_routing;
 #[path = "all/cloudformation_provisions_transfer_servers.rs"]
 mod cloudformation_provisions_transfer_servers;
 // Declared beside the entry above, at the head, for the same reason: the appended tail
+// and the sorted `c…` span (where every cloudformation suite lands) are both regions
+// concurrent suites add their line to.
+#[path = "all/cloudformation_provisions_batch_resources.rs"]
+mod cloudformation_provisions_batch_resources;
+// Declared beside the entry above, at the head, for the same reason: the appended tail
 // and the sorted `s…` span are both regions concurrent suites land in.
 #[path = "all/ses_family_signing_name_routing.rs"]
 mod ses_family_signing_name_routing;

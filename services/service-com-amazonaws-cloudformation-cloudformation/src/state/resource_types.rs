@@ -218,9 +218,12 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::Backup::BackupVault",
     // AWS Batch
     "AWS::Batch::ComputeEnvironment",
+    "AWS::Batch::ConsumableResource",
     "AWS::Batch::JobDefinition",
     "AWS::Batch::JobQueue",
+    "AWS::Batch::QuotaShare",
     "AWS::Batch::SchedulingPolicy",
+    "AWS::Batch::ServiceEnvironment",
     // Amazon Bedrock
     "AWS::Bedrock::Agent",
     "AWS::Bedrock::AgentAlias",

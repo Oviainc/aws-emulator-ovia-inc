@@ -257,7 +257,7 @@ fn rows() -> Vec<Row> {
             share_identifier: Some("share-a"),
             quota_share_name: Some("quota-a"),
             // 1 is the fewest attempts `ServiceJobRetryStrategy$attempts` documents.
-            retry_attempts: Some(i64::from(state::MIN_SERVICE_JOB_RETRY_ATTEMPTS)),
+            retry_attempts: Some(i64::from(state::MIN_RETRY_ATTEMPTS)),
             attempt_duration_seconds: Some(600),
             preemption_retries: Some(2),
             tags: Some(json!({"env": "test", "team": "batch"})),
@@ -273,7 +273,7 @@ fn rows() -> Vec<Row> {
             scheduling_priority: Some(i64::from(state::MAX_SCHEDULING_PRIORITY)),
             share_identifier: None,
             quota_share_name: None,
-            retry_attempts: Some(i64::from(state::MAX_SERVICE_JOB_RETRY_ATTEMPTS)),
+            retry_attempts: Some(i64::from(state::MAX_RETRY_ATTEMPTS)),
             attempt_duration_seconds: Some(60),
             preemption_retries: None,
             tags: Some(json!({"only": "one"})),
@@ -648,22 +648,22 @@ async fn submitting_a_service_job_applies_the_bounds_its_members_document() {
         ),
         (
             "retryStrategy.attempts at the documented minimum",
-            json!({"retryStrategy": {"attempts": state::MIN_SERVICE_JOB_RETRY_ATTEMPTS}}),
+            json!({"retryStrategy": {"attempts": state::MIN_RETRY_ATTEMPTS}}),
             true,
         ),
         (
             "retryStrategy.attempts at the documented maximum",
-            json!({"retryStrategy": {"attempts": state::MAX_SERVICE_JOB_RETRY_ATTEMPTS}}),
+            json!({"retryStrategy": {"attempts": state::MAX_RETRY_ATTEMPTS}}),
             true,
         ),
         (
             "retryStrategy.attempts one below the minimum",
-            json!({"retryStrategy": {"attempts": state::MIN_SERVICE_JOB_RETRY_ATTEMPTS - 1}}),
+            json!({"retryStrategy": {"attempts": state::MIN_RETRY_ATTEMPTS - 1}}),
             false,
         ),
         (
             "retryStrategy.attempts one above the maximum",
-            json!({"retryStrategy": {"attempts": state::MAX_SERVICE_JOB_RETRY_ATTEMPTS + 1}}),
+            json!({"retryStrategy": {"attempts": state::MAX_RETRY_ATTEMPTS + 1}}),
             false,
         ),
     ];

@@ -215,8 +215,8 @@ async fn submit(
 }
 
 /// Long enough for every clock-owed transition of a job with no dependencies to fall
-/// due: each takes [`state::JOB_PHASE_MILLIS`], a plain job makes two, and the margin
-/// covers a slow machine.
+/// due: each takes [`state::JOB_PHASE_MILLIS`], a plain job makes ONE (`SUBMITTED` ->
+/// `RUNNABLE`, where it rests), and the margin covers a slow machine.
 async fn wait_past_the_clock() {
     let span = u64::try_from(state::JOB_PHASE_MILLIS).unwrap_or(500);
     tokio::time::sleep(Duration::from_millis(span * 3)).await;
@@ -226,8 +226,8 @@ async fn wait_past_the_clock() {
 /// job therefore takes.
 #[derive(Debug, Clone, Copy)]
 enum Row {
-    /// Left to the clock, then read back: SUBMITTED -> RUNNABLE -> FAILED (no container
-    /// runtime, see `state::NO_CONTAINER_RUNTIME_REASON`).
+    /// Left to the clock, then read back: SUBMITTED -> RUNNABLE, where the job rests
+    /// because nothing here places it on compute capacity.
     LeftToTheClock,
     /// Terminated while still `SUBMITTED`.
     Terminated,
@@ -242,7 +242,7 @@ impl Row {
     /// The statuses the job takes, in order.
     fn statuses(self) -> &'static [&'static str] {
         match self {
-            Row::LeftToTheClock => &["SUBMITTED", "RUNNABLE", "FAILED"],
+            Row::LeftToTheClock => &["SUBMITTED", "RUNNABLE"],
             Row::Terminated | Row::Cancelled => &["SUBMITTED", "FAILED"],
             Row::WaitingOnADependency => &["SUBMITTED", "PENDING", "FAILED"],
         }
@@ -268,10 +268,16 @@ async fn every_job_state_change_is_published_to_the_matching_rule_only() {
         let (definition, _) = job_definition(&batch, "jd-events", container_properties()).await;
 
         // The dependency row needs a job that has already finished, so its own statuses
-        // are driven by the dependency's outcome rather than by this row's clock.
+        // are driven by the dependency's outcome rather than by this row's clock. Nothing
+        // places a job here, so a caller is what takes the dependency terminal.
         let dependency = if matches!(row, Row::WaitingOnADependency) {
             let (id, _) = submit(&batch, "dependency", &queue, &definition, &[]).await;
-            wait_past_the_clock().await;
+            let _ = batch
+                .ok(
+                    "/v1/terminatejob",
+                    json!({ "jobId": &id, "reason": "end the dependency" }),
+                )
+                .await;
             let detail = describe_job(&batch, &id).await;
             assert_eq!(
                 detail["status"],
@@ -507,13 +513,14 @@ async fn a_rule_filtering_on_the_job_detail_sees_only_the_matching_transitions()
     let queue = job_queue(&batch, "jq-filtered", &environment).await;
     let (definition, _) = job_definition(&batch, "jd-filtered", container_properties()).await;
 
-    // One rule per status of the chain a plain job walks, plus one naming a status this
-    // job never takes: each must see exactly the transitions its pattern names, and each
-    // delivers to its own queue, so what a rule saw is observable from the queue too.
+    // One rule per status of the chain a plain job walks, plus two naming statuses this
+    // job never takes (nothing places it, so it rests in RUNNABLE): each must see exactly
+    // the transitions its pattern names, and each delivers to its own queue, so what a
+    // rule saw is observable from the queue too.
     let rows = [
         ("submitted-only", "SUBMITTED", 1),
         ("runnable-only", "RUNNABLE", 1),
-        ("failed-only", "FAILED", 1),
+        ("failed-only", "FAILED", 0),
         ("succeeded-only", "SUCCEEDED", 0),
     ];
     let mut urls = Vec::new();
@@ -605,7 +612,7 @@ async fn the_clock_owed_transitions_arrive_without_any_further_batch_call() {
                 );
             }
         }
-        if statuses.iter().any(|status| status == "FAILED") {
+        if statuses.iter().any(|status| status == "RUNNABLE") {
             break;
         }
         tokio::time::sleep(Duration::from_millis(span / 5)).await;
@@ -613,11 +620,7 @@ async fn the_clock_owed_transitions_arrive_without_any_further_batch_call() {
 
     assert_eq!(
         statuses,
-        vec![
-            "SUBMITTED".to_string(),
-            "RUNNABLE".to_string(),
-            "FAILED".to_string()
-        ],
+        vec!["SUBMITTED".to_string(), "RUNNABLE".to_string()],
         "expected the whole clock-owed chain delivered without a further Batch call, got \
          {statuses:?}"
     );

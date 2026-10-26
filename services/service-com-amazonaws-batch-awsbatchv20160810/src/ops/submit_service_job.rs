@@ -236,15 +236,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .map(|strategy| strategy.attempts)
             .filter(|attempts| {
-                !(batch::MIN_SERVICE_JOB_RETRY_ATTEMPTS..=batch::MAX_SERVICE_JOB_RETRY_ATTEMPTS)
-                    .contains(attempts)
+                !(batch::MIN_RETRY_ATTEMPTS..=batch::MAX_RETRY_ATTEMPTS).contains(attempts)
             })
         {
             return Err(SubmitServiceJobErrorModeled::ClientException(batch::client_exception(
                 format!(
                     "retryStrategy.attempts {attempts} must be between {} and {}",
-                    batch::MIN_SERVICE_JOB_RETRY_ATTEMPTS,
-                    batch::MAX_SERVICE_JOB_RETRY_ATTEMPTS
+                    batch::MIN_RETRY_ATTEMPTS, batch::MAX_RETRY_ATTEMPTS
                 ),
             ))
             .into());

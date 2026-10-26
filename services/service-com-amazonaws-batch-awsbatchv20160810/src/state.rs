@@ -28,10 +28,13 @@
 //!
 //! A job's container is NOT run: this emulator has no container runtime, and the
 //! engine contract (`vendor/engine/src/lib.rs`) forbids reporting a status,
-//! duration or exit code for work nothing ran. So the run the caller asked for
-//! ends in the modelled failure state with [`NO_CONTAINER_RUNTIME_REASON`] as its
-//! `statusReason`, and no `startedAt`, attempt or `exitCode` is invented. Everything
-//! around it — accepting, resolving, scheduling, listing, terminating — is real.
+//! duration or exit code for work nothing ran. `RUNNABLE` is where a job waits to be
+//! placed on compute capacity, and a job is placed only by a scheduler that has such
+//! capacity, so a job here RESTS in `RUNNABLE`: it owes nothing further, it is never
+//! advanced to `STARTING`, and no `startedAt`, `stoppedAt`, attempt or `exitCode` is
+//! invented for it. Only a caller ends it — `CancelJob`, `TerminateJob`, or the
+//! deletion of its queue. Everything around it — accepting, resolving, scheduling,
+//! listing, cancelling, terminating — is real.
 //!
 //! A SERVICE job's work is not run either, for the same reason: nothing here runs
 //! SageMaker AI, so a service job `SubmitServiceJob` accepted walks the same
@@ -110,6 +113,12 @@ pub mod limits {
     /// Dependencies one submit may name. AWS Batch documents it on `SubmitJob$dependsOn`:
     /// "A job can depend upon a maximum of 20 jobs."
     pub const MAX_JOB_DEPENDENCIES: usize = 20;
+
+    /// Jobs one bulk `CancelJobs`/`TerminateJobs` request may name, from both operations'
+    /// own docs: "An array of up to 50 Batch job IDs of the jobs to cancel" /
+    /// "...to terminate". Both members target a plain string list, so the bound is applied
+    /// in the handlers.
+    pub const MAX_BULK_JOBS: usize = 50;
 
     /// Jobs kept at once. An emulator bound, as above: a submit that would exceed it
     /// first evicts the jobs that have been terminal longest, and is refused only when
@@ -363,10 +372,6 @@ pub const NEXT_TOKEN_NOT_PROCESSABLE: &str = "Error processing next token";
 pub const SERVICE_JOB_COMPLETED_NOT_UPDATABLE: &str =
     "UpdateServiceJob cannot be called on a service job which is completed.";
 
-/// `statusReason` of a job whose container could not be run here.
-pub const NO_CONTAINER_RUNTIME_REASON: &str =
-    "This emulator has no container runtime, so the job's container was never started";
-
 /// `statusReason` of a job the deletion of its job queue ended.
 ///
 /// `DeleteJobQueue`'s own doc: "All jobs in the queue are eventually terminated when you
@@ -468,13 +473,59 @@ pub const MAX_QUOTA_SHARE_NAME_LEN: usize = 128;
 /// types the member as a plain `String`, so the framework cannot refuse a bad one.
 pub const MAX_JOB_NAME_LEN: usize = 128;
 
-/// The fewest attempts `ServiceJobRetryStrategy$attempts` accepts, from the member's doc:
-/// "You can specify between 1 and 10 attempts." The model types it as a plain `Integer`,
-/// so the bound is applied in the handler.
-pub const MIN_SERVICE_JOB_RETRY_ATTEMPTS: i32 = 1;
-/// The most attempts `ServiceJobRetryStrategy$attempts` accepts; see
-/// [`MIN_SERVICE_JOB_RETRY_ATTEMPTS`].
-pub const MAX_SERVICE_JOB_RETRY_ATTEMPTS: i32 = 10;
+/// The fewest retry attempts this service accepts, from the member docs of BOTH retry
+/// strategies — `RetryStrategy$attempts` ("The number of times to move a job to the
+/// `RUNNABLE` status. You can specify between 1 and 10 attempts.") and
+/// `ServiceJobRetryStrategy$attempts` ("You can specify between 1 and 10 attempts.").
+/// Both model the member as a plain `Integer`, so the bound is applied in the handlers.
+pub const MIN_RETRY_ATTEMPTS: i32 = 1;
+/// The most retry attempts this service accepts; see [`MIN_RETRY_ATTEMPTS`].
+pub const MAX_RETRY_ATTEMPTS: i32 = 10;
+
+/// The `ResourceType` whose `ResourceRequirement$value` is a vCPU count.
+pub const RESOURCE_TYPE_VCPU: &str = "VCPU";
+/// The `ResourceType` whose `ResourceRequirement$value` is a memory hard limit in MiB.
+pub const RESOURCE_TYPE_MEMORY: &str = "MEMORY";
+
+/// The vCPU/memory pairs Fargate supports, as `ResourceRequirement$value`'s own doc
+/// enumerates them under `type="VCPU"`: one entry per supported vCPU count ("The supported
+/// values are 0.25, 0.5, 1, 2, 4, 8, 16, and 32"), carrying the `MEMORY` values that doc
+/// lists for it, in MiB.
+///
+/// Source: `smithy_query(query="doc", shape="ResourceRequirement", member="value")`. The
+/// member is a plain `String` on both sides, so neither the values nor the pairing can be
+/// enforced at the boundary.
+const FARGATE_VCPU_MEMORY: &[(f64, &[i64])] = &[
+    (0.25, &[512, 1024, 2048]),
+    (0.5, &[1024, 2048, 3072, 4096]),
+    (1.0, &[2048, 3072, 4096, 5120, 6144, 7168, 8192]),
+    (
+        2.0,
+        &[
+            4096, 5120, 6144, 7168, 8192, 9216, 10240, 11264, 12288, 13312, 14336, 15360, 16384,
+        ],
+    ),
+    (
+        4.0,
+        &[
+            8192, 9216, 10240, 11264, 12288, 13312, 14336, 15360, 16384, 17408, 18432, 19456,
+            20480, 21504, 22528, 23552, 24576, 25600, 26624, 27648, 28672, 29696, 30720,
+        ],
+    ),
+    (
+        8.0,
+        &[
+            16384, 20480, 24576, 28672, 32768, 36864, 40960, 45056, 49152, 53248, 57344, 61440,
+        ],
+    ),
+    (
+        16.0,
+        &[
+            32768, 40960, 49152, 57344, 65536, 73728, 81920, 90112, 98304, 106496, 114688, 122880,
+        ],
+    ),
+    (32.0, &[61440, 122880, 249856]),
+];
 
 /// The fewest results `ListServiceJobs$maxResults` accepts, from the member's doc: "This
 /// value can be between 1 and 100." The model types it as a plain `Integer`, so the bound
@@ -662,6 +713,10 @@ pub const JOB_RUNNING: &str = "RUNNING";
 pub const JOB_SUCCEEDED: &str = "SUCCEEDED";
 /// Terminal `JobStatus`: the job did not complete successfully.
 pub const JOB_FAILED: &str = "FAILED";
+
+/// How many `RUNNABLE` jobs `GetJobQueueSnapshot` lists, from the operation's own doc:
+/// "The first 100 RUNNABLE jobs in the job queue are listed in order of dispatch."
+pub const MAX_FRONT_OF_QUEUE_JOBS: usize = 100;
 
 // `ServiceJobStatus` values. A separate enum from `JobStatus` in the model
 // (`smithy_query(query="shape", shape="ServiceJobStatus")`: SUBMITTED, PENDING,
@@ -1338,11 +1393,35 @@ pub struct Job {
     pub status: String,
     pub status_reason: Option<String>,
     pub created_at: i64,
+    /// `startedAt`: "when the job transitioned from the `STARTING` state to the `RUNNING`
+    /// state" (`JobDetail$startedAt`). Nothing here places a job on compute capacity, so
+    /// no job ever starts and this stays `None` — the member is then ABSENT from every
+    /// projection, rather than carrying an instant nothing ran at.
     pub started_at: Option<i64>,
+    /// `stoppedAt`: "when the job transitioned from the `RUNNING` state to a terminal
+    /// state" (`JobDetail$stoppedAt`). A job that never ran never made that transition, so
+    /// it reports none even once it is terminal; [`Self::ended_at`] is what records WHEN
+    /// it became terminal.
     pub stopped_at: Option<i64>,
+    /// When this job reached a terminal `JobStatus`, in epoch milliseconds, whatever took
+    /// it there.
+    ///
+    /// Internal bookkeeping, not a modelled member: it is what releases the jobs waiting
+    /// on this one and what orders the terminal jobs the store evicts first. It is NOT
+    /// `stoppedAt`, which AWS Batch documents as the `RUNNING` -> terminal transition and
+    /// so leaves absent for a job that never ran.
+    pub ended_at: Option<i64>,
     /// When the next clock-owed transition falls due; `None` while the job waits
     /// on a dependency, and once it is terminal.
     pub next_phase_due_at: Option<i64>,
+    /// When this job reached its CURRENT position in the `RUNNABLE` ordering of its job
+    /// queue, in epoch milliseconds, or `None` while it is not in that ordering.
+    ///
+    /// `GetJobQueueSnapshot` reports it as `earliestTimeAtPosition` ("when the job
+    /// transitioned to its current position in the job queue"), so it is written when the
+    /// job ENTERS `RUNNABLE` and again whenever a job ahead of it in the same queue leaves
+    /// the ordering — which is the only thing that moves a job forward here.
+    pub at_position_since: Option<i64>,
     pub is_cancelled: bool,
     pub is_terminated: bool,
     /// The `reason` of a `CancelJob` that arrived while this job was `PENDING`, i.e.
@@ -1706,6 +1785,19 @@ pub fn client_exception_message(detail: &str, request_id: &str) -> String {
     format!("Error executing request, Exception : {detail}, RequestId: {request_id}")
 }
 
+/// The request id a message worded by [`client_exception_message`] states, or `None` for a
+/// message that is not in that envelope.
+///
+/// The one reader of the envelope's shape, beside the one writer above, so the id a
+/// response STATES can be reported in the header AWS carries a response's request id in
+/// (`crate::service::request_id_header`) without a second copy of the format.
+pub fn enveloped_request_id(message: &str) -> Option<&str> {
+    let (head, request_id) = message.rsplit_once(", RequestId: ")?;
+    head.starts_with("Error executing request, Exception : ")
+        .then_some(request_id)
+        .filter(|id| !id.is_empty())
+}
+
 /// The segment the validating walk spells a step from a collection into one of its
 /// elements with (`aws_smithy_schema_server::constraints::path`): the step itself, and the
 /// segment before it, name a POSITION inside that collection rather than a member of the
@@ -1930,6 +2022,143 @@ pub fn execution_roles_of<'a>(
         }
     }
     roles
+}
+
+/// The `resourceRequirements` list of EVERY container-properties object a job definition
+/// carries, one entry per object, in declaration order: the top-level
+/// `containerProperties`, the `container` of each node range of a multi-node definition,
+/// and each container of each `ecsProperties` task (its own or a node range's).
+///
+/// One traversal, the twin of [`execution_roles_of`], so a rule about what a container may
+/// reserve is applied to every place a job definition can carry container properties
+/// rather than only to the top-level member.
+pub fn resource_requirements_of<'a>(
+    container_properties: Option<&'a ContainerProperties>,
+    node_properties: Option<&'a NodeProperties>,
+    ecs_properties: Option<&'a EcsProperties>,
+) -> Vec<&'a [ResourceRequirement]> {
+    let mut requirements: Vec<&'a [ResourceRequirement]> = Vec::new();
+    let mut push = |list: Option<&'a Vec<ResourceRequirement>>| {
+        if let Some(list) = list {
+            requirements.push(list.as_slice());
+        }
+    };
+    if let Some(container) = container_properties {
+        push(container.resource_requirements.as_ref());
+    }
+    if let Some(node) = node_properties {
+        for range in &node.node_range_properties {
+            if let Some(container) = range.container.as_ref() {
+                push(container.resource_requirements.as_ref());
+            }
+            for task in range
+                .ecs_properties
+                .as_ref()
+                .map(|ecs| ecs.task_properties.as_slice())
+                .unwrap_or_default()
+            {
+                for container in &task.containers {
+                    push(container.resource_requirements.as_ref());
+                }
+            }
+        }
+    }
+    if let Some(ecs) = ecs_properties {
+        for task in &ecs.task_properties {
+            for container in &task.containers {
+                push(container.resource_requirements.as_ref());
+            }
+        }
+    }
+    requirements
+}
+
+/// The reason `requirements` is not a Fargate-supported reservation, or `None` when it is.
+///
+/// `ResourceRequirement$value`'s own doc pairs the two: "For jobs that are running on
+/// Fargate resources, then `value` must match one of the supported values and the `MEMORY`
+/// values must be one of the values supported for that `VCPU` value" ([`FARGATE_VCPU_MEMORY`]).
+/// A list that states neither resource states no pair to check; one that states only one of
+/// them is incomplete, which is a different rule ("you must specify at least one vCPU", "you
+/// must specify at least 4 MiB of memory") and not this function's.
+pub fn fargate_reservation_refusal(requirements: &[ResourceRequirement]) -> Option<String> {
+    let stated = |resource: &str| {
+        requirements
+            .iter()
+            .find(|requirement| requirement.r#type == resource)
+            .map(|requirement| requirement.value.as_str())
+    };
+    let (Some(vcpu), Some(memory)) = (
+        stated(RESOURCE_TYPE_VCPU),
+        stated(RESOURCE_TYPE_MEMORY),
+    ) else {
+        return None;
+    };
+    let admitted = vcpu
+        .parse::<f64>()
+        .ok()
+        .zip(memory.parse::<i64>().ok())
+        .is_some_and(|(vcpu, memory)| {
+            FARGATE_VCPU_MEMORY.iter().any(|(supported, memories)| {
+                (*supported - vcpu).abs() < f64::EPSILON && memories.contains(&memory)
+            })
+        });
+    (!admitted).then(|| {
+        // The detail AWS is recorded to state for a pair Fargate does not support, worded
+        // from the reservation the request stated: the two values and their units.
+        format!("Fargate resource requirements ({vcpu} vCPU, {memory} MiB) not valid.")
+    })
+}
+
+/// `environment` with every pair whose value is the EMPTY STRING dropped.
+///
+/// A `KeyValuePair` carrying an empty value says nothing about the variable it names, so
+/// AWS Batch is recorded to store no such variable: a read of the stored revision cannot
+/// tell the name apart from one the request never mentioned. The model constrains
+/// `KeyValuePair$value` not at all, so this is applied where the revision is WRITTEN.
+fn without_empty_values(environment: &mut Option<Vec<KeyValuePair>>) {
+    let Some(pairs) = environment.as_mut() else {
+        return;
+    };
+    pairs.retain(|pair| pair.value.as_deref() != Some(""));
+}
+
+/// Drop every empty-valued environment pair from EVERY container-properties object a job
+/// definition carries ([`without_empty_values`]), in the same traversal
+/// [`execution_roles_of`] and [`resource_requirements_of`] walk.
+///
+/// Only the objects whose `environment` is a `KeyValuePair` list are walked: an Amazon EKS
+/// pod states its variables as `EksContainerEnvironmentVariable`, a shape of its own whose
+/// `value` AWS does not document this behaviour for.
+pub fn normalize_environments(
+    container_properties: Option<&mut ContainerProperties>,
+    node_properties: Option<&mut NodeProperties>,
+    ecs_properties: Option<&mut EcsProperties>,
+) {
+    if let Some(container) = container_properties {
+        without_empty_values(&mut container.environment);
+    }
+    if let Some(node) = node_properties {
+        for range in &mut node.node_range_properties {
+            if let Some(container) = range.container.as_mut() {
+                without_empty_values(&mut container.environment);
+            }
+            if let Some(ecs) = range.ecs_properties.as_mut() {
+                for task in &mut ecs.task_properties {
+                    for container in &mut task.containers {
+                        without_empty_values(&mut container.environment);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(ecs) = ecs_properties {
+        for task in &mut ecs.task_properties {
+            for container in &mut task.containers {
+                without_empty_values(&mut container.environment);
+            }
+        }
+    }
 }
 
 /// Per-service state for com-amazonaws-batch-awsbatchv20160810. A handler reaches it through [`service_state`].
@@ -2661,11 +2890,12 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                     Some(Advanced::Terminal)
                 }
                 DependencyOutcome::Satisfied(at) => {
-                    // The job may be placed one span after the last dependency stopped.
+                    // The job may be placed one span after the last dependency stopped,
+                    // and then rests in `RUNNABLE` like every other released job.
                     let released = at + JOB_PHASE_MILLIS;
                     if released <= now {
                         self.set_job_status(id, JOB_RUNNABLE, released);
-                        self.set_job_due(id, Some(released + JOB_PHASE_MILLIS));
+                        self.set_job_due(id, None);
                         Some(Advanced::Moved)
                     } else {
                         self.set_job_due(id, Some(released));
@@ -2685,15 +2915,17 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                     }
                     JOB_SUBMITTED => {
                         self.set_job_status(id, JOB_RUNNABLE, due);
-                        self.set_job_due(id, Some(due + JOB_PHASE_MILLIS));
+                        // `RUNNABLE` is where a job waits for the scheduler to place it,
+                        // and nothing here has compute capacity to place it on, so the
+                        // job RESTS: the clock owes it nothing more.
+                        self.set_job_due(id, None);
                         Some(Advanced::Moved)
                     }
-                    // The container cannot be run here, so the run the caller
-                    // asked for ends in the modelled failure state, saying so.
-                    // No `startedAt`, attempt or `exitCode` is invented for it.
+                    // A job already resting in `RUNNABLE` owes nothing: only a caller
+                    // (`CancelJob`, `TerminateJob`, `DeleteJobQueue`) ends it.
                     JOB_RUNNABLE => {
-                        self.finish_job(id, JOB_FAILED, NO_CONTAINER_RUNTIME_REASON, due);
-                        Some(Advanced::Terminal)
+                        self.set_job_due(id, None);
+                        None
                     }
                     _ => None,
                 }
@@ -2928,8 +3160,8 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     /// AWS Batch documents for `TerminateJob`: jobs in `SUBMITTED`, `PENDING` or
     /// `RUNNABLE` are cancelled, jobs that have progressed to `STARTING` or `RUNNING` are
     /// terminated; either way the job ends `FAILED` carrying `reason`. `STARTING` and
-    /// `RUNNING` are modelled but unreachable here (nothing runs a container, so a job
-    /// never leaves `RUNNABLE` except to fail), and the rule is kept for both so the
+    /// `RUNNING` are modelled but unreachable here (nothing places a job, so a job rests
+    /// in `RUNNABLE` until a caller ends it), and the rule is kept for both so the
     /// distinction holds the day a runtime exists. A job already in a terminal status is
     /// left exactly as it is.
     pub fn terminate_job(&mut self, id: &str, reason: &str, now: i64) -> bool {
@@ -2965,8 +3197,13 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             return CancelOutcome::AlreadyTerminal;
         }
         match job.status.as_str() {
+            // A `PENDING` job is cancelled from the caller's point of view straight away
+            // — AWS is recorded to report `isCancelled` on it while it is still `PENDING`
+            // — but it only LEAVES `PENDING` once the jobs it waits on are done, so the
+            // terminal status is the clock's to materialise (see [`Job::cancel_requested`]).
             JOB_PENDING => {
                 if let Some(job) = self.jobs.get_mut(id) {
+                    job.is_cancelled = true;
                     job.cancel_requested = Some(reason.to_string());
                 }
                 CancelOutcome::Deferred
@@ -2998,11 +3235,63 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     }
 
     /// Set `id`'s status at `at`, leaving what the clock owes it alone.
+    ///
+    /// A job ENTERING `RUNNABLE` joins its queue's `RUNNABLE` ordering at `at`, which is
+    /// what `GetJobQueueSnapshot` reports as its `earliestTimeAtPosition`
+    /// ([`Job::at_position_since`]).
     fn set_job_status(&mut self, id: &str, status: &str, at: i64) {
         if let Some(job) = self.jobs.get_mut(id) {
+            let entering_queue = status == JOB_RUNNABLE && job.status != JOB_RUNNABLE;
             job.status = status.to_string();
+            if entering_queue {
+                job.at_position_since = Some(at);
+            }
         }
         self.record_job_state_change(id, at);
+    }
+
+    /// The key a job is ordered by in its queue's `RUNNABLE` ordering: its submission
+    /// instant, then its id so two jobs submitted in the same millisecond still have one
+    /// order. `GetJobQueueSnapshot`'s `frontOfQueue` doc: "For first-in-first-out (FIFO)
+    /// job queues, jobs are ordered based on their submission time."
+    fn queue_order_key(job: &Job) -> (i64, &str) {
+        (job.created_at, job.job_id.as_str())
+    }
+
+    /// The `RUNNABLE` jobs of the queue `arn`, in the order the queue dispatches them.
+    pub fn runnable_jobs_of_queue(&self, arn: &str) -> Vec<&Job> {
+        let mut queued: Vec<&Job> = self
+            .jobs_by_queue
+            .get(arn)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.jobs.get(id))
+            .filter(|job| job.status == JOB_RUNNABLE)
+            .collect();
+        queued.sort_by_key(|job| Self::queue_order_key(job));
+        queued
+    }
+
+    /// Move every `RUNNABLE` job BEHIND `departed` in its queue to its new position at
+    /// `at`: a job leaving the ordering is the only thing that advances the jobs after it,
+    /// and each of those is now at a position it reached at this instant.
+    fn advance_queue_positions(&mut self, departed: &str, at: i64) {
+        let Some(gone) = self.jobs.get(departed) else {
+            return;
+        };
+        let queue_arn = gone.job_queue_arn.clone();
+        let gone_key = (gone.created_at, gone.job_id.clone());
+        let behind: Vec<String> = self
+            .runnable_jobs_of_queue(&queue_arn)
+            .into_iter()
+            .filter(|job| (job.created_at, job.job_id.clone()) > gone_key)
+            .map(|job| job.job_id.clone())
+            .collect();
+        for id in behind {
+            if let Some(job) = self.jobs.get_mut(&id) {
+                job.at_position_since = Some(at);
+            }
+        }
     }
 
     /// Point `id`'s clock-owed transition at `due`, or clear it, keeping the due index in
@@ -3021,32 +3310,50 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         }
     }
 
-    /// Put `id` in a terminal `status` at `stopped_at` with `reason` as its
+    /// Put `id` in a terminal `status` at `ended_at` with `reason` as its
     /// `statusReason` (and its container's `reason`), and clear what the clock owed it.
+    ///
+    /// `stoppedAt` is written only for a job that had actually STARTED: the member is
+    /// documented as the `RUNNING` -> terminal transition, so a job nothing ran reports
+    /// none ([`Job::stopped_at`]). [`Job::ended_at`] records the instant either way.
     ///
     /// Every route into a terminal status goes through here — the clock and `TerminateJob`
     /// alike — so this is where the jobs WAITING on `id` are woken: each one that is still
     /// waiting gets this instant as its due instant, which puts it back in the due index,
     /// and the next `materialize_due` recomputes what its dependencies now allow. One
     /// release path, both callers.
-    fn finish_job(&mut self, id: &str, status: &str, reason: &str, stopped_at: i64) {
+    fn finish_job(&mut self, id: &str, status: &str, reason: &str, ended_at: i64) {
         self.set_job_due(id, None);
+        // A job leaving the queue's `RUNNABLE` ordering moves the jobs behind it forward,
+        // so each of those reaches its new position at this instant. Read BEFORE the
+        // status is overwritten, which is what tells us the job was in that ordering.
+        let was_queued = self
+            .jobs
+            .get(id)
+            .is_some_and(|job| job.status == JOB_RUNNABLE);
+        if was_queued {
+            self.advance_queue_positions(id, ended_at);
+        }
         if let Some(job) = self.jobs.get_mut(id) {
             job.status = status.to_string();
             job.status_reason = Some(reason.to_string());
-            job.stopped_at = Some(stopped_at);
+            job.ended_at = Some(ended_at);
+            job.at_position_since = None;
+            if job.started_at.is_some() {
+                job.stopped_at = Some(ended_at);
+            }
             if let Some(container) = job.container.as_mut() {
                 container.reason = Some(reason.to_string());
             }
         }
-        self.record_job_state_change(id, stopped_at);
+        self.record_job_state_change(id, ended_at);
         let waiting = self.dependents.get(id).cloned().unwrap_or_default();
         for dependent in waiting {
             let still_waiting = self.jobs.get(&dependent).is_some_and(|job| {
                 job.status == JOB_PENDING && job.next_phase_due_at.is_none()
             });
             if still_waiting {
-                self.set_job_due(&dependent, Some(stopped_at));
+                self.set_job_due(&dependent, Some(ended_at));
             }
         }
     }
@@ -3061,7 +3368,7 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             .filter(|job| {
                 is_terminal_status(&job.status) && !self.has_live_dependent(&job.job_id)
             })
-            .map(|job| (job.stopped_at.unwrap_or(job.created_at), job.job_id.clone()))
+            .map(|job| (job.ended_at.unwrap_or(job.created_at), job.job_id.clone()))
             .collect();
         evictable.sort();
         for (_, id) in evictable.into_iter().take(wanted) {
@@ -3119,7 +3426,7 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             let Some(dependency) = self.jobs.get(dependency_id) else {
                 return DependencyOutcome::Unresolvable;
             };
-            let stopped = dependency.stopped_at.unwrap_or(now);
+            let stopped = dependency.ended_at.unwrap_or(now);
             match dependency.status.as_str() {
                 JOB_SUCCEEDED => latest = latest.max(stopped),
                 JOB_FAILED => return DependencyOutcome::Failed(stopped),
