@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_data_retention.rs"]
 mod account_data_retention;
+#[path = "all/advanced_prompt_optimization_jobs.rs"]
+mod advanced_prompt_optimization_jobs;
 #[path = "all/arn_inputs.rs"]
 mod arn_inputs;
 #[path = "all/automated_reasoning_policies.rs"]

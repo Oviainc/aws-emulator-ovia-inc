@@ -17,7 +17,15 @@ pub struct GetAdvancedPromptOptimizationJobInput {
     pub job_identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#GetAdvancedPromptOptimizationJobResponse")]
+/// `GetAdvancedPromptOptimizationJobResponse`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `creationTime` and `lastModifiedTime` carry `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation",operation="GetAdvancedPromptOptimizationJob")`), which
+/// the derive does not put on a member schema — see `types/date_time_wire.rs` for that
+/// whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct GetAdvancedPromptOptimizationJobOutput {
     pub job_arn: String,
@@ -32,4 +40,79 @@ pub struct GetAdvancedPromptOptimizationJobOutput {
     pub failure_message: Option<String>,
     pub model_configurations: Vec<ModelConfiguration>,
 }
+
+bedrock_schema_and_codec!(
+    GetAdvancedPromptOptimizationJobOutput,
+    GET_ADVANCED_PROMPT_OPTIMIZATION_JOB_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrock#GetAdvancedPromptOptimizationJobResponse",
+    "com.amazonaws.bedrock",
+    "GetAdvancedPromptOptimizationJobResponse",
+    (M_JOB_ARN, job_arn, "jobArn", 0, req, string),
+    (M_JOB_NAME, job_name, "jobName", 1, req, string),
+    (
+        M_JOB_DESCRIPTION,
+        job_description,
+        "jobDescription",
+        2,
+        opt,
+        string
+    ),
+    (M_JOB_STATUS, job_status, "jobStatus", 3, req, string),
+    (
+        M_INPUT_CONFIG,
+        input_config,
+        "inputConfig",
+        4,
+        req,
+        struct_of(AdvancedPromptOptimizationInputConfig)
+    ),
+    (
+        M_OUTPUT_CONFIG,
+        output_config,
+        "outputConfig",
+        5,
+        req,
+        struct_of(AdvancedPromptOptimizationOutputConfig)
+    ),
+    (
+        M_ENCRYPTION_KEY_ARN,
+        encryption_key_arn,
+        "encryptionKeyArn",
+        6,
+        opt,
+        string
+    ),
+    (
+        M_CREATION_TIME,
+        creation_time,
+        "creationTime",
+        7,
+        req,
+        date_time
+    ),
+    (
+        M_LAST_MODIFIED_TIME,
+        last_modified_time,
+        "lastModifiedTime",
+        8,
+        opt,
+        date_time
+    ),
+    (
+        M_FAILURE_MESSAGE,
+        failure_message,
+        "failureMessage",
+        9,
+        opt,
+        string
+    ),
+    (
+        M_MODEL_CONFIGURATIONS,
+        model_configurations,
+        "modelConfigurations",
+        10,
+        req,
+        list_of_struct(ModelConfiguration)
+    ),
+);
 

@@ -32,6 +32,12 @@
 //! And it holds the evaluation jobs `ops/create_evaluation_job.rs` mints and
 //! `ops/get_evaluation_job.rs` reads back.
 //!
+//! And it holds the advanced prompt optimization jobs
+//! `ops/create_advanced_prompt_optimization_job.rs` mints,
+//! `ops/get_advanced_prompt_optimization_job.rs` reads back and
+//! `ops/stop_advanced_prompt_optimization_job.rs` winds down, together with the instant
+//! each job's non-terminal `jobStatus` is owed its move to a terminal one.
+//!
 //! And it holds the model customization jobs `ops/create_model_customization_job.rs`
 //! mints, `ops/get_model_customization_job.rs` reads back and
 //! `ops/stop_model_customization_job.rs` winds down, together with the instant each job's
@@ -129,6 +135,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
+    AdvancedPromptOptimizationInputConfig, AdvancedPromptOptimizationOutputConfig,
     AutomatedReasoningPolicyDefinition, AutomatedReasoningPolicyTestCase, CustomModelDataSource,
     CustomModelDeploymentSummary,
     CustomModelSummary, CustomizationConfig, EndpointConfig, EvaluationConfig,
@@ -149,7 +156,8 @@ use crate::ops::types::{
     GuardrailTopicPolicy, GuardrailTopicPolicyConfig, GuardrailTopicsTier,
     GuardrailTopicsTierConfig, GuardrailWord, GuardrailWordConfig, GuardrailWordPolicy,
     GuardrailWordPolicyConfig, InferenceProfileModel, LoggingConfig, MarketplaceModelEndpoint,
-    ModelDataSource, ModelEnforcement, OutputDataConfig, PromptRouterTargetModel,
+    ModelConfiguration, ModelDataSource, ModelEnforcement, OutputDataConfig,
+    PromptRouterTargetModel,
     ProvisionedModelSummary, RoutingCriteria, SelectiveContentGuarding, Tag, TrainingDataConfig,
     ValidationDataConfig, VpcConfig,
 };
@@ -395,6 +403,57 @@ pub const EVALUATION_JOB_TYPE_HUMAN: &str = "Human";
 /// without a server-side cap a caller could grow this part of the store with nothing but
 /// fresh job names.
 pub const MAX_EVALUATION_JOBS_PER_ACCOUNT: usize = 100;
+
+/// `AdvancedPromptOptimizationJobStatus` — the job Amazon Bedrock accepted is running.
+///
+/// The enum is `[InProgress, Completed, Failed, PartiallyCompleted, Stopping, Stopped,
+/// Deleting]` (`smithy_query(query="shape",shape="AdvancedPromptOptimizationJobStatus")`),
+/// which is also what `crate::ops::types::ADVANCED_PROMPT_OPTIMIZATION_JOB_STATUS_VALUES`
+/// carries. The optimization runs after the create returns, so this is the status the job
+/// carries from the call that starts it.
+///
+/// It is also the only status `CreateAdvancedPromptOptimizationJob` mints. `Completed`,
+/// `PartiallyCompleted` and `Failed` mean the optimization ran over the caller's JSONL
+/// input and its results were written to the request's `outputConfig` — work this emulator
+/// does not perform, so no call here mints any of them and no clock transition leads to
+/// them. `Stopping` and `Stopped` are reached by a caller's own
+/// `StopAdvancedPromptOptimizationJob` (see
+/// [`ADVANCED_PROMPT_OPTIMIZATION_JOB_STATUS_STOPPING`]) and `Deleting` by
+/// `BatchDeleteAdvancedPromptOptimizationJob`.
+pub const ADVANCED_PROMPT_OPTIMIZATION_JOB_STATUS_IN_PROGRESS: &str = "InProgress";
+
+/// `AdvancedPromptOptimizationJobStatus` — the job is winding down because a caller
+/// stopped it.
+///
+/// The status `StopAdvancedPromptOptimizationJob` moves a running job to: stopping a job is
+/// asynchronous, so this is the non-terminal status the job carries from the call that asks
+/// for the stop until the stop has taken effect. See
+/// [`ADVANCED_PROMPT_OPTIMIZATION_JOB_STATUS_IN_PROGRESS`] for the value list.
+pub const ADVANCED_PROMPT_OPTIMIZATION_JOB_STATUS_STOPPING: &str = "Stopping";
+
+/// `AdvancedPromptOptimizationJobStatus` once the stop has taken effect — the terminal
+/// status the non-terminal [`ADVANCED_PROMPT_OPTIMIZATION_JOB_STATUS_STOPPING`] is owed its
+/// move to, after [`ADVANCED_PROMPT_OPTIMIZATION_JOB_STOPPED_AFTER`].
+pub const ADVANCED_PROMPT_OPTIMIZATION_JOB_STATUS_STOPPED: &str = "Stopped";
+
+/// How long after `StopAdvancedPromptOptimizationJob` a job's `Stopping` status is owed its
+/// move to [`ADVANCED_PROMPT_OPTIMIZATION_JOB_STATUS_STOPPED`].
+///
+/// CHOSEN, not documented: AWS publishes no duration for stopping an advanced prompt
+/// optimization job, so this is the emulator's span, the one
+/// [`EVALUATION_JOB_STOPPED_AFTER`] uses for the same kind of wind-down. It is non-zero, so
+/// a caller that reads the job straight after stopping it still observes the `Stopping`
+/// status the real service reports; and it is materialised from the stored due instant on
+/// the next call that touches the record rather than waited on, so no handler sleeps.
+pub const ADVANCED_PROMPT_OPTIMIZATION_JOB_STOPPED_AFTER: Duration = Duration::from_millis(500);
+
+/// The most advanced prompt optimization jobs this account may hold at once, past which a
+/// create is refused with `ServiceQuotaExceededException`.
+///
+/// The emulator's own bound rather than a published quota, for the reason
+/// [`MAX_EVALUATION_JOBS_PER_ACCOUNT`] gives: without a server-side cap a caller could grow
+/// this part of the store with nothing but fresh creates.
+pub const MAX_ADVANCED_PROMPT_OPTIMIZATION_JOBS_PER_ACCOUNT: usize = 100;
 
 /// `ProvisionedModelStatus` — the Provisioned Throughput is still being brought up by the
 /// create call.
@@ -1150,6 +1209,103 @@ impl EvaluationJobRecord {
     pub fn settle(&mut self, now: SystemTime) {
         if let Some(due) = self.stopped_due_at.filter(|due| now >= *due) {
             self.status = EVALUATION_JOB_STATUS_STOPPED;
+            self.stopped_due_at = None;
+            self.last_modified_at = due;
+        }
+    }
+}
+
+/// One stored advanced prompt optimization job: the identity
+/// `CreateAdvancedPromptOptimizationJob` minted, the configuration that request carried,
+/// the status it holds now and the instants a read reports.
+///
+/// `status` is `&'static str` for the same reason [`EvaluationJobRecord::status`] is: it is
+/// a value this emulator derives rather than anything a request names.
+#[derive(Debug, Clone)]
+pub struct AdvancedPromptOptimizationJobRecord {
+    /// The `AdvancedPromptOptimizationJobArn` this job is addressed by, minted by
+    /// [`advanced_prompt_optimization_job_arn`].
+    pub arn: String,
+    /// `jobName`, as the create request spelled it.
+    pub name: String,
+    /// The region the create addressed, which [`Self::arn`] also carries. Kept beside it
+    /// so a bare-id lookup is per region without re-parsing an ARN, exactly as
+    /// [`EvaluationJobRecord::region`] is.
+    pub region: String,
+    /// `jobDescription`, as the create request carried it (absent when it carried none).
+    pub description: Option<String>,
+    /// `inputConfig` — the S3 location of the JSONL input the job optimizes over.
+    pub input_config: AdvancedPromptOptimizationInputConfig,
+    /// `outputConfig` — the S3 prefix the optimization results are written under.
+    pub output_config: AdvancedPromptOptimizationOutputConfig,
+    /// `encryptionKeyArn`, as the create request carried it (absent when it carried none,
+    /// in which case the output is encrypted with an Amazon-owned key and the read reports
+    /// no key). Stored VERBATIM: the member is a `KmsKeyArn` in both the request and the
+    /// response, so the ARN the request gave is the ARN the read reports.
+    pub encryption_key_arn: Option<String>,
+    /// `modelConfigurations` — the target models the job optimizes the prompts for, in the
+    /// order the create request listed them.
+    pub model_configurations: Vec<ModelConfiguration>,
+    /// `tags` — the tags the create request attached.
+    ///
+    /// Kept with the record because it is part of the request that minted it; this
+    /// resource's read operations report no tag member, so nothing reads them back, exactly
+    /// as [`ProvisionedModelThroughputRecord::tags`] are kept.
+    pub tags: Vec<Tag>,
+    /// `AdvancedPromptOptimizationJobStatus`.
+    pub status: &'static str,
+    /// When [`Self::status`] is owed its move to
+    /// [`ADVANCED_PROMPT_OPTIMIZATION_JOB_STATUS_STOPPED`], or `None` while no stop is in
+    /// flight.
+    ///
+    /// The due INSTANT, not a timer, for the same reason
+    /// [`EvaluationJobRecord::stopped_due_at`] is one.
+    pub stopped_due_at: Option<SystemTime>,
+    pub created_at: SystemTime,
+    /// When the job last changed, which is the creation instant until something changes it.
+    pub last_modified_at: SystemTime,
+}
+
+impl AdvancedPromptOptimizationJobRecord {
+    /// Whether this job is one a stop may be asked for: it is still in progress.
+    ///
+    /// "Stops an advanced prompt optimization job that is in progress"
+    /// (`smithy_query(query="doc",shape="StopAdvancedPromptOptimizationJob")`), so a job in
+    /// any other status has nothing left to stop.
+    #[must_use]
+    pub fn is_in_progress(&self) -> bool {
+        self.status == ADVANCED_PROMPT_OPTIMIZATION_JOB_STATUS_IN_PROGRESS
+    }
+
+    /// Whether a stop has already taken this job over: it is winding down, or has wound
+    /// down.
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.status == ADVANCED_PROMPT_OPTIMIZATION_JOB_STATUS_STOPPING
+            || self.status == ADVANCED_PROMPT_OPTIMIZATION_JOB_STATUS_STOPPED
+    }
+
+    /// Move this job to [`ADVANCED_PROMPT_OPTIMIZATION_JOB_STATUS_STOPPING`] and record
+    /// when the stop is owed its move to
+    /// [`ADVANCED_PROMPT_OPTIMIZATION_JOB_STATUS_STOPPED`].
+    ///
+    /// The caller's own write, asked for by `StopAdvancedPromptOptimizationJob` — not a
+    /// clock transition: [`Self::settle`] is what materialises the one the clock owes.
+    pub fn stop(&mut self, now: SystemTime) {
+        self.status = ADVANCED_PROMPT_OPTIMIZATION_JOB_STATUS_STOPPING;
+        self.stopped_due_at = Some(now + ADVANCED_PROMPT_OPTIMIZATION_JOB_STOPPED_AFTER);
+        self.last_modified_at = now;
+    }
+
+    /// Materialise the move to [`ADVANCED_PROMPT_OPTIMIZATION_JOB_STATUS_STOPPED`] the
+    /// clock has already made due at `now`.
+    ///
+    /// The only write a reporting operation on this resource makes: it was owed at the due
+    /// instant even if nobody had called, which is why that instant — not `now` — is the
+    /// one the job reports as its last modification.
+    pub fn settle(&mut self, now: SystemTime) {
+        if let Some(due) = self.stopped_due_at.filter(|due| now >= *due) {
+            self.status = ADVANCED_PROMPT_OPTIMIZATION_JOB_STATUS_STOPPED;
             self.stopped_due_at = None;
             self.last_modified_at = due;
         }
@@ -2110,6 +2266,14 @@ pub struct AccountDataRetention {
 ///   `CreateEvaluationJob` enforces, and `evaluation_job_create_tokens` holds at most one
 ///   entry per stored job for the same reason `create_tokens` does.
 ///
+/// * `advanced_prompt_optimization_jobs` holds one entry per stored advanced prompt
+///   optimization job, capped at
+///   [`MAX_ADVANCED_PROMPT_OPTIMIZATION_JOBS_PER_ACCOUNT`] by the quota
+///   `CreateAdvancedPromptOptimizationJob` enforces (the entry is keyed by the job ARN,
+///   which carries a freshly minted id, so no two creates can address one entry), and
+///   `advanced_prompt_optimization_job_create_tokens` holds at most one entry per stored
+///   job for the same reason `create_tokens` does.
+///
 /// * `marketplace_model_endpoints` holds one entry per live marketplace model endpoint,
 ///   capped at [`MAX_MARKETPLACE_MODEL_ENDPOINTS_PER_ACCOUNT`] by the quota
 ///   `CreateMarketplaceModelEndpoint` enforces (the entry is keyed by the endpoint ARN,
@@ -2309,6 +2473,19 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// How many evaluation job ids this store has minted; the uniqueness half of a minted
     /// id.
     pub minted_evaluation_jobs: u64,
+    /// Every stored advanced prompt optimization job, keyed by its
+    /// `AdvancedPromptOptimizationJobArn` — one of the two spellings an
+    /// `AdvancedPromptOptimizationJobIdentifier` carries, the other being the minted job
+    /// id, which that ARN itself carries
+    /// (`smithy_query(query="operation",operation="GetAdvancedPromptOptimizationJob")`).
+    pub advanced_prompt_optimization_jobs: HashMap<String, AdvancedPromptOptimizationJobRecord>,
+    /// `CreateAdvancedPromptOptimizationJob` idempotency: `(region, clientToken)` -> the
+    /// `jobArn` that token minted. Scoped to that one operation, and to the region the
+    /// request addressed, the way the evaluation job index is.
+    pub advanced_prompt_optimization_job_create_tokens: HashMap<(String, String), String>,
+    /// How many advanced prompt optimization job ids this store has minted; the uniqueness
+    /// half of a minted id.
+    pub minted_advanced_prompt_optimization_jobs: u64,
     /// Every stored Provisioned Throughput, keyed by its `ProvisionedModelArn` — one of
     /// the two spellings `ProvisionedModelId` admits.
     pub provisioned_model_throughputs: HashMap<String, ProvisionedModelThroughputRecord>,
@@ -2915,6 +3092,62 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     pub fn mint_evaluation_job_id(&mut self, now: SystemTime) -> String {
         self.minted_evaluation_jobs += 1;
         minted_id(self.minted_evaluation_jobs, now)
+    }
+
+    /// Mint a fresh advanced prompt optimization job id: the resource half of an
+    /// `advanced-prompt-optimization-job/<id>` ARN, unique within this store.
+    ///
+    /// Built like a guardrail id, and for the same two reasons;
+    /// `AdvancedPromptOptimizationJobArn` admits exactly `[a-z0-9]{12}` there, which is
+    /// what two [`ID_HALF_WIDTH`] base-36 halves spell, and
+    /// `AdvancedPromptOptimizationJobIdentifier`'s bare alternative is that same
+    /// `[a-z0-9]{12}`.
+    pub fn mint_advanced_prompt_optimization_job_id(&mut self, now: SystemTime) -> String {
+        self.minted_advanced_prompt_optimization_jobs += 1;
+        minted_id(self.minted_advanced_prompt_optimization_jobs, now)
+    }
+
+    /// The `AdvancedPromptOptimizationJobArn` an `AdvancedPromptOptimizationJobIdentifier`
+    /// names: the identifier itself when it is the ARN of a stored job, otherwise the ARN
+    /// the job of that ID carries in `region`.
+    ///
+    /// The identifier's pattern is that ARN with its `advanced-prompt-optimization-job/<id>`
+    /// tail, or the bare `<id>` alone
+    /// (`smithy_query(query="operation",operation="GetAdvancedPromptOptimizationJob")`), so
+    /// both spellings address the same job — resolved exactly as
+    /// [`Self::model_invocation_job_arn_of`] resolves a batch inference job's two
+    /// spellings.
+    #[must_use]
+    pub fn advanced_prompt_optimization_job_arn_of(
+        &self,
+        identifier: &str,
+        region: &str,
+    ) -> Option<String> {
+        if self
+            .advanced_prompt_optimization_jobs
+            .contains_key(identifier)
+        {
+            return Some(identifier.to_string());
+        }
+        let arn = advanced_prompt_optimization_job_arn(region, identifier);
+        self.advanced_prompt_optimization_jobs
+            .contains_key(&arn)
+            .then_some(arn)
+    }
+
+    /// The advanced prompt optimization job an `AdvancedPromptOptimizationJobIdentifier`
+    /// names, with any status transition the clock has made due at `now` materialised first
+    /// — so every caller reads the status the job holds at `now`, whichever operation asked.
+    pub fn advanced_prompt_optimization_job(
+        &mut self,
+        identifier: &str,
+        region: &str,
+        now: SystemTime,
+    ) -> Option<&mut AdvancedPromptOptimizationJobRecord> {
+        let arn = self.advanced_prompt_optimization_job_arn_of(identifier, region)?;
+        let record = self.advanced_prompt_optimization_jobs.get_mut(&arn)?;
+        record.settle(now);
+        Some(record)
     }
 
     /// Mint a fresh Provisioned Throughput id: the resource half of a
@@ -4006,6 +4239,19 @@ pub fn imported_model_arn(region: &str, id: &str) -> String {
 /// spells it.
 pub fn evaluation_job_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn("bedrock", region, &format!("evaluation-job/{id}"))
+}
+
+/// The ARN of an advanced prompt optimization job in `region`:
+/// `arn:aws:bedrock:<region>:<account>:advanced-prompt-optimization-job/<id>`, as
+/// `AdvancedPromptOptimizationJobArn`
+/// (`^arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:advanced-prompt-optimization-job/[a-z0-9]{12}$`)
+/// spells it.
+pub fn advanced_prompt_optimization_job_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        "bedrock",
+        region,
+        &format!("advanced-prompt-optimization-job/{id}"),
+    )
 }
 
 /// The `EvaluationJobType` of a job configured by `config`.
