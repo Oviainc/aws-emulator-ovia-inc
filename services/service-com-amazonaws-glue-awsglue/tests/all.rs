@@ -109,5 +109,7 @@ mod triggers;
 mod usage_profiles;
 #[path = "all/wire.rs"]
 mod wire;
+#[path = "all/workflow_runs.rs"]
+mod workflow_runs;
 #[path = "all/workflows.rs"]
 mod workflows;

@@ -155,9 +155,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Read-only: the stored workflow is projected out and nothing is written.
-        let store = state.lock();
-        let Some(entry) = store.workflow(&input.name) else {
+        // The only write this read makes: the status changes the clock had already made
+        // due to this workflow's runs, so the last execution it reports is the one the
+        // clock had already reached.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(entry) = store.workflow_mut(&input.name) else {
             return Err(GetWorkflowErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
                     message: Some(crate::state::messages::workflow_not_found(&input.name)),
@@ -166,6 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        entry.settle_due_runs(now);
 
         // "Specifies whether to include a graph when returning the workflow resource
         // metadata": the reader that did not ask for one is answered without it, which is

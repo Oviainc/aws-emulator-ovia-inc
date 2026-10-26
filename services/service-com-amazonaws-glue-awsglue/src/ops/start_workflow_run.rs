@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartWorkflowRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartWorkflowRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartWorkflowRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a run of a stored workflow: the run is recorded against that workflow and the
+//! id minted for it is answered, so a sibling reader (`GetWorkflowRun`) reports the same
+//! run under the same id.
+//!
+//! A workflow can only be run if something can BEGIN a run of it — a trigger bound to it
+//! that does not wait on the workflow's own jobs and crawlers
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::starting_trigger`]) — so a workflow with
+//! no such entry point is refused with `InvalidInputException`, a `Name` this account
+//! holds no workflow under with `EntityNotFoundException`, and a start past the
+//! workflow's own concurrency ceiling with `ConcurrentRunsExceededException`.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +154,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartWorkflowRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartWorkflowRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartWorkflowRun"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on — the same
+            // way `CreateWorkflow` reports it.
+            return Err(StartWorkflowRunErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue workflow store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // `Name` is `@required` with `length 1..255` and the model constrains nothing else
+        // this start carries, so every check left is one the STORE answers.
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // How many actions the workflow's entry point initiates, resolved before the
+        // workflow is borrowed to write to. A trigger is served only through the endpoint
+        // that created it, so the entry point is looked for in THIS Region.
+        let starting_actions = store
+            .starting_trigger(&region, &input.name)
+            .map(|trigger| trigger.actions.len());
+
+        let Some(workflow) = store.workflow_mut(&input.name) else {
+            return Err(StartWorkflowRunErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::workflow_not_found(&input.name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        // A workflow nothing can begin a run of has no entry point to start from, so the
+        // start is refused rather than recorded.
+        let Some(total_actions) = starting_actions else {
+            return Err(StartWorkflowRunErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::no_starting_trigger(&input.name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // Everything the clock already owed this workflow's runs is materialised before
+        // they are counted, so a run the clock has already finished does not count as one
+        // in flight.
+        workflow.settle_due_runs(now);
+        // "You can use this parameter to prevent unwanted multiple updates to data … If
+        // you leave this parameter blank, there is no limit to the number of concurrent
+        // workflow runs": a start past a ceiling the workflow named is refused with this
+        // operation's own modelled error.
+        if let Some(ceiling) = workflow.concurrent_run_ceiling() {
+            let in_flight = workflow.runs_in_flight();
+            if in_flight >= usize::try_from(ceiling).unwrap_or(usize::MAX) {
+                return Err(
+                    StartWorkflowRunErrorModeled::ConcurrentRunsExceededException(
+                        ConcurrentRunsExceededException {
+                            message: Some(
+                                crate::state::messages::concurrent_workflow_runs_exceeded(
+                                    &input.name,
+                                ),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let run_id = crate::state::new_workflow_run_id();
+        let run = crate::state::WorkflowRunEntry::start(
+            workflow,
+            &input,
+            run_id.clone(),
+            now,
+            i32::try_from(total_actions).unwrap_or(i32::MAX),
+        );
+        workflow.record_run(run);
+        ::tracing::info!(
+            operation = "StartWorkflowRun",
+            workflow = %input.name,
+            run = %run_id,
+            "started a Glue workflow run"
+        );
+
+        Ok(StartWorkflowRunOutput {
+            // "An Id for the new run."
+            run_id: Some(run_id),
+        })
     }
 }

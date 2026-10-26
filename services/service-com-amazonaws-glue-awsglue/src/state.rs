@@ -105,7 +105,9 @@
 //! workflow. It should be unique within your account" (`CreateWorkflowRequest$Name`), and
 //! every operation that addresses a workflow (`GetWorkflow`, `UpdateWorkflow`,
 //! `DeleteWorkflow`, `StartWorkflowRun`) names it by `Name` alone, with no `CatalogId`
-//! member.
+//! member. A workflow holds the RUNS `StartWorkflowRun` started of it
+//! ([`WorkflowEntry::runs`]), because every operation that addresses a run names its
+//! workflow too (`GetWorkflowRun` takes a `Name` beside the `RunId`).
 //!
 //! DATA QUALITY RULE RECOMMENDATION RUNS — the runs `StartDataQualityRuleRecommendationRun`
 //! starts over one data source (a catalog table) — sit beside the catalog tree in the same
@@ -170,10 +172,11 @@ use crate::ops::types::{
     SchemaChangePolicy, SchemaColumn, SchemaId, SecurityConfiguration, SourceControlDetails,
     StartColumnStatisticsTaskRunInput,
     StartDataQualityRuleRecommendationRunInput,
-    StartJobRunInput, StorageDescriptor, Table, TableIdentifier, TableInput, TableVersion,
+    StartJobRunInput, StartWorkflowRunInput, StorageDescriptor, Table, TableIdentifier, TableInput,
+    TableVersion,
     TransformEncryption, TransformFilterCriteria, TransformParameters, TransformSortCriteria,
     Trigger,
-    UpdateCrawlerInput, Workflow, WorkflowGraph,
+    UpdateCrawlerInput, Workflow, WorkflowGraph, WorkflowRun, WorkflowRunStatistics,
 };
 
 /// Ceiling on the databases one catalog may hold.
@@ -1243,6 +1246,34 @@ impl ComAmazonawsGlueAwsglueState {
     /// The stored workflow `name`, or `None` when this account holds no such workflow.
     pub fn workflow(&self, name: &str) -> Option<&WorkflowEntry> {
         self.workflows.get(name)
+    }
+
+    /// [`Self::workflow`] mutably: the one record every write to a workflow, and every
+    /// write to one of its runs, lands in.
+    pub fn workflow_mut(&mut self, name: &str) -> Option<&mut WorkflowEntry> {
+        self.workflows.get_mut(name)
+    }
+
+    /// The trigger of the Region `region` that can BEGIN a run of the workflow
+    /// `workflow_name`, or `None` when that workflow has no entry point.
+    ///
+    /// A trigger belongs to the workflow its `WorkflowName` names, and it can begin a run
+    /// unless firing it depends on something inside the workflow having run first: a
+    /// `CONDITIONAL` trigger "fires when its predicate is satisfied"
+    /// (`CreateTriggerRequest$Predicate` — "required when the trigger type is
+    /// CONDITIONAL"), and that predicate's conditions are the states of this workflow's own
+    /// jobs and crawlers, so it can only continue a run, never start one. Every other
+    /// modelled `TriggerType` fires on something outside the workflow — a caller, the
+    /// clock, an event — so any of them is an entry point.
+    ///
+    /// The walk is over the Region's triggers, bounded by [`MAX_TRIGGERS`], and takes them
+    /// in name order (the map is ordered), so the same workflow resolves to the same entry
+    /// point on every call.
+    pub fn starting_trigger(&self, region: &str, workflow_name: &str) -> Option<&TriggerEntry> {
+        self.triggers.get(region)?.values().find(|trigger| {
+            trigger.workflow_name.as_deref() == Some(workflow_name)
+                && trigger.trigger_type != TRIGGER_TYPE_CONDITIONAL
+        })
     }
 
     /// Store `entry` as this account's workflow under its own name, which is the key every
@@ -5729,6 +5760,34 @@ pub mod messages {
         format!("Workflow {name} not found.")
     }
 
+    /// `StartWorkflowRun` for a workflow no trigger can begin a run of. RECORDED
+    /// template: the sentence is fixed and its one variable part is the workflow the
+    /// request named, taken from the request's own `Name`. The start is refused with the
+    /// operation's modelled `InvalidInputException` — a workflow with no entry point is
+    /// not something the service can run.
+    pub fn no_starting_trigger(name: &str) -> String {
+        format!("Workflow {name} doesn't have any starting trigger.")
+    }
+
+    /// `StartWorkflowRun` for a workflow already running as many runs as it allows.
+    /// DOCUMENTED template: `WorkflowRun$ErrorMessage` states this is the wording — "This
+    /// error message describes any error that may have occurred in starting the workflow
+    /// run. Currently the only error message is "Concurrent runs exceeded for workflow:
+    /// `foo`."" — so the sentence is fixed and its one variable part is the workflow the
+    /// request named. The start is refused with the operation's modelled
+    /// `ConcurrentRunsExceededException`.
+    pub fn concurrent_workflow_runs_exceeded(name: &str) -> String {
+        format!("Concurrent runs exceeded for workflow: {name}.")
+    }
+
+    /// A workflow run lookup (`GetWorkflowRun`) for a `RunId` the named workflow holds no
+    /// run under. NOT recorded: the sentence follows the per-resource template of
+    /// [`column_statistics_task_run_not_found`], built from the ADDRESS the request sent —
+    /// the workflow and the run id, which together name a workflow run.
+    pub fn workflow_run_not_found(workflow_name: &str, run_id: &str) -> String {
+        format!("Workflow run {run_id} not found for workflow {workflow_name}.")
+    }
+
     /// A data quality rule recommendation run lookup
     /// (`GetDataQualityRuleRecommendationRun`) for an id no run in this account has. NOT
     /// recorded: the sentence follows the per-resource template of
@@ -6463,10 +6522,10 @@ pub fn table_column_names(table: &TableEntry) -> Vec<String> {
 /// `CreateWorkflow` registers, and the resource an EVENT trigger attaches to.
 ///
 /// Every member of the modelled `Workflow` shape a create can set is held here, plus the
-/// create's `Tags`, which that shape does not carry. The two server-set members are the
-/// instants the record was written at; the members only a RUN or a BLUEPRINT produces
-/// (`LastRun`, `BlueprintDetails`) belong to the operations that produce them, so a
-/// workflow a create wrote carries neither.
+/// create's `Tags`, which that shape does not carry. The server-set members are the
+/// instants the record was written at and the runs started of it; the member only a
+/// BLUEPRINT produces (`BlueprintDetails`) belongs to the operations that produce it, so a
+/// workflow a create wrote carries none.
 #[derive(Debug, Clone)]
 pub struct WorkflowEntry {
     /// The workflow's name, which is also its key in
@@ -6494,6 +6553,13 @@ pub struct WorkflowEntry {
     /// gives: [`TaggedResourceKind`] carries no workflow variant yet, and resolving one
     /// belongs to the tagging operations' own issues.
     pub tags: HashMap<String, String>,
+    /// The runs `StartWorkflowRun` started of this workflow, oldest first and bounded by
+    /// [`MAX_RUNS_PER_WORKFLOW`].
+    ///
+    /// A run lives on its workflow because every operation that addresses one names the
+    /// workflow too: `GetWorkflowRun` takes a `Name` beside the `RunId`, exactly as
+    /// `GetJobRun` takes a `JobName` beside its run id.
+    pub runs: Vec<WorkflowRunEntry>,
 }
 
 impl WorkflowEntry {
@@ -6509,6 +6575,54 @@ impl WorkflowEntry {
             created_on: now,
             last_modified_on: now,
             tags: input.tags.clone().unwrap_or_default(),
+            // A workflow a create wrote has not been run.
+            runs: Vec::new(),
+        }
+    }
+
+    /// The maximum number of this workflow's runs that may be in flight at once, or `None`
+    /// when the workflow names no ceiling: "If you leave this parameter blank, there is no
+    /// limit to the number of concurrent workflow runs"
+    /// (`CreateWorkflowRequest$MaxConcurrentRuns`).
+    ///
+    /// A named ceiling is held at one ([`DEFAULT_MAX_CONCURRENT_RUNS`]), so a stored zero
+    /// cannot make the workflow unrunnable — the same floor a job's concurrency gets.
+    pub fn concurrent_run_ceiling(&self) -> Option<i32> {
+        self.max_concurrent_runs
+            .map(|ceiling| ceiling.max(DEFAULT_MAX_CONCURRENT_RUNS))
+    }
+
+    /// Give every run of this workflow the state the CLOCK already owed it at `now`.
+    ///
+    /// This is the one write a reporting operation performs, exactly as
+    /// [`JobEntry::settle_due_runs`] is for a job run: a run's next status was due at
+    /// [`WorkflowRunEntry::settles_at`] whether or not anybody called, so materialising it
+    /// on read reports the status the clock had already reached.
+    pub fn settle_due_runs(&mut self, now: SystemTime) {
+        for run in &mut self.runs {
+            run.settle_if_due(now);
+        }
+    }
+
+    /// The stored run with this id, or `None` when this workflow has no such run.
+    pub fn run(&self, run_id: &str) -> Option<&WorkflowRunEntry> {
+        self.runs.iter().find(|run| run.id == run_id)
+    }
+
+    /// How many of this workflow's runs have not finished.
+    ///
+    /// Call [`Self::settle_due_runs`] first, or a run the clock has already finished still
+    /// counts as in flight.
+    pub fn runs_in_flight(&self) -> usize {
+        self.runs.iter().filter(|run| !run.is_terminal()).count()
+    }
+
+    /// Append a run, keeping at most [`MAX_RUNS_PER_WORKFLOW`] of them.
+    pub fn record_run(&mut self, run: WorkflowRunEntry) {
+        self.runs.push(run);
+        if self.runs.len() > MAX_RUNS_PER_WORKFLOW {
+            let overflow = self.runs.len() - MAX_RUNS_PER_WORKFLOW;
+            self.runs.drain(..overflow);
         }
     }
 
@@ -6526,14 +6640,232 @@ impl WorkflowEntry {
             default_run_properties: self.default_run_properties.clone(),
             created_on: Some(to_date_time(self.created_on)),
             last_modified_on: Some(to_date_time(self.last_modified_on)),
-            // "The information about the last execution of the workflow": a workflow no
-            // run has been started of has had no last execution.
-            last_run: None,
+            // "The information about the last execution of the workflow": the most
+            // recently started run this workflow holds, and nothing at all for a workflow
+            // no run has been started of. The nested run carries no graph of its own —
+            // `IncludeGraph` asks for the WORKFLOW's graph, which is reported beside it.
+            last_run: self.runs.last().map(|run| run.to_workflow_run(false)),
             graph: include_graph.then(workflow_graph),
             max_concurrent_runs: self.max_concurrent_runs,
             // "The details of the blueprint that this particular workflow is created
             // from": a workflow `CreateWorkflow` registered was created from none.
             blueprint_details: None,
+        }
+    }
+}
+
+/// The `WorkflowRunStatus` a run is in the instant `StartWorkflowRun` returns. One of the
+/// modelled `WorkflowRunStatus` values (`RUNNING`, `COMPLETED`, `STOPPING`, `STOPPED`,
+/// `ERROR`).
+pub const WORKFLOW_RUN_STATUS_RUNNING: &str = "RUNNING";
+
+/// The `WorkflowRunStatus` of a run that finished having errored. See
+/// [`WORKFLOW_RUN_STATUS_RUNNING`].
+pub const WORKFLOW_RUN_STATUS_ERROR: &str = "ERROR";
+
+/// The `WorkflowRunStatus` values a run never moves out of again: of the modelled enum
+/// quoted on [`WORKFLOW_RUN_STATUS_RUNNING`], the ones that name a finished run. The other
+/// two (`RUNNING`, `STOPPING`) each still owe a further status.
+pub const TERMINAL_WORKFLOW_RUN_STATUSES: [&str; 3] =
+    ["COMPLETED", "STOPPED", WORKFLOW_RUN_STATUS_ERROR];
+
+/// How long a workflow run stays in the status the call that started it put it in before
+/// the clock owes it the next one.
+///
+/// CHOSEN, not documented: Glue publishes no duration for a workflow run, so this is the
+/// emulator's own span — deliberately not zero, so a caller that polls `GetWorkflowRun`
+/// straight after `StartWorkflowRun` still observes the run in flight, and the concurrency
+/// ceiling that goes with it. The due instant is stored on the run and materialised by
+/// whichever later call reads it; nothing sleeps.
+pub const WORKFLOW_RUN_SETTLES_AFTER: Duration = Duration::from_millis(500);
+
+/// `WorkflowRun$ErrorMessage` for the terminal status the clock owes every run.
+///
+/// This emulator is the Glue control plane: it records a workflow run faithfully, but
+/// nothing here runs the jobs and crawlers the workflow's triggers initiate, so a run can
+/// never reach `COMPLETED` — it comes to rest in the modelled error status carrying a
+/// reason that says exactly that, rather than reporting a result nothing computed.
+pub const WORKFLOW_RUN_NOT_EXECUTED_MESSAGE: &str =
+    "This emulator records workflow runs but runs no job or crawler, so the workflow run \
+     ended without any action being executed.";
+
+/// The prefix a Glue workflow run id carries, which is what makes an `IdString`
+/// recognisable as a workflow run id rather than any other id the service mints.
+pub const WORKFLOW_RUN_ID_PREFIX: &str = "wr_";
+
+/// How many runs one workflow keeps.
+///
+/// CHOSEN: Glue publishes no retention for workflow-run records, so this is the emulator's
+/// own window, for the reason [`MAX_RUNS_PER_JOB`] gives. The OLDEST record is dropped
+/// first, so the runs a caller is most likely to read are kept.
+pub const MAX_RUNS_PER_WORKFLOW: usize = 100;
+
+/// How many workflow run ids this process has minted. A nonce source for
+/// [`new_workflow_run_id`], exactly as [`MINTED_JOB_RUN_IDS`] is for a job run id.
+static MINTED_WORKFLOW_RUN_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// How many 64-bit words a Glue workflow run id carries: four, i.e. 256 bits rendered as
+/// 64 lowercase hexadecimal characters.
+const WORKFLOW_RUN_ID_WORDS: usize = 4;
+
+/// A fresh `RunId`: the id the service assigns a workflow run when it starts.
+///
+/// [`WORKFLOW_RUN_ID_PREFIX`] followed by 64 lowercase hexadecimal characters, which is
+/// inside `IdString`'s `length 1..255`. The bits come from [`mint_hex_id`], as a job run
+/// id's do, so two runs started in the same nanosecond cannot be given the same id. It is
+/// stored on the run, so every later read of that run reports the same id.
+///
+/// This names a RESOURCE, not a credential: a credential would come from the credential
+/// store, never from here.
+pub fn new_workflow_run_id() -> String {
+    format!(
+        "{WORKFLOW_RUN_ID_PREFIX}{}",
+        mint_hex_id(&MINTED_WORKFLOW_RUN_IDS, WORKFLOW_RUN_ID_WORDS)
+    )
+}
+
+/// One run of a workflow, as `StartWorkflowRun` recorded it: "A workflow run is an
+/// execution of a workflow providing all the runtime information" (`WorkflowRun`).
+#[derive(Debug, Clone)]
+pub struct WorkflowRunEntry {
+    /// `WorkflowRun$WorkflowRunId`, minted by [`new_workflow_run_id`].
+    pub id: String,
+    /// `WorkflowRun$Name`: "Name of the workflow that was run."
+    pub workflow_name: String,
+    /// `WorkflowRun$WorkflowRunProperties`: "The workflow run properties which were set
+    /// during the run" — the workflow's own `DefaultRunProperties` ("to be used as part of
+    /// each execution of the workflow") with the start's `RunProperties` applied over them.
+    pub run_properties: HashMap<String, String>,
+    /// Server-set: the instant `StartWorkflowRun` recorded this run.
+    pub started_on: SystemTime,
+    /// Server-set once the run reaches a terminal status, and absent until then.
+    pub completed_on: Option<SystemTime>,
+    /// One of the modelled `WorkflowRunStatus` values.
+    pub status: String,
+    /// The instant the clock owes this run its next status; `None` once it has settled.
+    pub settles_at: Option<SystemTime>,
+    /// The `WorkflowRunStatus` the clock owes this run at [`Self::settles_at`].
+    pub settles_to: String,
+    /// `WorkflowRun$ErrorMessage`, which a run carries only once something has gone wrong
+    /// with it.
+    pub error_message: Option<String>,
+    /// `WorkflowRunStatistics$TotalActions`: "Total number of Actions in the workflow run",
+    /// which are the actions the trigger that began the run initiates.
+    pub total_actions: i32,
+}
+
+impl WorkflowRunEntry {
+    /// Record a run of `workflow` as the `StartWorkflowRun` request asks for it, in
+    /// [`WORKFLOW_RUN_STATUS_RUNNING`] with its next status due
+    /// [`WORKFLOW_RUN_SETTLES_AFTER`] out.
+    ///
+    /// `total_actions` is how many actions the trigger that began this run initiates, which
+    /// is the run's total action count.
+    pub fn start(
+        workflow: &WorkflowEntry,
+        input: &StartWorkflowRunInput,
+        id: String,
+        now: SystemTime,
+        total_actions: i32,
+    ) -> Self {
+        // "A collection of properties to be used as part of each execution of the
+        // workflow" is the base every run starts from, and "the workflow run properties
+        // for the new workflow run" (`StartWorkflowRunRequest$RunProperties`) are this
+        // run's own, so they win where both name a key.
+        let mut run_properties = workflow.default_run_properties.clone().unwrap_or_default();
+        if let Some(requested) = input.run_properties.as_ref() {
+            run_properties.extend(
+                requested
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone())),
+            );
+        }
+
+        Self {
+            id,
+            workflow_name: workflow.name.clone(),
+            run_properties,
+            started_on: now,
+            completed_on: None,
+            status: WORKFLOW_RUN_STATUS_RUNNING.to_string(),
+            settles_at: Some(
+                now.checked_add(WORKFLOW_RUN_SETTLES_AFTER)
+                    .unwrap_or(now),
+            ),
+            // Nothing here runs the actions the workflow's triggers initiate, so the
+            // status the clock owes a run that nobody stops is the modelled error status.
+            settles_to: WORKFLOW_RUN_STATUS_ERROR.to_string(),
+            // Nothing has gone wrong yet: a run carries an error message only once it has.
+            error_message: None,
+            total_actions,
+        }
+    }
+
+    /// Whether this run has finished, by [`TERMINAL_WORKFLOW_RUN_STATUSES`].
+    pub fn is_terminal(&self) -> bool {
+        TERMINAL_WORKFLOW_RUN_STATUSES.contains(&self.status.as_str())
+    }
+
+    /// Move this run into the status the clock owed it at `now`, if it owed one.
+    ///
+    /// The run was due to leave the status a call put it in at [`Self::settles_at`] whether
+    /// or not anybody called, and the instants recorded are that DUE instant, not the
+    /// instant somebody read it — so two reads of a settled run report the same run.
+    pub fn settle_if_due(&mut self, now: SystemTime) {
+        let Some(due) = self.settles_at else {
+            return;
+        };
+        if due > now {
+            return;
+        }
+        self.settles_at = None;
+        self.status = self.settles_to.clone();
+        // "This error message describes any error that may have occurred in starting the
+        // workflow run": the run that comes to rest in the error status carries the reason
+        // nothing executed, while one a stop brought to rest errored at nothing.
+        if self.status == WORKFLOW_RUN_STATUS_ERROR {
+            self.error_message = Some(WORKFLOW_RUN_NOT_EXECUTED_MESSAGE.to_string());
+        }
+        if self.is_terminal() {
+            self.completed_on = Some(due);
+        }
+    }
+
+    /// Rebuild the modelled `WorkflowRun` shape from what is stored.
+    ///
+    /// `include_graph` is the reader's own `IncludeGraph` ("Specifies whether to include
+    /// the workflow graph in response or not"), handled as a workflow read handles it.
+    pub fn to_workflow_run(&self, include_graph: bool) -> WorkflowRun {
+        WorkflowRun {
+            name: Some(self.workflow_name.clone()),
+            workflow_run_id: Some(self.id.clone()),
+            // "The ID of the previous workflow run": a run a start began follows no run,
+            // so there is none to report.
+            previous_run_id: None,
+            workflow_run_properties: Some(self.run_properties.clone()),
+            started_on: Some(to_date_time(self.started_on)),
+            completed_on: self.completed_on.map(to_date_time),
+            status: Some(self.status.clone()),
+            error_message: self.error_message.clone(),
+            statistics: Some(self.statistics()),
+            graph: include_graph.then(workflow_graph),
+            // "The batch condition that started the workflow run": only an EVENT trigger's
+            // batch condition starts a run, and a start a caller made carries none.
+            starting_event_batch_condition: None,
+        }
+    }
+
+    /// `WorkflowRun$Statistics`: "Workflow run statistics provides statistics about the
+    /// workflow run."
+    ///
+    /// Every count but the total is the model's own default of 0: nothing here executes an
+    /// action, so no action of this run has succeeded, failed, timed out, stopped, errored,
+    /// or is running or waiting. The total is the number of actions the trigger that began
+    /// the run initiates.
+    fn statistics(&self) -> WorkflowRunStatistics {
+        WorkflowRunStatistics {
+            total_actions: self.total_actions,
+            ..WorkflowRunStatistics::default()
         }
     }
 }
