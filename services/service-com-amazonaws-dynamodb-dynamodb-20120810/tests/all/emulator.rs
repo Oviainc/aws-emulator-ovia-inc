@@ -131,6 +131,42 @@ pub async fn ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Va
     parsed
 }
 
+/// How long a poll for the documented `CREATING` -> `ACTIVE` transition may take before
+/// a suite calls it a hang. Generous slack over the emulator's own transition span: a
+/// loaded machine is not a defect, and the point of the bound is that the wait ENDS,
+/// which is what a client's `table_exists` waiter needs.
+pub const ACTIVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long [`describe_when_active`] sleeps between `DescribeTable` calls.
+pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Poll `DescribeTable` until the table reports `ACTIVE`, answering the `Table`
+/// description it reported then — the waiter loop a client runs after a `CreateTable`,
+/// shared by every suite that needs a table ready before it drives one.
+///
+/// Every poll must answer 200: "You can use the DescribeTable action to check the table
+/// status", so a table an accepted create registered is never missing. The wait is
+/// bounded, and a table that never settles panics naming the last description it gave
+/// rather than hanging. `case` names the row the assertions belong to.
+pub async fn describe_when_active(router: &MultiServiceRouter, case: &str, name: &str) -> Value {
+    let started = std::time::Instant::now();
+    let mut last = Value::Null;
+    while started.elapsed() < ACTIVE_DEADLINE {
+        let (status, body) = call(router, "DescribeTable", json!({"TableName": name})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeTable must resolve a table the create accepted, got {status} \
+             with {body}"
+        );
+        if body["Table"]["TableStatus"] == json!("ACTIVE") {
+            return body["Table"].clone();
+        }
+        last = body;
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    panic!("case {case:?}: the table never reached ACTIVE within {ACTIVE_DEADLINE:?}, last {last}")
+}
+
 /// Every record a table's stream holds, read from its trim horizon through the STREAMS
 /// surface — the loop a change-data-capture consumer runs, shared by every suite that
 /// reads a change feed. `case` names the row the assertions below belong to.
