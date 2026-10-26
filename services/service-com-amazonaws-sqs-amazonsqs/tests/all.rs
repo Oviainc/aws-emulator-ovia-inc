@@ -21,6 +21,8 @@ mod fifo_queue;
 mod fifo_receive_idempotency;
 #[path = "all/list_message_move_tasks.rs"]
 mod list_message_move_tasks;
+#[path = "all/message_attribute_rules.rs"]
+mod message_attribute_rules;
 #[path = "all/message_lifecycle.rs"]
 mod message_lifecycle;
 #[path = "all/message_move_task.rs"]

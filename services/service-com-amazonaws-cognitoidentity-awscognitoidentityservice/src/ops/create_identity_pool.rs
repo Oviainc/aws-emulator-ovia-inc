@@ -191,6 +191,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Authorization comes first: the pool whose id this call mints is not named yet, so
+        // the decision is taken against the account's identity pools in the region the
+        // request is signed for — and nothing is stored when it refuses.
+        if let Some(denied) =
+            crate::state::authorization::denied(&*self.engine, ctx, Self::NAME, None)
+        {
+            return Err(denied);
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateIdentityPoolErrorModeled::InternalErrorException(
                 InternalErrorException {

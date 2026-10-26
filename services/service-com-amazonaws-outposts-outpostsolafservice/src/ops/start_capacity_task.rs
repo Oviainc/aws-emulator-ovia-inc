@@ -15,23 +15,24 @@
 //! ([`crate::state::MAX_RESOURCES`]): a completed task is never released, so the store
 //! this operation grows needs a bound.
 //!
-//! One input class answers the scaffold's 501 and nothing else does: a DRY RUN. Its
-//! result is a verdict on the Outpost's available instance capacity, and this emulator
-//! models no AVAILABLE capacity to weigh a request against — `ListAssets` reports the
-//! hardware an Outpost holds and `GetOutpostSupportedInstanceTypes` what that hardware
-//! can run, but nothing tracks what of its capacity is in USE
-//! (`GetOutpostInstanceTypes` is still a scaffold stub with an issue of its own) — so it
-//! cannot judge one; and a dry run must
-//! change nothing, so it cannot answer with a persisted task either. A 501 says "nobody
-//! has written this yet", which is exactly true of the capacity model a dry run needs.
+//! One input class creates no task at all: a DRY RUN. "Requesting a dry run does not
+//! make any changes to your plan", so such a call is answered from a projection of
+//! the request that nothing is stored for, carrying the verdict the dry run asks for
+//! — whether the requested pools are above or below the instance capacity available
+//! to the hardware they would configure, which
+//! [`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::capacity_verdict`]
+//! weighs off what is persisted: the vCPU ceiling of that hardware and the instances
+//! running on it that the task could not stop. It reports no `CapacityTaskId`,
+//! because no task was created for one to name, and a terminal `CapacityTaskStatus`,
+//! because the verdict leaves nothing for the clock to advance.
 //!
 //! A dry run is still a request about resources, though, so the resolution above runs
-//! FIRST and only the capacity verdict is unimplemented: an `OutpostIdentifier`, an
-//! `OrderId` or an `AssetId` that resolves to nothing is the same modelled
-//! `NotFoundException` a real start is refused with, because which resources a request
-//! names either exist or they do not whatever work it then asks for. The one-active-task
-//! rule and the store's entry ceiling, by contrast, are about a task being CREATED, and
-//! a dry run creates none — so neither is applied to one.
+//! FIRST: an `OutpostIdentifier`, an `OrderId` or an `AssetId` that resolves to
+//! nothing is the same modelled `NotFoundException` a real start is refused with,
+//! because which resources a request names either exist or they do not whatever work
+//! it then asks for. The one-active-task rule and the store's entry ceiling, by
+//! contrast, are about a task being CREATED, and a dry run creates none — so neither
+//! is applied to one.
 //!
 //! ## Shape of an operation
 //!
@@ -298,20 +299,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         // A dry run reports whether the requested pools are above or below the
-        // Outpost's AVAILABLE instance capacity, and changes nothing. This emulator
-        // models no installed capacity to weigh them against, so it can neither
-        // judge the request nor answer it with a persisted task: see this module's
-        // header for why that is the scaffold's 501 rather than a made-up verdict.
+        // instance capacity available to them, and changes nothing: "requesting a dry
+        // run does not make any changes to your plan". Both figures that verdict
+        // compares are already persisted — the vCPU ceiling of the hardware the
+        // configuration is asked of, and the instances running on it — so the answer
+        // follows from the store ([`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::capacity_verdict`])
+        // and nothing is written for it.
         //
         // It is answered HERE — after every resource the request names has been
         // resolved, and before anything is read of the tasks already stored or
-        // written to them — so the only thing a dry run is answered 501 for is the
-        // capacity verdict itself, and nothing a dry run touches changes what a
-        // later caller sees.
+        // written to them — so the rules about a task being CREATED (one active task
+        // per Outpost and per order, the store's entry ceiling) are not applied to a
+        // call that creates none, and nothing a dry run touches changes what a later
+        // caller sees.
         if input.dry_run {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "StartCapacityTask with DryRun set",
-            ));
+            let verdict = store.capacity_verdict(
+                &region,
+                &outpost_id,
+                asset_id.as_deref(),
+                &input.instance_pools,
+                input.instances_to_exclude.as_ref(),
+            );
+            // The dry run was requested and answered at this one instant, and it
+            // leaves nothing to do: the verdict is a terminal status, so the clock
+            // owes it no transition.
+            let now = std::time::SystemTime::now();
+            return Ok(StartCapacityTaskOutput {
+                // No task was created, so there is no `CapacityTaskId` to report: an
+                // id here would name a task `GetCapacityTask` could not answer.
+                capacity_task_id: None,
+                outpost_id: Some(outpost_id),
+                order_id,
+                asset_id,
+                // The plan the verdict is about, and the two members that say how it
+                // was to be run, reported back as the caller sent them.
+                requested_instance_pools: Some(input.instance_pools),
+                instances_to_exclude: input.instances_to_exclude,
+                task_action_on_blocking_instances: crate::state::non_empty(
+                    input.task_action_on_blocking_instances,
+                ),
+                // "Results of the dry run showing if the specified capacity task is
+                // above or below the available instance capacity": the call was a dry
+                // run, and this is its verdict.
+                dry_run: true,
+                capacity_task_status: Some(verdict.status.to_string()),
+                failed: verdict.failed,
+                creation_date: Some(::aws_smithy_types::DateTime::from(now)),
+                // "Date that the specified capacity task ran successfully", so only
+                // the verdict that found the configuration runnable carries one.
+                completion_date: (verdict.status == crate::state::CAPACITY_TASK_COMPLETED)
+                    .then(|| ::aws_smithy_types::DateTime::from(now)),
+                last_modified_date: Some(::aws_smithy_types::DateTime::from(now)),
+            });
         }
 
         // Materialise what the clock already owed before judging whether another

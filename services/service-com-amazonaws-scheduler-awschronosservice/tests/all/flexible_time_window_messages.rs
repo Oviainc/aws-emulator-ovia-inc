@@ -20,7 +20,7 @@
 //! operation that addresses one by name and whether the group was named or left
 //! implicit.
 
-use crate::wire_harness::{call, error_code, scheduler_router};
+use crate::wire_harness::{call, error_code, error_message, scheduler_router};
 
 /// One row: the `FlexibleTimeWindow` sent, and the whole message expected back.
 struct WindowCase {
@@ -93,16 +93,6 @@ fn window_cases() -> Vec<WindowCase> {
             message: None,
         },
     ]
-}
-
-/// The `Message` a restJson1 error carries, or an empty string when it carries
-/// none.
-fn error_message(body: &serde_json::Value) -> String {
-    body.get("Message")
-        .or_else(|| body.get("message"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_string()
 }
 
 #[tokio::test]

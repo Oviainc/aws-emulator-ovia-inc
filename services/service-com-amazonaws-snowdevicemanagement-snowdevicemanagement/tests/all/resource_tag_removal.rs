@@ -493,8 +493,10 @@ async fn untag_resource_touches_only_the_record_its_arn_names() {
         "case {case:?}: the device must still report no tags, got {described}"
     );
 
-    // The ARN's region is not part of the key: the inventory and the task store are
-    // per-account, so a device ARN naming another region addresses the same record.
+    // The ARN's Region is part of what it addresses: a record of this service belongs to
+    // one Region and is invisible in every other, so a device ARN naming another Region
+    // addresses no record this endpoint serves and removes nothing (the whole rule is
+    // `tagging_region_scope.rs`).
     let case = "a device ARN naming another region of this account";
     let other_region = arn(
         ARN_SERVICE,
@@ -502,7 +504,12 @@ async fn untag_resource_touches_only_the_record_its_arn_names() {
         ACCOUNT,
         &format!("managed-device/{device_id}"),
     );
-    assert_removed(&untag_resource(&router, &other_region, &["owner"]).await, case);
+    assert_refused(
+        &untag_resource(&router, &other_region, &["owner"]).await,
+        404,
+        "NotFoundException",
+        case,
+    );
 }
 
 /// Rule 2, the malformed half: a `resourceArn` that is not an ARN of this service

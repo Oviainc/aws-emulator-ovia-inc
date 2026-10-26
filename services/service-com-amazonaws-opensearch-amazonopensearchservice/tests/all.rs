@@ -51,6 +51,8 @@ mod package_association_listings;
 mod package_associations;
 #[path = "all/package_registry.rs"]
 mod package_registry;
+#[path = "all/package_scope.rs"]
+mod package_scope;
 #[path = "all/reserved_instance_offerings.rs"]
 mod reserved_instance_offerings;
 #[path = "all/reserved_instances.rs"]

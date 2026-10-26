@@ -15,7 +15,9 @@
 //! orderable-instance-type catalog and the catalog of orderable hardware
 //! configurations this service publishes, the hardware an Outpost of a given form
 //! factor is installed with, the instance types an Outpost's EC2 capacity is
-//! configured with, pricing a renewal of the subscription an
+//! configured with, weighing a requested capacity configuration against the instance
+//! capacity available to the hardware it is asked of, pricing a renewal of the
+//! subscription an
 //! Outpost's orders hold and recording the contract a renewal of it is bought
 //! under, and
 //! the two rules this service words its refusals by — the `NotFoundException`
@@ -505,20 +507,34 @@ pub const CAPACITY_TASK_TERMINAL: &[&str] = &[
     CAPACITY_TASK_CANCELLED,
 ];
 
-// The `CapacityTaskStatus` values a task this emulator started never reaches, and
+// The `CapacityTaskStatus` values a task this emulator STARTS never reaches, and
 // why, stated once so no handler invents one:
 //
 // * `WAITING_FOR_EVACUATION` and the `CapacityTaskFailure` type
 //   `BLOCKING_INSTANCES_NOT_EVACUATED` describe a task held up by running EC2
-//   instances. Whether a task is held up is a judgement about the Outpost's
-//   INSTALLED instance capacity, which this emulator does not model — the same
-//   reason `StartCapacityTask` answers a dry run 501 — so a task it starts runs on
-//   the clock and never waits. Which instances would have to stop is reported by
-//   `ListBlockingInstancesForCapacityTask`, off [`OutpostRecord::instances`].
-// * `FAILED` needs a failure something produced; nothing in this slice can fail a
-//   task, so `Failed` stays absent rather than carrying an invented reason.
+//   instances. Nothing in this slice stops an instance, so a task it starts runs on
+//   the clock and never waits for one to be evacuated. Which instances would have to
+//   stop is reported by `ListBlockingInstancesForCapacityTask`, off
+//   [`OutpostRecord::instances`].
+// * `FAILED` needs a failure something produced; nothing fails a task it has
+//   started, so `Failed` stays absent rather than carrying an invented reason. The
+//   one verdict this service does reach is the DRY RUN's, which is not a task at all
+//   ([`ComAmazonawsOutpostsOutpostsolafserviceState::capacity_verdict`]).
 // * `CANCELLATION_IN_PROGRESS` and `CANCELLED` belong to `CancelCapacityTask`,
 //   which is still a scaffold stub.
+
+/// The `CapacityTaskFailureType` of a capacity configuration the hardware it is
+/// asked of cannot be configured with, from the modelled value set
+/// [`crate::ops::types::CAPACITY_TASK_FAILURE_TYPE_VALUES`].
+///
+/// It is the failure type a request for more instance capacity than the hardware has
+/// available carries: what the request asks for is not a configuration that hardware
+/// can hold. The other four values the enum declares each describe something
+/// happening to a task while it runs — a host in an unexpected state, instances that
+/// were not evacuated, an internal error, a resource that went away — which is not
+/// what weighing a plan against installed capacity answers.
+pub const CAPACITY_TASK_FAILURE_UNSUPPORTED_CONFIGURATION: &str =
+    "UNSUPPORTED_CAPACITY_CONFIGURATION";
 
 /// How long after the call that started it each step of a capacity task's
 /// `REQUESTED` -> `IN_PROGRESS` -> `COMPLETED` progression falls due.
@@ -648,6 +664,176 @@ macro_rules! capacity_task_projection {
             task_action_on_blocking_instances: record.task_action_on_blocking_instances.clone(),
         }
     }};
+}
+
+/// What weighing a requested capacity configuration against the instance capacity
+/// available to it answers: the `CapacityTaskStatus` the verdict is reported as, and
+/// why the configuration cannot be run when it cannot.
+///
+/// Produced by
+/// [`ComAmazonawsOutpostsOutpostsolafserviceState::capacity_verdict`], which states
+/// the rule; this carries the two members a report of it fills
+/// (`CapacityTaskStatus` and `Failed`), so the status and the failure can never
+/// disagree about whether the configuration fits.
+#[derive(Debug, Clone)]
+pub struct CapacityVerdict {
+    /// The modelled `CapacityTaskStatus` the verdict is reported as:
+    /// [`CAPACITY_TASK_COMPLETED`] for a configuration the hardware can take,
+    /// [`CAPACITY_TASK_FAILED`] for one it cannot.
+    pub status: &'static str,
+    /// Why the configuration cannot be run, for a verdict that failed, and `None`
+    /// for one that did not — exactly as `Failed` is reported.
+    pub failed: Option<CapacityTaskFailure>,
+}
+
+impl CapacityVerdict {
+    /// The verdict on a configuration the hardware it was asked of cannot take: the
+    /// modelled [`CAPACITY_TASK_FAILURE_UNSUPPORTED_CONFIGURATION`] failure, worded
+    /// by `reason`.
+    fn unsupported(reason: String) -> Self {
+        Self {
+            status: CAPACITY_TASK_FAILED,
+            failed: Some(CapacityTaskFailure {
+                reason,
+                r#type: Some(CAPACITY_TASK_FAILURE_UNSUPPORTED_CONFIGURATION.to_string()),
+            }),
+        }
+    }
+
+    /// The verdict on a configuration the hardware can take: no failure at all.
+    fn fits() -> Self {
+        Self {
+            status: CAPACITY_TASK_COMPLETED,
+            failed: None,
+        }
+    }
+}
+
+/// The longest `CapacityTaskFailure$Reason` the model accepts
+/// (`CapacityTaskStatusReason`, `length(min: 0, max: 128)`), which every reason this
+/// service words fits by construction.
+pub const CAPACITY_TASK_STATUS_REASON_MAX: usize = 128;
+
+/// The instance FAMILY of an EC2 instance type: the part before the size, which is
+/// what `ComputeAttributes$InstanceFamilies` names, or `None` for a value carrying no
+/// size at all.
+pub fn instance_type_family(instance_type: &str) -> Option<&str> {
+    instance_type.split_once('.').map(|(family, _)| family)
+}
+
+/// Whether compute hardware that recorded `compute` RUNS an instance type of
+/// `family` whose default size is `vcpus` vCPUs.
+///
+/// Two facts a `ComputeAttributes` records answer this, and one it did not record
+/// narrows nothing — the emulator does not claim hardware is limited by a figure
+/// nobody recorded:
+///
+/// * `InstanceFamilies`, the instance families the compute asset supports, so an
+///   instance type of another family is not one that hardware runs;
+/// * `MaxVcpus`, "the maximum number of vCPUs possible for the specified asset", so
+///   an instance type larger than that ceiling does not fit on it.
+///
+/// Stated once here because two reports ask it: which instance types one asset of an
+/// Outpost supports (`GetOutpostSupportedInstanceTypes`), and whether the pools a
+/// capacity task requests name a configuration the hardware in its scope can hold
+/// ([`ComAmazonawsOutpostsOutpostsolafserviceState::capacity_verdict`]).
+pub fn compute_runs(compute: &ComputeAttributes, family: Option<&str>, vcpus: Option<i32>) -> bool {
+    let in_recorded_family = match compute.instance_families.as_deref() {
+        Some(families) if !families.is_empty() => {
+            family.is_some_and(|family| families.iter().any(|recorded| recorded == family))
+        }
+        _ => true,
+    };
+    let within_vcpu_ceiling = compute
+        .max_vcpus
+        .is_none_or(|max| vcpus.is_none_or(|vcpus| vcpus <= max));
+    in_recorded_family && within_vcpu_ceiling
+}
+
+/// Whether a capacity task that excludes `exclude` would need `instance` STOPPED —
+/// so the capacity that instance holds is capacity the task can free.
+///
+/// Two conditions, both from what AWS documents for the list of a task's blocking
+/// instances:
+///
+/// * it belongs to "the account that initiated the capacity task". A capacity task is
+///   started by the caller of `StartCapacityTask`, and every request this emulator
+///   serves is the one emulator account's (`engine::emulator_account_id`, the account
+///   id `Outpost$OwnerId` and `Site$AccountId` carry), so that is the account a task
+///   was initiated by. An instance recorded as another account's — one the Outpost is
+///   shared with — is on the Outpost but not this caller's to stop. An instance whose
+///   owning account was never recorded matches no account, so it is not one either.
+/// * the task does not exclude it. `InstancesToExclude` is "user-specified instances
+///   that must not be stopped. These instances will not appear in the list of
+///   instances that Amazon Web Services recommends to stop in order to free up
+///   capacity" — so an excluded instance is one the task cannot stop, however it was
+///   named.
+///
+/// Stated once here because two rules read it: which instances
+/// `ListBlockingInstancesForCapacityTask` recommends stopping, and how much of the
+/// hardware's capacity a task could have
+/// ([`ComAmazonawsOutpostsOutpostsolafserviceState::capacity_verdict`]).
+pub fn instance_can_be_stopped(instance: &AssetInstance, exclude: &ExcludedInstances<'_>) -> bool {
+    instance.account_id.as_deref() == Some(::engine::emulator_account_id())
+        && !exclude.names(instance)
+}
+
+/// The instances a capacity task must not stop, read off the modelled
+/// `InstancesToExclude` ONCE so that asking about one instance is a lookup rather
+/// than a walk of what the caller sent.
+///
+/// Both callers of [`instance_can_be_stopped`] ask about every instance recorded for
+/// an Outpost, so reading the caller's lists per instance would cost the product of
+/// the two; built once, the work a request causes is its own length plus a lookup per
+/// recorded instance.
+#[derive(Debug, Default)]
+pub struct ExcludedInstances<'a> {
+    /// `InstancesToExclude$Instances`: the instance ids that must not be stopped.
+    instances: BTreeSet<&'a str>,
+    /// `InstancesToExclude$AccountIds`: "IDs of the accounts that own each instance
+    /// that must not be stopped".
+    account_ids: BTreeSet<&'a str>,
+    /// `InstancesToExclude$Services`: "names of the services that own each instance
+    /// that must not be stopped".
+    services: BTreeSet<&'a str>,
+}
+
+impl<'a> ExcludedInstances<'a> {
+    /// What `exclude` names, as the three sets above. A member the request never
+    /// carried names nothing, exactly as an empty one does.
+    pub fn of(exclude: Option<&'a InstancesToExclude>) -> Self {
+        let set = |values: &'a Option<Vec<String>>| -> BTreeSet<&'a str> {
+            values
+                .iter()
+                .flatten()
+                .map(std::string::String::as_str)
+                .collect()
+        };
+        match exclude {
+            Some(exclude) => Self {
+                instances: set(&exclude.instances),
+                account_ids: set(&exclude.account_ids),
+                services: set(&exclude.services),
+            },
+            None => Self::default(),
+        }
+    }
+
+    /// Whether these exclusions name `instance` through ANY of the three sub-lists.
+    ///
+    /// The model gives `InstancesToExclude` three of them, each naming instances that
+    /// must not be stopped by a different attribute: by instance id, by owning account
+    /// and by owning service. They are alternatives, so an instance any one of them
+    /// names is excluded; a sub-list that is absent (or empty) excludes nothing, and a
+    /// member an instance has no recorded value for is named by no list.
+    fn names(&self, instance: &AssetInstance) -> bool {
+        let named = |excluded: &BTreeSet<&str>, value: Option<&String>| {
+            value.is_some_and(|value| excluded.contains(value.as_str()))
+        };
+        named(&self.instances, instance.instance_id.as_ref())
+            || named(&self.account_ids, instance.account_id.as_ref())
+            || named(&self.services, instance.aws_service_name.as_ref())
+    }
 }
 
 /// A persisted quote: the modelled [`Quote`] plus its creation order.
@@ -2367,6 +2553,139 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
             .sum()
     }
 
+    /// The verdict on the capacity configuration `pools` asks of the Outpost
+    /// `outpost_id` names in `region`, scoped to the asset `asset_id` names when the
+    /// request named one: whether what it asks for is at or above the instance
+    /// capacity available to it.
+    ///
+    /// "You can request a dry run to determine if the instance type and instance size
+    /// changes is above or below available instance capacity", as the modelled
+    /// `DryRun` documents it, so the verdict compares two figures this store already
+    /// holds, both in the vCPUs every instance-capacity figure of this service is
+    /// published in ([`Self::published_vcpus`]):
+    ///
+    /// * what the configuration ASKS FOR: each pool's `Count` ("the number of
+    ///   instances for the specified instance type") times the default vCPUs the
+    ///   catalog publishes for its instance type.
+    /// * what is AVAILABLE on the hardware in scope — the one asset the request
+    ///   names, or every compute asset of the Outpost when it names none, because a
+    ///   capacity task configures the hardware it names. That is the vCPU ceiling of
+    ///   that hardware (`ComputeAttributes$MaxVcpus`) less the vCPUs held by the
+    ///   instances running on it that the task could not stop: an instance the
+    ///   request excludes must not be stopped and one belonging to another account is
+    ///   not this caller's to stop ([`instance_can_be_stopped`]), so neither one's
+    ///   capacity can be freed, while the instances it may stop hold capacity it can
+    ///   have.
+    ///
+    /// A configuration at or below what is available is one the hardware can take
+    /// ([`CapacityVerdict::fits`]). One ABOVE it, and one naming an instance type
+    /// none of the hardware in scope runs ([`compute_runs`]) or this service
+    /// publishes no vCPU figure for, is the modelled unsupported-configuration
+    /// failure. Hardware that recorded nothing about its capacity carries none and
+    /// hardware that is not there carries none either, so an Outpost holding no
+    /// compute asset can take no pool: a request is weighed against what is
+    /// persisted, never against a figure the emulator invents.
+    ///
+    /// A READ: it computes the verdict and writes nothing, which is what lets a dry
+    /// run — the one call that asks for it — leave the store exactly as it found it.
+    ///
+    /// What it COSTS is proportional to the request it was given and nothing else: the
+    /// published catalog is read into one lookup and the hardware in scope into one
+    /// list before any pool is weighed, and whether that hardware runs a given
+    /// instance type is decided once per DISTINCT type the catalog publishes — so a
+    /// pool costs a lookup and an addition however many pools arrive, and no figure
+    /// here multiplies the length of the request by anything that grows.
+    pub fn capacity_verdict(
+        &self,
+        region: &str,
+        outpost_id: &str,
+        asset_id: Option<&str>,
+        pools: &[InstanceTypeCapacity],
+        instances_to_exclude: Option<&InstancesToExclude>,
+    ) -> CapacityVerdict {
+        let record = self.outpost(region, outpost_id);
+        // Which hardware the configuration is asked of: the asset the request named,
+        // or all of the Outpost's when it named none. Read once, because every pool
+        // is asked of the same hardware.
+        let in_scope = |asset: Option<&str>| asset_id.is_none_or(|named| asset == Some(named));
+        let hardware: Vec<&ComputeAttributes> = record
+            .iter()
+            .flat_map(|record| record.assets.iter())
+            .filter(|asset| in_scope(asset.asset_id.as_deref()))
+            .filter_map(|asset| asset.compute_attributes.as_ref())
+            .collect();
+        // The vCPUs the catalog publishes for each instance type, as ONE lookup over
+        // the catalog this service publishes ([`Self::published_vcpus`] is the same
+        // figure, found by walking it) — so weighing a pool is a lookup rather than a
+        // walk, whatever a request carries.
+        let published: BTreeMap<&str, i32> = self
+            .orderable_instance_types
+            .iter()
+            .filter_map(|record| {
+                Some((
+                    record.instance_type.instance_type.as_deref()?,
+                    record.instance_type.vcp_us?,
+                ))
+            })
+            .collect();
+        // Which of those types the hardware in scope runs, decided the first time a
+        // pool names one: the catalog publishes finitely many types and only a
+        // published one is ever asked about, so what this holds is bounded by the
+        // catalog and not by how many pools arrived.
+        let mut runs: BTreeMap<&str, bool> = BTreeMap::new();
+
+        // What the configuration asks for, and whether the hardware could hold it at
+        // all. A pool of an instance type the catalog publishes no vCPU count for
+        // cannot be weighed — the emulator has no size for that type and never
+        // invents one — and one of a type that hardware does not run is not a
+        // configuration it can hold, whatever capacity happens to be free on it.
+        let mut requested: i64 = 0;
+        for pool in pools {
+            let instance_type = pool.instance_type.as_str();
+            let Some(&vcpus) = published.get(instance_type) else {
+                return CapacityVerdict::unsupported(instance_type_not_run(instance_type));
+            };
+            let runs_it = *runs.entry(instance_type).or_insert_with(|| {
+                hardware.iter().any(|compute| {
+                    compute_runs(compute, instance_type_family(instance_type), Some(vcpus))
+                })
+            });
+            if !runs_it {
+                return CapacityVerdict::unsupported(instance_type_not_run(instance_type));
+            }
+            // `InstanceTypeCount` is modelled `range(0..9999)`, so a count the
+            // boundary accepted is never negative. Saturating, so no length of
+            // request can carry the total past what the figure is held in.
+            requested = requested
+                .saturating_add(i64::from(vcpus).saturating_mul(i64::from(pool.count.max(0))));
+        }
+
+        // What that hardware carries: the sum of its hosts' vCPU ceilings. A host
+        // that recorded no ceiling carries no figure, and so no capacity.
+        let ceiling: i64 = hardware
+            .iter()
+            .filter_map(|compute| compute.max_vcpus)
+            .map(i64::from)
+            .sum();
+        // What of it is in use and could not be freed for this configuration. What
+        // the request excludes is read into [`ExcludedInstances`] once, so an
+        // instance costs a lookup in it rather than a walk of it.
+        let exclude = ExcludedInstances::of(instances_to_exclude);
+        let held: i64 = record
+            .iter()
+            .flat_map(|record| record.instances.iter())
+            .filter(|instance| in_scope(instance.asset_id.as_deref()))
+            .filter(|instance| !instance_can_be_stopped(instance, &exclude))
+            .filter_map(|instance| published.get(instance.instance_type.as_deref()?))
+            .map(|vcpus| i64::from(*vcpus))
+            .sum();
+        let available = (ceiling - held).max(0);
+        if requested > available {
+            return CapacityVerdict::unsupported(capacity_above_available(requested, available));
+        }
+        CapacityVerdict::fits()
+    }
+
     /// How many renewal contracts this store holds, across every Outpost of every
     /// region.
     ///
@@ -3739,6 +4058,54 @@ pub fn outpost_id_pattern_report() -> String {
 /// so the caller can poll exactly that one.
 pub fn capacity_task_conflict(resource_type: &str, resource_id: &str, active: &str) -> String {
     format!("{resource_type} {resource_id} already has an active capacity task: {active}")
+}
+
+/// How this service states that the hardware a capacity configuration was asked of
+/// does not run one of the instance types it names.
+///
+/// One of the two reasons a [`CapacityVerdict`] can fail. AWS publishes no wording
+/// for a capacity failure, so the sentence is the emulator's own; what a caller
+/// branches on is the modelled `CapacityTaskFailure$Type`
+/// ([`CAPACITY_TASK_FAILURE_UNSUPPORTED_CONFIGURATION`]), while the reason names the
+/// instance type the configuration cannot be held in, so the caller knows which pool
+/// to change.
+///
+/// The instance type is a value the REQUEST carried, and the reason is a value this
+/// service reports, so the echo of it is cut to the room the fixed wording leaves
+/// inside [`CAPACITY_TASK_STATUS_REASON_MAX`] ([`clip`]): the reason fits the
+/// modelled member whatever arrives, for any value and without a case that cannot be
+/// answered.
+pub fn instance_type_not_run(instance_type: &str) -> String {
+    const WORDING: &str = "the hardware of this capacity task does not run ";
+    let room = CAPACITY_TASK_STATUS_REASON_MAX.saturating_sub(WORDING.len());
+    format!("{WORDING}{}", clip(instance_type, room))
+}
+
+/// `value` cut to at most `max` bytes, on a character boundary.
+///
+/// Built up character by character rather than sliced, so a value of any length and
+/// any encoding is answered rather than being a case this service cannot word.
+fn clip(value: &str, max: usize) -> String {
+    let mut clipped = String::new();
+    for character in value.chars() {
+        if clipped.len() + character.len_utf8() > max {
+            break;
+        }
+        clipped.push(character);
+    }
+    clipped
+}
+
+/// How this service states that a capacity configuration asks for more instance
+/// capacity than is available to it, both figures in vCPUs.
+///
+/// The other reason a [`CapacityVerdict`] can fail, worded by the same rule
+/// [`instance_type_not_run`] is: the reason names what was asked for and what is
+/// available, which is what tells a caller how much of its plan has to go.
+pub fn capacity_above_available(requested: i64, available: i64) -> String {
+    format!(
+        "the requested capacity of {requested} vCPUs is above the {available} vCPUs available"
+    )
 }
 
 /// How this service states that an Outpost cannot be deleted while unfinished work

@@ -49,7 +49,7 @@
 //! ## Input
 //!
 //! * `ResourceArn` (TagResourceArn, len 1..1011, pattern
-//!   ^arn:aws(-[a-z]+)?:scheduler:[a-z0-9\-]+:\d{12}:schedule-group\/[0-9a-zA-Z-_.]+$)
+//!   ^arn:aws[a-z-]*:scheduler:[a-z0-9\-]+:\d{12}:schedule-group\/[0-9a-zA-Z-_.]+$)
 //!   **required** — The ARN of the EventBridge Scheduler resource for which you want to view
 //!   tags.
 //!

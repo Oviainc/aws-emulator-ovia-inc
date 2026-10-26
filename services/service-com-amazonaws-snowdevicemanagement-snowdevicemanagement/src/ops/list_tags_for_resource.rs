@@ -11,7 +11,8 @@
 //! refused with the modelled `AccessDeniedException` (403) whatever it names, with a
 //! message that names the CALLER's own principal and discloses nothing about the ARN, so
 //! a tag read cannot be used to learn what another account holds; an ARN of this account
-//! that addresses no stored device and no stored task is answered 404 `NotFoundException`.
+//! that addresses no device and no task of the Region the request was signed for is
+//! answered 404 `NotFoundException`.
 //! Everything else is a projection of the stored record's tags.
 //!
 //! ## Shape of an operation
@@ -155,9 +156,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `resourceArn` carries everything this operation addresses, so nothing here is
-        // read from the request's metadata.
-        let _ = ctx;
+        // `resourceArn` carries which resource this operation addresses, and the
+        // request's SigV4 scope carries which Region's records this endpoint serves;
+        // both are needed to resolve it.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -168,6 +169,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // The Region of the endpoint this request reached: a record of this service
+        // lives in one Region and is invisible in every other, so it is what the
+        // addressed ARN has to agree with.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // Settling is owed here too, because reading a task's tags has to see the
         // state the clock gave it.
@@ -199,10 +204,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "Returns a list of tags for a managed device or task": an ARN that parses but
-        // names no device and no task of this account is answered 404 `NotFoundException`
-        // — not the model's `ResourceNotFoundException`, which is what the device and
-        // task operations answer with — so it too comes from the error channel.
-        let Some(tags) = store.tags_of(&resource) else {
+        // names no device and no task of this endpoint's Region is answered 404
+        // `NotFoundException` — not the model's `ResourceNotFoundException`, which is
+        // what the device and task operations answer with — so it too comes from the
+        // error channel. An ARN whose Region field is another Region addresses no record
+        // here, whatever id it carries, the same way every id-addressed operation of
+        // this service resolves only within the signed Region.
+        let Some(tags) = store.tags_of(&region, &resource) else {
             return Err(crate::scaffolded::Scaffolded::not_found(
                 crate::state::TAGGING_NOT_FOUND_MESSAGE,
             ));

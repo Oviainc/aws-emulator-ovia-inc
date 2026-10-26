@@ -101,6 +101,17 @@ pub fn error_code(body: &serde_json::Value) -> String {
         .to_string()
 }
 
+/// The `Message` a restJson1 error carries, or an empty string when it carries
+/// none. The envelope spells the member `Message`; `message` is accepted too, so
+/// a suite asserts the TEXT rather than the casing.
+pub fn error_message(body: &serde_json::Value) -> String {
+    body.get("Message")
+        .or_else(|| body.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
 /// Percent-encode one URI path segment or query value, the way an SDK does: an
 /// ARN carries `:` and `/`, and `/tags/{ResourceArn}` is a single (non-greedy)
 /// label, so everything but the unreserved characters has to be encoded for the

@@ -345,9 +345,9 @@ async fn a_created_pricing_rule_reads_back_out_of_state_member_for_member() {
 /// `Fields`, and stores nothing.
 ///
 /// The rows differ along which member is missing and along the scope and the type
-/// that make it required, so every conditioned member is covered. The model states no
-/// condition that REFUSES one of these members on another combination, so this suite
-/// asserts only the direction the documentation states.
+/// that make it required, so every conditioned member is covered. The other direction
+/// of the same condition — a request NAMING a member its scope does not key on — is
+/// asserted in `pricing_rule_scope_members.rs`.
 #[tokio::test]
 async fn a_combination_missing_a_member_it_keys_on_is_refused() {
     // (case, body, expected Reason, expected member at fault)

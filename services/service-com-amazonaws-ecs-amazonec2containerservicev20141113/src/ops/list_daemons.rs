@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDaemons
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDaemons`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDaemons::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the daemons of one cluster: the records `CreateDaemon` stored, summarised and
+//! paged. A REPORTING operation — it creates and deletes nothing, so a cluster whose
+//! creates were all refused lists no daemon at all.
 //!
 //! ## Shape of an operation
 //!
@@ -169,20 +164,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDaemons` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDaemonsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDaemons"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListDaemonsErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // "This value can be between 1 and 100."
+        if let Some(max_results) = input.max_results {
+            if !(1..=crate::state::MAX_LIST_PAGE_SIZE).contains(&max_results) {
+                return Err(ListDaemonsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "maxResults must be between 1 and {}; got {max_results}",
+                            crate::state::MAX_LIST_PAGE_SIZE
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "The Amazon Resource Name (ARN) of the cluster to filter daemons by. If you do
+        // not specify a cluster, the default cluster is assumed."
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster_arn.as_deref());
+        // The filter is a caller-supplied list, so it is bounded HERE, before the set it
+        // is read into is built: the daemons of one cluster deploy onto the providers that
+        // cluster holds, which are at most this many.
+        if input
+            .capacity_provider_arns
+            .as_ref()
+            .is_some_and(|references| {
+                references.len() > crate::state::MAX_CLUSTER_CAPACITY_PROVIDERS
+            })
+        {
+            return Err(ListDaemonsErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::at_most_items_message(
+                        "capacity providers",
+                        crate::state::MAX_CLUSTER_CAPACITY_PROVIDERS,
+                    )),
+                },
+            )
+            .into());
+        }
+        // "The Amazon Resource Names (ARNs) of the capacity providers to filter daemons
+        // by": each entry is matched by the provider NAME it refers to, so naming one by
+        // ARN and by its short name filters on the same provider.
+        let wanted_providers: Option<::std::collections::HashSet<String>> =
+            input.capacity_provider_arns.as_ref().map(|references| {
+                references
+                    .iter()
+                    .map(|reference| {
+                        crate::state::capacity_provider_name_from_reference(reference)
+                    })
+                    .collect()
+            });
+
+        let mut guard = state.lock();
+        guard.advance_clock(::std::time::SystemTime::now());
+
+        if !guard.has_active_cluster(&cluster_name) {
+            return Err(ListDaemonsErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let mut matching: Vec<(String, DaemonSummary)> = guard
+            .daemons
+            .values()
+            .filter(|daemon| daemon.cluster_name == cluster_name)
+            // "Only daemons associated with the specified capacity providers are
+            // returned" — a daemon matches the filter when it deploys onto any provider
+            // the request named.
+            .filter(|daemon| {
+                wanted_providers.as_ref().is_none_or(|wanted| {
+                    daemon
+                        .capacity_provider_names
+                        .iter()
+                        .any(|name| wanted.contains(name))
+                })
+            })
+            .map(|daemon| (daemon.arn.clone(), daemon.summary()))
+            .collect();
+        // A daemon ARN is `daemon/<cluster>/<name>` and daemon names are unique within a
+        // cluster, so sorting the ARNs of ONE cluster totally orders them and gives
+        // paging a stable sequence to walk.
+        matching.sort_by(|left, right| left.0.cmp(&right.0));
+
+        // "If this parameter isn't used, then ListDaemons returns up to 100 results and a
+        // nextToken value if applicable."
+        let page_size = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(crate::state::DEFAULT_LIST_PAGE_SIZE);
+        // The token is the ARN the next page starts at — "an opaque identifier that is
+        // only used to retrieve the next items in a list" — so a page is unaffected by
+        // daemons created or deleted before it.
+        let start = match input.next_token.as_deref() {
+            Some(token) => matching.partition_point(|(arn, _)| arn.as_str() < token),
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(matching.len());
+        let daemon_summaries_list: Vec<DaemonSummary> = matching[start.min(matching.len())..end]
+            .iter()
+            .map(|(_, summary)| summary.clone())
+            .collect();
+        // The token is absent once the walk has reported every matching daemon.
+        let next_token = matching.get(end).map(|(arn, _)| arn.clone());
+
+        Ok(ListDaemonsOutput {
+            daemon_summaries_list: Some(daemon_summaries_list),
+            next_token,
+        })
     }
 }

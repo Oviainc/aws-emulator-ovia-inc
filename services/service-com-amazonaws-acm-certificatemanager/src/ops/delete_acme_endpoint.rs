@@ -209,7 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_due(now);
         // Whatever status the endpoint carries, this call removes it, and the record goes
-        // with its accounts and its domain validations
+        // with its accounts, its domain validations and its external account bindings
         // ([`crate::state::ComAmazonawsAcmCertificatemanagerState::remove_acme_endpoint`]).
         //
         // The status does not gate the delete the way it gates `UpdateAcmeEndpoint`,

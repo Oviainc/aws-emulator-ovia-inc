@@ -3482,15 +3482,30 @@ pub fn check_free_form(member: &str, value: &str) -> Result<(), String> {
 /// documents a default that branches on a request naming it.
 pub const DEFAULT_DB_SUBNET_GROUP: &str = "default";
 
-/// The message the `DBSubnetGroupNotFoundFault` carries for `name`: the fault names the
-/// group the request could not resolve, in the folded spelling the group would be stored
-/// under, in the wording Amazon RDS answers that fault with.
+/// The message the `DBSubnetGroupNotFoundFault` carries for `name` where the call only
+/// LOOKS the group UP — it reports the groups (`DescribeDBSubnetGroups`, a tag read) or
+/// it resolves a group it places another resource in (`CreateDBInstance`,
+/// `CreateDBCluster`). The fault names the group the request could not resolve, in the
+/// folded spelling the group would be stored under.
 ///
-/// It lives here because every operation that RESOLVES a `DBSubnetGroupName` — the
-/// delete, the describe and the create operations that place a resource in a group —
-/// answers the same fault, so the wording is written once rather than per handler.
+/// Amazon RDS words this one fault by the ROLE the group plays in the call, so the
+/// lookup wording lives here, next to the wording for the calls that ACT on the group
+/// ([`db_subnet_group_does_not_exist_message`]), rather than in each handler.
 pub fn db_subnet_group_not_found_message(name: &str) -> String {
     format!("DB Subnet group '{name}' not found.")
+}
+
+/// The message the `DBSubnetGroupNotFoundFault` carries for `name` where the group is
+/// the SUBJECT of the call and the call changes it — `DeleteDBSubnetGroup` and
+/// `ModifyDBSubnetGroup`, whose whole effect is on that group. RDS words the fault
+/// differently there than in a lookup ([`db_subnet_group_not_found_message`]), so a
+/// caller can tell "there is no such group to report" from "there is no such group to
+/// change"; both still answer the one modelled 404 `DBSubnetGroupNotFoundFault`.
+///
+/// Like the lookup wording it is parameterized by the requested name, in the folded
+/// spelling the group would be stored under.
+pub fn db_subnet_group_does_not_exist_message(name: &str) -> String {
+    format!("DB subnet group '{name}' does not exist.")
 }
 
 /// A stored DB subnet group: the name, the description and the EC2 subnets the request
@@ -3890,6 +3905,52 @@ pub fn check_subnet_id(subnet_id: &str) -> Result<(), String> {
         "'{subnet_id}' is not an EC2 subnet id (expected subnet- followed by 8 or 17 \
          hexadecimal characters)"
     ))
+}
+
+/// Why a `SubnetIds` list a request carries cannot make up a DB subnet group. Each
+/// variant carries the message naming the constraint it broke; the caller maps it onto
+/// the modelled fault of ITS operation, which is the one thing that differs between the
+/// operations that take such a list.
+#[derive(Debug, Clone)]
+pub enum SubnetListRejection {
+    /// More subnets than one group holds — `DBSubnetQuotaExceededFault`.
+    TooManySubnets(String),
+    /// A value that is not an EC2 subnet id at all — `InvalidSubnet`.
+    NotASubnet(String),
+    /// Fewer than two distinct subnets, so fewer than two Availability Zones can be
+    /// covered — `DBSubnetGroupDoesNotCoverEnoughAZs`.
+    NotEnoughAvailabilityZones(String),
+}
+
+/// Refuse a `SubnetIds` list a DB subnet group cannot be made of, whichever operation
+/// carries it: the published allowance for ONE group
+/// ([`MAX_SUBNETS_PER_DB_SUBNET_GROUP`]), the EC2 subnet id form
+/// ([`check_subnet_id`]), and the documented coverage requirement ("DB subnet groups
+/// must contain at least one subnet in at least two AZs in the Amazon Web Services
+/// Region" — a subnet lies in exactly ONE Availability Zone, so a group naming fewer
+/// than two DISTINCT subnets cannot cover two zones whatever those subnets are, which
+/// is all that follows from the request alone; which zones the named subnets actually
+/// lie in is an EC2 fact this service does not hold).
+pub fn check_db_subnet_group_subnets(subnet_ids: &[String]) -> Result<(), SubnetListRejection> {
+    if subnet_ids.len() > MAX_SUBNETS_PER_DB_SUBNET_GROUP {
+        return Err(SubnetListRejection::TooManySubnets(format!(
+            "the request names {} subnets: a DB subnet group holds at most {}",
+            subnet_ids.len(),
+            MAX_SUBNETS_PER_DB_SUBNET_GROUP
+        )));
+    }
+    for subnet_id in subnet_ids {
+        check_subnet_id(subnet_id).map_err(SubnetListRejection::NotASubnet)?;
+    }
+    let distinct: BTreeSet<&str> = subnet_ids.iter().map(String::as_str).collect();
+    if distinct.len() < 2 {
+        return Err(SubnetListRejection::NotEnoughAvailabilityZones(format!(
+            "the request names {} distinct subnet(s): a DB subnet group must cover at \
+             least two Availability Zones, so it must name at least two subnets",
+            distinct.len()
+        )));
+    }
+    Ok(())
 }
 
 /// The region segment of an ARN (`arn:aws:<service>:<region>:<account>:<resource>`), or

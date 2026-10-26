@@ -544,6 +544,88 @@ pub fn reconcile_pricing_rule_rate(
     Ok((modifier_percentage, None))
 }
 
+/// Whether the members a pricing rule's `Scope` keys on — and ONLY those — are the
+/// ones the request names, or the refusal the request earns.
+///
+/// A pricing rule describes exactly ONE scope, and the members outside that scope's
+/// key are not part of the rule: the model's own member documentation conditions
+/// each of them on the scope (`Service`: "If the Scope attribute is set to SERVICE or
+/// SKU, the attribute indicates which service the PricingRule is applicable for";
+/// `UsageType` / `Operation`: "If the Scope attribute is set to SKU, this attribute
+/// indicates which usage type / operation the PricingRule is modifying";
+/// `BillingEntity` is the seller a `BILLING_ENTITY` rule prices). So the condition
+/// holds in BOTH directions — a scope-keyed member has to be there, and a member the
+/// scope does not key on may not be — because a rule holding either way round
+/// describes pricing the service cannot apply. Each refusal carries the reason
+/// `ValidationExceptionReason` enumerates for that member (`ILLEGAL_SERVICE`,
+/// `ILLEGAL_USAGE_TYPE`, `ILLEGAL_OPERATION`, `ILLEGAL_BILLING_ENTITY`).
+///
+/// `Err` carries the `(reason, member, message)` of the modelled
+/// `ValidationException` the calling operation refuses the request with, exactly as
+/// [`reconcile_pricing_rule_rate`] hands back the rate refusals, so every path that
+/// sets a rule's scope judges it the same way.
+pub fn check_pricing_rule_scope_members(
+    scope: &str,
+    service: Option<&str>,
+    usage_type: Option<&str>,
+    operation: Option<&str>,
+    billing_entity: Option<&str>,
+) -> Result<(), ValidationRefusal> {
+    // Per member: its name, how a message names it, the reason enumerated for it, the
+    // scopes it keys on, and whether this request named it. The member and the value
+    // sit in one row so the two cannot drift apart.
+    let members: [(&'static str, &'static str, &'static str, &[&str], bool); 4] = [
+        (
+            "Service",
+            "a Service",
+            "ILLEGAL_SERVICE",
+            &["SERVICE", "SKU"],
+            service.is_some(),
+        ),
+        (
+            "UsageType",
+            "a UsageType",
+            "ILLEGAL_USAGE_TYPE",
+            &["SKU"],
+            usage_type.is_some(),
+        ),
+        (
+            "Operation",
+            "an Operation",
+            "ILLEGAL_OPERATION",
+            &["SKU"],
+            operation.is_some(),
+        ),
+        (
+            "BillingEntity",
+            "a BillingEntity",
+            "ILLEGAL_BILLING_ENTITY",
+            &["BILLING_ENTITY"],
+            billing_entity.is_some(),
+        ),
+    ];
+    for (member, phrase, reason, keyed_scopes, named) in members {
+        match (keyed_scopes.contains(&scope), named) {
+            (true, false) => {
+                return Err((
+                    reason,
+                    member,
+                    format!("a pricing rule scoped to {scope} must name {phrase}"),
+                ));
+            }
+            (false, true) => {
+                return Err((
+                    reason,
+                    member,
+                    format!("a pricing rule scoped to {scope} does not take {phrase}"),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// A pricing plan as `CreatePricingPlan` persisted it.
 ///
 /// The record carries the plan as it stands NOW, plus the generations of it that later

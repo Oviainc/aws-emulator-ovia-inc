@@ -2,7 +2,10 @@
 
 //! @op SendMessage
 //! IMPLEMENTED: this operation appends a message to the queue's arrival-order deque in
-//! [`crate::state`] and answers with its id and content digests. On a FIFO queue it
+//! [`crate::state`] and answers with its id and content digests. It validates the
+//! message attributes and the message system attributes the send carries by Amazon SQS's
+//! documented name, type and value rules, and digests each map into its own
+//! `MD5Of...` member. On a FIFO queue it
 //! also honours the FIFO members — it requires a `MessageGroupId`, deduplicates on the
 //! `MessageDeduplicationId` (supplied, or derived from the body under
 //! `ContentBasedDeduplication`) and assigns the message a `SequenceNumber`. It is the
@@ -286,26 +289,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let fifo = queue.is_fifo();
 
-        // A member this emulator does not honour is refused rather than silently
-        // dropped on a 200: `MessageSystemAttributes` carries the X-Ray trace header,
-        // which nothing here propagates. The request is not malformed, so the refusal
-        // is the modelled "unsupported operation" rather than a parameter fault.
-        if input
+        // "The message system attribute to send ... Currently, the only supported message
+        // system attribute is AWSTraceHeader": the one name the map's key shape publishes
+        // is taken and carried on the message, and any other name — or a value that is not
+        // a non-empty String — is refused before anything is stored.
+        let message_system_attributes: BTreeMap<String, MessageSystemAttributeValue> = input
             .message_system_attributes
-            .as_ref()
-            .is_some_and(|attributes| !attributes.is_empty())
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        // Name-ordered, so a request with two bad system attributes is always refused for
+        // the same one.
+        if let Some(reason) = message_system_attributes
+            .iter()
+            .find_map(|(name, value)| sqs::message_system_attribute_refusal(name, value))
         {
-            return Err(SendMessageErrorModeled::UnsupportedOperation(
-                UnsupportedOperation {
-                    message: Some(
-                        "The request includes MessageSystemAttributes, which this emulator does \
-                         not support yet: it carries the X-Ray trace header, which nothing here \
-                         propagates."
-                            .to_string(),
-                    ),
-                },
-            )
-            .into());
+            return Err(Scaffolded::invalid_parameter_value(reason));
         }
 
         // "In FIFO queues, MessageGroupId organizes messages into distinct groups ...
@@ -385,7 +385,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let message_attributes: BTreeMap<String, MessageAttributeValue> = input
+        let mut message_attributes: BTreeMap<String, MessageAttributeValue> = input
             .message_attributes
             .clone()
             .unwrap_or_default()
@@ -406,10 +406,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(Scaffolded::invalid_parameter_value(reason));
         }
+        // A `Number` attribute carries a number, and the queue holds the number rather
+        // than the text the request wrote it as; from here on the message is measured,
+        // digested and stored in that form.
+        sqs::store_message_attributes_canonically(&mut message_attributes);
 
         // Everything the message carries counts toward the queue's MaximumMessageSize:
-        // "All parts of a message are included in the ... size limit: the message body,
-        // the message attributes". A message over it is rejected rather than stored.
+        // "All parts of the message attribute, including Name, Type, and Value, are part
+        // of the message size restriction". A message over it is rejected rather than
+        // stored. The system attributes are NOT part of it — "the size of a message system
+        // attribute doesn't count towards the total size of a message" — but they are part
+        // of what the store retains, so the store's own budget below counts them.
         let maximum = queue.integer(sqs::MAXIMUM_MESSAGE_SIZE);
         let attribute_bytes = sqs::message_attribute_bytes(&message_attributes);
         let size = input.message_body.len().saturating_add(attribute_bytes);
@@ -418,9 +425,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &format!("Message must be shorter than {maximum} bytes."),
             )));
         }
+        let retained = size
+            .saturating_add(sqs::message_system_attribute_bytes(&message_system_attributes));
 
         let md5_of_body = sqs::md5_hex(input.message_body.as_bytes());
         let md5_of_message_attributes = sqs::md5_of_message_attributes(&message_attributes);
+        let md5_of_message_system_attributes =
+            sqs::md5_of_message_system_attributes(&message_system_attributes);
 
         // "If a message with a particular MessageDeduplicationId is sent successfully,
         // any messages sent with the same MessageDeduplicationId are accepted
@@ -438,7 +449,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(SendMessageOutput {
                 md5_of_message_body: Some(md5_of_body),
                 md5_of_message_attributes,
-                md5_of_message_system_attributes: None,
+                md5_of_message_system_attributes,
                 message_id: Some(admitted.message_id.clone()),
                 sequence_number: Some(admitted.sequence_number.clone()),
             });
@@ -447,7 +458,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What this in-memory store can be made to hold is bounded, counting every byte
         // the message retains; a message over the bound is refused rather than accepted
         // and silently evicted later.
-        if let Some(reason) = queue.message_rejection(size, store_bytes) {
+        if let Some(reason) = queue.message_rejection(retained, store_bytes) {
             return Err(SendMessageErrorModeled::OverLimit(OverLimit {
                 message: Some(reason),
             })
@@ -464,6 +475,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             body: input.message_body,
             md5_of_body: md5_of_body.clone(),
             message_attributes,
+            message_system_attributes,
             message_group_id: group_id,
             message_deduplication_id: deduplication_id,
             sequence_number: sequence_number.clone(),
@@ -488,7 +500,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(SendMessageOutput {
             md5_of_message_body: Some(md5_of_body),
             md5_of_message_attributes,
-            md5_of_message_system_attributes: None,
+            md5_of_message_system_attributes,
             message_id: Some(message_id),
             sequence_number,
         })

@@ -128,3 +128,11 @@ mod remediation_execution_failed_items;
 mod resource_config_deletion;
 #[path = "all/compliance_by_resource.rs"]
 mod compliance_by_resource;
+#[path = "all/resource_type_association.rs"]
+mod resource_type_association;
+#[path = "all/delete_remediation_exceptions.rs"]
+mod delete_remediation_exceptions;
+#[path = "all/select_aggregate_resource_config.rs"]
+mod select_aggregate_resource_config;
+#[path = "all/recorded_refusal_wording.rs"]
+mod recorded_refusal_wording;

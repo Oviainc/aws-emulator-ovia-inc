@@ -5,7 +5,8 @@
 //! Merges the request's tags into the tag set of the schedule group its
 //! `ResourceArn` identifies, in [`crate::state`]. A key the group already
 //! carries takes the new value; a key it does not is added. A key under the
-//! reserved [`crate::state::RESERVED_TAG_KEY_PREFIX`] is refused, and so is a
+//! reserved [`crate::state::RESERVED_TAG_KEY_PREFIX`] is refused as a
+//! modification of system tags, and so is a
 //! merge that would carry the group past
 //! [`crate::state::MAX_TAGS_PER_RESOURCE`].
 //!
@@ -53,7 +54,7 @@
 //! ## Input
 //!
 //! * `ResourceArn` (TagResourceArn, len 1..1011, pattern
-//!   ^arn:aws(-[a-z]+)?:scheduler:[a-z0-9\-]+:\d{12}:schedule-group\/[0-9a-zA-Z-_.]+$)
+//!   ^arn:aws[a-z-]*:scheduler:[a-z0-9\-]+:\d{12}:schedule-group\/[0-9a-zA-Z-_.]+$)
 //!   **required** — The Amazon Resource Name (ARN) of the schedule group that you are adding
 //!   tags to.
 //! * `Tags` (TagList, len 0..200) **required** — The list of tags to associate with the
@@ -156,16 +157,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Request validation comes before the resource lookup, so a reserved key
-        // is refused the same way whether or not the ARN names a live group.
-        if let Some(reserved) =
-            crate::state::reserved_tag_key(input.tags.iter().map(|tag| tag.key.as_str()))
-        {
+        // is refused the same way whether or not the ARN names a live group. The
+        // refusal is about the reserved namespace, not about this request, so its
+        // wording is the shared constant and names no key.
+        if crate::state::names_system_tag(input.tags.iter().map(|tag| tag.key.as_str())) {
             return Err(TagResourceErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!(
-                        "Tag key {reserved} is reserved: keys must not begin with {}.",
-                        crate::state::RESERVED_TAG_KEY_PREFIX
-                    ),
+                    message: crate::state::SYSTEM_TAG_REFUSAL_MESSAGE.to_string(),
                 },
             )
             .into());

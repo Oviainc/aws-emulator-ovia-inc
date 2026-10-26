@@ -527,6 +527,20 @@ impl DeliveryBudget {
     }
 }
 
+/// The body an SQS subscriber of `published` receives: the message as published, or —
+/// when it was published with `MessageStructure` of `json` — the branch that document
+/// names for the `sqs` protocol, falling back to its `default` branch.
+///
+/// The queues of one topic all deliver over the same protocol, so one publish selects
+/// this body once.
+fn protocol_body(published: &PublishedMessage) -> String {
+    state::structured_message_body(
+        &published.message,
+        published.message_structure.as_deref(),
+        SQS_PROTOCOL,
+    )
+}
+
 /// The deliveries `published` owes to the SQS queues among `subscriptions`, within what
 /// `budget` has left.
 ///
@@ -541,18 +555,30 @@ pub(crate) fn queue_deliveries(
     published: &PublishedMessage,
     budget: &mut DeliveryBudget,
 ) -> Vec<QueueDelivery> {
+    // The body the subscribers of THIS protocol receive: the whole published message,
+    // unless it was published with a per-protocol structure, in which case it is the
+    // branch that structure names for the protocol. Every queue of a topic is subscribed
+    // over the same protocol, so one fan-out selects it once — the envelope around it is
+    // still rendered per subscription, because it carries that subscription's own
+    // unsubscribe link.
+    let body_lazily: ::std::cell::OnceCell<String> = ::std::cell::OnceCell::new();
     let mut raw_body: Option<::std::sync::Arc<str>> = None;
     let mut deliveries: Vec<QueueDelivery> = Vec::new();
     for subscription in subscriptions {
         let Some(target) = QueueTarget::of(subscription) else {
             continue;
         };
+        let protocol_body = body_lazily.get_or_init(|| protocol_body(published));
         let body = if target.raw {
             raw_body
-                .get_or_insert_with(|| published.message.clone())
+                .get_or_insert_with(|| ::std::sync::Arc::from(protocol_body.as_str()))
                 .clone()
         } else {
-            ::std::sync::Arc::from(notification_envelope(published, &subscription.arn))
+            ::std::sync::Arc::from(notification_envelope(
+                published,
+                protocol_body,
+                &subscription.arn,
+            ))
         };
         if !budget.charge(body.len()) {
             ::tracing::warn!(
@@ -1012,10 +1038,16 @@ fn sqs_client(
 /// The envelope carries the metadata the message was published with — its type, id, topic,
 /// subject, body, attributes and the instant it was published — and the link that cancels THE
 /// SUBSCRIPTION IT IS DELIVERED TO, so it is rendered per subscriber rather than once per
-/// publish. It carries NO signature members (`Signature`, `SigningCertURL`): nothing signs a
+/// publish. The `body` it wraps is the message the SUBSCRIBER's protocol receives, which is
+/// the whole published message unless it was published as a structure of per-protocol
+/// branches. It carries NO signature members (`Signature`, `SigningCertURL`): nothing signs a
 /// message in this emulator, and a member that looked like a signature would be one a
 /// subscriber could not verify.
-fn notification_envelope(published: &PublishedMessage, subscription_arn: &str) -> String {
+fn notification_envelope(
+    published: &PublishedMessage,
+    body: &str,
+    subscription_arn: &str,
+) -> String {
     let mut envelope = serde_json::Map::new();
     envelope.insert(
         "Type".to_string(),
@@ -1032,10 +1064,7 @@ fn notification_envelope(published: &PublishedMessage, subscription_arn: &str) -
     if let Some(subject) = published.subject.as_deref() {
         envelope.insert("Subject".to_string(), serde_json::Value::from(subject));
     }
-    envelope.insert(
-        "Message".to_string(),
-        serde_json::Value::from(&*published.message),
-    );
+    envelope.insert("Message".to_string(), serde_json::Value::from(body));
     if let Some(timestamp) = rfc3339(published.published_at) {
         envelope.insert("Timestamp".to_string(), serde_json::Value::from(timestamp));
     }

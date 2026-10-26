@@ -213,15 +213,20 @@ fn same_percentage(left: f64, right: f64) -> bool {
 /// The request body that creates the `MARKUP` rule the tables start from: every
 /// member `UpdatePricingRule` can change carries a known starting value, and every
 /// member it cannot change is set too, so a row can assert both halves.
+///
+/// The scope is `SKU` because that is the scope keying the MOST of those unchangeable
+/// members (`Service`, `UsageType` and `Operation` all at once); a scope does not key
+/// `BillingEntity` beside them, and a rule carries only the members its scope keys on,
+/// so this rule names none (the `BILLING_ENTITY` scope that does key it is covered in
+/// `pricing_rule_scope_members.rs`).
 fn markup_rule(name: &str) -> Value {
     json!({
         "Name": name,
         "Description": "the rule as created",
-        "Scope": "SERVICE",
+        "Scope": "SKU",
         "Service": "AmazonEC2",
         "Type": "MARKUP",
         "ModifierPercentage": 10.0,
-        "BillingEntity": "AWS",
         "UsageType": "USW2-BoxUsage:m2.2xlarge",
         "Operation": "RunInstances:0202",
     })
@@ -414,9 +419,8 @@ async fn update_replaces_the_members_it_names_and_keeps_the_rest() {
 
             // The members no update operation can change come back as created.
             for (member, expected) in [
-                ("Scope", "SERVICE"),
+                ("Scope", "SKU"),
                 ("Service", "AmazonEC2"),
-                ("BillingEntity", "AWS"),
                 ("UsageType", "USW2-BoxUsage:m2.2xlarge"),
                 ("Operation", "RunInstances:0202"),
             ] {

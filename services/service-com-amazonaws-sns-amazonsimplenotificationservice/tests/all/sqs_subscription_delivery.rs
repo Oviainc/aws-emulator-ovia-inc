@@ -529,15 +529,18 @@ async fn a_raw_delivery_carries_the_number_a_number_attribute_names() {
             "12345678901234567890.5",
         ),
         (
-            // Not a plain decimal number, so there is no canonical spelling to give it.
+            // SNS leaves exponent notation as published; the queue's own `SendMessage`
+            // then stores a `Number` as the number it names, so what the queue receives
+            // is that number written out plainly.
             "a number in exponent notation",
             "Number",
             "1e2",
-            "1e2",
+            "100",
         ),
-        ("a number that is not a number", "Number", "five", "five"),
-        // Only a Number is a number: a String's value is text, sign and all.
+        // Only a Number is a number: a String's value is text, sign and all — so a value
+        // that is not a number at all is carried verbatim under a type that takes text.
         ("a string that looks like a number", "String", "+5", "+5"),
+        ("a string that is not a number", "String", "five", "five"),
     ];
 
     for (case, data_type, published, expected) in rows {
@@ -574,4 +577,27 @@ async fn a_raw_delivery_carries_the_number_a_number_attribute_names() {
              {carried_type:?}"
         );
     }
+
+    // A `Number` attribute whose value is not a number is one the SUBSCRIBED QUEUE will
+    // not take — its own `SendMessage` refuses a `Number` it cannot read — so the
+    // notification does not reach it, and the attempt is recorded rather than retried as
+    // a delivery that happened.
+    sns(
+        &emulator,
+        "Publish",
+        &[
+            ("TopicArn", &topic),
+            ("Message", "an attributed message"),
+            ("MessageAttributes.entry.1.Name", "n"),
+            ("MessageAttributes.entry.1.Value.DataType", "Number"),
+            ("MessageAttributes.entry.1.Value.StringValue", "five"),
+        ],
+    )
+    .await;
+    let delivered = drain(&emulator, &url).await;
+    assert!(
+        delivered.is_empty(),
+        "case \"a number that is not a number\": the queue takes no such attribute, so \
+         nothing is delivered, got {delivered:?}"
+    );
 }

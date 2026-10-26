@@ -574,17 +574,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(body) => {
                 let Some(submitted) = crate::state::declared_template(body) else {
                     return Err(crate::scaffolded::Scaffolded::validation_error(
-                        "Template format error: the TemplateBody is not a template this \
-                         service can read",
+                        crate::state::template::NOT_WELL_FORMED,
                     ));
                 };
                 if submitted.resources.is_empty() {
                     // A change set is a plan over resources, so a template that declares
-                    // none has nothing to plan: "Template format error: At least one
-                    // Resources member must be defined."
+                    // none has nothing to plan.
                     return Err(crate::scaffolded::Scaffolded::validation_error(
-                        "Template format error: At least one Resources member must be \
-                         defined.",
+                        crate::state::template::NO_RESOURCES_DECLARED,
                     ));
                 }
                 submitted

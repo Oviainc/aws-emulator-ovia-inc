@@ -3700,6 +3700,16 @@ pub const FIRST_PACKAGE_VERSION: u32 = 1;
 /// `DescribePackages` answers with, it also bounds the size of that answer.
 pub const PACKAGE_QUOTA: usize = 25;
 
+/// How many users one package's scope holds before `UpdatePackageScope` refuses to
+/// grant another.
+///
+/// The emulator's OWN bound, like [`PACKAGE_QUOTA`]: the model puts no length on
+/// `PackageUserList`, so without one a caller granting fresh accounts could grow a
+/// package's stored scope — and the `AllowListedUserList` every read of that package
+/// answers with — without end. Every user it counts is released by withdrawing that
+/// user's access.
+pub const PACKAGE_SCOPE_QUOTA: usize = 100;
+
 /// One custom package of this account, as this emulator persists it.
 #[derive(Debug, Clone)]
 pub struct Package {
@@ -4129,6 +4139,19 @@ pub struct ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// live on that domain ([`Domain::insights`]), so an insight has exactly one
     /// home whichever entity holds it. See [`InsightRecord`].
     pub account_insights: BTreeMap<String, InsightRecord>,
+    /// Whether this account may share its packages with other users at all — the
+    /// entitlement `UpdatePackageScope` needs before it can grant one.
+    ///
+    /// ONE account-scoped value rather than a flag per package: it says what the
+    /// ACCOUNT may do, so every package of the account is judged by the same value. No
+    /// operation of this API carries it and no setting seeds it — a package vendor is
+    /// admitted to the programme out of band — so it starts `false`, which is where an
+    /// account that has not been admitted stands, and every scope update from such an
+    /// account is refused. There is therefore no caller-visible seam that turns it on:
+    /// over the wire the refusal is all `UpdatePackageScope` can answer, and the grant
+    /// path is reached by a caller holding this store (a test, or a future operation
+    /// for an admitted account).
+    pub package_vending_entitled: bool,
     /// Every service-managed VPC endpoint of this account, keyed by its
     /// `VpcEndpointId` — unique per endpoint, so the id IS the key.
     /// `CreateVpcEndpoint` mints one and `DescribeVpcEndpoints` / `ListVpcEndpoints`
@@ -4158,6 +4181,7 @@ impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
             billing_subscription_seq: 0,
             packages: BTreeMap::new(),
             account_insights: BTreeMap::new(),
+            package_vending_entitled: false,
             vpc_endpoints: BTreeMap::new(),
             vpc_endpoint_seq: 0,
         }
