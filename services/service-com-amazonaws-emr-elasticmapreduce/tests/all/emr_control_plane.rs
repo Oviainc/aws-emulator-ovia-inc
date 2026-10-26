@@ -113,7 +113,10 @@ fn fleet_request(name: &str) -> Value {
 /// The members `CreateStudio` requires, with every network id in the form Amazon EC2
 /// gives that resource ("Resource IDs", Amazon EC2 User Guide: the type prefix plus 8
 /// or 17 lowercase hex characters).
-fn studio_request(name: &str) -> Value {
+///
+/// `pub(crate)` so another suite in this test target drives `CreateStudio` through the
+/// same request rather than growing a second copy of it.
+pub(crate) fn studio_request(name: &str) -> Value {
     json!({
         "Name": name,
         "AuthMode": "SSO",

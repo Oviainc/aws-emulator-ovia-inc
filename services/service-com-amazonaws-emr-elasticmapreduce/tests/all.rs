@@ -43,5 +43,7 @@ mod release_labels;
 mod security_configurations;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/studio_session_mapping_listing.rs"]
+mod studio_session_mapping_listing;
 #[path = "all/supported_instance_types.rs"]
 mod supported_instance_types;
