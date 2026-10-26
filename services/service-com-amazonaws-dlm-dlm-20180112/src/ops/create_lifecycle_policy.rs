@@ -110,6 +110,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The request-body half of the `[Default policies only]` parameter set, read
+// through the one trait `state.rs` declares for it.
+use crate::state::DefaultPolicyOnlyBody;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -200,7 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // model cannot express: "If you create a default policy, you can specify
         // the request parameters either in the request body, or in the
         // PolicyDetails request structure, but not both."
-        let stated_in_body = default_policy_only_body_parameters(&input);
+        let stated_in_body = input.default_policy_only_body_parameters();
         if is_default && input.policy_details.is_some() {
             let mut duplicated = stated_in_body.stated_names("");
             // The resource type is one of those parameters: `DefaultPolicy` and
@@ -432,25 +436,4 @@ fn policy_language_is_simplified(details: Option<&PolicyDetails>) -> bool {
     details.is_some_and(|details| {
         details.policy_language.as_deref() == Some(crate::state::SIMPLIFIED_POLICY_LANGUAGE)
     })
-}
-
-/// The `[Default policies only]` parameters this request states in the request
-/// BODY, as against inside its `PolicyDetails` structure.
-///
-/// `PolicyDetails$ResourceType`'s request-body counterpart is `DefaultPolicy`,
-/// which is also the member that makes the request a default-policy request in
-/// the first place, so it is read where that name belongs rather than from this
-/// set of same-named members.
-fn default_policy_only_body_parameters(
-    input: &CreateLifecyclePolicyInput,
-) -> crate::state::DefaultPolicyOnlyParameters {
-    crate::state::DefaultPolicyOnlyParameters {
-        resource_type: false,
-        create_interval: input.create_interval.is_some(),
-        retain_interval: input.retain_interval.is_some(),
-        copy_tags: input.copy_tags.is_some(),
-        cross_region_copy_targets: input.cross_region_copy_targets.is_some(),
-        extend_deletion: input.extend_deletion.is_some(),
-        exclusions: input.exclusions.is_some(),
-    }
 }
