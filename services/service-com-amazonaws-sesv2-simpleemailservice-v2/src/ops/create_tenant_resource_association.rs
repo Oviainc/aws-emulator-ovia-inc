@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTenantResourceAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTenantResourceAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTenantResourceAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associates the resource the request names with the tenant it names: the tenant is
+//! resolved against the tenant store first, and the association is recorded so the
+//! resource's own listing reports it. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +139,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTenantResourceAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTenantResourceAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTenantResourceAssociation"))
+        // The association is identified by the tenant and the resource ARN alone, so no
+        // request metadata is needed.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to write to. That is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateTenantResourceAssociation without the shared emulator state",
+            ));
+        };
+
+        let tenant_name = input.tenant_name;
+        let resource_arn = input.resource_arn;
+        // The model binds only `length 1..` on `TenantName`; the documented form is the
+        // handler's to enforce, with the `BadRequestException` the model binds for "the
+        // input you provided is invalid" — the same check every operation taking a
+        // `TenantName` applies, so a name no tenant could carry is refused as malformed
+        // rather than reported missing.
+        if !crate::state::tenant_name_is_well_formed(&tenant_name) {
+            return Err(CreateTenantResourceAssociationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::invalid_tenant_name(&tenant_name)),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Resolution comes BEFORE any write: a tenant the account does not hold leaves
+        // the association table exactly as it was.
+        let Some(tenant) = store.tenants.get(&tenant_name) else {
+            return Err(CreateTenantResourceAssociationErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::requested_tenant_not_found(&tenant_name)),
+                },
+            )
+            .into());
+        };
+        let tenant_id = tenant.tenant_id.clone();
+
+        let key = (resource_arn.clone(), tenant_name.clone());
+        if store.tenant_resource_associations.contains_key(&key) {
+            // "The resource specified in your request already exists": the association
+            // is the resource here, so a repeat is refused rather than stored twice.
+            return Err(
+                CreateTenantResourceAssociationErrorModeled::AlreadyExistsException(
+                    AlreadyExistsException {
+                        message: Some(crate::state::tenant_resource_association_exists(
+                            &tenant_name,
+                            &resource_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        if store.tenant_resource_associations.len()
+            >= crate::state::MAX_TENANT_RESOURCE_ASSOCIATIONS
+        {
+            return Err(CreateTenantResourceAssociationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!(
+                        "The account already holds the maximum of {} tenant resource \
+                         associations.",
+                        crate::state::MAX_TENANT_RESOURCE_ASSOCIATIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store.tenant_resource_associations.insert(
+            key,
+            crate::state::TenantResourceAssociationRecord {
+                tenant_name,
+                tenant_id,
+                resource_arn,
+                associated_at: now,
+            },
+        );
+
+        // The response carries no members: the association is observed through the
+        // listings that read the record just stored.
+        Ok(CreateTenantResourceAssociationOutput {})
     }
 }

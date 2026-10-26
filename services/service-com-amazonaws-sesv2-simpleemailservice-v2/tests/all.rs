@@ -35,5 +35,7 @@ mod multi_region_endpoints;
 mod state_roundtrip;
 #[path = "all/suppressed_destinations.rs"]
 mod suppressed_destinations;
+#[path = "all/tenant_resource_associations.rs"]
+mod tenant_resource_associations;
 #[path = "all/tenants.rs"]
 mod tenants;

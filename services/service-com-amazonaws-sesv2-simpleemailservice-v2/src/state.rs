@@ -156,6 +156,16 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 /// refuses past it with the `LimitExceededException` its model binds.
 pub const MAX_TENANTS: usize = 1_000;
 
+/// Tenant-resource associations the store holds, across every tenant and resource.
+///
+/// A CHOSEN bound, not an AWS one: an association is created by a request and the
+/// resource it is keyed under is a caller-supplied ARN, so a long-lived emulator must
+/// not grow without limit while serving them, and the bound is on the WHOLE table —
+/// a per-tenant bound would still leave the table growing with the tenant count.
+/// `CreateTenantResourceAssociation` refuses past it with the `BadRequestException`
+/// its model binds, which is the only limit-shaped error it binds at all.
+pub const MAX_TENANT_RESOURCE_ASSOCIATIONS: usize = 10_000;
+
 /// The longest `TenantName` SES accepts: its documentation states the name "can
 /// contain up to 64 alphanumeric characters, including letters, numbers, hyphens
 /// (-) and underscores (_) only". The model itself binds only the lower bound
@@ -236,8 +246,11 @@ pub fn invalid_tenant_name(tenant_name: &str) -> String {
 
 /// How this service words `NotFoundException` for a tenant it does not hold.
 ///
-/// One wording for every operation that takes a `TenantName`, so a client sees the
-/// same sentence whichever call first tells it the tenant is gone.
+/// One wording for the operations that read a tenant, or a tenant's suppression
+/// list, by `TenantName` — `GetTenant`, `GetSuppressedDestination` and
+/// `ListSuppressedDestinations` — so a client sees the same sentence whichever of
+/// them first tells it the tenant is gone. The tenant-resource association surface
+/// words the same condition differently; see [`requested_tenant_not_found`].
 pub fn tenant_not_found(tenant_name: &str) -> String {
     format!("Tenant {tenant_name} does not exist.")
 }
@@ -245,6 +258,21 @@ pub fn tenant_not_found(tenant_name: &str) -> String {
 /// How this service words `AlreadyExistsException` for a tenant name already taken.
 pub fn tenant_already_exists(tenant_name: &str) -> String {
     format!("Tenant with name: {tenant_name} already exists.")
+}
+
+/// How the tenant-resource association surface words `NotFoundException` for a
+/// tenant the account does not hold: the sentence SES answers a
+/// `CreateTenantResourceAssociation` whose `TenantName` resolves to nothing, with the
+/// requested name as its only variable part.
+pub fn requested_tenant_not_found(tenant_name: &str) -> String {
+    format!("The requested tenant <{tenant_name}> does not exist.")
+}
+
+/// How this service words `AlreadyExistsException` for a resource already associated
+/// with the named tenant, stated once for every operation that creates an
+/// association.
+pub fn tenant_resource_association_exists(tenant_name: &str, resource_arn: &str) -> String {
+    format!("The resource <{resource_arn}> is already associated with tenant <{tenant_name}>.")
 }
 
 /// Configuration sets the account may hold: SES's documented quota is 10,000
@@ -280,6 +308,12 @@ pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
     /// Monotonic counter feeding [`Self::next_tenant_id`], so two tenants created
     /// in the same millisecond still get different ids.
     pub tenant_sequence: u64,
+    /// Tenant-resource associations, keyed by the resource's `ResourceArn` and then
+    /// the `TenantName` it is associated with: one resource may be associated with
+    /// several tenants and one tenant with several resources, so the pair is the
+    /// identity of an association. Ordered, so `ListResourceTenants` enumerates and
+    /// pages one resource's tenants deterministically.
+    pub tenant_resource_associations: BTreeMap<(String, String), TenantResourceAssociationRecord>,
     /// Contact lists, keyed by the `ContactListName` they were created with — an
     /// opaque name the API echoes back as given, so it is keyed exactly as supplied.
     /// Ordered, so `ListContactLists` enumerates and pages deterministically.
@@ -1077,6 +1111,38 @@ impl TenantRecord {
                 value: value.clone(),
             })
             .collect()
+    }
+}
+
+/// One tenant-resource association: a resource (an email identity, a configuration
+/// set or an email template, named by its ARN) usable when sending on behalf of the
+/// tenant it is associated with.
+///
+/// The tenant's id is copied in at association time, so the association reports the
+/// tenant record it was made against even after a tenant of the same name is
+/// recreated.
+#[derive(Debug, Clone)]
+pub struct TenantResourceAssociationRecord {
+    /// The `TenantName` the association was made for, as the request spelled it.
+    pub tenant_name: String,
+    /// The associated tenant's `TenantId`, read off the tenant record.
+    pub tenant_id: String,
+    /// The `ResourceArn` the association was made for, as the request spelled it.
+    pub resource_arn: String,
+    /// When the resource was associated with the tenant.
+    pub associated_at: SystemTime,
+}
+
+impl TenantResourceAssociationRecord {
+    /// The modelled `ResourceTenantMetadata` view of this association, as
+    /// `ListResourceTenants` reports it.
+    pub fn resource_tenant_view(&self) -> crate::ops::types::ResourceTenantMetadata {
+        crate::ops::types::ResourceTenantMetadata {
+            tenant_name: Some(self.tenant_name.clone()),
+            tenant_id: Some(self.tenant_id.clone()),
+            resource_arn: Some(self.resource_arn.clone()),
+            associated_timestamp: Some(::aws_smithy_types::DateTime::from(self.associated_at)),
+        }
     }
 }
 
@@ -2062,6 +2128,9 @@ pub const SUPPRESSED_DESTINATIONS_PAGE_TOKEN_TAG: &str = "sesv2:suppressed-desti
 
 /// The tag `ListMultiRegionEndpoints`'s own tokens carry.
 pub const MULTI_REGION_ENDPOINTS_PAGE_TOKEN_TAG: &str = "sesv2:multi-region-endpoints:";
+
+/// The tag `ListResourceTenants`'s own tokens carry.
+pub const RESOURCE_TENANTS_PAGE_TOKEN_TAG: &str = "sesv2:resource-tenants:";
 
 /// Encode a `NextToken` that resumes the listing tagged `tag` after `last_returned`.
 ///

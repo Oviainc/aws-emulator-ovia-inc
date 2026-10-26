@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourceTenants
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourceTenants`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourceTenants::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tenants the resource the request names is associated with, read off the
+//! association records `CreateTenantResourceAssociation` stored. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +147,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourceTenants` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourceTenantsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourceTenants"))
+        // The listing is identified by the resource ARN alone, so no request metadata is
+        // needed.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a throttle an SDK would retry forever.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListResourceTenants without the shared emulator state",
+            ));
+        };
+
+        // "The number of results to show in a single call": `PageSize` targets
+        // `MaxItems`, on which the model puts no bound, so only a positive count
+        // truncates a page; a non-positive one is read as no truncation, which keeps a
+        // caller that sends 0 from being stuck on an empty page forever.
+        let page_size = usize::try_from(input.page_size.unwrap_or_default())
+            .ok()
+            .filter(|size| *size > 0);
+
+        // The token is this operation's own: it names the last tenant the previous page
+        // reported, so the next page resumes strictly after it.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_tagged_page_token(
+                    crate::state::RESOURCE_TENANTS_PAGE_TOKEN_TAG,
+                    token,
+                )
+                .ok_or_else(|| {
+                    bad_request("NextToken is not a token returned by ListResourceTenants.")
+                })?,
+            ),
+        };
+
+        // Reporting only: nothing here writes, so a read leaves every later caller
+        // seeing exactly what it saw.
+        let store = state.lock();
+        // The association table is keyed by the resource ARN and then the tenant name,
+        // so one resource's associations are a contiguous, name-ordered run: a page is a
+        // window over that order and the resume point is a position in it, which keeps a
+        // token valid even if the tenant it names has since been disassociated.
+        let associated: Vec<&crate::state::TenantResourceAssociationRecord> = store
+            .tenant_resource_associations
+            .range((input.resource_arn.clone(), String::new())..)
+            .take_while(|((resource_arn, _), _)| *resource_arn == input.resource_arn)
+            .map(|(_, record)| record)
+            .collect();
+        let start = match resume_after.as_deref() {
+            None => 0,
+            Some(last) => associated.partition_point(|record| record.tenant_name.as_str() <= last),
+        };
+        let remaining = &associated[start..];
+        let page = match page_size {
+            Some(size) => &remaining[..size.min(remaining.len())],
+            None => remaining,
+        };
+
+        let resource_tenants: Vec<ResourceTenantMetadata> = page
+            .iter()
+            .map(|record| record.resource_tenant_view())
+            .collect();
+        // A token only when tenants remain behind this page, so a walk terminates.
+        let next_token = (page.len() < remaining.len())
+            .then(|| {
+                page.last().map(|record| {
+                    crate::state::encode_tagged_page_token(
+                        crate::state::RESOURCE_TENANTS_PAGE_TOKEN_TAG,
+                        &record.tenant_name,
+                    )
+                })
+            })
+            .flatten();
+
+        Ok(ListResourceTenantsOutput {
+            resource_tenants: Some(resource_tenants),
+            next_token,
+        })
     }
+}
+
+/// Refuse the request with this service's input error.
+fn bad_request(message: impl Into<String>) -> ListResourceTenantsError {
+    ListResourceTenantsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }
