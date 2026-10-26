@@ -262,26 +262,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|scraper| crate::state::scraper_matches_filters(scraper, filters))
             .collect();
 
-        // `nextToken` is the page cursor this operation itself emitted: the id of the
-        // last summary of the previous page, so the next page starts after it.
-        if let Some(cursor) = input.next_token.as_deref() {
-            scrapers.retain(|scraper| scraper.scraper_id.as_str() > cursor);
-        }
-
-        // "The range is 1-1000. If you omit this parameter, the default of 100 is used."
-        // Clamped here rather than trusted from the request, so the amount of work one
-        // call does is bounded by this service, not chosen by its caller.
-        let page_size = input.max_results.map_or(crate::state::SCRAPER_PAGE_DEFAULT, |max| {
-            max.clamp(1, crate::state::SCRAPER_PAGE_LIMIT)
-        }) as usize;
-
-        let has_more = scrapers.len() > page_size;
-        scrapers.truncate(page_size);
-        let next_token = if has_more {
-            scrapers.last().map(|scraper| scraper.scraper_id.clone())
-        } else {
-            None
-        };
+        // The cursor-and-page-bound rule every listing of this service shares, owned
+        // once by [`crate::state::take_page`]: the page starts after the `nextToken` this
+        // operation itself emitted, holds at most `maxResults` entries — "The range is
+        // 1-1000. If you omit this parameter, the default of 100 is used." — and carries
+        // a token only while further scrapers remain.
+        let next_token = crate::state::take_page(
+            &mut scrapers,
+            |scraper| scraper.scraper_id.as_str(),
+            input.next_token.as_deref(),
+            input.max_results,
+            crate::state::SCRAPER_PAGE_DEFAULT,
+            crate::state::SCRAPER_PAGE_LIMIT,
+        );
 
         Ok(ListScrapersOutput {
             scrapers: scrapers

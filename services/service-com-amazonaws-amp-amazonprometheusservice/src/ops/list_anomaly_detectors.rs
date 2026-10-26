@@ -212,36 +212,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // what makes `nextToken` a usable cursor.
         detectors.sort_by(|left, right| left.anomaly_detector_id.cmp(&right.anomaly_detector_id));
 
-        // `nextToken` is the cursor this operation itself emitted: the id of the last
-        // summary of the previous page, so the next page starts after it. It is a FILTER
-        // over the records already selected above, never a key into the store: whatever a
-        // caller sends — including a token another workspace's listing minted — can only
-        // drop entries from this workspace's page.
-        if let Some(cursor) = input.next_token.as_deref() {
-            detectors.retain(|detector| detector.anomaly_detector_id.as_str() > cursor);
-        }
-
-        // "The maximum number of results to return in a single call. Valid range is 1 to
-        // 1000." (`ListAnomalyDetectorsRequest$maxResults`, modelled
-        // `@range(min: 1, max: 1000)`.) Clamped here rather than trusted from the
-        // request, so the amount of work one call does is bounded by this service.
-        let page_size = input
-            .max_results
-            .map_or(crate::state::ANOMALY_DETECTOR_PAGE_DEFAULT, |max| {
-                max.clamp(1, crate::state::ANOMALY_DETECTOR_PAGE_LIMIT)
-            }) as usize;
-
-        let has_more = detectors.len() > page_size;
-        detectors.truncate(page_size);
-        // "The pagination token to retrieve the next set of results" — emitted ONLY when
-        // a further page exists, never on the last one.
-        let next_token = if has_more {
-            detectors
-                .last()
-                .map(|detector| detector.anomaly_detector_id.clone())
-        } else {
-            None
-        };
+        // The cursor-and-page-bound rule every listing of this service shares, owned once
+        // by [`crate::state::take_page`]: the page starts after the `nextToken` this
+        // operation itself emitted — a FILTER over the detectors selected above, never a
+        // key into the store, so a token another workspace's listing minted can only drop
+        // entries from this page — holds at most `maxResults` entries ("The maximum number
+        // of results to return in a single call. Valid range is 1 to 1000.",
+        // `ListAnomalyDetectorsRequest$maxResults`, modelled `@range(min: 1, max: 1000)`),
+        // and carries a token only while further detectors remain.
+        let next_token = crate::state::take_page(
+            &mut detectors,
+            |detector| detector.anomaly_detector_id.as_str(),
+            input.next_token.as_deref(),
+            input.max_results,
+            crate::state::ANOMALY_DETECTOR_PAGE_DEFAULT,
+            crate::state::ANOMALY_DETECTOR_PAGE_LIMIT,
+        );
 
         Ok(ListAnomalyDetectorsOutput {
             anomaly_detectors: detectors

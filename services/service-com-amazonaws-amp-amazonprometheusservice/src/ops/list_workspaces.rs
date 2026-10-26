@@ -189,30 +189,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         workspaces.sort_by(|left, right| left.workspace_id.cmp(&right.workspace_id));
 
-        // `nextToken` is the page cursor this operation itself emitted: the id of the
-        // last summary of the previous page, so the next page starts after it.
-        if let Some(cursor) = input.next_token.as_deref() {
-            workspaces.retain(|workspace| workspace.workspace_id.as_str() > cursor);
-        }
-
-        // "The maximum number of workspaces to return per request. The default is 100."
-        // (`ListWorkspacesRequest$maxResults`, modelled `@range(min: 1, max: 1000)`.)
-        // Clamped here rather than trusted from the request, so the amount of work one
-        // call does is bounded by this service, not chosen by its caller.
-        let page_size = input.max_results.map_or(
+        // The cursor-and-page-bound rule every listing of this service shares, owned
+        // once by [`crate::state::take_page`]: the page starts after the `nextToken` this
+        // operation itself emitted, holds at most `maxResults` entries — "The maximum
+        // number of workspaces to return per request. The default is 100."
+        // (`ListWorkspacesRequest$maxResults`, modelled `@range(min: 1, max: 1000)`) —
+        // and carries a token only while further workspaces remain.
+        let next_token = crate::state::take_page(
+            &mut workspaces,
+            |workspace| workspace.workspace_id.as_str(),
+            input.next_token.as_deref(),
+            input.max_results,
             crate::state::WORKSPACE_PAGE_DEFAULT,
-            |max| max.clamp(1, crate::state::WORKSPACE_PAGE_LIMIT),
-        ) as usize;
-
-        let has_more = workspaces.len() > page_size;
-        workspaces.truncate(page_size);
-        let next_token = if has_more {
-            workspaces
-                .last()
-                .map(|workspace| workspace.workspace_id.clone())
-        } else {
-            None
-        };
+            crate::state::WORKSPACE_PAGE_LIMIT,
+        );
 
         Ok(ListWorkspacesOutput {
             workspaces: workspaces

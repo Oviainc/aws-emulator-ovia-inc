@@ -27,6 +27,8 @@ mod create_while_a_removal_is_owed;
 mod default_scraper_configuration;
 #[path = "all/kms_key_arn_and_parent_resolution.rs"]
 mod kms_key_arn_and_parent_resolution;
+#[path = "all/list_paging_rule.rs"]
+mod list_paging_rule;
 #[path = "all/logging_configuration.rs"]
 mod logging_configuration;
 #[path = "all/logging_configuration_deletion.rs"]

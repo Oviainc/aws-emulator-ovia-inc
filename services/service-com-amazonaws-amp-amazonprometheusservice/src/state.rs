@@ -406,6 +406,48 @@ pub const ANOMALY_DETECTOR_PAGE_LIMIT: i32 = 1_000;
 /// See [`ANOMALY_DETECTOR_PAGE_LIMIT`].
 pub const ANOMALY_DETECTOR_PAGE_DEFAULT: i32 = 100;
 
+/// Cut ONE page out of the records a listing has already selected, and report the
+/// `nextToken` that page owes.
+///
+/// Every list operation of this service pages its results the same way, so the rule
+/// lives here ONCE instead of in each handler:
+///
+/// * `next_token` is the cursor a previous page of the SAME listing emitted — the key of
+///   its last entry — so this page starts strictly AFTER that key. It is a filter over
+///   the records already selected by the caller, never a key into the store, so a token
+///   from another listing can only drop entries from this page.
+/// * `max_results` is clamped into `1..=limit` here rather than trusted from the
+///   request, so the amount of work one call does is bounded by this service and not
+///   chosen by its caller; `default` is the page size a request that names no
+///   `max_results` gets. Each listing passes its own published pair (for example
+///   [`WORKSPACE_PAGE_DEFAULT`] / [`WORKSPACE_PAGE_LIMIT`]), because the pair is a fact
+///   about that operation's modelled member.
+/// * The token is emitted ONLY when a further page exists — "a token indicating that
+///   there are more results to retrieve" — never on the last page.
+///
+/// `records` is the selected list in the order the listing serves it, and is truncated
+/// in place to the page; `key` reads the member that listing orders and pages by.
+pub fn take_page<T>(
+    records: &mut Vec<T>,
+    key: impl Fn(&T) -> &str,
+    next_token: Option<&str>,
+    max_results: Option<i32>,
+    default: i32,
+    limit: i32,
+) -> Option<String> {
+    if let Some(cursor) = next_token {
+        records.retain(|record| key(record) > cursor);
+    }
+
+    let page_size = max_results.map_or(default, |max| max.clamp(1, limit)) as usize;
+    let has_more = records.len() > page_size;
+    records.truncate(page_size);
+
+    has_more
+        .then(|| records.last().map(|record| key(record).to_string()))
+        .flatten()
+}
+
 /// The filter keys `ListScrapers` honours, as `ListScrapersRequest$filters` documents
 /// them: "Keys include `status`, `sourceArn`, `destinationArn`, and `alias`."
 ///

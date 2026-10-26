@@ -217,35 +217,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        // `nextToken` is the cursor this operation itself emitted: the name of the last
-        // summary of the previous page, so the next page starts after it. "The other
-        // parameters must be the same as the initial call", which is why the filter is
-        // applied before the cursor rather than after it. It is a FILTER over the records
-        // already selected above, never a key into the store: whatever a caller sends —
-        // including a token another workspace's listing minted — can only drop entries
-        // from this workspace's page.
-        if let Some(cursor) = input.next_token.as_deref() {
-            namespaces.retain(|namespace| namespace.name.as_str() > cursor);
-        }
-
-        // "The maximum number of results to return. The default is 100."
-        // (`ListRuleGroupsNamespacesRequest$maxResults`, modelled
-        // `@range(min: 1, max: 1000)`.) Clamped here rather than trusted from the
-        // request, so the amount of work one call does is bounded by this service.
-        let page_size = input.max_results.map_or(
+        // The cursor-and-page-bound rule every listing of this service shares, owned once
+        // by [`crate::state::take_page`]: the page starts after the `nextToken` this
+        // operation itself emitted — applied to the namespaces selected above, since "The
+        // other parameters must be the same as the initial call", and a FILTER rather than
+        // a key into the store, so a token another workspace's listing minted can only
+        // drop entries from this page — holds at most `maxResults` entries ("The maximum
+        // number of results to return. The default is 100.",
+        // `ListRuleGroupsNamespacesRequest$maxResults`, modelled
+        // `@range(min: 1, max: 1000)`), and carries a token only while further namespaces
+        // remain.
+        let next_token = crate::state::take_page(
+            &mut namespaces,
+            |namespace| namespace.name.as_str(),
+            input.next_token.as_deref(),
+            input.max_results,
             crate::state::RULE_GROUPS_NAMESPACE_PAGE_DEFAULT,
-            |max| max.clamp(1, crate::state::RULE_GROUPS_NAMESPACE_PAGE_LIMIT),
-        ) as usize;
-
-        let has_more = namespaces.len() > page_size;
-        namespaces.truncate(page_size);
-        // "A token indicating that there are more results to retrieve" — so it is emitted
-        // ONLY when a further page exists, never on the last one.
-        let next_token = if has_more {
-            namespaces.last().map(|namespace| namespace.name.clone())
-        } else {
-            None
-        };
+            crate::state::RULE_GROUPS_NAMESPACE_PAGE_LIMIT,
+        );
 
         Ok(ListRuleGroupsNamespacesOutput {
             rule_groups_namespaces: namespaces
