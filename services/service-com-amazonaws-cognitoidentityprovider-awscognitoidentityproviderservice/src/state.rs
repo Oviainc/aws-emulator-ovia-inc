@@ -21,7 +21,8 @@ use crate::ops::types::{
     DeviceConfigurationType, DeviceSecretVerifierConfigType, DeviceType, DomainDescriptionType,
     EmailConfigurationType, EmailMfaConfigType, GroupType, IdentityProviderType,
     IssuerConfigurationType,
-    KeyConfigurationType, LambdaConfigType, LogConfigurationType, LogDeliveryConfigurationType,
+    KeyConfigurationType, LambdaConfigType, LimitDefinitionType, LimitType,
+    LogConfigurationType, LogDeliveryConfigurationType,
     MFAOptionType, NewDeviceMetadataType,
     NumberAttributeConstraintsType, PasswordPolicyType, RefreshTokenRotationType,
     ResourceServerScopeType, ResourceServerType, RiskConfigurationType,
@@ -520,6 +521,11 @@ pub struct ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceS
     /// The passkey registrations in flight, keyed by the challenge value the
     /// credential creation options carried to the caller.
     pub web_authn_registrations: HashMap<String, WebAuthnRegistration>,
+    /// The provisioned request rate this account has set per API category, in
+    /// requests per second, keyed by the category name. A category no
+    /// adjustment has moved holds no entry and reports the rate it includes, so
+    /// the map records the adjustments rather than the whole catalogue.
+    pub provisioned_api_rates: BTreeMap<String, i32>,
     /// The managed login branding styles a modification is IN FLIGHT for right
     /// now, keyed by the (`UserPoolId`, `ManagedLoginBrandingId`) pair every
     /// handler reaches a style by, which is what makes concurrent modification
@@ -4855,6 +4861,263 @@ fn unix_seconds(time: SystemTime) -> i64 {
 /// absent on the wire rather than an empty one.
 pub fn non_empty<T: Clone>(values: &[T]) -> Option<Vec<T>> {
     (!values.is_empty()).then(|| values.to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// Provisioned API rate limits
+//
+// An account holds one request-rate limit per API category: the rate the
+// category includes at no additional cost, and the provisioned rate in force,
+// which the account may set anywhere from that included rate up to its
+// account-level maximum. These limits belong to the ACCOUNT rather than to a
+// user pool, so they live beside the pools rather than inside one.
+// ---------------------------------------------------------------------------
+
+/// The one `LimitClass` this service models, which is the class of the
+/// request-rate limits: "For API rate limits, this is `API_CATEGORY`"
+/// (`LimitDefinitionType.LimitClass` in this service's model, whose only
+/// modelled value is [`crate::ops::types::LIMIT_CLASS_VALUES`]).
+pub const API_CATEGORY_LIMIT_CLASS: &str = "API_CATEGORY";
+
+/// The attribute that identifies WHICH API rate limit a definition means:
+/// "For API rate limits, specify the `Category` key with a value like
+/// `UserAuthentication` or `UserCreation`"
+/// (`LimitDefinitionType.Attributes` in this service's model).
+pub const API_CATEGORY_ATTRIBUTE: &str = "Category";
+
+/// The highest rate the account may provision for ANY one API rate limit, in
+/// requests per second.
+///
+/// `UpdateProvisionedLimit`: "The value must be between the default limit and
+/// your account-level maximum limit in Service Quotas" (this service's model).
+/// That maximum is the account's own Service Quotas value, which this API
+/// neither reports nor raises — only a Service Quotas increase request does —
+/// so this emulator's account holds ONE maximum, the same for every limit, and
+/// a rate above it is refused as a quota excess rather than stored.
+pub const MAX_PROVISIONED_API_RATE: i32 = 10_000;
+
+/// One API category an account holds a request-rate limit for.
+#[derive(Debug)]
+pub struct ApiCategory {
+    /// The `Category` attribute value that names it.
+    pub name: &'static str,
+    /// The rate this category includes at no additional cost, in requests per
+    /// second: `LimitType.FreeLimitValue` is "the default (free) limit value,
+    /// in requests per second (RPS) … the rate included at no additional cost"
+    /// (this service's model), which is the category's published request-rate
+    /// quota (Amazon Cognito Developer Guide, "Quotas in Amazon Cognito"). It
+    /// is the rate in force until an adjustment provisions more, and the lowest
+    /// rate the limit can be provisioned at.
+    pub free_rate: i32,
+}
+
+/// The API categories an account holds a request-rate limit for, with the rate
+/// each one includes at no additional cost. A definition naming no category
+/// here identifies no limit this account holds.
+///
+/// The names are the ones this service's model documents for the `Category`
+/// attribute (`LimitDefinitionType.Attributes` names `UserAuthentication` and
+/// `UserCreation`, `UpdateProvisionedLimit` also `UserFederation`), beside the
+/// remaining request-rate categories of user pool operations, whose published
+/// per-category rates are the included rates here (Amazon Cognito Developer
+/// Guide, "Quotas in Amazon Cognito").
+///
+/// Every limit is provisionable over the same range, from the rate it includes
+/// up to [`MAX_PROVISIONED_API_RATE`]: the upper bound is the account's, not
+/// the category's.
+pub const API_CATEGORIES: &[ApiCategory] = &[
+    ApiCategory {
+        name: "UserAuthentication",
+        free_rate: 120,
+    },
+    ApiCategory {
+        name: "UserFederation",
+        free_rate: 25,
+    },
+    ApiCategory {
+        name: "UserCreation",
+        free_rate: 50,
+    },
+    ApiCategory {
+        name: "UserRead",
+        free_rate: 120,
+    },
+    ApiCategory {
+        name: "UserUpdate",
+        free_rate: 25,
+    },
+    ApiCategory {
+        name: "UserAccountRecovery",
+        free_rate: 30,
+    },
+];
+
+/// Why a limit definition identifies no limit this account holds.
+///
+/// Both operations resolve a definition the same way, so both render these; a
+/// rate refusal is [`RateRefusal`], which only the operation that requests a
+/// rate can reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LimitLookupFailure {
+    /// The definition names a limit class this service holds no limits of.
+    UnsupportedClass(String),
+    /// The definition carries none of the attributes that identify which limit
+    /// of its class is meant; the attribute it has to carry is named.
+    MissingAttribute(&'static str),
+    /// The definition's attributes identify no limit this account holds.
+    UnknownCategory(String),
+}
+
+impl LimitLookupFailure {
+    /// What a refusal tells the caller, which is the same sentence whichever
+    /// operation was refused: the caller has to correct the same definition
+    /// from it either way.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            Self::UnsupportedClass(class) => {
+                format!("There is no limit of class {class} in this account.")
+            }
+            Self::MissingAttribute(attribute) => format!(
+                "The limit definition must include the attribute {attribute} to identify \
+                 the {API_CATEGORY_LIMIT_CLASS} limit it means."
+            ),
+            Self::UnknownCategory(category) => {
+                format!("There is no limit for API category {category} in this account.")
+            }
+        }
+    }
+}
+
+/// Why a requested rate is not one this account can provision for a limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RateRefusal {
+    /// The requested rate is below the rate the limit includes, which is the
+    /// lowest rate it can hold.
+    BelowFreeRate { requested: i32, free_rate: i32 },
+    /// The requested rate is above the account's maximum, so provisioning it
+    /// would need a Service Quotas increase.
+    AboveAccountMaximum { requested: i32, maximum: i32 },
+}
+
+impl RateRefusal {
+    /// What a refusal tells the caller.
+    ///
+    /// A rate outside the account's range names the requested rate and the
+    /// bound it missed, because `UpdateProvisionedLimit` documents the range as
+    /// "the value must be between the default limit and your account-level
+    /// maximum limit in Service Quotas" (this service's model) and neither
+    /// bound is in the request.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            Self::BelowFreeRate {
+                requested,
+                free_rate,
+            } => format!(
+                "The requested limit value {requested} is below the default limit of \
+                 {free_rate} requests per second for this limit."
+            ),
+            Self::AboveAccountMaximum { requested, maximum } => format!(
+                "The requested limit value {requested} exceeds your account's maximum limit \
+                 of {maximum} requests per second for this limit. To increase your limit, \
+                 submit a Service Quotas increase request."
+            ),
+        }
+    }
+}
+
+/// The API category `definition` identifies.
+///
+/// A definition identifies a limit by its class and the attributes of that
+/// class: the request-rate limits are the `API_CATEGORY` class, and the
+/// `Category` attribute is what names one of them. Nothing about the account's
+/// state takes part, so both operations resolve a definition the same way.
+pub fn api_category(
+    definition: &LimitDefinitionType,
+) -> Result<&'static ApiCategory, LimitLookupFailure> {
+    if definition.limit_class != API_CATEGORY_LIMIT_CLASS {
+        return Err(LimitLookupFailure::UnsupportedClass(
+            definition.limit_class.clone(),
+        ));
+    }
+    let named = definition
+        .attributes
+        .get(API_CATEGORY_ATTRIBUTE)
+        .ok_or(LimitLookupFailure::MissingAttribute(API_CATEGORY_ATTRIBUTE))?;
+    API_CATEGORIES
+        .iter()
+        .find(|candidate| candidate.name == named)
+        .ok_or_else(|| LimitLookupFailure::UnknownCategory(named.clone()))
+}
+
+/// The definition that identifies `category`'s limit, as every reader of that
+/// limit renders it: the class of the request-rate limits and the one attribute
+/// that names the category. Built from the RESOLVED category rather than echoed
+/// from a request, so one limit is identified the same way whatever a caller
+/// sent.
+#[must_use]
+pub fn api_category_definition(category: &ApiCategory) -> LimitDefinitionType {
+    LimitDefinitionType {
+        limit_class: API_CATEGORY_LIMIT_CLASS.to_string(),
+        attributes: [(
+            API_CATEGORY_ATTRIBUTE.to_string(),
+            category.name.to_string(),
+        )]
+        .into_iter()
+        .collect(),
+    }
+}
+
+impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
+    /// The limit this account holds for `category`.
+    ///
+    /// A PURE read: the provisioned rate is the one a previous update stored,
+    /// and a limit nothing has adjusted reports the rate the category includes
+    /// at no additional cost — the rate Amazon Cognito enforces until the
+    /// account provisions more.
+    #[must_use]
+    pub fn api_category_limit(&self, category: &ApiCategory) -> LimitType {
+        LimitType {
+            limit_definition: api_category_definition(category),
+            provisioned_limit_value: self
+                .provisioned_api_rates
+                .get(category.name)
+                .copied()
+                .unwrap_or(category.free_rate),
+            free_limit_value: category.free_rate,
+        }
+    }
+
+    /// Provision `requested` requests per second for `category` and return the
+    /// limit as it now stands.
+    ///
+    /// Every rate in the account's range is stored, the rate already in force
+    /// included: the range runs from the rate the category includes up to
+    /// [`MAX_PROVISIONED_API_RATE`], and a rate outside it is refused. A
+    /// refused call stores nothing, so the limit a later read reports is the
+    /// one that was already in force.
+    pub fn set_api_category_limit(
+        &mut self,
+        category: &ApiCategory,
+        requested: i32,
+    ) -> Result<LimitType, RateRefusal> {
+        if requested < category.free_rate {
+            return Err(RateRefusal::BelowFreeRate {
+                requested,
+                free_rate: category.free_rate,
+            });
+        }
+        if requested > MAX_PROVISIONED_API_RATE {
+            return Err(RateRefusal::AboveAccountMaximum {
+                requested,
+                maximum: MAX_PROVISIONED_API_RATE,
+            });
+        }
+        self.provisioned_api_rates
+            .insert(category.name.to_string(), requested);
+        Ok(self.api_category_limit(category))
+    }
 }
 
 // ---------------------------------------------------------------------------
