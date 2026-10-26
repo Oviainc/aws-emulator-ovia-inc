@@ -84,6 +84,24 @@ impl Captured {
         self.headers.get(name).map(String::as_str)
     }
 
+    /// The request's JSON envelope, un-gzipped first when the request says it is gzipped,
+    /// or `None` when the body is neither — what an endpoint reading its own input sees,
+    /// with no case to fail.
+    fn envelope_if_json(&self) -> Option<Value> {
+        let body = match self.header("content-encoding") {
+            Some("gzip") => {
+                let mut decoded = Vec::new();
+                flate2::read::GzDecoder::new(&self.body[..])
+                    .read_to_end(&mut decoded)
+                    .ok()?;
+                decoded
+            }
+            Some(_) => return None,
+            None => self.body.clone(),
+        };
+        serde_json::from_slice(&body).ok()
+    }
+
     /// The request's JSON envelope, un-gzipped first when the request says it is gzipped.
     fn envelope(&self, case: &str) -> Value {
         let body = match self.header("content-encoding") {
@@ -113,18 +131,57 @@ impl Captured {
     }
 }
 
+/// A request id that is not the one of any request this emulator renders: an 8-4-4-4-12
+/// GUID, so an answer naming it is a well-formed answer to ANOTHER request.
+const ANOTHER_REQUEST_ID: &str = "00000000-0000-4000-8000-000000000000";
+
+/// What the body of the endpoint's answer says about the delivery request it answers.
+///
+/// The delivery protocol asks a destination to answer one JSON document naming the request
+/// it is answering, and to report a request it could not process in that document's own
+/// `errorMessage` member rather than in the status line. These are the forms an endpoint's
+/// answer can take around that: the acknowledgment, and each way an answer can fail to be
+/// one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// The acknowledgment: this request's own id.
+    EchoesTheRequestId,
+    /// This request's id beside the `timestamp` the documented answer also carries.
+    EchoesTheRequestIdAndTimestamp,
+    /// This request's id beside an `errorMessage` that reports nothing.
+    EchoesTheRequestIdAndNoError,
+    /// This request's id beside the error the destination reports for it.
+    ReportsAnError,
+    /// [`ANOTHER_REQUEST_ID`], so the answer belongs to a different request.
+    NamesAnotherRequest,
+    /// A JSON object naming no request at all.
+    NamesNoRequest,
+    /// A body that is not JSON.
+    NotJson,
+    /// No body at all.
+    Nothing,
+}
+
 /// An HTTP endpoint that records every delivery request it is sent and answers each with
-/// one status — the in-process transport a delivery is made over.
+/// one status and one form of answer — the in-process transport a delivery is made over.
 #[derive(Debug, Clone)]
 struct Sink {
     status: u16,
+    answer: Answer,
     captured: Arc<Mutex<Vec<Captured>>>,
 }
 
 impl Sink {
+    /// An endpoint answering `status` with the acknowledgment the protocol asks for.
     fn answering(status: u16) -> Self {
+        Self::answering_with(status, Answer::EchoesTheRequestId)
+    }
+
+    /// An endpoint answering `status` with `answer`.
+    fn answering_with(status: u16, answer: Answer) -> Self {
         Self {
             status,
+            answer,
             captured: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -154,9 +211,10 @@ impl HttpConnector for Sink {
             body: request.body().bytes().unwrap_or_default().to_vec(),
         };
         // The acknowledgment the delivery protocol asks a destination for names the
-        // request it acknowledges.
-        let request_id = serde_json::from_slice::<Value>(&captured.body)
-            .ok()
+        // request it acknowledges, which an endpoint reads out of the envelope it was
+        // sent — un-gzipped first when the request says it is gzipped.
+        let request_id = captured
+            .envelope_if_json()
             .and_then(|envelope| {
                 envelope
                     .get("requestId")
@@ -168,11 +226,30 @@ impl HttpConnector for Sink {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(captured);
+        let answered_at = epoch_millis(SystemTime::now());
+        let body = match self.answer {
+            Answer::EchoesTheRequestId => json!({ "requestId": request_id }).to_string(),
+            Answer::EchoesTheRequestIdAndTimestamp => {
+                json!({ "requestId": request_id, "timestamp": answered_at }).to_string()
+            }
+            Answer::EchoesTheRequestIdAndNoError => {
+                json!({ "requestId": request_id, "errorMessage": Value::Null }).to_string()
+            }
+            Answer::ReportsAnError => json!({
+                "requestId": request_id,
+                "timestamp": answered_at,
+                "errorMessage": "the destination could not process this batch",
+            })
+            .to_string(),
+            Answer::NamesAnotherRequest => {
+                json!({ "requestId": ANOTHER_REQUEST_ID, "timestamp": answered_at }).to_string()
+            }
+            Answer::NamesNoRequest => json!({ "timestamp": answered_at }).to_string(),
+            Answer::NotJson => "accepted".to_string(),
+            Answer::Nothing => String::new(),
+        };
         let status = StatusCode::try_from(self.status).expect("the sink's status is a status");
-        let response = HttpResponse::new(
-            status,
-            SdkBody::from(json!({ "requestId": request_id }).to_string()),
-        );
+        let response = HttpResponse::new(status, SdkBody::from(body));
         HttpConnectorFuture::new(Box::pin(async move { Ok(response) }))
     }
 }
@@ -751,6 +828,149 @@ async fn only_a_success_status_acknowledges_a_delivery_to_an_http_endpoint() {
                 emulator.backup_objects().is_empty(),
                 "case {case:?}: nothing is parked in the backup while the retry window is \
                  open, got {:?}",
+                emulator.backup_objects().keys().collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The answer
+// ---------------------------------------------------------------------------
+
+/// One row of the acknowledgment table: how the endpoint answers a delivery request, and
+/// whether that answer hands the buffer over.
+struct AnswerRow {
+    case: &'static str,
+    status: u16,
+    answer: Answer,
+    acknowledges: bool,
+}
+
+#[tokio::test]
+async fn only_an_answer_that_acknowledges_this_request_hands_a_buffer_over() {
+    // Each row varies the answer's body around the one document the delivery protocol asks
+    // a destination for: the request's own id, optionally beside the `timestamp` and the
+    // `errorMessage` that document also carries. A success status is on BOTH sides of the
+    // rule, so what the rows separate is the answer and not the status. The retry window is
+    // wide, so a buffer an answer did not hand over is one the records are still waiting
+    // for.
+    let rows = [
+        AnswerRow {
+            case: "acknowledged",
+            status: 200,
+            answer: Answer::EchoesTheRequestId,
+            acknowledges: true,
+        },
+        AnswerRow {
+            case: "acknowledged-with-timestamp",
+            status: 200,
+            answer: Answer::EchoesTheRequestIdAndTimestamp,
+            acknowledges: true,
+        },
+        AnswerRow {
+            case: "acknowledged-with-no-error",
+            status: 200,
+            answer: Answer::EchoesTheRequestIdAndNoError,
+            acknowledges: true,
+        },
+        AnswerRow {
+            case: "acknowledged-at-201",
+            status: 201,
+            answer: Answer::EchoesTheRequestId,
+            acknowledges: true,
+        },
+        AnswerRow {
+            case: "reports-an-error",
+            status: 200,
+            answer: Answer::ReportsAnError,
+            acknowledges: false,
+        },
+        AnswerRow {
+            case: "reports-an-error-at-202",
+            status: 202,
+            answer: Answer::ReportsAnError,
+            acknowledges: false,
+        },
+        AnswerRow {
+            case: "names-another-request",
+            status: 200,
+            answer: Answer::NamesAnotherRequest,
+            acknowledges: false,
+        },
+        AnswerRow {
+            case: "names-no-request",
+            status: 200,
+            answer: Answer::NamesNoRequest,
+            acknowledges: false,
+        },
+        AnswerRow {
+            case: "answers-what-is-not-json",
+            status: 200,
+            answer: Answer::NotJson,
+            acknowledges: false,
+        },
+        AnswerRow {
+            case: "answers-no-body",
+            status: 200,
+            answer: Answer::Nothing,
+            acknowledges: false,
+        },
+    ];
+
+    let emulator = Emulator::new();
+    emulator.create_bucket(BACKUP_BUCKET).await;
+    let payloads: &[&[u8]] = &[b"first", b"second"];
+
+    // Every row's stream is created first, so the `CREATING` -> `ACTIVE` span is waited out
+    // once for the whole table.
+    let mut cases = Vec::new();
+    for row in rows {
+        let sink = Sink::answering_with(row.status, row.answer);
+        let config = endpoint_configuration(&endpoint_url(row.case), 60);
+        emulator.create_endpoint_stream(row.case, config).await;
+        cases.push((row, sink));
+    }
+    emulator.await_active_streams().await;
+
+    for (row, sink) in cases {
+        let transport = sink.transport();
+        emulator.put_batch(row.case, payloads).await;
+        emulator
+            .deliver_until(
+                row.case,
+                row.case,
+                &transport,
+                "the endpoint is sent the buffer",
+                || !sink.captured().is_empty(),
+            )
+            .await;
+
+        if row.acknowledges {
+            emulator
+                .deliver_until(
+                    row.case,
+                    row.case,
+                    &transport,
+                    "the buffer is handed over",
+                    || emulator.buffered(row.case).is_empty(),
+                )
+                .await;
+        } else {
+            // The records are neither delivered nor lost: they stay buffered for the
+            // retry window. The buffer is taken out of the store for the duration of an
+            // attempt, so this waits for the restored buffer rather than reading once.
+            let expected: Vec<Vec<u8>> = payloads.iter().map(|data| data.to_vec()).collect();
+            emulator
+                .wait_until(row.case, "the records are back in the buffer", || {
+                    emulator.buffered(row.case) == expected
+                })
+                .await;
+            assert!(
+                emulator.backup_objects().is_empty(),
+                "case {:?}: nothing is parked in the backup while the retry window is open, \
+                 got {:?}",
+                row.case,
                 emulator.backup_objects().keys().collect::<Vec<_>>()
             );
         }

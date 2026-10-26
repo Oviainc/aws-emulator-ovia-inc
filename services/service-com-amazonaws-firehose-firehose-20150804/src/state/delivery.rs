@@ -385,6 +385,15 @@ const HTTP_ENDPOINT_DESTINATION_EXCEPTION: DeliveryFailure = DeliveryFailure {
     error_message: "the HTTP endpoint destination did not acknowledge the delivery",
 };
 
+/// The failure of a buffer the HTTP endpoint answered with a SUCCESS status, but not with
+/// the acknowledgment the delivery protocol asks for: the answer is not one JSON document
+/// naming the request it answers, or it reports an error of its own in that document.
+const HTTP_ENDPOINT_INVALID_RESPONSE: DeliveryFailure = DeliveryFailure {
+    output_type: HTTP_ENDPOINT_FAILED_OUTPUT_TYPE,
+    error_code: "HttpEndpoint.InvalidResponseFromDestination",
+    error_message: "the HTTP endpoint destination's answer did not acknowledge the delivery",
+};
+
 /// The failure of a buffer whose delivery request could not be made at all: nothing this
 /// emulator serves answers at that URL, or the configuration does not render a request
 /// (a `Url` that is not a URI, an `AccessKey` or a common attribute that is not a header
@@ -998,8 +1007,9 @@ pub async fn deliver_due<Eng: Send + Sync + 'static>(
 /// describes: a `POST` of the JSON envelope [`request_envelope`] renders, with the protocol
 /// version, the request id the envelope also carries, the Firehose stream the records came
 /// from, the configured access key and common attributes, and the body gzipped where
-/// `ContentEncoding` asks for it. A `2xx` answer is the acknowledgment; anything else, and
-/// any request that could not be made at all, is a failed delivery.
+/// `ContentEncoding` asks for it. The acknowledgment is a success status whose answer
+/// ACKNOWLEDGES this request ([`acknowledges`]); any other answer, and any request that
+/// could not be made at all, is a failed delivery.
 ///
 /// The request goes through the IN-PROCESS emulator transport and NOTHING else, so a URL a
 /// caller configured reaches only what this emulator serves itself: no socket is opened
@@ -1078,16 +1088,72 @@ async fn post_to_endpoint(
             HTTP_ENDPOINT_CONNECTION_FAILED
         })?;
     let status = response.status().as_u16();
-    if (200..300).contains(&status) {
-        return Ok(());
+    if !(200..300).contains(&status) {
+        ::tracing::warn!(
+            stream = %delivery.stream,
+            status,
+            "the HTTP endpoint destination did not acknowledge this delivery"
+        );
+        return Err(HTTP_ENDPOINT_DESTINATION_EXCEPTION);
     }
-    ::tracing::warn!(
-        stream = %delivery.stream,
-        status,
-        "the HTTP endpoint destination did not acknowledge this delivery"
-    );
-    Err(HTTP_ENDPOINT_DESTINATION_EXCEPTION)
+    if let Err(reason) = acknowledges(&response, &request_id) {
+        ::tracing::warn!(
+            stream = %delivery.stream,
+            status,
+            reason,
+            "the HTTP endpoint destination's answer does not acknowledge this delivery"
+        );
+        return Err(HTTP_ENDPOINT_INVALID_RESPONSE);
+    }
+    Ok(())
 }
+
+/// Whether the endpoint's answer ACKNOWLEDGES the delivery request `request_id`, or why it
+/// does not.
+///
+/// A success status is not by itself the acknowledgment: the delivery protocol
+/// `HttpEndpointConfiguration$Url` points at asks a destination to answer one JSON document
+/// naming the request it is answering, and to report a request it could not process in that
+/// document's own error member rather than in the status line. So an answer hands this
+/// buffer over only when its body is a JSON object whose `requestId` is THIS request's and
+/// whose error member is absent or empty; anything else — an unreadable or non-JSON body, a
+/// body naming no request or another one, a body reporting an error — is a buffer the
+/// destination has not taken, which is then retried and finally parked exactly like one it
+/// refused outright.
+fn acknowledges(
+    response: &::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    request_id: &str,
+) -> Result<(), &'static str> {
+    let Some(body) = response.body().bytes() else {
+        return Err("the answer's body could not be read");
+    };
+    let Ok(answer) = ::serde_json::from_slice::<::serde_json::Value>(body) else {
+        return Err("the answer's body is not JSON");
+    };
+    let Some(answered) = answer
+        .get(ANSWER_REQUEST_ID_MEMBER)
+        .and_then(::serde_json::Value::as_str)
+    else {
+        return Err("the answer names no request");
+    };
+    if answered != request_id {
+        return Err("the answer names another request");
+    }
+    match answer.get(ANSWER_ERROR_MESSAGE_MEMBER) {
+        None | Some(::serde_json::Value::Null) => Ok(()),
+        Some(::serde_json::Value::String(message)) if message.is_empty() => Ok(()),
+        Some(_) => Err("the answer reports an error of its own"),
+    }
+}
+
+/// The member of the endpoint's answer naming the delivery request it answers, which an
+/// acknowledgment names this request in.
+const ANSWER_REQUEST_ID_MEMBER: &str = "requestId";
+
+/// The member of the endpoint's answer reporting that the destination did not process the
+/// delivered buffer, so an answer carrying one is not an acknowledgment whatever its status
+/// said.
+const ANSWER_ERROR_MESSAGE_MEMBER: &str = "errorMessage";
 
 /// The JSON body of one delivery request: the request's own id, the instant it was made and
 /// one entry per buffered record carrying that record's data base64-encoded, in arrival
