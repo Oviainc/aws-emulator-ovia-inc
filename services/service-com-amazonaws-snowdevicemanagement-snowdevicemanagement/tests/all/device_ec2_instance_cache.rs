@@ -26,9 +26,9 @@
 //! state the entry is in, whether its owed instant has passed, the device, and how
 //! many instances that device runs.
 //!
-//! The tiny HTTP harness below is local to this suite on purpose: a sibling suite's
-//! helpers are private to its module, and this file must keep compiling while that
-//! one changes.
+//! The tiny HTTP harness below is this suite's own on purpose: the sibling lifecycle
+//! suite's helpers sign for another Region. It is shared with the suite that pins WHEN
+//! a reboot's refresh is applied, which is about the same cache.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -59,7 +59,7 @@ const ACTIVATED_DEVICES: u64 = 3;
 /// How much slack a comparison of two reported instants allows, in seconds. The
 /// instants under test are hundreds of milliseconds apart, so this is well inside
 /// the differences the cases assert.
-const TOLERANCE: f64 = 1e-2;
+pub(crate) const TOLERANCE: f64 = 1e-2;
 
 /// `InstanceStateName`'s values, each with the `InstanceState$code` the model
 /// documents for it and the state the work that value names ends in — `None` for a
@@ -73,7 +73,7 @@ const TOLERANCE: f64 = 1e-2;
 /// down ends up terminated, one that is stopping ends up stopped. Written out here
 /// rather than imported, so a wrong catalog in the implementation cannot make this
 /// suite pass.
-const INSTANCE_STATES: &[(&str, i64, Option<&str>)] = &[
+pub(crate) const INSTANCE_STATES: &[(&str, i64, Option<&str>)] = &[
     ("PENDING", 0, Some("RUNNING")),
     ("RUNNING", 16, None),
     ("SHUTTING_DOWN", 32, Some("TERMINATED")),
@@ -89,7 +89,7 @@ const INSTANCE_STATES: &[(&str, i64, Option<&str>)] = &[
 /// that was under way ends with the restart, and an instance that would then be up
 /// comes back up — which an instance reports as starting. An instance that was
 /// deliberately stopped, or that no longer exists, stays that way.
-fn state_after_a_restart(before: &str) -> &'static str {
+pub(crate) fn state_after_a_restart(before: &str) -> &'static str {
     let ended = INSTANCE_STATES
         .iter()
         .find(|(name, _, _)| *name == before)
@@ -107,7 +107,7 @@ fn state_after_a_restart(before: &str) -> &'static str {
 }
 
 /// The `InstanceState$code` this suite's catalog documents for `state_name`.
-fn documented_code(state_name: &str) -> i64 {
+pub(crate) fn documented_code(state_name: &str) -> i64 {
     INSTANCE_STATES
         .iter()
         .find(|(name, _, _)| *name == state_name)
@@ -118,9 +118,9 @@ fn documented_code(state_name: &str) -> i64 {
 /// One emulator and the engine its state lives in: a router carrying only this
 /// service, with Snow Device Management activated on [`ACTIVATED_DEVICES`] ordered
 /// devices in [`SIGNED_REGION`].
-struct Emulator {
-    router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
+pub(crate) struct Emulator {
+    pub(crate) router: MultiServiceRouter,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 /// The emulator every case starts from, with the fixture's OWED instants held past
@@ -132,7 +132,7 @@ struct Emulator {
 /// few hundred milliseconds out; each case below stages the entry and the instant it
 /// is about, so the fixture's own instants are moved out of the way first and no case
 /// depends on how fast the machine runs it.
-fn emulator() -> Emulator {
+pub(crate) fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     {
         let state = service_state(&*engine).expect("the in-memory engine carries this service's state");
@@ -154,12 +154,12 @@ fn emulator() -> Emulator {
 }
 
 /// What the emulator answered: the HTTP status and the JSON body.
-struct Answer {
-    status: u16,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
-async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Option<Value>) -> Answer {
+pub(crate) async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Option<Value>) -> Answer {
     let payload = body.map(|value| value.to_string()).unwrap_or_default();
     let mut builder = ::http::Request::builder()
         .method(method)
@@ -190,7 +190,7 @@ async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Option
 }
 
 /// Assert a call succeeded and hand back its body.
-fn ok(answer: &Answer, case: &str) -> Value {
+pub(crate) fn ok(answer: &Answer, case: &str) -> Value {
     assert_eq!(
         answer.status, 200,
         "case {case:?}: expected HTTP 200, got {} with {}",
@@ -200,7 +200,7 @@ fn ok(answer: &Answer, case: &str) -> Value {
 }
 
 /// `DescribeDeviceEc2Instances`, as a map from `instanceId` to the reported summary.
-async fn cache_of(
+pub(crate) async fn cache_of(
     em: &Emulator,
     device: &str,
     instance_ids: &[String],
@@ -229,17 +229,17 @@ async fn cache_of(
 }
 
 /// `CreateTask`: `POST /task`.
-async fn create_task(em: &Emulator, request: Value) -> Answer {
+pub(crate) async fn create_task(em: &Emulator, request: Value) -> Answer {
     call(&em.router, "POST", "/task", Some(request)).await
 }
 
 /// `DescribeTask`: `POST /task/{taskId}`.
-async fn describe_task(em: &Emulator, task_id: &str) -> Answer {
+pub(crate) async fn describe_task(em: &Emulator, task_id: &str) -> Answer {
     call(&em.router, "POST", &format!("/task/{task_id}"), None).await
 }
 
 /// The epoch-seconds the timestamp at `path` carries.
-fn epoch(summary: &Value, path: &[&str], case: &str) -> f64 {
+pub(crate) fn epoch(summary: &Value, path: &[&str], case: &str) -> f64 {
     let mut cursor = summary;
     for key in path {
         cursor = &cursor[*key];
@@ -250,14 +250,14 @@ fn epoch(summary: &Value, path: &[&str], case: &str) -> f64 {
 }
 
 /// `at` as the epoch-seconds the wire carries it in.
-fn seconds(at: SystemTime) -> f64 {
+pub(crate) fn seconds(at: SystemTime) -> f64 {
     at.duration_since(UNIX_EPOCH)
         .expect("an instant after the epoch")
         .as_secs_f64()
 }
 
 /// The reported state name of one summary.
-fn state_name(summary: &Value, case: &str) -> String {
+pub(crate) fn state_name(summary: &Value, case: &str) -> String {
     summary["instance"]["state"]["name"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: expected a state name, got {summary}"))
@@ -267,7 +267,7 @@ fn state_name(summary: &Value, case: &str) -> String {
 /// Every rule a reported summary satisfies whatever the case: its state code is the
 /// one its name is documented with, and both freshness members report the same
 /// instant, since both say when the entry was last updated.
-fn assert_consistent(summary: &Value, case: &str) {
+pub(crate) fn assert_consistent(summary: &Value, case: &str) {
     let name = state_name(summary, case);
     let code = summary["instance"]["state"]["code"]
         .as_i64()
@@ -292,7 +292,7 @@ fn assert_consistent(summary: &Value, case: &str) {
 /// The cache is written by the device and not by any request this API models, so a
 /// case that is about an entry the device pushed stages it here, the same way the
 /// inventory is staged.
-fn stage_instance(
+pub(crate) fn stage_instance(
     em: &Emulator,
     device: &str,
     instance: &str,

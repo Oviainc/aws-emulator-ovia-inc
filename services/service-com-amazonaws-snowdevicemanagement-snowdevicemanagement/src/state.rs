@@ -1157,17 +1157,6 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
             }
         }
 
-        // The devices' Amazon EC2 instance caches: an instance state that names
-        // work in flight resolves to the state that work ends in once its own
-        // instant has passed ([`Ec2Instance::settle`]). This is owed whoever calls
-        // and whether or not any task ran, so it is materialised for every device,
-        // ahead of what a settling execution reports to its own device below.
-        for device in self.devices.values_mut() {
-            for instance in device.ec2_instances.values_mut() {
-                instance.settle(now);
-            }
-        }
-
         effects.sort_by_key(|effect| (effect.at, effect.phase.settles_first()));
         for DeviceEffect {
             at,
@@ -1206,11 +1195,28 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
             // instances run in back up and reported that whole set afresh: the
             // cloud-side cache this account reads is the one the restart produced
             // ([`Ec2Instance::restart`]). That is what the device has DONE, so it
-            // is applied when the reboot finished, not when it began.
+            // is applied AT the instant the reboot finished — the same instant the
+            // check-in above records — and not when it began or when someone
+            // looked. Each entry is first carried to what it owed by that instant,
+            // so the restart is applied to the entry as it stood then.
             if command == TaskCommand::Reboot && phase == DeviceCommandPhase::Finished {
                 for instance in device.ec2_instances.values_mut() {
-                    instance.restart(now);
+                    instance.settle(at);
+                    instance.restart(at);
                 }
+            }
+        }
+
+        // The devices' Amazon EC2 instance caches: an instance state that names
+        // work in flight resolves to the state that work ends in once its own
+        // instant has passed ([`Ec2Instance::settle`]). This is owed whoever calls
+        // and whether or not any task ran, so it is materialised for every device —
+        // after what a settling execution reported to its own device above, so that
+        // the in-flight state a restart leaves an instance in is carried on by the
+        // clock from the instant the restart produced it, like any other.
+        for device in self.devices.values_mut() {
+            for instance in device.ec2_instances.values_mut() {
+                instance.settle(now);
             }
         }
 
