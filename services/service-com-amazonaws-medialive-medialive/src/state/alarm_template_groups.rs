@@ -155,6 +155,61 @@ impl ComAmazonawsMedialiveMedialiveState {
             .or_else(|| self.alarm_template_group_named(region, identifier))
     }
 
+    /// The cloudwatch alarm template groups stored in `region`, in the order
+    /// their ids were minted, beginning at the group `start` names when a
+    /// `NextToken` carried a resume point.
+    ///
+    /// The store itself is private, so this is how a listing reads it — the same
+    /// reading the listing of the TEMPLATES inside them already uses
+    /// ([`ComAmazonawsMedialiveMedialiveState::alarm_templates_in`]): a
+    /// `BTreeMap` range scan from the resume point, which is why a token naming a
+    /// group deleted since the previous page resumes at the next surviving id
+    /// instead of failing. Groups of other regions are invisible, for the reason
+    /// [`Self::alarm_template_group`] states.
+    pub fn alarm_template_groups_in<'a>(
+        &'a self,
+        region: &'a str,
+        start: Option<&'a str>,
+    ) -> impl Iterator<Item = &'a CloudWatchAlarmTemplateGroupRecord> + 'a {
+        let first = match start {
+            Some(token) => ::std::ops::Bound::Included(token),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        self.alarm_template_groups
+            .range::<str, _>((first, ::std::ops::Bound::Unbounded))
+            .map(|(_, group)| group)
+            .filter(move |group| group.region == region)
+    }
+
+    /// Project a stored group onto the `CloudWatchAlarmTemplateGroupSummary` a
+    /// listing reports.
+    ///
+    /// Every member the summary shares with the flat group shape
+    /// ([`alarm_template_group_output`]) carries the stored value, so a listing
+    /// and the `GetCloudWatchAlarmTemplateGroup` beside it cannot disagree about
+    /// one group. Where the two shapes differ, the summary adds `TemplateCount` —
+    /// "The number of templates in a group", which is derived from the templates
+    /// that exist right now
+    /// ([`ComAmazonawsMedialiveMedialiveState::alarm_template_ids_in_group`])
+    /// rather than from anything recorded on the group, so it tracks every later
+    /// template create and delete.
+    pub fn alarm_template_group_summary(
+        &self,
+        group: &CloudWatchAlarmTemplateGroupRecord,
+    ) -> crate::ops::types::CloudWatchAlarmTemplateGroupSummary {
+        crate::ops::types::CloudWatchAlarmTemplateGroupSummary {
+            arn: group.arn.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(group.created_at),
+            description: group.description.clone(),
+            id: group.id.clone(),
+            modified_at: Some(::aws_smithy_types::DateTime::from(group.modified_at)),
+            name: group.name.clone(),
+            tags: Some(group.tags.clone()),
+            template_count: i32::try_from(self.alarm_template_ids_in_group(&group.id).len())
+                .unwrap_or(i32::MAX),
+        }
+    }
+
     /// Remove the cloudwatch alarm template group `identifier` names in
     /// `region`, answering the record that was removed — or refuse.
     ///

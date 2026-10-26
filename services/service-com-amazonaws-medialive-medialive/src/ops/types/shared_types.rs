@@ -752,6 +752,148 @@ macro_rules! signal_map_response {
     };
 }
 
+/// The schema, the serializer and the deserializer for one monitor template-GROUP
+/// SUMMARY shape — the shape a group LISTING reports.
+///
+/// `CloudWatchAlarmTemplateGroupSummary` and `EventBridgeRuleTemplateGroupSummary` are
+/// member for member the same shape (`smithy_query(query="shape",shape="…")`): the seven
+/// members of the flat group shape ([`template_group_response`]) plus `TemplateCount`, in
+/// the model's order, with `CreatedAt` and `ModifiedAt` targeting `__timestampIso8601`. One
+/// macro rather than two copies of the same 150 lines, so the two cannot drift from each
+/// other or from the model.
+///
+/// Unlike the flat response shapes this one DOES carry a deserializer: a summary is the
+/// element of a list member of a derived response shape, and the derive on that shape reads
+/// each element through `DeserializableStruct`.
+///
+/// The `@required` members (`Arn`, `CreatedAt`, `Id`, `Name`, `TemplateCount`) are bare
+/// fields refused by name when absent, exactly as the derive has them.
+macro_rules! template_group_summary {
+    ($ty:ident, $schema_static:ident, $shape:literal) => {
+        impl $ty {
+            const M_ARN: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Arn", "arn", String, 0);
+            const M_CREATED_AT: ::aws_smithy_schema::Schema =
+                shared_types::date_time_member_of!($shape, "CreatedAt", "createdAt", 1);
+            const M_DESCRIPTION: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Description", "description", String, 2);
+            const M_ID: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Id", "id", String, 3);
+            const M_MODIFIED_AT: ::aws_smithy_schema::Schema =
+                shared_types::date_time_member_of!($shape, "ModifiedAt", "modifiedAt", 4);
+            const M_NAME: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Name", "name", String, 5);
+            const M_TAGS: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Tags", "tags", Map, 6);
+            const M_TEMPLATE_COUNT: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "TemplateCount", "templateCount", Integer, 7);
+
+            pub const SCHEMA: ::aws_smithy_schema::Schema =
+                ::aws_smithy_schema::Schema::new_struct(
+                    ::aws_smithy_schema::ShapeId::from_static(
+                        concat!("com.amazonaws.medialive#", $shape),
+                        shared_types::NAMESPACE,
+                        $shape,
+                    ),
+                    ::aws_smithy_schema::ShapeType::Structure,
+                    &[
+                        &Self::M_ARN,
+                        &Self::M_CREATED_AT,
+                        &Self::M_DESCRIPTION,
+                        &Self::M_ID,
+                        &Self::M_MODIFIED_AT,
+                        &Self::M_NAME,
+                        &Self::M_TAGS,
+                        &Self::M_TEMPLATE_COUNT,
+                    ],
+                );
+        }
+
+        pub static $schema_static: &::aws_smithy_schema::Schema = &$ty::SCHEMA;
+
+        impl ::aws_smithy_schema::serde::SerializableStruct for $ty {
+            fn serialize_members(
+                &self,
+                serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+            ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+                serializer.write_string(&Self::M_ARN, self.arn.as_str())?;
+                serializer.write_timestamp(&Self::M_CREATED_AT, &self.created_at)?;
+                if let Some(value) = self.description.as_ref() {
+                    serializer.write_string(&Self::M_DESCRIPTION, value.as_str())?;
+                }
+                serializer.write_string(&Self::M_ID, self.id.as_str())?;
+                if let Some(value) = self.modified_at.as_ref() {
+                    serializer.write_timestamp(&Self::M_MODIFIED_AT, value)?;
+                }
+                serializer.write_string(&Self::M_NAME, self.name.as_str())?;
+                if let Some(value) = self.tags.as_ref() {
+                    serializer.write_map(&Self::M_TAGS, &|entries| {
+                        for (key, tag) in value.iter() {
+                            entries.write_string(&Self::M_TAGS, key.as_str())?;
+                            entries.write_string(&Self::M_TAGS, tag.as_str())?;
+                        }
+                        Ok(())
+                    })?;
+                }
+                serializer.write_integer(&Self::M_TEMPLATE_COUNT, self.template_count)?;
+                Ok(())
+            }
+        }
+
+        impl ::aws_smithy_schema_server::DeserializableStruct for $ty {
+            fn deserialize(
+                deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+            ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+                let mut arn = ::std::option::Option::None;
+                let mut created_at = ::std::option::Option::None;
+                let mut description = ::std::option::Option::None;
+                let mut id = ::std::option::Option::None;
+                let mut modified_at = ::std::option::Option::None;
+                let mut name = ::std::option::Option::None;
+                let mut tags = ::std::option::Option::None;
+                let mut template_count = ::std::option::Option::None;
+                deserializer.read_struct(&Self::SCHEMA, &mut |member, reader| {
+                    match member.member_index() {
+                        Some(0) => arn = Some(reader.read_string(&Self::M_ARN)?),
+                        Some(1) => created_at = Some(reader.read_timestamp(&Self::M_CREATED_AT)?),
+                        Some(2) => description = Some(reader.read_string(&Self::M_DESCRIPTION)?),
+                        Some(3) => id = Some(reader.read_string(&Self::M_ID)?),
+                        Some(4) => modified_at = Some(reader.read_timestamp(&Self::M_MODIFIED_AT)?),
+                        Some(5) => name = Some(reader.read_string(&Self::M_NAME)?),
+                        Some(6) => {
+                            let mut entries: ::std::collections::HashMap<String, String> =
+                                ::std::collections::HashMap::new();
+                            reader.read_map(&Self::M_TAGS, &mut |key, value| {
+                                entries.insert(key, value.read_string(&Self::M_TAGS)?);
+                                Ok(())
+                            })?;
+                            tags = Some(entries);
+                        }
+                        Some(7) => {
+                            template_count = Some(reader.read_integer(&Self::M_TEMPLATE_COUNT)?);
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                })?;
+                Ok(Self {
+                    arn: arn.ok_or_else(|| ::aws_smithy_schema_server::missing_member("Arn"))?,
+                    created_at: created_at
+                        .ok_or_else(|| ::aws_smithy_schema_server::missing_member("CreatedAt"))?,
+                    description,
+                    id: id.ok_or_else(|| ::aws_smithy_schema_server::missing_member("Id"))?,
+                    modified_at,
+                    name: name.ok_or_else(|| ::aws_smithy_schema_server::missing_member("Name"))?,
+                    tags,
+                    template_count: template_count.ok_or_else(|| {
+                        ::aws_smithy_schema_server::missing_member("TemplateCount")
+                    })?,
+                })
+            }
+        }
+    };
+}
+
 // Re-exported as items so the hand-written shapes of this service can invoke them by path
 // (`shared_types::member_of!(..)`) from whichever `types/` module declares them, without a
 // copy of the macro per module.
@@ -761,6 +903,7 @@ pub(crate) use event_bridge_rule_template_response;
 pub(crate) use member_of;
 pub(crate) use signal_map_response;
 pub(crate) use template_group_response;
+pub(crate) use template_group_summary;
 
 #[smithy_macros::smithy(shape = "com.amazonaws.medialive#BadGatewayException")]
 #[derive(Debug, Clone, Default)]

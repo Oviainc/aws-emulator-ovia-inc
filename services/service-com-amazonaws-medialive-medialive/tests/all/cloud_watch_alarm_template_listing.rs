@@ -104,7 +104,7 @@ async fn create_group(router: &MultiServiceRouter, region: &str, name: &str) -> 
 /// Every REQUIRED member of `CreateCloudWatchAlarmTemplate` besides
 /// `GroupIdentifier`, with one modelled value each, so a row that varies ONE
 /// member still sends a complete request.
-fn required_members(name: &str) -> Value {
+pub fn required_members(name: &str) -> Value {
     json!({
         "name": name,
         "comparisonOperator": COMPARISON_OPERATORS[1],

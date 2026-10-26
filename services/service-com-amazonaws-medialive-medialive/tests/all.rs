@@ -74,6 +74,9 @@ mod cloud_watch_alarm_template_datapoints;
 #[path = "all/cloud_watch_alarm_template_deletion.rs"]
 mod cloud_watch_alarm_template_deletion;
 
+#[path = "all/cloud_watch_alarm_template_group_listing.rs"]
+mod cloud_watch_alarm_template_group_listing;
+
 #[path = "all/cloud_watch_alarm_template_groups.rs"]
 mod cloud_watch_alarm_template_groups;
 

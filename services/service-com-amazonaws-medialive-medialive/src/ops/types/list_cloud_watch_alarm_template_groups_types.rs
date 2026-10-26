@@ -27,7 +27,19 @@ pub struct ListCloudWatchAlarmTemplateGroupsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.medialive#CloudWatchAlarmTemplateGroupSummary")]
+/// `CloudWatchAlarmTemplateGroupSummary`, with its schema written out instead of derived
+/// because `CreatedAt` and `ModifiedAt` target `__timestampIso8601`, which is
+/// `@timestampFormat("date-time")`; the note in `shared_types` says why that cannot be
+/// derived here. Member for member this is the model's shape: same ids, same order, same
+/// indices.
+///
+/// It DOES carry a deserializer: it is the element of
+/// `ListCloudWatchAlarmTemplateGroupsResponse$CloudWatchAlarmTemplateGroups`, and the
+/// derive on that shape reads each element through `DeserializableStruct`.
+///
+/// The schema, the serializer and the deserializer themselves come from
+/// `shared_types::template_group_summary!`, shared with the eventbridge rule template
+/// group summary, which is member for member the same shape.
 #[derive(Debug, Clone)]
 pub struct CloudWatchAlarmTemplateGroupSummary {
     pub arn: String,
@@ -39,4 +51,10 @@ pub struct CloudWatchAlarmTemplateGroupSummary {
     pub tags: Option<std::collections::HashMap<String, String>>,
     pub template_count: i32,
 }
+
+shared_types::template_group_summary!(
+    CloudWatchAlarmTemplateGroupSummary,
+    CLOUD_WATCH_ALARM_TEMPLATE_GROUP_SUMMARY_SCHEMA,
+    "CloudWatchAlarmTemplateGroupSummary"
+);
 
