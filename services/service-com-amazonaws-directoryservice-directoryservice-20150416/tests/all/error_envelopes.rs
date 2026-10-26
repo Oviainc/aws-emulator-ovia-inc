@@ -309,7 +309,7 @@ fn refusal_table(directory_id: &str, taken_alias: &str) -> Vec<Refusal> {
         operation: "DescribeSnapshots",
         body: json!({ "SnapshotIds": ["s-0000000000"] }),
         error: "EntityDoesNotExistException",
-        diagnostic: Diagnostic::Fixed("Snapshot s-0000000000 does not exist".to_string()),
+        diagnostic: Diagnostic::Fixed("Snapshot: s-0000000000 does not exist".to_string()),
     });
     rows.push(Refusal {
         case: "DescribeADAssessment on an absent assessment".to_string(),
