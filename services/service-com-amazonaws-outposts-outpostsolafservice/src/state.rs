@@ -2476,6 +2476,12 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         in_region_mut(&mut self.quotes, region, quote_id)
     }
 
+    /// Remove the quote `quote_id` names in `region`. See [`Self::remove_site`].
+    pub fn remove_quote(&mut self, region: &str, quote_id: &str) -> Option<QuoteRecord> {
+        in_region(&self.quotes, region, quote_id)?;
+        self.quotes.remove(quote_id)
+    }
+
     /// Every quote of `region`, in the store's creation order — what `ListQuotes`
     /// pages through. See [`RegionalRecord`].
     pub fn quotes_in<'a>(&'a self, region: &str) -> impl Iterator<Item = &'a QuoteRecord> + 'a {
