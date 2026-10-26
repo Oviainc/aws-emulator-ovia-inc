@@ -10,7 +10,7 @@
 //! state seam (`RecommendedActionsStore::seed`), because the service models no
 //! create operation: AWS computes the recommendations itself.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -2006,6 +2006,348 @@ async fn a_token_names_one_selection_whatever_characters_its_values_carry() {
                 body.get("recommendedActions").is_none(),
                 "case {case:?}: a refused token must not silently report a page, got {body}"
             );
+        }
+    }
+}
+
+/// The identity of a listing's SELECTION: `filter.actions` reduced to the SET of
+/// (`key`, `matchOption`, value SET) predicates it ANDs.
+///
+/// That is the rule a `nextToken` has to name. The filters are ANDed, so their
+/// order does not matter and ANDing one with itself changes nothing; each filter
+/// tests membership of a set of values, so the order and repetition of `values`
+/// does not matter either. Nothing else about the request body takes part: two
+/// bodies name one listing exactly when these sets are equal.
+type SelectionId = BTreeSet<(String, String, BTreeSet<String>)>;
+
+/// One spelling of one selection: a label and the request body that writes it.
+struct SelectionSpelling {
+    label: &'static str,
+    body: Value,
+}
+
+/// The [`SelectionId`] a request body names.
+fn selection_id(case: &str, body: &Value) -> SelectionId {
+    let Some(actions) = body
+        .get("filter")
+        .and_then(|filter| filter.get("actions"))
+    else {
+        // No filter (or a filter naming no actions) selects every record: the empty
+        // set of predicates.
+        return SelectionId::new();
+    };
+    actions
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: filter.actions is not an array: {actions}"))
+        .iter()
+        .map(|action| {
+            let member = |name: &str| {
+                action
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("case {case:?}: filter carries no {name}: {action}"))
+                    .to_string()
+            };
+            let values: BTreeSet<String> = action
+                .get("values")
+                .and_then(Value::as_array)
+                .unwrap_or_else(|| panic!("case {case:?}: filter carries no values: {action}"))
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .unwrap_or_else(|| {
+                            panic!("case {case:?}: a filter value is not a string: {value}")
+                        })
+                        .to_string()
+                })
+                .collect();
+            (member("key"), member("matchOption"), values)
+        })
+        .collect()
+}
+
+/// A selection rendered the way a CONCATENATION tells selections apart: each filter
+/// written `<key>:<matchOption>:<value>,<value>…` and the filters joined with `&`,
+/// nothing escaped.
+///
+/// This is not what the service does — it is how the sweep below proves its own
+/// coverage. `FilterValue` is modelled `length 1..1024, pattern [\S\s]*`
+/// (`smithy_query(query="shape", shape="FilterValues")`), so a caller-supplied value
+/// may carry `,`, `:` or `&`; whenever two DIFFERENT selections render alike here,
+/// an identity taken over this rendering cannot tell them apart, and a token issued
+/// over one would resume the other at an offset computed over records it never
+/// named.
+fn concatenated_rendering(id: &SelectionId) -> String {
+    let mut parts: Vec<String> = id
+        .iter()
+        .map(|(key, match_option, values)| {
+            let values: Vec<&str> = values.iter().map(String::as_str).collect();
+            format!("{key}:{match_option}:{}", values.join(","))
+        })
+        .collect();
+    parts.sort();
+    parts.join("&")
+}
+
+/// The same request body with one more top-level member.
+fn with_member(case: &str, body: &Value, member: &str, value: Value) -> Value {
+    let mut body = body.clone();
+    body.as_object_mut()
+        .unwrap_or_else(|| panic!("case {case:?}: the request body is not a JSON object"))
+        .insert(member.to_string(), value);
+    body
+}
+
+/// Spellings of selections, differing along what the rule generalises over: which
+/// separator a value carries (`,`, `:`, `&`) and where in the value it sits, how
+/// many values and how many filters the selection ANDs, the order and the
+/// repetition of both, the match option (the model's whole `MatchOption` set), the
+/// key filtered on (`FEATURE` / `SEVERITY` / `TYPE`, the model's whole `FilterName`
+/// set, `smithy_query(query="shape", shape="FilterName,MatchOption")`), and the
+/// unfiltered selection written two ways.
+fn selection_spellings() -> Vec<SelectionSpelling> {
+    let spelling = |label: &'static str, body: Value| SelectionSpelling { label, body };
+    vec![
+        spelling("no filter member at all", json!({})),
+        spelling("a filter naming no actions", json!({"filter": {}})),
+        spelling(
+            "one feature value carrying a comma",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["BUDGETS,PAYMENTS"]}
+            ]}}),
+        ),
+        spelling(
+            "two feature values",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["BUDGETS", "PAYMENTS"]}
+            ]}}),
+        ),
+        spelling(
+            "those two values reordered and repeated",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS",
+                 "values": ["PAYMENTS", "BUDGETS", "PAYMENTS"]}
+            ]}}),
+        ),
+        spelling(
+            "the comma ending the first of two values",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS",
+                 "values": ["BUDGETS,PAYMENTS", "IAM"]}
+            ]}}),
+        ),
+        spelling(
+            "the comma opening the second of two values",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS",
+                 "values": ["BUDGETS", "PAYMENTS,IAM"]}
+            ]}}),
+        ),
+        spelling(
+            "one value carrying a colon and an ampersand",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS",
+                 "values": ["ZZZ&SEVERITY:NOT_EQUALS:INFO"]}
+            ]}}),
+        ),
+        spelling(
+            "two filters spelling that value's parts",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["ZZZ"]},
+                {"key": "SEVERITY", "matchOption": "NOT_EQUALS", "values": ["INFO"]}
+            ]}}),
+        ),
+        spelling(
+            "those two filters in the opposite order",
+            json!({"filter": {"actions": [
+                {"key": "SEVERITY", "matchOption": "NOT_EQUALS", "values": ["INFO"]},
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["ZZZ"]}
+            ]}}),
+        ),
+        spelling(
+            "a separator-carrying filter listed twice",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["BUDGETS,PAYMENTS"]},
+                {"key": "FEATURE", "matchOption": "NOT_EQUALS", "values": ["BUDGETS,PAYMENTS"]}
+            ]}}),
+        ),
+        spelling(
+            "a type value ending in a colon and a match option",
+            json!({"filter": {"actions": [
+                {"key": "TYPE", "matchOption": "NOT_EQUALS", "values": ["PAYMENTS_DUE:NOT_EQUALS"]}
+            ]}}),
+        ),
+        spelling(
+            "that type value without its colon",
+            json!({"filter": {"actions": [
+                {"key": "TYPE", "matchOption": "NOT_EQUALS", "values": ["PAYMENTS_DUE"]}
+            ]}}),
+        ),
+        spelling(
+            "EQUALS over a value carrying a comma",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "EQUALS", "values": ["BUDGETS,PAYMENTS", "IAM"]}
+            ]}}),
+        ),
+        spelling(
+            "EQUALS over the same characters split differently",
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "EQUALS", "values": ["BUDGETS", "PAYMENTS,IAM"]}
+            ]}}),
+        ),
+        spelling(
+            "EQUALS over two severities",
+            json!({"filter": {"actions": [
+                {"key": "SEVERITY", "matchOption": "EQUALS", "values": ["INFO", "CRITICAL"]}
+            ]}}),
+        ),
+        spelling(
+            "EQUALS over those two severities as one value",
+            json!({"filter": {"actions": [
+                {"key": "SEVERITY", "matchOption": "EQUALS", "values": ["CRITICAL,INFO"]}
+            ]}}),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_next_token_is_accepted_by_exactly_the_selection_it_was_issued_over() {
+    let emulator = Emulator::empty();
+    emulator.seed(fixture());
+
+    let spellings = selection_spellings();
+    let ids: Vec<SelectionId> = spellings
+        .iter()
+        .map(|spelling| selection_id(spelling.label, &spelling.body))
+        .collect();
+
+    // The sweep below is only a test of the collision class if the table HOLDS a
+    // collision: two spellings that name different selections and that a
+    // concatenation renders identically.
+    let colliding: Vec<(&str, &str)> = (0..spellings.len())
+        .flat_map(|left| (left + 1..spellings.len()).map(move |right| (left, right)))
+        .filter(|&(left, right)| {
+            ids[left] != ids[right]
+                && concatenated_rendering(&ids[left]) == concatenated_rendering(&ids[right])
+        })
+        .map(|(left, right)| (spellings[left].label, spellings[right].label))
+        .collect();
+    assert!(
+        colliding.len() >= 4,
+        "the table must span the collision class: expected at least 4 pairs of different \
+         selections that a concatenation renders alike, got {} ({colliding:?})",
+        colliding.len()
+    );
+
+    // What each spelling reports with no page size, so a resumption can be checked
+    // against the record set the PRESENTED body selects.
+    let mut reported: Vec<Vec<String>> = Vec::with_capacity(spellings.len());
+    for spelling in &spellings {
+        let (status, body) = emulator.list(&spelling.body).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: listing the selection expected 200, got {status} with {body}",
+            spelling.label
+        );
+        reported.push(ids_of(spelling.label, &body));
+    }
+
+    // One token per spelling whose selection spans more than one page of one record.
+    let mut tokens: Vec<Option<String>> = Vec::with_capacity(spellings.len());
+    for (index, spelling) in spellings.iter().enumerate() {
+        if reported[index].len() < 2 {
+            tokens.push(None);
+            continue;
+        }
+        let minting = with_member(spelling.label, &spelling.body, "maxResults", json!(1));
+        let (status, first) = emulator.list(&minting).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: minting a token expected 200, got {status} with {first}",
+            spelling.label
+        );
+        let token = first
+            .get("nextToken")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: a selection of {} records served one at a time must offer a \
+                     nextToken, got {first}",
+                    spelling.label,
+                    reported[index].len()
+                )
+            })
+            .to_string();
+        tokens.push(Some(token));
+    }
+
+    // EVERY ordered pair: a token resumes the listing exactly when the presented body
+    // names the selection the token was minted over, and is refused otherwise —
+    // never applied to a record set it never named.
+    for (minted, minted_spelling) in spellings.iter().enumerate() {
+        let Some(token) = tokens[minted].as_ref() else {
+            continue;
+        };
+        for (presented, presented_spelling) in spellings.iter().enumerate() {
+            let case = format!(
+                "token minted over {:?}, presented with {:?}",
+                minted_spelling.label, presented_spelling.label
+            );
+            let resumed =
+                with_member(&case, &presented_spelling.body, "nextToken", json!(token));
+            let (status, body) = emulator.list(&resumed).await;
+
+            if ids[minted] == ids[presented] {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: the two bodies name one selection, so the token must resume \
+                     it; got {status} with {body}"
+                );
+                let page = ids_of(&case, &body);
+                let expected = reported[presented][1..].to_vec();
+                assert_eq!(
+                    page, expected,
+                    "case {case:?}: expected the records after the first, {expected:?}, got \
+                     {page:?}"
+                );
+            } else {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: the bodies name different selections (the presented one \
+                     reports {:?}), so the token must be refused; got {status} with {body}",
+                    reported[presented]
+                );
+                assert_eq!(
+                    error_code(&case, &body),
+                    "ValidationException",
+                    "case {case:?}: expected a ValidationException, got {body}"
+                );
+                assert_eq!(
+                    body.get("reason").and_then(Value::as_str),
+                    Some("cannotParse"),
+                    "case {case:?}: expected reason cannotParse, got {body}"
+                );
+                let names: Vec<&str> = body
+                    .get("fieldList")
+                    .and_then(Value::as_array)
+                    .unwrap_or_else(|| {
+                        panic!("case {case:?}: expected a fieldList array, got {body}")
+                    })
+                    .iter()
+                    .filter_map(|field| field.get("name").and_then(Value::as_str))
+                    .collect();
+                assert_eq!(
+                    names,
+                    vec!["nextToken"],
+                    "case {case:?}: expected the refusal to name nextToken, got {names:?} in \
+                     {body}"
+                );
+                assert!(
+                    body.get("recommendedActions").is_none(),
+                    "case {case:?}: a refused token must not report a page, got {body}"
+                );
+            }
         }
     }
 }
