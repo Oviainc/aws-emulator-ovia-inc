@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAccountSuppressionAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAccountSuppressionAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAccountSuppressionAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the account-level suppression attributes this service persists with the
+//! ones the request carries: the reasons for which an address is added to the
+//! account's suppression list automatically, and the Auto Validation attributes.
+//! `PUT /v2/email/account/suppression` addresses the account's suppression
+//! sub-resource as a whole, so what the request states is what the account holds
+//! afterwards and a member it leaves out is cleared — which is what turns the
+//! account-level suppression list off. `GetAccount` reads the result back from the
+//! same record. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +139,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAccountSuppressionAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAccountSuppressionAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAccountSuppressionAttributes"))
+        // The account these attributes belong to is the one the request was signed
+        // for, and the emulator serves one, so nothing in `ctx` selects a record.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to write to. That is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutAccountSuppressionAttributes without the shared emulator state",
+            ));
+        };
+
+        // `SuppressionListReasons` is a list whose member the model types as a plain
+        // string here, so its value set is the handler's to enforce, with the
+        // `BadRequestException` the model binds for "the input you provided is
+        // invalid". A request that names no reasons leaves the set empty, which is
+        // the account-level suppression list switched off.
+        let suppressed_reasons = input
+            .suppressed_reasons
+            .unwrap_or_default()
+            .into_iter()
+            .map(|reason| enum_value("SuppressedReasons", reason, SUPPRESSION_LIST_REASON_VALUES))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // The validation attributes carry two enums of their own, both checked the
+        // same way, and all of them before anything is persisted: a refused request
+        // leaves the account exactly as it was.
+        let validation_attributes = match input.validation_attributes {
+            Some(validation) => {
+                let threshold = validation.condition_threshold;
+                let condition_threshold_enabled = enum_value(
+                    "ConditionThresholdEnabled",
+                    threshold.condition_threshold_enabled,
+                    FEATURE_STATUS_VALUES,
+                )?;
+                let overall_confidence_threshold = match threshold.overall_confidence_threshold {
+                    Some(confidence) => Some(SuppressionConfidenceThreshold {
+                        confidence_verdict_threshold: enum_value(
+                            "ConfidenceVerdictThreshold",
+                            confidence.confidence_verdict_threshold,
+                            SUPPRESSION_CONFIDENCE_VERDICT_THRESHOLD_VALUES,
+                        )?,
+                    }),
+                    None => None,
+                };
+                Some(SuppressionValidationAttributes {
+                    condition_threshold: SuppressionConditionThreshold {
+                        condition_threshold_enabled,
+                        overall_confidence_threshold,
+                    },
+                })
+            }
+            None => None,
+        };
+
+        let mut store = state.lock();
+        store.account.suppressed_reasons = suppressed_reasons;
+        store.account.suppression_validation = validation_attributes;
+
+        // `PutAccountSuppressionAttributesResponse` carries no members: what was
+        // persisted is read back with `GetAccount`.
+        Ok(PutAccountSuppressionAttributesOutput {})
     }
+}
+
+/// `value` when it is one of `allowed`, and this operation's input error otherwise.
+///
+/// The wording is the service's shared one, lifted into this operation's error
+/// channel, so every member refuses an unmodelled value the same way.
+fn enum_value(
+    member: &str,
+    value: String,
+    allowed: &[&str],
+) -> Result<String, PutAccountSuppressionAttributesError> {
+    crate::state::modelled_enum_value(member, value, allowed).map_err(|message| {
+        PutAccountSuppressionAttributesErrorModeled::BadRequestException(BadRequestException {
+            message: Some(message),
+        })
+        .into()
+    })
 }
