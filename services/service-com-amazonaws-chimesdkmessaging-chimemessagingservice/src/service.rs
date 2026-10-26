@@ -100,7 +100,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The one shared space this model publishes is `/app-instances`, where it binds
         // only the streaming-configuration sub-space; the app-instance resource itself
         // belongs to the Chime SDK Identity endpoint. (`/tags` is shared by five of the
-        // six and is resolved by endpoint prefix only — see `chime_family`.)
+        // six: a request that names no endpoint is served by the family's declared
+        // tagging owner, and this service serves that space at its OWN endpoint from the
+        // same shared ARN-keyed tag directory, so both answer alike — see
+        // `chime_family`.)
         service_common::chime_family::claims_chime_family_request(
             parts,
             OWN_ENDPOINT_PREFIX,

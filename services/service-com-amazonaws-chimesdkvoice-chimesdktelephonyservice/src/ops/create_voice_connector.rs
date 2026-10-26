@@ -180,6 +180,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The tags given at create time go in the family's shared, ARN-keyed tag
+        // directory, which is where the tagging operations read them from; resolved
+        // before anything is written so a create cannot half-succeed.
+        let Some(tag_directory) = crate::state::chime_tags(&*self.engine) else {
+            return Err(CreateVoiceConnectorErrorModeled::ServiceFailureException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
 
         // `Name`'s length and pattern, and `AwsRegion`'s enum value set, are modelled
         // constraints, so the boundary validator has already refused anything outside
@@ -212,15 +221,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         record.integration_type = input.integration_type;
         record.network_type = input.network_type;
-        record.tags = input
+        let voice_connector_arn = record.voice_connector_arn.clone();
+        let voice_connector = record.to_shape();
+        store.voice_connectors.insert(voice_connector_id, record);
+        drop(store);
+
+        // `TagList` is `@length(min: 1)`, so the member is either absent or non-empty.
+        // The pairs go to the family's shared directory, which is the one place any
+        // tagging call reads them from.
+        let tags: Vec<(String, String)> = input
             .tags
             .unwrap_or_default()
             .into_iter()
             .map(|tag| (tag.key, tag.value))
             .collect();
-        let voice_connector = record.to_shape();
-        store.voice_connectors.insert(voice_connector_id, record);
-        drop(store);
+        if !tags.is_empty() {
+            tag_directory.lock().tag(&voice_connector_arn, tags);
+        }
 
         Ok(CreateVoiceConnectorOutput {
             voice_connector: Some(voice_connector),

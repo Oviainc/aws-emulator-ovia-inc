@@ -186,6 +186,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the channel store is unavailable".to_string()),
             })
         })?;
+        // A deleted channel leaves no tags behind: its tags live in the family's shared
+        // ARN-keyed directory, so they are dropped there rather than with the record.
+        let tag_directory = crate::state::chime_tags(&*self.engine).ok_or_else(|| {
+            DeleteChannelErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the Chime tag directory is unavailable".to_string()),
+            })
+        })?;
 
         let mut store = state.lock();
         // The channel owns its messages, so removing the record removes them with it.
@@ -201,6 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
+        tag_directory.lock().forget(&input.channel_arn);
 
         Ok(DeleteChannelOutput)
     }

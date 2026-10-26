@@ -201,6 +201,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::store_unavailable(),
             )
         })?;
+        // The tags given at create time go in the family's shared, ARN-keyed tag
+        // directory, which is where the tagging operations read them from; resolved
+        // before anything is written so a create cannot half-succeed.
+        let tag_directory = crate::state::chime_tags(&*self.engine).ok_or_else(|| {
+            CreateMeetingWithAttendeesErrorModeled::ServiceFailureException(
+                crate::state::store_unavailable(),
+            )
+        })?;
         let mut store = state.lock();
 
         // `ClientRequestToken` is `@idempotencyToken`: a replay returns the meeting the
@@ -248,6 +256,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let ceiling = crate::state::attendee_ceiling(features.as_ref());
 
         let meeting_id = store.mint_meeting_id();
+        // Bound once and used both for the record and for the tag directory's key, so a
+        // create-time tag can never be written under a different ARN than the one the
+        // meeting carries — nor be dropped for want of one.
+        let meeting_arn = crate::state::meeting_arn(&meeting_id, &input.media_region);
         let meeting = Meeting {
             // Server-owned: the media endpoints and the ARN are DERIVED from the minted
             // id, never taken from the request.
@@ -255,7 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &meeting_id,
                 &input.media_region,
             )),
-            meeting_arn: Some(crate::state::meeting_arn(&meeting_id, &input.media_region)),
+            meeting_arn: Some(meeting_arn.clone()),
             meeting_id: Some(meeting_id.clone()),
             // Caller-owned: stored as supplied, so a reader reports what was asked for.
             meeting_host_id: input.meeting_host_id,
@@ -276,7 +288,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 attendees: ::std::collections::BTreeMap::new(),
                 notifications_configuration: input.notifications_configuration,
                 media_placement_network_type: input.media_placement_network_type,
-                tags: input.tags.unwrap_or_default(),
                 client_request_token: input.client_request_token,
             },
         );
@@ -364,8 +375,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let meeting = stored.meeting.clone();
+        drop(store);
+
+        // The pairs go to the family's shared directory, which is the one place any
+        // tagging call reads them from.
+        let tags: Vec<(String, String)> = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+        if !tags.is_empty() {
+            tag_directory.lock().tag(&meeting_arn, tags);
+        }
+
         Ok(CreateMeetingWithAttendeesOutput {
-            meeting: Some(stored.meeting.clone()),
+            meeting: Some(meeting),
             attendees: Some(created),
             errors: Some(errors),
         })

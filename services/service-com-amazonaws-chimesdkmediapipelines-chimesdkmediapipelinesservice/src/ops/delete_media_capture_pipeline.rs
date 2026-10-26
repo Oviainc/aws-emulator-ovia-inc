@@ -175,18 +175,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-
-        if !state
-            .lock()
-            .remove_capture_pipeline(&input.media_pipeline_id)
-        {
-            return Err(DeleteMediaCapturePipelineErrorModeled::NotFoundException(
-                crate::state::not_found(format!(
-                    "No media capture pipeline with the ID {} exists.",
-                    input.media_pipeline_id
-                )),
+        // A deleted pipeline leaves no tags behind: its tags live in the family's shared
+        // ARN-keyed directory, so they are dropped there rather than with the record.
+        let Some(tag_directory) = crate::state::chime_tags(&*self.engine) else {
+            return Err(DeleteMediaCapturePipelineErrorModeled::ServiceFailureException(
+                crate::state::service_failure("The Chime tag directory is unavailable."),
             )
             .into());
+        };
+
+        let removed_arn = {
+            let mut store = state.lock();
+            let arn = store
+                .capture_pipeline(&input.media_pipeline_id)
+                .map(|pipeline| pipeline.media_pipeline_arn.clone());
+            if !store.remove_capture_pipeline(&input.media_pipeline_id) {
+                return Err(DeleteMediaCapturePipelineErrorModeled::NotFoundException(
+                    crate::state::not_found(format!(
+                        "No media capture pipeline with the ID {} exists.",
+                        input.media_pipeline_id
+                    )),
+                )
+                .into());
+            }
+            arn
+        };
+        if let Some(arn) = removed_arn {
+            tag_directory.lock().forget(&arn);
         }
 
         // 204, empty body: the modelled output shape has no members.

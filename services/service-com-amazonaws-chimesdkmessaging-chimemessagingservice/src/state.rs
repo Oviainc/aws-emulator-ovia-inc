@@ -11,6 +11,12 @@
 //! [`aws_smithy_types::DateTime`], because the list operations have to order and range
 //! filter them and `DateTime` carries no total order. [`date_time`] converts one back
 //! for the wire and [`millis_of`] converts an inbound filter bound in.
+//!
+//! Two things this service reads are NOT in the struct below, because another Chime
+//! service reads or writes them too and the engine keys state by type: the app-instance
+//! ADMIN directory ([`app_instance_admins`]) and the family's ARN-keyed TAG directory
+//! ([`chime_tags`]), which holds the tags of every channel and channel flow — including
+//! the ones a create was given.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -20,7 +26,7 @@ use crate::ops::types::{
     Channel, ChannelBan, ChannelBanSummary, ChannelFlow, ChannelFlowSummary, ChannelMembership,
     ChannelMembershipSummary, ChannelMessage, ChannelMessageStatusStructure, ChannelMessageSummary,
     ChannelModerator, ChannelModeratorSummary, ChannelSummary, ElasticChannelConfiguration,
-    ExpirationSettings, Identity, MessageAttributeValue, Processor, Tag, Target,
+    ExpirationSettings, Identity, MessageAttributeValue, Processor, Target,
 };
 
 /// How many `CreateChannel` idempotency records this emulator keeps.
@@ -36,6 +42,12 @@ use crate::ops::types::{
 /// `CreateChannelFlow`'s ledger is bounded the same way, for the same reason and with the
 /// same consequence.
 pub const MAX_CREATE_CHANNEL_IDEMPOTENCY_RECORDS: usize = 4096;
+
+/// How many tags one resource of THIS service carries at once: the bound its own model
+/// declares on `TagList` (`@length(min: 1, max: 50)`,
+/// `smithy_query(query="operation",operation="TagResource")`), which is the family's
+/// usual one — so the shared directory's default bound is this service's bound too.
+pub const MAX_TAGS_PER_RESOURCE: usize = ::service_common::chime_tags::MAX_TAGS_PER_RESOURCE;
 
 /// What the service states when a `ChannelFlowArn` names no channel flow it holds.
 ///
@@ -62,9 +74,9 @@ pub const UNRESOLVABLE_APP_INSTANCE: &str =
 /// `CreateChannelFlow` answers the modelled `ResourceLimitExceededException` instead of
 /// minting another, which is also how the real service reports a quota it will not
 /// exceed. A `ChannelFlowRecord` holds at most `Name` 256, three `Processor`s of
-/// (`Name` 256 + `LambdaFunctionArn` 2048) and 50 tags of 128 + 256, so on the order of
-/// 26 KiB; 256 flows bound the map at about 7 MiB. This emulator's own choice, not a
-/// modelled or documented service limit.
+/// (`Name` 256 + `LambdaFunctionArn` 2048), so on the order of 7 KiB; 256 flows bound the
+/// map at about 2 MiB. This emulator's own choice, not a modelled or documented service
+/// limit.
 pub const MAX_STORED_CHANNEL_FLOWS: usize = 256;
 
 /// How many channels this emulator stores at once.
@@ -76,8 +88,8 @@ pub const MAX_STORED_CHANNEL_FLOWS: usize = 256;
 /// which is also how the real service reports a quota it will not exceed.
 ///
 /// Memory: a `ChannelRecord`'s own members are at most `Name` 256 + `Metadata` 1024 +
-/// `ChannelId` 64 + three `ChimeArn`s (3 x 1600) + 50 tags of 128 + 256, so on the order
-/// of 26 KiB; 256 channels bound the records themselves at about 7 MiB, plus at most
+/// `ChannelId` 64 + three `ChimeArn`s (3 x 1600), so on the order of 6 KiB; 256 channels
+/// bound the records themselves at about 2 MiB, plus at most
 /// [`MAX_MESSAGE_BYTES_PER_CHANNEL`] of messages each (256 MiB in total) — a bound every
 /// retention path respects, because a message larger than [`MAX_MESSAGE_BYTES`] is
 /// refused rather than stored.
@@ -306,6 +318,47 @@ impl ComAmazonawsChimesdkmessagingChimemessagingserviceState {
         self.create_channel_flow_idempotency
             .remember(key, channel_flow_arn);
     }
+
+    /// True when `arn` still names a live resource of this service.
+    pub fn resource_exists(&self, arn: &str) -> bool {
+        self.channels.contains_key(arn) || self.channel_flows.contains_key(arn)
+    }
+
+    /// Whether a tagging call may address `arn`.
+    ///
+    /// The family's one rule for that question lives in
+    /// [`::service_common::chime_tags::addresses_taggable_resource`]; this store answers
+    /// the half of it only this service can — whether an ARN that names a resource THIS
+    /// service mints ([`names_messaging_resource`]) is one it still holds.
+    pub fn taggable(&self, arn: &str) -> bool {
+        ::service_common::chime_tags::addresses_taggable_resource(
+            arn,
+            names_messaging_resource(arn).then(|| self.resource_exists(arn)),
+        )
+    }
+}
+
+/// Whether `arn` names a resource THIS service mints, so that this service's store is
+/// what says whether it exists.
+///
+/// Both of them hang off an app instance under a segment of their own: a channel is
+/// `arn:…:chime:…:app-instance/<id>/channel/<id>` and a channel flow
+/// `…/channel-flow/<id>` (`CreateChannel` and `CreateChannelFlow` derive the ARN that
+/// way). The app instance itself and its identity children (`…/user/<id>`, `…/bot/<id>`)
+/// are the Chime SDK Identity service's, and every other family member's resources carry
+/// a different resource type altogether, so none of them reads as this service's.
+#[must_use]
+pub fn names_messaging_resource(arn: &str) -> bool {
+    let Some(resource) = ::service_common::arn::resource(arn) else {
+        return false;
+    };
+    let tokens: Vec<&str> = resource.split('/').collect();
+    match tokens.as_slice() {
+        ["app-instance", id, child, child_id] => {
+            !id.is_empty() && !child_id.is_empty() && matches!(*child, "channel" | "channel-flow")
+        }
+        _ => false,
+    }
 }
 
 /// A channel flow minted by `CreateChannelFlow`: the container for the processor Lambda
@@ -319,7 +372,6 @@ pub struct ChannelFlowRecord {
     pub processors: Vec<Processor>,
     pub created_millis: i64,
     pub last_updated_millis: i64,
-    pub tags: Vec<Tag>,
 }
 
 impl ChannelFlowRecord {
@@ -365,7 +417,6 @@ pub struct ChannelRecord {
     pub last_message_millis: Option<i64>,
     pub elastic_channel_configuration: Option<ElasticChannelConfiguration>,
     pub expiration_settings: Option<ExpirationSettings>,
-    pub tags: Vec<Tag>,
     /// Messages in the order they were accepted, which is ASCENDING `CreatedTimestamp`.
     pub messages: Vec<ChannelMessageRecord>,
     /// `ClientRequestToken -> MessageId` for this channel's `SendChannelMessage` calls.
@@ -858,6 +909,29 @@ pub fn app_instance_admins<Eng: Send + Sync + 'static>(
                 ::service_common::chime_app_instance_admins::AppInstanceAdminDirectory,
             >,
         )
+}
+
+/// The SHARED Chime TAG directory in the shared engine: call it with a handler's
+/// `&*self.engine`.
+///
+/// A resource's tags are keyed by ARN and live in ONE directory
+/// ([`::service_common::chime_tags::ChimeTagDirectory`]) rather than on the channel and
+/// channel-flow records of this state struct, because the family's generic tagging routes
+/// are served by one member for every member's resource: a copy inside
+/// [`ComAmazonawsChimesdkmessagingChimemessagingserviceState`] would be invisible to the
+/// sibling serving a tagging call, which would then report "no tags" for a channel that
+/// has them.
+///
+/// LOCK ORDER: a writer takes [`service_state`] first and this directory second, and no
+/// reader holds this one while taking another store, so the order cannot invert.
+///
+/// Answer `None` with a modelled server error, never with a fresh engine.
+pub fn chime_tags<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::chime_tags::ChimeTagDirectory>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<::service_common::chime_tags::ChimeTagDirectory>)
 }
 
 /// The `aws.api#service$arnNamespace` a `LambdaFunctionArn` carries, which is what

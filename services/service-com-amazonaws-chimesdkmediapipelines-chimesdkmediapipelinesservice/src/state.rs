@@ -13,6 +13,11 @@
 //! Besides the store this module holds the few derivations every pipeline handler
 //! shares — the ARN shape, the signed region, the modelled error shapes and the
 //! pagination cursor — so no two handlers spell one of them differently.
+//!
+//! One thing this service reads is NOT in the store below, because the other Chime
+//! services read and write it too and the engine keys state by type: the family's
+//! ARN-keyed TAG directory ([`chime_tags`]), which holds the tags of every pipeline and
+//! configuration — including the ones a create was given.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,7 +30,7 @@ use crate::ops::types::{
     MediaCapturePipelineSummary, MediaInsightsPipelineConfiguration,
     MediaInsightsPipelineConfigurationElement, MediaPipelineSummary, NotFoundException,
     RealTimeAlertConfiguration, ResourceLimitExceededException, ServiceFailureException,
-    SseAwsKeyManagementParams, Tag,
+    SseAwsKeyManagementParams,
 };
 
 /// The `MediaPipelineStatus` value a freshly created pipeline carries.
@@ -149,9 +154,25 @@ pub fn media_pipeline_arn(region: &str, media_pipeline_id: &str) -> String {
     ::engine::emulator_arn(
         "chime",
         region,
-        &format!("media-pipeline/{media_pipeline_id}"),
+        &format!("{MEDIA_PIPELINE_RESOURCE_TYPE}/{media_pipeline_id}"),
     )
 }
+
+/// The resource TYPE a media pipeline's ARN carries, as [`media_pipeline_arn`] derives it.
+pub const MEDIA_PIPELINE_RESOURCE_TYPE: &str = "media-pipeline";
+
+/// The resource TYPE a media insights pipeline configuration's ARN carries, as
+/// [`media_insights_pipeline_configuration_arn`] derives it.
+pub const MEDIA_INSIGHTS_CONFIGURATION_RESOURCE_TYPE: &str =
+    "media-insights-pipeline-configuration";
+
+/// How many tags one resource of THIS service carries at once.
+///
+/// Its own model bounds `TagList` at 200 members, not the 50 the other Chime models
+/// declare (`smithy_query(query="operation",operation="TagResource")` on this model:
+/// `Tags` -> `length {min: 1, max: 200}`), so this is the count the shared tag directory
+/// holds a resource of this service to.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 
 /// A media insights pipeline configuration's ARN, in the same (`chime`) namespace:
 /// `arn:aws:chime:<region>:<account>:media-insights-pipeline-configuration/<name>`.
@@ -167,7 +188,7 @@ pub fn media_insights_pipeline_configuration_arn(region: &str, name: &str) -> St
     ::engine::emulator_arn(
         "chime",
         region,
-        &format!("media-insights-pipeline-configuration/{name}"),
+        &format!("{MEDIA_INSIGHTS_CONFIGURATION_RESOURCE_TYPE}/{name}"),
     )
 }
 
@@ -253,6 +274,25 @@ pub fn resource_limit_exceeded(message: impl Into<String>) -> ResourceLimitExcee
 /// The `message` a refused pagination token is reported with.
 pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "The next-token value is not a valid pagination token.";
 
+/// `NotFoundException`'s payload for a tagging call whose `ResourceARN` names no resource
+/// this service holds. Read by all three generic tagging operations, so the three cannot
+/// word one refusal three ways.
+pub fn tagged_resource_not_found(resource_arn: &str) -> NotFoundException {
+    not_found(format!("resource {resource_arn} does not exist"))
+}
+
+/// The message a tagging call that would take a resource past
+/// [`MAX_TAGS_PER_RESOURCE`] tags is refused with; `requested` is how many tags the
+/// resource would have ended up with. This service's tagging operations model no
+/// limit error, so the refusal is the modelled `BadRequestException` carrying this
+/// sentence.
+pub fn too_many_tags_message(resource_arn: &str, requested: usize) -> String {
+    format!(
+        "{requested} tags were requested for {resource_arn}, which is more than the maximum \
+         of {MAX_TAGS_PER_RESOURCE} tags per resource"
+    )
+}
+
 /// A pagination token this service did not issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidPageToken;
@@ -332,7 +372,6 @@ pub struct CapturePipeline {
     pub updated_timestamp: DateTime,
     pub chime_sdk_meeting_configuration: Option<ChimeSdkMeetingConfiguration>,
     pub sse_aws_key_management_params: Option<SseAwsKeyManagementParams>,
-    pub tags: Vec<Tag>,
     /// When the `Initializing -> InProgress` transition the clock owes falls due,
     /// or `None` once it has been materialised. Stored as an instant rather than
     /// slept for, so the transition is owed whether or not anybody calls.
@@ -394,7 +433,6 @@ pub struct InsightsConfiguration {
     pub resource_access_role_arn: String,
     pub real_time_alert_configuration: Option<RealTimeAlertConfiguration>,
     pub elements: Vec<MediaInsightsPipelineConfigurationElement>,
-    pub tags: Vec<Tag>,
     pub created_timestamp: DateTime,
     pub updated_timestamp: DateTime,
 }
@@ -659,6 +697,31 @@ impl ComAmazonawsChimesdkmediapipelinesChimesdkmediapipelinesserviceState {
             .retain(|_, minted| *minted != name);
         true
     }
+
+    /// Whether a tagging call may address `arn`.
+    ///
+    /// The family's one rule for that question lives in
+    /// [`::service_common::chime_tags::addresses_taggable_resource`]; this store answers
+    /// the half of it only this service can — whether an ARN that names a resource THIS
+    /// service mints (a [`MEDIA_PIPELINE_RESOURCE_TYPE`] or a
+    /// [`MEDIA_INSIGHTS_CONFIGURATION_RESOURCE_TYPE`]) is one it still holds. An ARN of
+    /// any other Chime resource type is another family member's, which this store cannot
+    /// check.
+    pub fn taggable(&self, arn: &str) -> bool {
+        let own_resource_exists = match ::service_common::arn::resource_type(arn) {
+            Some(MEDIA_PIPELINE_RESOURCE_TYPE) => Some(
+                ::service_common::arn::resource_id_of_type(arn, MEDIA_PIPELINE_RESOURCE_TYPE)
+                    .is_some_and(|id| self.capture_pipeline(id).is_some()),
+            ),
+            // A configuration is named by its ARN as well as by its name, which is what
+            // `InsightsConfiguration::is_named_by` reads.
+            Some(MEDIA_INSIGHTS_CONFIGURATION_RESOURCE_TYPE) => {
+                Some(self.insights_configuration(arn).is_some())
+            }
+            _ => None,
+        };
+        ::service_common::chime_tags::addresses_taggable_resource(arn, own_resource_exists)
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -670,4 +733,27 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsChimesdkmediapipelinesChimesdkmediapipelinesserviceState>)
+}
+
+/// The SHARED Chime TAG directory in the shared engine: call it with a handler's
+/// `&*self.engine`.
+///
+/// A resource's tags are keyed by ARN and live in ONE directory
+/// ([`::service_common::chime_tags::ChimeTagDirectory`]) rather than on the records of
+/// this store, because the family's generic tagging routes are served by one member for
+/// every member's resource: a copy inside
+/// [`ComAmazonawsChimesdkmediapipelinesChimesdkmediapipelinesserviceState`] would be
+/// invisible to the sibling serving a tagging call, which would then report "no tags" for
+/// a pipeline that has them.
+///
+/// LOCK ORDER: a writer takes [`service_state`] first and this directory second, and no
+/// reader holds this one while taking another store, so the order cannot invert.
+///
+/// Answer `None` with a modelled server error, never with a fresh engine.
+pub fn chime_tags<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::chime_tags::ChimeTagDirectory>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<::service_common::chime_tags::ChimeTagDirectory>)
 }

@@ -98,9 +98,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // readers for the path spaces the family shares, live once in `service-common`.
         //
         // Every path space this model binds is its own except `/tags`, which five of the
-        // six publish identically and which is resolved by endpoint prefix only — see
-        // `chime_family` — so there is no shared space left for this service to claim on
-        // a request that names no endpoint.
+        // six publish identically: a request that names no endpoint is served by the
+        // family's declared tagging owner, and this service serves that space at its OWN
+        // endpoint from the same shared ARN-keyed tag directory, so both answer alike —
+        // see `chime_family`. There is therefore no shared space left for this service to
+        // claim on a request that names no endpoint.
         service_common::chime_family::claims_chime_family_request(
             parts,
             OWN_ENDPOINT_PREFIX,

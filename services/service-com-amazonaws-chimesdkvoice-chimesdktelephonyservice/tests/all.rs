@@ -14,6 +14,9 @@
 #[path = "all/probe_scratch.rs"]
 mod probe_scratch;
 
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

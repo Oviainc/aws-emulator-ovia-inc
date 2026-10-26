@@ -17,6 +17,8 @@ mod channel_flows;
 mod channel_membership;
 #[path = "all/channel_messaging.rs"]
 mod channel_messaging;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/service_claim.rs"]
 mod service_claim;
 #[path = "all/state_roundtrip.rs"]

@@ -211,17 +211,15 @@ impl ComAmazonawsChimesdkidentityChimeidentityserviceState {
 
     /// Whether a tagging call may address `arn`.
     ///
-    /// The ARN has to name a resource of this family at all — one in the Chime ARN
-    /// namespace ([`ARN_SERVICE`]), read through the one parse this workspace states for a
-    /// caller-supplied ARN — so a value that is no ARN, or another vendor's, names nothing
-    /// to tag. A resource THIS service mints ([`names_identity_resource`]) then has to
-    /// exist for its tags to be written or read: this store is what says whether it does.
-    /// A resource of a SIBLING Chime service cannot be checked from here — its store is
-    /// the sibling's, and this service only serves the family's shared tagging routes for
-    /// it — so such an ARN is taken at its word rather than refused as absent.
+    /// The family's one rule for that question lives in
+    /// [`::service_common::chime_tags::addresses_taggable_resource`]; this store answers
+    /// the half of it only this service can — whether an ARN that names a resource THIS
+    /// service mints ([`names_identity_resource`]) is one it still holds.
     pub fn taggable(&self, arn: &str) -> bool {
-        ::service_common::arn::is_resource_arn_of(arn, ARN_SERVICE)
-            && (!names_identity_resource(arn) || self.resource_exists(arn))
+        ::service_common::chime_tags::addresses_taggable_resource(
+            arn,
+            names_identity_resource(arn).then(|| self.resource_exists(arn)),
+        )
     }
 
     /// The ARN a previous call of `operation` already minted for `token`, if that

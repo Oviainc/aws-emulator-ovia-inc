@@ -200,6 +200,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+        // The tags given at create time go in the family's shared, ARN-keyed tag
+        // directory, which is where the tagging operations read them from; resolved
+        // before anything is written so a create cannot half-succeed.
+        let Some(tag_directory) = crate::state::chime_tags(&*self.engine) else {
+            return Err(
+                CreateMediaInsightsPipelineConfigurationErrorModeled::ServiceFailureException(
+                    crate::state::service_failure("The Chime tag directory is unavailable."),
+                )
+                .into(),
+            );
+        };
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -216,19 +227,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let id = store.mint_media_pipeline_id();
         let created = crate::state::timestamp(now);
+        // Bound once and used both for the record and for the tag directory's key, so a
+        // create-time tag can never be written under a different ARN than the one the
+        // configuration carries — nor be dropped for want of one.
+        let configuration_arn = crate::state::media_insights_pipeline_configuration_arn(
+            &crate::state::request_region(ctx.parts()),
+            &input.media_insights_pipeline_configuration_name,
+        );
         let configuration = crate::state::InsightsConfiguration {
             // Replaced by the store, which owns the creation sequence.
             seq: 0,
-            arn: crate::state::media_insights_pipeline_configuration_arn(
-                &crate::state::request_region(ctx.parts()),
-                &input.media_insights_pipeline_configuration_name,
-            ),
+            arn: configuration_arn.clone(),
             name: input.media_insights_pipeline_configuration_name,
             id,
             resource_access_role_arn: input.resource_access_role_arn,
             real_time_alert_configuration: input.real_time_alert_configuration,
             elements: input.elements,
-            tags: input.tags.unwrap_or_default(),
             created_timestamp: created,
             updated_timestamp: created,
         };
@@ -275,6 +289,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
         };
+
+        // `TagList` is `@length(min: 1)`, so the member is either absent or non-empty.
+        // The pairs go to the family's shared directory, which is the one place any
+        // tagging call reads them from.
+        let tags: Vec<(String, String)> = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+        if !tags.is_empty() {
+            tag_directory
+                .lock()
+                .tag_within(&configuration_arn, tags, crate::state::MAX_TAGS_PER_RESOURCE);
+        }
 
         Ok(CreateMediaInsightsPipelineConfigurationOutput {
             media_insights_pipeline_configuration: Some(stored),

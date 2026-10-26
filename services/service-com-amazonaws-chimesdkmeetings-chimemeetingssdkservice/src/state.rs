@@ -25,6 +25,11 @@
 //! | [`StoredMeeting::attendees`] | [`attendee_ceiling`] per meeting | `DeleteAttendee`/`DeleteMeeting`, or `CreateAttendee` is refused |
 //! | [`ComAmazonawsChimesdkmeetingsChimemeetingssdkserviceState::meeting_by_client_request_token`] | one entry per live meeting | the entry is dropped with its meeting |
 //! | the record of ended meetings | [`MAX_ENDED_MEETINGS`] | the oldest id is forgotten when the next meeting ends |
+//!
+//! One thing this service reads is NOT in the struct below, because the other Chime
+//! services read and write it too and the engine keys state by type: the family's
+//! ARN-keyed TAG directory ([`chime_tags`]), which holds the tags of every meeting —
+//! including the ones a create was given.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,11 +39,22 @@ use sha2::{Digest as _, Sha256};
 use crate::ops::types::{
     Attendee, AttendeeCapabilities, BadRequestException, LimitExceededException, MediaPlacement,
     Meeting, MeetingFeaturesConfiguration, NotFoundException, NotificationsConfiguration,
-    ServiceFailureException, Tag,
+    ResourceNotFoundException, ServiceFailureException, TooManyTagsException,
 };
 
 /// The `arnNamespace` this service's ARNs carry (`OPERATIONS.md`, `## Wire protocol`).
 pub const ARN_NAMESPACE: &str = "chime";
+
+/// The resource TYPE a meeting's ARN carries (`…:chime:<region>:<account>:meeting/<id>`,
+/// as [`meeting_arn`] derives it). It is the one resource type this service mints, so it
+/// is the one an ARN has to carry for this store to say whether the resource exists.
+pub const MEETING_RESOURCE_TYPE: &str = "meeting";
+
+/// How many tags one resource of THIS service carries at once: the bound its own model
+/// declares on `TagList` (`@length(min: 0, max: 50)`,
+/// `smithy_query(query="shape",shape="TagList")`), which is the family's usual one — so
+/// the shared directory's default bound is this service's bound too.
+pub const MAX_TAGS_PER_RESOURCE: usize = ::service_common::chime_tags::MAX_TAGS_PER_RESOURCE;
 
 // The values of the model's `MediaCapabilities` enum
 // (`smithy_query(query="shape",shape="MediaCapabilities")` -> `SendReceive | Send |
@@ -202,6 +218,35 @@ pub fn attendee_limit_reached(meeting_id: &str, ceiling: usize) -> LimitExceeded
     }
 }
 
+/// `ResourceNotFoundException`'s payload for a tagging call whose `ResourceARN` names no
+/// resource this service holds. Read by all three generic tagging operations, so the
+/// three cannot word one refusal three ways. `ResourceName` carries the ARN the call
+/// named, which is what that member documents ("The name of the resource that couldn't be
+/// found").
+pub fn tagged_resource_not_found(resource_arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        code: Some("NotFound".to_string()),
+        message: Some(format!("resource {resource_arn} does not exist")),
+        request_id: None,
+        resource_name: Some(resource_arn.to_string()),
+    }
+}
+
+/// `TooManyTagsException`'s payload for a tagging call that would take a resource past
+/// [`MAX_TAGS_PER_RESOURCE`] tags; `requested` is how many tags the resource would have
+/// ended up with.
+pub fn too_many_tags(resource_arn: &str, requested: usize) -> TooManyTagsException {
+    TooManyTagsException {
+        code: Some("TooManyTags".to_string()),
+        message: Some(format!(
+            "{requested} tags were requested for {resource_arn}, which is more than the \
+             maximum of {MAX_TAGS_PER_RESOURCE} tags per resource"
+        )),
+        request_id: None,
+        resource_name: Some(resource_arn.to_string()),
+    }
+}
+
 /// One Amazon Chime SDK meeting as this service persists it: the modelled [`Meeting`] it
 /// hands back, plus the request members the `Meeting` shape does not carry.
 ///
@@ -226,9 +271,6 @@ pub struct StoredMeeting {
     /// The `MediaPlacementNetworkType` the meeting was created with. Kept for the same
     /// reason: it is part of the meeting, and the `Meeting` shape has no member for it.
     pub media_placement_network_type: Option<String>,
-    /// The tags supplied for the meeting, kept as the one place `TagResource` /
-    /// `ListTagsForResource` will read them from when they are implemented.
-    pub tags: Vec<Tag>,
     /// The `ClientRequestToken` that created this meeting, so deleting the meeting can
     /// drop its idempotency record too.
     pub client_request_token: String,
@@ -361,6 +403,25 @@ impl ComAmazonawsChimesdkmeetingsChimemeetingssdkserviceState {
     fn next_seq(&mut self) -> u64 {
         self.next_seq = self.next_seq.wrapping_add(1);
         self.next_seq
+    }
+
+    /// Whether a tagging call may address `arn`.
+    ///
+    /// The family's one rule for that question lives in
+    /// [`::service_common::chime_tags::addresses_taggable_resource`]; this store answers
+    /// the half of it only this service can — whether an ARN that names a resource THIS
+    /// service mints (one of type [`MEETING_RESOURCE_TYPE`]) is one it still holds. The
+    /// comparison is against the meeting's OWN ARN, so an ARN carrying a live meeting's id
+    /// in another Region names no meeting here. An ARN of any other Chime resource type is
+    /// another family member's, which this store cannot check.
+    pub fn taggable(&self, arn: &str) -> bool {
+        let own_resource_exists =
+            ::service_common::arn::resource_id_of_type(arn, MEETING_RESOURCE_TYPE).map(|id| {
+                self.meetings
+                    .get(id)
+                    .is_some_and(|stored| stored.meeting.meeting_arn.as_deref() == Some(arn))
+            });
+        ::service_common::chime_tags::addresses_taggable_resource(arn, own_resource_exists)
     }
 }
 
@@ -648,4 +709,27 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsChimesdkmeetingsChimemeetingssdkserviceState>)
+}
+
+/// The SHARED Chime TAG directory in the shared engine: call it with a handler's
+/// `&*self.engine`.
+///
+/// A resource's tags are keyed by ARN and live in ONE directory
+/// ([`::service_common::chime_tags::ChimeTagDirectory`]) rather than on the
+/// [`StoredMeeting`]s of this state struct, because the family's generic tagging routes
+/// are served by one member for every member's resource: a copy inside
+/// [`ComAmazonawsChimesdkmeetingsChimemeetingssdkserviceState`] would be invisible to the
+/// sibling serving a tagging call, which would then report "no tags" for a meeting that
+/// has them.
+///
+/// LOCK ORDER: a writer takes [`service_state`] first and this directory second, and no
+/// reader holds this one while taking another store, so the order cannot invert.
+///
+/// Answer `None` with a modelled server error, never with a fresh engine.
+pub fn chime_tags<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::chime_tags::ChimeTagDirectory>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<::service_common::chime_tags::ChimeTagDirectory>)
 }

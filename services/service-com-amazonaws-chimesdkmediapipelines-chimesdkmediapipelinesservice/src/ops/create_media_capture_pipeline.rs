@@ -180,6 +180,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The tags given at create time go in the family's shared, ARN-keyed tag
+        // directory, which is where the tagging operations read them from; resolved
+        // before anything is written so a create cannot half-succeed.
+        let Some(tag_directory) = crate::state::chime_tags(&*self.engine) else {
+            return Err(CreateMediaCapturePipelineErrorModeled::ServiceFailureException(
+                crate::state::service_failure("The Chime tag directory is unavailable."),
+            )
+            .into());
+        };
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -197,13 +206,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let media_pipeline_id = store.mint_media_pipeline_id();
         let created = crate::state::timestamp(now);
+        // Bound once and used both for the record and for the tag directory's key, so a
+        // create-time tag can never be written under a different ARN than the one the
+        // pipeline carries — nor be dropped for want of one.
+        let media_pipeline_arn = crate::state::media_pipeline_arn(
+            &crate::state::request_region(ctx.parts()),
+            &media_pipeline_id,
+        );
         let pipeline = crate::state::CapturePipeline {
             // Replaced by the store, which owns the creation sequence.
             seq: 0,
-            media_pipeline_arn: crate::state::media_pipeline_arn(
-                &crate::state::request_region(ctx.parts()),
-                &media_pipeline_id,
-            ),
+            media_pipeline_arn: media_pipeline_arn.clone(),
             media_pipeline_id,
             source_type: input.source_type,
             source_arn: input.source_arn,
@@ -215,7 +228,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated_timestamp: created,
             chime_sdk_meeting_configuration: input.chime_sdk_meeting_configuration,
             sse_aws_key_management_params: input.sse_aws_key_management_params,
-            tags: input.tags.unwrap_or_default(),
             // `Initializing` is non-terminal, so the service itself owes the move
             // to `InProgress`; a reader materialises it once it falls due.
             in_progress_due_at: Some(now + crate::state::INITIALIZING_TO_IN_PROGRESS),
@@ -238,6 +250,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
         };
+
+        // `TagList` is `@length(min: 1)`, so the member is either absent or non-empty.
+        // The pairs go to the family's shared directory, which is the one place any
+        // tagging call reads them from.
+        let tags: Vec<(String, String)> = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+        if !tags.is_empty() {
+            tag_directory
+                .lock()
+                .tag_within(&media_pipeline_arn, tags, crate::state::MAX_TAGS_PER_RESOURCE);
+        }
 
         Ok(CreateMediaCapturePipelineOutput {
             media_capture_pipeline: Some(stored),

@@ -19,5 +19,7 @@ mod delete_meeting_idempotence;
 mod meeting_attendee_lifecycle;
 #[path = "all/not_found_message.rs"]
 mod not_found_message;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

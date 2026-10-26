@@ -176,6 +176,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the channel store is unavailable".to_string()),
             })
         })?;
+        // The tags given at create time go in the family's shared, ARN-keyed tag
+        // directory, which is where the tagging operations read them from; resolved
+        // before anything is written so a create cannot half-succeed.
+        let tag_directory = crate::state::chime_tags(&*self.engine).ok_or_else(|| {
+            CreateChannelFlowErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the Chime tag directory is unavailable".to_string()),
+            })
+        })?;
 
         // `FallbackAction` and `InvocationType` are modelled as enums but arrive as
         // strings, so the values the model declares are checked here — as `CreateChannel`
@@ -292,10 +301,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 processors: input.processors,
                 created_millis: now,
                 last_updated_millis: now,
-                tags: input.tags.unwrap_or_default(),
             },
         );
         store.remember_channel_flow(idempotency_key, arn.clone());
+
+        // `TagList` is `@length(min: 1)`, so the member is either absent or non-empty.
+        // The pairs go to the family's shared directory, which is the one place any
+        // tagging call reads them from.
+        let tags: Vec<(String, String)> = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+        if !tags.is_empty() {
+            tag_directory.lock().tag(&arn, tags);
+        }
 
         Ok(CreateChannelFlowOutput {
             channel_flow_arn: Some(arn),

@@ -180,19 +180,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // A deleted connector leaves no tags behind: its tags live in the family's shared
+        // ARN-keyed directory, so they are dropped there rather than with the record.
+        let Some(tag_directory) = crate::state::chime_tags(&*self.engine) else {
+            return Err(DeleteVoiceConnectorErrorModeled::ServiceFailureException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
 
         let mut store = state.lock();
-        if store
-            .voice_connectors
-            .remove(&input.voice_connector_id)
-            .is_none()
-        {
+        let Some(removed) = store.voice_connectors.remove(&input.voice_connector_id) else {
             return Err(DeleteVoiceConnectorErrorModeled::NotFoundException(
                 crate::state::voice_connector_not_found(&input.voice_connector_id),
             )
             .into());
-        }
+        };
         drop(store);
+        tag_directory.lock().forget(&removed.voice_connector_arn);
 
         Ok(DeleteVoiceConnectorOutput)
     }

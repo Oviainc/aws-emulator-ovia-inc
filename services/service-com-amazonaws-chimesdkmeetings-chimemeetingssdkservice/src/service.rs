@@ -100,8 +100,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //
         // This model owns the `/meetings` resource space; the legacy endpoint binds only
         // the dial-out sub-space of it, so this service claims the COMPLEMENT of that one
-        // sub-space. (`/tags` is shared by five of the six and is resolved by endpoint
-        // prefix only — see `chime_family`.)
+        // sub-space. (`/tags` is shared by five of the six: a request that names no
+        // endpoint is served by the family's declared tagging owner, and this service
+        // serves that space at its OWN endpoint from the same shared ARN-keyed tag
+        // directory, so both answer alike — see `chime_family`.)
         service_common::chime_family::claims_chime_family_request(
             parts,
             OWN_ENDPOINT_PREFIX,

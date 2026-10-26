@@ -175,6 +175,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteMeetingErrorModeled::ServiceFailureException(crate::state::store_unavailable())
         })?;
+        // A deleted meeting leaves no tags behind: its tags live in the family's shared
+        // ARN-keyed directory, so they are dropped there rather than with the record.
+        let tag_directory = crate::state::chime_tags(&*self.engine).ok_or_else(|| {
+            DeleteMeetingErrorModeled::ServiceFailureException(crate::state::store_unavailable())
+        })?;
         let mut store = state.lock();
         // `forget_meeting` drops the meeting, the attendees nested in it and its
         // `ClientRequestToken` record together, so nothing outlives the meeting it
@@ -193,7 +198,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ListAttendees` and `CreateAttendee` on an absent meeting all answer the
         // modelled `NotFoundException`, because each of those has a value to report or a
         // record to attach and there is no meeting to take it from.
-        store.forget_meeting(&input.meeting_id);
+        let removed = store.forget_meeting(&input.meeting_id);
+        drop(store);
+        if let Some(arn) = removed
+            .as_ref()
+            .and_then(|stored| stored.meeting.meeting_arn.as_deref())
+        {
+            tag_directory.lock().forget(arn);
+        }
         Ok(DeleteMeetingOutput)
     }
 }

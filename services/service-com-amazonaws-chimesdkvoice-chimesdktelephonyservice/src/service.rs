@@ -103,8 +103,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // endpoint's too, operation for operation, and `chime` — the key such a request
         // resolves to — is that endpoint's `endpointPrefix`. A caller reaches THIS
         // endpoint's half of that space by addressing `voice-chime`, which the first
-        // conjunct answers. (`/tags` is shared by five of the six and is resolved by
-        // endpoint prefix only — see `chime_family`.)
+        // conjunct answers. (`/tags` is shared by five of the six: a request that names
+        // no endpoint is served by the family's declared tagging owner, and this service
+        // serves that space at its OWN endpoint from the same shared ARN-keyed tag
+        // directory, so both answer alike — see `chime_family`.)
         service_common::chime_family::claims_chime_family_request(
             parts,
             OWN_ENDPOINT_PREFIX,

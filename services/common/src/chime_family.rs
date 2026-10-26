@@ -66,19 +66,17 @@
 //!   served by the owner. That is answerable for ANY member's resource because the tags
 //!   do not live in one member's own state: they live in the ARN-keyed directory the
 //!   family shares ([`crate::chime_tags`]), so a tag written through whichever member
-//!   serves the write is read back by whichever member serves the read. A member that
-//!   still keeps its create-time tags in its own state has not been migrated onto that
-//!   directory yet.
+//!   serves the write is read back by whichever member serves the read. Every member that
+//!   binds the routes answers them from that directory — including the tags its own create
+//!   operations were given — so the answer does not depend on which endpoint the client
+//!   addressed.
 //!
 //! A shared segment this list MISSES keeps the behaviour it has today — several
 //! claimants, so the router's `AmbiguousService` — rather than being mis-routed: the
 //! list only ever REMOVES claims.
 //!
-//! Two follow-ups this rule leaves open, named here so neither is implicit:
+//! One follow-up this rule leaves open, named here so it is not implicit:
 //!
-//! * the members other than the tagging owner answer the `/tags` space only at their own
-//!   endpoint host, and each of them still records the tags given at CREATE time in its
-//!   own state, so those tags are not yet visible to a tagging call;
 //! * the `/app-instances` and `/meetings` splits are stated here as literal segment
 //!   readers; [`crate::addresses_modeled_route`] derives the same answer from each
 //!   model's own routing table and should replace them.

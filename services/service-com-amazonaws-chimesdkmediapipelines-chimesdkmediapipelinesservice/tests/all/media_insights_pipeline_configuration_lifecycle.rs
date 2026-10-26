@@ -821,7 +821,6 @@ fn stored_configuration(name: &str, elements: usize) -> InsightsConfiguration {
                 ..Default::default()
             })
             .collect(),
-        tags: Vec::new(),
         created_timestamp: aws_smithy_types::DateTime::from_secs(0),
         updated_timestamp: aws_smithy_types::DateTime::from_secs(0),
     }

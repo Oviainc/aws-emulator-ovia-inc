@@ -24,18 +24,27 @@
 //! pairs, and each reader projects them onto the `Tag` shape ITS model declares.
 //!
 //! The directory is a record of what this emulator TAGGED, so it is partial by
-//! construction: a resource it holds no entry for simply has no tags. A member that still
-//! keeps create-time tags in its own state has not been migrated onto it yet — tags given
-//! at create time are visible to a tagging call only once that member writes them here.
+//! construction: a resource it holds no entry for simply has no tags. Every member that
+//! binds the generic tagging routes writes the tags its CREATE operations were given here
+//! too, so the tags of a resource are one piece of state whichever route wrote them.
 
 use std::collections::{BTreeMap, VecDeque};
 
-/// How many tags one resource carries at once.
+/// The ARN namespace (`aws.api#service$arnNamespace`) every resource of the Chime family
+/// carries, and so the vendor field a tagging call's `ResourceARN` has to name: source
+/// `smithy_query(query="service_info")` on any of the six models, `awsService.arnNamespace`.
+pub const CHIME_ARN_NAMESPACE: &str = "chime";
+
+/// How many tags one resource carries at once, for a member whose model does not say
+/// otherwise.
 ///
-/// From the models themselves: every Chime `TagList` is `@length(min: 1, max: 50)`
-/// (`smithy_query(query="operation",operation="TagResource")` on any of the five), so a
-/// resource cannot hold more than 50 tags and a request that would take it past that is
-/// refused with the resource-limit error those models declare.
+/// From the models themselves: the Chime SDK Identity, Messaging, Meetings and Voice
+/// `TagList` is bounded at 50 members
+/// (`smithy_query(query="operation",operation="TagResource")` on each), so a resource of
+/// one of those services cannot hold more than 50 tags and a request that would take it
+/// past that is refused with the limit error that model declares. The Chime SDK Media
+/// Pipelines model bounds its own `TagList` at 200 instead, and that member passes its own
+/// bound to [`ChimeTagDirectory::tag_within`].
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// How many distinct resources the directory holds tags for at once.
@@ -79,11 +88,20 @@ impl ChimeTagDirectory {
     where
         I: IntoIterator<Item = (String, String)>,
     {
+        self.tag_within(resource_arn, pairs, MAX_TAGS_PER_RESOURCE)
+    }
+
+    /// [`tag`](Self::tag) under the tag count the CALLER's model bounds a resource by,
+    /// for a member whose `TagList` is not the family's usual 50 members.
+    pub fn tag_within<I>(&mut self, resource_arn: &str, pairs: I, max_tags: usize) -> Tagged
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
         let mut merged = self.tags.get(resource_arn).cloned().unwrap_or_default();
         for (key, value) in pairs {
             merged.insert(key, value);
         }
-        if merged.len() > MAX_TAGS_PER_RESOURCE {
+        if merged.len() > max_tags {
             return Tagged::TooManyTags(merged.len());
         }
         if self.tags.insert(resource_arn.to_string(), merged).is_none() {
@@ -141,6 +159,28 @@ impl ChimeTagDirectory {
     pub fn tagged_resources(&self) -> usize {
         self.tags.len()
     }
+}
+
+/// Whether a tagging call of a family member may address `resource_arn` at all.
+///
+/// The ARN has to name a resource of this family — one in the family's ARN namespace
+/// ([`CHIME_ARN_NAMESPACE`]), read through the one parse this workspace states for a
+/// caller-supplied ARN ([`crate::arn`]) — so a value that is no ARN, or another vendor's,
+/// names nothing to tag.
+///
+/// `own_resource_exists` is what the CALLING member's own store says about it:
+/// `Some(true)` / `Some(false)` when the ARN names a resource type that member mints and
+/// its store does or does not hold it, and `None` when the ARN names another member's
+/// resource. A sibling's resource is taken at its word rather than refused as absent: the
+/// member serving the family's shared tagging routes cannot read a sibling's store, and
+/// the tags themselves are keyed by ARN here rather than held by either store.
+///
+/// Every member reads THIS predicate, so the five cannot disagree about which ARNs the
+/// shared routes serve.
+#[must_use]
+pub fn addresses_taggable_resource(resource_arn: &str, own_resource_exists: Option<bool>) -> bool {
+    crate::arn::is_resource_arn_of(resource_arn, CHIME_ARN_NAMESPACE)
+        && own_resource_exists.unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -259,5 +299,79 @@ mod tests {
             1,
             "case one resource past capacity: expected the newest resource kept"
         );
+    }
+
+    #[test]
+    fn a_members_own_tag_count_bound_is_the_one_its_model_declares() {
+        // The Chime SDK Media Pipelines model bounds its `TagList` at 200 rather than 50,
+        // so a resource of that member holds up to 200 tags through the same directory.
+        let mut directory = ChimeTagDirectory::default();
+        let arn = "arn:aws:chime:us-east-1:000000000000:media-pipeline/mp1";
+        let wide: Vec<(String, String)> = (0..200)
+            .map(|index| (format!("k{index:03}"), "v".to_string()))
+            .collect();
+
+        assert_eq!(
+            directory.tag_within(arn, wide, 200),
+            Tagged::Stored,
+            "case 200 tags under a 200-tag bound: expected them stored"
+        );
+        assert_eq!(
+            directory.tag_within(arn, pairs(&[("one-too-many", "v")]), 200),
+            Tagged::TooManyTags(201),
+            "case one tag past a 200-tag bound: expected the refusal"
+        );
+        assert_eq!(
+            directory.tags_of(arn).len(),
+            200,
+            "case one tag past a 200-tag bound: expected the refused call to write nothing"
+        );
+    }
+
+    #[test]
+    fn a_tagging_call_addresses_a_family_arn_its_own_store_does_not_contradict() {
+        // (case, ARN, what the calling member's own store says, may be addressed)
+        let rows: [(&str, &str, Option<bool>, bool); 7] = [
+            (
+                "a resource of the calling member that exists",
+                "arn:aws:chime:us-east-1:000000000000:app-instance/ai1",
+                Some(true),
+                true,
+            ),
+            (
+                "a resource of the calling member that does not",
+                "arn:aws:chime:us-east-1:000000000000:app-instance/gone",
+                Some(false),
+                false,
+            ),
+            (
+                "a sibling member's resource, which this store cannot check",
+                "arn:aws:chime:us-east-1:000000000000:meeting/m1",
+                None,
+                true,
+            ),
+            (
+                "an account-less, region-less family ARN",
+                "arn:aws:chime:::media-pipeline/mp1",
+                None,
+                true,
+            ),
+            (
+                "another vendor's resource ARN",
+                "arn:aws:sqs:us-east-1:000000000000:queue/q1",
+                None,
+                false,
+            ),
+            ("a value that is no ARN at all", "app-instance/ai1", None, false),
+            ("an ARN with no resource field", "arn:aws:chime:us-east-1:000000000000", None, false),
+        ];
+
+        for (case, arn, own, expected) in rows {
+            let actual = addresses_taggable_resource(arn, own);
+            assert_eq!(
+                actual, expected,
+                "case {case:?} ({arn}, own {own:?}): expected {expected}, got {actual}"
+            );
+        }
     }
 }

@@ -187,23 +187,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+        // A deleted configuration leaves no tags behind: its tags live in the family's
+        // shared ARN-keyed directory, so they are dropped there rather than with the
+        // record.
+        let Some(tag_directory) = crate::state::chime_tags(&*self.engine) else {
+            return Err(
+                DeleteMediaInsightsPipelineConfigurationErrorModeled::ServiceFailureException(
+                    crate::state::service_failure("The Chime tag directory is unavailable."),
+                )
+                .into(),
+            );
+        };
 
         // The identifier resolves a configuration by its name or its ARN; nothing in
         // the store means nothing to delete, which is this operation's modelled 404 and
         // the normal outcome of a delete-if-exists cleanup path.
-        if !state
-            .lock()
-            .remove_insights_configuration(&input.identifier)
-        {
-            return Err(
-                DeleteMediaInsightsPipelineConfigurationErrorModeled::NotFoundException(
-                    crate::state::not_found(format!(
-                        "No media insights pipeline configuration identified by {} exists.",
-                        input.identifier
-                    )),
-                )
-                .into(),
-            );
+        let removed_arn = {
+            let mut store = state.lock();
+            let arn = store
+                .insights_configuration(&input.identifier)
+                .map(|configuration| configuration.arn.clone());
+            if !store.remove_insights_configuration(&input.identifier) {
+                return Err(
+                    DeleteMediaInsightsPipelineConfigurationErrorModeled::NotFoundException(
+                        crate::state::not_found(format!(
+                            "No media insights pipeline configuration identified by {} exists.",
+                            input.identifier
+                        )),
+                    )
+                    .into(),
+                );
+            }
+            arn
+        };
+        if let Some(arn) = removed_arn {
+            tag_directory.lock().forget(&arn);
         }
 
         // 204, empty body: the modelled output shape has no members.
