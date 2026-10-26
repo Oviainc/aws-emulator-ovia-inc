@@ -939,7 +939,9 @@ async fn delete_imported_key_material_refuses_a_key_whose_material_kms_generated
 fn seed_imported_material(engine: &Arc<engine::InMemoryEngine>, key_id: &str) -> String {
     let state = service_state(&**engine).expect("the KMS state store is reachable");
     let mut state = state.lock();
-    let key = state.keys.get_mut(key_id).expect("the key is held");
+    let key = state
+        .key_mut_in(REGION, key_id)
+        .expect("the key is held");
     let material =
         mint_material(MaterialKind::Aes256).expect("the platform produces entropy for key material");
     let key_material_id = material.id().expect("symmetric key material carries an id");

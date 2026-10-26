@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ReplicateKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ReplicateKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ReplicateKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replicates a multi-Region primary key into another Region: the replica is a key of
+//! its own in that Region, sharing the set's key id, key material, key spec, key usage,
+//! key material origin and automatic rotation status, and carrying the description, key
+//! policy and tags this request gives it. It is `Creating` for a moment and then reaches
+//! the state it was created for.
 //!
 //! ## Shape of an operation
 //!
@@ -260,18 +257,215 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ReplicateKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ReplicateKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ReplicateKey"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let replica_region = input.replica_region.clone();
+        let mut state = state.lock();
+
+        // "Specify the key ID or key ARN of a multi-Region primary key"
+        // (`smithy_query(query="doc",shape="ReplicateKeyRequest",member="KeyId")`) —
+        // resolved against the Region the request was signed for, since the primary
+        // key is replicated from its OWN Region's endpoint.
+        let key = match state.resolve(&region, &input.key_id) {
+            crate::state::KeyRef::Found(key) => key,
+            crate::state::KeyRef::UnauthorizedAccount => {
+                return Err(crate::state::unauthorized_account(Self::NAME, &input.key_id));
+            }
+            crate::state::KeyRef::MalformedArn => {
+                return Err(ReplicateKeyErrorModeled::InvalidArnException(
+                    InvalidArnException {
+                        message: Some(crate::state::invalid_arn_message(&input.key_id)),
+                    },
+                )
+                .into());
+            }
+            crate::state::KeyRef::NotFound => {
+                return Err(ReplicateKeyErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
+                })
+                .into());
+            }
+        };
+
+        // Only a key of a multi-Region set can be replicated, and only from the
+        // Region holding the set's PRIMARY key: "this operation creates a
+        // multi-Region replica key based on a multi-Region primary key in a different
+        // Region" (`smithy_query(query="doc",shape="ReplicateKey")`), and "to convert
+        // a replica key to a primary key, use the UpdatePrimaryRegion operation"
+        // (same doc) — so neither a single-Region key nor a replica key is a resource
+        // this operation is valid for, which is its modelled
+        // `UnsupportedOperationException`.
+        let Some(topology) = key.multi_region_topology.as_ref() else {
+            return Err(unsupported(crate::state::not_multi_region_message(key)));
+        };
+        if topology.primary_region != key.region {
+            let primary_region = topology.primary_region.clone();
+            return Err(unsupported(crate::state::not_primary_key_message(
+                key,
+                &primary_region,
+            )));
+        }
+
+        // A disabled key has its own modelled refusal here — "the specified KMS key
+        // is not enabled" — and any other key state outside `Enabled` (a key awaiting
+        // deletion, one awaiting imported key material, or a replica still being
+        // created) is a key state this operation is not compatible with.
+        if key.key_state == crate::state::KEY_STATE_DISABLED {
+            return Err(ReplicateKeyErrorModeled::DisabledException(DisabledException {
+                message: Some(crate::state::invalid_state_message(key)),
+            })
+            .into());
+        }
+        if !key.is_usable() {
+            return Err(ReplicateKeyErrorModeled::KMSInvalidStateException(
+                KMSInvalidStateException {
+                    message: Some(crate::state::invalid_state_message(key)),
+                },
+            )
+            .into());
+        }
+
+        // "You cannot create more than one replica of a primary key in any Region. If
+        // the Region already includes a replica of the key you're trying to
+        // replicate, ReplicateKey returns an AlreadyExistsException error" (same
+        // doc), and "the replica must be in a different Amazon Web Services Region
+        // than its primary key"
+        // (`smithy_query(query="doc",shape="ReplicateKeyRequest",member="ReplicaRegion")`)
+        // — so a Region that already holds ANY key of the set, its primary key
+        // included, already holds the key this call would create. KMS states the rule
+        // itself rather than naming the key or the Region, so the sentence carries no
+        // value from the request.
+        if state.key_in(&replica_region, &key.key_id).is_some() {
+            return Err(ReplicateKeyErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(
+                        "You can create only one replica of each primary key in each AWS Region."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "This parameter is optional. If you do not provide a key policy, KMS
+        // attaches the default key policy to the KMS key"
+        // (`smithy_query(query="doc",shape="ReplicateKeyRequest",member="Policy")`).
+        // The policy is not a shared property of a multi-Region set, so the replica's
+        // is the one this request carries, judged by the same criteria every other
+        // operation taking a key policy judges one by.
+        let policy = match input.policy.as_deref() {
+            None => crate::state::default_key_policy(),
+            Some(policy) => {
+                if policy.len() > crate::state::MAX_KEY_POLICY_BYTES {
+                    return Err(quota_exceeded(format!(
+                        "A key policy document can be at most {} bytes, but the request \
+                         carried {}.",
+                        crate::state::MAX_KEY_POLICY_BYTES,
+                        policy.len()
+                    )));
+                }
+                if let Err(reason) = crate::state::validate_key_policy(policy) {
+                    return Err(ReplicateKeyErrorModeled::MalformedPolicyDocumentException(
+                        MalformedPolicyDocumentException {
+                            message: Some(reason),
+                        },
+                    )
+                    .into());
+                }
+                policy.to_string()
+            }
+        };
+
+        // Tags are not a shared property either: "you can specify the same tags or
+        // different tags for each key in a set of related multi-Region keys"
+        // (`smithy_query(query="doc",shape="ReplicateKeyRequest",member="Tags")`), and
+        // which tag lists KMS keeps is the one judgement every operation accepting
+        // tags shares.
+        let requested_tags = input.tags.iter().flatten().count();
+        if requested_tags > crate::state::MAX_TAGS_PER_KEY {
+            return Err(quota_exceeded(format!(
+                "A KMS key can carry at most {} tags, but the request carried {requested_tags}.",
+                crate::state::MAX_TAGS_PER_KEY
+            )));
+        }
+        let tags = match crate::state::requested_tags(input.tags.as_deref().unwrap_or_default()) {
+            Ok(tags) => tags,
+            Err(reason) => {
+                return Err(ReplicateKeyErrorModeled::TagException(TagException {
+                    message: Some(reason),
+                })
+                .into());
+            }
+        };
+
+        // "KMS pricing and quotas for KMS keys apply to each primary key and replica
+        // key" (same doc): the replica is a key of its own, so it needs room in the
+        // store exactly as a created key does, and past the bound nothing is
+        // persisted.
+        if !state.has_room_for_another_key() {
+            return Err(quota_exceeded(format!(
+                "The request was rejected because a quota was exceeded: this emulator holds \
+                 at most {} KMS keys.",
+                crate::state::MAX_KEYS
+            )));
+        }
+
+        // The replica carries the set's shared properties and this request's own
+        // ones; `Cmk::replica_in` is where that split lives.
+        let replica = key.replica_in(
+            replica_region.clone(),
+            input.description.clone().unwrap_or_default(),
+            policy.clone(),
+            tags,
+        );
+        let key_id = replica.key_id.clone();
+        let metadata = replica.metadata();
+        let replica_tags = replica.tag_list();
+        state.insert_key(replica);
+        // Which Regions hold a key of the set is shared by every key of it, so the
+        // new member is recorded on all of them — the primary key this call named
+        // included, which is what makes its `DescribeKey` report the new replica.
+        state.record_replica_region(&key_id, &replica_region);
+
+        Ok(ReplicateKeyOutput {
+            // "Displays details about the new replica key" — the same metadata
+            // `DescribeKey` reports at the replica's own endpoint, built from the one
+            // record, so the two can never disagree.
+            replica_key_metadata: Some(metadata),
+            // "The key policy of the new replica key" and "the tags on the new
+            // replica key", as the record now holds them.
+            replica_policy: Some(policy),
+            replica_tags: Some(replica_tags),
+        })
     }
+}
+
+/// Refuse a request that would exceed a quota, with the operation's modelled 400:
+/// "The request was rejected because a length constraint or quota was exceeded."
+fn quota_exceeded(message: impl Into<String>) -> ReplicateKeyError {
+    ReplicateKeyErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// Refuse a key this operation cannot replicate, with the operation's modelled 400:
+/// "a specified parameter is not supported or a specified resource is not valid for
+/// this operation".
+fn unsupported(message: impl Into<String>) -> ReplicateKeyError {
+    ReplicateKeyErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The state store is missing, which is a server fault rather than a bad request.
+fn store_unavailable() -> ReplicateKeyError {
+    ReplicateKeyErrorModeled::KMSInternalException(KMSInternalException {
+        message: Some("the KMS state store is unavailable".to_string()),
+    })
+    .into()
 }

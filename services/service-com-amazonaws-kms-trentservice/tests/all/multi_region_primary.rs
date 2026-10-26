@@ -21,19 +21,16 @@
 //! names (multi-Region or single-Region, by key id, by key ARN or by alias), and in
 //! the key state the named key is in.
 //!
-//! A replica key is created by `ReplicateKey`, which is still a scaffold stub with
-//! its own issue, so the promotion rows seed the replica Regions of the set
-//! DIRECTLY into the store — the same record a replicate would leave behind — and
-//! then drive `UpdatePrimaryRegion` and `DescribeKey` over the wire.
-
-use std::sync::Arc;
+//! The replica keys the promotion rows need are created by `ReplicateKey`, driven
+//! over the same wire, so the record this suite promotes within is the one a
+//! replicate really leaves behind.
 
 use serde_json::json;
-use service_com_amazonaws_kms_trentservice::state::{key_arn, service_state};
+use service_com_amazonaws_kms_trentservice::state::key_arn;
 
 use super::harness::{
-    assert_empty, call, create_alias, create_key, describe, error_code, failure, ok,
-    router_with_engine, text, REGION,
+    assert_empty, call, create_alias, create_key, describe, error_code, failure, ok, router, text,
+    REGION,
 };
 
 /// The Regions the promotion table moves the primary-key designation to, beside the
@@ -43,23 +40,27 @@ use super::harness::{
 /// segments before the digit, three of them, and a longer name.
 const REPLICA_REGIONS: [&str; 3] = ["eu-west-2", "ap-southeast-2", "us-gov-west-1"];
 
-/// Register `regions` as Regions holding a replica key of the multi-Region key
-/// `key_id`, which is the record `ReplicateKey` leaves behind once it is
-/// implemented (its own issue). Written through the engine the router was built
-/// over, so every later request observes it.
-fn seed_replica_regions(engine: &Arc<engine::InMemoryEngine>, key_id: &str, regions: &[&str]) {
-    let state = service_state(&**engine).expect("the KMS state store is reachable");
-    let mut state = state.lock();
-    let key = state
-        .keys
-        .get_mut(key_id)
-        .expect("the key the test just created is in the store");
-    let topology = key
-        .multi_region_topology
-        .as_mut()
-        .expect("a multi-Region key carries a multi-Region topology");
+/// Replicate the multi-Region key `key_id` into each of `regions`, which is what
+/// leaves a replica key of the set at each of those Regions' endpoints.
+async fn replicate_into(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    key_id: &str,
+    regions: &[&str],
+) {
     for region in regions {
-        topology.replica_regions.insert((*region).to_string());
+        let answer = ok(
+            router,
+            "ReplicateKey",
+            &json!({"KeyId": key_id, "ReplicaRegion": region}),
+        )
+        .await;
+        let metadata = answer["ReplicaKeyMetadata"].clone();
+        assert_eq!(
+            metadata["Arn"],
+            json!(key_arn(region, key_id)),
+            "case replicate {key_id} into {region}: the replica is named by the key ARN of \
+             its own Region, got {metadata}"
+        );
     }
 }
 
@@ -105,11 +106,11 @@ async fn topology_of(
 /// is primary. Every row is read back through `DescribeKey`.
 #[tokio::test]
 async fn update_primary_region_moves_the_primary_key_of_the_set() {
-    let (router, engine) = router_with_engine();
+    let router = router();
 
     let created = create_key(&router, &json!({"MultiRegion": true, "Description": "set"})).await;
     let key_id = text("seed", &created, "KeyId");
-    seed_replica_regions(&engine, &key_id, &REPLICA_REGIONS);
+    replicate_into(&router, &key_id, &REPLICA_REGIONS).await;
 
     // Every Region of the set: the one the key was created in (its first primary)
     // and the three the replicas live in.
@@ -211,7 +212,7 @@ async fn update_primary_region_moves_the_primary_key_of_the_set() {
 /// started with.
 #[tokio::test]
 async fn update_primary_region_refuses_what_it_cannot_promote() {
-    let (router, engine) = router_with_engine();
+    let router = router();
 
     // A multi-Region key with a replica elsewhere: the rows that are not about the
     // set's membership use it, so a refusal is never explained by a missing
@@ -221,7 +222,7 @@ async fn update_primary_region_refuses_what_it_cannot_promote() {
         &create_key(&router, &json!({"MultiRegion": true})).await,
         "KeyId",
     );
-    seed_replica_regions(&engine, &promotable, &[REPLICA_REGIONS[0]]);
+    replicate_into(&router, &promotable, &[REPLICA_REGIONS[0]]).await;
 
     // The keys the rows name, each in the state its row is about.
     let single = text("setup", &create_key(&router, &json!({})).await, "KeyId");
@@ -240,26 +241,28 @@ async fn update_primary_region_refuses_what_it_cannot_promote() {
         &create_key(&router, &json!({"MultiRegion": true})).await,
         "KeyId",
     );
-    seed_replica_regions(&engine, &disabled, &[REPLICA_REGIONS[0]]);
+    replicate_into(&router, &disabled, &[REPLICA_REGIONS[0]]).await;
     ok(&router, "DisableKey", &json!({"KeyId": disabled})).await;
     let pending_deletion = text(
         "setup",
         &create_key(&router, &json!({"MultiRegion": true})).await,
         "KeyId",
     );
-    seed_replica_regions(&engine, &pending_deletion, &[REPLICA_REGIONS[0]]);
+    replicate_into(&router, &pending_deletion, &[REPLICA_REGIONS[0]]).await;
     ok(
         &router,
         "ScheduleKeyDeletion",
         &json!({"KeyId": pending_deletion}),
     )
     .await;
+    // A key still awaiting imported key material cannot be replicated either, so the
+    // set this row names has no replica anywhere: its key state is what the row is
+    // about, and it is judged before the membership of the set is.
     let pending_import = text(
         "setup",
         &create_key(&router, &json!({"MultiRegion": true, "Origin": "EXTERNAL"})).await,
         "KeyId",
     );
-    seed_replica_regions(&engine, &pending_import, &[REPLICA_REGIONS[0]]);
     create_alias(&router, "setup", "alias/single-region", &single).await;
 
     // (case, KeyId, PrimaryRegion, expected HTTP status, expected error code). Every
@@ -388,7 +391,7 @@ async fn update_primary_region_refuses_what_it_cannot_promote() {
 /// whatever kind of single-Region key it is.
 #[tokio::test]
 async fn the_refusal_of_a_single_region_key_names_it_by_its_arn() {
-    let router = router_with_engine().0;
+    let router = router();
 
     // The rows span the kinds of single-Region key this service mints: the default
     // symmetric encryption key, one created explicitly single-Region, an asymmetric

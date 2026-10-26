@@ -82,6 +82,26 @@ pub const KEY_STATE_PENDING_DELETION: &str = "PendingDeletion";
 /// `ImportKeyMaterial` to supply it. See [`KEY_STATE_ENABLED`].
 pub const KEY_STATE_PENDING_IMPORT: &str = "PendingImport";
 
+/// The TRANSIENT state a replica key of a multi-Region key set is in while KMS is
+/// still creating it: "when this operation completes, the new replica key has a
+/// transient key state of Creating. This key state changes to Enabled (or
+/// PendingImport) after a few seconds when the process of creating the new replica
+/// key is complete. While the key state is Creating, you can manage key, but you
+/// cannot yet use it in cryptographic operations"
+/// (`smithy_query(query="doc",shape="ReplicateKey")`). See [`KEY_STATE_ENABLED`].
+pub const KEY_STATE_CREATING: &str = "Creating";
+
+/// How long a replica key stays in [`KEY_STATE_CREATING`] before it reaches the
+/// state it was created for.
+///
+/// The documentation says only "after a few seconds", so the length of the span is
+/// this emulator's. It is deliberately short, so no caller waits on it, and
+/// NON-ZERO, so a caller acting straight after the replicate still observes the
+/// transient state and the key-state refusal that goes with it. The instant it ends
+/// is stored on the key record ([`Cmk::creating_until`]) and the state a reader
+/// reports is derived from the clock, so nothing has to be written when it passes.
+pub const REPLICA_CREATING_SPAN: Duration = Duration::from_millis(500);
+
 /// The `KeyUsageType` a cryptographic encrypt/decrypt key carries, from
 /// `smithy_query(shape="KeyUsageType")`. "For encrypting, decrypting,
 /// re-encrypting, and generating data keys, the KeyUsage must be ENCRYPT_DECRYPT"
@@ -206,9 +226,15 @@ pub const MAX_CUSTOM_KEY_STORES: usize = 5_000;
 /// Per-service state for com-amazonaws-kms-trentservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsKmsTrentserviceState {
-    /// Every persisted key, keyed by its minted key id (a UUID).
+    /// Every persisted key, keyed by its KEY ARN
+    /// (`arn:aws:kms:<region>:<account>:key/<key-id>`) rather than by its key id:
+    /// every key of a multi-Region set shares ONE key id — "these KMS keys have the
+    /// same key ID, key material, and other metadata"
+    /// (`smithy_query(query="doc",shape="ReplicateKey")`) — while each of them is a
+    /// separate key living in its own Region, so the key id alone does not identify
+    /// one. The ARN does, because the Region is part of it ([`key_arn`]).
     pub keys: HashMap<String, Cmk>,
-    /// The key ids in creation order. `ListKeys` pages over this, so a page
+    /// The key ARNs in creation order. `ListKeys` pages over this, so a page
     /// boundary is stable across calls and a new key never reshuffles earlier
     /// pages.
     pub key_order: Vec<String>,
@@ -251,8 +277,8 @@ impl ComAmazonawsKmsTrentserviceState {
     /// The caller refuses the request past [`MAX_KEYS`] BEFORE minting, so this
     /// never grows the store without a bound.
     pub fn insert_key(&mut self, key: Cmk) {
-        self.key_order.push(key.key_id.clone());
-        self.keys.insert(key.key_id.clone(), key);
+        self.key_order.push(key.arn.clone());
+        self.keys.insert(key.arn.clone(), key);
     }
 
     /// Whether the store can hold another key, which is what `CreateKey` checks
@@ -537,11 +563,8 @@ impl ComAmazonawsKmsTrentserviceState {
             Err(IdentifierRefusal::MalformedArn) => KeyRefMut::MalformedArn,
             Err(IdentifierRefusal::UnauthorizedAccount) => KeyRefMut::UnauthorizedAccount,
             Ok(identifier) => {
-                match self
-                    .lookup(region, &identifier)
-                    .map(|key| key.key_id.clone())
-                {
-                    Some(key_id) => match self.keys.get_mut(&key_id) {
+                match self.lookup(region, &identifier).map(|key| key.arn.clone()) {
+                    Some(arn) => match self.keys.get_mut(&arn) {
                         Some(key) => KeyRefMut::Found(key),
                         None => KeyRefMut::NotFound,
                     },
@@ -554,14 +577,70 @@ impl ComAmazonawsKmsTrentserviceState {
     /// The key `region`'s endpoint serves for the exact key id `key_id` — the
     /// lookup a ciphertext envelope needs, which names a key id and nothing else.
     pub fn key_in(&self, region: &str, key_id: &str) -> Option<&Cmk> {
-        self.keys.get(key_id).filter(|key| key.region == region)
+        self.keys.get(&key_arn(region, key_id))
     }
 
-    /// Record that `operation` used the key `key_id` in a successful cryptographic
-    /// operation — see [`Cmk::record_last_usage`], which this is the store-level way
-    /// in to, for a handler that has finished reading the key.
-    pub fn record_last_usage(&mut self, key_id: &str, operation: &str) {
-        if let Some(key) = self.keys.get_mut(key_id) {
+    /// [`Self::key_in`], for a caller that then mutates the key it found.
+    pub fn key_mut_in(&mut self, region: &str, key_id: &str) -> Option<&mut Cmk> {
+        self.keys.get_mut(&key_arn(region, key_id))
+    }
+
+    /// The key ARNs of every key of the multi-Region key set `key_id` holds — one
+    /// per Region that holds a key of the set, since every key of a set shares the
+    /// set's key id.
+    fn set_member_arns(&self, key_id: &str) -> Vec<String> {
+        self.keys
+            .values()
+            .filter(|key| key.key_id == key_id)
+            .map(|key| key.arn.clone())
+            .collect()
+    }
+
+    /// Record that `region` now holds a replica key of the multi-Region key set
+    /// `key_id`, on EVERY key of that set.
+    ///
+    /// Which Regions hold the set's keys is a property its members share: "KMS
+    /// automatically synchronizes these shared properties among related multi-Region
+    /// keys" (`smithy_query(query="doc",shape="ReplicateKey")`), so the membership is
+    /// written through every member rather than only through the key the request
+    /// named — and a reader at any of their endpoints reports the same set.
+    pub fn record_replica_region(&mut self, key_id: &str, region: &str) {
+        for arn in self.set_member_arns(key_id) {
+            if let Some(topology) = self
+                .keys
+                .get_mut(&arn)
+                .and_then(|key| key.multi_region_topology.as_mut())
+            {
+                topology.replica_regions.insert(region.to_string());
+            }
+        }
+    }
+
+    /// Make the key in `region` the primary key of the multi-Region key set `key_id`
+    /// ([`MultiRegionTopology::promote`]) on every key of that set, answering whether
+    /// `region` held a replica of it to promote at all.
+    ///
+    /// See [`Self::record_replica_region`] for why every member is written.
+    pub fn promote_primary_region(&mut self, key_id: &str, region: &str) -> bool {
+        let mut promoted = false;
+        for arn in self.set_member_arns(key_id) {
+            if let Some(topology) = self
+                .keys
+                .get_mut(&arn)
+                .and_then(|key| key.multi_region_topology.as_mut())
+            {
+                promoted |= topology.promote(region);
+            }
+        }
+        promoted
+    }
+
+    /// Record that `operation` used the key `key_id` that `region`'s endpoint serves
+    /// in a successful cryptographic operation — see [`Cmk::record_last_usage`], which
+    /// this is the store-level way in to, for a handler that has finished reading the
+    /// key.
+    pub fn record_last_usage(&mut self, region: &str, key_id: &str, operation: &str) {
+        if let Some(key) = self.key_mut_in(region, key_id) {
             key.record_last_usage(operation);
         }
     }
@@ -648,7 +727,9 @@ impl ComAmazonawsKmsTrentserviceState {
     pub fn key_ids_in(&self, region: &str) -> Vec<&str> {
         self.key_order
             .iter()
-            .filter_map(|key_id| self.key_in(region, key_id).map(|key| key.key_id.as_str()))
+            .filter_map(|arn| self.keys.get(arn))
+            .filter(|key| key.region == region)
+            .map(|key| key.key_id.as_str())
             .collect()
     }
 
@@ -1457,6 +1538,12 @@ pub struct Cmk {
     /// One of [`KEY_STATE_ENABLED`], [`KEY_STATE_DISABLED`],
     /// [`KEY_STATE_PENDING_DELETION`].
     pub key_state: String,
+    /// When this key stops being in the transient [`KEY_STATE_CREATING`] state, or
+    /// `None` for a key that was never in it. Only a replica key starts there, and
+    /// only until [`REPLICA_CREATING_SPAN`] after the call that created it; a reader
+    /// derives the transient state from this instant ([`Self::is_creating`]) rather
+    /// than from anything a later call wrote.
+    pub creating_until: Option<SystemTime>,
     pub description: String,
     pub key_usage: String,
     pub key_spec: String,
@@ -1551,6 +1638,7 @@ impl std::fmt::Debug for Cmk {
             .field("creation_date", &self.creation_date)
             .field("enabled", &self.enabled)
             .field("key_state", &self.key_state)
+            .field("creating_until", &self.creating_until)
             .field("description", &self.description)
             .field("key_usage", &self.key_usage)
             .field("key_spec", &self.key_spec)
@@ -1616,6 +1704,9 @@ impl Cmk {
             } else {
                 KEY_STATE_ENABLED.to_string()
             },
+            // A key `CreateKey` mints is never in the transient `Creating` state:
+            // only a replica key is ([`Self::replica_in`]).
+            creating_until: None,
             description,
             key_usage,
             key_spec,
@@ -1640,6 +1731,99 @@ impl Cmk {
             last_usage: None,
             // A key created with no key material has not been given any yet, and a key
             // whose material KMS generated never carries imported material.
+            imported_material: None,
+        }
+    }
+
+    /// The replica key of this multi-Region primary key that `ReplicateKey` creates
+    /// in `region`.
+    ///
+    /// "A primary key and its replica keys share properties that make them
+    /// interoperable. They have the same key ID and key material. They also have the
+    /// same key spec, key usage, key material origin, and automatic key rotation
+    /// status. KMS automatically synchronizes these shared properties among related
+    /// multi-Region keys. All other properties of a replica key can differ, including
+    /// its key policy, tags, aliases, and key state"
+    /// (`smithy_query(query="doc",shape="ReplicateKey")`): the shared properties are
+    /// taken from THIS key and everything else from the request, so the replica is a
+    /// key of the same set rather than a copy of the record.
+    ///
+    /// "If you replicate a multi-Region primary key with imported key material, the
+    /// replica key is created with no key material. You must import the same key
+    /// material that you imported into the primary key" (same doc) — so a key whose
+    /// material came from outside KMS replicates WITHOUT material, and its replica
+    /// waits in [`KEY_STATE_PENDING_IMPORT`] once it is created.
+    pub fn replica_in(
+        &self,
+        region: String,
+        description: String,
+        policy: String,
+        tags: BTreeMap<String, String>,
+    ) -> Self {
+        let awaiting_import = self.origin == ORIGIN_EXTERNAL;
+        let material = if awaiting_import {
+            KeyMaterial::AwaitingImport
+        } else {
+            self.material.clone()
+        };
+        // The material a rotation replaced is part of the shared material history,
+        // so a ciphertext the set sealed before a rotation opens at the replica's
+        // endpoint too.
+        let superseded_material = if awaiting_import {
+            Vec::new()
+        } else {
+            self.superseded_material.clone()
+        };
+        let arn = key_arn(&region, &self.key_id);
+        // One topology describes the whole set, and the replica joins it: the
+        // Region it lives in now holds a replica key of the set.
+        let mut topology = self
+            .multi_region_topology
+            .clone()
+            .unwrap_or_else(|| MultiRegionTopology::primary_in(self.region.clone()));
+        topology.replica_regions.insert(region.clone());
+        Self {
+            key_id: self.key_id.clone(),
+            arn,
+            aws_account_id: self.aws_account_id.clone(),
+            region,
+            // The replica is a new key, created now: its creation date is its own,
+            // not the primary key's.
+            creation_date: SystemTime::now(),
+            enabled: !awaiting_import,
+            key_state: if awaiting_import {
+                KEY_STATE_PENDING_IMPORT.to_string()
+            } else {
+                KEY_STATE_ENABLED.to_string()
+            },
+            creating_until: Some(SystemTime::now() + REPLICA_CREATING_SPAN),
+            description,
+            key_usage: self.key_usage.clone(),
+            key_spec: self.key_spec.clone(),
+            origin: self.origin.clone(),
+            key_manager: self.key_manager.clone(),
+            multi_region_topology: Some(topology),
+            policy,
+            deletion_date: None,
+            pending_window_in_days: None,
+            tags,
+            current_key_material_id: material.id(),
+            material,
+            superseded_material,
+            rotations: if awaiting_import {
+                Vec::new()
+            } else {
+                self.rotations.clone()
+            },
+            // The automatic key rotation status is a shared property, so the replica
+            // starts on the set's schedule.
+            rotation_schedule: self.rotation_schedule.clone(),
+            // The replica has not been used in a cryptographic operation yet; what
+            // the primary key was used for is the primary key's record.
+            last_usage: None,
+            // A replica of a key with imported material holds none until the same
+            // material is imported into it, and one of a key whose material KMS
+            // generated never carries imported material.
             imported_material: None,
         }
     }
@@ -1926,7 +2110,13 @@ impl Cmk {
             key_id: self.key_id.clone(),
             arn: Some(self.arn.clone()),
             creation_date: Some(date_time(self.creation_date)),
-            enabled: self.enabled && !self.key_material_expired(),
+            // "Specifies whether the KMS key is enabled. When KeyState is Enabled
+            // this value is true, otherwise it is false"
+            // (`smithy_query(query="doc",shape="KeyMetadata",member="Enabled")`), so
+            // it is read from the state a READER reports: a replica still being
+            // created, and a key whose imported material the clock has taken away,
+            // are not enabled.
+            enabled: self.reported_key_state() == KEY_STATE_ENABLED,
             description: Some(self.description.clone()),
             key_usage: Some(self.key_usage.clone()),
             key_state: Some(self.reported_key_state().to_string()),
@@ -2015,14 +2205,25 @@ impl Cmk {
     }
 
     /// The `KeyState` a READER reports for this key, which is the one it carries unless
-    /// the clock has already taken its key material away: material past its `ValidTo`
-    /// is deleted, and a key with no key material waits in
+    /// the clock still owes it a transient state change: a replica key is `Creating`
+    /// until [`Self::creating_until`] passes, and material past its `ValidTo` is
+    /// deleted, leaving a key with no key material waiting in
     /// [`KEY_STATE_PENDING_IMPORT`].
     pub fn reported_key_state(&self) -> &str {
+        if self.is_creating() {
+            return KEY_STATE_CREATING;
+        }
         if self.key_material_expired() {
             return KEY_STATE_PENDING_IMPORT;
         }
         &self.key_state
+    }
+
+    /// Whether this key is still in the transient [`KEY_STATE_CREATING`] state, which
+    /// the clock ends by itself — see [`REPLICA_CREATING_SPAN`].
+    pub fn is_creating(&self) -> bool {
+        self.creating_until
+            .is_some_and(|until| SystemTime::now() < until)
     }
 
     /// Whether this key can be used in a cryptographic operation right now.
@@ -2389,6 +2590,13 @@ impl MaterialKind {
 }
 
 /// The key material behind one KMS key.
+///
+/// `Clone` is what lets a multi-Region replica key hold the SAME material as the
+/// primary key it was replicated from: "they have the same key ID and key material"
+/// (`smithy_query(query="doc",shape="ReplicateKey")`), which is what makes a
+/// ciphertext produced in one Region decryptable in another. The bytes never leave
+/// this process either way.
+#[derive(Clone)]
 pub enum KeyMaterial {
     /// The 256-bit AES-GCM key of a symmetric encryption KMS key, from the OS
     /// CSPRNG. `Encrypt` and `Decrypt` seal and open under exactly these bytes.
@@ -2994,6 +3202,36 @@ pub fn invalid_state_message(key: &Cmk) -> String {
 /// deletion."
 pub fn required_state_message(key: &Cmk, required_state: &str) -> String {
     format!("{} is not {}.", key.arn, key_state_prose(required_state))
+}
+
+/// How an operation that acts on a multi-Region key SET refuses a key that belongs
+/// to none, naming the key the request resolved to by its ARN.
+///
+/// `ReplicateKey` replicates "a multi-Region primary key" and `UpdatePrimaryRegion`
+/// "changes the primary key of a multi-Region key"
+/// (`smithy_query(query="doc",shape="ReplicateKey")`), so for both of them a
+/// single-Region key is a resource that is not valid for the operation — the modelled
+/// `UnsupportedOperationException`. One function for both, so the two cannot word the
+/// same refusal differently.
+pub fn not_multi_region_message(key: &Cmk) -> String {
+    format!("{} is not a multi-region key.", key.arn)
+}
+
+/// How an operation that acts on the PRIMARY key of a multi-Region key set refuses a
+/// REPLICA key of one.
+///
+/// `ReplicateKey`'s `KeyId` "identifies the multi-Region primary key that is being
+/// replicated"
+/// (`smithy_query(query="doc",shape="ReplicateKeyRequest",member="KeyId")`), so a
+/// replica key of a set is a resource that is not valid for it; the refusal names the
+/// key the request resolved to and the Region that does hold the set's primary key,
+/// which is where the call belongs.
+pub fn not_primary_key_message(key: &Cmk, primary_region: &str) -> String {
+    format!(
+        "{} is not a multi-region primary key. The primary key of this multi-region key is in \
+         {primary_region}.",
+        key.arn
+    )
 }
 
 /// A `KeyState` value as prose: `PendingDeletion` -> `pending deletion`.

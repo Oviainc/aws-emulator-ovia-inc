@@ -410,7 +410,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The key was just used in a successful cryptographic operation, which is what
         // `GetKeyLastUsage` reports.
-        state.record_last_usage(&key_id, Self::NAME);
+        state.record_last_usage(&region, &key_id, Self::NAME);
 
         Ok(EncryptOutput {
             ciphertext_blob: Some(ciphertext_blob),

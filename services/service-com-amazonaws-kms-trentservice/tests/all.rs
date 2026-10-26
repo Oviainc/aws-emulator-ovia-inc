@@ -53,6 +53,8 @@ mod key_specs;
 mod list_resource_tags_reads;
 #[path = "all/multi_region_primary.rs"]
 mod multi_region_primary;
+#[path = "all/replicate_key.rs"]
+mod replicate_key;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

@@ -220,15 +220,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
-        let key = match state.resolve_mut(&region, &input.key_id) {
-            crate::state::KeyRefMut::Found(key) => key,
-            crate::state::KeyRefMut::UnauthorizedAccount => {
+        let key = match state.resolve(&region, &input.key_id) {
+            crate::state::KeyRef::Found(key) => key,
+            crate::state::KeyRef::UnauthorizedAccount => {
                 return Err(crate::state::unauthorized_account(
                     Self::NAME,
                     &input.key_id,
                 ));
             }
-            crate::state::KeyRefMut::MalformedArn => {
+            crate::state::KeyRef::MalformedArn => {
                 return Err(UpdatePrimaryRegionErrorModeled::InvalidArnException(
                     InvalidArnException {
                         message: Some(crate::state::invalid_arn_message(&input.key_id)),
@@ -236,7 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            crate::state::KeyRefMut::NotFound => {
+            crate::state::KeyRef::NotFound => {
                 return Err(UpdatePrimaryRegionErrorModeled::NotFoundException(
                     NotFoundException {
                         message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
@@ -256,7 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !key.is_multi_region() {
             return Err(UpdatePrimaryRegionErrorModeled::UnsupportedOperationException(
                 UnsupportedOperationException {
-                    message: Some(format!("{} is not a multi-region key.", key.arn)),
+                    message: Some(crate::state::not_multi_region_message(key)),
                 },
             )
             .into());
@@ -281,6 +281,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The key the designation moves within, named as every refusal of this
+        // operation names it, read before the store is written through again.
+        let key_id = key.key_id.clone();
+        let key_arn = key.arn.clone();
+
         // "The key ID and primary Region that you specify uniquely identify the
         // replica key that will become the primary key. The primary Region must
         // already have a replica key. This operation does not create a KMS key in
@@ -291,15 +296,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // failure naming the member and what is wrong with it; nothing is
         // persisted. The Region that already holds the primary key holds no replica
         // of the set either, so it is refused the same way.
-        let promoted = key
-            .multi_region_topology
-            .as_mut()
-            .is_some_and(|topology| topology.promote(&input.primary_region));
-        if !promoted {
+        //
+        // Which key of the set is its primary is a property every key of the set
+        // shares, so the move is written through all of them.
+        if !state.promote_primary_region(&key_id, &input.primary_region) {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "PrimaryRegion {} has no replica key of {}. The primary Region must already \
-                 have a replica key.",
-                input.primary_region, key.arn
+                "PrimaryRegion {} has no replica key of {key_arn}. The primary Region must \
+                 already have a replica key.",
+                input.primary_region
             )));
         }
 

@@ -24,15 +24,12 @@
 //!    whose kind cannot rotate is refused by every rotation operation alike, with the
 //!    error code alone and no message.
 
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
-use service_com_amazonaws_kms_trentservice::state::service_state;
 
 use super::harness::{
-    assert_empty, call, create_alias, create_key, describe, error_code, ok, router,
-    router_with_engine, text, REGION,
+    assert_empty, call, create_alias, create_key, describe, error_code, ok, router, text, REGION,
 };
 
 /// Seconds in a day: the unit `RotationPeriodInDays` counts in
@@ -462,7 +459,7 @@ async fn the_rotation_status_is_a_report_that_changes_nothing() {
 /// `EnableKeyRotation` and for `DisableKeyRotation`.
 #[tokio::test]
 async fn configuring_rotation_is_refused_outside_an_enabled_symmetric_kms_key() {
-    let (router, engine) = router_with_engine();
+    let router = router();
     let account = engine::emulator_account_id();
 
     // Rows: a key this operation is not valid for, and the error that reports it.
@@ -645,15 +642,15 @@ async fn configuring_rotation_is_refused_outside_an_enabled_symmetric_kms_key() 
     }
 
     // A replica key of a multi-Region set carries no schedule of its own: the
-    // property is set on the primary key of the set. The set is seeded with a replica
-    // Region and then promoted there, which is what leaves this endpoint serving a
-    // replica of the set rather than its primary key.
+    // property is set on the primary key of the set. The set is replicated into
+    // another Region and then promoted there, which is what leaves this endpoint
+    // serving a replica of the set rather than its primary key.
     let replica = text(
         "setup",
         &create_key(&router, &json!({"MultiRegion": true})).await,
         "KeyId",
     );
-    seed_replica_region(&engine, &replica, "eu-west-2");
+    replicate_into(&router, &replica, "eu-west-2").await;
     ok(
         &router,
         "UpdatePrimaryRegion",
@@ -676,20 +673,18 @@ async fn configuring_rotation_is_refused_outside_an_enabled_symmetric_kms_key() 
     }
 }
 
-/// Register `region` as a Region holding a replica key of the multi-Region key
-/// `key_id`, which is the record `ReplicateKey` leaves behind once it is implemented
-/// (its own issue) — the same seam `multi_region_primary` seeds through. Written
-/// through the engine the router was built over, so every later request observes it.
-fn seed_replica_region(engine: &Arc<engine::InMemoryEngine>, key_id: &str, region: &str) {
-    let state = service_state(&**engine).expect("the KMS state store is reachable");
-    let mut state = state.lock();
-    let key = state
-        .keys
-        .get_mut(key_id)
-        .expect("the key the test just created is in the store");
-    let topology = key
-        .multi_region_topology
-        .as_mut()
-        .expect("a multi-Region key carries a multi-Region topology");
-    topology.replica_regions.insert(region.to_string());
+/// Replicate the multi-Region key `key_id` into `region`, which is what leaves a
+/// replica key of the set at that Region's endpoint — the same seam
+/// `multi_region_primary` drives.
+async fn replicate_into(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    key_id: &str,
+    region: &str,
+) {
+    ok(
+        router,
+        "ReplicateKey",
+        &json!({"KeyId": key_id, "ReplicaRegion": region}),
+    )
+    .await;
 }
