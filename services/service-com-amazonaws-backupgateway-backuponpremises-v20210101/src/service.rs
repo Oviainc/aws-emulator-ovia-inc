@@ -39,6 +39,14 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! Two of those seams also serve this service's ACTIVATION handshake — the unsigned,
+//! non-modelled HTTP request a deployed gateway appliance makes to be issued the
+//! `ActivationKey` a later `CreateGateway` redeems. It carries no credential scope and no
+//! `X-Amz-Target`, so `can_handle` has to claim it and `override_routing_error` is where it
+//! is answered; see [`activation`] for the whole rule.
+
+mod activation;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
@@ -170,6 +178,13 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The SAME shared engine the generated entry threads into every operation.
+    ///
+    /// Held here because the [`activation`] handshake is answered from
+    /// [`Service::override_routing_error`], which is not an operation and so has no
+    /// `self.engine` of its own: the activation it records has to go into the one store
+    /// `CreateGateway` reads, never a second copy.
+    engine: Arc<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -178,7 +193,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
         }
     }
 }
@@ -195,10 +211,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Claim a request whose resolved route key is this service's signing
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+        if let Some(key) = smithy_server_runtime::resolve_route_key(parts) {
+            if key == self.entry.identity().signing_name() {
+                return true;
+            }
         }
+        // And the ACTIVATION handshake, which is not a modelled request: an appliance makes
+        // it before anybody holds a gateway, so it carries no AWS credential to resolve a
+        // route key from and the front door would answer `404 UnknownService` for the very
+        // endpoint a client was told to ask a key of. The claim is narrow — a `GET` of the
+        // endpoint root carrying `activationRegion` — so it takes no request another service
+        // serves; see [`activation`].
+        activation::claims_parts(parts)
     }
 
     fn override_operation(
@@ -247,7 +271,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
         // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
         // word that routing failure in your own envelope instead.
-        let _ = req;
+        //
+        // The ACTIVATION handshake IS such a request: it names no modelled operation, so
+        // this pre-authentication seam is where it is answered — which is what lets an
+        // appliance holding no AWS credential be issued a key at all. Every other
+        // unresolvable request keeps the protocol-correct default.
+        if activation::claims_request(req) {
+            return Some(activation::serve(&*self.engine, req));
+        }
         None
     }
 

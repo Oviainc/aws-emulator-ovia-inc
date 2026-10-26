@@ -8,11 +8,15 @@
 //! the ARN a create returns is read back out of [`StoredGateway`] after the insert, so
 //! a response can only describe a record that is really in the store.
 //!
-//! The `ActivationKey` a create carries is kept ON the record
-//! ([`StoredGateway::activation_key`]): it identifies the appliance the gateway stands
-//! for, and it is minted out of band by that appliance's activation handshake, which no
-//! operation of this model performs — so the store holds no registry of keys to resolve
-//! it against, and every well-formed key names an appliance the service cannot verify.
+//! The `ActivationKey` a create carries is REDEEMED against the activation registry this
+//! store owns ([`PendingActivation`]): the activation handshake a deployed appliance makes
+//! issues the key ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::issue_activation_key`],
+//! reached over the wire through `crate::service`), and the create that activates that
+//! appliance consumes its entry
+//! ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::redeem_activation_key`]), so
+//! a key is redeemable exactly once and a key nothing issued is redeemable never. The
+//! redeemed key is kept ON the record it created ([`StoredGateway::activation_key`]),
+//! because it identifies the appliance the gateway stands for.
 //!
 //! The record carries the members of the later slices too (hypervisor association,
 //! maintenance window, bandwidth schedule), so those operations extend this one struct
@@ -307,6 +311,39 @@ pub const MAINTENANCE_START_TIME_INVALID_MESSAGE: &str =
     "A maintenance start time is weekly or monthly: DayOfWeek and DayOfMonth cannot both \
      be specified.";
 
+/// `ValidationException$ErrorCode` for a `CreateGateway` whose `ActivationKey` names no
+/// activation this service has issued and not yet redeemed.
+///
+/// An activation key is MINTED by the activation handshake a deployed appliance makes
+/// ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::issue_activation_key`]) and
+/// redeemed by the create that activates that appliance, so a key no handshake issued —
+/// or one a create has already redeemed — names no activation to redeem. `CreateGateway`
+/// declares exactly one client error (`ValidationException`, HTTP 400:
+/// `smithy_query(query="operation",operation="CreateGateway")`), so that is the shape the
+/// refusal takes, and this `ErrorCode` names the condition inside it.
+pub const ACTIVATION_KEY_NOT_FOUND: &str = "ActivationKeyNotFound";
+
+/// See [`ACTIVATION_KEY_NOT_FOUND`]: the sentence AWS is recorded stating for that refusal
+/// (`issues/.../backup-gateway-negative-paths-succeed-or-return-the.md`), kept in one place
+/// so every refusal of an unredeemable key is worded the same way.
+pub const ACTIVATION_KEY_NOT_FOUND_MESSAGE: &str = "The specified activation key was not found.";
+
+/// How many hyphen-separated groups an issued activation key carries, and how many
+/// symbols each group holds.
+///
+/// The form a gateway appliance prints: the sibling storage-gateway model records
+/// `29AV1-3OFV9-VVIUB-NKT0I-LRO6V` as the `ActivationKey` of its `ActivateGateway`
+/// example (`smithy_query(query="operation",operation="ActivateGateway",
+/// model_path="services/service-com-amazonaws-storagegateway-storagegateway-20130630/\
+/// smithy-model/com-amazonaws-storagegateway-storagegateway-20130630.json")`). Five groups
+/// of five keeps every issued key inside this model's own `ActivationKey` constraints
+/// (len 1..50, pattern `^[0-9a-zA-Z\-]+$`), so a key this service issues is a key its own
+/// boundary validator accepts.
+const ACTIVATION_KEY_GROUPS: usize = 5;
+
+/// See [`ACTIVATION_KEY_GROUPS`].
+const ACTIVATION_KEY_GROUP_SYMBOLS: usize = 5;
+
 /// The region a minted ARN falls back to when the request carries no SigV4 credential
 /// scope to read one from (an unsigned request on an emulator with authentication off).
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -418,6 +455,16 @@ pub const METADATA_SYNC_SUCCEEDED_MESSAGE: &str = "The metadata sync succeeded."
 /// services in this workspace use for a caller-driven store.
 pub const MAX_STORED_GATEWAYS: usize = 1_000;
 
+/// The largest number of issued-but-unredeemed activation keys this emulator keeps.
+///
+/// The activation handshake is unsigned — it is what a deployed appliance makes BEFORE
+/// anybody holds a gateway — so the registry it writes to is bounded here: once it is
+/// full, issuing a key drops the key that has been pending longest
+/// ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::issue_activation_key`]),
+/// which keeps resident memory bounded without letting one caller's handshakes stop
+/// another appliance from activating.
+pub const MAX_PENDING_ACTIVATION_KEYS: usize = 1_000;
+
 /// The largest number of hypervisors this emulator keeps, for the same reason as
 /// [`MAX_STORED_GATEWAYS`]: `ImportHypervisorConfiguration` grows resident memory one
 /// record per call, so the store is bounded and an import past the ceiling is refused
@@ -469,6 +516,25 @@ pub const MAX_PAGE_SIZE: usize = 100;
 /// enforce it.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// One activation this service has ISSUED and no create has redeemed yet.
+///
+/// Keyed in the store by the activation key itself: the key is what a create presents, so
+/// it is the identity of the pending activation, and a redeemed key is REMOVED rather than
+/// flagged — the activation it named is spent and names nothing to redeem again.
+#[derive(Debug, Clone)]
+pub struct PendingActivation {
+    /// The region the handshake asked for the key in, normalised through [`arn_region`].
+    ///
+    /// An activation key is issued for ONE region — which is what the handshake's
+    /// `activationRegion` names — so a create addressed to another region's endpoint
+    /// presents a key that region's service never issued.
+    pub region: String,
+    /// When the handshake issued the key: the order
+    /// [`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::issue_activation_key`]
+    /// drops pending keys in once the registry is full.
+    pub issued_at: SystemTime,
+}
+
 /// One persisted gateway.
 ///
 /// Keyed in the store by [`StoredGateway::arn`]; `gateway_id` is the ARN's resource
@@ -484,8 +550,9 @@ pub struct StoredGateway {
     pub display_name: String,
     /// `GatewayType`; the model declares only [`BACKUP_VM`].
     pub gateway_type: String,
-    /// The activation key the gateway was created with. Not part of any response
-    /// shape — kept because it identifies the appliance this record stands for.
+    /// The activation key the gateway was created with — the one its create REDEEMED
+    /// ([`PendingActivation`]). Not part of any response shape — kept because it
+    /// identifies the appliance this record stands for.
     pub activation_key: String,
     /// The hypervisor this gateway is associated with, as
     /// [`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::associate_gateway_to_server`]
@@ -1054,6 +1121,21 @@ pub struct ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// Monotonic counter behind the `gateway/<id>` ARN suffix, so every minted ARN is
     /// unique within a run and the sequence is reproducible.
     next_gateway_id: u64,
+    /// The activation keys this service has issued and no create has redeemed, by key.
+    ///
+    /// The registry `CreateGateway` resolves its `ActivationKey` against: the activation
+    /// handshake of a deployed appliance writes it ([`Self::issue_activation_key`]) and the
+    /// create that activates that appliance consumes its entry
+    /// ([`Self::redeem_activation_key`]), so a key is redeemable exactly once and a key
+    /// nothing issued is redeemable never.
+    ///
+    /// A `BTreeMap` so the pending set has a total, stable order — the order the oldest
+    /// entry is found in when the registry is full.
+    pending_activations: BTreeMap<String, PendingActivation>,
+    /// Monotonic counter behind an issued activation key, so every key this service hands
+    /// out is unique within a run and the sequence is reproducible — the same reason
+    /// `next_gateway_id` sits behind the `gateway/<id>` ARN suffix.
+    next_activation_id: u64,
     /// Hypervisors by ARN. A `BTreeMap` for the same reason as `gateways`: the key order
     /// is total and stable, and it is the order `ListHypervisors` reports them in —
     /// "ordered by their Amazon Resource Names (ARNs)"
@@ -1077,6 +1159,74 @@ pub struct ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
 }
 
 impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
+    /// Issue an activation key for `region`, persist it as pending, and hand it back.
+    ///
+    /// This is the service half of the activation handshake a deployed appliance makes
+    /// before anybody creates a gateway: the key is MINTED here — never taken from a
+    /// request — and `CreateGateway` serves only a key it finds in this registry, so the
+    /// create really redeems an activation instead of accepting whatever string it was
+    /// handed.
+    ///
+    /// The key is minted from this store's own counter, rendered as the hyphen-separated
+    /// groups an appliance prints ([`ACTIVATION_KEY_GROUPS`]) — the same way every ARN
+    /// suffix of this store is minted, so a key is unique within a run and the sequence a
+    /// test sees is reproducible. What makes a key redeemable is this REGISTRY, not how the
+    /// key is spelled, so nothing rests on it being unguessable.
+    ///
+    /// Once the registry holds [`MAX_PENDING_ACTIVATION_KEYS`], the key pending LONGEST is
+    /// dropped to make room: the handshake is unsigned, so the bound cannot be a refusal
+    /// that would let one caller stop every other appliance from activating.
+    pub fn issue_activation_key(&mut self, region: &str, now: SystemTime) -> String {
+        while self.pending_activations.len() >= MAX_PENDING_ACTIVATION_KEYS {
+            let Some(oldest) = self
+                .pending_activations
+                .iter()
+                .min_by(|(left_key, left), (right_key, right)| {
+                    (left.issued_at, left_key.as_str()).cmp(&(right.issued_at, right_key.as_str()))
+                })
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.pending_activations.remove(&oldest);
+        }
+        let key = minted_activation_key(self.next_activation_id);
+        self.next_activation_id += 1;
+        self.pending_activations.insert(
+            key.clone(),
+            PendingActivation {
+                region: arn_region(region),
+                issued_at: now,
+            },
+        );
+        key
+    }
+
+    /// Whether `key` names an activation this service issued for `region` and no create has
+    /// redeemed — read-only, so the caller can refuse before anything is written.
+    pub fn activation_key_is_redeemable(&self, key: &str, region: &str) -> bool {
+        self.pending_activations
+            .get(key)
+            .is_some_and(|pending| pending.region == arn_region(region))
+    }
+
+    /// Redeem `key` for `region`, removing the activation it names.
+    ///
+    /// `false` — nothing removed — for a key this service never issued, one already
+    /// redeemed, or one issued for another region: the caller refuses, and the registry is
+    /// left as it was.
+    pub fn redeem_activation_key(&mut self, key: &str, region: &str) -> bool {
+        if !self.activation_key_is_redeemable(key, region) {
+            return false;
+        }
+        self.pending_activations.remove(key).is_some()
+    }
+
+    /// How many issued activation keys are still pending redemption.
+    pub fn pending_activation_count(&self) -> usize {
+        self.pending_activations.len()
+    }
+
     /// Mint and persist a gateway, and hand back the record as it is now STORED —
     /// read out of the map after the insert, so the ARN a caller gets is the key the
     /// store holds rather than anything derived from the request.
@@ -2039,6 +2189,31 @@ pub fn arn_region(region: &str) -> String {
     } else {
         DEFAULT_REGION.to_string()
     }
+}
+
+/// One activation key as the activation handshake prints it: `sequence`, rendered as
+/// [`ACTIVATION_KEY_GROUPS`] groups of [`ACTIVATION_KEY_GROUP_SYMBOLS`] base-36 symbols.
+///
+/// The sequence is the store's own counter, as every ARN suffix this store mints is, so a
+/// key is unique within a run and the sequence is reproducible. Nothing is taken from the
+/// request: a key derived from what a client sent would let that client present a key the
+/// service never issued.
+fn minted_activation_key(sequence: u64) -> String {
+    const SYMBOLS: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let mut remaining = sequence;
+    let mut symbols = [b'0'; ACTIVATION_KEY_GROUPS * ACTIVATION_KEY_GROUP_SYMBOLS];
+    // Least significant symbol last, so the rendering reads as a number and two keys minted
+    // in a row differ in their final group.
+    for symbol in symbols.iter_mut().rev() {
+        let digit = usize::try_from(remaining % 36).unwrap_or_default();
+        *symbol = SYMBOLS.get(digit).copied().unwrap_or(b'0');
+        remaining /= 36;
+    }
+    symbols
+        .chunks(ACTIVATION_KEY_GROUP_SYMBOLS)
+        .map(|group| ::std::str::from_utf8(group).unwrap_or_default())
+        .collect::<Vec<&str>>()
+        .join("-")
 }
 
 /// The region this request was signed for, read from its SigV4 credential scope.

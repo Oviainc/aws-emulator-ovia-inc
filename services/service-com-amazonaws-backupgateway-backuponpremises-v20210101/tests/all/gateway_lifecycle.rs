@@ -13,7 +13,7 @@
 //! gateway its ARN names out of the persisted store and answers from that record, so a
 //! create is visible to every later read, an update replaces only the members the
 //! request carried, and a delete makes the record absent. The tables below span that
-//! class — several gateways differing in display name, activation key and tag count, and
+//! class — several gateways differing in display name and tag count, and
 //! every page size over a fixed set of records — rather than one recorded request.
 //!
 //! The request harness here ([`call`], [`build_router`], [`Reply`]) is shared with the
@@ -41,20 +41,63 @@ const TARGET_PREFIX: &str = "BackupOnPremises_v20210101";
 /// `us-east-1` fallback: a minted ARN has to carry the region the caller addressed.
 pub(crate) const REGION: &str = "us-west-2";
 
-/// The activation key the helpers below create gateways with.
+/// The activation key the helpers below create gateways with: one the service ISSUED.
 ///
-/// It plays no part in whether a create succeeds: the key is minted outside this API,
-/// by the activation handshake of the appliance the gateway stands for, so the service
-/// has nothing to resolve it against and every key the model accepts mints a gateway
-/// (see `gateway_activation`). It is persisted on the record it creates.
-pub(crate) const ACTIVATION_KEY: &str = "ACTIVATION-KEY123";
+/// A create REDEEMS the activation its key names, and a key is minted only by the
+/// activation handshake a deployed appliance makes — so this harness makes that handshake
+/// over the wire, exactly as a client would, rather than seeding the registry in process.
+/// Each call issues a new key, because a redeemed activation is spent.
+pub(crate) async fn issued_activation_key(router: &MultiServiceRouter) -> String {
+    issued_activation_key_for(router, REGION).await
+}
+
+/// [`issued_activation_key`], for a named region: a key is issued for ONE region, which is
+/// what the handshake's `activationRegion` names.
+pub(crate) async fn issued_activation_key_for(
+    router: &MultiServiceRouter,
+    region: &str,
+) -> String {
+    let reply = activation_handshake(router, &format!("activationRegion={region}")).await;
+    assert_eq!(
+        reply.0, 200,
+        "the activation handshake for {region:?} must issue a key, got {} {:?}",
+        reply.0, reply.1
+    );
+    reply.1
+}
+
+/// One activation handshake: the unsigned `GET /?<query>` a deployed appliance makes, and
+/// the status and body it is answered with.
+pub(crate) async fn activation_handshake(
+    router: &MultiServiceRouter,
+    query: &str,
+) -> (u16, String) {
+    let request = http::Request::builder()
+        .method("GET")
+        .uri(format!("/?{query}"))
+        .header("host", "backup-gateway.us-west-2.amazonaws.com")
+        .body(Bytes::new())
+        .expect("build the activation request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let body = String::from_utf8(response.body().to_vec())
+        .expect("the activation handshake answers in text");
+    (status, body)
+}
 
 /// A SigV4 `Authorization` header whose credential scope names this service's signing
-/// name (`backup-gateway`) and [`REGION`]. The signature itself is never checked here:
-/// the test router runs with request authentication off.
-const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
-     Credential=AKIAIOSFODNN7EXAMPLE/20260101/us-west-2/backup-gateway/aws4_request, \
-     SignedHeaders=host, Signature=0000000000000000000000000000000000000000000000000000000000000000";
+/// name (`backup-gateway`) and `region`. The signature itself is never checked here:
+/// the test router runs with request authentication off, so what this carries is the
+/// REGION the request was addressed to, which is what a minted ARN and a redeemed
+/// activation are read off.
+fn authorization(region: &str) -> String {
+    format!(
+        "AWS4-HMAC-SHA256 \
+         Credential=AKIAIOSFODNN7EXAMPLE/20260101/{region}/backup-gateway/aws4_request, \
+         SignedHeaders=host, \
+         Signature=0000000000000000000000000000000000000000000000000000000000000000"
+    )
+}
 
 /// What one dispatched request answered.
 #[derive(Debug)]
@@ -130,6 +173,16 @@ pub(crate) fn gateway_count(engine: &Arc<engine::InMemoryEngine>) -> usize {
         .gateway_count()
 }
 
+/// How many activation keys the store holds pending redemption — read straight out of the
+/// store, so a test can tell an activation that was really issued (or really spent) from a
+/// response that merely looks right.
+pub(crate) fn pending_activation_count(engine: &Arc<engine::InMemoryEngine>) -> usize {
+    service_state(&**engine)
+        .expect("the in-memory engine must expose this state")
+        .lock()
+        .pending_activation_count()
+}
+
 /// How many hypervisors the store holds — the one place the sibling suites read it from,
 /// for the same reason as [`gateway_count`].
 pub(crate) fn hypervisor_count(engine: &Arc<engine::InMemoryEngine>) -> usize {
@@ -166,13 +219,24 @@ pub(crate) fn build_router(engine: &Arc<engine::InMemoryEngine>) -> MultiService
 }
 
 pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Reply {
+    call_in_region(router, REGION, operation, body).await
+}
+
+/// [`call`], addressed to a named region: the region a request is signed for is the one a
+/// minted ARN carries and the one an activation has to have been issued for.
+pub(crate) async fn call_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> Reply {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
         .header("host", "backup-gateway.us-west-2.amazonaws.com")
         .header("content-type", "application/x-amz-json-1.0")
         .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
-        .header("authorization", AUTHORIZATION)
+        .header("authorization", authorization(region))
         .body(Bytes::from(
             serde_json::to_vec(body).expect("serialize the request body"),
         ))
@@ -272,10 +336,11 @@ pub(crate) fn never_created_arn() -> String {
 }
 
 pub(crate) async fn create(router: &MultiServiceRouter, display_name: &str) -> String {
+    let activation_key = issued_activation_key(router).await;
     let reply = call(
         router,
         "CreateGateway",
-        &create_body(display_name, ACTIVATION_KEY, &BTreeMap::new()),
+        &create_body(display_name, &activation_key, &BTreeMap::new()),
     )
     .await;
     assert_eq!(
@@ -346,7 +411,11 @@ async fn gateway_lifecycle_round_trips_through_the_store() {
     let created = call(
         &router,
         "CreateGateway",
-        &create_body("my-gateway", ACTIVATION_KEY, &tag_map([("env", "test")])),
+        &create_body(
+            "my-gateway",
+            &issued_activation_key(&router).await,
+            &tag_map([("env", "test")]),
+        ),
     )
     .await;
     assert_eq!(
@@ -526,52 +595,45 @@ async fn gateway_lifecycle_round_trips_through_the_store() {
 }
 
 /// Each create mints its OWN record: the rows differ along what the rule generalises
-/// over — the display name, the activation key, and how many tags the request carries —
-/// and every row must come back exactly as it was stored, under an ARN no other row
-/// shares.
+/// over — the display name and how many tags the request carries — and every row must come
+/// back exactly as it was stored, under an ARN no other row shares.
+///
+/// Each row redeems its own activation, because an activation is spent by the create that
+/// redeems it.
 #[tokio::test]
 async fn every_created_gateway_is_its_own_record() {
     let engine = build_engine();
     let router = build_router(&engine);
 
-    // (case, GatewayDisplayName, ActivationKey, Tags)
-    let rows: [(&str, &str, &str, BTreeMap<String, String>); 5] = [
-        ("no tags", "gw-plain", ACTIVATION_KEY, BTreeMap::new()),
-        (
-            "one tag",
-            "gw-one-tag",
-            "abc123",
-            tag_map([("env", "test")]),
-        ),
+    // (case, GatewayDisplayName, Tags)
+    let rows: [(&str, &str, BTreeMap<String, String>); 5] = [
+        ("no tags", "gw-plain", BTreeMap::new()),
+        ("one tag", "gw-one-tag", tag_map([("env", "test")])),
         (
             "three tags",
             "gw-three-tags",
-            "A-B-C-1-2-3",
             tag_map([("env", "prod"), ("owner", "qa"), ("tier", "gold")]),
         ),
         (
             "single-character names",
             "g",
-            "a",
             tag_map([("k", "")]), // TagValue's modelled length minimum is 0
         ),
         (
             "longest names the model allows",
-            // Name: len 1..100; ActivationKey: len 1..50.
+            // Name: len 1..100.
             "g1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567",
-            "K1234567890123456789012345678901234567890123456789",
             tag_map([("env", "test")]),
         ),
     ];
 
-    // The rows' keys differ in length and spelling, which the create does not key on.
-
     let mut arns = BTreeSet::new();
-    for (case, display_name, activation_key, tags) in &rows {
+    for (case, display_name, tags) in &rows {
+        let activation_key = issued_activation_key(&router).await;
         let created = call(
             &router,
             "CreateGateway",
-            &create_body(display_name, activation_key, tags),
+            &create_body(display_name, &activation_key, tags),
         )
         .await;
         assert_eq!(
@@ -971,7 +1033,7 @@ async fn the_store_and_the_page_are_bounded() {
         for index in 0..MAX_STORED_GATEWAYS {
             store.create_gateway(
                 REGION,
-                ACTIVATION_KEY,
+                "SEEDED-ACTIVATION-KEY",
                 &format!("gw-seeded-{index}"),
                 BACKUP_VM,
                 BTreeMap::new(),
@@ -985,10 +1047,13 @@ async fn the_store_and_the_page_are_bounded() {
         );
     }
 
+    // The create carries an activation the service really issued, so what refuses it is
+    // the ceiling and nothing else.
+    let activation_key = issued_activation_key(&router).await;
     let refused = call(
         &router,
         "CreateGateway",
-        &create_body("gw-over-ceiling", ACTIVATION_KEY, &BTreeMap::new()),
+        &create_body("gw-over-ceiling", &activation_key, &BTreeMap::new()),
     )
     .await;
     assert_eq!(
@@ -997,6 +1062,13 @@ async fn the_store_and_the_page_are_bounded() {
         "case over the ceiling: CreateGateway must be refused with 400 \
          ValidationException, got {} {:?}",
         refused.status,
+        refused.body
+    );
+    assert_eq!(
+        refused.str_at("/ErrorCode"),
+        None,
+        "case over the ceiling: the refusal is the emulator's own bound, not an \
+         unredeemable activation, got {:?}",
         refused.body
     );
     assert_eq!(

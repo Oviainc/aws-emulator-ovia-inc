@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGateway
-//! Creates a backup gateway: mints a gateway record, persists it in
-//! [`crate::state`], and returns the ARN read back out of the store. This is the ONLY
-//! file to touch for this operation.
+//! Creates a backup gateway: REDEEMS the activation the request's `ActivationKey` names,
+//! mints a gateway record, persists it in [`crate::state`], and returns the ARN read back
+//! out of the store. This is the ONLY file to touch for this operation.
 //!
-//! Every `ActivationKey` the modelled constraints accept (len 1..50, pattern
-//! `^[0-9a-zA-Z\-]+$`) mints a gateway: the key is issued to a deployed appliance OUTSIDE
-//! this API — no operation of this model, and nothing a client can send, produces one —
-//! so the service has no record of its own to resolve the key against and accepts the key
-//! the request carries, recording it on the gateway it mints. A key the modelled
-//! constraints refuse never reaches `handle`: the boundary validator answers it with the
-//! modelled `ValidationException`.
+//! An activation key is minted by the activation handshake a deployed appliance makes, not
+//! by a client: `crate::service`'s activation channel issues one and records it pending,
+//! and this create consumes that record. So a key this service issued for the region the
+//! request is addressed to activates exactly one gateway, and a key nothing issued — or
+//! one a create already redeemed — is refused with the modelled `ValidationException`
+//! (HTTP 400, [`crate::state::ACTIVATION_KEY_NOT_FOUND`]) before anything is persisted. A
+//! key the modelled constraints refuse (len 1..50, pattern `^[0-9a-zA-Z\-]+$`) never
+//! reaches `handle` at all: the boundary validator answers it with the same modelled
+//! error.
 //!
 //! ## Shape of an operation
 //!
@@ -171,25 +173,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         )?;
 
-        // A gateway is regional, so its ARN carries the region the caller signed for.
+        // A gateway is regional, so its ARN carries the region the caller signed for — and
+        // so does the activation the create redeems, which the handshake issued for one
+        // region.
         let region = crate::state::request_region(ctx.parts());
 
         // The record is read back OUT of the store after the insert, so the ARN below is
         // the key the store now holds — not a string built from this request.
         //
-        // One guard spans the ceiling check and the insert, so two concurrent creates
-        // cannot both pass a check that only one of them should: this operation is the
-        // only thing that grows the store, so the store is bounded here.
+        // One guard spans the activation lookup, the ceiling check, the redemption and the
+        // insert, so two concurrent creates cannot both redeem one activation, and neither
+        // can both pass a ceiling check that only one of them should.
         let mut store = state.lock();
 
-        // The `ActivationKey` is NOT resolved against anything the service holds. It is
-        // minted out of band, by the activation handshake of the appliance the customer
-        // deployed, which no operation of this model performs — so there is no registry a
-        // client could have populated, and gating the create on one would refuse every
-        // request a client can make. The key the request carries is what identifies the
-        // appliance, and it is persisted on the record below; the only thing that can be
-        // said about its WELL-FORMEDNESS is what the model states, and the boundary
-        // validator has already refused anything that violates it.
+        // The `ActivationKey` is RESOLVED against the activations this service has issued
+        // and not yet redeemed. A key is minted only by the activation handshake of a
+        // deployed appliance (`crate::service`'s activation channel), so a key nothing
+        // issued names no appliance that ever activated, a key already redeemed names an
+        // activation that is spent, and a key issued for another region was issued by
+        // another region's service. The lookup is read-only, so the refusal below happens
+        // before anything is written and the create is atomic: no gateway is persisted and
+        // no later read or listing can see one.
+        if !store.activation_key_is_redeemable(&input.activation_key, &region) {
+            tracing::info!(
+                operation = "CreateGateway",
+                region = %region,
+                outcome = "refused",
+                reason = crate::state::ACTIVATION_KEY_NOT_FOUND,
+                "refused a create whose activation key names no activation"
+            );
+            return Err(CreateGatewayErrorModeled::ValidationException(ValidationException {
+                error_code: Some(crate::state::ACTIVATION_KEY_NOT_FOUND.to_string()),
+                message: Some(crate::state::ACTIVATION_KEY_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        }
         if store.gateway_count() >= crate::state::MAX_STORED_GATEWAYS {
             return Err(CreateGatewayErrorModeled::ValidationException(ValidationException {
                 error_code: None,
@@ -201,6 +219,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
+        // The activation is spent by the create that redeems it, so the same key cannot
+        // activate a second gateway. It is consumed only once every refusal above has been
+        // ruled out, so a create this emulator declines leaves the activation pending for
+        // the appliance to retry with.
+        //
+        // The redemption cannot report `false` here: it decides the same predicate the
+        // refusal above decided, under the same guard, and nothing else can take the record
+        // while that guard is held. The invariant is asserted in a debug build, where a test
+        // sees it break; a release build answers the request rather than panicking on it.
+        let spent = store.redeem_activation_key(&input.activation_key, &region);
+        debug_assert!(
+            spent,
+            "an activation this guard found redeemable must still be there to redeem"
+        );
         let created = store.create_gateway(
             &region,
             &input.activation_key,
@@ -208,6 +240,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.gateway_type,
             tags,
             ::std::time::SystemTime::now(),
+        );
+
+        // The record of a state-changing call: which gateway was minted, in which region,
+        // by redeeming an activation. The KEY is never recorded — it is a credential.
+        tracing::info!(
+            operation = "CreateGateway",
+            region = %region,
+            gateway_arn = %created.arn,
+            outcome = "created",
+            "redeemed an activation and created a gateway"
         );
 
         Ok(CreateGatewayOutput {

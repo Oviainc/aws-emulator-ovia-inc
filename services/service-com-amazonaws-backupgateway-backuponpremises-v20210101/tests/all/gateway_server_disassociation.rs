@@ -30,8 +30,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::gateway_lifecycle::{
-    build_engine, build_router, call, create, create_body, gateway_count, never_created_arn, Reply,
-    ACTIVATION_KEY, REGION,
+    build_engine, build_router, call, create, create_body, gateway_count, issued_activation_key,
+    never_created_arn, Reply, REGION,
 };
 use crate::gateway_server_association::{
     arn_of, arn_of_length, associate, import, listed_hypervisor_ids, message_of,
@@ -352,7 +352,11 @@ async fn a_disassociation_changes_only_the_servers_link() {
         let created = call(
             &router,
             "CreateGateway",
-            &create_body(&format!("gw-extras-{index}"), ACTIVATION_KEY, &tags),
+            &create_body(
+                &format!("gw-extras-{index}"),
+                &issued_activation_key(&router).await,
+                &tags,
+            ),
         )
         .await;
         assert_eq!(

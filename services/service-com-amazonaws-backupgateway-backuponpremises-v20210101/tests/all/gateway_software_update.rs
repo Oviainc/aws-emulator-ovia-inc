@@ -47,8 +47,8 @@ use backup_gateway::state::{
 
 use crate::bandwidth_rate_limit_schedule::{arn_in, arn_of_length, interval};
 use crate::gateway_lifecycle::{
-    build_engine, build_router, call, create, create_body, gateway_count, never_created_arn, Reply,
-    ACTIVATION_KEY,
+    build_engine, build_router, call, create, create_body, gateway_count, issued_activation_key,
+    never_created_arn, Reply,
 };
 
 /// How far past the instant an install falls due a case looks, when it waits or rewinds
@@ -192,7 +192,11 @@ async fn set_up(router: &MultiServiceRouter, fixture: &Fixture, index: usize) ->
     let created = call(
         router,
         "CreateGateway",
-        &create_body(&format!("gw-update-{index}"), ACTIVATION_KEY, &tags),
+        &create_body(
+            &format!("gw-update-{index}"),
+            &issued_activation_key(router).await,
+            &tags,
+        ),
     )
     .await;
     assert_eq!(

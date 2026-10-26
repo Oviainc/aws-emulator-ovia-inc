@@ -105,3 +105,27 @@ State lives in the SINGLE shared engine, keyed by type. Reach it through
 Do not add a second engine crate — the router and every service must share
 one `InMemoryEngine` type or the engine the router injects cannot be handed to this
 service's operations.
+
+## The activation handshake (how to get an `ActivationKey`)
+
+`CreateGateway` takes an `ActivationKey` and no operation of this model issues one: on AWS
+the key is minted when the gateway appliance a customer deployed makes its activation
+handshake — an unsigned HTTP request, made outside the SDK, that names the region the key
+is for and is answered with the key itself.
+
+This emulator serves that handshake (`src/service/activation.rs`), because it stands in for
+the appliance as much as for the service, and `CreateGateway` REDEEMS the key against the
+activations it issued. So the way to create a gateway is two requests:
+
+```sh
+# 1. the handshake: an unsigned GET of the endpoint root, answered with the key
+key=$(curl -sk "https://localhost:9297/?activationRegion=us-west-2&gatewayType=BACKUP_VM&no_redirect")
+
+# 2. the create, which redeems that activation
+aws backup-gateway create-gateway --activation-key "$key" \
+    --gateway-display-name my-gateway --gateway-type BACKUP_VM
+```
+
+A key nothing issued, one a create already redeemed, or one issued for another region is
+refused with HTTP 400 `ValidationException` / `ErrorCode` `ActivationKeyNotFound`, which is
+what AWS answers a key it has no activation record for.

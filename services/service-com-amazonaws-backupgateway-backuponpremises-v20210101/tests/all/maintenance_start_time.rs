@@ -38,8 +38,8 @@ use backup_gateway::state::{service_state, MAINTENANCE_START_TIME_INVALID};
 
 use crate::bandwidth_rate_limit_schedule::{arn_in, arn_of_length};
 use crate::gateway_lifecycle::{
-    build_engine, build_router, call, create, create_body, gateway_count, never_created_arn, Reply,
-    ACTIVATION_KEY,
+    build_engine, build_router, call, create, create_body, gateway_count, issued_activation_key,
+    never_created_arn, Reply,
 };
 
 /// One maintenance window as the request states it.
@@ -282,7 +282,11 @@ async fn a_later_put_replaces_the_window_and_touches_nothing_else() {
     let created = call(
         &router,
         "CreateGateway",
-        &create_body("gw-replace", ACTIVATION_KEY, &tags),
+        &create_body(
+            "gw-replace",
+            &issued_activation_key(&router).await,
+            &tags,
+        ),
     )
     .await;
     assert_eq!(
