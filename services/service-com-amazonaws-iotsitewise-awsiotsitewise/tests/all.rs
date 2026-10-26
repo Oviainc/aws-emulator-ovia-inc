@@ -213,6 +213,12 @@ mod bulk_import_jobs;
 // declaration of its own, and each append there collided with this one.
 #[path = "all/create_computation_model_bounds.rs"]
 mod create_computation_model_bounds;
+// In its alphabetical place inside the sorted list, beside the sibling bounds
+// suite, rather than appended after the list: the END of this file is where every
+// concurrent iotsitewise change appends a declaration of its own, and an append
+// there collided with this one.
+#[path = "all/create_workspace_bounds.rs"]
+mod create_workspace_bounds;
 #[path = "all/dataset_export_jobs.rs"]
 mod dataset_export_jobs;
 #[path = "all/describe_asset_property.rs"]

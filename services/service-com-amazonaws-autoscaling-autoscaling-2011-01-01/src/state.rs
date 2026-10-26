@@ -628,8 +628,9 @@ pub fn is_valid_termination_policy(policy: &str) -> bool {
 // holds — so they live here as constants and the handlers that report them take
 // no lock and write nothing.
 //
-// Each catalog's doc comment names the model member whose documentation
-// publishes its membership, and its ordering.
+// Each catalog's doc comment names where its membership and ordering come
+// from: normally the model member whose documentation publishes them, and
+// where that documentation is behind the service, what it omits.
 // ---------------------------------------------------------------------------
 
 /// The processes `SuspendProcesses` and `ResumeProcesses` name, and the catalog
@@ -715,10 +716,22 @@ pub const AUTO_SCALING_NOTIFICATION_TYPES: &[&str] = &[
 ];
 
 /// The catalog `DescribeMetricCollectionTypes` reports as `Metrics`: the group
-/// metrics `EnableMetricsCollection` and `DisableMetricsCollection` name, from
-/// the model's own documentation for `MetricCollectionType$Metric` ("One of the
-/// following metrics: …"), in the order that documentation publishes them —
-/// sizes, then instance counts, then capacities, then the warm pool.
+/// metrics `EnableMetricsCollection` and `DisableMetricsCollection` name.
+///
+/// The model's own documentation for `MetricCollectionType$Metric` ("One of the
+/// following metrics: …") enumerates only the twenty metrics that predate the
+/// retained-capacity series, so that prose is a LOWER BOUND on what the service
+/// publishes rather than the catalog itself: the warm pool's own minimum
+/// (`WarmPoolMinSize`) and the four retained-capacity series a group's instance
+/// maintenance policy reports (`GroupTerminatingRetainedInstances`,
+/// `GroupTerminatingRetainedCapacity`, `WarmPoolPendingRetainedCapacity`,
+/// `WarmPoolTerminatingRetainedCapacity`) are enabled by name through
+/// `EnableMetricsCollection` and published by this catalog without appearing in
+/// it.
+///
+/// Grouped the way that documentation groups what it does enumerate — sizes,
+/// then instance counts, then capacities, then the warm pool — with each metric
+/// the prose omits beside the one it refines.
 pub const METRIC_COLLECTION_TYPES: &[&str] = &[
     "GroupMinSize",
     "GroupMaxSize",
@@ -727,20 +740,37 @@ pub const METRIC_COLLECTION_TYPES: &[&str] = &[
     "GroupPendingInstances",
     "GroupStandbyInstances",
     "GroupTerminatingInstances",
+    "GroupTerminatingRetainedInstances",
     "GroupTotalInstances",
     "GroupInServiceCapacity",
     "GroupPendingCapacity",
     "GroupStandbyCapacity",
     "GroupTerminatingCapacity",
+    "GroupTerminatingRetainedCapacity",
     "GroupTotalCapacity",
+    "WarmPoolMinSize",
     "WarmPoolDesiredCapacity",
     "WarmPoolWarmedCapacity",
     "WarmPoolPendingCapacity",
+    "WarmPoolPendingRetainedCapacity",
     "WarmPoolTerminatingCapacity",
+    "WarmPoolTerminatingRetainedCapacity",
     "WarmPoolTotalCapacity",
     "GroupAndWarmPoolDesiredCapacity",
     "GroupAndWarmPoolTotalCapacity",
 ];
+
+/// Whether `metric` is one of [`METRIC_COLLECTION_TYPES`].
+///
+/// The metrics `EnableMetricsCollection` and `DisableMetricsCollection` accept
+/// are the metrics this catalog publishes, so both sides check membership
+/// through here and cannot drift apart. NOT YET IN FORCE on the wire: those two
+/// operations are still scaffolded (each owned by its own issue), so nothing in
+/// `src/ops/` validates a metric name today — this is the seam they are to use
+/// when they are implemented.
+pub fn is_valid_metric_collection_type(metric: &str) -> bool {
+    METRIC_COLLECTION_TYPES.contains(&metric)
+}
 
 /// The catalog `DescribeMetricCollectionTypes` reports as `Granularities`, from
 /// the model's own documentation for `MetricGranularityType$Granularity`: "The

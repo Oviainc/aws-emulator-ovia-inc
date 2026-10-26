@@ -10,7 +10,7 @@
 //! quotas this service enforces beside the counts computed from the store.
 //!
 //! The catalog table below is the class, not one row of it: its rows differ in the
-//! size of the list (1, 2, 3, 5, 8, 9 and 20 entries), in its shape (a list of
+//! size of the list (1, 2, 3, 5, 8, 9 and 25 entries), in its shape (a list of
 //! strings against a list of structures) and in how many members the answer
 //! carries, and every one of them is asserted through the same rule.
 //!
@@ -198,6 +198,31 @@ async fn a_catalog_read_is_independent_of_state_and_changes_none_of_it() {
         "asg-catalog",
         "a catalog read must leave the store alone, got {body}"
     );
+
+    // And a DELETE is the other direction: the store losing a group leaves every
+    // catalog as it was too.
+    let (status, body) = query(
+        &router,
+        "DeleteAutoScalingGroup",
+        &[("AutoScalingGroupName", "asg-catalog")],
+    )
+    .await;
+    assert_eq!(status, 200, "DeleteAutoScalingGroup: got {status}: {body}");
+    for (case, before) in CATALOGS.iter().zip(&first) {
+        let (status, body) = query(&router, case.action, &[]).await;
+        assert_eq!(
+            status, 200,
+            "case {:?} after a delete: expected 200, got {status}: {body}",
+            case.action
+        );
+        let after = tag_values(&body, case.entry_tag);
+        assert_eq!(
+            &after, before,
+            "case {:?} after a delete: a catalog must not depend on the store, \
+             expected {before:?}, got {after:?}",
+            case.action
+        );
+    }
 }
 
 /// The published catalog and the values the mutating operations accept are one
