@@ -601,7 +601,7 @@ async fn a_mapping_naming_a_program_the_multiplex_does_not_hold_is_refused() {
         );
         assert_eq!(
             error_message(&refusal),
-            format!("MultiplexProgram {named} not found"),
+            format!("Multiplex program {id}/{named} not found"),
             "case {case:?}: expected the refusal to name the program asked for, got {refusal}"
         );
 

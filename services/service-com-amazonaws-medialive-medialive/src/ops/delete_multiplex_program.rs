@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMultiplexProgram
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMultiplexProgram`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMultiplexProgram::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Delete a program from a multiplex." The named program leaves the multiplex it
+//! was created in, and the caller is answered with that program as it stood when
+//! the delete took it out: the multiplex's derived `ProgramCount` stops counting
+//! it, and every reader of that program answers not-found from then on.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +159,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMultiplexProgram` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMultiplexProgramErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMultiplexProgram"))
+        // A multiplex program has no ARN and no id of its own — it is named by
+        // its multiplex and its `ProgramName` — so nothing here depends on the
+        // region the request was signed for.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let mut state = state.lock();
+        // Transitions the clock had already made due were owed whether or not
+        // this delete ran, so they are materialised before anything is read: a
+        // multiplex whose own delete has come due holds no program a caller may
+        // still remove.
+        state.settle(::std::time::SystemTime::now());
+
+        // The multiplex's state, the program's existence and the removal are one
+        // step in the state slice, so this handler cannot check one of them and
+        // write past another. The response is the program the removal took out,
+        // described out of the state it was still in rather than from anything
+        // in this request.
+        let program = state
+            .remove_multiplex_program(&input.multiplex_id, &input.program_name)
+            .map_err(|refusal| refused(refusal, &input.multiplex_id, &input.program_name))?;
+
+        Ok(crate::state::multiplex_program_description_output!(
+            DeleteMultiplexProgramOutput,
+            program
+        ))
     }
+}
+
+/// Turn a store refusal into this operation's own modelled error.
+///
+/// A `MultiplexId` naming no stored multiplex, and a `ProgramName` the named
+/// multiplex does not hold, are what this operation's modelled
+/// `NotFoundException` is for, and the refusal names which of the two is missing
+/// with the same wording every reader of this service uses — so a second delete
+/// of the same program is refused exactly as a describe of it is. A multiplex a
+/// delete has already been accepted for is a conflict with the state: its record
+/// is still readable, but nothing it holds is a caller's to change.
+fn refused(
+    refusal: crate::state::MultiplexProgramDeleteRefusal,
+    multiplex_id: &str,
+    program_name: &str,
+) -> DeleteMultiplexProgramError {
+    use crate::state::MultiplexProgramDeleteRefusal as Refusal;
+    match refusal {
+        Refusal::MultiplexNotFound => {
+            DeleteMultiplexProgramErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message("Multiplex", multiplex_id)),
+            })
+        }
+        Refusal::ProgramNotFound => {
+            DeleteMultiplexProgramErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::multiplex_program_not_found_message(
+                    multiplex_id,
+                    program_name,
+                )),
+            })
+        }
+        Refusal::MultiplexGone(state) => {
+            DeleteMultiplexProgramErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Multiplex {multiplex_id} is {state}; its programs can no longer be deleted"
+                )),
+            })
+        }
+    }
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to delete the program from. A modelled server error,
+/// never a fresh engine (which would drop the deletion when this request
+/// returns).
+fn unavailable() -> DeleteMultiplexProgramError {
+    DeleteMultiplexProgramErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }
