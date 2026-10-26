@@ -39,6 +39,8 @@ mod implicit_default_bus;
 mod input_validation;
 #[path = "all/missing_resource_wording.rs"]
 mod missing_resource_wording;
+#[path = "all/or_relationship_branches.rs"]
+mod or_relationship_branches;
 #[path = "all/partner_entry_rejection.rs"]
 mod partner_entry_rejection;
 #[path = "all/partner_event_source.rs"]
@@ -51,6 +53,8 @@ mod pattern_preflight;
 mod pattern_refusal_wording;
 #[path = "all/replay_cancellation.rs"]
 mod replay_cancellation;
+#[path = "all/replay_filter_arns_scoping.rs"]
+mod replay_filter_arns_scoping;
 #[path = "all/replay_name_opt_out.rs"]
 mod replay_name_opt_out;
 #[path = "all/reserved_event_source.rs"]

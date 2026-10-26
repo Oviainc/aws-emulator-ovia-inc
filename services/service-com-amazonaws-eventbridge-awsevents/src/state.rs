@@ -4084,10 +4084,43 @@ pub mod event_pattern {
     /// other argument.
     const EXISTS_NOT_BOOLEAN: &str = "exists match pattern must be either true or false.";
 
+    /// How many pattern objects an `$or` relationship relates.
+    ///
+    /// `$or` is a RELATIONSHIP between pattern objects, and a relationship needs
+    /// two sides: the service states the bound itself in the refusal the checker
+    /// gives for a shorter list ([`OR_NEEDS_TWO_OBJECTS`]).
+    const OR_RELATED_OBJECTS: usize = 2;
+
+    /// The reason the operation that only CHECKS a pattern gives for a `$or`
+    /// relating fewer than [`OR_RELATED_OBJECTS`] pattern objects.
+    ///
+    /// The two validators this service runs a pattern through agree on every
+    /// refusal but this one: the checker words it for the relationship, while the
+    /// compiler reads a list too short to relate anything as the ordinary match
+    /// term list it is (see [`validate_object`]).
+    const OR_NEEDS_TWO_OBJECTS: &str = "There must have at least 2 Objects in $or relationship.";
+
     /// The character `wildcard` matches any run of characters with.
     const WILDCARD: char = '*';
 
-    /// Parse `pattern` as an event pattern, reporting why it is not one.
+    /// Which of the two validators this service runs a pattern through is reading
+    /// it.
+    ///
+    /// They refuse the same patterns for the same reasons everywhere but one
+    /// construct ([`OR_NEEDS_TWO_OBJECTS`]), so the distinction travels as a
+    /// parameter of the one parse rather than as a second copy of it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Validator {
+        /// The compiler a pattern that is about to be STORED goes through:
+        /// `PutRule`, `CreateArchive`, `UpdateArchive`, and the parse routing
+        /// takes of a stored pattern.
+        Compiler,
+        /// The checker `TestEventPattern` answers from, which stores nothing.
+        Checker,
+    }
+
+    /// Parse `pattern` as the pattern COMPILER reads it — the validator every
+    /// operation that stores a pattern, and routing itself, goes through.
     ///
     /// What comes back is the WHOLE message of the `InvalidEventPatternException`
     /// a caller answers with: the opening ([`INVALID_PATTERN`]) and then the
@@ -4095,11 +4128,17 @@ pub mod event_pattern {
     /// that wording and no field path; one this module words for itself names the
     /// field path, so a caller can find what to change.
     pub fn parse(pattern: &str) -> Result<Map<String, Value>, String> {
-        parse_reason(pattern).map_err(|reason| format!("{INVALID_PATTERN} {reason}"))
+        parse_as(pattern, Validator::Compiler)
+    }
+
+    /// [`parse`], read by `validator`: the same parse, worded as that validator
+    /// words it.
+    pub fn parse_as(pattern: &str, validator: Validator) -> Result<Map<String, Value>, String> {
+        parse_reason(pattern, validator).map_err(|reason| format!("{INVALID_PATTERN} {reason}"))
     }
 
     /// The parse itself, reporting the bare reason the refusal states.
-    fn parse_reason(pattern: &str) -> Result<Map<String, Value>, String> {
+    fn parse_reason(pattern: &str, validator: Validator) -> Result<Map<String, Value>, String> {
         let value: Value = ::serde_json::from_str(pattern)
             .map_err(|error| format!("Event pattern is not valid JSON: {error}"))?;
         let Value::Object(map) = value else {
@@ -4108,7 +4147,7 @@ pub mod event_pattern {
         if map.is_empty() {
             return Err("Event pattern must name at least one field".to_string());
         }
-        validate_object(&map, "", 1)?;
+        validate_object(&map, "", 1, validator)?;
         Ok(map)
     }
 
@@ -4186,29 +4225,37 @@ pub mod event_pattern {
     /// How many bytes of PATTERN a term's argument may make the matcher walk:
     /// every string it carries and every member it holds, AT EVERY LEVEL.
     ///
-    /// Recursive rather than one level deep, because the walks this pays for
-    /// descend: a nested `anything-but` argument
-    /// (`{"anything-but": {"wildcard": ["*a*", "*b*"]}}`) compares the leaf
-    /// against every member of its inner list, so a charge that stopped at the
-    /// outer object would pay one unit for all of it. The pattern is bounded by
-    /// `EventPattern`'s modelled 4096 characters, so this walk is itself cheap.
+    /// Every level, because the walks this pays for descend: a nested
+    /// `anything-but` argument (`{"anything-but": {"wildcard": ["*a*", "*b*"]}}`)
+    /// compares the leaf against every member of its inner list, so a charge that
+    /// stopped at the outer object would pay one unit for all of it. A pattern is
+    /// bounded by `EventPattern`'s modelled 4096 characters, so this walk is
+    /// itself cheap — but the same reading is asked of an EVENT's value (see
+    /// [`match_term`]'s `exists` arm), which nests as deep as
+    /// [`super::MAX_DETAIL_DEPTH`] admits. It therefore descends on an EXPLICIT
+    /// stack rather than on the thread's: how deeply a document nests decides how
+    /// much heap this walk takes and never whether the process survives it, which
+    /// is the same guarantee the parse of that document is given
+    /// ([`super::parse_json_document`]).
     fn argument_cost(argument: &Value) -> usize {
-        match argument {
-            Value::String(text) => text.len().max(1),
-            Value::Array(members) => members
-                .iter()
-                .map(argument_cost)
-                .sum::<usize>()
-                .saturating_add(members.len())
-                .max(1),
-            Value::Object(map) => map
-                .values()
-                .map(argument_cost)
-                .sum::<usize>()
-                .saturating_add(map.len())
-                .max(1),
-            _ => 1,
+        let mut total = 0usize;
+        let mut pending: Vec<&Value> = ::std::vec![argument];
+        while let Some(value) = pending.pop() {
+            let charge = match value {
+                Value::String(text) => text.len().max(1),
+                Value::Array(members) => {
+                    pending.extend(members.iter());
+                    members.len().max(1)
+                }
+                Value::Object(map) => {
+                    pending.extend(map.values());
+                    map.len().max(1)
+                }
+                _ => 1,
+            };
+            total = total.saturating_add(charge);
         }
+        total
     }
 
     /// What comparing ONE leaf against `argument` may walk: the argument's own
@@ -4250,6 +4297,7 @@ pub mod event_pattern {
         pattern: &Map<String, Value>,
         path: &str,
         depth: usize,
+        validator: Validator,
     ) -> Result<(), String> {
         if depth > MAX_PATTERN_DEPTH {
             return Err(format!(
@@ -4269,6 +4317,22 @@ pub mod event_pattern {
                 if branches.is_empty() {
                     return Err(EMPTY_ARRAY.to_string());
                 }
+                // `$or` relates pattern objects to one another, and a
+                // relationship needs [`OR_RELATED_OBJECTS`] sides: a list too
+                // short to relate anything is no relationship, so the checker
+                // says so ([`OR_NEEDS_TWO_OBJECTS`]) and the compiler reads the
+                // list as the ordinary match TERM list a field's value is —
+                // which is what makes a lone object naming no match type an
+                // unrecognized match type rather than a branch of an `$or`.
+                if branches.len() < OR_RELATED_OBJECTS {
+                    match validator {
+                        Validator::Checker => return Err(OR_NEEDS_TWO_OBJECTS.to_string()),
+                        Validator::Compiler => branches
+                            .iter()
+                            .try_for_each(|term| validate_term(term, &field))?,
+                    }
+                    continue;
+                }
                 for branch in branches {
                     let Some(object) = branch.as_object() else {
                         return Err(format!("every branch of {field} must be a pattern object"));
@@ -4276,7 +4340,7 @@ pub mod event_pattern {
                     if object.is_empty() {
                         return Err(EMPTY_OBJECT.to_string());
                     }
-                    validate_object(object, &field, depth + 1)?;
+                    validate_object(object, &field, depth + 1, validator)?;
                 }
                 continue;
             }
@@ -4293,7 +4357,7 @@ pub mod event_pattern {
                     if child.is_empty() {
                         return Err(EMPTY_OBJECT.to_string());
                     }
-                    validate_object(child, &field, depth + 1)?;
+                    validate_object(child, &field, depth + 1, validator)?;
                 }
                 _ => return Err(format!("\"{field}\" must be an object or an array")),
             }
@@ -4532,7 +4596,7 @@ pub mod event_pattern {
             if !budget.charge(1) {
                 return false;
             }
-            let held = if key == "$or" {
+            let held = if key == "$or" && relates_objects(spec) {
                 match_any_branch(spec, event, budget)
             } else {
                 let field = event.get(key);
@@ -4568,6 +4632,19 @@ pub mod event_pattern {
             }
         }
         true
+    }
+
+    /// Whether `spec` is the or-RELATIONSHIP `$or` names: a list of at least
+    /// [`OR_RELATED_OBJECTS`] pattern objects.
+    ///
+    /// The same reading the parse takes ([`validate_object`]), so what a pattern
+    /// was ADMITTED as is what it is matched as: a `$or` relating too little to
+    /// be a relationship is the ordinary field — named `$or`, which no event
+    /// envelope carries — that the parse read it as.
+    fn relates_objects(spec: &Value) -> bool {
+        spec.as_array().is_some_and(|branches| {
+            branches.len() >= OR_RELATED_OBJECTS && branches.iter().all(Value::is_object)
+        })
     }
 
     /// `$or`: at least one branch, itself a pattern object, must match.
@@ -4633,12 +4710,20 @@ pub mod event_pattern {
     /// `null`, an object and an empty array carry no leaf, so a field holding one
     /// of them is absent for `exists` — which is what "exists only works on leaf
     /// nodes" means.
+    ///
+    /// The search descends an EVENT's value, which nests as deep as
+    /// [`super::MAX_DETAIL_DEPTH`] admits, so it descends on an explicit stack for
+    /// the reason [`argument_cost`] gives.
     fn leaf_exists(value: &Value) -> bool {
-        match value {
-            Value::Null | Value::Object(_) => false,
-            Value::Array(members) => members.iter().any(leaf_exists),
-            _ => true,
+        let mut pending: Vec<&Value> = ::std::vec![value];
+        while let Some(value) = pending.pop() {
+            match value {
+                Value::Null | Value::Object(_) => {}
+                Value::Array(members) => pending.extend(members.iter()),
+                _ => return true,
+            }
         }
+        false
     }
 
     /// Whether a pattern's literal term and an event's leaf are the same value.

@@ -815,6 +815,121 @@ async fn deepest_detail_rows() {
     );
 }
 
+/// An `exists` term on a field whose VALUE is the whole nested document is
+/// evaluated on a thread with no more stack than an ordinary one
+/// ([`ORDINARY_STACK_BYTES`]), at the published nesting bound.
+///
+/// That term is the one place the matcher reads an EVENT's value at every level
+/// rather than one level down: it charges the whole value against the match
+/// budget and then searches it for a leaf ("exists only works on leaf nodes. It
+/// does not work on intermediate nodes"). Both of those readings — and the
+/// envelope's rendering and release afterwards — therefore meet a document as
+/// deep as `PutEvents` admits, so what this pins is that the depth the parse is
+/// given stack for is a depth every later walk of the same tree survives.
+///
+/// The rows differ along what the nesting under the named field is, which is what
+/// decides both how the search descends and what it finds: nested ARRAYS carry
+/// the leaf at the bottom, so the field exists; nested OBJECTS carry no leaf at
+/// all, so it does not; and the mixed nesting puts an object in the way of the
+/// search, so it does not either.
+#[test]
+fn an_exists_term_reads_the_deepest_detail_without_a_large_request_stack() {
+    on_a_thread_with(ORDINARY_STACK_BYTES, deepest_exists_rows);
+}
+
+async fn deepest_exists_rows() {
+    let emulator = emulator();
+    // The pattern names the field the nesting hangs from, so the `exists` search
+    // is handed the whole nested value rather than a leaf one level down.
+    let (status, body) = call(
+        &emulator,
+        "PutRule",
+        &json!({
+            "Name": "exists-into-deep-detail",
+            "EventPattern": json!({ "detail": { "a": [{ "exists": true }] } }).to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "PutRule answered {status} {body}");
+    let account = engine::emulator_account_id();
+    let (status, body) = call(
+        &emulator,
+        "PutTargets",
+        &json!({
+            "Rule": "exists-into-deep-detail",
+            "Targets": [{
+                "Id": "queue",
+                "Arn": format!("arn:aws:sqs:{REGION}:{account}:deepest-exists"),
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "PutTargets answered {status} {body}");
+
+    // (the nesting under the named field, whether a leaf is reachable through it)
+    //
+    // "exists only works on leaf nodes. It does not work on intermediate nodes":
+    // the search descends an array-valued field to its members and stops at any
+    // object, so only nesting that is arrays ALL the way down carries a leaf the
+    // field can be said to have — the mixed nesting puts an object in the way.
+    let rows: [(Shape, bool); 3] = [
+        (Shape::Arrays, true),
+        (Shape::Objects, false),
+        (Shape::Mixed, false),
+    ];
+
+    let mut expected_matches = 0usize;
+    for (shape, holds_a_leaf) in rows {
+        let case = format!("{shape:?} at the bound");
+        let detail = nested_detail(shape, DOCUMENTED_MAX_DETAIL_DEPTH);
+        let (status, body) = call(
+            &emulator,
+            "PutEvents",
+            &json!({
+                "Entries": [{
+                    "Source": SOURCE,
+                    "DetailType": DETAIL_TYPE,
+                    "Detail": detail,
+                }],
+            }),
+        )
+        .await;
+        ingested(&case, status, &body);
+        expected_matches += usize::from(holds_a_leaf);
+
+        // The routing log holds one record per ingested event, naming the rules
+        // it matched — none of them for an event the search found no leaf in.
+        let log = routed(&emulator);
+        let matched: Vec<String> = log
+            .last()
+            .unwrap_or_else(|| panic!("case {case:?}: the ingested event must be recorded"))
+            .matched_rules
+            .clone();
+        if holds_a_leaf {
+            assert_eq!(
+                matched,
+                vec!["exists-into-deep-detail".to_string()],
+                "case {case:?}: the search has to find the leaf the nesting carries, got \
+                 {matched:?}"
+            );
+        } else {
+            assert!(
+                matched.is_empty(),
+                "case {case:?}: nested objects carry no leaf, so the rule must not match the \
+                 event, got {matched:?}"
+            );
+        }
+    }
+    let matched_events = routed(&emulator)
+        .iter()
+        .filter(|event| !event.matched_rules.is_empty())
+        .count();
+    assert_eq!(
+        matched_events, expected_matches,
+        "expected {expected_matches} of the three events to match, got {matched_events}"
+    );
+}
+
 /// Removing a target is idempotent: an `Id` the rule does not carry asks for a
 /// state that already holds, so nothing fails — `FailedEntryCount` 0 and an
 /// empty `FailedEntries` — and the same call made twice answers the same way and

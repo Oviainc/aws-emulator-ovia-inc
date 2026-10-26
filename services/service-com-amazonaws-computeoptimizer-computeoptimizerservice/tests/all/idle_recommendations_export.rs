@@ -180,6 +180,35 @@ async fn downloaded(router: &MultiServiceRouter, case: &str, bucket: &str, key: 
         .unwrap_or_else(|error| panic!("case {case:?}: the object is text: {error}"))
 }
 
+/// The timestamp column, whose cell states an instant rather than text.
+const TIMESTAMP_COLUMN: &str = "LastRefreshTimestamp";
+
+/// The instant one cell of the timestamp column states, as a count of whole milliseconds —
+/// `None` for a cell that states no instant at all.
+///
+/// The file states the instant in RFC 3339 while `IdleRecommendation$lastRefreshTimestamp`
+/// crosses the wire as a JSON NUMBER, and an `f64` of a present-day instant carries less than
+/// a microsecond, so the two renderings of one instant can land on neighbouring microseconds.
+/// Both sides are therefore compared at the millisecond resolution an AWS JSON timestamp
+/// states — close enough that any other instant, or no instant, still fails, and far enough
+/// that the comparison is about the instant rather than about a rounding step neither end
+/// chose.
+fn stated_millis(cell: &str) -> Option<i64> {
+    let at = ::aws_smithy_types::DateTime::from_str(
+        cell,
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .ok()?;
+    Some(millis_of(at))
+}
+
+/// One `DateTime` as a count of whole milliseconds since the epoch.
+fn millis_of(at: ::aws_smithy_types::DateTime) -> i64 {
+    at.secs()
+        .saturating_mul(1_000)
+        .saturating_add(i64::from(at.subsec_nanos() / 1_000_000))
+}
+
 /// A figure as the export file states it: at the two decimal places every figure this service
 /// reports is rounded to.
 fn number_cell(value: Option<f64>) -> String {
@@ -241,7 +270,7 @@ fn expected_cell(column: &str, recommendation: &Value) -> String {
             .unwrap_or_default(),
         // "The timestamp of when the idle resource recommendation was last generated", as the
         // file states an instant: RFC 3339 in UTC.
-        "LastRefreshTimestamp" => recommendation["lastRefreshTimestamp"]
+        TIMESTAMP_COLUMN => recommendation["lastRefreshTimestamp"]
             .as_f64()
             .and_then(|at| {
                 ::aws_smithy_types::DateTime::from_secs_f64(at)
@@ -492,10 +521,26 @@ async fn the_export_file_holds_the_recommendations_the_reader_reports() {
 
         for (row, recommendation) in data.iter().zip(&reported) {
             for column in &header {
+                let held = cell(&header, row, column);
+                if column == TIMESTAMP_COLUMN {
+                    // Compared as the instant each states, for the reason
+                    // [`stated_millis`] gives.
+                    let reported = recommendation["lastRefreshTimestamp"]
+                        .as_f64()
+                        .map(|at| millis_of(::aws_smithy_types::DateTime::from_secs_f64(at)));
+                    assert_eq!(
+                        stated_millis(held),
+                        reported,
+                        "case {case:?}: column {column} of {} must state the instant the reader \
+                         reports ({:?}), got {held:?} in {row:?}",
+                        text(recommendation, "resourceArn"),
+                        recommendation["lastRefreshTimestamp"]
+                    );
+                    continue;
+                }
                 let expected = expected_cell(column, recommendation);
                 assert_eq!(
-                    cell(&header, row, column),
-                    expected,
+                    held, expected,
                     "case {case:?}: column {column} of {} must hold what the reader reports \
                      ({expected:?}), got {row:?}",
                     text(recommendation, "resourceArn")
