@@ -13,6 +13,13 @@
 //! An unknown monitor, or a probe that monitor does not hold, is
 //! `ResourceNotFoundException`.
 //!
+//! The monitor's own state follows the probes it holds
+//! ([`crate::state::Monitor::follow_probe_states`]), which this handler applies
+//! after the write: taking a probe away gains the monitor nothing to aggregate,
+//! so an accepted delete never activates a monitor, and the draining probe is
+//! still held, so the monitor keeps the state it had reached until that record
+//! is gone.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -196,6 +203,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !already_tearing_down {
             monitor.modified_at = now;
         }
+        // The monitor-level consequence of the write, from the one rule that
+        // decides a monitor's own state: the probes it holds. A teardown gains
+        // the monitor nothing to aggregate, so it never makes an activation due,
+        // and the probe is still held and reported, so the monitor keeps the
+        // state it had reached until that record is gone — decided here rather
+        // than left to whichever caller settles the monitor next.
+        monitor.follow_probe_states(now);
         Ok(DeleteProbeOutput {})
     }
 }

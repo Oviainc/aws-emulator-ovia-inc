@@ -15,6 +15,8 @@
 mod authored_refusal_messages;
 #[path = "all/client_token_replay.rs"]
 mod client_token_replay;
+#[path = "all/delete_probe_and_monitor_state.rs"]
+mod delete_probe_and_monitor_state;
 #[path = "all/idempotent_replay_state.rs"]
 mod idempotent_replay_state;
 #[path = "all/list_monitors_pagination.rs"]

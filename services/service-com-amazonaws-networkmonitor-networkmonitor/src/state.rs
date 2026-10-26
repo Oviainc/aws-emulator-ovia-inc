@@ -64,9 +64,11 @@ pub const MONITOR_STATE_ACTIVE: &str = "ACTIVE";
 /// has nothing to activate: it is reported `INACTIVE` straight away and stays
 /// there — nothing is due — until a probe of its own is in service again. This
 /// is the state a monitor created with an empty (or absent) `probes` list is in,
-/// the one a monitor returns to when its last probe is deleted, and the one it
+/// the one a monitor returns to once its last probe has gone, and the one it
 /// returns to when every probe it holds has been deactivated
-/// ([`Monitor::follow_probe_states`]).
+/// ([`Monitor::follow_probe_states`]). A monitor already in it stays in it when a
+/// probe of its own is deleted: taking a probe away gains a monitor nothing to
+/// aggregate.
 pub const MONITOR_STATE_INACTIVE: &str = "INACTIVE";
 
 /// `ProbeState` of a probe that is not sending packets yet (model enum
@@ -921,12 +923,24 @@ impl Probe {
     ///
     /// A deactivated probe keeps its configuration but sends no packets, so it
     /// measures nothing its monitor could aggregate
-    /// ([`Monitor::follow_probe_states`]). Every other state a probe is
-    /// reported in counts as being in service, a probe draining through its
-    /// teardown included: the monitor holds it, and keeps aggregating it, until
-    /// the record is gone.
+    /// ([`Monitor::follow_probe_states`]).
     pub fn is_deactivated(&self) -> bool {
         self.state == PROBE_STATE_INACTIVE
+    }
+
+    /// Whether this probe is in service, i.e. measures for its monitor or is
+    /// provisioning to.
+    ///
+    /// A probe is in service while it is neither switched off by a caller
+    /// ([`Self::is_deactivated`]) nor on its way out
+    /// ([`Self::is_being_torn_down`]): a teardown is irreversible, so a probe
+    /// draining through it will never measure again and is not something a
+    /// monitor can bring into service. Such a probe is still HELD and still
+    /// reported — the monitor keeps aggregating what it already had until the
+    /// record is gone ([`Monitor::follow_probe_states`]) — but it can never be
+    /// what makes a monitor's activation due.
+    pub fn is_in_service(&self) -> bool {
+        !self.is_deactivated() && !self.is_being_torn_down()
     }
 
     /// Materialise the lifecycle transition the clock has already made due for
@@ -997,9 +1011,17 @@ impl Monitor {
     }
 
     /// Whether any probe this monitor holds is in service, i.e. is something
-    /// the monitor can aggregate ([`Probe::is_deactivated`]).
+    /// the monitor can aggregate ([`Probe::is_in_service`]).
     pub fn has_probe_in_service(&self) -> bool {
-        self.probes.values().any(|probe| !probe.is_deactivated())
+        self.probes.values().any(Probe::is_in_service)
+    }
+
+    /// Whether any probe this monitor holds is draining through its teardown
+    /// ([`Probe::is_being_torn_down`]) — a probe the monitor still holds and
+    /// still reports, which is why such a probe leaves the monitor's own state
+    /// where it is ([`Self::follow_probe_states`]).
+    pub fn has_probe_being_torn_down(&self) -> bool {
+        self.probes.values().any(Probe::is_being_torn_down)
     }
 
     /// Make this monitor's `state` follow the probes it holds, which is the one
@@ -1011,13 +1033,23 @@ impl Monitor {
     /// `PENDING` -> `ACTIVE` transition ([`Self::schedule_activation`]) and
     /// reaches `ACTIVE` once that instant has passed.
     ///
+    /// A probe on its way out is neither: taking a probe away gains a monitor
+    /// nothing to aggregate, so a teardown never makes an activation due, and
+    /// the probe is still held and reported, so it does not idle the monitor
+    /// either. A monitor whose every remaining probe is draining therefore keeps
+    /// the state it had reached, with nothing new due, and falls back to
+    /// `INACTIVE` when the last of those records is gone.
+    ///
     /// Called by every operation that can change which probes are in service,
     /// and by the settle walk every read performs, so one monitor-level rule is
-    /// applied however a probe got into or out of service. Both halves are
-    /// decided by the probe records themselves, so applying it twice changes
-    /// nothing: the activation a monitor is already owed keeps its instant.
+    /// applied however a probe got into or out of service. Every half is decided
+    /// by the probe records themselves, so applying it twice changes nothing:
+    /// the activation a monitor is already owed keeps its instant.
     pub fn follow_probe_states(&mut self, now: SystemTime) {
         if !self.has_probe_in_service() {
+            if self.has_probe_being_torn_down() {
+                return;
+            }
             if self.state != MONITOR_STATE_INACTIVE || self.activates_at.is_some() {
                 self.clear_activation();
             }
