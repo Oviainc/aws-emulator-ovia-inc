@@ -55,6 +55,8 @@ mod resource_policy;
 mod retry_build;
 #[path = "all/sandbox_connection.rs"]
 mod sandbox_connection;
+#[path = "all/sandbox_idle_timeout.rs"]
+mod sandbox_idle_timeout;
 #[path = "all/sandbox_lifecycle.rs"]
 mod sandbox_lifecycle;
 #[path = "all/sandbox_sessions.rs"]
