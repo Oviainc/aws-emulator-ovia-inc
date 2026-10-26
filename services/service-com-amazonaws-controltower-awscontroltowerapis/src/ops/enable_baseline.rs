@@ -6,7 +6,12 @@
 //! starts the asynchronous `ENABLE_BASELINE` operation `GetBaselineOperation` reports.
 //! The request is checked against the service's baseline catalog first — the baseline, the
 //! version it offers, the organizational-unit target and the parameters that baseline
-//! declares — so only an enablement that could exist is persisted.
+//! declares — so only an enablement that could exist is persisted. A `tags` member lands
+//! in the one tag store `ListTagsForResource` reads, so it is held to the same rule
+//! `TagResource` applies: a key in the reserved
+//! [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace names a tag Amazon Web Services
+//! applies itself, so a request carrying one is refused with the modelled
+//! `ValidationException` (400) and nothing is written.
 //! Implemented here because `GetBaselineOperation` has nothing to resolve until some call
 //! mints a baseline operation; the remaining baseline operations keep their own stub
 //! issues.
@@ -249,6 +254,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         if let Some(message) = crate::state::unacceptable_parameters_message(baseline, &parameters)
         {
+            return Err(
+                EnableBaselineErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
+        // A tag key Amazon Web Services keeps for itself is not a caller's to write, and
+        // this member lands in the same tag store `TagResource` merges into. Read off the
+        // REQUEST alone, so the refusal is settled before any state is touched and the
+        // enablement is not recorded either.
+        if let Some(message) = crate::state::reserved_tag_key_message(
+            "tags",
+            input.tags.iter().flatten().map(|(key, _)| key.as_str()),
+        ) {
             return Err(
                 EnableBaselineErrorModeled::ValidationException(ValidationException { message })
                     .into(),

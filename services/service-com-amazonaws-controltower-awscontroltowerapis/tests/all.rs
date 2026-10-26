@@ -71,6 +71,8 @@ mod list_enabled_baselines;
 mod list_filter_narrowing;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
+#[path = "all/reserved_tag_keys.rs"]
+mod reserved_tag_keys;
 #[path = "all/resource_identifier_form.rs"]
 mod resource_identifier_form;
 #[path = "all/resource_tags.rs"]

@@ -13,9 +13,12 @@
 //!
 //! What it accepts is settled before anything is written: the `controlIdentifier` must name
 //! a control of [`crate::state::CONTROL_CATALOG`] that a caller may enable, the
-//! `targetIdentifier` an AWS Organizations organizational unit, and `parameters` only keys
-//! that control declares — so no enablement of a control or a target that could not exist
-//! becomes persisted state.
+//! `targetIdentifier` an AWS Organizations organizational unit, `parameters` only keys
+//! that control declares, and `tags` no key in the reserved
+//! [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace (a tag Amazon Web Services applies
+//! itself, refused with the modelled `ValidationException`) — so no enablement of a
+//! control or a target that could not exist, and no tag AWS reserves, becomes persisted
+//! state.
 //!
 //! ## Shape of an operation
 //!
@@ -266,6 +269,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(message) =
             crate::state::unacceptable_control_parameters_message(control, &parameters)
         {
+            return Err(
+                EnableControlErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
+        // A tag key Amazon Web Services keeps for itself is not a caller's to write, and
+        // this member lands in the same tag store `TagResource` merges into. Read off the
+        // REQUEST alone, so the refusal is settled before any state is touched and the
+        // enablement is not recorded either.
+        if let Some(message) = crate::state::reserved_tag_key_message(
+            "tags",
+            input.tags.iter().flatten().map(|(key, _)| key.as_str()),
+        ) {
             return Err(
                 EnableControlErrorModeled::ValidationException(ValidationException { message })
                     .into(),

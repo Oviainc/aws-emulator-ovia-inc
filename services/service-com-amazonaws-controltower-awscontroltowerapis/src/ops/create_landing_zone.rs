@@ -5,7 +5,12 @@
 //! Mints the account's single landing zone and the `CREATE` entry of the landing zone
 //! operation log, both persisted in [`crate::state`]: the `arn` returned is the key the
 //! landing zone is stored under, and the `operationIdentifier` returned is the key
-//! `GetLandingZoneOperation` resolves.
+//! `GetLandingZoneOperation` resolves. A `tags` member is written to the one tag store
+//! `ListTagsForResource` reads, so it is held to the same rule `TagResource` applies: a
+//! key in the reserved [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace names a tag
+//! Amazon Web Services applies itself, so a request carrying one is refused with the
+//! modelled `ValidationException` (400) and nothing — landing zone, operation or tag — is
+//! written.
 //!
 //! Implemented: this operation no longer answers HTTP 501.
 //!
@@ -201,6 +206,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateLandingZoneErrorModeled::ValidationException(ValidationException {
                     message: defect,
+                })
+                .into(),
+            );
+        }
+
+        // A tag key Amazon Web Services keeps for itself is not a caller's to write, and
+        // this member lands in the same tag store `TagResource` merges into. Read off the
+        // REQUEST alone, so the refusal is settled before any state is touched and the
+        // landing zone is not minted either.
+        if let Some(message) = crate::state::reserved_tag_key_message(
+            "tags",
+            input.tags.iter().flatten().map(|(key, _)| key.as_str()),
+        ) {
+            return Err(
+                CreateLandingZoneErrorModeled::ValidationException(ValidationException {
+                    message,
                 })
                 .into(),
             );

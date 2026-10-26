@@ -200,6 +200,48 @@ pub const CATALOG_LANDING_ZONE_VERSIONS: &[&str] = &[
 /// fresh keys.
 pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 
+/// The tag-key prefix Amazon Web Services keeps for the tags it applies itself.
+///
+/// A key under this prefix names a tag Amazon Web Services generates, so it is not a
+/// caller's to create: the AWS tag restrictions reserve the prefix for Amazon Web
+/// Services' own use in ANY letter case, which is why [`is_reserved_tag_key`] compares it
+/// case-insensitively. The modelled `TagKey` (len 1..128) can express nothing of this, so
+/// it is the handler's rule: every request that WRITES tags refuses a map carrying such a
+/// key with the `ValidationException` the model declares for it, and writes nothing.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` names a tag in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace.
+///
+/// A PREFIX test, in any letter case: only a key that OPENS with the prefix is reserved,
+/// so a key that merely contains it (`team:aws:cost`) or that starts with the letters
+/// without the separator (`awsome`) is an ordinary key a caller may create.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// Why the tag keys a request would write cannot be accepted, or `None` when none of them
+/// is reserved.
+///
+/// The ONE place this refusal is decided and worded, reached by every operation of this
+/// service that writes tags (`TagResource` and the `tags` member of `CreateLandingZone`,
+/// `EnableControl` and `EnableBaseline`), so the rule cannot drift between them. The
+/// message names the member it is stated against and the offending key; the SMALLEST
+/// offending key is the one named, so a map carrying several reserved keys is refused in
+/// the same words on every call rather than naming whichever one a hash map happened to
+/// yield first.
+pub fn reserved_tag_key_message<'a, I>(member: &str, keys: I) -> Option<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let offending = keys.into_iter().filter(|key| is_reserved_tag_key(key)).min()?;
+    Some(format!(
+        "{member} carries tag key {offending:?}, which opens with the reserved \
+         {RESERVED_TAG_KEY_PREFIX} prefix; keys under that prefix name tags Amazon Web \
+         Services applies itself and cannot be created or modified"
+    ))
+}
+
 /// The newest landing zone version this emulator's catalog offers.
 ///
 /// Reported through `LandingZoneDetail$latestAvailableVersion` ("The latest available
@@ -1736,6 +1778,11 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
     /// so that cap cannot be bypassed by repeated tagging; the create/enable operations
     /// write their own `tags` member straight into the store at a freshly minted ARN,
     /// where the front door's `TagMap` `@length` max already holds the same count.
+    ///
+    /// The keys are the CALLER's to check first: a map carrying a key in the reserved
+    /// [`RESERVED_TAG_KEY_PREFIX`] namespace is refused before any write reaches here
+    /// (see [`reserved_tag_key_message`]), so nothing stored through this method holds a
+    /// key Amazon Web Services keeps for itself.
     pub fn merge_tags<I>(&mut self, arn: &str, tags: I) -> Option<usize>
     where
         I: IntoIterator<Item = (String, String)>,

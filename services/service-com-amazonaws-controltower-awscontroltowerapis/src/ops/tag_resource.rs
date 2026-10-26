@@ -14,7 +14,10 @@
 //! resource past [`crate::state::MAX_TAGS_PER_RESOURCE`] — the `TagMap` `@length` max,
 //! beyond which `ListTagsForResource` could not report the result inside the model's own
 //! constraint — is refused with the modelled `ValidationException` (400) and writes
-//! nothing either. Success is HTTP 204 with no body, as the model's `@http` trait says.
+//! nothing either, and so is a map carrying a key in the reserved
+//! [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace, which names a tag Amazon Web
+//! Services applies itself rather than one a caller may create. Success is HTTP 204 with
+//! no body, as the model's `@http` trait says.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -159,6 +162,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A tag key Amazon Web Services keeps for itself is not a caller's to write, and
+        // the check reads the REQUEST alone, so it is settled before the store is reached
+        // and a refused request cannot have written anything.
+        if let Some(message) = crate::state::reserved_tag_key_message(
+            "tags",
+            input.tags.keys().map(String::as_str),
+        ) {
+            return Err(
+                TagResourceErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
 
         let mut store = state.lock();
         // Only materialises transitions the clock already owed, so a resource whose
