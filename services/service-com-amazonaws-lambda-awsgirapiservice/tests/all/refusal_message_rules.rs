@@ -9,11 +9,15 @@
 //!
 //! * a resource that does not exist is refused with ONE canonical sentence,
 //!   [`CANONICAL_NOT_FOUND`], with nothing appended to it — whatever the resource kind
-//!   (layer version, event source mapping, function URL, code signing configuration, or a
-//!   function carrying no resource-based policy) and whichever operation asked. The
+//!   (layer version, event source mapping, function URL, a resource addressed by its tags,
+//!   or a function carrying no resource-based policy) and whichever operation asked. The
 //!   exception is an operation whose OWN resource is the one missing where AWS words that
-//!   case itself: a function, an alias, a capacity provider, and a layer version addressed
-//!   through its policy (`missing_policy_refusal.rs` pins that last distinction);
+//!   case itself: a function, an alias, a capacity provider, a code signing configuration,
+//!   and a layer version addressed through its policy (`missing_policy_refusal.rs` pins
+//!   that last distinction);
+//! * a CODE SIGNING CONFIGURATION the operation's own `CodeSigningConfigArn` named keeps
+//!   its own sentence, [`CODE_SIGNING_CONFIG_GONE`] around the ARN the request carried,
+//!   whichever of the operations on the configuration asked;
 //! * an ALIAS that does not exist keeps its own sentence, [`ALIAS_NOT_FOUND_PREFIX`]
 //!   followed by the alias ARN built from stored state, so a caller can tell
 //!   alias-not-found from function-not-found by the leading phrase, and a CAPACITY
@@ -116,6 +120,14 @@ const UNHELD_UUID: &str = "11111111-2222-3333-4444-555555555555";
 /// (`code-signing-config:csc-[a-z0-9]{17}`) that nothing is held under.
 const UNHELD_CODE_SIGNING_CONFIG: &str =
     "arn:aws:lambda:us-east-1:000000000000:code-signing-config:csc-0a1b2c3d4e5f60718";
+
+/// Lambda's sentence for a code signing configuration the request's own
+/// `CodeSigningConfigArn` names and this account holds none of: the ARN fills the slot in
+/// the middle, which is `(prefix, suffix)` here.
+const CODE_SIGNING_CONFIG_GONE: (&str, &str) = (
+    "The Lambda code signing configuration ",
+    " can not be found.",
+);
 
 /// The `message` of a wire error, under either casing the JSON envelopes use.
 fn message(answer: &Answer) -> String {
@@ -495,13 +507,6 @@ async fn every_resource_that_does_not_exist_is_refused_with_the_one_canonical_se
             identifier: "rmr-bare".to_string(),
         },
         NotFoundCase {
-            label: "GetCodeSigningConfig for an ARN nothing holds",
-            method: "GET",
-            uri: format!("/2020-04-22/code-signing-configs/{UNHELD_CODE_SIGNING_CONFIG}"),
-            body: Value::Null,
-            identifier: UNHELD_CODE_SIGNING_CONFIG.to_string(),
-        },
-        NotFoundCase {
             label: "ListTags on a code signing config ARN nothing holds",
             method: "GET",
             uri: format!("{TAGS_URI}/{UNHELD_CODE_SIGNING_CONFIG}"),
@@ -648,6 +653,81 @@ async fn a_removal_with_no_policy_to_act_on_reports_the_missing_policy() {
         read.status,
         read.text()
     );
+}
+
+/// One code-signing-configuration row: the operation that named an ARN nothing is held
+/// under, and the ARN it named.
+struct CodeSigningConfigCase {
+    label: &'static str,
+    method: &'static str,
+    arn: &'static str,
+    body: Value,
+}
+
+#[tokio::test]
+async fn a_code_signing_configuration_that_does_not_exist_is_refused_by_its_own_sentence() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+
+    // The rows differ in the operation that asked (the read, the update and the delete all
+    // address the configuration by `CodeSigningConfigArn`) and in the ARN they named, which
+    // is the only variable part of the sentence.
+    let other_unheld: &str =
+        "arn:aws:lambda:us-east-1:000000000000:code-signing-config:csc-ffff0000ffff0000f";
+    let cases = [
+        CodeSigningConfigCase {
+            label: "GetCodeSigningConfig for an ARN nothing holds",
+            method: "GET",
+            arn: UNHELD_CODE_SIGNING_CONFIG,
+            body: Value::Null,
+        },
+        CodeSigningConfigCase {
+            label: "DeleteCodeSigningConfig for an ARN nothing holds",
+            method: "DELETE",
+            arn: UNHELD_CODE_SIGNING_CONFIG,
+            body: Value::Null,
+        },
+        CodeSigningConfigCase {
+            label: "UpdateCodeSigningConfig for an ARN nothing holds",
+            method: "PUT",
+            arn: UNHELD_CODE_SIGNING_CONFIG,
+            body: json!({ "Description": "nothing to update" }),
+        },
+        CodeSigningConfigCase {
+            label: "DeleteCodeSigningConfig for a second ARN nothing holds",
+            method: "DELETE",
+            arn: other_unheld,
+            body: Value::Null,
+        },
+    ];
+
+    for case in &cases {
+        let answer = call(
+            &router,
+            case.method,
+            &format!("/2020-04-22/code-signing-configs/{}", case.arn),
+            &case.body,
+        )
+        .await;
+        let reported = message(&answer);
+        let expected = format!(
+            "{}{}{}",
+            CODE_SIGNING_CONFIG_GONE.0, case.arn, CODE_SIGNING_CONFIG_GONE.1
+        );
+        assert_eq!(
+            (answer.status, answer.error_code().contains("ResourceNotFoundException")),
+            (404, true),
+            "case {:?}: expected 404 ResourceNotFoundException, got {} {}",
+            case.label,
+            answer.status,
+            answer.text()
+        );
+        assert_eq!(
+            reported, expected,
+            "case {:?}: expected {expected:?}, got {reported:?}",
+            case.label
+        );
+    }
 }
 
 /// One capacity-provider row: how the request addresses a provider nothing holds.

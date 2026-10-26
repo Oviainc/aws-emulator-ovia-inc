@@ -41,6 +41,8 @@ mod capacity_provider_naming;
 mod capacity_provider_update;
 #[path = "all/capacity_providers.rs"]
 mod capacity_providers;
+#[path = "all/code_signing_config_deletion.rs"]
+mod code_signing_config_deletion;
 #[path = "all/code_signing_config_update.rs"]
 mod code_signing_config_update;
 #[path = "all/code_signing_configs.rs"]

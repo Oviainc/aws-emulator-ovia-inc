@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCodeSigningConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCodeSigningConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCodeSigningConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes ONE code-signing configuration — the single
+//! [`crate::state::CodeSigningConfigRecord`] the request's `CodeSigningConfigArn`
+//! addresses — from [`crate::state`], so a later `GetCodeSigningConfig` on that ARN
+//! reports that no such configuration exists and nothing can be associated with it any
+//! more.
+//!
+//! "You can delete the code signing configuration only if no function is using it", so a
+//! configuration some function is still associated with is refused
+//! `ResourceConflictException` and stays exactly as it was: a function names the
+//! configuration it deploys under through its own function-level association
+//! ([`crate::state::ComAmazonawsLambdaAwsgirapiserviceState::code_signing_config_users`]),
+//! which `CreateFunction` and `PutFunctionCodeSigningConfig` set. The refusal states that
+//! condition and nothing of the request
+//! ([`crate::state::CODE_SIGNING_CONFIG_IN_USE_MESSAGE`]).
+//!
+//! The configuration is the only resource this request names, so an ARN naming none of
+//! them is the modelled 404 — AWS's own sentence for a missing configuration,
+//! [`crate::state::code_signing_config_gone_message`] — rather than a success: there is no
+//! second resource for that error to be about. A configuration that WAS deleted is in
+//! exactly that case, so a repeat of a delete that succeeded answers the same 404.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +154,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCodeSigningConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCodeSigningConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCodeSigningConfig"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteCodeSigningConfigErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // No clock-owed transition is materialised first because none can reach what this
+        // call reads: a function's code-signing association is set only by a request, and
+        // the clock removes no function.
+
+        // A configuration is addressed by the ARN it was minted with, which is the key the
+        // store holds it under — the same lookup `GetCodeSigningConfig` makes, so the two
+        // surfaces agree on which ARNs name a configuration this account holds.
+        if !store
+            .code_signing_configs
+            .contains_key(&input.code_signing_config_arn)
+        {
+            // A code-signing configuration is a resource AWS words its own 404 sentence
+            // for, naming the ARN the request carried.
+            return Err(
+                DeleteCodeSigningConfigErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(crate::state::code_signing_config_gone_message(
+                            &input.code_signing_config_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "You can delete the code signing configuration only if no function is using
+        // it": a function associated with the configuration is such a use, so the delete
+        // is refused and removes nothing.
+        if !store
+            .code_signing_config_users(&input.code_signing_config_arn)
+            .is_empty()
+        {
+            return Err(
+                DeleteCodeSigningConfigErrorModeled::ResourceConflictException(
+                    ResourceConflictException {
+                        r#type: None,
+                        message: Some(
+                            crate::state::CODE_SIGNING_CONFIG_IN_USE_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The publishers, the policy value and the tags live on the record itself, so
+        // removing it removes them: nothing of a deleted configuration is reported again.
+        store
+            .code_signing_configs
+            .remove(&input.code_signing_config_arn);
+
+        // A successful delete carries no body; the modelled 204 is `SUCCESS_STATUS`.
+        Ok(DeleteCodeSigningConfigOutput {})
     }
 }

@@ -149,10 +149,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let Some(record) = store.code_signing_configs.get(&input.code_signing_config_arn) else {
+            // A code-signing configuration is a resource AWS words its own 404 sentence
+            // for, naming the ARN the request carried.
             return Err(GetCodeSigningConfigErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     r#type: None,
-                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    message: Some(crate::state::code_signing_config_gone_message(
+                        &input.code_signing_config_arn,
+                    )),
                 },
             )
             .into());

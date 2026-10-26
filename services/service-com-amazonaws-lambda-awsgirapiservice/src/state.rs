@@ -108,7 +108,12 @@
 //! the ARN of a configuration this store already holds, never one the request invented.
 //! `CreateFunction` sets the same value from its own `CodeSigningConfigArn` member, and
 //! `GetFunctionCodeSigningConfig` reports exactly what is stored there, so one function
-//! has ONE association however it was set.
+//! has ONE association however it was set. The association is also what makes a stored
+//! configuration IN USE: `DeleteCodeSigningConfig` can remove a configuration "only if no
+//! function is using it", so it removes the record out of
+//! [`ComAmazonawsLambdaAwsgirapiserviceState::code_signing_configs`] only when
+//! [`ComAmazonawsLambdaAwsgirapiserviceState::code_signing_config_users`] finds no
+//! function naming it.
 //!
 //! The capacity-provider slice is the account's other top-level resource:
 //! [`ComAmazonawsLambdaAwsgirapiserviceState::capacity_providers`] holds one
@@ -366,6 +371,44 @@ pub fn code_signing_config_not_found_message(arn: &str) -> String {
         "The code signing configuration cannot be found. Check that the provided \
          configuration is not deleted: {arn}."
     )
+}
+
+/// The refusal `DeleteCodeSigningConfig` answers when some function still names the
+/// configuration the request asked to delete.
+///
+/// The CONDITION is the one the operation documents — "You can delete the code signing
+/// configuration only if no function is using it" — and the SENTENCE below is how the
+/// service words that refusal, as the recorded response to such a delete carries it: it is
+/// reproduced verbatim rather than reworded to the condition, because the wording is the
+/// requirement. The service classifies the association as the modelled
+/// `ResourceConflictException` ("The resource already exists, or another operation is in
+/// progress") and words the refusal in those terms.
+///
+/// It is the WHOLE message: no ARN, no function and no count, so there is nothing of the
+/// request in it and a caller can compare it exactly. Which functions hold the
+/// configuration is reported by the function surface
+/// ([`ComAmazonawsLambdaAwsgirapiserviceState::code_signing_config_users`]) instead.
+pub const CODE_SIGNING_CONFIG_IN_USE_MESSAGE: &str =
+    "Lambda cannot delete the code signing configuration at this time — another operation \
+     is in progress. Try again later.";
+
+/// The refusal an operation ON a code-signing configuration answers when this account
+/// holds none under the ARN it named: the sentence AWS words that case as, with the ARN the
+/// request carried as its variable part.
+///
+/// A code-signing configuration is one of the resource kinds AWS gives its own 404 sentence
+/// to rather than the canonical [`RESOURCE_NOT_FOUND_MESSAGE`], so every operation whose
+/// OWN resource is the configuration — `GetCodeSigningConfig`, `UpdateCodeSigningConfig`
+/// and `DeleteCodeSigningConfig`, each addressing it by `CodeSigningConfigArn` — answers
+/// this one sentence, and a configuration that was deleted reads exactly like one that
+/// never existed.
+///
+/// It is a different sentence from [`code_signing_config_not_found_message`], which belongs
+/// to the modelled `CodeSigningConfigNotFoundException` an operation on a FUNCTION answers
+/// when the configuration it was told to associate is not there.
+#[must_use]
+pub fn code_signing_config_gone_message(arn: &str) -> String {
+    format!("The Lambda code signing configuration {arn} can not be found.")
 }
 
 /// The most published versions this emulator keeps for one function.
@@ -1168,9 +1211,11 @@ pub fn pattern_violation_message(path: &str, value: &str, pattern: &str) -> Stri
 /// request named ([`resolve_function`]'s `Function not found: <arn>`), an alias looked up
 /// by name ([`alias_not_found_message`]), a layer version addressed by the operations on
 /// its POLICY ([`resolve_layer_version`], where the version is the operation's own
-/// resource) and the configuration-shaped refusals below. Every other 404 in this service
-/// — a function URL, a layer version READ, an event source mapping, a code signing
-/// configuration, a function carrying no resource-based policy — answers this.
+/// resource), a code signing configuration an operation on the configuration itself named
+/// ([`code_signing_config_gone_message`]) and the configuration-shaped refusals below.
+/// Every other 404 in this service — a function URL, a layer version READ, an event source
+/// mapping, a resource addressed by its TAGS, a function carrying no resource-based policy
+/// — answers this.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The resource you requested does not exist.";
 
 /// The refusal a `RevisionId` precondition that did not hold gets on `AddPermission` and
@@ -3463,6 +3508,23 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
             }
         }
         users
+    }
+
+    /// The ARNs of every function associated with the code-signing configuration
+    /// `config_arn` names, in a stable order.
+    ///
+    /// A function names the configuration it deploys under through the single
+    /// function-level [`FunctionRecord::code_signing_config_arn`] — the operations that
+    /// set and read it take an unqualified `FunctionName`, so a published version is not
+    /// a separate user of the configuration and a function appears here at most once,
+    /// under its own unqualified ARN.
+    #[must_use]
+    pub fn code_signing_config_users(&self, config_arn: &str) -> Vec<String> {
+        self.functions
+            .values()
+            .filter(|function| function.code_signing_config_arn.as_deref() == Some(config_arn))
+            .map(|function| function.arn.clone())
+            .collect()
     }
 
     /// Every entry `ListFunctions` can report, in pagination order.
