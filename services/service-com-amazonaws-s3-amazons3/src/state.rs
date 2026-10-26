@@ -397,6 +397,22 @@ pub enum AnnotationWrite {
     TotalByteBudgetReached { would_hold: usize },
 }
 
+/// What [`ComAmazonawsS3Amazons3State::remove_object_annotation`] did, so the caller
+/// answers each outcome without re-deriving it — the removal counterpart of
+/// [`AnnotationWrite`], and without its ceilings: taking an annotation away only releases
+/// bytes, so no budget can refuse it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnotationRemoval {
+    /// The addressed object version carried that name and no longer does; the payload and
+    /// everything it retained are gone.
+    Removed,
+    /// The bucket exists and holds the addressed object version, but that version carries
+    /// no annotation under the name; nothing was removed.
+    NoSuchAnnotation,
+    /// The bucket exists but holds no such object version; nothing was removed.
+    NoSuchObject,
+}
+
 /// How many annotations one object may carry.
 ///
 /// From `PutObjectAnnotation`'s own documentation: "Each object can have up to 1,000
@@ -7722,6 +7738,37 @@ impl ComAmazonawsS3Amazons3State {
                 object.annotations.insert(name.to_string(), annotation);
                 AnnotationWrite::Applied
             })
+    }
+
+    /// Remove the annotation `name` addresses from the object version `version_id` names
+    /// in `bucket` — the key's current object when it names none. Reports what the removal
+    /// did, or `None` when this emulator holds no such bucket (so a delete refuses a name
+    /// that is not a bucket instead of reporting a removal from nothing).
+    ///
+    /// PERMANENT, and of the one annotation `name` addresses alone: "Deleting an annotation
+    /// is permanent. Annotations are not independently versioned, so there is no delete
+    /// marker or way to recover a deleted annotation" (`DeleteObjectAnnotation`'s own
+    /// documentation), so the payload and everything it retained are released and every
+    /// other annotation of the object stays where it was.
+    ///
+    /// The counterpart of [`Self::put_object_annotation`] and the ONLY way an annotation is
+    /// taken away, so the bytes an annotation retains are released in exactly one place;
+    /// unlike a write it is bounded by nothing, because a removal only gives room back.
+    pub fn remove_object_annotation(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        name: &str,
+    ) -> Option<AnnotationRemoval> {
+        let held = self.buckets.get_mut(bucket)?;
+        let Some(object) = held.addressed_object_mut(key, version_id) else {
+            return Some(AnnotationRemoval::NoSuchObject);
+        };
+        Some(match object.annotations.remove(name) {
+            Some(_) => AnnotationRemoval::Removed,
+            None => AnnotationRemoval::NoSuchAnnotation,
+        })
     }
 
     /// Record a bucket named `name` in `region`, reporting what happened.

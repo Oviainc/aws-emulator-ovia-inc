@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteObjectAnnotation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteObjectAnnotation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteObjectAnnotation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the one annotation a request names from the stored object version it addresses,
+//! permanently, and reports the version the annotation was deleted from.
+//! Implemented here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -103,14 +97,90 @@ use super::types::*;
 // `DeleteObjectAnnotationError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `DeleteObjectAnnotationError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#DeleteObjectAnnotation")]
+/// This operation's output, as the wire carries it: the one member this handler can report,
+/// bound to a response header, and NO body.
+///
+/// A successful delete answers "204 No Content", and an HTTP 204 response has no body. The
+/// modelled `DeleteObjectAnnotationOutput` cannot be used for it: the protocol only leaves
+/// the body empty for a `smithy.api#Unit` output shape, so the generated shape serializes an
+/// empty `<DeleteObjectAnnotationOutput>` document into that 204. This LOCAL shape keeps the
+/// Unit shape id — hence the empty body — while declaring the modelled member as an
+/// `@httpHeader` binding, which the protocol still captures for a Unit output; `with_http`
+/// carries the modelled 204, without which the status falls back to the protocol default of
+/// 200. It is the same pairing [`super::delete_object`] and [`super::delete_object_tagging`]
+/// use for their own 204s, and it carries their fragility: body suppression is keyed off the
+/// Unit SHAPE ID while the members still run through the HTTP binder. The test
+/// `a_delete_takes_one_annotation_and_leaves_the_object_and_its_other_annotations` pins both
+/// the empty body and the header, so the pairing cannot break unnoticed.
+#[derive(Debug, Clone, Default)]
+pub struct DeleteObjectAnnotationNoContent {
+    /// `x-amz-object-version-id`: "The version ID of the object that the annotation was
+    /// deleted from". Reported only when that stored version has an id of its own, the way
+    /// S3 omits the header otherwise.
+    pub object_version_id: Option<String>,
+}
+
+/// `x-amz-object-version-id`, as [`DeleteObjectAnnotationNoContent`] binds it.
+static OBJECT_VERSION_ID_HEADER: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.s3#DeleteObjectAnnotationOutput$ObjectVersionId",
+            "com.amazonaws.s3#DeleteObjectAnnotationOutput",
+            "ObjectVersionId",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "ObjectVersionId",
+        0,
+    )
+    .with_http_header("x-amz-object-version-id");
+
+static DELETE_OBJECT_ANNOTATION_NO_CONTENT_MEMBERS: &[&::aws_smithy_schema::Schema] =
+    &[&OBJECT_VERSION_ID_HEADER];
+
+impl DeleteObjectAnnotationNoContent {
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
+        ::aws_smithy_schema::ShapeType::Structure,
+        DELETE_OBJECT_ANNOTATION_NO_CONTENT_MEMBERS,
+    )
+    .with_http(::aws_smithy_schema::traits::HttpTrait::new(
+        "DELETE",
+        "/{Bucket}/{Key+}?annotation",
+        Some(204u16),
+    ));
+}
+
+pub static DELETE_OBJECT_ANNOTATION_NO_CONTENT_SCHEMA: &::aws_smithy_schema::Schema =
+    &DeleteObjectAnnotationNoContent::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for DeleteObjectAnnotationNoContent {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(object_version_id) = self.object_version_id.as_deref() {
+            serializer.write_string(&OBJECT_VERSION_ID_HEADER, object_version_id)?;
+        }
+        Ok(())
+    }
+}
+
+// The operation's MODELED errors, widened with `extra_errors` by the 404 shape this SERVICE
+// models for an annotation that is not there.
+//
+// The model lists `NoSuchBucket` and `NoSuchKey` for this operation, the first two links of
+// the chain bucket → object → annotation that `AnnotationName` addresses; the third link has
+// its own shape, `NoSuchAnnotation` (`@httpError(404)`), which the READER of this same
+// subresource answers for a name no object carries. Widening the set with it is what lets a
+// delete answer the same 404 for the same cause rather than reporting a removal it did not
+// make.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#DeleteObjectAnnotation",
+    extra_errors = ["NoSuchAnnotation"]
+)]
 #[derive(Debug)]
 pub enum DeleteObjectAnnotationErrorModeled {
+    NoSuchAnnotation(NoSuchAnnotation),
     NoSuchBucket(NoSuchBucket),
     NoSuchKey(NoSuchKey),
 }
@@ -153,12 +223,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for DeleteObjectAnnotation<Eng>
 {
     type Input = DeleteObjectAnnotationInput;
-    type Output = DeleteObjectAnnotationOutput;
+    type Output = DeleteObjectAnnotationNoContent;
     type Error = DeleteObjectAnnotationError;
 
     const NAME: &'static str = "DeleteObjectAnnotation";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_OBJECT_ANNOTATION_INPUT_SCHEMA;
-    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_OBJECT_ANNOTATION_OUTPUT_SCHEMA;
+    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema =
+        DELETE_OBJECT_ANNOTATION_NO_CONTENT_SCHEMA;
     const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
@@ -167,17 +238,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteObjectAnnotation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteObjectAnnotationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteObjectAnnotation"))
+        // request metadata only, and this write needs nothing from it.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner"
+        // (`DeleteObjectAnnotationRequest$ExpectedBucketOwner`), judged the way the writer
+        // and the reader of this same subresource judge it: this emulator serves one
+        // account, so the owner of every bucket it holds is that account.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ));
+        }
+
+        // A `versionId` that is not SHAPED like one cannot name a version of anything, so
+        // it is a malformed argument rather than an absent version — the way `GetObject`
+        // and the writer and reader of this subresource answer the same argument.
+        if let Some(version_id) = input.version_id.as_deref() {
+            if !crate::state::version_id_is_well_formed(version_id) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    crate::state::INVALID_VERSION_ID_MESSAGE,
+                ));
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store nothing can be removed at all, and every modelled error
+            // would be a false statement about the address the request names, so the
+            // scaffold's 501 carries what is true: this emulator cannot serve the request.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteObjectAnnotation",
+            ));
+        };
+        let mut store = state.lock();
+
+        // The ADDRESS is resolved first, so a request naming a bucket, a key or a version
+        // this emulator does not hold answers that rather than "no such annotation" on an
+        // object that is not there. "The version ID of the object"
+        // (`DeleteObjectAnnotationRequest$VersionId`), and with none the key's current
+        // object — what every reader naming no version answers from.
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(DeleteObjectAnnotationErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        let Some(object) = bucket.addressed_object(&input.key, input.version_id.as_deref()) else {
+            // A well-formed `versionId` that names no stored version is `NoSuchVersion`
+            // (404), which this model carries no shape for; a request naming no version at
+            // all is the modelled `NoSuchKey`.
+            return Err(match input.version_id.as_deref() {
+                Some(_) => crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::NO_SUCH_VERSION_CODE,
+                    404,
+                    crate::state::NO_SUCH_VERSION_MESSAGE,
+                ),
+                None => DeleteObjectAnnotationErrorModeled::NoSuchKey(NoSuchKey {}).into(),
+            });
+        };
+
+        // "Use the x-amz-object-if-match header to perform a conditional delete that only
+        // succeeds if the object's ETag matches the provided value, preventing race
+        // conditions during concurrent updates" (this operation's own documentation) —
+        // judged against the entity tag of the version just addressed, and BEFORE anything
+        // is removed, so a request whose precondition does not hold leaves the object's
+        // annotations exactly as they were. S3 answers a precondition that does not hold
+        // `PreconditionFailed` (412), a code this model carries no shape for.
+        if input
+            .object_if_match
+            .as_deref()
+            .is_some_and(|expected| expected != object.etag)
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::PRECONDITION_FAILED_CODE,
+                crate::state::PRECONDITION_FAILED_STATUS,
+                crate::state::PRECONDITION_FAILED_MESSAGE,
+            ));
+        }
+
+        // "The version ID of the object that the annotation was deleted from"
+        // (`DeleteObjectAnnotationOutput$ObjectVersionId`), read off the stored version
+        // before the removal rather than invented, so it is reported exactly when that
+        // version has an id of its own (a write into a versioning-enabled bucket).
+        let object_version_id = object.version_id.clone();
+
+        // Removed through the one place an annotation is ever removed, so the bytes it
+        // retained are released in exactly one place. It takes away the one name the request
+        // addresses and nothing else, and it is PERMANENT: "Annotations are not
+        // independently versioned, so there is no delete marker or way to recover a deleted
+        // annotation", so a second delete of the same name finds nothing there.
+        let outcome = store.remove_object_annotation(
+            &input.bucket,
+            &input.key,
+            input.version_id.as_deref(),
+            &input.annotation_name,
+        );
+        match outcome {
+            Some(crate::state::AnnotationRemoval::Removed) => {}
+            // Unreachable through this handler (the address was just resolved under the
+            // same lock), and answered rather than asserted so a future caller of this
+            // state seam cannot turn a vanished address into a panic.
+            None => {
+                return Err(
+                    DeleteObjectAnnotationErrorModeled::NoSuchBucket(NoSuchBucket {}).into(),
+                )
+            }
+            Some(crate::state::AnnotationRemoval::NoSuchObject) => {
+                return Err(DeleteObjectAnnotationErrorModeled::NoSuchKey(NoSuchKey {}).into())
+            }
+            // The third link of the address: the object is there and carries no annotation
+            // under that name, so there is nothing this call could delete. That is also
+            // what a name no write could have recorded (one past the published bounds, or
+            // under a prefix S3 reserves) answers, since no object can be carrying it —
+            // exactly as the reader of this subresource answers the same name.
+            Some(crate::state::AnnotationRemoval::NoSuchAnnotation) => {
+                return Err(
+                    DeleteObjectAnnotationErrorModeled::NoSuchAnnotation(NoSuchAnnotation {})
+                        .into(),
+                )
+            }
+        }
+
+        Ok(DeleteObjectAnnotationNoContent {
+            object_version_id,
+            // `RequestCharged`, the output's only other member, reports a Requester Pays
+            // charge this emulator does not model, so nothing is reported for it rather
+            // than a charge being invented.
+        })
     }
 }

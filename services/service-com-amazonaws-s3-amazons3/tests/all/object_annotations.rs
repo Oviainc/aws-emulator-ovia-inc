@@ -46,7 +46,11 @@ use super::object_and_tagging_roundtrip::{bucket, expected_etag, put_object, tex
 /// `PUT /<bucket>/<key>?annotation&annotationName=<name>` — `PutObjectAnnotation`. The
 /// `?annotation` literal is what separates this route from `PutObject` on the same method
 /// and path, and the name travels as the query parameter the model binds it to.
-async fn put_annotation(
+///
+/// `pub(crate)`, like [`get_annotation`] and the two query-carrying variants beside them:
+/// the annotation-removal suite in this same test crate writes and reads back the
+/// annotations it deletes through these rather than standing up a second pair.
+pub(crate) async fn put_annotation(
     router: &MultiServiceRouter,
     bucket: &str,
     key: &str,
@@ -54,8 +58,22 @@ async fn put_annotation(
     payload: &[u8],
     headers: &[(&str, &str)],
 ) -> Answer {
+    put_annotation_at(router, bucket, key, name, "", payload, headers).await
+}
+
+/// [`put_annotation`] with whatever extra query parameters the case carries — a
+/// `&versionId=<id>` addressing one stored version, say.
+pub(crate) async fn put_annotation_at(
+    router: &MultiServiceRouter,
+    bucket: &str,
+    key: &str,
+    name: &str,
+    query: &str,
+    payload: &[u8],
+    headers: &[(&str, &str)],
+) -> Answer {
     let uri = format!(
-        "/{bucket}/{key}?annotation&annotationName={}",
+        "/{bucket}/{key}?annotation&annotationName={}{query}",
         url_encoded_key(name)
     );
     send_bytes(router, "PUT", &uri, headers, payload).await
@@ -64,14 +82,26 @@ async fn put_annotation(
 /// `GET /<bucket>/<key>?annotation&annotationName=<name>&x-id=GetObjectAnnotation` —
 /// `GetObjectAnnotation`. The `x-id` literal is what the model binds to separate this read
 /// from `ListObjectAnnotations`, which is bound to the same method, path and `?annotation`.
-async fn get_annotation(
+pub(crate) async fn get_annotation(
     router: &MultiServiceRouter,
     bucket: &str,
     key: &str,
     name: &str,
 ) -> Answer {
+    get_annotation_at(router, bucket, key, name, "").await
+}
+
+/// [`get_annotation`] with whatever extra query parameters the case carries — a
+/// `&versionId=<id>` addressing one stored version, say.
+pub(crate) async fn get_annotation_at(
+    router: &MultiServiceRouter,
+    bucket: &str,
+    key: &str,
+    name: &str,
+    query: &str,
+) -> Answer {
     let uri = format!(
-        "/{bucket}/{key}?annotation&annotationName={}&x-id=GetObjectAnnotation",
+        "/{bucket}/{key}?annotation&annotationName={}&x-id=GetObjectAnnotation{query}",
         url_encoded_key(name)
     );
     send_bytes(router, "GET", &uri, &[], b"").await
