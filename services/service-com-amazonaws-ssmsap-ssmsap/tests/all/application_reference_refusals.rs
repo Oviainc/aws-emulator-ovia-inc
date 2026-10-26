@@ -169,6 +169,16 @@ fn id_refusals() -> Vec<Refusal> {
             code: VALIDATION_EXCEPTION,
             message: validation_refusal_message,
         },
+        Refusal {
+            // Also models no `ResourceNotFoundException`, so the application-scoped
+            // listing answers the same condition with the same 400 wording.
+            label: "ListOperations",
+            path: "/list-operations",
+            body: |reference| json!({ "ApplicationId": reference }),
+            status: 400,
+            code: VALIDATION_EXCEPTION,
+            message: validation_refusal_message,
+        },
     ]
 }
 

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOperations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOperations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOperations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the operation records `RegisterApplication` / `StartApplication` /
+//! `StartApplicationRefresh` / `StopApplication` / `DeregisterApplication` filed against
+//! ONE registered application, read out of persisted state: the same records
+//! `GetOperation` resolves by id, narrowed by every `Filter` the request carries and
+//! handed out in pages. An `ApplicationId` that names no application registered in this
+//! account and Region is refused with the modelled `ValidationException`; nothing is
+//! synthesised.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +146,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOperations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOperationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The Region this request was signed for: an operation record belongs to the
+        // Region the call that filed it was made in, so it is reported at that regional
+        // endpoint alone.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListOperationsErrorModeled::InternalServerException(crate::state::store_unavailable())
+        })?;
+        let mut state = state.lock();
+        // Each record was due to reach its terminal status at its own instant whether or
+        // not anybody polled, so materialising that here reports what those operations
+        // already are — and makes this listing agree with a `GetOperation` made at the
+        // same instant.
+        state.settle(::std::time::SystemTime::now());
+
+        let filters = input.filters.unwrap_or_default();
+        // The validation every filtered listing of this service shares: the bounds the
+        // model declares on `FilterList`, `FilterName` and `FilterValue` — re-stated
+        // before any filtering runs so the work this request does over the store is
+        // bounded by a check in this crate rather than by request size — then an operator
+        // the model declares and a `Name` this listing reports.
+        crate::state::validate_filters(
+            &filters,
+            crate::state::FilterOperators::Modelled,
+            crate::state::OPERATION_FILTER_NAMES,
+        )
+        .map_err(ListOperationsErrorModeled::ValidationException)?;
+
+        let region_state = state.region(&region);
+        // `ApplicationId` is required, so the listing is always scoped to ONE
+        // application, which has to be registered in this Region. This operation models
+        // no `ResourceNotFoundException`, so a reference no registration answers is the
+        // `ValidationException` it does model rather than an empty page, which would
+        // report an application that exists and has had nothing done to it.
+        if !region_state.applications.contains_key(&input.application_id) {
+            return Err(ListOperationsErrorModeled::ValidationException(
+                crate::state::no_registered_application(&input.application_id),
+            )
+            .into());
+        }
+
+        // The records filed against that application, narrowed by every filter the
+        // request carries (several filters narrow together), each paired with the key the
+        // listing is ordered and paged by: its own `OperationId`.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOperations"))
+        // The store this selects from is bounded by a ceiling enforced where a record is
+        // written (`MAX_RETAINED_OPERATIONS` per Region), so the work one request does
+        // cannot grow with how many requests came before it; a store that exceeded it
+        // would be a regression in that ceiling, which this says in a debug build while
+        // the listing still reports every record it holds.
+        debug_assert!(
+            region_state.operations.len() <= crate::state::MAX_RETAINED_OPERATIONS,
+            "a Region retains at most {} operation records, found {}",
+            crate::state::MAX_RETAINED_OPERATIONS,
+            region_state.operations.len()
+        );
+        let matching: Vec<(String, Operation)> = region_state
+            .operations_for(&input.application_id)
+            .into_iter()
+            .filter(|record| {
+                filters.iter().all(|filter| {
+                    crate::state::filter_matches_attribute(
+                        record.filter_attribute(&filter.name),
+                        filter,
+                    )
+                })
+            })
+            .map(|record| (record.id.clone(), record.view()))
+            .collect();
+
+        let page = crate::state::page(
+            matching,
+            input.max_results,
+            input.next_token.as_deref(),
+            crate::state::Listing::Operations,
+        )
+        .map_err(|error| {
+            ListOperationsErrorModeled::ValidationException(
+                crate::state::page_validation_exception(&error),
+            )
+        })?;
+
+        Ok(ListOperationsOutput {
+            operations: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

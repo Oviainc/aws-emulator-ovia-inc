@@ -8,7 +8,8 @@
 //! `StartApplicationRefresh`, `DeregisterApplication`) resolves the SAME
 //! [`StoredApplication`] out of
 //! [`RegionState::applications`], and every call that changes one files a
-//! [`StoredOperation`] in [`RegionState::operations`] that `GetOperation` reads back.
+//! [`StoredOperation`] in [`RegionState::operations`] that `GetOperation` reads back and
+//! `ListOperations` reports per application ([`RegionState::operations_for`]).
 //! So a register is observable by every later read, a deregister by every later call,
 //! and an `OperationId` handed to a caller always names a record that exists.
 //!
@@ -1045,6 +1046,26 @@ impl StoredOperation {
             ));
         }
         events
+    }
+
+    /// The value a `ListOperations` filter whose `Name` is `name` compares against, or
+    /// `None` when this record has no such attribute (which nothing matches).
+    ///
+    /// The names are the identifying and status members the model gives `Operation` —
+    /// `Id`, `Type`, `Status`, `ResourceType`, `ResourceId`, `ResourceArn` — which is the
+    /// shape that listing returns, so a filter names something the response itself
+    /// reports, the same way [`StoredConfigurationCheckOperation::filter_attribute`] does
+    /// for the configuration check listing. See [`OPERATION_FILTER_NAMES`].
+    pub fn filter_attribute(&self, name: &str) -> Option<&str> {
+        match name {
+            "Id" => Some(self.id.as_str()),
+            "Type" => Some(self.op_type.as_str()),
+            "Status" => Some(self.status.as_str()),
+            "ResourceType" => Some(self.resource_type.as_str()),
+            "ResourceId" => Some(self.resource_id.as_str()),
+            "ResourceArn" => Some(self.resource_arn.as_str()),
+            _ => None,
+        }
     }
 
     /// Project the stored operation onto the modelled `Operation`.
@@ -2744,6 +2765,25 @@ impl RegionState {
         id
     }
 
+    /// The operation records filed against `application_id`, in the order a listing
+    /// reports and pages them: by their own `OperationId`, which is the order
+    /// [`Self::operations`] is keyed in, so the keys a page is taken over are already
+    /// ascending and a `NextToken` resumes where the previous page stopped.
+    ///
+    /// A record names the resource the call that filed it acted on
+    /// ([`Self::record_operation`]), so the records of an application are the ones whose
+    /// `ResourceId` is its id — which is the `ResourceId` the listing reports for each of
+    /// them.
+    ///
+    /// Call [`Self::settle`] first, so a record whose terminal status the clock already
+    /// owes is reported in it.
+    pub fn operations_for(&self, application_id: &str) -> Vec<&StoredOperation> {
+        self.operations
+            .values()
+            .filter(|record| record.resource_id == application_id)
+            .collect()
+    }
+
     /// File a configuration check operation for `check_id` against `application_id` and
     /// return the record, so the caller reports the SAME thing a later
     /// `GetConfigurationCheckOperation` reads.
@@ -3531,6 +3571,19 @@ pub const FILTER_NAMES: &[&str] = &["Id", "DiscoveryStatus", "Type", "Arn"];
 pub const CONFIGURATION_CHECK_FILTER_NAMES: &[&str] =
     &["Id", "ApplicationId", "Status", "ConfigurationCheckId"];
 
+/// The `Name` values a `ListOperations` filter may carry: the identifying and status
+/// members the model gives `Operation`, which is the shape that listing returns. Filter
+/// names are case-sensitive, as `Filter$Name`'s documentation states. See
+/// [`StoredOperation::filter_attribute`].
+pub const OPERATION_FILTER_NAMES: &[&str] = &[
+    "Id",
+    "Type",
+    "Status",
+    "ResourceType",
+    "ResourceId",
+    "ResourceArn",
+];
+
 /// The `Name` values a `ListOperationEvents` filter may carry, and the only operator it
 /// accepts for them is [`FILTER_OPERATOR_EQUALS`] — both as that operation documents its
 /// `Filters` member (`smithy_query(query="doc", shape="ListOperationEventsInput",
@@ -3750,6 +3803,8 @@ pub enum Listing {
     Components,
     /// `ListDatabases`, whose keys are `<ApplicationId>/<DatabaseId>`.
     Databases,
+    /// `ListOperations`, whose keys are `OperationId`s.
+    Operations,
     /// `ListConfigurationCheckOperations`, whose keys are `OperationId`s.
     ConfigurationCheckOperations,
     /// `ListConfigurationCheckDefinitions`, whose keys are `ConfigurationCheckType`s.
@@ -3772,6 +3827,7 @@ impl Listing {
             Self::Applications => "ssmsap:applications:v1:",
             Self::Components => "ssmsap:components:v1:",
             Self::Databases => "ssmsap:databases:v1:",
+            Self::Operations => "ssmsap:operations:v1:",
             Self::ConfigurationCheckOperations => "ssmsap:check-operations:v1:",
             Self::ConfigurationCheckDefinitions => "ssmsap:check-definitions:v1:",
             Self::OperationEvents => "ssmsap:operation-events:v1:",

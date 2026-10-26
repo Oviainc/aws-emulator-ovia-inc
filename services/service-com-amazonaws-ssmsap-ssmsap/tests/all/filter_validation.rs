@@ -15,8 +15,9 @@
 //! is refused by another that does not, and the wording of the refusal is the same for
 //! all of them.
 //!
-//! The rows span what the rule generalises over: all three filtered listings
-//! (`ListApplications`, `ListConfigurationCheckOperations`, `ListOperationEvents`), every
+//! The rows span what the rule generalises over: all four filtered listings
+//! (`ListApplications`, `ListConfigurationCheckOperations`, `ListOperationEvents`,
+//! `ListOperations`), every
 //! filter name each one filters by crossed with every operator it offers, names drawn
 //! from each OTHER listing's catalogue, a name in the wrong case (filter names are
 //! case-sensitive), a name no shape of this service carries, a modelled operator a
@@ -26,7 +27,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_ssmsap_ssmsap::ops::types::{Filter, FILTER_OPERATOR_VALUES};
 use service_com_amazonaws_ssmsap_ssmsap::state::{
     validate_filters, FilterOperators, CONFIGURATION_CHECK_FILTER_NAMES, FILTER_NAMES,
-    FILTER_OPERATOR_EQUALS, OPERATION_EVENT_FILTER_NAMES,
+    FILTER_OPERATOR_EQUALS, OPERATION_EVENT_FILTER_NAMES, OPERATION_FILTER_NAMES,
 };
 
 use crate::application_lifecycle::{settle, valid_registration, Emulator, Reply};
@@ -121,6 +122,7 @@ impl FilteredListing {
             FILTER_NAMES,
             CONFIGURATION_CHECK_FILTER_NAMES,
             OPERATION_EVENT_FILTER_NAMES,
+            OPERATION_FILTER_NAMES,
         ] {
             for name in catalogue {
                 if !self.names.contains(name) && !names.iter().any(|held| held == name) {
@@ -186,6 +188,13 @@ async fn listings(emulator: &Emulator) -> Vec<FilteredListing> {
             names: OPERATION_EVENT_FILTER_NAMES,
             operators: FilterOperators::Only(FILTER_OPERATOR_EQUALS),
             scope: json!({"OperationId": operation_id}),
+        },
+        FilteredListing {
+            label: "ListOperations",
+            path: "/list-operations",
+            names: OPERATION_FILTER_NAMES,
+            operators: FilterOperators::Modelled,
+            scope: json!({"ApplicationId": APPLICATION}),
         },
     ]
 }
@@ -301,7 +310,7 @@ async fn every_listing_refuses_an_operator_it_does_not_offer() {
 #[test]
 fn the_shared_validation_checks_the_operator_before_the_name() {
     // (label, the operators a listing offers, the names it filters by)
-    let rows: [(&str, FilterOperators<'static>, &[&str]); 3] = [
+    let rows: [(&str, FilterOperators<'static>, &[&str]); 4] = [
         ("ListApplications", FilterOperators::Modelled, FILTER_NAMES),
         (
             "ListConfigurationCheckOperations",
@@ -312,6 +321,11 @@ fn the_shared_validation_checks_the_operator_before_the_name() {
             "ListOperationEvents",
             FilterOperators::Only(FILTER_OPERATOR_EQUALS),
             OPERATION_EVENT_FILTER_NAMES,
+        ),
+        (
+            "ListOperations",
+            FilterOperators::Modelled,
+            OPERATION_FILTER_NAMES,
         ),
     ];
 

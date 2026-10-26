@@ -49,6 +49,8 @@ mod list_configuration_check_operations;
 mod list_databases;
 #[path = "all/list_operation_events.rs"]
 mod list_operation_events;
+#[path = "all/list_operations.rs"]
+mod list_operations;
 #[path = "all/pattern_violation_messages.rs"]
 mod pattern_violation_messages;
 #[path = "all/register_application_conditional_requirements.rs"]
