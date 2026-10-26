@@ -17,6 +17,9 @@
 //! content in place, `PublishDataTransformationProfile` snapshots a version of it
 //! into [`DataTransformationProfile::published`], and
 //! `GetDataTransformationProfile` reads the SAME record back, version by version.
+//! `ListDataTransformationProfileVersions` reports those same versions — the
+//! DRAFT and every published snapshot — newest first and paged, so a published
+//! version is observable identically through either of them.
 //!
 //! The FHIR export job is the third: a job record belongs to the data store it
 //! exports, `StartFHIRExportJob` MINTS one here, and `DescribeFHIRExportJob` /
@@ -49,9 +52,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
     AnalyticsConfiguration, BackupConfiguration, DatastoreBackupStatus, DatastoreProperties,
-    ErrorCause, ExportJobProperties, IdentityProviderConfiguration, ImportJobProperties,
-    InputDataConfig, JobProgressReport, KmsEncryptionConfig, NlpConfiguration, OutputDataConfig,
-    PreloadDataConfig, ProfileConfiguration, SseConfiguration, Tag, TransformationInputDataConfig,
+    DataTransformationProfileVersionSummary, ErrorCause, ExportJobProperties,
+    IdentityProviderConfiguration, ImportJobProperties, InputDataConfig, JobProgressReport,
+    KmsEncryptionConfig, NlpConfiguration, OutputDataConfig, PreloadDataConfig,
+    ProfileConfiguration, SseConfiguration, Tag, TransformationInputDataConfig,
     TransformationJobProgressReport, TransformationJobProperties, TransformationJobSummary,
     TransformationOutputDataConfig,
 };
@@ -1368,6 +1372,55 @@ impl DataTransformationProfile {
     /// version").
     pub fn latest_published(&self) -> Option<&ProfileVersionRecord> {
         self.published.values().next_back()
+    }
+
+    /// Every version this profile holds — its DRAFT and each version published
+    /// from it — in REVERSE CHRONOLOGICAL order, newest first, which is the
+    /// order `ListDataTransformationProfileVersions` reports them in ("all
+    /// versions of a specific data transformation profile (DRAFT and
+    /// published), in reverse chronological order (newest first)").
+    ///
+    /// A version's `LastUpdatedAt` is when it last changed, so that is what
+    /// "chronological" is measured on: the DRAFT moves to the front when
+    /// `UpdateDataTransformationProfile` rewrites it, and a publish puts the
+    /// snapshot it took in front of every older version. The version number
+    /// breaks a tie between two versions stamped at the same instant,
+    /// descending for the same reason, so the order is a stable total one and
+    /// paging through it is resumable. The walk is bounded: at most
+    /// `1 + MAX_PROFILE_VERSION` versions.
+    pub fn versions_newest_first(&self) -> Vec<&ProfileVersionRecord> {
+        let mut versions: Vec<&ProfileVersionRecord> = ::std::iter::once(&self.draft)
+            .chain(self.published.values())
+            .collect();
+        versions.sort_by(|a, b| {
+            epoch_nanos(&b.last_updated_at)
+                .cmp(&epoch_nanos(&a.last_updated_at))
+                .then_with(|| b.version.cmp(&a.version))
+        });
+        versions
+    }
+
+    /// One of this profile's versions as the modelled
+    /// `DataTransformationProfileVersionSummary`, the shape
+    /// `ListDataTransformationProfileVersions` reports a version through.
+    ///
+    /// The metadata comes from the profile and the per-version members from the
+    /// version, so a summary and the `GetDataTransformationProfile` of the same
+    /// version can never disagree. The content itself is NOT summarised: the
+    /// model sends a caller to `GetDataTransformationProfile` for it.
+    pub fn version_summary(
+        &self,
+        version: &ProfileVersionRecord,
+    ) -> DataTransformationProfileVersionSummary {
+        DataTransformationProfileVersionSummary {
+            profile_id: self.id.clone(),
+            version: version.version,
+            source_format: self.source_format.clone(),
+            target_format: self.target_format.clone(),
+            profile_name: Some(self.name.clone()),
+            change_description: version.change_description.clone(),
+            last_updated_at: Some(version.last_updated_at),
+        }
     }
 
     /// How many BYTES of content this profile retains across its DRAFT and every
