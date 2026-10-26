@@ -99,6 +99,16 @@ pub const MAX_LIST_SCHEDULE_GROUPS_PAGE: usize = MAX_LIST_SCHEDULES_PAGE;
 /// such a key is refused.
 pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
+/// What a request naming a tag key in the reserved namespace is refused with.
+///
+/// A key under [`RESERVED_TAG_KEY_PREFIX`] belongs to the service, not to the
+/// caller, so the refusal is an authorization statement about that namespace —
+/// the caller may not modify system tags — and NOT a complaint about the key's
+/// syntax. It therefore names neither the key nor the prefix: the text is the
+/// same for every reserved key, and for every entry point that takes tags.
+pub const SYSTEM_TAG_REFUSAL_MESSAGE: &str =
+    "Caller is an end user and not allowed to modify system tags.";
+
 /// Largest number of tags one schedule group holds.
 ///
 /// `TagList` (what `TagResource$Tags` sends and `ListTagsForResourceOutput$Tags`
@@ -111,7 +121,7 @@ const SCHEDULE_GROUP_ARN_INFIX: &str = ":schedule-group/";
 
 /// The name of the schedule group `arn` identifies.
 ///
-/// `TagResourceArn` is modelled `^arn:aws(-[a-z]+)?:scheduler:[a-z0-9\-]+:\d{12}:schedule-group\/[0-9a-zA-Z-_.]+$`,
+/// `TagResourceArn` is modelled `^arn:aws[a-z-]*:scheduler:[a-z0-9\-]+:\d{12}:schedule-group\/[0-9a-zA-Z-_.]+$`,
 /// so the name is everything after the resource type — the boundary validator has
 /// already refused an ARN of any other shape (a schedule's, say) by the time a
 /// handler runs.
@@ -121,19 +131,21 @@ pub fn schedule_group_name_from_arn(arn: &str) -> Option<&str> {
         .filter(|name| !name.is_empty() && !name.contains('/'))
 }
 
-/// The reserved tag key among `keys`, if any — the lowest one, so the refusal
-/// names the same key however the request ordered its tags. The comparison is
-/// case-insensitive on the prefix: `AWS:` is reserved exactly as `aws:` is.
+/// Whether any of `keys` is in the reserved namespace, which is what makes a
+/// request a modification of system tags. The comparison is case-insensitive on
+/// the prefix: `AWS:` is reserved exactly as `aws:` is.
+///
+/// A predicate rather than the offending key, because the refusal
+/// ([`SYSTEM_TAG_REFUSAL_MESSAGE`]) does not report which key it was.
 ///
 /// See [`RESERVED_TAG_KEY_PREFIX`].
-pub fn reserved_tag_key<'a, I: IntoIterator<Item = &'a str>>(keys: I) -> Option<&'a str> {
+pub fn names_system_tag<'a, I: IntoIterator<Item = &'a str>>(keys: I) -> bool {
     let prefix = RESERVED_TAG_KEY_PREFIX.as_bytes();
-    keys.into_iter()
-        .filter(|key| {
-            let key = key.as_bytes();
-            key.len() >= prefix.len() && key[..prefix.len()].eq_ignore_ascii_case(prefix)
-        })
-        .min()
+    keys.into_iter().any(|key| {
+        key.as_bytes()
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    })
 }
 
 /// A `ScheduleGroup` as this emulator persists it.
@@ -431,10 +443,31 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsSchedulerAwschronosserviceState>)
 }
 
+/// Whether `value` is shaped like a Region name: non-empty, and made only of
+/// the characters every ARN in this service's model spells its Region segment
+/// with (`[a-z0-9\-]+`).
+///
+/// The Region a request carries is interpolated into an ARN and into the host
+/// of the endpoint an in-process call to another service is addressed to, so a
+/// value outside that class is not used at all — nothing a request sends can
+/// reshape either.
+fn is_region_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
 /// The region this request was signed for, which is the region its ARNs carry.
+///
+/// A credential scope that names no Region — or one that is not shaped like a
+/// Region name — leaves [`FALLBACK_REGION`], so every caller of this gets a
+/// value from [`is_region_name`]'s class.
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
-        .map_or_else(|| FALLBACK_REGION.to_string(), |scope| scope.region)
+        .map(|scope| scope.region)
+        .filter(|region| is_region_name(region))
+        .unwrap_or_else(|| FALLBACK_REGION.to_string())
 }
 
 /// `arn:aws:scheduler:<region>:<account>:schedule-group/<name>`.
@@ -546,6 +579,13 @@ pub async fn execution_role_violation(
 ) -> Option<String> {
     let Some(role_name) = iam_role_name(role_arn) else {
         return Some(EXECUTION_ROLE_REFUSAL.to_string());
+    };
+    // The Region names the HOST this call is addressed to, so only a value from
+    // the Region class reaches it; anything else resolves to the fallback.
+    let region = if is_region_name(region) {
+        region
+    } else {
+        FALLBACK_REGION
     };
     let config = ::aws_sdk_iam::Config::builder()
         .behavior_version(::aws_sdk_iam::config::BehaviorVersion::latest())

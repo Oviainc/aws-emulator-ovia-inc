@@ -4,7 +4,7 @@
 //!
 //! The rule under test: `ResourceArn` is modelled `TagResourceArn`,
 //! `length 1..1011` with pattern
-//! `^arn:aws(-[a-z]+)?:scheduler:[a-z0-9\-]+:\d{12}:schedule-group\/[0-9a-zA-Z-_.]+$`
+//! `^arn:aws[a-z-]*:scheduler:[a-z0-9\-]+:\d{12}:schedule-group\/[0-9a-zA-Z-_.]+$`
 //! (`smithy_query(query="operation", operation="ListTagsForResource")`), so an
 //! ARN WITHIN the bound is a well-formed request answered by the resource rule —
 //! 200 with the group's stored tags when it names a group of this account and

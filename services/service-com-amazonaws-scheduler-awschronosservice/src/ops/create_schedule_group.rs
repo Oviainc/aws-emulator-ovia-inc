@@ -174,18 +174,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
-        // The reserved-prefix rule holds wherever this service takes tags, not
-        // only in TagResource: AWS owns the `aws:` key namespace.
+        // The reserved-namespace rule holds wherever this service takes tags, not
+        // only in TagResource, and is refused in the same words: the keys in that
+        // namespace are the service's own.
         let tags = input.tags.unwrap_or_default();
-        if let Some(reserved) =
-            crate::state::reserved_tag_key(tags.iter().map(|tag| tag.key.as_str()))
-        {
+        if crate::state::names_system_tag(tags.iter().map(|tag| tag.key.as_str())) {
             return Err(CreateScheduleGroupErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!(
-                        "Tag key {reserved} is reserved: keys must not begin with {}.",
-                        crate::state::RESERVED_TAG_KEY_PREFIX
-                    ),
+                    message: crate::state::SYSTEM_TAG_REFUSAL_MESSAGE.to_string(),
                 },
             )
             .into());
