@@ -45,6 +45,8 @@ mod resolver_endpoints;
 mod resolver_rule_association_listing;
 #[path = "all/resolver_rule_deletion.rs"]
 mod resolver_rule_deletion;
+#[path = "all/resolver_rule_disassociation.rs"]
+mod resolver_rule_disassociation;
 #[path = "all/resolver_rule_error_bodies.rs"]
 mod resolver_rule_error_bodies;
 #[path = "all/resolver_rule_policies.rs"]
