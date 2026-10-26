@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetConnectionFunction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetConnectionFunction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetConnectionFunction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation SERVES the connection function code the create or the last
+//! mutation of the addressed stage persisted in `crate::state`, byte for byte, together
+//! with that stage's version token, so what a caller reads back is what the store holds
+//! rather than anything re-derived from the request being served. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -141,20 +137,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetConnectionFunction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetConnectionFunctionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetConnectionFunction"))
+        // The engine is reachable from `&self` (constructor-injected); this operation
+        // needs nothing from the request metadata the context carries.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+
+        // A READ: the store is locked only to copy the code out of it. Nothing about a
+        // connection function is owed by the clock -- it reaches the LIVE stage through a
+        // `PublishConnectionFunction` call, never by waiting -- so this read materialises
+        // nothing and leaves what a later caller sees untouched.
+        let store = state.lock();
+
+        // "The connection function's stage", either DEVELOPMENT or LIVE: a request that
+        // names no stage addresses the stage a connection function is created in, the SAME
+        // default `DescribeConnectionFunction` reads under.
+        let stage = input
+            .stage
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_FUNCTION_STAGE);
+
+        // An identifier no connection function answers to, and a stage a connection
+        // function has not been published to, are the same thing to the caller: the entity
+        // it asked for was not found.
+        let Some(stage_record) = store
+            .connection_function(&input.identifier)
+            .and_then(|function| function.stage(stage))
+        else {
+            return Err(GetConnectionFunctionErrorModeled::EntityNotFound(
+                crate::state::connection_function_not_found(&input.identifier, stage),
+            )
+            .into());
+        };
+
+        Ok(GetConnectionFunctionOutput {
+            // "The connection function's code": the bytes the create or the last mutation
+            // of THIS stage stored, unchanged.
+            connection_function_code: Some(stage_record.code.clone()),
+            // "The version identifier for the current version of the connection function":
+            // the token the last mutation of THIS stage handed back, which is what an
+            // `If-Match` against that stage is checked against.
+            e_tag: Some(stage_record.etag.clone()),
+            // "The connection function's content type." The response payload is the
+            // `FunctionBlob` itself rather than a document, and the model constrains it
+            // only as a blob, so the media type is the one for arbitrary bytes.
+            content_type: Some(crate::state::FUNCTION_CODE_CONTENT_TYPE.to_string()),
+        })
     }
 }
+

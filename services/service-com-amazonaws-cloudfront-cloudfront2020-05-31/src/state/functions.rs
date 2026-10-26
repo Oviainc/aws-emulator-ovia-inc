@@ -47,6 +47,15 @@ pub const FUNCTION_STAGE_LIVE: &str = "LIVE";
 /// addresses: "When you create a function, it's in the `DEVELOPMENT` stage."
 pub const DEFAULT_FUNCTION_STAGE: &str = FUNCTION_STAGE_DEVELOPMENT;
 
+/// The media type the code reads report for the function code they serve
+/// (`GetFunction$ContentType` and `GetConnectionFunction$ContentType`).
+///
+/// Each of those responses carries the `FunctionBlob` ITSELF as its payload rather than a
+/// document, and the model constrains it only as a blob, so the media type is the one for
+/// arbitrary bytes. ONE value for both reads: a connection function's code travels as the
+/// same blob a CloudFront function's does.
+pub const FUNCTION_CODE_CONTENT_TYPE: &str = "application/octet-stream";
+
 /// `FunctionSummary$Status` for a function whose stage has not been published.
 ///
 /// A function CloudFront has just created exists only in `DEVELOPMENT` and has never been

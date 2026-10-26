@@ -181,14 +181,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The content type (media type) of the response." `FunctionBlob` is an
             // opaque blob on the wire, served as the payload of this response, so the
             // media type is the one for arbitrary bytes.
-            content_type: Some(FUNCTION_CODE_CONTENT_TYPE.to_string()),
+            content_type: Some(crate::state::FUNCTION_CODE_CONTENT_TYPE.to_string()),
         })
     }
 }
 
-/// The media type `GetFunction` reports for the function code it serves.
-///
-/// The response payload is the `FunctionBlob` itself rather than a document, and the
-/// model constrains it only as a blob, so it is served as arbitrary bytes rather than as
-/// a text or XML media type.
-const FUNCTION_CODE_CONTENT_TYPE: &str = "application/octet-stream";

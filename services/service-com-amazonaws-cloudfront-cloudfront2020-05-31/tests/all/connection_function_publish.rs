@@ -63,7 +63,10 @@ const STATUS_ASSOCIATED: &str = "ASSOCIATED";
 
 /// `POST /2020-05-31/connection-function/{Id}/publish`, carrying `if_match` as the
 /// `If-Match` header the operation binds its required `IfMatch` member to.
-async fn publish_connection_function(
+///
+/// `pub(crate)` so the suite that reads a published stage's CODE drives the publish through
+/// this one call path rather than a second copy of it.
+pub(crate) async fn publish_connection_function(
     router: &MultiServiceRouter,
     id: &str,
     if_match: &str,

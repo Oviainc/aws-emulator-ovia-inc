@@ -25,6 +25,8 @@ mod cache_policy_list;
 mod cache_policy_update;
 #[path = "all/caller_reference_immutable.rs"]
 mod caller_reference_immutable;
+#[path = "all/connection_function_code.rs"]
+mod connection_function_code;
 #[path = "all/connection_function_lifecycle.rs"]
 mod connection_function_lifecycle;
 #[path = "all/connection_function_publish.rs"]
