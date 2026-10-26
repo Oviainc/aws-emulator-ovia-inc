@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLogSubscriptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLogSubscriptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLogSubscriptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the log subscriptions of the account, or the one a directory holds. Implemented
+//! here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +141,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLogSubscriptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLogSubscriptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLogSubscriptions"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The cursor a previous page handed back: the creation rank of the directory this
+        // page resumes after, together with the filter it was issued under. A token this
+        // service did not issue, or one issued for a different listing, is refused rather
+        // than served as a page of another listing.
+        let filter = crate::state::cursor_filter(&[input.directory_id.as_deref().unwrap_or_default()]);
+        let after_seq = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_cursor(CURSOR_KIND, token)
+                .and_then(|value| {
+                    let (seq, issued_for) = value.split_once(crate::state::CURSOR_SEPARATOR)?;
+                    if issued_for != filter.as_str() {
+                        return None;
+                    }
+                    seq.parse::<u64>().ok()
+                })
+                .ok_or_else(|| {
+                    ListLogSubscriptionsErrorModeled::InvalidNextTokenException(
+                        crate::state::invalid_next_token(),
+                    )
+                })?,
+        };
+        let page_size = crate::state::page_size(input.limit);
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+
+        // A `DirectoryId` narrows the listing to that directory's subscription, and an id
+        // naming no stored directory is reported rather than served as an empty page.
+        if let Some(directory_id) = input.directory_id.as_deref() {
+            if !store.directories.contains_key(directory_id) {
+                return Err(ListLogSubscriptionsErrorModeled::EntityDoesNotExistException(
+                    crate::state::refusal(crate::state::no_such_directory(directory_id)),
+                )
+                .into());
+            }
+        }
+
+        // Every subscription the request asks for, in the creation order of the
+        // directories holding them, from the cursor on. A directory that forwards its
+        // logs nowhere contributes nothing: "If there are no log subscriptions for the
+        // Amazon Web Services account or the directory, an empty list will be returned."
+        let mut selected: Vec<(u64, LogSubscription)> = store
+            .directories_in_creation_order()
+            .into_iter()
+            .filter(|directory| directory.seq > after_seq)
+            .filter(|directory| {
+                input
+                    .directory_id
+                    .as_deref()
+                    .is_none_or(|directory_id| directory.directory_id == directory_id)
+            })
+            .filter_map(|directory| {
+                directory.log_subscription.as_ref().map(|subscription| {
+                    (
+                        directory.seq,
+                        subscription.to_log_subscription(&directory.directory_id),
+                    )
+                })
+            })
+            .collect();
+        drop(store);
+
+        let truncated = selected.len() > page_size;
+        selected.truncate(page_size);
+        let page_ended_after = selected.last().map(|(seq, _)| *seq);
+        let log_subscriptions: Vec<LogSubscription> =
+            selected.into_iter().map(|(_, entry)| entry).collect();
+
+        Ok(ListLogSubscriptionsOutput {
+            log_subscriptions: Some(log_subscriptions),
+            // Only a truncated page has a next one; the final page carries no token.
+            next_token: if truncated {
+                page_ended_after.map(|seq| {
+                    crate::state::encode_cursor(
+                        CURSOR_KIND,
+                        &format!(
+                            "{seq}{separator}{filter}",
+                            separator = crate::state::CURSOR_SEPARATOR
+                        ),
+                    )
+                })
+            } else {
+                None
+            },
+        })
     }
 }
+
+/// Which listing this operation's `NextToken` belongs to, so a token issued by another
+/// paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "log-subscriptions";
