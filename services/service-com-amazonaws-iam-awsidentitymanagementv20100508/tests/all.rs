@@ -41,6 +41,8 @@ mod group_inline_policies;
 mod group_listing;
 #[path = "all/group_membership.rs"]
 mod group_membership;
+#[path = "all/group_policy_listing.rs"]
+mod group_policy_listing;
 #[path = "all/human_readable_summaries.rs"]
 mod human_readable_summaries;
 #[path = "all/identity_policy_enforcement.rs"]

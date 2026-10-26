@@ -472,6 +472,15 @@ pub const MARKER_SCOPE_ROLE_POLICIES: &str = "role-policies";
 /// role's inline policies: see [`user_policies_marker_scope`].
 pub const MARKER_SCOPE_USER_POLICIES: &str = "user-policies";
 
+/// The marker scope of ONE group's EMBEDDED inline policies, which
+/// `ListGroupPolicies` pages over. It is its OWN scope, with the group's key
+/// following it, exactly as the user's and role's inline-policy scopes carry
+/// theirs, so a marker issued while paging one group's inline policies names no
+/// position in another group's — nor among that group's ATTACHED managed
+/// policies, nor among the account's group collection:
+/// see [`group_policies_marker_scope`].
+pub const MARKER_SCOPE_GROUP_POLICIES: &str = "group-policies";
+
 /// The marker scope of the entities ONE managed policy relates to, which
 /// `ListEntitiesForPolicy` pages over. The policy's ARN follows it, so a marker
 /// issued while paging the entities of one policy does not name a position in
@@ -969,7 +978,8 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// [`user_inline_policies`](Self::user_inline_policies) is, and for the same
     /// reason: "user, group, role, and policy names must be unique within the
     /// account. Names are not distinguished by case." `PutGroupPolicy` fills this
-    /// map and `GetGroupPolicy` reads it.
+    /// map, `GetGroupPolicy` reads one entry and `ListGroupPolicies` pages over
+    /// the names.
     pub group_inline_policies: BTreeMap<String, BTreeMap<String, InlinePolicy>>,
     /// Access key id -> the key's record, including [`name_key`] of the user that
     /// owns it. `GetUser` with no `UserName` resolves the caller through this map,
@@ -2077,6 +2087,11 @@ pub fn role_policies_marker_scope(role_key: &str) -> String {
 /// The marker scope of the inline-policy set of the user keyed by `user_key`.
 pub fn user_policies_marker_scope(user_key: &str) -> String {
     format!("{MARKER_SCOPE_USER_POLICIES}:{user_key}")
+}
+
+/// The marker scope of the inline-policy set of the group keyed by `group_key`.
+pub fn group_policies_marker_scope(group_key: &str) -> String {
+    format!("{MARKER_SCOPE_GROUP_POLICIES}:{group_key}")
 }
 
 /// The marker scope of the entity collection of the managed policy `policy_arn`
