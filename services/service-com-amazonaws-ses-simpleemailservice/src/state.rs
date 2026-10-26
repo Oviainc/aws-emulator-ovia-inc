@@ -2,19 +2,21 @@
 
 //! Engine state for the com-amazonaws-ses-simpleemailservice service.
 //!
-//! One store per emulator: the identity list SES keys every send against, the
-//! send log the sending quota is derived from, the account's sending limits, and
-//! the configuration sets a send may name.
+//! One store per emulator: the identity list SES keys every send against (with
+//! the sending-authorization policies each identity carries), the send log the
+//! sending quota is derived from, the account's sending limits, and the
+//! configuration sets a send may name.
 //!
 //! Nothing here is a counter that a reader bumps: `SentLast24Hours` is COMPUTED
 //! from the send log (see [`ComAmazonawsSesSimpleemailserviceState::sent_last_24_hours`]),
 //! so it falls again as messages age out of the window instead of drifting.
 //!
-//! Both caller-driven stores are BOUNDED, because every request reaching this
+//! Every caller-driven store is BOUNDED, because every request reaching this
 //! emulator can grow one of them: the identity list at [`MAX_IDENTITIES`]
-//! entries, and the send log at the account's own 24-hour quota, with the
-//! window's expiry applied on append
-//! ([`ComAmazonawsSesSimpleemailserviceState::log_sent_message`]) and
+//! entries, each identity's sending-authorization policies at
+//! [`MAX_IDENTITY_POLICIES`] documents of [`MAX_POLICY_BYTES`], and the send log
+//! at the account's own 24-hour quota, with the window's expiry applied on
+//! append ([`ComAmazonawsSesSimpleemailserviceState::log_sent_message`]) and
 //! [`MAX_SENT_LOG_ENTRIES`] as the backstop. The text one log entry keeps is
 //! capped at [`MAX_LOGGED_TEXT`].
 
@@ -55,6 +57,25 @@ pub const MAX_IDENTITIES: usize = 10_000;
 /// append, so this is the backstop that still bounds the store if the stored
 /// quota is raised later.
 pub const MAX_SENT_LOG_ENTRIES: usize = 1_000;
+
+/// The bytes one sending-authorization policy document may carry.
+///
+/// `PutIdentityPolicyRequest$Policy` states the ceiling: "The text of the policy
+/// in JSON format. The policy cannot exceed 4 KB." The model carries only the
+/// member's lower bound (`length 1..`), so the documented ceiling is the
+/// handler's to enforce — and it is also what bounds one entry of the policy
+/// store.
+pub const MAX_POLICY_BYTES: usize = 4 * 1024;
+
+/// The sending-authorization policies ONE identity may hold at once, and so the
+/// ceiling on an identity's policy map.
+///
+/// `GetIdentityPoliciesRequest$PolicyNames` is documented as "a list of the names
+/// of policies to be retrieved. You can retrieve a maximum of 20 policies at a
+/// time", so 20 policies is the whole set a caller can read back in one call —
+/// the documented size of an identity's policy collection. A put past it is
+/// refused rather than letting caller input grow this store without end.
+pub const MAX_IDENTITY_POLICIES: usize = 20;
 
 /// The characters of a message's subject and body the log keeps.
 ///
@@ -140,6 +161,20 @@ pub struct Identity {
     pub verification_token: Option<String>,
     /// The Easy DKIM tokens, set by `VerifyDomainDkim` (still a stub, so empty).
     pub dkim_tokens: Vec<String>,
+    /// The sending-authorization policies attached to this identity, keyed by
+    /// policy name.
+    ///
+    /// Held ON the identity record, because a policy exists only for an identity
+    /// the account owns: nothing can attach one to an identity that is not in
+    /// the list, and removing the identity removes its policies with it. A
+    /// `BTreeMap` so `ListIdentityPolicies` answers in one stable
+    /// (lexicographic) order, and bounded at [`MAX_IDENTITY_POLICIES`] entries
+    /// of [`MAX_POLICY_BYTES`] each.
+    ///
+    /// The document is kept VERBATIM as the caller submitted it, so
+    /// `GetIdentityPolicies` reports back the text that was stored rather than a
+    /// re-rendering of it.
+    pub policies: BTreeMap<String, String>,
     /// When the identity was added to the list.
     pub verified_at: SystemTime,
 }
@@ -266,6 +301,7 @@ impl ComAmazonawsSesSimpleemailserviceState {
                     verification_status: VerificationStatus::Success,
                     verification_token,
                     dkim_tokens: Vec::new(),
+                    policies: BTreeMap::new(),
                     verified_at: SystemTime::now(),
                 }),
         )
@@ -312,6 +348,29 @@ impl ComAmazonawsSesSimpleemailserviceState {
             return false;
         };
         domain_suffixes(domain).any(|suffix| self.is_verified(suffix))
+    }
+
+    /// The sending-authorization policies attached to `identity`, or `None` when
+    /// this account holds no such identity.
+    ///
+    /// `None` is what the policy operations refuse on: they are "for the identity
+    /// owner only", so an identity this account has not verified is not an
+    /// identity with no policies.
+    pub fn identity_policies(&self, identity: &str) -> Option<&BTreeMap<String, String>> {
+        self.identities
+            .get(identity_key(identity))
+            .map(|stored| &stored.policies)
+    }
+
+    /// [`Self::identity_policies`] for a writer: the same map, keyed the same
+    /// way, so a policy is put on and read back from one record.
+    pub fn identity_policies_mut(
+        &mut self,
+        identity: &str,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        self.identities
+            .get_mut(identity_key(identity))
+            .map(|stored| &mut stored.policies)
     }
 
     /// Whether `name` is in the identity list with a successful verification.
@@ -414,6 +473,38 @@ pub fn addr_spec(value: &str) -> &str {
         _ => trimmed,
     }
 }
+
+/// The key an identity is stored under, for a caller value that may name the
+/// identity either way the policy operations document.
+///
+/// Their `Identity` member states both forms: "You can specify an identity by
+/// using its name or by using its Amazon Resource Name (ARN). Examples:
+/// user@example.com, example.com,
+/// arn:aws:ses:us-east-1:123456789012:identity/example.com." So an ARN of this
+/// service naming an `identity` resource is read down to the identity it names,
+/// and anything else is the identity itself; either way the value is keyed by
+/// its addr-spec, the way the writers key it ([`addr_spec`]).
+///
+/// The ARN is read through the ONE caller-supplied-ARN parse
+/// (`service_common::arn`) rather than by splitting the value here, so this
+/// service cannot disagree with another about what an ARN is.
+pub fn identity_key(value: &str) -> &str {
+    let trimmed = value.trim();
+    if let Some(named) = ::service_common::arn::is_resource_arn_of(trimmed, SES_ARN_VENDOR)
+        .then(|| ::service_common::arn::resource_id_of_type(trimmed, IDENTITY_RESOURCE_TYPE))
+        .flatten()
+    {
+        return addr_spec(named);
+    }
+    addr_spec(trimmed)
+}
+
+/// The vendor field of this service's own ARNs, which is its signing name.
+const SES_ARN_VENDOR: &str = "ses";
+
+/// The resource type an SES identity ARN addresses
+/// (`arn:aws:ses:<region>:<account>:identity/<name>`).
+const IDENTITY_RESOURCE_TYPE: &str = "identity";
 
 /// The domain itself and every parent domain of it, longest first
 /// (`mail.corp.example.com` -> `mail.corp.example.com`, `corp.example.com`,
