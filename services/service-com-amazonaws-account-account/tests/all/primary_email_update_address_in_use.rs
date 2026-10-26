@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_account_account::state::initial_primary_email;
+use service_com_amazonaws_account_account::state::{initial_primary_email, service_state};
 use service_com_amazonaws_account_account::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -61,16 +61,37 @@ const MEMBER_ACCOUNTS: [&str; 8] = [
     "988888888888",
 ];
 
-/// A passcode inside `Otp`'s modelled `^[a-zA-Z0-9]{6}$`.
+/// A passcode inside `Otp`'s modelled `^[a-zA-Z0-9]{6}$` that nothing sent,
+/// for a case with no outstanding passcode to present.
 const WELL_FORMED_PASSCODE: &str = "a1B2c3";
 
-/// One emulator: a router carrying only this service, over one shared engine.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+/// One emulator: a router carrying only this service over one shared engine,
+/// plus that engine, so a case can read the passcode a start sent out of the
+/// store — the way the owner of the mailbox reads it off the message.
+struct Emulator {
+    router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
+}
+
+impl Emulator {
+    fn new() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// The passcode outstanding for the update of `account_id`, or `None` once
+    /// it has been consumed (or while no update was ever started).
+    fn passcode(&self, account_id: &str) -> Option<String> {
+        let state = service_state(&*self.engine).expect("the account store is mounted");
+        let store = state.lock();
+        store
+            .account(account_id)
+            .and_then(|account| account.primary_email_update.as_ref())
+            .and_then(|update| update.outstanding_otp().map(str::to_string))
+    }
 }
 
 /// What the emulator answered: the HTTP status and the JSON body.
@@ -101,7 +122,7 @@ impl Answer {
     }
 }
 
-async fn call(router: &MultiServiceRouter, uri: &str, body: Value) -> Answer {
+async fn call(router: &Emulator, uri: &str, body: Value) -> Answer {
     let payload = body.to_string();
     let request = ::http::Request::builder()
         .method("POST")
@@ -112,7 +133,7 @@ async fn call(router: &MultiServiceRouter, uri: &str, body: Value) -> Answer {
         .body(Bytes::from(payload))
         .expect("the test request is well formed");
 
-    let response = router.dispatch(request).await;
+    let response = router.router.dispatch(request).await;
     let status = response.status().as_u16();
     let bytes = response.into_body();
     let body = if bytes.is_empty() {
@@ -128,7 +149,7 @@ async fn call(router: &MultiServiceRouter, uri: &str, body: Value) -> Answer {
     Answer { status, body }
 }
 
-async fn start(router: &MultiServiceRouter, account_id: &str, address: &str) -> Answer {
+async fn start(router: &Emulator, account_id: &str, address: &str) -> Answer {
     call(
         router,
         "/startPrimaryEmailUpdate",
@@ -137,16 +158,23 @@ async fn start(router: &MultiServiceRouter, account_id: &str, address: &str) -> 
     .await
 }
 
-async fn accept(router: &MultiServiceRouter, account_id: &str, address: &str) -> Answer {
+/// Accept the update of `account_id` with the passcode that update was started
+/// with — the only value that confirms it — read out of the store. A case with
+/// no outstanding passcode presents a well-formed value nothing sent, so the
+/// request is still one the boundary admits.
+async fn accept(router: &Emulator, account_id: &str, address: &str) -> Answer {
+    let passcode = router
+        .passcode(account_id)
+        .unwrap_or_else(|| WELL_FORMED_PASSCODE.to_string());
     call(
         router,
         "/acceptPrimaryEmailUpdate",
-        json!({"AccountId": account_id, "PrimaryEmail": address, "Otp": WELL_FORMED_PASSCODE}),
+        json!({"AccountId": account_id, "PrimaryEmail": address, "Otp": passcode}),
     )
     .await
 }
 
-async fn status_read(router: &MultiServiceRouter, account_id: &str) -> Answer {
+async fn status_read(router: &Emulator, account_id: &str) -> Answer {
     call(
         router,
         "/getPrimaryEmailUpdateStatus",
@@ -155,7 +183,7 @@ async fn status_read(router: &MultiServiceRouter, account_id: &str) -> Answer {
     .await
 }
 
-async fn primary_email_read(router: &MultiServiceRouter, account_id: &str) -> Answer {
+async fn primary_email_read(router: &Emulator, account_id: &str) -> Answer {
     call(router, "/getPrimaryEmail", json!({"AccountId": account_id})).await
 }
 
@@ -203,7 +231,7 @@ fn assert_started_pending(case: &str, answer: &Answer) {
 
 /// The status the emulator reports for `account_id`, asserting the read
 /// succeeded.
-async fn reported_status(router: &MultiServiceRouter, case: &str, account_id: &str) -> String {
+async fn reported_status(router: &Emulator, case: &str, account_id: &str) -> String {
     let answer = status_read(router, account_id).await;
     assert_eq!(
         answer.status, 200,
@@ -216,7 +244,7 @@ async fn reported_status(router: &MultiServiceRouter, case: &str, account_id: &s
 /// Poll the status of `account_id` until it leaves `transient`, and answer what
 /// it settled to.
 async fn settled_status(
-    router: &MultiServiceRouter,
+    router: &Emulator,
     case: &str,
     account_id: &str,
     transient: &str,
@@ -309,7 +337,7 @@ fn rows() -> Vec<Row> {
 
 /// Put `address` in use on `holder`, the way the row names, and leave the store
 /// there.
-async fn put_in_use(router: &MultiServiceRouter, case: &str, row: &Row) {
+async fn put_in_use(router: &Emulator, case: &str, row: &Row) {
     match row.held_because {
         HeldBecause::SeededRootAddress => {
             // The record has to EXIST for its seeded root address to be in use,
@@ -380,7 +408,7 @@ async fn put_in_use(router: &MultiServiceRouter, case: &str, row: &Row) {
 async fn starting_an_update_for_an_address_in_use_conflicts() {
     for row in rows() {
         // Each row gets its own emulator, so the accounts it names are fresh.
-        let router = emulator();
+        let router = Emulator::new();
         let case = row.case;
         put_in_use(&router, case, &row).await;
 
@@ -468,7 +496,7 @@ async fn an_address_only_asked_for_is_not_in_use() {
     ];
 
     for (case, first, second, address) in cases {
-        let router = emulator();
+        let router = Emulator::new();
 
         assert_started_pending(case, &start(&router, first, &address).await);
         // A pending request takes the address from nobody, so the second
@@ -506,7 +534,7 @@ async fn an_address_only_asked_for_is_not_in_use() {
 /// for an address ANOTHER account holds.
 #[tokio::test]
 async fn an_account_may_ask_again_for_the_address_it_holds() {
-    let router = emulator();
+    let router = Emulator::new();
 
     // (case, the account, the address it ends up holding)
     let cases: Vec<(&str, &str, String)> = vec![

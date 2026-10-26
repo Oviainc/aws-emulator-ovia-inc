@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_account_account::state::default_account_id;
+use service_com_amazonaws_account_account::state::{default_account_id, service_state};
 use service_com_amazonaws_account_account::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -72,17 +72,38 @@ const MEMBER_ACCOUNTS: [&str; 6] = [
     "123456789012",
 ];
 
-/// Passcodes spanning the forms `Otp`'s `^[a-zA-Z0-9]{6}$` admits, from
-/// `smithy_query(query="operation", operation="AcceptPrimaryEmailUpdate")`.
-const WELL_FORMED_PASSCODES: [&str; 4] = ["123456", "abcdef", "ABCDEF", "a1B2c3"];
+/// A passcode inside `Otp`'s modelled `^[a-zA-Z0-9]{6}$` that nothing sent,
+/// from `smithy_query(query="operation", operation="AcceptPrimaryEmailUpdate")`
+/// — for a case with no outstanding passcode to present.
+const WELL_FORMED_PASSCODE: &str = "a1B2c3";
 
-/// One emulator: a router carrying only this service, over one shared engine.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+/// One emulator: a router carrying only this service over one shared engine,
+/// plus that engine, so a case can read the passcode a start sent out of the
+/// store — the way the owner of the mailbox reads it off the message.
+struct Emulator {
+    router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
+}
+
+impl Emulator {
+    fn new() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// The passcode outstanding for the update of `account_id`, or `None` once
+    /// it has been consumed (or while no update was ever started).
+    fn passcode(&self, account_id: &str) -> Option<String> {
+        let state = service_state(&*self.engine).expect("the account store is mounted");
+        let store = state.lock();
+        store
+            .account(account_id)
+            .and_then(|account| account.primary_email_update.as_ref())
+            .and_then(|update| update.outstanding_otp().map(str::to_string))
+    }
 }
 
 /// What the emulator answered: the HTTP status and the JSON body.
@@ -114,7 +135,7 @@ impl Answer {
     }
 }
 
-async fn call(router: &MultiServiceRouter, uri: &str, body: Value) -> Answer {
+async fn call(router: &Emulator, uri: &str, body: Value) -> Answer {
     let request = ::http::Request::builder()
         .method("POST")
         .uri(uri)
@@ -124,7 +145,7 @@ async fn call(router: &MultiServiceRouter, uri: &str, body: Value) -> Answer {
         .body(Bytes::from(body.to_string()))
         .expect("the test request is well formed");
 
-    let response = router.dispatch(request).await;
+    let response = router.router.dispatch(request).await;
     let status = response.status().as_u16();
     let bytes = response.into_body();
     let body = if bytes.is_empty() {
@@ -140,14 +161,14 @@ async fn call(router: &MultiServiceRouter, uri: &str, body: Value) -> Answer {
     Answer { status, body }
 }
 
-async fn read(router: &MultiServiceRouter, request: Value) -> Answer {
+async fn read(router: &Emulator, request: Value) -> Answer {
     call(router, "/getPrimaryEmail", request).await
 }
 
 /// Bring a member account's record into existence through a write that is not
 /// part of the primary-email flow, so the read is exercised on an account no
 /// email update has ever touched.
-async fn create_record(router: &MultiServiceRouter, case: &str, account_id: &str) {
+async fn create_record(router: &Emulator, case: &str, account_id: &str) {
     let created = call(
         router,
         "/putAccountName",
@@ -161,7 +182,7 @@ async fn create_record(router: &MultiServiceRouter, case: &str, account_id: &str
     );
 }
 
-async fn start(router: &MultiServiceRouter, account_id: &str, address: &str) -> Answer {
+async fn start(router: &Emulator, account_id: &str, address: &str) -> Answer {
     call(
         router,
         "/startPrimaryEmailUpdate",
@@ -170,12 +191,14 @@ async fn start(router: &MultiServiceRouter, account_id: &str, address: &str) -> 
     .await
 }
 
-async fn accept(
-    router: &MultiServiceRouter,
-    account_id: &str,
-    address: &str,
-    passcode: &str,
-) -> Answer {
+/// Accept the update of `account_id` with the passcode that update was started
+/// with — the only value that confirms it — read out of the store. A case with
+/// no outstanding passcode presents a well-formed value nothing sent, so the
+/// request is still one the boundary admits.
+async fn accept(router: &Emulator, account_id: &str, address: &str) -> Answer {
+    let passcode = router
+        .passcode(account_id)
+        .unwrap_or_else(|| WELL_FORMED_PASSCODE.to_string());
     call(
         router,
         "/acceptPrimaryEmailUpdate",
@@ -192,7 +215,7 @@ fn address_of_length(length: usize) -> String {
 
 /// The address the emulator reports for `account_id`, asserting the read
 /// succeeded and answered an address the modelled `@length` admits.
-async fn reported_email(router: &MultiServiceRouter, case: &str, account_id: &str) -> String {
+async fn reported_email(router: &Emulator, case: &str, account_id: &str) -> String {
     let answer = read(router, json!({"AccountId": account_id})).await;
     assert_eq!(
         answer.status, 200,
@@ -241,7 +264,7 @@ fn assert_refused(case: &str, answer: &Answer, status: u16, code: &str) {
 /// changes what the next caller sees.
 #[tokio::test]
 async fn every_account_the_store_holds_reports_one_stable_primary_email() {
-    let router = emulator();
+    let router = Emulator::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
 
     for account_id in MEMBER_ACCOUNTS {
@@ -269,34 +292,31 @@ async fn every_account_the_store_holds_reports_one_stable_primary_email() {
     );
 }
 
-/// The rows the update tables walk: an account of its own, the address the
-/// update asks for, and the passcode that confirms it. The rows differ in the
-/// address's length and form, both published `@length` bounds included.
-fn update_rows() -> Vec<(&'static str, &'static str, String, &'static str)> {
+/// The rows the update tables walk: an account of its own and the address the
+/// update asks for. The rows differ in the address's length and form, both
+/// published `@length` bounds included. The passcode is not a row: it is
+/// whatever the start sent, read out of the store by the case itself.
+fn update_rows() -> Vec<(&'static str, &'static str, String)> {
     let rows = vec![
         (
             "the shortest address the bound admits",
             MEMBER_ACCOUNTS[0],
             "a@b.c".to_string(),
-            WELL_FORMED_PASSCODES[0],
         ),
         (
             "the longest address the bound admits",
             MEMBER_ACCOUNTS[1],
             address_of_length(PRIMARY_EMAIL_MAX),
-            WELL_FORMED_PASSCODES[1],
         ),
         (
             "an ordinary address",
             MEMBER_ACCOUNTS[2],
             "ada@example.com".to_string(),
-            WELL_FORMED_PASSCODES[2],
         ),
         (
             "a tagged address on a two-label domain",
             MEMBER_ACCOUNTS[3],
             "ada+aws@example.co.uk".to_string(),
-            WELL_FORMED_PASSCODES[3],
         ),
     ];
     assert_eq!(
@@ -316,9 +336,9 @@ fn update_rows() -> Vec<(&'static str, &'static str, String, &'static str)> {
 /// confirmed, and the read keeps reporting the address the account already had.
 #[tokio::test]
 async fn a_pending_update_does_not_change_the_reported_primary_email() {
-    let router = emulator();
+    let router = Emulator::new();
 
-    for (case, account_id, address, _) in update_rows() {
+    for (case, account_id, address) in update_rows() {
         create_record(&router, case, account_id).await;
         let before = reported_email(&router, case, account_id).await;
         assert_ne!(
@@ -353,9 +373,9 @@ async fn a_pending_update_does_not_change_the_reported_primary_email() {
 /// the read reports — and keeps reporting.
 #[tokio::test]
 async fn a_completed_update_is_the_reported_primary_email() {
-    let router = emulator();
+    let router = Emulator::new();
 
-    for (case, account_id, address, passcode) in update_rows() {
+    for (case, account_id, address) in update_rows() {
         create_record(&router, case, account_id).await;
         let before = reported_email(&router, case, account_id).await;
 
@@ -365,7 +385,7 @@ async fn a_completed_update_is_the_reported_primary_email() {
             "case {case:?}: StartPrimaryEmailUpdate must answer 200, got {} with {:?}",
             started.status, started.body
         );
-        let accepted = accept(&router, account_id, &address, passcode).await;
+        let accepted = accept(&router, account_id, &address).await;
         assert_eq!(
             accepted.status, 200,
             "case {case:?}: AcceptPrimaryEmailUpdate must answer 200, got {} with {:?}",
@@ -419,7 +439,7 @@ async fn a_completed_update_is_the_reported_primary_email() {
 /// reports the address of the LAST one.
 #[tokio::test]
 async fn the_last_completed_update_is_what_the_read_reports() {
-    let router = emulator();
+    let router = Emulator::new();
     let account_id = MEMBER_ACCOUNTS[4];
     // Three addresses in a row, differing in form and in length: the last one
     // sits on the published minimum.
@@ -439,7 +459,7 @@ async fn the_last_completed_update_is_what_the_read_reports() {
             "case {case:?}: StartPrimaryEmailUpdate must answer 200, got {} with {:?}",
             started.status, started.body
         );
-        let accepted = accept(&router, account_id, address, WELL_FORMED_PASSCODES[0]).await;
+        let accepted = accept(&router, account_id, address).await;
         assert_eq!(
             accepted.status, 200,
             "case {case:?}: AcceptPrimaryEmailUpdate must answer 200, got {} with {:?}",
@@ -536,7 +556,7 @@ async fn a_read_outside_a_member_account_of_the_organization_is_refused() {
         ),
     ];
 
-    let router = emulator();
+    let router = Emulator::new();
     for (case, request, status, code, probe) in cases {
         let answer = read(&router, request).await;
         assert_refused(case, &answer, status, code);

@@ -3,12 +3,19 @@
 //! @op AcceptPrimaryEmailUpdate
 //! Accepts the primary email update a `StartPrimaryEmailUpdate` recorded against
 //! the MEMBER account the request names: the presented address has to be an
-//! email address and has to be the one the update was started for, and only an
-//! update still waiting for its one-time passcode can be accepted. An accepted
-//! update is `ACCEPTED`, and its
+//! email address and has to be the one the update was started for, the
+//! presented `Otp` has to be the one-time passcode that update was started
+//! with, and only an update still waiting for that passcode can be accepted. An
+//! accepted update is `ACCEPTED`, and its
 //! `COMPLETED` status — at which point the address IS the account's primary
 //! email — is owed by the clock
 //! ([`crate::state::PRIMARY_EMAIL_UPDATE_COMPLETION`]).
+//!
+//! The order the refusals are decided in: the authorization rule, then the
+//! address's syntax, then the update's status, then the input members the
+//! request presents (the address, then the passcode), and last the conflict
+//! with another account's hold on the address — so a refused input member is
+//! reported as the 400 it is, whatever else the store holds.
 //!
 //! ## Shape of an operation
 //!
@@ -261,6 +268,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The passcode is the confirmation this operation exists for: `Otp` is
+        // "the OTP code sent to the PrimaryEmail specified on the
+        // StartPrimaryEmailUpdate API call", so the only value that confirms
+        // the update is the one `StartPrimaryEmailUpdate` sent, which the store
+        // holds for exactly this comparison. It is compared as the whole
+        // literal value it is, so a value differing in case or in one character
+        // is not the passcode that was sent. A wrong submission consumes
+        // nothing: the update stays `PENDING` and the right passcode still
+        // confirms it.
+        if update.outstanding_otp() != Some(input.otp.as_str()) {
+            return Err(AcceptPrimaryEmailUpdateErrorModeled::ValidationException(
+                crate::state::incorrect_primary_email_passcode(),
+            )
+            .into());
+        }
+
         if address_in_use {
             // The conflict this service's `ConflictException` documents by
             // example: a root user email cannot be changed to an address that
@@ -271,13 +294,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The passcode itself: Account Management mails it to the proposed
-        // address, and this emulator has no mailbox a caller could read it
-        // from, so it cannot hold a particular passcode a caller would have to
-        // present — and it invents none to compare against. What the model DOES
-        // state about `Otp` is its form (`^[a-zA-Z0-9]{6}$`), which the
-        // boundary refuses anything outside of; a passcode of that form
-        // confirms the update.
+        // The passcode matched: the update is confirmed and the passcode is
+        // consumed with it, so submitting it again finds nothing outstanding.
         update.accept(now);
         let status = update.settled_status(now).to_string();
 

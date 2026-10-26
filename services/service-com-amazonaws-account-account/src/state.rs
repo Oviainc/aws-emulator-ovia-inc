@@ -544,6 +544,16 @@ pub struct PrimaryEmailUpdate {
     /// a caller confirms against the one that was requested; it is never put in
     /// a response or a log by this service.
     pub requested_email: String,
+    /// The one-time passcode this update was started with, while it is still
+    /// outstanding, and `None` once the call that confirmed the update consumed
+    /// it.
+    ///
+    /// Held for the same reason the phone flow holds one (see
+    /// [`PhoneNumberVerificationState::Pending`]): the passcode goes out of
+    /// band, so the only way a caller's submission can be checked against the
+    /// one that was sent is for the store to hold it. It is `@sensitive` and
+    /// never leaves the store — no response and no log carries it.
+    pub otp: Option<String>,
     /// One of `PrimaryEmailUpdateStatus`'s values; see
     /// [`PENDING_PRIMARY_EMAIL_UPDATE_STATUS`].
     pub status: String,
@@ -564,14 +574,24 @@ pub struct PrimaryEmailUpdate {
 
 impl PrimaryEmailUpdate {
     /// The update `StartPrimaryEmailUpdate` records at `now`: `PENDING`, because
-    /// the address still has to be confirmed with the one-time passcode.
-    pub fn started(requested_email: String, now: SystemTime) -> Self {
+    /// the address still has to be confirmed with the one-time passcode `otp`,
+    /// which is outstanding from this moment on.
+    pub fn started(requested_email: String, otp: String, now: SystemTime) -> Self {
         Self {
             requested_email,
+            otp: Some(otp),
             status: PENDING_PRIMARY_EMAIL_UPDATE_STATUS.to_string(),
             updated_at: now,
             completes_at: None,
         }
+    }
+
+    /// The passcode outstanding for this update, or `None` once it has been
+    /// submitted: a one-time passcode is consumed by the call that confirms the
+    /// update. The counterpart of
+    /// [`PhoneNumberVerification::outstanding_otp`].
+    pub fn outstanding_otp(&self) -> Option<&str> {
+        self.otp.as_deref()
     }
 
     /// Whether this update is still waiting for the one-time passcode, which is
@@ -587,9 +607,11 @@ impl PrimaryEmailUpdate {
         self.status == ACCEPTED_PRIMARY_EMAIL_UPDATE_STATUS
     }
 
-    /// Confirm this update at `now`: it becomes `ACCEPTED`, and its `COMPLETED`
-    /// status comes due [`PRIMARY_EMAIL_UPDATE_COMPLETION`] later.
+    /// Confirm this update at `now`: it becomes `ACCEPTED`, its one-time
+    /// passcode is consumed, and its `COMPLETED` status comes due
+    /// [`PRIMARY_EMAIL_UPDATE_COMPLETION`] later.
     pub fn accept(&mut self, now: SystemTime) {
+        self.otp = None;
         self.status = ACCEPTED_PRIMARY_EMAIL_UPDATE_STATUS.to_string();
         self.updated_at = now;
         self.completes_at = Some(now + PRIMARY_EMAIL_UPDATE_COMPLETION);
@@ -1522,8 +1544,14 @@ pub fn no_outstanding_passcode(status: &str) -> ConflictException {
     }
 }
 
-/// The `ValidationException` payload for a `VerifyPhoneNumber` whose `Otp` is
-/// not the outstanding passcode.
+/// The Smithy member the one-time-passcode operations take their passcode in,
+/// which a refusal about that passcode names in its `fieldList`.
+pub const OTP_MEMBER: &str = "Otp";
+
+/// The `ValidationException` payload for a submitted `Otp` that is not the
+/// passcode this service sent, whatever the passcode was sent TO: `destination`
+/// names that — the phone number for `VerifyPhoneNumber`, the proposed address
+/// for `AcceptPrimaryEmailUpdate`.
 ///
 /// WHICH six alphanumerics are the passcode is not something the model can
 /// express, so the boundary admits any `^[a-zA-Z0-9]{6}$` and this service
@@ -1531,17 +1559,38 @@ pub fn no_outstanding_passcode(status: &str) -> ConflictException {
 /// `fieldList` names the member, so a client can see which input was invalid.
 /// Neither the submitted nor the outstanding passcode is echoed — `Otp` is
 /// `@sensitive`.
-pub fn incorrect_passcode() -> ValidationException {
+fn incorrect_passcode_for(destination: &str) -> ValidationException {
     ValidationException {
-        message: "The one-time passcode submitted in Otp is not the passcode sent to the phone \
-                  number in the primary contact information"
-            .to_string(),
+        message: format!(
+            "The one-time passcode submitted in {OTP_MEMBER} is not the passcode sent to \
+             {destination}"
+        ),
         reason: Some(FIELD_VALIDATION_FAILED.to_string()),
         field_list: Some(vec![ValidationExceptionField {
-            name: "Otp".to_string(),
+            name: OTP_MEMBER.to_string(),
             message: "the submitted one-time passcode is incorrect".to_string(),
         }]),
     }
+}
+
+/// The `ValidationException` payload for a `VerifyPhoneNumber` whose `Otp` is
+/// not the outstanding passcode: AWS sends that passcode to "the phone number in
+/// the primary contact information", which is what the message names.
+pub fn incorrect_passcode() -> ValidationException {
+    incorrect_passcode_for("the phone number in the primary contact information")
+}
+
+/// The `ValidationException` payload for an `AcceptPrimaryEmailUpdate` whose
+/// `Otp` is not the passcode the update was started with.
+///
+/// The model's own `Otp` documentation is the rule: it is "the OTP code sent to
+/// the PrimaryEmail specified on the StartPrimaryEmailUpdate API call", which is
+/// what the message names — the address itself is not echoed, because
+/// `PrimaryEmailAddress` is `@sensitive`.
+pub fn incorrect_primary_email_passcode() -> ValidationException {
+    incorrect_passcode_for(
+        "the PrimaryEmail specified on the StartPrimaryEmailUpdate API call",
+    )
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

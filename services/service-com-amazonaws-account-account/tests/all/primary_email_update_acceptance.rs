@@ -23,20 +23,24 @@
 //! 4. A primary email cannot be changed to an address already in use as an
 //!    account's primary email — the conflict the service's `ConflictException`
 //!    documents by example — so such an acceptance is HTTP 409.
-//! 5. `Otp` is constrained `^[a-zA-Z0-9]{6}$`: anything outside that form is
-//!    refused with HTTP 400 and consumes nothing, and every passcode of that
-//!    form is admitted.
+//! 5. `Otp` is "the OTP code sent to the PrimaryEmail specified on the
+//!    StartPrimaryEmailUpdate API call" (the model's own member
+//!    documentation): the update is confirmed by the passcode the start sent
+//!    and by no other value. Anything outside the modelled `^[a-zA-Z0-9]{6}$`
+//!    is refused at the boundary with HTTP 400, a well-formed value that is
+//!    not the one that was sent is refused with HTTP 400 too, and neither
+//!    consumes anything.
 //!
 //! Every table spans the class rather than one request: the rows differ in the
 //! account, in the address's length and form (both published `@length` bounds
-//! included) and in the passcode's form.
+//! included) and in the form of the passcode presented.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_account_account::state::default_account_id;
+use service_com_amazonaws_account_account::state::{default_account_id, service_state};
 use service_com_amazonaws_account_account::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -87,13 +91,40 @@ const MEMBER_ACCOUNTS: [&str; 8] = [
 /// `smithy_query(query="operation", operation="AcceptPrimaryEmailUpdate")`.
 const WELL_FORMED_PASSCODES: [&str; 4] = ["123456", "abcdef", "ABCDEF", "a1B2c3"];
 
-/// One emulator: a router carrying only this service, over one shared engine.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+/// One emulator: a router carrying only this service over one shared engine,
+/// plus that engine, so a test can read the passcode the start sent out of the
+/// store — the way the owner of the mailbox reads it off the message.
+struct Emulator {
+    router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
+}
+
+impl Emulator {
+    fn new() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// The passcode outstanding for the update of `account_id`, or `None` once
+    /// it has been consumed (or while no update was ever started).
+    fn passcode(&self, account_id: &str) -> Option<String> {
+        let state = service_state(&*self.engine).expect("the account store is mounted");
+        let store = state.lock();
+        store
+            .account(account_id)
+            .and_then(|account| account.primary_email_update.as_ref())
+            .and_then(|update| update.outstanding_otp().map(str::to_string))
+    }
+
+    /// That passcode, failing the case when the update is not waiting for one.
+    fn outstanding_passcode(&self, case: &str, account_id: &str) -> String {
+        self.passcode(account_id).unwrap_or_else(|| {
+            panic!("case {case:?}: a started update must have a passcode outstanding")
+        })
+    }
 }
 
 /// What the emulator answered: the HTTP status and the JSON body.
@@ -125,7 +156,7 @@ impl Answer {
     }
 }
 
-async fn call(router: &MultiServiceRouter, uri: &str, body: Value) -> Answer {
+async fn call(router: &Emulator, uri: &str, body: Value) -> Answer {
     let payload = body.to_string();
     let request = ::http::Request::builder()
         .method("POST")
@@ -136,7 +167,7 @@ async fn call(router: &MultiServiceRouter, uri: &str, body: Value) -> Answer {
         .body(Bytes::from(payload))
         .expect("the test request is well formed");
 
-    let response = router.dispatch(request).await;
+    let response = router.router.dispatch(request).await;
     let status = response.status().as_u16();
     let bytes = response.into_body();
     let body = if bytes.is_empty() {
@@ -152,7 +183,7 @@ async fn call(router: &MultiServiceRouter, uri: &str, body: Value) -> Answer {
     Answer { status, body }
 }
 
-async fn start(router: &MultiServiceRouter, account_id: &str, address: &str) -> Answer {
+async fn start(router: &Emulator, account_id: &str, address: &str) -> Answer {
     call(
         router,
         "/startPrimaryEmailUpdate",
@@ -161,12 +192,7 @@ async fn start(router: &MultiServiceRouter, account_id: &str, address: &str) -> 
     .await
 }
 
-async fn accept(
-    router: &MultiServiceRouter,
-    account_id: &str,
-    address: &str,
-    passcode: &str,
-) -> Answer {
+async fn accept(router: &Emulator, account_id: &str, address: &str, passcode: &str) -> Answer {
     call(
         router,
         "/acceptPrimaryEmailUpdate",
@@ -175,7 +201,7 @@ async fn accept(
     .await
 }
 
-async fn status_read(router: &MultiServiceRouter, request: Value) -> Answer {
+async fn status_read(router: &Emulator, request: Value) -> Answer {
     call(router, "/getPrimaryEmailUpdateStatus", request).await
 }
 
@@ -186,7 +212,7 @@ fn address_of_length(length: usize) -> String {
 }
 
 /// Start an update and assert it was recorded as `PENDING`.
-async fn start_pending(router: &MultiServiceRouter, case: &str, account_id: &str, address: &str) {
+async fn start_pending(router: &Emulator, case: &str, account_id: &str, address: &str) {
     let started = start(router, account_id, address).await;
     assert_eq!(
         started.status, 200,
@@ -203,7 +229,7 @@ async fn start_pending(router: &MultiServiceRouter, case: &str, account_id: &str
 
 /// The status the emulator reports for `account_id`, asserting the read
 /// succeeded with a modelled status.
-async fn reported_status(router: &MultiServiceRouter, case: &str, account_id: &str) -> String {
+async fn reported_status(router: &Emulator, case: &str, account_id: &str) -> String {
     let answer = status_read(router, json!({"AccountId": account_id})).await;
     assert_eq!(
         answer.status, 200,
@@ -222,7 +248,7 @@ async fn reported_status(router: &MultiServiceRouter, case: &str, account_id: &s
 /// it settled to. Fails the case if it is still transient after
 /// [`SETTLE_TIMEOUT`].
 async fn settled_status(
-    router: &MultiServiceRouter,
+    router: &Emulator,
     case: &str,
     account_id: &str,
     transient: &str,
@@ -263,34 +289,31 @@ fn assert_refused(case: &str, answer: &Answer, status: u16, code: &str) {
     );
 }
 
-/// The rows every acceptance table walks: an account of its own, an address and
-/// a passcode. They differ in the address's length and form — both published
-/// `@length` bounds included — and in the passcode's form.
-fn acceptance_rows() -> Vec<(&'static str, &'static str, String, &'static str)> {
+/// The rows every acceptance table walks: an account of its own and an address.
+/// They differ in the address's length and form — both published `@length`
+/// bounds included. The passcode is not a row: it is whatever the start sent,
+/// read out of the store by the case itself.
+fn acceptance_rows() -> Vec<(&'static str, &'static str, String)> {
     let rows = vec![
         (
-            "the shortest address the bound admits, a digits-only passcode",
+            "the shortest address the bound admits",
             MEMBER_ACCOUNTS[0],
             "a@b.c".to_string(),
-            WELL_FORMED_PASSCODES[0],
         ),
         (
-            "the longest address the bound admits, a lower-case passcode",
+            "the longest address the bound admits",
             MEMBER_ACCOUNTS[1],
             address_of_length(PRIMARY_EMAIL_MAX),
-            WELL_FORMED_PASSCODES[1],
         ),
         (
-            "an ordinary address, an upper-case passcode",
+            "an ordinary address",
             MEMBER_ACCOUNTS[2],
             "ada@example.com".to_string(),
-            WELL_FORMED_PASSCODES[2],
         ),
         (
-            "a tagged address, a mixed-case passcode",
+            "a tagged address",
             MEMBER_ACCOUNTS[3],
             "ada+aws@example.co.uk".to_string(),
-            WELL_FORMED_PASSCODES[3],
         ),
     ];
     assert_eq!(
@@ -312,9 +335,9 @@ fn acceptance_rows() -> Vec<(&'static str, &'static str, String, &'static str)> 
 /// acceptance of the same update conflicts.
 #[tokio::test]
 async fn accepting_a_pending_update_moves_it_to_accepted_and_then_to_completed() {
-    let router = emulator();
+    let router = Emulator::new();
 
-    for (case, account_id, address, passcode) in acceptance_rows() {
+    for (case, account_id, address) in acceptance_rows() {
         start_pending(&router, case, account_id, &address).await;
         assert_eq!(
             reported_status(&router, case, account_id).await,
@@ -322,7 +345,8 @@ async fn accepting_a_pending_update_moves_it_to_accepted_and_then_to_completed()
             "case {case:?}: an update nobody accepted must stay {PENDING}"
         );
 
-        let accepted = accept(&router, account_id, &address, passcode).await;
+        let passcode = router.outstanding_passcode(case, account_id);
+        let accepted = accept(&router, account_id, &address, &passcode).await;
         assert_eq!(
             accepted.status, 200,
             "case {case:?}: AcceptPrimaryEmailUpdate must answer 200, got {} with {:?}",
@@ -343,9 +367,16 @@ async fn accepting_a_pending_update_moves_it_to_accepted_and_then_to_completed()
             "case {case:?}: the status straight after the acceptance must be {ACCEPTED}"
         );
 
-        // Accepting the same update again conflicts with its current status.
-        let again = accept(&router, account_id, &address, passcode).await;
+        // Accepting the same update again conflicts with its current status —
+        // the passcode it was confirmed with is consumed, so replaying it
+        // confirms nothing.
+        let again = accept(&router, account_id, &address, &passcode).await;
         assert_refused(case, &again, 409, "ConflictException");
+        assert_eq!(
+            router.passcode(account_id),
+            None,
+            "case {case:?}: the passcode must be consumed by the acceptance"
+        );
 
         // The clock owes the terminal status and pays it on its own.
         assert_eq!(
@@ -373,7 +404,7 @@ async fn accepting_a_pending_update_moves_it_to_accepted_and_then_to_completed()
         );
 
         // And a completed update cannot be accepted again either.
-        let terminal = accept(&router, account_id, &address, passcode).await;
+        let terminal = accept(&router, account_id, &address, &passcode).await;
         assert_refused(case, &terminal, 409, "ConflictException");
     }
 }
@@ -420,11 +451,14 @@ async fn accepting_an_address_other_than_the_requested_one_is_refused() {
         ),
     ];
 
-    let router = emulator();
+    let router = Emulator::new();
     for (case, account_id, requested, presented) in cases {
         start_pending(&router, case, account_id, &requested).await;
 
-        let refused = accept(&router, account_id, &presented, WELL_FORMED_PASSCODES[0]).await;
+        // The passcode presented is the right one: the address is what the
+        // rule under test refuses.
+        let passcode = router.outstanding_passcode(case, account_id);
+        let refused = accept(&router, account_id, &presented, &passcode).await;
         assert_refused(case, &refused, 400, "ValidationException");
         assert_eq!(
             refused.body["reason"].as_str().unwrap_or_default(),
@@ -456,7 +490,7 @@ async fn accepting_an_address_other_than_the_requested_one_is_refused() {
             PENDING,
             "case {case:?}: a refused acceptance must leave the update {PENDING}"
         );
-        let accepted = accept(&router, account_id, &requested, WELL_FORMED_PASSCODES[0]).await;
+        let accepted = accept(&router, account_id, &requested, &passcode).await;
         assert_eq!(
             accepted.reported_status(),
             ACCEPTED,
@@ -467,10 +501,11 @@ async fn accepting_an_address_other_than_the_requested_one_is_refused() {
 }
 
 /// A passcode outside `Otp`'s modelled `^[a-zA-Z0-9]{6}$` is refused with HTTP
-/// 400 `ValidationException` and consumes nothing; every passcode of that form
-/// is admitted.
+/// 400 `ValidationException` and consumes nothing; so is a well-formed value
+/// that is not the passcode the start sent, and the passcode that WAS sent
+/// confirms the update afterwards.
 #[tokio::test]
-async fn a_passcode_outside_the_modelled_form_is_refused() {
+async fn a_passcode_that_is_not_the_one_that_was_sent_is_refused() {
     // Rows one character on either side of the modelled length, and rows whose
     // characters are outside the admitted class.
     let malformed = [
@@ -482,7 +517,7 @@ async fn a_passcode_outside_the_modelled_form_is_refused() {
         ("a non-ASCII character", "12345é"),
     ];
 
-    let router = emulator();
+    let router = Emulator::new();
     let address = "ada@example.com";
     for (case, passcode) in malformed {
         let account_id = MEMBER_ACCOUNTS[5];
@@ -497,16 +532,38 @@ async fn a_passcode_outside_the_modelled_form_is_refused() {
         );
     }
 
-    // Every well-formed passcode is admitted, on an account of its own.
-    for (index, passcode) in WELL_FORMED_PASSCODES.iter().enumerate() {
-        let case = format!("the well-formed passcode {passcode}");
+    // A well-formed value that is not the one that was sent confirms nothing
+    // either, and the one that WAS sent still does. The rows differ in the form
+    // of the value presented instead.
+    for (index, wrong) in WELL_FORMED_PASSCODES.iter().enumerate() {
+        let case = format!("the well-formed passcode {wrong}, which nothing sent");
         let account_id = MEMBER_ACCOUNTS[index];
         let address = format!("ada{index}@example.com");
         start_pending(&router, &case, account_id, &address).await;
-        let accepted = accept(&router, account_id, &address, passcode).await;
+
+        let sent = router.outstanding_passcode(&case, account_id);
+        if *wrong != sent {
+            let refused = accept(&router, account_id, &address, wrong).await;
+            assert_refused(&case, &refused, 400, "ValidationException");
+            assert_eq!(
+                refused.body["fieldList"][0]["name"]
+                    .as_str()
+                    .unwrap_or_default(),
+                "Otp",
+                "case {case:?}: the refused member must be named, got {:?}",
+                refused.body
+            );
+            assert_eq!(
+                reported_status(&router, &case, account_id).await,
+                PENDING,
+                "case {case:?}: a wrong passcode must leave the update {PENDING}"
+            );
+        }
+
+        let accepted = accept(&router, account_id, &address, &sent).await;
         assert_eq!(
             accepted.status, 200,
-            "case {case:?}: a well-formed passcode must be admitted, got {} with {:?}",
+            "case {case:?}: the passcode that was sent must be admitted, got {} with {:?}",
             accepted.status, accepted.body
         );
         assert_eq!(
@@ -525,7 +582,7 @@ async fn a_passcode_outside_the_modelled_form_is_refused() {
 /// accept (HTTP 400).
 #[tokio::test]
 async fn accepting_without_a_pending_update_is_refused() {
-    let router = emulator();
+    let router = Emulator::new();
 
     // An account the store knows, with no primary email update: naming it on a
     // PutAccountName is what creates the record.
@@ -604,14 +661,16 @@ async fn accepting_an_address_an_accepted_update_is_about_to_take_conflicts() {
         ),
     ];
 
-    let router = emulator();
+    let router = Emulator::new();
     for (case, first_account, second_account, address) in cases {
         // Both accounts may ASK for the address: a pending request changes
         // nothing, so neither start is refused.
         start_pending(&router, case, first_account, &address).await;
         start_pending(&router, case, second_account, &address).await;
 
-        let accepted = accept(&router, first_account, &address, WELL_FORMED_PASSCODES[0]).await;
+        let first_passcode = router.outstanding_passcode(case, first_account);
+        let second_passcode = router.outstanding_passcode(case, second_account);
+        let accepted = accept(&router, first_account, &address, &first_passcode).await;
         assert_eq!(
             accepted.reported_status(),
             ACCEPTED,
@@ -626,7 +685,7 @@ async fn accepting_an_address_an_accepted_update_is_about_to_take_conflicts() {
             ACCEPTED,
             "case {case:?}: the first update must still be in flight"
         );
-        let conflict = accept(&router, second_account, &address, WELL_FORMED_PASSCODES[1]).await;
+        let conflict = accept(&router, second_account, &address, &second_passcode).await;
         assert_refused(case, &conflict, 409, "ConflictException");
         assert_eq!(
             reported_status(&router, case, second_account).await,
@@ -640,7 +699,7 @@ async fn accepting_an_address_an_accepted_update_is_about_to_take_conflicts() {
             COMPLETED,
             "case {case:?}: the first update must settle to {COMPLETED}"
         );
-        let still = accept(&router, second_account, &address, WELL_FORMED_PASSCODES[1]).await;
+        let still = accept(&router, second_account, &address, &second_passcode).await;
         assert_refused(case, &still, 409, "ConflictException");
     }
 }
@@ -673,7 +732,7 @@ async fn accepting_an_address_already_in_use_conflicts() {
         ),
     ];
 
-    let router = emulator();
+    let router = Emulator::new();
     for (case, first_account, second_account, address) in cases {
         // Both accounts ask for the address while nothing has been confirmed
         // for it: two PENDING requests take it from nobody, so both starts are
@@ -681,9 +740,12 @@ async fn accepting_an_address_already_in_use_conflicts() {
         start_pending(&router, case, first_account, &address).await;
         start_pending(&router, case, second_account, &address).await;
 
+        let first_passcode = router.outstanding_passcode(case, first_account);
+        let second_passcode = router.outstanding_passcode(case, second_account);
+
         // The first account takes the address, all the way to COMPLETED: the
         // address is in use from the instant that completion came due.
-        let accepted = accept(&router, first_account, &address, WELL_FORMED_PASSCODES[0]).await;
+        let accepted = accept(&router, first_account, &address, &first_passcode).await;
         assert_eq!(
             accepted.status, 200,
             "case {case:?}: the first acceptance must answer 200, got {} with {:?}",
@@ -696,7 +758,7 @@ async fn accepting_an_address_already_in_use_conflicts() {
         );
 
         // Completing the change the second account asked for conflicts.
-        let conflict = accept(&router, second_account, &address, WELL_FORMED_PASSCODES[1]).await;
+        let conflict = accept(&router, second_account, &address, &second_passcode).await;
         assert_refused(case, &conflict, 409, "ConflictException");
         assert!(
             !conflict.body.to_string().contains(address.as_str()),

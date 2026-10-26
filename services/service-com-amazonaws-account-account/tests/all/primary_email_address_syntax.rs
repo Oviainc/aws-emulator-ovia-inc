@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_account_account::state::email_address_expression;
+use service_com_amazonaws_account_account::state::{email_address_expression, service_state};
 use service_com_amazonaws_account_account::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -78,7 +78,8 @@ const FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 const PENDING: &str = "PENDING";
 const ACCEPTED: &str = "ACCEPTED";
 
-/// A passcode inside `Otp`'s modelled `^[a-zA-Z0-9]{6}$`.
+/// A passcode inside `Otp`'s modelled `^[a-zA-Z0-9]{6}$` that nothing sent,
+/// for a case with no outstanding passcode to present.
 const WELL_FORMED_PASSCODE: &str = "a1B2c3";
 
 /// Member account ids this emulator has never been told about: each satisfies
@@ -93,13 +94,33 @@ const MEMBER_ACCOUNTS: [&str; 7] = [
     "123456789012",
 ];
 
-/// One emulator: a router carrying only this service, over one shared engine.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+/// One emulator: a router carrying only this service over one shared engine,
+/// plus that engine, so a case can read the passcode a start sent out of the
+/// store — the way the owner of the mailbox reads it off the message.
+struct Emulator {
+    router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
+}
+
+impl Emulator {
+    fn new() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// The passcode outstanding for the update of `account_id`, or `None` once
+    /// it has been consumed (or while no update was ever started).
+    fn passcode(&self, account_id: &str) -> Option<String> {
+        let state = service_state(&*self.engine).expect("the account store is mounted");
+        let store = state.lock();
+        store
+            .account(account_id)
+            .and_then(|account| account.primary_email_update.as_ref())
+            .and_then(|update| update.outstanding_otp().map(str::to_string))
+    }
 }
 
 /// What the emulator answered: the HTTP status and the JSON body.
@@ -143,7 +164,7 @@ impl Answer {
     }
 }
 
-async fn call(router: &MultiServiceRouter, uri: &str, body: Value) -> Answer {
+async fn call(router: &Emulator, uri: &str, body: Value) -> Answer {
     let payload = body.to_string();
     let request = ::http::Request::builder()
         .method("POST")
@@ -154,7 +175,7 @@ async fn call(router: &MultiServiceRouter, uri: &str, body: Value) -> Answer {
         .body(Bytes::from(payload))
         .expect("the test request is well formed");
 
-    let response = router.dispatch(request).await;
+    let response = router.router.dispatch(request).await;
     let status = response.status().as_u16();
     let bytes = response.into_body();
     let body = if bytes.is_empty() {
@@ -170,7 +191,7 @@ async fn call(router: &MultiServiceRouter, uri: &str, body: Value) -> Answer {
     Answer { status, body }
 }
 
-async fn start(router: &MultiServiceRouter, account_id: &str, address: &str) -> Answer {
+async fn start(router: &Emulator, account_id: &str, address: &str) -> Answer {
     call(
         router,
         "/startPrimaryEmailUpdate",
@@ -179,16 +200,23 @@ async fn start(router: &MultiServiceRouter, account_id: &str, address: &str) -> 
     .await
 }
 
-async fn accept(router: &MultiServiceRouter, account_id: &str, address: &str) -> Answer {
+/// Accept the update of `account_id` with the passcode that update was started
+/// with — the only value that confirms it — read out of the store. A case with
+/// no outstanding passcode presents a well-formed value nothing sent, so the
+/// request is still one the boundary admits.
+async fn accept(router: &Emulator, account_id: &str, address: &str) -> Answer {
+    let passcode = router
+        .passcode(account_id)
+        .unwrap_or_else(|| WELL_FORMED_PASSCODE.to_string());
     call(
         router,
         "/acceptPrimaryEmailUpdate",
-        json!({"AccountId": account_id, "PrimaryEmail": address, "Otp": WELL_FORMED_PASSCODE}),
+        json!({"AccountId": account_id, "PrimaryEmail": address, "Otp": passcode}),
     )
     .await
 }
 
-async fn status_read(router: &MultiServiceRouter, account_id: &str) -> Answer {
+async fn status_read(router: &Emulator, account_id: &str) -> Answer {
     call(
         router,
         "/getPrimaryEmailUpdateStatus",
@@ -201,7 +229,7 @@ async fn status_read(router: &MultiServiceRouter, account_id: &str) -> Answer {
 /// other member is inside its own modelled constraint
 /// (`smithy_query(query="operation", operation="PutAlternateContact")`). It
 /// names no `AccountId`, so it lands on the caller's own account.
-async fn put_alternate_contact(router: &MultiServiceRouter, address: &str) -> Answer {
+async fn put_alternate_contact(router: &Emulator, address: &str) -> Answer {
     call(
         router,
         "/putAlternateContact",
@@ -342,7 +370,7 @@ fn assert_member_refused(case: &str, answer: &Answer, member: &str, value: &str)
 /// read is still the refusal for an account outside the caller's organization.
 #[tokio::test]
 async fn an_address_that_is_not_an_email_address_is_refused_and_records_nothing() {
-    let router = emulator();
+    let router = Emulator::new();
     for (case, address) in malformed_rows() {
         let account_id = MEMBER_ACCOUNTS[0];
         let refused = start(&router, account_id, &address).await;
@@ -369,7 +397,7 @@ async fn an_address_that_is_not_an_email_address_is_refused_and_records_nothing(
 /// `ACCEPTED`.
 #[tokio::test]
 async fn every_address_of_the_modelled_form_is_admitted_and_round_trips() {
-    let router = emulator();
+    let router = Emulator::new();
     for (index, (case, address)) in well_formed_rows().into_iter().enumerate() {
         let account_id = MEMBER_ACCOUNTS[index];
         let started = start(&router, account_id, &address).await;
@@ -414,7 +442,7 @@ async fn every_address_of_the_modelled_form_is_admitted_and_round_trips() {
 /// refused is left waiting.
 #[tokio::test]
 async fn an_acceptance_of_an_address_that_is_not_an_email_address_is_refused() {
-    let router = emulator();
+    let router = Emulator::new();
     let requested = "ada@example.com";
     for (case, address) in malformed_rows() {
         let account_id = MEMBER_ACCOUNTS[1];
@@ -459,7 +487,7 @@ async fn an_acceptance_of_an_address_that_is_not_an_email_address_is_refused() {
 /// well.
 #[tokio::test]
 async fn the_two_address_members_admit_the_same_values() {
-    let router = emulator();
+    let router = Emulator::new();
 
     for (case, address) in malformed_rows() {
         let on_contact = put_alternate_contact(&router, &address).await;

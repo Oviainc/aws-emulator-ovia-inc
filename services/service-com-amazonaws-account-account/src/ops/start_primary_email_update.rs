@@ -265,7 +265,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The account carries its MOST RECENT update, so starting another one
         // replaces the record rather than adding a second: a restarted update is
         // the one a status read reports, with its own `UpdatedAt`.
-        let update = crate::state::PrimaryEmailUpdate::started(input.primary_email, now);
+        //
+        // A one-time passcode is minted here, because this is the call Account
+        // Management sends one on: `AcceptPrimaryEmailUpdate` takes "the OTP
+        // code sent to the PrimaryEmail specified on the
+        // StartPrimaryEmailUpdate API call", so the passcode that confirms the
+        // update has to exist from the moment the update is recorded. It is
+        // stored with the update and NEVER answered back — the response carries
+        // the status only, exactly as `SendPhoneNumberVerification` keeps the
+        // passcode it mints out of its own answer.
+        let update = crate::state::PrimaryEmailUpdate::started(
+            input.primary_email,
+            crate::state::new_otp(),
+            now,
+        );
         let status = update.status.clone();
         account.primary_email_update = Some(update);
 
