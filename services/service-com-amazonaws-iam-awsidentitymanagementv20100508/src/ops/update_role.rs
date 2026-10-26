@@ -161,52 +161,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
-        // The role is named by its friendly name and IAM entity names "are not
-        // distinguished by case", so the case-folded name is the identity. This operation
-        // CHANGES the account's own record of a role, so it answers from the store alone:
-        // a name only `crate::state::service_provisioned_role` resolves is still "a
-        // resource entity that does not exist" here, as that function's own documentation
-        // records.
-        let key = crate::state::name_key(&input.role_name);
-        let Some(role) = store.roles.get(&key) else {
-            return Err(UpdateRoleErrorModeled::NoSuchEntityException(
-                NoSuchEntityException {
-                    message: Some(format!(
-                        "The role with name {} cannot be found.",
-                        input.role_name
-                    )),
-                },
-            )
-            .into());
-        };
-        let role_name = role.role_name.clone();
-        // Which service a role is linked to is carried by its path, read through the one
-        // definition of that rule in `crate::state`.
-        let linked_service =
-            crate::state::service_linked_role_principal(&role.path).map(str::to_string);
-
-        // "Service-linked roles are protected Amazon Web Services resources. Only the
-        // service that depends on the service-linked role can modify or delete the role
-        // on your behalf", so a caller's change to one is refused with the modelled
-        // `UnmodifiableEntityException`, whose documentation says the message "includes
-        // the name of the service that depends on this service-linked role".
-        if let Some(linked_service) = linked_service {
-            return Err(UpdateRoleErrorModeled::UnmodifiableEntityException(
-                UnmodifiableEntityException {
-                    message: Some(format!(
-                        "Service role {role_name} cannot be modified: it is a \
-                         service-linked role, so the change must be requested through \
-                         {linked_service}"
-                    )),
-                },
-            )
-            .into());
-        }
-
+        // The role is named by its friendly name (not an ARN) and IAM entity names "are
+        // not distinguished by case", so the case-folded name is the identity. This
+        // operation CHANGES the account's own record of a role, so it answers from the
+        // store alone: a name only `crate::state::service_provisioned_role` resolves is
+        // still "a resource entity that does not exist" here, as that function's own
+        // documentation records.
+        //
         // "Updates the description or maximum session duration setting of a role": each
-        // member the request CARRIES replaces the value the record held, and a member it
-        // leaves out is left exactly as it was — the two settings are independent of one
-        // another, and of every other member of the record.
+        // setting the request CARRIES replaces the one the role held, spelled exactly as
+        // the request sent it. A setting the request omits is not one this call updates,
+        // so the role keeps what it held — the description `CreateRole` or
+        // `UpdateRoleDescription` wrote, and the duration `CreateRole` stored. No other
+        // member of the record is touched.
+        //
+        // Both settings belong to the account's own record of the role rather than to
+        // its permissions or its trust relationship, so a role a service links itself
+        // to is updated here like any other: the protected-entity refusal this operation
+        // also models guards the calls that change such a role's trust policy, its
+        // attached or inline permissions, or its existence (`UpdateAssumeRolePolicy`,
+        // `AttachRolePolicy`, `PutRolePolicy`, `DeleteRole`), not these two settings.
+        let key = crate::state::name_key(&input.role_name);
         let Some(role) = store.roles.get_mut(&key) else {
             return Err(UpdateRoleErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
@@ -225,6 +200,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             role.max_session_duration = Some(max_session_duration);
         }
 
+        // `UpdateRoleResponse` carries no members, so the updated record is reported by
+        // the readers of it (`GetRole`, `ListRoles`), not by this response.
         Ok(UpdateRoleOutput {})
     }
 }

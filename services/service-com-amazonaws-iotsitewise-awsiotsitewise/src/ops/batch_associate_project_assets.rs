@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchAssociateProjectAssets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchAssociateProjectAssets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchAssociateProjectAssets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: associates every asset the request names with the project it names
+//! and persists that membership on the project's own record, so `ListProjectAssets`
+//! reads back exactly what this call stored.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +157,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchAssociateProjectAssets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchAssociateProjectAssetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchAssociateProjectAssets"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_failure)?;
+        let _ = ctx;
+
+        // `clientToken` is NOT honoured for idempotent replay: this change stores no
+        // token -> outcome mapping, so a retry with the same token is judged on the
+        // state it finds, exactly like a first call. Deliberately left to the
+        // idempotency issue rather than half-done here, as `CreateProject` and
+        // `AssociateAssets` leave it. It needs no replay to be safe either way: the
+        // membership this call writes is a SET, so a repeat of the same request leaves
+        // the project holding exactly the same assets.
+        let mut store = state.lock();
+
+        // The project is what the association is recorded ON, so an id that resolves to
+        // no stored project names no project to associate anything with. Resolved
+        // first, as every project-scoped handler in this crate resolves the resource
+        // its path names before reading the body.
+        let Some(project) = store.projects.get(&input.project_id) else {
+            return Err(not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_PROJECT,
+                &input.project_id,
+            )));
+        };
+
+        // What the project WOULD hold once this request landed. The membership is a
+        // set, so an asset already associated and an id repeated inside one request
+        // each count once — which is also what makes the bound below count assets
+        // rather than request entries.
+        let mut associated = project.asset_ids.clone();
+        for asset_id in &input.asset_ids {
+            associated.insert(asset_id.clone());
+        }
+
+        // Every asset the request names has to exist: `assetIds` targets `ID`, the raw
+        // UUID form (no `externalId:` label, which the modelled pattern cannot hold),
+        // so this is a direct lookup. The per-asset `errors` list cannot carry this
+        // refusal — the only `AssetErrorCode` the model declares is INTERNAL_FAILURE —
+        // so an absent asset refuses the whole request, and it is checked BEFORE
+        // anything is written, so a refused call associates nothing at all.
+        for asset_id in &input.asset_ids {
+            if !store.assets.contains_key(asset_id) {
+                return Err(not_found(crate::state::not_found_message(
+                    crate::state::RESOURCE_ASSET,
+                    asset_id,
+                )));
+            }
+        }
+
+        // One project holds a bounded number of assets, and this is the operation that
+        // grows that membership: past the cap the association is a quota refusal, which
+        // is what this operation declares `LimitExceededException` (HTTP 410) for
+        // ("You've reached the quota for a resource").
+        if associated.len() > crate::state::MAX_ASSETS_PER_PROJECT {
+            return Err(BatchAssociateProjectAssetsErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: format!(
+                        "The project {} may hold at most {} assets, and this request would \
+                         leave it holding {}.",
+                        input.project_id,
+                        crate::state::MAX_ASSETS_PER_PROJECT,
+                        associated.len()
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The membership the checks above computed replaces the stored one. The project
+        // was resolved above and the store is held for the whole call, so it is still
+        // there.
+        let Some(project) = store.projects.get_mut(&input.project_id) else {
+            return Err(internal_failure());
+        };
+        project.asset_ids = associated;
+
+        // "A list of associated error information, if any": none, so the list is
+        // empty. Nothing in this handler can fail for one asset while succeeding for
+        // another — the only `AssetErrorCode` the model declares is INTERNAL_FAILURE,
+        // and this store either holds every asset the request named or refuses the
+        // whole request above.
+        Ok(BatchAssociateProjectAssetsOutput {
+            errors: Some(Vec::new()),
+        })
     }
+}
+
+/// HTTP 500 `InternalFailureException`: the store this operation needs is not there.
+fn internal_failure() -> BatchAssociateProjectAssetsError {
+    BatchAssociateProjectAssetsErrorModeled::InternalFailureException(InternalFailureException {
+        message: "the IoT SiteWise store is unavailable".to_string(),
+    })
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` for an id that names no stored resource, in
+/// the one wording every not-found refusal in this service carries.
+fn not_found(message: String) -> BatchAssociateProjectAssetsError {
+    BatchAssociateProjectAssetsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+    })
+    .into()
 }
