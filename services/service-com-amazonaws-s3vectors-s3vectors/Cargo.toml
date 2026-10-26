@@ -16,11 +16,19 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# `time` beyond the workspace default: a tag write holds its optimistic lock for the
+# span it takes to commit, and its own caller is answered only once it has.
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The shared IAM policy grammar and the shared evaluation of a policy document against
+# (action, resource, principal), which decides a vector bucket policy here.
+service-common = { path = "../common" }
+# A vector bucket policy names the principals it governs, and the STS store resolves
+# which principal a request's access key id speaks for.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

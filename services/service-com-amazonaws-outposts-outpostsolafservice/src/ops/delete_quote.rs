@@ -148,13 +148,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // region's inventory and of no other's, so that is where the identifier is
         // resolved — one region's endpoint cannot delete another region's quote.
         let region = crate::state::request_region(ctx.parts());
-        // `QuoteIdentifier` accepts the bare id or the full quote ARN; both name the
-        // same stored record.
-        let quote_id = crate::state::resolve_quote_id(&input.quote_identifier).ok_or_else(|| {
-            DeleteQuoteErrorModeled::ValidationException(ValidationException {
-                message: Some(crate::state::quote_identifier_pattern_report()),
+        // `QuoteIdentifier` accepts the bare id or the full quote ARN. A bare id names
+        // a quote of the inventory this endpoint serves; an ARN carries a partition, a
+        // Region and an account of its own, and one that is not this endpoint's names
+        // no quote it holds — so it deletes nothing here.
+        let not_found = || {
+            DeleteQuoteErrorModeled::NotFoundException(NotFoundException {
+                // The identifier echo, of the value AS SUPPLIED — not of `quote_id`,
+                // which is the bare id an ARN resolved to.
+                message: Some(crate::state::identifier_not_found(
+                    crate::state::QUOTE_IDENTIFIER_MEMBER,
+                    &input.quote_identifier,
+                )),
             })
-        })?;
+        };
+        let quote_id = crate::state::resolve_quote_id(&input.quote_identifier, &region)
+            .ok_or_else(|| {
+                DeleteQuoteErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::quote_identifier_pattern_report()),
+                })
+            })?
+            .here()
+            .ok_or_else(not_found)?
+            .to_string();
 
         let mut store = state.lock();
         // Whatever status the quote holds, the delete removes it: the model documents
@@ -169,15 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // empty success — so a second delete of the same quote is refused exactly as
         // a read of it is.
         if store.remove_quote(&region, &quote_id).is_none() {
-            return Err(DeleteQuoteErrorModeled::NotFoundException(NotFoundException {
-                // The identifier echo, of the value AS SUPPLIED — not of `quote_id`,
-                // which is the bare id an ARN resolved to.
-                message: Some(crate::state::identifier_not_found(
-                    crate::state::QUOTE_IDENTIFIER_MEMBER,
-                    &input.quote_identifier,
-                )),
-            })
-            .into());
+            return Err(not_found().into());
         }
 
         Ok(DeleteQuoteOutput {})
