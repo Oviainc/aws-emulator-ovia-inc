@@ -212,22 +212,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // in the account and Region", in creation order, so a page boundary is stable
         // across calls. The selector the request gives NARROWS that list to the key
         // store it names, and a selector that names none is a missing resource, never
-        // an empty list.
+        // an empty list. The two selectors are mutually exclusive (a request giving
+        // both is refused above), and the `CustomKeyStoreId` one resolves through
+        // [`crate::state::ComAmazonawsKmsTrentserviceState::custom_key_store_in`] — the
+        // one resolver `UpdateCustomKeyStore` uses too, so the two operations cannot
+        // disagree about which ids name nothing.
         let selected = input.custom_key_store_id.is_some() || input.custom_key_store_name.is_some();
-        let listed: Vec<&crate::state::CustomKeyStore> = state
-            .custom_key_stores_in(&region)
-            .into_iter()
-            .filter(|store| {
-                input
-                    .custom_key_store_id
-                    .as_deref()
-                    .is_none_or(|id| store.custom_key_store_id == id)
-                    && input
-                        .custom_key_store_name
-                        .as_deref()
-                        .is_none_or(|name| store.custom_key_store_name == name)
-            })
-            .collect();
+        let listed: Vec<&crate::state::CustomKeyStore> = match (
+            input.custom_key_store_id.as_deref(),
+            input.custom_key_store_name.as_deref(),
+        ) {
+            (Some(custom_key_store_id), _) => state
+                .custom_key_store_in(&region, custom_key_store_id)
+                .into_iter()
+                .collect(),
+            (None, Some(custom_key_store_name)) => state
+                .custom_key_stores_in(&region)
+                .into_iter()
+                .filter(|store| store.custom_key_store_name == custom_key_store_name)
+                .collect(),
+            (None, None) => state.custom_key_stores_in(&region),
+        };
         if selected && listed.is_empty() {
             return Err(not_found());
         }

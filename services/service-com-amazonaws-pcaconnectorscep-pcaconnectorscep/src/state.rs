@@ -10,8 +10,13 @@
 use std::collections::BTreeMap;
 use std::hash::{BuildHasher as _, Hasher as _};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
+use ::aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
+use ::aws_smithy_schema_server::constraints::{validate, LengthTrait, PatternTrait};
+use ::aws_smithy_schema_server::envelope;
 
 use crate::ops::types::{
     Challenge, ChallengeMetadata, ChallengeMetadataSummary, Connector, ConnectorSummary,
@@ -552,6 +557,132 @@ pub fn resource_type_of(resource_arn: &str) -> &'static str {
     } else {
         RESOURCE_TYPE_CONNECTOR
     }
+}
+
+/// The form a `ResourceArn` naming one of this service's resources takes: `ConnectorArn`'s
+/// own `@pattern` with `ChallengeArn`'s challenge segment appended OPTIONALLY.
+///
+/// One expression covers both kinds because the challenge pattern IS the connector pattern
+/// plus that segment (smithy_query: shape ConnectorArn, ChallengeArn), so the two cannot
+/// drift apart here. Written exactly as the model writes them, because it is also the
+/// requirement a refusal quotes back.
+pub const RESOURCE_ARN_PATTERN: &str = concat!(
+    r"^arn:aws(-[a-z]+)*:pca-connector-scep:[a-z]+(-[a-z]+)+-[1-9]\d*:\d{12}",
+    r":connector\/[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}",
+    r"(\/challenge\/[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12})?$"
+);
+
+/// Shortest a resource ARN of this service may be, from the `@length(5, 200)` that both
+/// `ConnectorArn` and `ChallengeArn` declare.
+pub const MIN_RESOURCE_ARN_LENGTH: i64 = 5;
+/// Longest a resource ARN of this service may be, from the same `@length`.
+pub const MAX_RESOURCE_ARN_LENGTH: i64 = 200;
+
+/// `ResourceArn`'s constraints: the `@length` above and [`RESOURCE_ARN_PATTERN`], as the
+/// trait values the framework's own constraint walk reads.
+static RESOURCE_ARN_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(
+        Some(MIN_RESOURCE_ARN_LENGTH),
+        Some(MAX_RESOURCE_ARN_LENGTH),
+    )));
+    traits.insert(Box::new(PatternTrait::new(RESOURCE_ARN_PATTERN)));
+    traits
+});
+
+/// The `resourceArn` member schema that walk is driven over: its name gives the violation
+/// path, in the lowerCamel spelling every clause uses, and its trait map carries the
+/// constraints.
+static M_RESOURCE_ARN: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.pcaconnectorscep#TaggedResource$resourceArn",
+        "com.amazonaws.pcaconnectorscep",
+        "resourceArn",
+    ),
+    ShapeType::String,
+    "resourceArn",
+    0,
+)
+.with_traits(&RESOURCE_ARN_TRAITS);
+
+/// The root of the shadow input the walk runs over. Its member list is empty on purpose: the
+/// walk visits what [`TaggedResource`] WRITES, and a root struct schema carries no member
+/// name, so it contributes no path segment.
+static TAGGED_RESOURCE_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "com.amazonaws.pcaconnectorscep#TaggedResource",
+        "com.amazonaws.pcaconnectorscep",
+        "TaggedResource",
+    ),
+    ShapeType::Structure,
+    &[],
+);
+
+/// One request's `ResourceArn`, written for the validating walk the way the codec writes a
+/// string member.
+struct TaggedResource<'a> {
+    resource_arn: &'a str,
+}
+
+impl SerializableStruct for TaggedResource<'_> {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&M_RESOURCE_ARN, self.resource_arn)
+    }
+}
+
+/// How many fields an ARN is built from: `arn:<partition>:<service>:<region>:<account>:<resource>`.
+const ARN_FIELD_COUNT: usize = 6;
+
+/// Whether `value` is a well-formed ARN naming a resource of some service OTHER than this
+/// one.
+///
+/// An ARN is six colon-separated fields — `arn:<partition>:<service>:<region>:<account-id>:<resource>`
+/// — of which the literal `arn`, the partition, the service and the resource are always
+/// filled; a region and an account id are empty in the ARNs of global and account-less
+/// resources, so neither is required here. The resource field keeps any further colons,
+/// because a resource id may carry them.
+///
+/// Such a value DOES name a resource, so a call naming it is a lookup that finds nothing
+/// rather than a request this service cannot parse.
+fn names_another_services_resource(value: &str) -> bool {
+    let fields: Vec<&str> = value.splitn(ARN_FIELD_COUNT, ':').collect();
+    let [prefix, partition, service, _region, _account, resource] = fields.as_slice() else {
+        return false;
+    };
+    *prefix == "arn"
+        && !partition.is_empty()
+        && !service.is_empty()
+        && *service != ARN_SERVICE
+        && !resource.is_empty()
+}
+
+/// Why `resource_arn` is not a resource ARN this service could hold anything under, stated
+/// the way the request boundary states a path label outside its own constraints, or `None`
+/// when it is a value to look a resource up by.
+///
+/// The tagging operations take `ResourceArn` as a bare `String` with no `@pattern` and no
+/// `@length` (smithy_query: operation ListTagsForResource / TagResource / UntagResource), so
+/// nothing is refused for them at the request boundary and this is the only place the check
+/// can live — while the same ARNs reached as `ConnectorArn` or `ChallengeArn` labels are
+/// refused there, against the very patterns [`RESOURCE_ARN_PATTERN`] is built from.
+///
+/// Two things are therefore separated. A value that could not name a resource at all, and an
+/// ARN of THIS service that is not one of its published resource ARNs, are input the service
+/// cannot parse. An ARN of another service is well formed and simply holds nothing here, so
+/// it is left to the lookup to miss.
+///
+/// The check and the wording are both the FRAMEWORK's: the constraint walk
+/// ([`aws_smithy_schema_server::constraints::validate`]) runs over the member schema above
+/// and renders one clause per constraint broken, length before pattern, in its
+/// `N validation error(s) detected` envelope with its own elision of the echoed value — so a
+/// string refused here is refused and worded exactly as the boundary refuses the same string
+/// on a patterned label.
+pub fn resource_arn_rejection(resource_arn: &str) -> Option<String> {
+    if names_another_services_resource(resource_arn) {
+        return None;
+    }
+    let violations = validate(&TaggedResource { resource_arn }, &TAGGED_RESOURCE_SCHEMA);
+    envelope(&violations)
 }
 
 /// Whether `character` is one a tag key or a tag value may carry.

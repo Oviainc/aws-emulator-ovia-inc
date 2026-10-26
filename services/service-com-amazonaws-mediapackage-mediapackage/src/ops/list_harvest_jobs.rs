@@ -156,7 +156,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // The two filters are MUTUALLY EXCLUSIVE: they select by different properties and
         // MediaPackage refuses the combination outright rather than intersecting them, so
         // a request carrying both is refused before any state is reached or settled — it
@@ -171,6 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
+        // MediaPackage is regional: a listing reports only the harvest jobs of the Region
+        // its own request is served in.
+        let region = crate::state::request_region(ctx.parts());
         let mut state = state.lock();
         // Reporting only: this materialises the status transitions the clock had already
         // made due, so the status each entry reports — and the `IncludeStatus` filter
@@ -189,8 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = crate::state::page_size(input.max_results);
 
         // Both filters apply BEFORE paging, so a page is `MaxResults` matching jobs and
-        // the token points at the next matching one.
-        let matching = state.harvest_jobs.values().filter(|record| {
+        // the token points at the next matching one. One Region's jobs are a contiguous
+        // id-ordered range of the store, so a job of another Region is not reported here
+        // at all.
+        let matching = state.harvest_jobs_in(&region).filter(|record| {
             input
                 .include_channel_id
                 .as_deref()
@@ -207,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         let harvest_jobs = keys
             .iter()
-            .filter_map(|key| state.harvest_jobs.get(*key))
+            .filter_map(|key| state.harvest_job(&region, key))
             .map(crate::state::HarvestJobRecord::to_harvest_job)
             .collect();
 

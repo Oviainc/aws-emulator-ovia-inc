@@ -4197,6 +4197,8 @@ pub enum PageOf {
     TypeSummaries,
     /// `ListStackInstances`'s `Summaries`.
     StackInstanceSummaries,
+    /// `ListGeneratedTemplates`'s `Summaries`.
+    TemplateSummaries,
 }
 
 impl PageOf {
@@ -4216,6 +4218,7 @@ impl PageOf {
             Self::AccountLimits => "account-limits",
             Self::TypeSummaries => "type-summaries",
             Self::StackInstanceSummaries => "stack-instance-summaries",
+            Self::TemplateSummaries => "template-summaries",
         }
     }
 }

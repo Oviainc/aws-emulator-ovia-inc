@@ -265,10 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !record.auto_start_enabled() {
                 return Err(StartSessionErrorModeled::ValidationException(
                     ValidationException {
-                        message: format!(
-                            "Application is in {settled_state} state and does not start \
-                             automatically; call StartApplication first"
-                        ),
+                        message: crate::state::auto_start_disabled_message("Session"),
                     },
                 )
                 .into());

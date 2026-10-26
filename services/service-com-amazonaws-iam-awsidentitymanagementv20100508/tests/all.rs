@@ -63,6 +63,8 @@ mod login_profiles;
 mod managed_policies;
 #[path = "all/open_id_connect_client_ids.rs"]
 mod open_id_connect_client_ids;
+#[path = "all/open_id_connect_provider_listing.rs"]
+mod open_id_connect_provider_listing;
 #[path = "all/open_id_connect_providers.rs"]
 mod open_id_connect_providers;
 #[path = "all/policies_granting_service_access.rs"]

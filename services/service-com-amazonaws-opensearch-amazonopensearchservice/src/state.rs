@@ -47,7 +47,7 @@ use crate::ops::types::{
     IdentityCenterOptionsInput, IdentityCenterOptionsStatus, InboundConnection,
     InboundConnectionStatus, Insight, InsightEntity, InsightField,
     InstanceCountLimits, InstanceLimits,
-    InstanceTypeDetails,
+    InstanceTypeDetails, InternalException,
     InvalidPaginationTokenException, JWTOptionsOutput, LimitExceededException, Limits,
     LogPublishingOption,
     LogPublishingOptionsStatus, NaturalLanguageQueryGenerationOptionsOutput,
@@ -1915,6 +1915,177 @@ impl ScheduledChange {
             cancellable: Some(self.cancellable),
         }
     }
+
+    /// Whether the service has already begun or finished this change, so there is no
+    /// longer an instant of it left to move: `ActionStatus`'s
+    /// [`ACTION_STATUS_IN_PROGRESS`] and [`ACTION_STATUS_COMPLETED`].
+    pub fn under_way(&self) -> bool {
+        self.status == ACTION_STATUS_IN_PROGRESS || self.status == ACTION_STATUS_COMPLETED
+    }
+
+    /// Re-time this change to `at`, as a caller's reschedule leaves the record.
+    ///
+    /// The instant is the whole of what the caller chose; the other two members the
+    /// move settles follow from the call itself: the change is now one a caller
+    /// scheduled rather than one the service picked the time of, and a change that has
+    /// been given an instant to happen at is waiting for it.
+    pub fn reschedule(&mut self, at: SystemTime) {
+        self.scheduled_at = at;
+        self.scheduled_by = SCHEDULED_BY_CUSTOMER.to_string();
+        self.status = ACTION_STATUS_PENDING_UPDATE.to_string();
+    }
+}
+
+/// `ActionStatus`'s `PENDING_UPDATE`: the change has an instant to happen at and is
+/// waiting for it.
+pub const ACTION_STATUS_PENDING_UPDATE: &str = "PENDING_UPDATE";
+
+/// `ActionStatus`'s `IN_PROGRESS`: the change is being applied to the domain.
+pub const ACTION_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// `ActionStatus`'s `COMPLETED`: the change has been applied to the domain.
+pub const ACTION_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// `ScheduledBy`'s `CUSTOMER`: a caller chose when this change happens.
+pub const SCHEDULED_BY_CUSTOMER: &str = "CUSTOMER";
+
+/// `ScheduleAt`'s `NOW`: "immediately schedules the update to happen in the current
+/// hour if there's capacity available".
+pub const SCHEDULE_AT_NOW: &str = "NOW";
+
+/// `ScheduleAt`'s `TIMESTAMP`: "lets you specify a custom date and time to apply the
+/// update", which is the one value `DesiredStartTime` belongs with.
+pub const SCHEDULE_AT_TIMESTAMP: &str = "TIMESTAMP";
+
+/// `ScheduleAt`'s `OFF_PEAK_WINDOW`: "marks the action to be picked up during an
+/// upcoming off-peak window".
+pub const SCHEDULE_AT_OFF_PEAK_WINDOW: &str = "OFF_PEAK_WINDOW";
+
+/// How long a day is, for the next opening of a domain's daily off-peak window.
+const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// `at` as a `SystemTime`, from the epoch-millisecond count a `Long` timestamp of
+/// this service carries — the inverse of [`epoch_millis`], so a value this service
+/// reported and one a caller sent name the same instant.
+///
+/// The count comes from the CALLER and `Long` bounds nothing, so the arithmetic is
+/// checked: a value no instant of this clock can represent answers the far end of the
+/// range it ran off rather than unwinding the handler that read it.
+pub fn instant_of_epoch_millis(millis: i64) -> SystemTime {
+    let offset = Duration::from_millis(millis.unsigned_abs());
+    if millis >= 0 {
+        SystemTime::UNIX_EPOCH.checked_add(offset).unwrap_or_else(|| {
+            SystemTime::UNIX_EPOCH
+                .checked_add(MAX_REPRESENTABLE_OFFSET)
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+        })
+    } else {
+        SystemTime::UNIX_EPOCH.checked_sub(offset).unwrap_or_else(|| {
+            SystemTime::UNIX_EPOCH
+                .checked_sub(MAX_REPRESENTABLE_OFFSET)
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+        })
+    }
+}
+
+/// How far from the epoch an instant this service reports can be, for the checked
+/// arithmetic of [`instant_of_epoch_millis`]: the largest span every platform's
+/// `SystemTime` represents on both sides of the epoch, which is more than four
+/// centuries.
+const MAX_REPRESENTABLE_OFFSET: Duration = Duration::from_secs(400 * 365 * 24 * 60 * 60);
+
+/// Whether the `DesiredStartTime` a request carries belongs with the `ScheduleAt` it
+/// names: "only specify this parameter if you set `ScheduleAt` to `TIMESTAMP`", and
+/// that value "must also provide a value for `DesiredStartTime`".
+///
+/// A property of the REQUEST alone, so the operations that schedule a change decide
+/// it before resolving anything the request names.
+pub fn check_desired_start_time(
+    schedule_at: &str,
+    desired_start_time: Option<i64>,
+) -> Result<(), ValidationException> {
+    match (schedule_at, desired_start_time) {
+        (SCHEDULE_AT_TIMESTAMP, None) => Err(ValidationException {
+            message: Some(format!(
+                "DesiredStartTime is required when ScheduleAt is {SCHEDULE_AT_TIMESTAMP}."
+            )),
+        }),
+        (SCHEDULE_AT_TIMESTAMP, Some(_)) => Ok(()),
+        (_, None) => Ok(()),
+        (_, Some(_)) => Err(ValidationException {
+            message: Some(format!(
+                "DesiredStartTime must only be specified when ScheduleAt is \
+                 {SCHEDULE_AT_TIMESTAMP}: {schedule_at}."
+            )),
+        }),
+    }
+}
+
+/// The instant a reschedule puts a change at, for a request whose `ScheduleAt` and
+/// `DesiredStartTime` [`check_desired_start_time`] has already admitted.
+///
+/// Each `ScheduleAt` value names its own instant: `NOW` the moment of the call,
+/// `TIMESTAMP` the one the caller gave, and `OFF_PEAK_WINDOW` the next opening of
+/// the window `domain` carries ([`Domain::next_off_peak_window_start`]).
+pub fn rescheduled_instant(
+    domain: &Domain,
+    schedule_at: &str,
+    desired_start_time: Option<i64>,
+    now: SystemTime,
+) -> SystemTime {
+    match schedule_at {
+        // `NOW` schedules "the update to happen in the current hour", which is the
+        // instant of the call itself.
+        SCHEDULE_AT_NOW => now,
+        SCHEDULE_AT_TIMESTAMP => desired_start_time.map_or(now, instant_of_epoch_millis),
+        SCHEDULE_AT_OFF_PEAK_WINDOW => domain.next_off_peak_window_start(now),
+        // `ScheduleAt` is an enum of exactly those three values and the boundary
+        // validator refuses anything else before a handler runs, so this arm stands for
+        // nothing a request can carry.
+        _ => now,
+    }
+}
+
+/// The `ValidationException` payload for a request whose `ActionType` is not the type
+/// of the change its `ActionID` names: "the type of action to reschedule … to
+/// retrieve this value, send a `ListScheduledActions` request", so the two members
+/// must name ONE change.
+pub fn scheduled_action_type_mismatch(
+    action_id: &str,
+    requested: &str,
+    stored: &str,
+) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "Scheduled action {action_id} is of type {stored}, not {requested}."
+        )),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for an `ActionID` that names no scheduled
+/// change of a domain the store DOES hold — the scheduled-change mirror of
+/// [`index_not_found`], naming both so a caller tells it apart from
+/// [`domain_not_found`].
+pub fn scheduled_action_not_found(
+    action_id: &str,
+    domain_name: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Scheduled action {action_id} doesn't exist for domain {domain_name}."
+        )),
+    }
+}
+
+/// The `ConflictException` payload for re-timing a change the service has already
+/// begun or finished: there is no instant of it left to move, and the refusal names
+/// the status that says so.
+pub fn scheduled_action_under_way(action_id: &str, status: &str) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "Scheduled action {action_id} is {status} and can no longer be rescheduled."
+        )),
+    }
 }
 
 /// One field of an insight's DETAILED view, as this emulator persists it.
@@ -2341,9 +2512,7 @@ impl Domain {
         self.service_software.settle(now);
         // An association of a package with this domain is owed its outcome by that
         // same clock, and likewise on its own span.
-        for association in self.package_associations.values_mut() {
-            association.settle(now);
-        }
+        self.settle_package_associations(now);
         // An engine version upgrade is owed its completion by the same clock, on the
         // span the call that started it recorded: once that has passed the domain runs
         // the version it was upgraded to, and the advanced options that upgrade carried
@@ -2375,6 +2544,67 @@ impl Domain {
     /// `EngineType` for this domain, derived from its `EngineVersion` prefix.
     pub fn engine_type(&self) -> Option<&'static str> {
         engine_type_of(&self.engine_version)
+    }
+
+    /// Materialise what the clock owes this domain's package associations: a status
+    /// move that has fallen due lands, and a removal that has fallen due takes the
+    /// record off the domain.
+    ///
+    /// ONE method rather than a loop at each call site, because the two halves belong
+    /// together: a record whose removal has fallen due must not be reported by ANY
+    /// read of the set, and `DomainPackageStatus` has no value for a package that is
+    /// no longer on the domain. [`Self::settle`] calls it, and so does every operation
+    /// that reports associations.
+    ///
+    /// This is the only write such a report makes, and it writes only what was already
+    /// owed at the same instant had nobody called.
+    pub fn settle_package_associations(&mut self, now: SystemTime) {
+        for association in self.package_associations.values_mut() {
+            association.settle(now);
+        }
+        self.package_associations
+            .retain(|_, association| association.removal_due.is_none_or(|due| now < due));
+    }
+
+    /// The next instant this domain's off-peak window opens after `now` — where a
+    /// change marked "to be picked up during an upcoming off-peak window" lands.
+    ///
+    /// The window is "a custom 10-hour, low-traffic window during which OpenSearch
+    /// Service can perform mandatory configuration changes on the domain", opening at
+    /// the `WindowStartTime` the domain carries, in UTC. `Hours` and `Minutes` are
+    /// `@default(0)`, so a domain that configured no custom start has its window open
+    /// at the start of the UTC day. The instant answered is strictly after `now`,
+    /// because a window that has already opened today is not an UPCOMING one.
+    ///
+    /// Every domain HAS such a window: `OffPeakWindowOptions$Enabled` "is only
+    /// available when modifying a domain created prior to February 16, 2023, not when
+    /// creating a new domain. All domains created after that date have an off-peak
+    /// window by default" — so the toggle says nothing about a domain this emulator
+    /// mints, and only the start time is read here.
+    pub fn next_off_peak_window_start(&self, now: SystemTime) -> SystemTime {
+        let start = self
+            .off_peak_window_options
+            .as_ref()
+            .and_then(|options| options.off_peak_window.as_ref())
+            .and_then(|window| window.window_start_time.as_ref());
+        // `Hours` is `@range(0..23)` and `Minutes` `@range(0..59)`, refused outside
+        // those bounds before any handler stored them; clamping is what keeps the
+        // offset inside one day whatever the record holds.
+        let hours = start.map_or(0, |time| time.hours).clamp(0, 23);
+        let minutes = start.map_or(0, |time| time.minutes).clamp(0, 59);
+        let into_day = Duration::from_secs(hours.unsigned_abs() * 3600 + minutes.unsigned_abs() * 60);
+        let since_epoch = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let day_started = SystemTime::UNIX_EPOCH
+            + Duration::from_secs(since_epoch - since_epoch % DAY.as_secs());
+        let today = day_started + into_day;
+        if today > now {
+            today
+        } else {
+            today + DAY
+        }
     }
 
     /// The `OptionState` of one option: `Processing` while the domain is applying a
@@ -3937,6 +4167,15 @@ pub struct PackageAssociation {
     /// `DomainPackageDetails$LastUpdated`: "timestamp of the most recent update to
     /// the package association status".
     pub last_updated: SystemTime,
+    /// When the clock takes this association OFF the domain, for one a dissociation
+    /// call put into its removal status; `None` for one no call has asked to remove.
+    ///
+    /// A removal needs its own due instant rather than an [`OwedStatus`] because
+    /// `DomainPackageStatus` has no value for a package that is no longer on the
+    /// domain: the record rests in [`DOMAIN_PACKAGE_STATUS_DISSOCIATING`] until the
+    /// span has passed and is then GONE ([`Domain::settle`]), which is what makes the
+    /// package disappear from the domain's associations.
+    pub removal_due: Option<SystemTime>,
 }
 
 impl PackageAssociation {
@@ -3962,7 +4201,7 @@ impl PackageAssociation {
     /// Read AFTER [`Self::settle`], so a move that has merely fallen due does not
     /// read as one still in flight.
     pub fn in_flight(&self) -> bool {
-        self.owed.is_some()
+        self.owed.is_some() || self.removal_due.is_some()
     }
 
     /// This record as `DomainPackageDetails` — the shape every operation that
@@ -4025,6 +4264,33 @@ pub fn package_not_available(package_id: &str, status: &str) -> ConflictExceptio
     ConflictException {
         message: Some(format!(
             "Package {package_id} is {status}, not {PACKAGE_STATUS_AVAILABLE}."
+        )),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for a dissociation of a package the
+/// domain is not holding: the link the call asks to remove does not exist, so the
+/// refusal names both the package and the domain it is not on — the association
+/// mirror of [`index_not_found`].
+pub fn package_not_associated(package_id: &str, domain_name: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Package {package_id} is not associated with domain {domain_name}."
+        )),
+    }
+}
+
+/// The `InternalException` payload for a store that no longer holds what the decision
+/// this call already made had resolved — a state the one lock this service takes makes
+/// unreachable.
+///
+/// "Request processing failed because of an unknown error, exception, or internal
+/// failure": such a write is not something the CALLER can fix, so it is answered on
+/// the server channel rather than reported as a bad request.
+pub fn internal_failure(what: &str) -> InternalException {
+    InternalException {
+        message: Some(format!(
+            "Request processing failed: {what} changed while the request was being served."
         )),
     }
 }
@@ -4115,16 +4381,16 @@ pub struct AssociationRequest {
     pub association_configuration: Option<PackageAssociationConfiguration>,
 }
 
-/// Why a package cannot be linked to a domain, as the modelled exception payload
-/// the refusal is reported through.
+/// Why a package cannot be linked to a domain, or unlinked from one, as the
+/// modelled exception payload the refusal is reported through.
 ///
 /// Each operation declares its OWN error enum, so this names the payload and the
 /// handler lifts it into its own channel: the DECISION lives in one place even
 /// though the error channels do not.
 #[derive(Debug)]
 pub enum AssociationRefusal {
-    /// The domain, the package or one of its prerequisites names nothing this
-    /// account holds.
+    /// The domain, the package, one of its prerequisites or the link itself names
+    /// nothing this account holds.
     NotFound(ResourceNotFoundException),
     /// The package or the association is in a status that cannot serve the call.
     Conflict(ConflictException),
@@ -4637,6 +4903,9 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
             prerequisite_package_ids: request.prerequisite_package_ids.clone(),
             association_configuration: request.association_configuration.clone(),
             last_updated: now,
+            // This call puts the package ON the domain, so nothing about it is owed a
+            // removal: a dissociation is what asks for one.
+            removal_due: None,
         };
         // Answered from the STORED record, through the projection every read path
         // reports an association with: the slot the write went into IS the record, so
@@ -4649,6 +4918,91 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
             Entry::Vacant(slot) => slot.insert(association),
         };
         Some(stored.to_details(domain_name, package))
+    }
+
+    /// Decide whether the association between `domain_name` and `package_id` can be
+    /// removed and, where it can, hand back the stored [`Package`] it links to.
+    ///
+    /// Reads ONLY — the mirror of [`Self::plan_package_association`], so a call that
+    /// removes several links can decide on all of them before writing any, and a
+    /// refused request leaves the domain's associations exactly as they were.
+    ///
+    /// Call AFTER [`Self::settle_packages`] and the domain's own settling, so an
+    /// association whose move has landed is judged in the status the clock already
+    /// left it in, and one whose removal has already fallen due is no longer there to
+    /// be removed again.
+    pub fn plan_package_dissociation(
+        &self,
+        domain_name: &str,
+        package_id: &str,
+    ) -> Result<Package, AssociationRefusal> {
+        let domain = self
+            .domains
+            .get(domain_name)
+            .ok_or_else(|| AssociationRefusal::Validation(domain_does_not_exist(domain_name)))?;
+        let package = self
+            .packages
+            .get(package_id)
+            .ok_or_else(|| AssociationRefusal::NotFound(package_not_found(package_id)))?;
+
+        // The service runs one change to a domain's package associations at a time, so
+        // a call made while another associate or dissociate on the SAME domain has not
+        // landed yet is refused rather than overtaking it — the identical rule the
+        // associate decision applies, because it is one rule about the domain.
+        //
+        // It is judged BEFORE the link itself, in the same place the associate decision
+        // judges it: the condition is about the DOMAIN, so which of its associations
+        // the call happens to name cannot change the answer — a domain with a change
+        // still landing refuses every package call alike, and only once nothing is in
+        // flight does the set it holds decide the call.
+        if domain
+            .package_associations
+            .values()
+            .any(PackageAssociation::in_flight)
+        {
+            return Err(AssociationRefusal::Conflict(concurrent_package_operation()));
+        }
+
+        // A removal needs a link to remove: a package the domain is not holding is
+        // nothing this call can take off it.
+        if !domain.package_associations.contains_key(package_id) {
+            return Err(AssociationRefusal::NotFound(package_not_associated(
+                package_id,
+                domain_name,
+            )));
+        }
+
+        Ok(package.clone())
+    }
+
+    /// Take the package off `domain_name` and hand back the stored record as
+    /// `DomainPackageDetails`.
+    ///
+    /// `package` is the record [`Self::plan_package_dissociation`] resolved, so this
+    /// writes only a removal the decision above admitted. `None` only where the
+    /// domain or the association is gone, which that plan already refused.
+    ///
+    /// The package is still on the domain the instant the call returns: it is being
+    /// taken off, so the association rests in [`DOMAIN_PACKAGE_STATUS_DISSOCIATING`]
+    /// and the clock owes it the removal that makes it disappear ([`Domain::settle`]).
+    pub fn remove_package_association(
+        &mut self,
+        domain_name: &str,
+        package: &Package,
+        now: SystemTime,
+    ) -> Option<DomainPackageDetails> {
+        let domain = self.domains.get_mut(domain_name)?;
+        let association = domain.package_associations.get_mut(&package.package_id)?;
+        association.status = DOMAIN_PACKAGE_STATUS_DISSOCIATING.to_string();
+        // Whatever move was outstanding is replaced by the removal this call asked
+        // for: the association is on its way off the domain, not on its way to any
+        // other status.
+        association.owed = None;
+        association.removal_due = Some(now + PROVISIONING);
+        association.last_updated = now;
+        // Answered from the STORED record, through the projection every read path
+        // reports an association with.
+        Some(association.to_details(domain_name, package))
     }
 
     /// The published offering whose `ReservedInstanceOfferingId` is `offering_id`.

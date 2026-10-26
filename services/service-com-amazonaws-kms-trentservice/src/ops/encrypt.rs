@@ -262,7 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx);
-        let state = state.lock();
+        let mut state = state.lock();
 
         // Permission a request draws from a grant is judged below, once the key is
         // known and its key state has been judged.
@@ -272,6 +272,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same way as an identifier that names nothing: the key is not found.
         let key = match state.resolve(&region, &input.key_id) {
             crate::state::KeyRef::Found(key) => key,
+            crate::state::KeyRef::UnauthorizedAccount => {
+                return Err(crate::state::unauthorized_account(
+                    Self::NAME,
+                    &input.key_id,
+                ));
+            }
             crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
                 return Err(EncryptErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
@@ -398,11 +404,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
+        // KMS answers with the key ARN, not the identifier the request used.
+        let key_arn = key.arn.clone();
+        let key_id = key.key_id.clone();
+
+        // The key was just used in a successful cryptographic operation, which is what
+        // `GetKeyLastUsage` reports.
+        state.record_last_usage(&key_id, Self::NAME);
 
         Ok(EncryptOutput {
             ciphertext_blob: Some(ciphertext_blob),
-            // KMS answers with the key ARN, not the identifier the request used.
-            key_id: Some(key.arn.clone()),
+            key_id: Some(key_arn),
             encryption_algorithm: Some(algorithm),
         })
     }

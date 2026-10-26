@@ -187,15 +187,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle(now);
 
-        let channel = state.channels.get_mut(&input.channel_id).ok_or_else(|| {
+        // The id is resolved FIRST, through the one guard every channel mutation
+        // shares: a channel whose delete this service has accepted is a
+        // tombstone a reader still reports but no caller may start, so it is
+        // answered with this operation's modelled `NotFoundException` (404)
+        // exactly as an id no channel ever had is. The state check below — and
+        // the `ConflictException` (409) it answers — is reached only by a
+        // channel that still exists, so a client can tell "gone, recreate it"
+        // from "busy, retry later".
+        let channel = state.mutable_channel(&input.channel_id).map_err(|dead| {
             StartChannelErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::not_found_message("Channel", &input.channel_id)),
+                message: Some(dead.message),
             })
         })?;
 
         // A channel starts only from the state in which it is not already doing
-        // something: starting one that is creating, starting, running, stopping or
-        // deleting is a conflict, not a no-op.
+        // something: starting one that is creating, starting, running or
+        // stopping is a conflict, not a no-op.
         if !channel.is_idle() {
             return Err(StartChannelErrorModeled::ConflictException(ConflictException {
                 // The wording lives in the state module, so this refusal and the

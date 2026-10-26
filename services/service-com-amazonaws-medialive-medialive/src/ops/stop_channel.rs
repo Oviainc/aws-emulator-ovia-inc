@@ -187,14 +187,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle(now);
 
-        let channel = state.channels.get_mut(&input.channel_id).ok_or_else(|| {
+        let channel = state.mutable_channel(&input.channel_id).map_err(|dead| {
             StopChannelErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::not_found_message("Channel", &input.channel_id)),
+                message: Some(dead.message),
             })
         })?;
 
         // Only a running channel can be stopped; anything else (still creating,
-        // still starting, already stopping, idle, deleting) is a conflict.
+        // still starting, already stopping, idle) is a conflict. A channel whose
+        // delete has been accepted never reaches here: the guard above answers it
+        // as not found, so the conflict belongs to a channel that still exists.
         if channel.state != crate::state::channel_state::RUNNING {
             return Err(StopChannelErrorModeled::ConflictException(ConflictException {
                 message: Some(crate::state::channel_not_running_message(

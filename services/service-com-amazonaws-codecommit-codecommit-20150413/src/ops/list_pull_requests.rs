@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPullRequests
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPullRequests`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: reports the `pullRequestId` of every pull request stored on the named
+//! repository (`crate::state::Repository::pull_requests`), most recently created first,
+//! narrowed by `pullRequestStatus` and `authorArn` and paged through this service's one
+//! pagination rule ([`crate::state::page_of`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPullRequests::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `AuthorDoesNotExistException` ("the specified ARN does not exist in the account") is
+//! never the answer here, for the reason `DescribePullRequestEvents` never answers
+//! `ActorDoesNotExistException`: which identities exist is not something this emulator
+//! holds — a caller is identified by the access key id its request is signed with and any
+//! such id is served — so an `authorArn` is judged on its FORM alone
+//! ([`crate::state::is_identity_arn`]), and a well-formed ARN that created no pull request
+//! here simply matches none.
 //!
 //! ## Shape of an operation
 //!
@@ -148,6 +151,28 @@ impl From<ListPullRequestsErrorModeled> for ListPullRequestsError {
     }
 }
 
+/// How this operation refuses a page it cannot serve. Both codes come from this
+/// service's one pagination rule ([`crate::state::page_of`]), so every paginated
+/// listing refuses the same `maxResults` and the same `nextToken` with the same
+/// words; this only maps each outcome onto the error THIS operation models for it.
+fn page_refusal(problem: crate::state::PageProblem) -> ListPullRequestsError {
+    match problem {
+        crate::state::PageProblem::InvalidMaxResults(message) => {
+            ListPullRequestsErrorModeled::InvalidMaxResultsException(InvalidMaxResultsException {
+                message: Some(message),
+            })
+        }
+        crate::state::PageProblem::InvalidContinuationToken(message) => {
+            ListPullRequestsErrorModeled::InvalidContinuationTokenException(
+                InvalidContinuationTokenException {
+                    message: Some(message),
+                },
+            )
+        }
+    }
+    .into()
+}
+
 /// The `ListPullRequests` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -184,18 +209,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPullRequests` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPullRequestsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPullRequests"))
+        let _ = ctx;
+        // `repositoryName` is `@required` with `length 1..100` and pattern
+        // `^[\w\.-]+$`, so an absent or malformed name is already refused at the
+        // request boundary (as `RepositoryNameRequiredException` /
+        // `InvalidRepositoryNameException`, see `crate::service`): reaching here
+        // means the name is well formed and may or may not name a live repository.
+        let repository_name = &input.repository_name;
+
+        // "Optional. The status of the pull request": the member is a modelled
+        // enum, so a value the model does not declare is already refused at the
+        // request boundary and what reaches here is a status a stored pull request
+        // could hold; leaving the member out narrows nothing.
+        let status = input.pull_request_status.as_deref();
+
+        // "Optional. The Amazon Resource Name (ARN) of the user who created the
+        // pull request": optional, so leaving the member out narrows nothing — but
+        // a member that is PRESENT names an author, so it is judged on its form
+        // whatever it holds. An empty or blank value is no ARN at all, which is the
+        // same malformed request as any other non-ARN.
+        let author_arn = input.author_arn.as_deref().map(str::trim);
+        if let Some(requested) = author_arn {
+            if !crate::state::is_identity_arn(requested) {
+                return Err(ListPullRequestsErrorModeled::InvalidAuthorArnException(
+                    InvalidAuthorArnException {
+                        message: Some(crate::state::INVALID_AUTHOR_ARN_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        // Reporting only: the pull requests are read exactly as the operations that
+        // create and change them left them, so two reads answer the same.
+        let store = state.lock();
+        let repository = store.repositories.get(repository_name).ok_or_else(|| {
+            ListPullRequestsErrorModeled::RepositoryDoesNotExistException(
+                RepositoryDoesNotExistException {
+                    message: Some(crate::state::repository_does_not_exist_message(
+                        repository_name,
+                    )),
+                },
+            )
+        })?;
+
+        // The ids this request asks for, MOST RECENTLY CREATED FIRST: a
+        // `pullRequestId` is minted from a counter that only ever goes up
+        // (`crate::state::ComAmazonawsCodecommitCodecommit20150413State::pull_requests_created`)
+        // and the map is keyed by it, so walking the keys backwards is newest
+        // first — the order the operation's documented answer is in (the CodeCommit
+        // CLI reference's `list-pull-requests` output lists the newer id before the
+        // older one). The walk is over stored records, so the ids reported are the
+        // ones state holds.
+        let ids: Vec<String> = repository
+            .pull_requests
+            .values()
+            .rev()
+            .filter(|pull_request| {
+                status.is_none_or(|requested| pull_request.status == requested)
+                    && author_arn.is_none_or(|requested| pull_request.author_arn == requested)
+            })
+            .map(|pull_request| pull_request.pull_request_id.to_string())
+            .collect();
+
+        // A continuation token belongs to the listing it was issued for: the same
+        // repository narrowed the same way, so a token cannot carry a position from
+        // one set of pull requests into another.
+        let scope = format!(
+            "{}/{repository_name}/{}/{}",
+            Self::NAME,
+            status.unwrap_or_default(),
+            author_arn.unwrap_or_default()
+        );
+        let (pull_request_ids, next_token) = crate::state::page_of(
+            &scope,
+            &ids,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(page_refusal)?;
+
+        Ok(ListPullRequestsOutput {
+            // Present and empty for a repository that holds no matching pull
+            // request: an empty list is the answer, and it is what tells an existing
+            // repository with no pull requests apart from one that does not exist.
+            pull_request_ids,
+            next_token,
+        })
     }
 }
+

@@ -27,8 +27,8 @@
 //! modelled `UPDATING` state and owes the `IDLE` it started from, so a caller
 //! polling straight afterwards sees that transient state.
 //!
-//! The id is resolved through the LIVE channel lookup
-//! (`state::live_channel_mut`), so a channel whose delete this service has
+//! The id is resolved through the shared channel-mutation guard
+//! (`state::mutable_channel`), so a channel whose delete this service has
 //! accepted — readable in `DELETING` and then in the terminal `DELETED` — names
 //! nothing a caller may still change. This operation models no 404
 //! (`smithy_query(query="operation", operation="UpdateChannel")`), so such a
@@ -261,22 +261,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // This operation models no `NotFoundException`, so the request itself is
         // what cannot be served: the modelled 400. The message tells the two
         // apart; the status and the code do not.
-        if state.live_channel_mut(&input.channel_id).is_none() {
-            let message = if state.channels.contains_key(&input.channel_id) {
-                crate::state::already_deleted_message(&format!("Channel {}", input.channel_id))
-            } else {
-                crate::state::not_found_message("Channel", &input.channel_id)
-            };
-            return Err(bad_request(&message));
-        }
+        let channel = state
+            .mutable_channel(&input.channel_id)
+            .map_err(|dead| bad_request(&dead.message))?;
 
         // A channel that has not stopped is encoding through exactly the
         // configuration this call would replace, so the edit waits until it has
         // stopped — the same notion `UpdateInput` applies to the channels that
         // attach the input it is asked to edit.
-        let channel = state
-            .live_channel_mut(&input.channel_id)
-            .ok_or_else(unavailable)?;
         if !channel.has_stopped() {
             return Err(UpdateChannelErrorModeled::ConflictException(ConflictException {
                 message: Some(format!(

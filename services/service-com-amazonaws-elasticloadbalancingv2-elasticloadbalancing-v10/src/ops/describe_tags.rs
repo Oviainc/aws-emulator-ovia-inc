@@ -234,30 +234,27 @@ fn tag_list(tags: &HashMap<String, String>) -> Vec<Tag> {
 /// The modelled refusal for an ARN this store holds no resource for: the `NotFound`
 /// error of the resource kind the ARN names.
 fn not_found(kind: TaggableResource, arn: &str) -> DescribeTagsError {
+    // One wording per kind for every tag operation, so the tag read and the tag writes
+    // refuse an absent resource in the same words.
+    let message = Some(crate::state::taggable_not_found_message(kind, arn));
     match kind {
         TaggableResource::LoadBalancer => DescribeTagsErrorModeled::LoadBalancerNotFoundException(
-            LoadBalancerNotFoundException {
-                message: Some(crate::state::load_balancer_not_found_message(arn)),
-            },
+            LoadBalancerNotFoundException { message },
         ),
         TaggableResource::TargetGroup => DescribeTagsErrorModeled::TargetGroupNotFoundException(
-            TargetGroupNotFoundException {
-                message: Some(format!("Target group '{arn}' not found")),
-            },
+            TargetGroupNotFoundException { message },
         ),
         TaggableResource::Listener => {
             DescribeTagsErrorModeled::ListenerNotFoundException(ListenerNotFoundException {
-                message: Some(format!("Listener '{arn}' not found")),
+                message,
             })
         }
         TaggableResource::Rule => {
-            DescribeTagsErrorModeled::RuleNotFoundException(RuleNotFoundException {
-                message: Some(format!("Rule '{arn}' not found")),
-            })
+            DescribeTagsErrorModeled::RuleNotFoundException(RuleNotFoundException { message })
         }
         TaggableResource::TrustStore => {
             DescribeTagsErrorModeled::TrustStoreNotFoundException(TrustStoreNotFoundException {
-                message: Some(format!("Trust store '{arn}' not found")),
+                message,
             })
         }
     }

@@ -45,6 +45,8 @@ mod custom_entity_types;
 mod data_catalog;
 #[path = "all/data_catalog_encryption_settings.rs"]
 mod data_catalog_encryption_settings;
+#[path = "all/data_quality_rule_recommendation_runs.rs"]
+mod data_quality_rule_recommendation_runs;
 #[path = "all/error_messages.rs"]
 mod error_messages;
 #[path = "all/etl_connections.rs"]

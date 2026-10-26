@@ -218,10 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         let Some(studio) = store.studios.get_mut(&input.studio_id) else {
-            return Err(refuse(format!(
-                "Studio id '{}' is not valid or does not exist.",
-                input.studio_id
-            )));
+            return Err(refuse(crate::state::unknown_studio_message()));
         };
 
         // Only what the request carried changes; everything else keeps the value the

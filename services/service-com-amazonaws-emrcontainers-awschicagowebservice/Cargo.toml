@@ -21,7 +21,7 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# SHA-256 behind `state::job_template_fingerprint`: the fixed-size digest that decides
+# SHA-256 behind `state::request_fingerprint`: the fixed-size digest that decides
 # whether a replayed `@idempotencyToken` carries the same request.
 sha2 = { workspace = true }
 # Renders that digest as the hex string the record stores.

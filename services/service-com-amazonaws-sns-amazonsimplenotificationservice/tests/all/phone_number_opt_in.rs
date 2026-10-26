@@ -46,7 +46,10 @@ const PHONE_NUMBER_PARAM: &str = "phoneNumber";
 /// Phone numbers in E.164 format, spanning the forms the rule accepts: both published
 /// digit bounds ([`MIN_E164_DIGITS`], [`MAX_E164_DIGITS`]) and numbers in between,
 /// across country codes of one, two and three digits.
-fn e164_numbers() -> Vec<(&'static str, String)> {
+///
+/// `pub(crate)` so the sibling opt-out LISTING suite drives the same accepted forms
+/// rather than keeping a second catalog of them.
+pub(crate) fn e164_numbers() -> Vec<(&'static str, String)> {
     vec![
         ("north american", "+12065550100".to_string()),
         ("united kingdom", "+447700900123".to_string()),
@@ -105,13 +108,19 @@ async fn check(sns: &Sns, number: &str) -> Answer {
 }
 
 /// One `OptInPhoneNumber` call.
-async fn opt_in(sns: &Sns, number: &str) -> Answer {
+///
+/// `pub(crate)` so the sibling opt-out listing suite clears an opt-out through the
+/// same wire call.
+pub(crate) async fn opt_in(sns: &Sns, number: &str) -> Answer {
     sns.call("OptInPhoneNumber", &[(PHONE_NUMBER_PARAM, number)])
         .await
 }
 
 /// The opt-out state the check reports, asserting the call was served.
-async fn reported(sns: &Sns, case: &str, number: &str) -> bool {
+///
+/// `pub(crate)` so the sibling opt-out listing suite reads one number's state back
+/// through the SAME call rather than writing a second reader.
+pub(crate) async fn reported(sns: &Sns, case: &str, number: &str) -> bool {
     let answer = check(sns, number).await;
     assert_eq!(
         answer.status, 200,
@@ -129,13 +138,28 @@ async fn reported(sns: &Sns, case: &str, number: &str) -> bool {
 /// Record `number` as opted out, as the out-of-band opt-out writes it, with the
 /// instant of its previous opt-in (if any).
 fn seed_opted_out(sns: &Sns, number: &str, last_opt_in: Option<SystemTime>) {
+    seed_opted_out_at(sns, number, SystemTime::now(), last_opt_in);
+}
+
+/// Record `number` as having opted out AT `opted_out_at`, as the out-of-band opt-out
+/// writes it, with the instant of its previous opt-in (if any).
+///
+/// `pub(crate)` so the sibling opt-out listing suite — whose rule is about the ORDER
+/// the opt-out instants put the numbers in — seeds a record the same way rather than
+/// writing a second seeder.
+pub(crate) fn seed_opted_out_at(
+    sns: &Sns,
+    number: &str,
+    opted_out_at: SystemTime,
+    last_opt_in: Option<SystemTime>,
+) {
     let state = sns.state();
     let mut state = state.lock();
     state.phone_numbers.insert(
         number.to_string(),
         PhoneNumberRecord {
             phone_number: number.to_string(),
-            opted_out_at: Some(SystemTime::now()),
+            opted_out_at: Some(opted_out_at),
             last_opt_in,
         },
     );

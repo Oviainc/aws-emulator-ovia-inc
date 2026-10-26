@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListKeyRotations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListKeyRotations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the key materials of the KMS key a `KeyId` names — the
+//! rotations it has had, and optionally the material it was created with. This is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListKeyRotations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORTING operation: it reads the rotation records `EnableKeyRotation` and
+//! `RotateKeyOnDemand` write onto the key and writes nothing itself, so a key that has
+//! never rotated answers an empty list rather than a refusal.
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +122,36 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The `IncludeKeyMaterial` value that adds the material the key was created with to
+/// the listing: "when you specify a value of ALL_KEY_MATERIAL, KMS adds the first key
+/// material and any imported key material pending rotation to the response"
+/// (`smithy_query(query="doc",shape="ListKeyRotationsRequest",member="IncludeKeyMaterial")`).
+const INCLUDE_KEY_MATERIAL_ALL: &str = "ALL_KEY_MATERIAL";
+
+/// The `KeyMaterialState` of the material a key encrypts under now: "KMS uses CURRENT
+/// key material for both encryption and decryption and NON_CURRENT key material only
+/// for decryption" (`smithy_query(query="shape",shape="RotationsListEntry")`).
+const KEY_MATERIAL_STATE_CURRENT: &str = "CURRENT";
+/// See [`KEY_MATERIAL_STATE_CURRENT`].
+const KEY_MATERIAL_STATE_NON_CURRENT: &str = "NON_CURRENT";
+
+/// The `ImportState` of key material a caller has supplied, and of a key still waiting
+/// for some: "it has two possible values: IMPORTED or PENDING_IMPORT"
+/// (`smithy_query(query="shape",shape="ImportState")`).
+const IMPORT_STATE_IMPORTED: &str = "IMPORTED";
+/// See [`IMPORT_STATE_IMPORTED`].
+const IMPORT_STATE_PENDING_IMPORT: &str = "PENDING_IMPORT";
+
+/// The largest page this listing answers with, which is also the largest `Limit` a
+/// request may ask for: `LimitType`'s modelled `@range(1..1000)`
+/// (`smithy_query(query="operation",operation="ListKeyRotations")`).
+const MAX_PAGE: usize = 1000;
+
+/// The page a request that names no `Limit` is paced at: "if you do not include a
+/// value, it defaults to 100"
+/// (`smithy_query(query="doc",shape="ListKeyRotationsRequest",member="Limit")`).
+const DEFAULT_PAGE: usize = 100;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -197,18 +225,189 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListKeyRotations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListKeyRotationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListKeyRotationsErrorModeled::KMSInternalException(
+                KMSInternalException {
+                    message: Some("the KMS state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        // A REPORTING operation: it reads one key's rotation records and writes
+        // nothing.
+        let state = state.lock();
+        let key = match state.resolve(&region, &input.key_id) {
+            crate::state::KeyRef::Found(key) => key,
+            crate::state::KeyRef::UnauthorizedAccount => {
+                return Err(crate::state::unauthorized_account(
+                    Self::NAME,
+                    &input.key_id,
+                ));
+            }
+            crate::state::KeyRef::MalformedArn => {
+                return Err(ListKeyRotationsErrorModeled::InvalidArnException(
+                    InvalidArnException {
+                        message: Some(crate::state::invalid_arn_message(&input.key_id)),
+                    },
+                )
+                .into());
+            }
+            crate::state::KeyRef::NotFound => {
+                return Err(ListKeyRotationsErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // "This parameter can only be used with KMS keys that support automatic or
+        // on-demand key rotation"
+        // (`smithy_query(query="doc",shape="ListKeyRotationsRequest",member="IncludeKeyMaterial")`),
+        // so asking for the first key material of a key whose material never rotates is
+        // "a specified parameter [that] is not supported" — the modelled
+        // `UnsupportedOperationException`, worded the way every other refusal of a key
+        // this service cannot rotate is (`crate::state::unsupported_rotation_message`).
+        // The rotation list itself is reported for EVERY key, because a key that cannot
+        // rotate has simply had no rotations.
+        let include_first_material = input.include_key_material.as_deref() == Some(INCLUDE_KEY_MATERIAL_ALL);
+        if include_first_material && !key.is_symmetric_encryption() {
+            return Err(ListKeyRotationsErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: crate::state::unsupported_rotation_message(),
+                },
+            )
+            .into());
+        }
+
+        // "A list of completed key material rotations", oldest first — the order the
+        // key record keeps them in, so a page boundary is stable across calls and a new
+        // rotation never reshuffles an earlier page. `ALL_KEY_MATERIAL` prepends the
+        // material the key was created with, which is not a rotation and so carries
+        // neither a `RotationDate` nor a `RotationType`: both "field[s] [are] not
+        // present for the first key material"
+        // (`smithy_query(query="shape",shape="RotationsListEntry")`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListKeyRotations"))
+        // The members that are "only present for symmetric encryption KMS keys with
+        // EXTERNAL origin" — the key material description, the import state, the
+        // expiration model and its `ValidTo` — describe IMPORTED key material, so they
+        // are filled from what the caller stated at the import
+        // ([`crate::state::ImportedKeyMaterial`]) for such a key and are absent for
+        // every other. Only the first-material entry can carry them: a key whose
+        // material a caller supplies is not one this service rotates, so it has no
+        // rotation entries.
+        let mut listed: Vec<RotationsListEntry> = Vec::new();
+        if include_first_material {
+            let first_key_material_id = key.first_key_material_id();
+            let external = key.origin == crate::state::ORIGIN_EXTERNAL;
+            let imported = key.imported_material.as_ref().filter(|_| external);
+            listed.push(RotationsListEntry {
+                key_id: Some(key.key_id.clone()),
+                key_material_state: Some(material_state(key, first_key_material_id.as_deref())),
+                key_material_id: first_key_material_id,
+                key_material_description: imported
+                    .and_then(|imported| imported.description.clone()),
+                // "Indicates if the key material is currently imported into KMS": a key
+                // of `EXTERNAL` origin that holds material has it imported, and one
+                // waiting for material does not.
+                import_state: external.then(|| {
+                    if imported.is_some() {
+                        IMPORT_STATE_IMPORTED.to_string()
+                    } else {
+                        IMPORT_STATE_PENDING_IMPORT.to_string()
+                    }
+                }),
+                expiration_model: imported.map(|imported| imported.expiration_model.clone()),
+                // "This field is only present ... in rotation list entries with an
+                // ExpirationModel value of KEY_MATERIAL_EXPIRES", which is exactly when
+                // the import recorded an instant to expire at.
+                valid_to: imported
+                    .and_then(|imported| imported.valid_to)
+                    .map(crate::state::date_time),
+                rotation_date: None,
+                rotation_type: None,
+            });
+        }
+        listed.extend(key.rotations.iter().map(|rotation| RotationsListEntry {
+            key_id: Some(key.key_id.clone()),
+            key_material_id: rotation.key_material_id.clone(),
+            // A rotation this service performs replaces material KMS generated, never
+            // imported material, so the imported-material members describe nothing here.
+            key_material_description: None,
+            import_state: None,
+            key_material_state: Some(material_state(key, rotation.key_material_id.as_deref())),
+            expiration_model: None,
+            valid_to: None,
+            rotation_date: Some(crate::state::date_time(rotation.rotation_date)),
+            rotation_type: Some(rotation.rotation_type.clone()),
+        }));
+
+        // "Set it to the value of NextMarker from the truncated response you just
+        // received", so a marker resumes after the last entry the previous page
+        // returned. Anything else "is not valid" (`InvalidMarkerException`), including a
+        // token naming key material this key no longer lists.
+        let start = match input.marker.as_deref() {
+            None => 0,
+            Some(marker) => {
+                let resume_after =
+                    crate::state::decode_rotation_marker(marker).and_then(|key_material_id| {
+                        listed.iter().position(|entry| {
+                            entry.key_material_id.as_deref() == Some(key_material_id.as_str())
+                        })
+                    });
+                match resume_after {
+                    Some(position) => position + 1,
+                    None => {
+                        return Err(ListKeyRotationsErrorModeled::InvalidMarkerException(
+                            InvalidMarkerException { message: None },
+                        )
+                        .into());
+                    }
+                }
+            }
+        };
+
+        // "When this value is present, KMS does not return more than the specified
+        // number of items, but it might return fewer"; a request that names no `Limit`
+        // is paced at the documented default. A `Limit` that reached here is already
+        // within the modelled range, and is clamped to it again so the page this handler
+        // builds is never a raw request value.
+        let limit = input
+            .limit
+            .and_then(|limit| usize::try_from(limit).ok())
+            .map_or(DEFAULT_PAGE, |limit| limit.clamp(1, MAX_PAGE));
+        let page: Vec<RotationsListEntry> = listed.iter().skip(start).take(limit).cloned().collect();
+
+        // "A flag that indicates whether there are more items in the list": the page
+        // ended before the listing did. `NextMarker` names the last entry of this page
+        // and is present only while the list is truncated.
+        let truncated = start + page.len() < listed.len();
+        let next_marker = page
+            .last()
+            .filter(|_| truncated)
+            .and_then(|entry| entry.key_material_id.as_deref())
+            .map(crate::state::encode_rotation_marker);
+
+        Ok(ListKeyRotationsOutput {
+            rotations: Some(page),
+            next_marker,
+            truncated,
+        })
+    }
+}
+
+/// The `KeyMaterialState` of one version of a key's material: the version the key
+/// encrypts under now is `CURRENT`, and every version a rotation has replaced is
+/// `NON_CURRENT` — "KMS uses CURRENT key material for both encryption and decryption
+/// and NON_CURRENT key material only for decryption"
+/// (`smithy_query(query="shape",shape="RotationsListEntry")`).
+fn material_state(key: &crate::state::Cmk, key_material_id: Option<&str>) -> String {
+    if key_material_id.is_some() && key_material_id == key.current_key_material_id.as_deref() {
+        KEY_MATERIAL_STATE_CURRENT.to_string()
+    } else {
+        KEY_MATERIAL_STATE_NON_CURRENT.to_string()
     }
 }

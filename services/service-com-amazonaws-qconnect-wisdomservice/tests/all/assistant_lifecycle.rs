@@ -1163,16 +1163,17 @@ async fn a_replayed_client_token_answers_with_the_first_resource() {
 }
 
 /// Creating a session under an assistant this account does not hold is refused before
-/// anything is minted — with the modelled `UnauthorizedException` (HTTP 401), which is
-/// what this path answers for a parent it cannot resolve, whichever legal label form
-/// names that parent, including an ARN this emulator could not have minted (another
-/// account, another partition), which names no resource of this account.
+/// anything is minted, and WHICH refusal depends on what the label names: a label that
+/// names no resource identity of this account — an ARN this emulator could not have
+/// minted (another account, another partition) — is the modelled `UnauthorizedException`
+/// (HTTP 401), because no permission of this account covers it; a label that COULD name
+/// one of this account's assistants but names none is resolved and reported absent with
+/// the modelled `ResourceNotFoundException` (HTTP 404).
 #[tokio::test]
 async fn creating_a_session_under_an_unknown_assistant_is_refused() {
     let emulator = Emulator::new();
     // A live assistant, so a foreign-account ARN carrying a REAL assistant id is covered
-    // too: the ARN names no assistant of this account, so the create is refused the same
-    // way as one naming an id nothing holds.
+    // too: the ARN names no assistant of this account.
     let live = emulator
         .create_assistant(REGION, json!({ "name": "live-parent", "type": "AGENT" }))
         .await;
@@ -1180,15 +1181,27 @@ async fn creating_a_session_under_an_unknown_assistant_is_refused() {
         .string("/assistant/assistantId")
         .unwrap_or_else(|| panic!("no assistantId in {}", live.body));
 
-    for (label, parent) in [
-        ("bare uuid nothing holds", ABSENT_UUID.to_string()),
+    for (label, parent, expected_status, expected_code, expected_message) in [
+        (
+            "bare uuid nothing holds",
+            ABSENT_UUID.to_string(),
+            404,
+            "ResourceNotFoundException",
+            MESSAGE_ASSISTANT_NOT_FOUND,
+        ),
         (
             "this account's arn for an absent id",
             expected_assistant_arn(REGION, ABSENT_UUID),
+            404,
+            "ResourceNotFoundException",
+            MESSAGE_ASSISTANT_NOT_FOUND,
         ),
         (
             "another account's arn for a live id",
             format!("arn:aws:wisdom:{REGION}:123456789012:assistant/{live_id}"),
+            401,
+            "UnauthorizedException",
+            MESSAGE_UNAUTHORIZED,
         ),
         (
             "another partition's arn for a live id",
@@ -1196,26 +1209,29 @@ async fn creating_a_session_under_an_unknown_assistant_is_refused() {
                 "arn:aws-cn:wisdom:{REGION}:{}:assistant/{live_id}",
                 engine::EMULATOR_ACCOUNT_ID
             ),
+            401,
+            "UnauthorizedException",
+            MESSAGE_UNAUTHORIZED,
         ),
     ] {
         let reply = emulator
             .create_session(REGION, &parent, json!({ "name": "orphan" }))
             .await;
         assert_eq!(
-            reply.status, 401,
-            "case {label:?}: expected HTTP 401, got {} with body {}",
+            reply.status, expected_status,
+            "case {label:?}: expected HTTP {expected_status}, got {} with body {}",
             reply.status, reply.body
         );
         assert!(
-            reply.error_type.contains("UnauthorizedException"),
-            "case {label:?}: expected UnauthorizedException, got {:?} with body {}",
+            reply.error_type.contains(expected_code),
+            "case {label:?}: expected {expected_code}, got {:?} with body {}",
             reply.error_type,
             reply.body
         );
         assert_eq!(
             reply.string("/message").as_deref(),
-            Some(MESSAGE_UNAUTHORIZED),
-            "case {label:?}: expected the service's fixed text {MESSAGE_UNAUTHORIZED:?}, \
+            Some(expected_message),
+            "case {label:?}: expected the service's fixed text {expected_message:?}, \
              got {:?}",
             reply.string("/message")
         );

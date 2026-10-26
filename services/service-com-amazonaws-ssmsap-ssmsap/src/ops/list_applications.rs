@@ -153,33 +153,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle(::std::time::SystemTime::now());
 
         let filters = input.filters.unwrap_or_default();
-        // The bounds the model declares on `FilterList`, `FilterName` and `FilterValue`,
-        // re-stated before any filtering runs so the work this request does over the
-        // store is bounded by a check in this crate rather than by request size.
-        crate::state::filters_within_bounds(&filters)
-            .map_err(ListApplicationsErrorModeled::ValidationException)?;
-        for filter in &filters {
-            if !FILTER_OPERATOR_VALUES.contains(&filter.operator.as_str()) {
-                return Err(ListApplicationsErrorModeled::ValidationException(
-                    crate::state::validation(format!(
-                        "Filter Operator must be one of {}, but was {}",
-                        FILTER_OPERATOR_VALUES.join(", "),
-                        filter.operator
-                    )),
-                )
-                .into());
-            }
-            if !crate::state::FILTER_NAMES.contains(&filter.name.as_str()) {
-                return Err(ListApplicationsErrorModeled::ValidationException(
-                    crate::state::validation(format!(
-                        "Filter Name must be one of {}, but was {}",
-                        crate::state::FILTER_NAMES.join(", "),
-                        filter.name
-                    )),
-                )
-                .into());
-            }
-        }
+        // The validation every filtered listing of this service shares: the bounds the
+        // model declares on `FilterList`, `FilterName` and `FilterValue` — re-stated
+        // before any filtering runs so the work this request does over the store is
+        // bounded by a check in this crate rather than by request size — then an
+        // operator the model declares and a `Name` this listing reports.
+        crate::state::validate_filters(
+            &filters,
+            crate::state::FilterOperators::Modelled,
+            crate::state::FILTER_NAMES,
+        )
+        .map_err(ListApplicationsErrorModeled::ValidationException)?;
 
         // The ids that match, in id order: the page is taken over ids so only the
         // applications actually returned are projected onto `ApplicationSummary`. Only

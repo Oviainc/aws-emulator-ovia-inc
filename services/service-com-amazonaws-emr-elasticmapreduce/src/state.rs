@@ -192,15 +192,58 @@ pub mod cluster_state_change_reason_code {
     pub const USER_REQUEST: &str = "USER_REQUEST";
 }
 
-/// How a cluster-scoped operation that models no client error refuses a `ClusterId` the
-/// service holds no cluster for.
+/// How a cluster-scoped operation refuses a `ClusterId` the service holds no cluster
+/// for: Amazon EMR's own wording for that refusal, which names the id the caller asked
+/// for. What IS the contract beside the text is the refusal itself — HTTP 400, with the
+/// client error the operation models — rather than an empty success.
 ///
-/// AWS does not document the wording, so the text is built from the request: it names
-/// the id the caller asked for. What IS the contract is the refusal itself — HTTP 400
-/// with the error code `ValidationException` — rather than an empty success.
+/// Every cluster-scoped operation answers THIS sentence, except the two whose refusal
+/// Amazon EMR words differently and which say so at their own call site: the legacy
+/// job-flow surface ([`unknown_job_flow_message`]) and `GetClusterSessionCredentials`
+/// ([`unknown_cluster_without_id_message`]).
 pub fn unknown_cluster_message(cluster_id: &str) -> String {
     format!("Cluster id {}", not_valid_message(cluster_id))
 }
+
+/// How the LEGACY job-flow surface refuses a cluster id it holds no cluster for: the
+/// operations that reach a cluster as a "job flow" answer one fixed sentence, naming
+/// neither the id nor the `ClusterId` member.
+pub fn unknown_job_flow_message() -> String {
+    "Specified job flow ID not valid.".to_string()
+}
+
+/// How `GetClusterSessionCredentials` refuses a cluster id it holds no cluster for: the
+/// same statement as [`unknown_cluster_message`] with no id in it.
+pub fn unknown_cluster_without_id_message() -> String {
+    "Cluster id is not valid.".to_string()
+}
+
+/// How `GetClusterSessionCredentials` refuses a cluster whose security configuration
+/// enables neither runtime roles nor IAM Identity Center: Amazon EMR's own sentence,
+/// which names the missing security-configuration feature and no cluster id. The
+/// apostrophe is the typographic one Amazon EMR writes it with.
+pub fn runtime_roles_not_enabled_message() -> String {
+    "You haven\u{2019}t enabled runtime roles or IAM Identity Center for your cluster in \
+     its security configuration."
+        .to_string()
+}
+
+/// How a Studio operation refuses a `StudioId` the service holds no Studio for.
+///
+/// The EMR Studio backend answers its own name and the wire fields of the error it
+/// raised beside the sentence, and names no Studio id: the id the caller sent is not
+/// part of it, and the request id is this response's own
+/// ([`::service_common::query_error_envelope::new_request_id`]).
+pub fn unknown_studio_message() -> String {
+    format!(
+        "Studio does not exist. (Service: {STUDIO_BACKEND_SERVICE}; Status Code: 400; \
+         Error Code: InvalidRequestException; Request ID: {}; Proxy: null)",
+        ::service_common::query_error_envelope::new_request_id()
+    )
+}
+
+/// The service name the EMR Studio backend reports in the refusals it wraps.
+const STUDIO_BACKEND_SERVICE: &str = "AWSEditors";
 
 /// How an operation refuses a value that names no resource it can resolve: the value,
 /// quoted, and that it is not valid.
@@ -358,6 +401,13 @@ pub const LIST_CLUSTERS_PAGE_SIZE: usize = 50;
 /// greater than 50 steps. To return more than 50 steps using the CLI, specify a
 /// `Marker` …" (`ListSteps` doc, Smithy model.)
 pub const LIST_STEPS_PAGE_SIZE: usize = 50;
+
+/// `ListSecurityConfigurations`, `ListStudios` and `ListStudioSessionMappings` page size.
+///
+/// CHOSEN, not documented: those three operations paginate on `Marker` and state no page
+/// size, so each one takes the 50 Amazon EMR publishes for the listings that DO state one
+/// ([`LIST_CLUSTERS_PAGE_SIZE`], [`LIST_STEPS_PAGE_SIZE`]).
+pub const LIST_PAGE_SIZE: usize = 50;
 
 /// "You can specify a maximum of 10 `stepIDs`." (`ListSteps` doc, Smithy model.)
 pub const LIST_STEPS_MAX_STEP_IDS: usize = 10;
@@ -1108,10 +1158,13 @@ impl NotebookExecutionRecord {
 /// configuration for block public access is updated, Amazon EMR updates this metadata."
 /// (`BlockPublicAccessConfigurationMetadata` doc, Smithy model.)
 ///
-/// The configuration is held as the wire shape the caller supplied, VERBATIM: a `Put`
-/// replaces the whole configuration, so what a later `Get` reports is what was put —
-/// an absent exception list stays absent, an empty one stays empty, and every port
-/// bound keeps the value it was given.
+/// The configuration is held as the wire shape the caller supplied: a `Put` replaces the
+/// whole configuration, so what a later `Get` reports is what was put, and every port
+/// bound keeps the value it was given. The one member canonicalized on the way in is the
+/// exception list, which an account that has put a configuration always HAS: a `Put` that
+/// omits it permits no public port, exactly as an explicit empty list does, so
+/// [`BlockPublicAccessRecord::put`] stores the empty list for both and the two cases read
+/// back as one representation.
 #[derive(Debug, Clone)]
 pub struct BlockPublicAccessRecord {
     pub configuration: BlockPublicAccessConfiguration,
@@ -1145,11 +1198,20 @@ impl BlockPublicAccessRecord {
 
     /// What `PutBlockPublicAccessConfiguration` stored, under the principal that called
     /// it.
+    ///
+    /// The configuration REPLACES whatever was held, and the exception list it leaves out
+    /// is the empty list rather than an unknown: "Specifies ports and port ranges that are
+    /// permitted to have security group rules that allow inbound traffic from all public
+    /// sources" (`BlockPublicAccessConfiguration$PermittedPublicSecurityGroupRuleRanges`
+    /// doc) — a configuration that names none permits none.
     pub fn put(
-        configuration: BlockPublicAccessConfiguration,
+        mut configuration: BlockPublicAccessConfiguration,
         created_by_arn: String,
         at: SystemTime,
     ) -> Self {
+        configuration
+            .permitted_public_security_group_rule_ranges
+            .get_or_insert_with(Vec::new);
         Self {
             configuration,
             creation_date_time: at,
@@ -3141,6 +3203,9 @@ fn audit_field(value: &str) -> String {
 pub enum AuditOutcome {
     /// A security configuration was created and stored.
     SecurityConfigurationCreated,
+    /// A create re-submitted the document already stored under that name, so nothing
+    /// changed (400 is not the answer: the create the caller already made stands).
+    SecurityConfigurationUnchanged,
     /// A stored security configuration was deleted.
     SecurityConfigurationDeleted,
     /// A cluster (job flow) was launched and persisted, under the id EMR minted for it.
@@ -3165,6 +3230,7 @@ impl AuditOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SecurityConfigurationCreated => "security-configuration-created",
+            Self::SecurityConfigurationUnchanged => "security-configuration-unchanged",
             Self::SecurityConfigurationDeleted => "security-configuration-deleted",
             Self::ClusterLaunched => "cluster-launched",
             Self::PersistentAppUICreated => "persistent-app-ui-created",
@@ -3195,6 +3261,35 @@ pub mod architecture {
     pub const AARCH64: &str = "AARCH64";
 }
 
+/// `com.amazonaws.emr#SupportedInstanceType$InstanceFamilyId`: "The Amazon EC2 family and
+/// generation for the `SupportedInstanceType`" — the workload class an EMR instance
+/// family belongs to crossed with its generation, which is what Amazon EMR reports for
+/// this member rather than the family part of the type name.
+///
+/// SOURCE: the values Amazon EMR reports for `InstanceFamilyId`, which are the workload
+/// classes of the Amazon EC2 instance-type naming convention (general purpose, compute
+/// optimized, memory optimized, storage optimized, accelerated) under the generation the
+/// family belongs to. A catalogued family names its class with [`family_class`] and its
+/// generation with [`InstanceFamilySpec::current_generation`]; the two are joined by
+/// [`InstanceFamilySpec::instance_family_id`].
+pub mod family_class {
+    /// A general-purpose family (`m`).
+    pub const GENERAL: &str = "GENERAL";
+    /// A compute-optimised family (`c`).
+    pub const COMPUTE: &str = "COMPUTE";
+    /// A memory-optimised family (`r`, `x`, `z`).
+    pub const HI_MEM: &str = "HI_MEM";
+    /// A storage-optimised family (`i`, `d`, `h`).
+    pub const STORAGE: &str = "STORAGE";
+    /// An accelerated-computing family (`p`, `g`).
+    pub const GPU: &str = "GPU";
+}
+
+/// The generation half of an [`InstanceFamilySpec::instance_family_id`]: a family Amazon
+/// EC2 still offers as current, or one it has superseded.
+const CURRENT_GEN: &str = "CURRENT_GEN";
+const PREVIOUS_GEN: &str = "PREVIOUS_GEN";
+
 /// One family of the instance-type catalog: an EC2 instance family, the sizes it is
 /// offered in, and the facts every size of it shares.
 ///
@@ -3205,15 +3300,18 @@ pub mod architecture {
 /// a sample behind a hand-picked list of names.
 #[derive(Debug, Clone, Copy)]
 pub struct InstanceFamilySpec {
-    /// The family part of the name, which is also EMR's
-    /// `SupportedInstanceType$InstanceFamilyId` ("The Amazon EC2 family and
-    /// generation"): `m5`, `c6g`, `r7g`.
+    /// The family part of the name: `m5`, `c6g`, `r7g`.
     pub family: &'static str,
     /// The size part of every name in this family: its published EC2 size ladder.
     pub sizes: &'static [&'static str],
     /// GiB of memory per vCPU — the constant that makes this family general purpose
     /// (4), compute optimised (2) or memory optimised (8).
     pub memory_gb_per_vcpu: f32,
+    /// The [`family_class`] value of this family's workload class.
+    pub class: &'static str,
+    /// Whether Amazon EC2 offers this family as a current generation, which is the
+    /// generation half of its [`InstanceFamilySpec::instance_family_id`].
+    pub current_generation: bool,
     /// The `architecture::` value of this family's processors.
     pub architecture: &'static str,
     /// Whether EBS optimization is on by default for this family, rather than merely
@@ -3247,6 +3345,18 @@ impl InstanceFamilySpec {
         carried
     }
 
+    /// EMR's `SupportedInstanceType$InstanceFamilyId` for every size of this family:
+    /// its workload class and its generation, joined — `GENERAL_CURRENT_GEN` for a
+    /// current-generation general-purpose family.
+    pub fn instance_family_id(&self) -> String {
+        let generation = if self.current_generation {
+            CURRENT_GEN
+        } else {
+            PREVIOUS_GEN
+        };
+        format!("{}_{generation}", self.class)
+    }
+
     /// This family's rows: one [`SupportedInstanceType`] per size on its ladder,
     /// smallest first.
     pub fn instance_types(&self) -> Vec<SupportedInstanceType> {
@@ -3273,7 +3383,7 @@ impl InstanceFamilySpec {
                     vcpu: Some(vcpu),
                     // Every family here runs a 64-bit processor only.
                     is64_bits_only: Some(true),
-                    instance_family_id: Some(self.family.to_string()),
+                    instance_family_id: Some(self.instance_family_id()),
                     ebs_optimized_available: Some(true),
                     ebs_optimized_by_default: Some(self.ebs_optimized_by_default),
                     // "Number of disks … This value is 0 for Amazon EBS-only
@@ -3349,6 +3459,8 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "m5",
         sizes: SIZES_5TH_GENERATION,
         memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        class: family_class::GENERAL,
+        current_generation: true,
         architecture: architecture::X86_64,
         ebs_optimized_by_default: true,
         introduced_in: &[(5, 13, 0)],
@@ -3357,6 +3469,8 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "m5a",
         sizes: SIZES_5TH_GENERATION,
         memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        class: family_class::GENERAL,
+        current_generation: true,
         architecture: architecture::X86_64,
         ebs_optimized_by_default: true,
         introduced_in: &[(5, 20, 0)],
@@ -3365,6 +3479,8 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "m6i",
         sizes: SIZES_6TH_GENERATION_INTEL,
         memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        class: family_class::GENERAL,
+        current_generation: true,
         architecture: architecture::X86_64,
         ebs_optimized_by_default: true,
         introduced_in: &[(6, 5, 0)],
@@ -3373,6 +3489,8 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "m6a",
         sizes: SIZES_6TH_GENERATION_AMD,
         memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        class: family_class::GENERAL,
+        current_generation: true,
         architecture: architecture::X86_64,
         ebs_optimized_by_default: true,
         introduced_in: &[(6, 6, 0)],
@@ -3381,6 +3499,8 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "m7i",
         sizes: SIZES_7TH_GENERATION_INTEL,
         memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        class: family_class::GENERAL,
+        current_generation: true,
         architecture: architecture::X86_64,
         ebs_optimized_by_default: true,
         introduced_in: &[(6, 15, 0)],
@@ -3390,6 +3510,8 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "m6g",
         sizes: SIZES_GRAVITON,
         memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        class: family_class::GENERAL,
+        current_generation: true,
         architecture: architecture::AARCH64,
         ebs_optimized_by_default: true,
         introduced_in: &[(5, 31, 0), (6, 1, 0)],
@@ -3398,6 +3520,8 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "m7g",
         sizes: SIZES_GRAVITON,
         memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        class: family_class::GENERAL,
+        current_generation: true,
         architecture: architecture::AARCH64,
         ebs_optimized_by_default: true,
         introduced_in: &[(6, 15, 0)],
@@ -3407,6 +3531,8 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "c5",
         sizes: SIZES_C5,
         memory_gb_per_vcpu: MEMORY_COMPUTE_OPTIMIZED,
+        class: family_class::COMPUTE,
+        current_generation: true,
         architecture: architecture::X86_64,
         ebs_optimized_by_default: true,
         introduced_in: &[(5, 13, 0)],
@@ -3415,6 +3541,8 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "c6i",
         sizes: SIZES_6TH_GENERATION_INTEL,
         memory_gb_per_vcpu: MEMORY_COMPUTE_OPTIMIZED,
+        class: family_class::COMPUTE,
+        current_generation: true,
         architecture: architecture::X86_64,
         ebs_optimized_by_default: true,
         introduced_in: &[(6, 5, 0)],
@@ -3423,6 +3551,8 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "c7i",
         sizes: SIZES_7TH_GENERATION_INTEL,
         memory_gb_per_vcpu: MEMORY_COMPUTE_OPTIMIZED,
+        class: family_class::COMPUTE,
+        current_generation: true,
         architecture: architecture::X86_64,
         ebs_optimized_by_default: true,
         introduced_in: &[(6, 15, 0)],
@@ -3431,6 +3561,8 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "c6g",
         sizes: SIZES_GRAVITON,
         memory_gb_per_vcpu: MEMORY_COMPUTE_OPTIMIZED,
+        class: family_class::COMPUTE,
+        current_generation: true,
         architecture: architecture::AARCH64,
         ebs_optimized_by_default: true,
         introduced_in: &[(5, 31, 0), (6, 1, 0)],
@@ -3439,6 +3571,8 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "c7g",
         sizes: SIZES_GRAVITON,
         memory_gb_per_vcpu: MEMORY_COMPUTE_OPTIMIZED,
+        class: family_class::COMPUTE,
+        current_generation: true,
         architecture: architecture::AARCH64,
         ebs_optimized_by_default: true,
         introduced_in: &[(6, 15, 0)],
@@ -3448,6 +3582,8 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "r5",
         sizes: SIZES_5TH_GENERATION,
         memory_gb_per_vcpu: MEMORY_MEMORY_OPTIMIZED,
+        class: family_class::HI_MEM,
+        current_generation: true,
         architecture: architecture::X86_64,
         ebs_optimized_by_default: true,
         introduced_in: &[(5, 20, 0)],
@@ -3456,6 +3592,8 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "r6i",
         sizes: SIZES_6TH_GENERATION_INTEL,
         memory_gb_per_vcpu: MEMORY_MEMORY_OPTIMIZED,
+        class: family_class::HI_MEM,
+        current_generation: true,
         architecture: architecture::X86_64,
         ebs_optimized_by_default: true,
         introduced_in: &[(6, 5, 0)],
@@ -3464,6 +3602,8 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "r6g",
         sizes: SIZES_GRAVITON,
         memory_gb_per_vcpu: MEMORY_MEMORY_OPTIMIZED,
+        class: family_class::HI_MEM,
+        current_generation: true,
         architecture: architecture::AARCH64,
         ebs_optimized_by_default: true,
         introduced_in: &[(5, 31, 0), (6, 1, 0)],
@@ -3472,6 +3612,8 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         family: "r7g",
         sizes: SIZES_GRAVITON,
         memory_gb_per_vcpu: MEMORY_MEMORY_OPTIMIZED,
+        class: family_class::HI_MEM,
+        current_generation: true,
         architecture: architecture::AARCH64,
         ebs_optimized_by_default: true,
         introduced_in: &[(6, 15, 0)],

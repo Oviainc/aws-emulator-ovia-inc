@@ -77,6 +77,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+// The token format every listing of this service issues, hosted once in
+// `crate::state` beside the id-space predicates its decode half takes.
+use crate::state::encode_page_token;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -233,24 +236,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// range 1..100), so an unpaginated caller sees as much as one page can carry.
 const DEFAULT_PAGE_SIZE: usize = 100;
 
-/// A pagination token naming the last snapshot id of the page just returned. Hex keeps
-/// the token opaque to a client and within `PaginationToken`'s 1..8192 length, the same
-/// encoding `ListGraphs` pages its own id space with.
-fn encode_page_token(last_returned_id: &str) -> String {
-    hex::encode(last_returned_id)
-}
-
 /// The snapshot id a token resumes after, or `None` when the token is not one
-/// [`encode_page_token`] produced.
+/// [`encode_page_token`] produced for the snapshot-id space.
 ///
-/// A decoded value that does not name a position in the snapshot-id space (the modelled
-/// `SnapshotId` pattern) is rejected rather than treated as the start of the list.
-/// Membership in the store is deliberately NOT required: a snapshot deleted between two
-/// pages must still leave its successors reachable, which is what resuming from a
-/// position, rather than from a row, gives.
+/// Only the id space is this listing's own: the wire format, and the decision to refuse
+/// a value that names no position in that space rather than treat it as the start of the
+/// list, are [`crate::state::decode_page_token`]'s.
 fn decode_page_token(token: &str) -> Option<String> {
-    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
-    crate::state::is_snapshot_id(&decoded).then_some(decoded)
+    crate::state::decode_page_token(token, crate::state::is_snapshot_id)
 }
 
 #[cfg(test)]
