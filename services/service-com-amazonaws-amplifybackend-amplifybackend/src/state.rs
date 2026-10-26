@@ -30,8 +30,6 @@ pub const RESOURCE_TYPE_BACKEND: &str = "backend";
 pub const RESOURCE_TYPE_BACKEND_ENVIRONMENT: &str = "backend-environment";
 /// `NotFoundException::ResourceType` for an auth resource that does not exist.
 pub const RESOURCE_TYPE_BACKEND_AUTH: &str = "backend-auth";
-/// `NotFoundException::ResourceType` for a job id this app never minted.
-pub const RESOURCE_TYPE_BACKEND_JOB: &str = "backend-job";
 
 /// The modelled `NotFoundException` payload for a resource that does not exist.
 ///
@@ -116,6 +114,31 @@ pub fn resource_not_found<E>(sentence: impl AsRef<str>) -> crate::scaffolded::Sc
     ))
 }
 
+/// The sentence a JOB READ whose address resolves to no job is refused with, WITHOUT the
+/// prefix [`resource_not_found`] adds.
+///
+/// Recorded behaviour, not modelled: the refusal speaks about the PARAMETERS as a whole
+/// and names none of them, so it has no variable part — one sentence answers every
+/// unresolvable job address, and nothing of the request is echoed back.
+pub const UNRESOLVABLE_JOB_SENTENCE: &str = "Unable to find matching job with provided parameters.";
+
+/// The refusal a job read answers when the (app, environment, job id) it addresses
+/// resolves to no job: HTTP 404 with the error code `ResourceNotFoundException` and
+/// [`UNRESOLVABLE_JOB_SENTENCE`].
+///
+/// ONE refusal for the WHOLE address. AmplifyBackend does not tell "this app is unknown"
+/// apart from "this environment or job does not exist" on a job read: every part of the
+/// address is state, so a part that resolves to nothing makes the JOB absent, which is a
+/// 404 and never a request-validation failure — hence this read does NOT run the
+/// app-identity gate ([`require_registered_app`]), and it cannot: the gate's 400 would
+/// classify absent state as a caller bug.
+///
+/// Generic over the operation's modelled error enum, like the other shared refusals, so a
+/// job read cannot word it a second way.
+pub fn job_not_found<E>() -> crate::scaffolded::Scaffolded<E> {
+    resource_not_found(UNRESOLVABLE_JOB_SENTENCE)
+}
+
 /// Whether `app_id` identifies an Amplify app this emulator has registered.
 ///
 /// The registry is this service's own `apps` map: `CreateBackend` is the one operation in
@@ -127,9 +150,12 @@ pub fn resource_not_found<E>(sentence: impl AsRef<str>) -> crate::scaffolded::Sc
 /// answers differ, which is the whole point of the gate. An app id the map does not hold
 /// is refused as invalid INPUT (see [`require_registered_app`]), while a resource missing
 /// INSIDE a registered app is answered as the missing resource it is — the modelled
-/// `NotFoundException` for an environment, a job or an auth resource, the recorded
+/// `NotFoundException` for an environment or an auth resource, the recorded
 /// `ResourceNotFoundException` ([`resource_not_found`]) for the reads that answer it, and
 /// `IsSuccess: true` on `DeleteToken`, which validates nothing but the app.
+///
+/// A JOB READ is not gated at all: its whole address is state, so it answers one
+/// job-absent refusal ([`job_not_found`]) whichever part of it does not resolve.
 ///
 /// What it is NOT, and the one known gap: an `AppId` is minted by Amplify's `CreateApp`,
 /// so the authoritative registry is the Amplify service's app store, and an app that

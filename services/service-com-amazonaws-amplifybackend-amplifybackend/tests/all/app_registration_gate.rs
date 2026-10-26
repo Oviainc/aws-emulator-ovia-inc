@@ -179,7 +179,10 @@ struct Op {
 /// neither is `RemoveAllBackends`, which resolves the app against the registry that mints
 /// an `AppId` (Amplify's own) as well as this service's backend records, so an app this
 /// gate refuses can still be one it serves — its own suite,
-/// `tests/all/remove_all_backends.rs`, is where both answers are pinned.
+/// `tests/all/remove_all_backends.rs`, is where both answers are pinned. `GetBackendJob`
+/// is not here either: its whole address is state, so it answers ONE job-absent refusal
+/// for an unknown app exactly as for an unknown job — `tests/all/backend_job_not_found.rs`
+/// pins that rule.
 fn operations(app_id: &str) -> Vec<Op> {
     vec![
         Op {
@@ -197,15 +200,6 @@ fn operations(app_id: &str) -> Vec<Op> {
             body: Some(json!({})),
             registered_status: 200,
             registered_code: "",
-        },
-        Op {
-            name: "GetBackendJob",
-            method: "GET",
-            path: format!("/backend/{app_id}/job/{ENVIRONMENT}/999"),
-            body: None,
-            // The app exists; job 999 does not.
-            registered_status: 404,
-            registered_code: "NotFoundException",
         },
         Op {
             name: "DeleteBackend",
