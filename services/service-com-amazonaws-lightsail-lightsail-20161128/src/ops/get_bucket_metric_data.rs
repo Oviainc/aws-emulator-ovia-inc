@@ -273,20 +273,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The timestamp indicating the earliest data to be returned" / "the
         // latest data to be returned": a window whose end does not follow its
-        // start spans no instant, so no data of it could be returned.
-        let start = crate::state::timestamp_key(input.start_time);
-        let end = crate::state::timestamp_key(input.end_time);
-        if start >= end {
-            return Err(invalid(format!(
-                "startTime must be earlier than endTime, got startTime {} and endTime {} \
-                 (seconds since the epoch)",
-                // The INSTANT each member names, sub-second part included and
-                // signed, so a window inverted inside one second — or one that
-                // lies before the epoch — is reported as what it is rather than as
-                // two equal whole seconds.
-                input.start_time.as_secs_f64(),
-                input.end_time.as_secs_f64()
-            )));
+        // start spans no instant, so no data of it could be returned. The refusal
+        // is [`crate::state::inverted_window_refusal`], which names both bounds
+        // as the instants they are — this service answers that pair the same way
+        // wherever it takes one.
+        if let Some(message) =
+            crate::state::inverted_window_refusal(input.start_time, input.end_time)
+        {
+            return Err(invalid(message));
         }
 
         // `unit` is "The unit for the metric data request. Valid units depend on

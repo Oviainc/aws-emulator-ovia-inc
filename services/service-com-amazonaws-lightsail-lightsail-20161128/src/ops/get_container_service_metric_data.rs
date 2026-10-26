@@ -207,15 +207,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The start time of the time period" / "The end time of the time
         // period": a period whose end does not follow its start is no period at
-        // all, so no window of it could be reported.
-        let start = crate::state::timestamp_key(input.start_time);
-        let end = crate::state::timestamp_key(input.end_time);
-        if start >= end {
-            return Err(invalid(format!(
-                "startTime must be earlier than endTime, got startTime {} and endTime {} \
-                 (seconds since the epoch)",
-                start.0, end.0
-            )));
+        // all, so no window of it could be reported. The refusal is
+        // [`crate::state::inverted_window_refusal`], which names both bounds as
+        // the instants they are — this service answers that pair the same way
+        // wherever it takes one.
+        if let Some(message) =
+            crate::state::inverted_window_refusal(input.start_time, input.end_time)
+        {
+            return Err(invalid(message));
         }
 
         // `statistics` is "The statistic for the metric": a request that names

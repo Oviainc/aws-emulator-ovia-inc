@@ -200,14 +200,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // interval at all, and this service refuses that pair the same way
         // wherever it takes one (see `GetContainerLog`).
         if let (Some(start), Some(end)) = (input.start_time, input.end_time) {
-            let start_key = crate::state::timestamp_key(start);
-            let end_key = crate::state::timestamp_key(end);
-            if start_key >= end_key {
-                return Err(invalid(format!(
-                    "startTime must be earlier than endTime, got startTime {}.{:09} and \
-                     endTime {}.{:09} (seconds and nanoseconds since the epoch)",
-                    start_key.0, start_key.1, end_key.0, end_key.1
-                )));
+            if let Some(message) = crate::state::inverted_window_refusal(start, end) {
+                return Err(invalid(message));
             }
         }
 

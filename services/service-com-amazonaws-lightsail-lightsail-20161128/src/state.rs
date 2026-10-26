@@ -14268,6 +14268,62 @@ pub fn timestamp_key(value: ::aws_smithy_types::DateTime) -> (i64, u32) {
     (value.secs(), value.subsec_nanos())
 }
 
+/// Nanoseconds in one second, the divisor a `DateTime`'s sub-second part is held
+/// against.
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+
+/// One modelled timestamp as the seconds since the epoch a refusal reports it
+/// by: the whole seconds, the sub-second part beside them, and the instant's own
+/// sign.
+///
+/// The whole seconds alone are NOT the instant — every instant inside one second
+/// shares them, and the seconds component of a pre-epoch instant is the second
+/// BELOW it — so a message built from them alone states two equal numbers for a
+/// pair that differs. The fraction is rendered exactly, from the nanoseconds
+/// rather than through a float, and trailing zeros are dropped so a whole second
+/// still reads as one number.
+fn epoch_seconds_display(value: ::aws_smithy_types::DateTime) -> String {
+    let (secs, subsec_nanos) = timestamp_key(value);
+    if subsec_nanos == 0 {
+        return secs.to_string();
+    }
+    // `secs` is the second at or below the instant and `subsec_nanos` the part
+    // above that second, so a NEGATIVE instant's magnitude is one second less
+    // its fraction: -0.5 is seconds -1 plus 500000000 nanoseconds.
+    let (sign, whole, nanos) = if secs < 0 {
+        (
+            "-",
+            secs.unsigned_abs().saturating_sub(1),
+            NANOS_PER_SECOND - u64::from(subsec_nanos),
+        )
+    } else {
+        ("", secs.unsigned_abs(), u64::from(subsec_nanos))
+    };
+    let fraction = format!("{nanos:09}");
+    format!("{sign}{whole}.{}", fraction.trim_end_matches('0'))
+}
+
+/// The refusal a time window whose end does not follow its start earns, and
+/// `None` while the pair is a window — the one sentence this service answers
+/// that pair with wherever it takes one.
+///
+/// Both bounds are named as the INSTANTS they are, sub-second part and sign
+/// included, so a window inverted inside one second — or one lying before the
+/// epoch — is reported as what it is rather than as two equal whole seconds.
+pub fn inverted_window_refusal(
+    start: ::aws_smithy_types::DateTime,
+    end: ::aws_smithy_types::DateTime,
+) -> Option<String> {
+    (timestamp_key(start) >= timestamp_key(end)).then(|| {
+        format!(
+            "startTime must be earlier than endTime, got startTime {} and endTime {} \
+             (seconds since the epoch)",
+            epoch_seconds_display(start),
+            epoch_seconds_display(end)
+        )
+    })
+}
+
 /// A seed drawn once per process, so ids minted by two emulator processes from
 /// the same counter still differ.
 fn process_seed() -> u128 {
