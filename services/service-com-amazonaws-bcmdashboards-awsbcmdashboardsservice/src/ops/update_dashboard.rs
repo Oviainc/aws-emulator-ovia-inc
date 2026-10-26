@@ -2,9 +2,11 @@
 
 //! @op UpdateDashboard
 //!
-//! Updates the stored dashboard in place: `name` (required) and `description` are
-//! replaced, `widgets` are replaced wholesale when the member is present and left
-//! untouched when it is absent, and `updatedAt` is set to the moment of the call while
+//! Updates the stored dashboard in place: `name` (required) is replaced, each OPTIONAL
+//! member (`description`, `widgets`) is replaced when the request carries it and left
+//! exactly as stored when the request omits it — this service unsets an optional member
+//! through an explicit clear flag (see `UpdateScheduledReport`'s `clearWidgetIds`), not
+//! through omission — and `updatedAt` is set to the moment of the call while
 //! `createdAt` is preserved. An ARN no dashboard is stored under answers the service's
 //! not-found refusal — HTTP 400 with the error code `ResourceNotFoundException` and a
 //! `resourceId` member carrying the requested ARN, as
@@ -223,15 +225,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `name` is @required on every UpdateDashboard call and documented as "The new
-        // name for the dashboard"; `description` is documented as "The new description
-        // for the dashboard" — both are replacements, so an absent `description` leaves
-        // the dashboard with none. `widgets` is documented as "The updated array of
-        // widget configurations for the dashboard. Replaces all existing widgets.", which
-        // is what a present list does; the model says nothing about an absent one, and
-        // this issue's plan has it leave the stored widgets untouched. (Doc text from
-        // smithy_query(query="shape",shape="UpdateDashboardRequest").)
+        // name for the dashboard", so it is always replaced. The OPTIONAL members are a
+        // partial update: a member the request carries replaces what was stored
+        // (`description` is "The new description for the dashboard"; `widgets` is "The
+        // updated array of widget configurations for the dashboard. Replaces all existing
+        // widgets."), and a member the request OMITS leaves the stored value exactly as it
+        // was. This service spells out how a caller unsets an optional member instead:
+        // `UpdateScheduledReportRequest` carries `clearWidgetIds` and
+        // `clearWidgetDateRangeOverride` (boolean, @default false) for precisely that, and
+        // `UpdateDashboardRequest` models no such flag for `description` or `widgets` — so
+        // omission is not a clear here. (Member docs and the clear flags from
+        // smithy_query(query="shape",shape="UpdateDashboardRequest,UpdateScheduledReportRequest").)
         dashboard.name = input.name;
-        dashboard.description = input.description;
+        if let Some(description) = input.description {
+            dashboard.description = Some(description);
+        }
         if let Some(widgets) = widgets {
             dashboard.widgets = widgets;
         }

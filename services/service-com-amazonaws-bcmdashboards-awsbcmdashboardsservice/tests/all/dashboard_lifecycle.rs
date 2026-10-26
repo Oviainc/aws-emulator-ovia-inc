@@ -736,8 +736,8 @@ async fn list_dashboards_refuses_a_bad_page_request() {
 }
 
 /// UpdateDashboard mutates the stored record in place: the members it carries are
-/// replaced, absent `widgets` leave the stored widgets alone, `updatedAt` moves
-/// forward and `createdAt` does not.
+/// replaced, an absent optional member (`description`, `widgets`) leaves what was
+/// stored alone, `updatedAt` moves forward and `createdAt` does not.
 #[tokio::test]
 async fn update_dashboard_mutates_the_stored_record() {
     let original_widgets = json!([
@@ -815,10 +815,17 @@ async fn update_dashboard_mutates_the_stored_record() {
             Some("After Update"),
             "case {label}: the new name must be stored: {after}"
         );
+        // An update that omits `description` leaves the stored one in place: this
+        // service unsets an optional member only through an explicit clear flag, and
+        // UpdateDashboard models none.
+        let expected_description = extra
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("The original description");
         assert_eq!(
             after.get("description").and_then(Value::as_str),
-            extra.get("description").and_then(Value::as_str),
-            "case {label}: description must be the updated one (absent clears it): {after}"
+            Some(expected_description),
+            "case {label}: expected description {expected_description:?}, got {after}"
         );
         let titles: Vec<&str> = after["widgets"]
             .as_array()

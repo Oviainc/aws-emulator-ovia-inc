@@ -55,3 +55,5 @@ mod state_roundtrip;
 mod tag_resource;
 #[path = "all/untag_resource.rs"]
 mod untag_resource;
+#[path = "all/update_dashboard_partial_update.rs"]
+mod update_dashboard_partial_update;
