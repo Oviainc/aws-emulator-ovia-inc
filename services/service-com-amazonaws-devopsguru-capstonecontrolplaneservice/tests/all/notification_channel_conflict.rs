@@ -3,12 +3,15 @@
 //! End-to-end tests for the identity of a notification channel: the SNS topic in
 //! `Config.Sns.TopicArn` IS the channel, and a topic backs at most one channel.
 //!
-//! RULE pinned by every test here: a create whose target identity is already taken
-//! cannot be carried out, so it is REFUSED with the modelled conflict error for the
-//! operation (`ConflictException`, HTTP 409) and the store is left exactly as it was —
-//! never answered as if the create had happened. Freeing the identity (here, removing
-//! the channel) makes the create succeed again, and a create for a free identity is
-//! unaffected.
+//! RULE pinned by every test here: because the target the caller names is the
+//! registration's identity, registering it is IDEMPOTENT — a repeat registration of a
+//! target already registered states what already holds, so it SUCCEEDS with the
+//! operation's success status and reports the EXISTING resource's identifier, minting
+//! nothing, storing nothing new and changing nothing, rather than being refused as a
+//! creation conflict. It holds however many callers repeat it, sequentially or at the
+//! same time, so N callers that each ensure one topic is registered all come away with
+//! the one id. Freeing the identity (here, removing the channel) makes the next
+//! registration mint a fresh one, and a registration for a free identity is unaffected.
 //!
 //! Every test drives the service the way a client does — a buffered HTTP request
 //! through the same `MultiServiceRouter` the emulator boots — and exercises the rule
@@ -25,7 +28,7 @@ use crate::configuration_lifecycle::{is_modeled_channel_id, Emulator};
 use crate::mutation_idempotency_and_tenancy::{channel_config, listed_channel_ids, minted_id};
 
 /// The channels `ListNotificationChannels` reports, as (Id, Config) pairs, walking its
-/// pages — the whole store, so a test can assert a refusal changed NOTHING.
+/// pages — the whole store, so a test can assert a repeat add changed NOTHING.
 async fn listed_channels(emulator: &Emulator) -> Vec<(String, Value)> {
     let mut channels = Vec::new();
     let mut token: Option<String> = None;
@@ -58,35 +61,35 @@ async fn listed_channels(emulator: &Emulator) -> Vec<(String, Value)> {
     }
 }
 
-/// One conflicting registration: what was registered first and what the repeat carries.
-struct ConflictCase<'a> {
+/// One repeated registration: what was registered first and what the repeat carries.
+struct RepeatCase<'a> {
     name: &'a str,
     topic_arn: &'a str,
     /// `Config.Filters` of the registration already in place (`null` for none).
     registered_filters: Value,
-    /// `Config.Filters` the conflicting add carries (`null` for none).
+    /// `Config.Filters` the repeated add carries (`null` for none).
     repeated_filters: Value,
-    /// How many times the conflicting add is repeated — each must be refused alike.
+    /// How many times the add is repeated — each must answer alike.
     attempts: usize,
-    /// Another topic registered first, which the conflict must leave alone.
+    /// Another topic registered first, which the repeat must leave alone.
     bystander_topic: Option<&'a str>,
 }
 
-/// RULE: a topic may back at most one notification channel, so an
-/// `AddNotificationChannel` whose `Config.Sns.TopicArn` already backs a channel is
-/// refused with `ConflictException` (HTTP 409) — naming the channel the conflict is in
-/// — and mints nothing, changes nothing and removes nothing.
+/// RULE: a topic may back at most one notification channel and is that channel's
+/// identity, so an `AddNotificationChannel` whose `Config.Sns.TopicArn` already backs a
+/// channel succeeds with 200 reporting THAT channel's `Id`, and mints nothing, stores
+/// nothing new, changes nothing and removes nothing.
 ///
 /// The rows differ in the form of the topic ARN (region, account, name length), in the
-/// form of `Config.Filters` on both the registered and the conflicting request
-/// (absent, one list, both lists, empty lists, changed), in how many times the
-/// conflicting add is repeated, and in whether another channel exists alongside; the
-/// issue's `us-east-1` topic added twice is the first row.
+/// form of `Config.Filters` on both the registered and the repeated request (absent,
+/// one list, both lists, empty lists, changed), in how many times the add is repeated,
+/// and in whether another channel exists alongside; the issue's topic added twice is
+/// the first row.
 #[tokio::test]
-async fn re_adding_a_registered_topic_is_a_conflict() {
+async fn re_adding_a_registered_topic_reports_the_same_channel() {
     let both_lists = json!({ "Severities": ["HIGH", "MEDIUM"], "MessageTypes": ["NEW_INSIGHT"] });
     let cases = [
-        ConflictCase {
+        RepeatCase {
             name: "the reported topic, added twice with the same config",
             topic_arn: "arn:aws:sns:us-east-1:123456789012:guru-alerts",
             registered_filters: json!(null),
@@ -94,7 +97,7 @@ async fn re_adding_a_registered_topic_is_a_conflict() {
             attempts: 1,
             bystander_topic: None,
         },
-        ConflictCase {
+        RepeatCase {
             name: "a repeat that adds filters, three times",
             topic_arn: "arn:aws:sns:us-west-2:000000000000:sim2real-devopsguru-topic-388962c1",
             registered_filters: json!(null),
@@ -102,7 +105,7 @@ async fn re_adding_a_registered_topic_is_a_conflict() {
             attempts: 3,
             bystander_topic: None,
         },
-        ConflictCase {
+        RepeatCase {
             name: "a repeat that drops the filters, beside another channel",
             topic_arn: "arn:aws:sns:eu-west-1:210987654321:guru-eu-alerts",
             registered_filters: both_lists.clone(),
@@ -110,7 +113,7 @@ async fn re_adding_a_registered_topic_is_a_conflict() {
             attempts: 2,
             bystander_topic: Some("arn:aws:sns:eu-west-1:210987654321:guru-eu-bystander"),
         },
-        ConflictCase {
+        RepeatCase {
             name: "a repeat that changes the filters",
             topic_arn: "arn:aws:sns:ap-southeast-2:000000000000:guru-filtered-topic",
             registered_filters: both_lists.clone(),
@@ -118,7 +121,7 @@ async fn re_adding_a_registered_topic_is_a_conflict() {
             attempts: 1,
             bystander_topic: Some("arn:aws:sns:us-east-1:000000000000:guru-other-region"),
         },
-        ConflictCase {
+        RepeatCase {
             name: "a one-character topic name, repeated with empty filter lists",
             topic_arn: "arn:aws:sns:us-east-2:000000000000:g",
             registered_filters: json!({ "MessageTypes": ["CLOSED_INSIGHT"] }),
@@ -167,46 +170,29 @@ async fn re_adding_a_registered_topic_is_a_conflict() {
                 .add_notification_channel(repeat_config.clone())
                 .await;
             assert_eq!(
-                repeat.status, 409,
-                "case {:?}: re-add {attempt} must be refused with 409, got status {} body {}",
+                repeat.status, 200,
+                "case {:?}: re-add {attempt} must succeed, got status {} body {}",
                 case.name, repeat.status, repeat.raw
             );
-            assert!(
-                repeat.names_error("ConflictException"),
-                "case {:?}: re-add {attempt} must name a ConflictException, got {}",
-                case.name,
-                repeat.raw
-            );
-            assert!(
-                repeat.at("/Id").is_none(),
-                "case {:?}: a refused re-add must report no Id, got {}",
-                case.name,
-                repeat.raw
-            );
-            // `ConflictException` requires Message, ResourceId and ResourceType
-            // (smithy_query(query="shape",shape="ConflictException")); the conflict is
-            // in the channel that already backs the topic, so it is that channel the
-            // error identifies.
             assert_eq!(
-                repeat.at("/ResourceId").and_then(Value::as_str),
+                repeat.at("/Id").and_then(Value::as_str),
                 Some(id.as_str()),
-                "case {:?}: expected the conflicting channel {id:?} in ResourceId, got {}",
+                "case {:?}: re-add {attempt} must report the registered channel {id:?}, got {}",
                 case.name,
                 repeat.raw
             );
-            for member in ["/Message", "/ResourceType"] {
-                let value = repeat.at(member).and_then(Value::as_str).unwrap_or_default();
-                assert!(
-                    !value.is_empty(),
-                    "case {:?}: expected a non-empty {member} on the conflict, got {}",
-                    case.name,
-                    repeat.raw
-                );
-            }
+            // The repeat is a success, so it names no error at all — the conflict the
+            // model still declares for the operation is not what a repeat answers.
+            assert!(
+                !repeat.names_error("ConflictException"),
+                "case {:?}: re-add {attempt} must not report a ConflictException, got {}",
+                case.name,
+                repeat.raw
+            );
         }
 
-        // The refusal changed nothing: the same channels, each still carrying the
-        // config it was registered with.
+        // The repeats changed nothing: the same channels, one per topic, each still
+        // carrying the config the registration that created it submitted.
         let mut after = listed_channels(&emulator).await;
         after.sort_by(|left, right| left.0.cmp(&right.0));
         assert_eq!(
@@ -216,7 +202,7 @@ async fn re_adding_a_registered_topic_is_a_conflict() {
         );
 
         // The rule is keyed on the TOPIC, not on the operation: a free topic still
-        // mints its own channel.
+        // mints a channel of its own.
         let free = emulator
             .add_notification_channel(channel_config(
                 "arn:aws:sns:us-east-1:000000000000:guru-free-topic",
@@ -237,14 +223,14 @@ async fn re_adding_a_registered_topic_is_a_conflict() {
     }
 }
 
-/// RULE (the same identity, released): the conflict lasts exactly as long as the
-/// registration does — once `RemoveNotificationChannel` frees the topic, adding it
-/// again succeeds and mints a fresh id, and THAT registration conflicts in its turn.
+/// RULE (the same identity, released): the registration a repeat resolves to lasts
+/// exactly as long as the channel does — once `RemoveNotificationChannel` frees the
+/// topic, adding it again mints a FRESH id, and repeats then resolve to that one.
 ///
 /// The rows differ in how many register/free cycles the topic goes through and in the
 /// form of `Config.Filters` each cycle carries.
 #[tokio::test]
-async fn freeing_the_topic_lets_it_be_registered_again() {
+async fn freeing_the_topic_mints_a_fresh_channel_for_it() {
     let cases: [(&str, usize, Value); 3] = [
         ("one cycle, no filters", 1, json!(null)),
         (
@@ -278,17 +264,17 @@ async fn freeing_the_topic_lets_it_be_registered_again() {
                 "case {name:?}: cycle {cycle} reused the id {id:?} of a removed channel"
             );
 
-            let conflict = emulator.add_notification_channel(config.clone()).await;
+            let repeat = emulator.add_notification_channel(config.clone()).await;
             assert_eq!(
-                conflict.status, 409,
-                "case {name:?}: cycle {cycle}'s re-add must be refused with 409, got status {} body {}",
-                conflict.status, conflict.raw
+                repeat.status, 200,
+                "case {name:?}: cycle {cycle}'s re-add must succeed, got status {} body {}",
+                repeat.status, repeat.raw
             );
             assert_eq!(
-                conflict.at("/ResourceId").and_then(Value::as_str),
+                repeat.at("/Id").and_then(Value::as_str),
                 Some(id.as_str()),
-                "case {name:?}: cycle {cycle} must name the live channel {id:?}, got {}",
-                conflict.raw
+                "case {name:?}: cycle {cycle} must report the live channel {id:?}, got {}",
+                repeat.raw
             );
 
             let removed = emulator.remove_notification_channel(&id).await;
@@ -310,11 +296,12 @@ async fn freeing_the_topic_lets_it_be_registered_again() {
 /// number of concurrent registrations rather than a single pair.
 const RACERS: usize = 6;
 
-/// RULE (the same identity, reached concurrently): exactly ONE of N callers registering
-/// one topic at the same time creates the channel; every other is refused with the
-/// conflict, and exactly one channel exists afterwards — the id the winner reported.
+/// RULE (the same identity, reached concurrently): N callers registering one topic at
+/// the same time ALL succeed and ALL report the same `Id`, and exactly one channel
+/// exists afterwards — the lookup and the insert happen under one lock, so the race
+/// collapses onto a single registration instead of one caller winning it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn only_one_of_many_concurrent_registrations_creates_the_channel() {
+async fn every_concurrent_registration_of_one_topic_reports_the_same_channel() {
     let emulator = Arc::new(Emulator::new());
     let topic_arn = "arn:aws:sns:us-west-2:000000000000:sim2real-devopsguru-topic-race";
 
@@ -327,42 +314,33 @@ async fn only_one_of_many_concurrent_registrations_creates_the_channel() {
         }));
     }
 
-    let mut created: Vec<String> = Vec::new();
-    let mut refused = 0usize;
+    let mut reported: Vec<String> = Vec::new();
     for racer in racers {
         let (index, reply) = racer.await.expect("the racing add task ran");
-        match reply.status {
-            200 => created.push(minted_id(&reply)),
-            409 => {
-                assert!(
-                    reply.names_error("ConflictException"),
-                    "racer {index}: a refused concurrent add must name a ConflictException, got {}",
-                    reply.raw
-                );
-                refused += 1;
-            }
-            status => panic!(
-                "racer {index}: expected 200 or 409 for a concurrent add, got status {status} body {}",
-                reply.raw
-            ),
-        }
+        assert_eq!(
+            reply.status, 200,
+            "racer {index}: every concurrent add must succeed, got status {} body {}",
+            reply.status, reply.raw
+        );
+        let id = minted_id(&reply);
+        assert!(
+            is_modeled_channel_id(&id),
+            "racer {index}: expected a modelled channel id, got {id:?}"
+        );
+        reported.push(id);
     }
 
+    let distinct: BTreeSet<String> = reported.iter().cloned().collect();
     assert_eq!(
-        created.len(),
+        distinct.len(),
         1,
-        "expected exactly one of {RACERS} racers to create the channel, got {created:?}"
-    );
-    assert_eq!(
-        refused,
-        RACERS - 1,
-        "expected the other {} racers to be refused, got {refused}",
-        RACERS - 1
+        "expected all {RACERS} racers to report one id, got {reported:?}"
     );
 
     let listed = listed_channel_ids(&emulator).await;
+    let expected: Vec<String> = distinct.into_iter().collect();
     assert_eq!(
-        listed, created,
-        "expected exactly the created channel {created:?} after the race, got {listed:?}"
+        listed, expected,
+        "expected exactly the one registered channel {expected:?} after the race, got {listed:?}"
     );
 }

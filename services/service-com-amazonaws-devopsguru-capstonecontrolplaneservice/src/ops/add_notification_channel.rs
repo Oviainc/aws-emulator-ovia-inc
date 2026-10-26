@@ -3,8 +3,11 @@
 //! @op AddNotificationChannel
 //! Registers an SNS topic as a notification channel: mints the channel id and stores
 //! the submitted config against it. The topic is the channel's identity and a topic may
-//! back at most one channel, so an add whose topic already backs one is refused with
-//! `ConflictException` (HTTP 409) and stores nothing.
+//! back at most one channel, so the registration is IDEMPOTENT in its topic: an add
+//! whose topic already backs a channel reports that channel's id with the operation's
+//! success status, mints no second id and stores nothing new, so N callers that each
+//! ensure the topic is registered all end up with the one id. `ConflictException` stays
+//! modelled for the operation, but a repeated registration is not what triggers it.
 //!
 //! ## Shape of an operation
 //!
@@ -194,34 +197,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
 
-        // CREATION CONFLICT. The topic IS the channel's identity and may back at most
-        // one channel, so the registration this call asks to create already exists: the
-        // add cannot be carried out in the state the resource is in and is refused with
-        // the `ConflictException` (HTTP 409) the model declares for exactly that, naming
-        // the channel the conflict is in. Nothing is minted and nothing is changed, so a
-        // caller that meant to create a registration learns none was created, and one
-        // probing for the conflict sees it. Freeing the topic with
-        // `RemoveNotificationChannel` makes the add succeed again. Checked BEFORE the
-        // store bound, because a call that stores nothing cannot take the store past it.
+        // IDEMPOTENT REGISTRATION. The topic IS the channel's identity, so a repeat add
+        // of a topic that already backs a channel asks for a registration that is
+        // already in place: the call states what already holds, so it SUCCEEDS and
+        // reports the registered channel's id. No id is minted, no second record is
+        // inserted and the stored config is left as the registration that created it
+        // submitted, so the store keeps exactly one channel per topic and every caller
+        // racing to register one topic resolves to the same id — the lookup and the
+        // insert below both happen under the one state lock this guard holds, so the
+        // concurrent case collapses rather than racing. Freeing the topic with
+        // `RemoveNotificationChannel` makes the next add mint a fresh channel. Resolved
+        // BEFORE the store bound, because a call that stores nothing cannot take the
+        // store past it.
         if let Some(existing) = guard
             .notification_channels
             .values()
             .find(|channel| channel.sns_topic_arn == topic_arn)
         {
-            return Err(AddNotificationChannelErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "the Amazon SNS topic {topic_arn} already backs notification channel {}",
-                        existing.id
-                    ),
-                    // The conflict is IN the channel that already registers the topic, so
-                    // `ResourceId` is that channel's `NotificationChannelId` and
-                    // `ResourceType` names the kind of resource it is.
-                    resource_id: existing.id.clone(),
-                    resource_type: crate::state::NOTIFICATION_CHANNEL_RESOURCE_TYPE.to_string(),
-                },
-            )
-            .into());
+            return Ok(AddNotificationChannelOutput {
+                id: existing.id.clone(),
+            });
         }
 
         // STORE BOUND. A channel is reclaimed only by `RemoveNotificationChannel`, so

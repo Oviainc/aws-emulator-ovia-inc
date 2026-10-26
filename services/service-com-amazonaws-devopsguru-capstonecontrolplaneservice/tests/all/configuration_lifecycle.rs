@@ -777,7 +777,7 @@ async fn repeating_a_read_reports_the_same_state() {
 /// RULE: `AddNotificationChannel` mints a fresh `NotificationChannelId` and stores the
 /// submitted `Config` under it, so `ListNotificationChannels` reports that id with
 /// exactly the config submitted; the SNS topic identifies the channel, so a second add
-/// of the same topic is refused with `ConflictException` (409) instead of creating a
+/// of the same topic reports the id already registered for it instead of creating a
 /// second channel; `RemoveNotificationChannel` deletes it, after which the id names
 /// nothing and a repeat delete is a successful no-op.
 ///
@@ -840,24 +840,25 @@ async fn a_channel_round_trips_its_config_and_its_topic_is_unique() {
         );
 
         // The topic, not the request, is the channel's identity: the registration is
-        // already in place, so a repeat add conflicts with it (the conflict rule itself
+        // already in place, so a repeat add resolves to it (the idempotency rule itself
         // is pinned by `crate::notification_channel_conflict`).
         let repeat = emulator.add_notification_channel(config.clone()).await;
         assert_eq!(
-            repeat.status, 409,
-            "case {name:?}: a second add of the same topic must be refused, got {}",
+            repeat.status, 200,
+            "case {name:?}: a second add of the same topic must succeed, got {}",
             repeat.raw
         );
-        assert!(
-            repeat.names_error("ConflictException"),
-            "case {name:?}: expected a ConflictException, got {}",
+        assert_eq!(
+            repeat.at("/Id").and_then(Value::as_str),
+            Some(id.as_str()),
+            "case {name:?}: expected the registered id {id:?} back, got {}",
             repeat.raw
         );
         let after_repeat = emulator.list_notification_channels(None).await;
         let listed_again = after_repeat.at("/Channels").cloned().unwrap_or(Value::Null);
         assert_eq!(
             listed_again, expected_channels,
-            "case {name:?}: expected the refused repeat to change nothing, got {listed_again}"
+            "case {name:?}: expected the repeat to change nothing, got {listed_again}"
         );
 
         // An unknown but well-formed id names no channel, so removing it is a no-op.

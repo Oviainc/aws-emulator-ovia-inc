@@ -4,8 +4,9 @@
 //!
 //! * a REMOVAL keyed by a caller-named target is IDEMPOTENT — removing a target already
 //!   absent states what the call asks for, so it succeeds and changes nothing (a
-//!   creation keyed by a target already taken is the opposite rule, a conflict, and is
-//!   pinned by [`crate::notification_channel_conflict`]);
+//!   REGISTRATION keyed by a target already taken follows the same rule from the other
+//!   side — it succeeds reporting the resource already registered — and is pinned by
+//!   [`crate::notification_channel_conflict`]);
 //! * a write is REFUSED with the modelled client error, and persists nothing, when the
 //!   configuration it would leave stored is one the service cannot represent — a second
 //!   app-boundary key for an account that has exactly one, or customer-managed-key
