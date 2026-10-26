@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateNode
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateNode`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateNode::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes the settings of one stored node of one cluster: the `Name`, the
+//! `Role` and the SDI source mappings the request carried, and nothing else — a
+//! member the request names not at all asks for no change to it.
+//!
+//! The lookup, the documented rules (a `Name` "unique in the Cluster", a
+//! mapping's three mandatory parameters, its card numbering and the SdiSource it
+//! connects a port to) and the write all live in the node slice
+//! ([`crate::state::ComAmazonawsMedialiveMedialiveState::apply_node_changes`]),
+//! so this handler only turns a [`crate::state::NodeUpdateRefusal`] into one of
+//! this operation's modelled errors and reports the node the slice read back.
 //!
 //! ## Shape of an operation
 //!
@@ -116,7 +118,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-medialive-medialive.jso
 // here — hence the `UpdateNodeError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.medialive#UpdateNode")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.medialive#UpdateNode",
+    // `NotFoundException` is a shape the SERVICE models, and one `DescribeNode`
+    // and `DeleteNode` declare for this very resource, which this operation's
+    // error list omits: a cluster/node pair that names no node names nothing to
+    // update, which is what the read, the delete and `UpdateNodeState` of the
+    // same node say.
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum UpdateNodeErrorModeled {
     BadGatewayException(BadGatewayException),
@@ -125,6 +135,7 @@ pub enum UpdateNodeErrorModeled {
     ForbiddenException(ForbiddenException),
     GatewayTimeoutException(GatewayTimeoutException),
     InternalServerErrorException(InternalServerErrorException),
+    NotFoundException(NotFoundException),
     TooManyRequestsException(TooManyRequestsException),
 }
 
@@ -179,18 +190,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateNode` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateNodeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateNode"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        // Clock-owed work first, as every operation of this service does: it
+        // materialises only what the clock had already made due, so a node whose
+        // deregistration has come due is answered as the deregistered node it
+        // already was.
+        state.settle(now);
+
+        let changes = crate::state::NodeChanges {
+            name: input.name,
+            role: input.role,
+            sdi_source_mappings: input.sdi_source_mappings,
+        };
+        // The slice checks every refusal BEFORE the first write, so a refused
+        // update leaves the stored node exactly as it was, and it projects the
+        // node it wrote — the response reports the STORED node rather than one
+        // assembled from this request.
+        let node = state
+            .apply_node_changes(&input.cluster_id, &input.node_id, changes)
+            .map_err(|refusal| refused(refusal, &input.node_id))?;
+
+        Ok(crate::state::node_description_output!(UpdateNodeOutput, node))
     }
+}
+
+/// One [`crate::state::NodeUpdateRefusal`] as this operation's own modelled
+/// error.
+///
+/// A cluster/node pair that names no node — and a node whose deregistration has
+/// already been accepted, which names no node a caller may still change — leaves
+/// nothing to update: `NotFoundException` (404), the error `DescribeNode`,
+/// `DeleteNode` and `UpdateNodeState` answer for the same node, with the wording
+/// this service uses for a resource that is not there and for one whose delete
+/// it has already accepted.
+///
+/// A `Name` another live node of the cluster holds is a clash with the stored
+/// state, which is what this operation's `ConflictException` (409) is for,
+/// worded as every other name clash in this service is. An `SdiSourceMappings`
+/// entry that leaves out one of its three mandatory members, names a card the
+/// hardware numbering does not reach or an SdiSource the account does not hold,
+/// and a list longer than this emulator stores, are requests that are out of
+/// bounds: `BadRequestException` (400), the client error this operation models
+/// for a request it cannot act on — the same answer `CreateNode` gives a node's
+/// other caller-chosen list when that is out of bounds.
+fn refused(refusal: crate::state::NodeUpdateRefusal, node_id: &str) -> UpdateNodeError {
+    use crate::state::NodeUpdateRefusal as Refusal;
+    match refusal {
+        Refusal::NoSuchNode => UpdateNodeErrorModeled::NotFoundException(NotFoundException {
+            message: Some(crate::state::not_found_message("Node", node_id)),
+        }),
+        Refusal::DeleteAccepted => UpdateNodeErrorModeled::NotFoundException(NotFoundException {
+            message: Some(crate::state::already_deleted_message(&format!(
+                "Node {node_id}"
+            ))),
+        }),
+        Refusal::NameTaken => UpdateNodeErrorModeled::ConflictException(ConflictException {
+            message: Some(crate::state::NAME_ALREADY_IN_USE_MESSAGE.to_string()),
+        }),
+        Refusal::TooManySdiSourceMappings(count) => {
+            bad_request(crate::state::too_many_sdi_source_mappings_message(count))
+        }
+        Refusal::IncompleteSdiSourceMapping => {
+            bad_request(crate::state::SDI_SOURCE_MAPPING_MEMBERS_MESSAGE.to_string())
+        }
+        Refusal::CardNumberOutOfRange(card_number) => {
+            bad_request(crate::state::card_number_out_of_range_message(card_number))
+        }
+        Refusal::UnknownSdiSource(sdi_source) => bad_request(
+            crate::state::unknown_reference_message("sdiSourceMappings", "SdiSource", &sdi_source),
+        ),
+    }
+    .into()
+}
+
+/// One `BadRequestException` (400) carrying `message` — the shape is stated
+/// once, so the refusals of that class cannot report it differently.
+fn bad_request(message: String) -> UpdateNodeErrorModeled {
+    UpdateNodeErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no node store to update. A modelled server error, never a fresh
+/// engine (which would drop the write when this request returns).
+fn unavailable() -> UpdateNodeError {
+    UpdateNodeErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

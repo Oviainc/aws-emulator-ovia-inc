@@ -30,6 +30,14 @@
 //! ([`node_state::CREATED`]), what a deletion walks through, or a state only the
 //! node's own hardware could reach (see [`node_state`]).
 //!
+//! A node's SETTINGS — its `Name`, its `Role` and its SDI source mappings — are
+//! what `UpdateNode` changes
+//! ([`ComAmazonawsMedialiveMedialiveState::apply_node_changes`]): a member the
+//! request leaves out is not changed, a `Name` is unique in the cluster the node
+//! belongs to, and an SDI source mapping has to name all three of its documented
+//! parameters, a card the hardware numbering reaches and an SdiSource this
+//! account holds.
+//!
 //! A node's DELETION is a DEREGISTRATION: the `NodeState` enum models no
 //! `DELETING`/`DELETED` pair, it models `DEREGISTERING` and the terminal
 //! `DEREGISTERED`, which is what `DeleteNode`'s `202 Accepted` accepts and what
@@ -45,9 +53,10 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     DescribeNodeSummary, NodeInterfaceMapping, NodeInterfaceMappingCreateRequest, SdiSourceMapping,
+    SdiSourceMappingUpdateRequest,
 };
 
-use super::{ComAmazonawsMedialiveMedialiveState, TRANSIENT_STATE_SPAN};
+use super::{ComAmazonawsMedialiveMedialiveState, SdiSourceRecord, TRANSIENT_STATE_SPAN};
 
 /// The `NodeState` values this slice uses, spelled exactly as the model declares
 /// them (`smithy_query(query="shape", shape="NodeState")`: CREATED | REGISTERING
@@ -132,6 +141,52 @@ pub const MAX_NODE_TOKENS: usize = MAX_NODES;
 /// of bounds.
 pub const MAX_NODE_INTERFACE_MAPPINGS: usize = 32;
 
+/// The most `SdiSourceMappings` entries this emulator accepts on one node.
+///
+/// A ceiling, not a guess at AWS's published quota: the list is caller-chosen
+/// and the model targets it at `SdiSourceMappingsUpdateRequest`, which carries
+/// no `@length`, so the request boundary refuses no length and this is where the
+/// bound lives — the same reason, and the same ceiling, as
+/// [`MAX_NODE_INTERFACE_MAPPINGS`] on the other caller-chosen list a node
+/// carries.
+pub const MAX_NODE_SDI_SOURCE_MAPPINGS: usize = 32;
+
+/// The lowest `CardNumber` a mapping can name: "A number that uniquely
+/// identifies the SDI card on the node hardware. … The numbering always starts
+/// at 1" (`smithy_query(query="doc", shape="SdiSourceMappingUpdateRequest",
+/// member="CardNumber")`), so a number below it identifies no card.
+///
+/// A port's `ChannelNumber` has no documented first number — "For information
+/// about how ports are identified on physical cards, see the documentation for
+/// your node hardware" — so no bound of its own is invented here.
+pub const FIRST_SDI_CARD_NUMBER: i32 = 1;
+
+/// The message an `SdiSourceMappings` entry that leaves one of its three
+/// members out is refused with: `SdiSourceMappingUpdateRequest` is documented
+/// "You must specify all three parameters in this object", so an entry naming
+/// fewer connects no port to any source.
+pub const SDI_SOURCE_MAPPING_MEMBERS_MESSAGE: &str =
+    "every entry of sdiSourceMappings must specify cardNumber, channelNumber and sdiSource";
+
+/// The message a request that lists more `SdiSourceMappings` than this emulator
+/// stores is refused with: how many the request carried and the ceiling, worded
+/// as `CreateNode` words the same class of bound on a node's other
+/// caller-chosen list.
+pub fn too_many_sdi_source_mappings_message(count: usize) -> String {
+    format!(
+        "sdiSourceMappings carries {count} mappings; at most {MAX_NODE_SDI_SOURCE_MAPPINGS} are accepted"
+    )
+}
+
+/// The message a mapping naming a card below [`FIRST_SDI_CARD_NUMBER`] is
+/// refused with: the number the request named and the first one the hardware
+/// numbering uses.
+pub fn card_number_out_of_range_message(card_number: i32) -> String {
+    format!(
+        "sdiSourceMappings names cardNumber {card_number}; SDI card numbering starts at {FIRST_SDI_CARD_NUMBER}"
+    )
+}
+
 /// Why [`ComAmazonawsMedialiveMedialiveState::apply_node_state`] wrote nothing.
 /// Each variant leaves the stored node exactly as it was.
 #[derive(Debug)]
@@ -142,6 +197,35 @@ pub enum NodeStateRefusal {
     /// The node exists but its deregistration has already been accepted, so it
     /// is readable and no longer writable.
     DeleteAccepted,
+}
+
+/// Why [`ComAmazonawsMedialiveMedialiveState::apply_node_changes`] wrote
+/// nothing. Each variant leaves the stored node exactly as it was.
+#[derive(Debug)]
+pub enum NodeUpdateRefusal {
+    /// The cluster and node id pair names no node at all — an id no node ever
+    /// had, or one presented under a cluster it does not belong to.
+    NoSuchNode,
+    /// The node exists but its deregistration has already been accepted, so it
+    /// is readable and no longer writable.
+    DeleteAccepted,
+    /// Another live node of the same cluster already carries the requested
+    /// `Name`, which is documented to be unique in the Cluster.
+    NameTaken,
+    /// The request listed more `SdiSourceMappings` than
+    /// [`MAX_NODE_SDI_SOURCE_MAPPINGS`]. Carries the count it asked for, so the
+    /// refusal can name it.
+    TooManySdiSourceMappings(usize),
+    /// One `SdiSourceMappings` entry left out at least one of the three members
+    /// the shape documents as mandatory.
+    IncompleteSdiSourceMapping,
+    /// One entry named a `CardNumber` below [`FIRST_SDI_CARD_NUMBER`], which
+    /// identifies no SDI card. Carries the number it named.
+    CardNumberOutOfRange(i32),
+    /// One entry's `SdiSource` names no SdiSource this account holds, so the
+    /// mapping would connect a port to a source no read of the account can
+    /// show. Carries the id it named.
+    UnknownSdiSource(String),
 }
 
 /// Why [`ComAmazonawsMedialiveMedialiveState::insert_node`] stored nothing. Each
@@ -186,8 +270,10 @@ pub struct NodeRecord {
     /// projected onto the response shape once at create time.
     pub node_interface_mappings: Vec<NodeInterfaceMapping>,
     /// The node's SDI source mappings. Empty at create time — `CreateNode`
-    /// models no member for them; `UpdateNode` is what sets them, and is its own
-    /// issue.
+    /// models no member for them — and written by `UpdateNode`, the one
+    /// operation whose request carries them ("you create a mapping for an SDI
+    /// source by updating a Node. You can't create the mapping when you first
+    /// create the Node").
     pub sdi_source_mappings: Vec<SdiSourceMapping>,
     /// The request's `Tags`. `CreateNode` accepts them but no node-shaped
     /// response carries a `Tags` member (`smithy_query(query="shape",
@@ -213,8 +299,8 @@ impl NodeRecord {
     /// hand out a node this answers `true` for, while the READ path goes on
     /// reporting the record in its terminal state.
     /// [`ComAmazonawsMedialiveMedialiveState::apply_node_state`] resolves its
-    /// node the same way, and so does a mutation the slice gains later
-    /// (`UpdateNode`, its own issue).
+    /// node the same way, and so does
+    /// [`ComAmazonawsMedialiveMedialiveState::apply_node_changes`].
     pub fn is_delete_accepted(&self) -> bool {
         self.state == node_state::DEREGISTERING || self.state == node_state::DEREGISTERED
     }
@@ -522,6 +608,168 @@ impl ComAmazonawsMedialiveMedialiveState {
         let written = node.clone();
         Ok(self.node_summary(&written))
     }
+
+    /// The live node of `cluster_id` called `name`, if that cluster holds one.
+    ///
+    /// `UpdateNode`'s own `Name` is documented "Specify a name that is unique in
+    /// the Cluster … Names are case-sensitive", so at most one node answers and
+    /// the comparison is exact. A node whose deregistration has been accepted
+    /// reserves its name no longer: it is on its way out of the account, so the
+    /// name it carried is free for another node, exactly as the channel
+    /// placement group slice treats a group that is leaving.
+    ///
+    /// Only the UPDATE resolves against this. The uniqueness sentence is on
+    /// `UpdateNodeRequest$Name` alone: `CreateNodeRequest$Name` is documented
+    /// "The user-specified name of the Node to be created"
+    /// (`smithy_query(query="doc", shape="CreateNodeRequest", member="Name")`),
+    /// stating no uniqueness and declaring no error for a clash, so
+    /// [`Self::insert_node`] takes the name the create asked for — unlike the
+    /// channel placement group slice, whose CREATE member carries the sentence
+    /// too and whose create therefore refuses a clash.
+    fn node_named(&self, cluster_id: &str, name: &str) -> Option<&NodeRecord> {
+        self.nodes.values().find(|node| {
+            node.cluster_id == cluster_id
+                && !node.is_delete_accepted()
+                && node.name.as_deref() == Some(name)
+        })
+    }
+
+    /// One `SdiSourceMappings` request list, checked against what the model
+    /// documents of it and projected onto the response shape — or refused.
+    ///
+    /// Each entry has to carry all three of its members ("You must specify all
+    /// three parameters in this object"), name a card the hardware numbering
+    /// reaches ([`FIRST_SDI_CARD_NUMBER`]) and name an SdiSource this account
+    /// holds ("The ID of the SdiSource to associate with this port on this
+    /// card. You can use the ListSdiSources operation to discover all the IDs"),
+    /// which is the same resolution an input's own `SdiSources` list gets
+    /// ([`ComAmazonawsMedialiveMedialiveState::input_configuration_error`]): a
+    /// deleted source is held by the account no longer, so it is nothing a new
+    /// mapping can connect a port to.
+    ///
+    /// The whole list is checked before the caller writes any of it, so a
+    /// refused update leaves the stored node exactly as it was.
+    fn described_sdi_source_mappings(
+        &self,
+        requested: Vec<SdiSourceMappingUpdateRequest>,
+    ) -> Result<Vec<SdiSourceMapping>, NodeUpdateRefusal> {
+        if requested.len() > MAX_NODE_SDI_SOURCE_MAPPINGS {
+            return Err(NodeUpdateRefusal::TooManySdiSourceMappings(requested.len()));
+        }
+        let mut mappings = Vec::with_capacity(requested.len());
+        for mapping in requested {
+            let (Some(card_number), Some(channel_number), Some(sdi_source)) = (
+                mapping.card_number,
+                mapping.channel_number,
+                mapping.sdi_source,
+            ) else {
+                return Err(NodeUpdateRefusal::IncompleteSdiSourceMapping);
+            };
+            if card_number < FIRST_SDI_CARD_NUMBER {
+                return Err(NodeUpdateRefusal::CardNumberOutOfRange(card_number));
+            }
+            if self
+                .sdi_sources
+                .get(&sdi_source)
+                .is_none_or(SdiSourceRecord::is_deleted)
+            {
+                // Whatever the member carried, including the empty string:
+                // the account holds no source of that id, which is exactly
+                // what this refusal says.
+                return Err(NodeUpdateRefusal::UnknownSdiSource(sdi_source));
+            }
+            mappings.push(SdiSourceMapping {
+                card_number: Some(card_number),
+                channel_number: Some(channel_number),
+                sdi_source: Some(sdi_source),
+            });
+        }
+        Ok(mappings)
+    }
+
+    /// Apply an `UpdateNode` request's changes to the node the cluster/node pair
+    /// names and answer the node as that write left it — or refuse.
+    ///
+    /// Every refusal is checked BEFORE the first write, so a refused update
+    /// leaves the stored node exactly as it was. A member the request omitted is
+    /// not changed ("Include this parameter only if you want to change the
+    /// current …"), and a `SdiSourceMappings` the request DID carry replaces the
+    /// node's mappings, because the member is the node's whole mapping list
+    /// rather than an addition to it.
+    ///
+    /// A node whose deregistration has already been accepted is refused rather
+    /// than written, exactly as [`Self::apply_node_state`] refuses it: an id
+    /// whose delete the service accepted names no node a caller may still
+    /// change. Nothing here owes the clock a step — a node's settings are in
+    /// effect as of this call and its `State` is not one of them.
+    pub fn apply_node_changes(
+        &mut self,
+        cluster_id: &str,
+        node_id: &str,
+        changes: NodeChanges,
+    ) -> Result<DescribeNodeSummary, NodeUpdateRefusal> {
+        match self.node(cluster_id, node_id) {
+            None => return Err(NodeUpdateRefusal::NoSuchNode),
+            Some(node) if node.is_delete_accepted() => {
+                return Err(NodeUpdateRefusal::DeleteAccepted)
+            }
+            Some(_) => {}
+        }
+        // A name another live node of this cluster holds is refused, while
+        // re-sending the node's own name is not a collision with itself.
+        if let Some(name) = changes.name.as_deref() {
+            if self
+                .node_named(cluster_id, name)
+                .is_some_and(|holder| holder.id != node_id)
+            {
+                return Err(NodeUpdateRefusal::NameTaken);
+            }
+        }
+        let mappings = match changes.sdi_source_mappings {
+            Some(requested) => Some(self.described_sdi_source_mappings(requested)?),
+            None => None,
+        };
+
+        let node = self
+            .node_mut(cluster_id, node_id)
+            // UNREACHABLE: the node was resolved at the top of this same
+            // exclusive borrow and nothing between the two lookups touches the
+            // store, so this is the invariant restated rather than a second
+            // failure mode.
+            .ok_or(NodeUpdateRefusal::NoSuchNode)?;
+        if let Some(name) = changes.name {
+            node.name = Some(name);
+        }
+        if let Some(role) = changes.role {
+            node.role = Some(role);
+        }
+        if let Some(mappings) = mappings {
+            node.sdi_source_mappings = mappings;
+        }
+        // Projected from the record this call just wrote, for the same reason
+        // [`Self::apply_node_state`] projects its own write.
+        let written = node.clone();
+        Ok(self.node_summary(&written))
+    }
+}
+
+/// The changes one `UpdateNode` request asks for: the members it carried.
+///
+/// `None` is "the request named this member not at all", which asks for no
+/// change to it — every member of the request shape is optional and the model
+/// documents no default for any of them.
+#[derive(Debug, Clone, Default)]
+pub struct NodeChanges {
+    /// The `Name` to change the node's to, which has to be unique in the
+    /// cluster the node belongs to.
+    pub name: Option<String>,
+    /// The `NodeRole` to change the node's to, stored verbatim: the member
+    /// targets an enum, so a value outside it is refused at the request
+    /// boundary.
+    pub role: Option<String>,
+    /// The node's whole SDI source mapping list, as the request shape carries
+    /// it.
+    pub sdi_source_mappings: Option<Vec<SdiSourceMappingUpdateRequest>>,
 }
 
 /// One created node's interface mapping, projected from the CREATE REQUEST shape
@@ -557,8 +805,8 @@ fn node_token_key(cluster_id: &str, token: &str) -> String {
 
 /// Project a `DescribeNodeSummary` onto one of the structurally identical
 /// per-operation flat node output shapes (`CreateNodeOutput`,
-/// `DescribeNodeOutput`, `DeleteNodeOutput`, `UpdateNodeStateOutput`, and
-/// `UpdateNode`'s once that lands).
+/// `DescribeNodeOutput`, `DeleteNodeOutput`, `UpdateNodeStateOutput` and
+/// `UpdateNodeOutput`).
 ///
 /// One macro rather than a hand-written copy of the same member move per
 /// operation, so a create and the read that follows it cannot report the same

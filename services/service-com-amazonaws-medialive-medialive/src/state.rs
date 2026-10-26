@@ -308,8 +308,10 @@ pub(crate) use multiplexes::{multiplex_description_output, multiplex_program_des
 pub mod nodes;
 
 pub use nodes::{
-    node_state, NodeRecord, NodeRefusal, NodeStateRefusal, MAX_NODES,
-    MAX_NODE_INTERFACE_MAPPINGS, MAX_NODE_TOKENS, NODE_CONNECTION_STATE,
+    card_number_out_of_range_message, node_state, too_many_sdi_source_mappings_message, NodeChanges,
+    NodeRecord, NodeRefusal, NodeStateRefusal, NodeUpdateRefusal, FIRST_SDI_CARD_NUMBER, MAX_NODES,
+    MAX_NODE_INTERFACE_MAPPINGS, MAX_NODE_SDI_SOURCE_MAPPINGS, MAX_NODE_TOKENS,
+    NODE_CONNECTION_STATE, SDI_SOURCE_MAPPING_MEMBERS_MESSAGE,
 };
 
 pub(crate) use nodes::node_description_output;

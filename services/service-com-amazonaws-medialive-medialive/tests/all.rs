@@ -239,6 +239,9 @@ mod node_lifecycle;
 #[path = "all/node_listing.rs"]
 mod node_listing;
 
+#[path = "all/node_settings_update.rs"]
+mod node_settings_update;
+
 #[path = "all/offering_catalog.rs"]
 mod offering_catalog;
 

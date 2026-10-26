@@ -35,7 +35,10 @@ async fn create_source(router: &MultiServiceRouter, body: Value) -> (u16, Value)
 ///
 /// `201 Created` is the recorded status of a MediaLive create (see
 /// `CreateSdiSource`'s `SUCCESS_STATUS`).
-async fn created(router: &MultiServiceRouter, case: &str, body: Value) -> Value {
+///
+/// Shared with the node settings suite, whose SDI source mappings have to name
+/// a source this account holds, so the two suites create one the same way.
+pub(crate) async fn created(router: &MultiServiceRouter, case: &str, body: Value) -> Value {
     let (status, source) = create_source(router, body).await;
     assert_eq!(
         status, 201,
@@ -67,7 +70,10 @@ async fn update_source(
     }
 }
 
-async fn delete_source(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+/// `DeleteSdiSource` on one source, which puts it into the terminal `DELETED`
+/// state. Shared with the node settings suite, whose rule is that a deleted
+/// source is nothing a new SDI source mapping can connect a port to.
+pub(crate) async fn delete_source(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     let (status, response) = call(router, "DELETE", &format!("{SDI_SOURCES}/{id}"), None).await;
     if status == 200 {
         (status, response["sdiSource"].clone())
