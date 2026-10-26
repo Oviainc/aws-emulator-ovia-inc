@@ -168,16 +168,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // region's inventory and of no other's, so that is where the parent is
         // resolved — and with it the task nested under it.
         let region = crate::state::request_region(ctx.parts());
-        // `OutpostIdentifier` accepts the bare id or the full Outpost ARN; both name
-        // the same stored Outpost.
-        let outpost_id =
-            crate::state::resolve_outpost_id(&input.outpost_identifier).ok_or_else(|| {
+        // `OutpostIdentifier` accepts the bare id or the full Outpost ARN. A bare id
+        // names an Outpost of the inventory this endpoint serves; an ARN carries a
+        // partition, a Region and an account of its own, and one that is not this
+        // endpoint's names no Outpost it holds.
+        let outpost_not_found = || {
+            ListBlockingInstancesForCapacityTaskErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::identifier_not_found(
+                        crate::state::OUTPOST_IDENTIFIER_MEMBER,
+                        &input.outpost_identifier,
+                    )),
+                },
+            )
+        };
+        let outpost_id = crate::state::resolve_outpost_id(&input.outpost_identifier, &region)
+            .ok_or_else(|| {
                 ListBlockingInstancesForCapacityTaskErrorModeled::ValidationException(
                     ValidationException {
                         message: Some(crate::state::outpost_identifier_pattern_report()),
                     },
                 )
-            })?;
+            })?
+            .here()
+            .ok_or_else(outpost_not_found)?
+            .to_string();
+
         // The resume point the caller's token names. A token this service did not
         // issue for THIS list is a bad request, not an empty page.
         let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
@@ -206,16 +222,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so the parent is resolved first: an Outpost the store does not hold cannot be
         // asked about the instances running on it. The refusal is the identifier echo of
         // the value AS SUPPLIED — not of the bare id an ARN resolved to.
-        let record = store.outpost(&region, &outpost_id).ok_or_else(|| {
-            ListBlockingInstancesForCapacityTaskErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(crate::state::identifier_not_found(
-                        crate::state::OUTPOST_IDENTIFIER_MEMBER,
-                        &input.outpost_identifier,
-                    )),
-                },
-            )
-        })?;
+        let record = store
+            .outpost(&region, &outpost_id)
+            .ok_or_else(outpost_not_found)?;
         // A capacity task belongs to exactly one Outpost, so one named under another
         // Outpost's route names nothing: the task identifier is what is not found.
         let task = store

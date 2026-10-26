@@ -158,14 +158,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // region's inventory and of no other's, so that is where the identifier is
         // resolved.
         let region = crate::state::request_region(ctx.parts());
-        // `OutpostIdentifier` accepts the bare id or the full Outpost ARN; both name
-        // the same stored Outpost.
-        let outpost_id =
-            crate::state::resolve_outpost_id(&input.outpost_identifier).ok_or_else(|| {
+        // `OutpostIdentifier` accepts the bare id or the full Outpost ARN. A bare id
+        // names an Outpost of the inventory this endpoint serves; an ARN carries a
+        // partition, a Region and an account of its own, and one that is not this
+        // endpoint's names no Outpost it holds — so there is no subscription of it
+        // here to price.
+        let not_found = || {
+            GetRenewalPricingErrorModeled::NotFoundException(NotFoundException {
+                // The identifier echo, of the value AS SUPPLIED — not of
+                // `outpost_id`, which is the bare id an ARN resolved to.
+                message: Some(crate::state::identifier_not_found(
+                    crate::state::OUTPOST_IDENTIFIER_MEMBER,
+                    &input.outpost_identifier,
+                )),
+            })
+        };
+        let outpost_id = crate::state::resolve_outpost_id(&input.outpost_identifier, &region)
+            .ok_or_else(|| {
                 GetRenewalPricingErrorModeled::ValidationException(ValidationException {
                     message: Some(crate::state::outpost_identifier_pattern_report()),
                 })
-            })?;
+            })?
+            .here()
+            .ok_or_else(not_found)?
+            .to_string();
+
 
         // A read, so the guard is taken immutably: nothing this operation reports
         // depends on a transition the clock owes — the lifecycle status is the
@@ -177,17 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An Outpost the store holds none of is the not-found error this operation
         // models: there is no subscription of it to price.
         if store.outpost(&region, &outpost_id).is_none() {
-            return Err(GetRenewalPricingErrorModeled::NotFoundException(
-                NotFoundException {
-                    // The identifier echo, of the value AS SUPPLIED — not of
-                    // `outpost_id`, which is the bare id an ARN resolved to.
-                    message: Some(crate::state::identifier_not_found(
-                        crate::state::OUTPOST_IDENTIFIER_MEMBER,
-                        &input.outpost_identifier,
-                    )),
-                },
-            )
-            .into());
+            return Err(not_found().into());
         }
         // Every payment option and term the subscription on this Outpost's own
         // hardware can be renewed under, priced from that hardware.
