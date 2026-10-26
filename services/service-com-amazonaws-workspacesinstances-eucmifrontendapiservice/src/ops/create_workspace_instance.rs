@@ -314,21 +314,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(CreateWorkspaceInstanceErrorModeled::ValidationException)?;
 
         // Both members that carry caller tags for the resource this call creates are
-        // read: `ManagedInstance.TagSpecifications`, each of whose specifications tags
-        // the new instance when it names `instance` or names no resource type at all,
-        // and the top-level `Tags` list, which names the WorkSpace Instance directly.
-        // The direct member is merged LAST, so where both carry a key its value is the
-        // one stored; within either member a repeated key keeps the last value, which
-        // is what merging onto a map gives.
+        // read through the crate's one `TagList` reader: `ManagedInstance
+        // .TagSpecifications`, each of whose specifications tags the new instance when
+        // it names `instance` or names no resource type at all, and the top-level
+        // `Tags` list, which names the WorkSpace Instance directly. The direct member
+        // is merged LAST, so where both carry a key its value is the one stored.
         let mut tags = crate::state::tags_in_specifications(
             crate::state::INSTANCE_TAG_SPECIFICATION_RESOURCE_TYPE,
             input.managed_instance.tag_specifications.iter().flatten(),
         );
-        for tag in input.tags.iter().flatten() {
-            if let Some(key) = tag.key.as_deref() {
-                tags.insert(key.to_string(), tag.value.clone().unwrap_or_default());
-            }
-        }
+        crate::state::merge_tags(&mut tags, input.tags.iter().flatten());
         // One request's `Tags` is `TagList len 0..50` (the same bound as
         // `state::MAX_TAGS_PER_INSTANCE`, enforced at the boundary before this runs),
         // but `TagSpecifications` is a list of up to 30 specifications each carrying

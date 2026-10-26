@@ -169,20 +169,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        // Tagging MERGES onto what is already stored, and a key already present takes
-        // the new value. `Tag.Key` and `Tag.Value` are both optional in the model; an
-        // entry with no key names no tag, and an absent value is the empty value its
-        // `len 0..256` allows.
+        // Tagging MERGES onto what is already stored, through the crate's one
+        // `TagList` reader: a key already present takes the new value, a keyless entry
+        // names no tag, and an absent value is the empty one.
         //
         // The merge is computed BEFORE anything is stored, so a request that would
         // leave the resource holding more tags than the modelled `TagList len 0..50`
         // can report is refused outright rather than growing the record.
         let mut merged = record.tags.clone();
-        for tag in input.tags {
-            if let Some(key) = tag.key {
-                merged.insert(key, tag.value.unwrap_or_default());
-            }
-        }
+        crate::state::merge_tags(&mut merged, input.tags.iter());
         if merged.len() > crate::state::MAX_TAGS_PER_INSTANCE {
             // Names the member and the constraint it violated, and NONE of what the
             // caller sent: this service does not reflect request values back into an

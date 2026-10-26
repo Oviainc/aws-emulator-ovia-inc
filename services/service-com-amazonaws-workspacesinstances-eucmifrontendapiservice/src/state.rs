@@ -2305,15 +2305,38 @@ pub fn specification_tag_keys<'a>(
         .filter_map(|tag| tag.key.as_deref())
 }
 
+/// Merge a modelled `TagList` onto the tag set a record stores.
+///
+/// `Tag.Key` and `Tag.Value` are both optional in the model
+/// (`smithy_query(query="shape",shape="Tag")`): an entry with no key names no tag and
+/// is skipped, and an absent value is the empty value its `len 0..256` allows. A
+/// repeated key keeps the last value, which is what merging onto a map gives, and a
+/// key already in `tags` takes the new value — a `TagList` ADDS to what is stored
+/// rather than replacing it.
+///
+/// The ONE place this direction is written, as [`tag_list`] is the one place for the
+/// inverse: every operation that stores caller tags — the tagging call and both
+/// creates, through their `Tags` member or their `TagSpecifications` — reads a
+/// `TagList` the same way, so the rule cannot drift between them.
+pub fn merge_tags<'a>(
+    tags: &mut BTreeMap<String, String>,
+    entries: impl IntoIterator<Item = &'a Tag>,
+) {
+    for tag in entries {
+        if let Some(key) = tag.key.as_deref() {
+            tags.insert(key.to_string(), tag.value.clone().unwrap_or_default());
+        }
+    }
+}
+
 /// The tags a create request's `TagSpecification` list applies to the ONE resource
 /// the call creates, whose `ResourceTypeEnum` token is `resource_type`.
 ///
 /// Each `TagSpecification` carries a `ResourceTypeEnum` and a `TagList`, so a
 /// specification that names ANOTHER resource type tags nothing on this call; one that
 /// names none, or names this call's own resource type, tags the resource it creates.
-/// `Tag.Key` and `Tag.Value` are both optional in the model: an entry with no key
-/// names no tag, and an absent value is the empty value its `len 0..256` allows. A
-/// repeated key keeps the last value, which is what merging onto a map gives.
+/// Each contributing `TagList` is read through [`merge_tags`], so a keyless entry, an
+/// absent value and a repeated key are treated exactly as they are anywhere else.
 ///
 /// Shared by every create that models a `TagSpecifications` member, so the member is
 /// read the same way whichever resource the call creates.
@@ -2330,14 +2353,7 @@ pub fn tags_in_specifications<'a>(
         if !targets_resource {
             continue;
         }
-        for tag in specification.tags.iter().flatten() {
-            if let Some(key) = tag.key.as_deref() {
-                tags.insert(
-                    key.to_string(),
-                    tag.value.clone().unwrap_or_default(),
-                );
-            }
-        }
+        merge_tags(&mut tags, specification.tags.iter().flatten());
     }
     tags
 }
