@@ -14,8 +14,8 @@
 //!   are the ones SNAPSHOTTED when it started, whatever the profile does later.
 //!
 //! The cases are tables: a row per input class the rules generalise over (member
-//! count, name length, validity-period unit, platform in or out of the documented
-//! catalog, page size, filter).
+//! count, name length, validity-period unit, published platform, page size,
+//! filter).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,8 +58,8 @@ fn matches_profile_version_pattern(value: &str) -> bool {
 
 /// An ACM certificate ARN for `signingMaterial`: the certificate a profile's
 /// signatures are issued under. A put below carries it whenever its platform is
-/// one whose profile holds that certificate — see
-/// `crate::state::platform_requires_signing_material`.
+/// one whose profile holds that certificate — see the published
+/// `requires_signing_material` of `crate::state::SIGNING_PLATFORM_CATALOG`.
 const CERTIFICATE_ARN: &str = "arn:aws:acm:us-west-2:000000000000:certificate/abc";
 
 /// `signingMaterial` naming [`CERTIFICATE_ARN`].
@@ -205,8 +205,8 @@ async fn walk_profiles(router: &MultiServiceRouter, filters: &str, page_size: i3
 
 /// A profile shape to put and read back. The rows differ along what the rule
 /// generalises over: how many optional members the request carries, the length and
-/// form of the name, the validity-period unit, and whether the platform is one the
-/// documented catalog names.
+/// form of the name, the validity-period unit, and which published platform the
+/// profile is bound to (including one published with no display name).
 struct ProfileCase {
     name: &'static str,
     /// The request body, minus nothing: exactly what the client sends.
@@ -268,17 +268,23 @@ fn profile_cases() -> Vec<ProfileCase> {
             }),
             platform_display_name: Some("AmazonFreeRTOS SHA1-RSA CC3220SF-Format"),
         },
-        // A platform the documented catalog does not name: the profile is stored
-        // all the same, with no display name to report.
+        // A YEARS period, one tag, and overrides naming exactly the algorithms
+        // this platform publishes as allowed.
         ProfileCase {
-            name: "Private_Platform_Profile_9",
+            name: "FreeRTOS_Profile_9",
             request: json!({
-                "platformId": "PrivatePlatform-SHA256-ECDSA",
+                "platformId": "AmazonFreeRTOS-Default",
                 "signingMaterial": { "certificateArn": CERTIFICATE_ARN },
                 "signatureValidityPeriod": { "value": 2, "type": "YEARS" },
+                "overrides": {
+                    "signingConfiguration": {
+                        "encryptionAlgorithm": "ECDSA",
+                        "hashAlgorithm": "SHA256",
+                    },
+                },
                 "tags": { "only": "one" },
             }),
-            platform_display_name: None,
+            platform_display_name: Some("AmazonFreeRTOS SHA256-ECDSA"),
         },
     ]
 }

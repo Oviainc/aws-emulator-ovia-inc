@@ -53,22 +53,20 @@ const CERTIFICATE_ARN: &str = "arn:aws:acm:us-west-2:000000000000:certificate/ab
 /// The signing platforms this suite puts profiles on, and whether a profile on
 /// each one must carry `signingMaterial`.
 ///
-/// The first five are the signing platforms this emulator publishes (the ids of
+/// These are the signing platforms this emulator publishes (the ids of
 /// `crate::state::SIGNING_PLATFORM_CATALOG`): the four code-signing platforms
 /// AWS Signer issues the certificate for itself, plus the container-image
 /// platform, whose profile holds the certificate its signatures are issued
-/// under. The rest are platforms outside that catalog, which likewise cannot be
-/// created without naming the certificate. Source: the recorded wire behaviour
-/// of `PutSigningProfile` (see the rule on
-/// `crate::state::platform_requires_signing_material`).
+/// under. Source: the recorded wire behaviour of `PutSigningProfile` (see the
+/// published `requires_signing_material` of each catalog entry). A `platformId`
+/// the catalog does not publish is refused outright, which
+/// `put_profile_platform_validation.rs` covers.
 const PLATFORM_CASES: &[(&str, bool)] = &[
     ("AWSLambda-SHA384-ECDSA", false),
     ("AWSIoTDeviceManagement-SHA256-ECDSA", false),
     ("AmazonFreeRTOS-Default", false),
     ("AmazonFreeRTOS-TI-CC3220SF", false),
     ("Notation-OCI-SHA384-ECDSA", true),
-    ("Notation-OCI-SHA256-ECDSA", true),
-    ("PrivatePlatform-SHA256-ECDSA", true),
 ];
 
 /// One emulator: a router carrying only this service, over one shared engine.
@@ -461,10 +459,10 @@ async fn every_refusal_names_its_condition_in_the_modelled_code_member() {
 /// certificate its signatures are issued under, and refused requests store
 /// nothing.
 ///
-/// One row per catalog platform, plus platform ids outside the catalog, each put
-/// twice: with the certificate and without it.
+/// One row per published platform, each put twice: with the certificate and
+/// without it.
 #[tokio::test]
-async fn signing_material_is_required_exactly_on_the_platforms_outside_the_catalog() {
+async fn signing_material_is_required_exactly_on_the_platforms_that_publish_it() {
     let router = emulator();
 
     for (ordinal, (platform, requires_material)) in PLATFORM_CASES.iter().enumerate() {
