@@ -30,6 +30,13 @@
 //! * "Only one format, `PartitionedPrefix` or `SimplePrefix`, is allowed"
 //!   (`TargetObjectKeyFormat`): a container naming both is refused with `MalformedXML`
 //!   (HTTP 400).
+//! * "You use the Grantee request element to grant access to other people. The Permissions
+//!   request element specifies the kind of access the grantee has to the logs"
+//!   (`PutBucketLogging`): a `TargetGrant` is a grant on the delivered logs, named by the
+//!   same `Grantee` every other grant in this API uses, so a grant whose grantee's `Type`
+//!   and members disagree, which names a group URI outside the predefined set, or which
+//!   carries no grantee or no permission at all, is refused with the code and status that
+//!   same broken grant gets from `PutBucketAcl`.
 //! * A call naming a bucket this emulator does not hold answers `NoSuchBucket` (HTTP 404);
 //!   one naming an `ExpectedBucketOwner` that is not the account's answers HTTP 403
 //!   `AccessDenied`. Every refused put leaves the stored status exactly as it was.
@@ -37,14 +44,16 @@
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use service_com_amazonaws_s3_amazons3::ops::types::{
-    BUCKET_LOGS_PERMISSION_VALUES, PARTITION_DATE_SOURCE_VALUES,
+    BUCKET_LOCATION_CONSTRAINT_VALUES, BUCKET_LOGS_PERMISSION_VALUES, PARTITION_DATE_SOURCE_VALUES,
 };
 use service_com_amazonaws_s3_amazons3::state::{
     CROSS_LOCATION_LOGGING_PROHIBITED_CODE, CROSS_LOCATION_LOGGING_PROHIBITED_MESSAGE,
-    EU_LOCATION_CONSTRAINT_REGION, GRANTEE_CANONICAL_USER, GRANTEE_GROUP,
+    DEFAULT_BUCKET_REGION, EMAIL_GRANTEE_DISCONTINUED_REGIONS, EU_LOCATION_CONSTRAINT_REGION,
+    GRANTEE_BY_EMAIL, GRANTEE_CANONICAL_USER, GRANTEE_GROUP, INVALID_ARGUMENT_CODE,
     INVALID_TARGET_BUCKET_FOR_LOGGING_CODE, INVALID_TARGET_BUCKET_FOR_LOGGING_MESSAGE,
     LOG_DELIVERY_GROUP_URI, MALFORMED_ACL_CODE, MALFORMED_XML_CODE, MALFORMED_XML_MESSAGE,
-    MAX_ACL_GRANTS, NO_SUCH_BUCKET_CODE,
+    MAX_ACL_GRANTS, METHOD_NOT_ALLOWED_CODE, NO_SUCH_BUCKET_CODE,
+    UNRESOLVABLE_GRANT_BY_EMAIL_CODE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -875,4 +884,300 @@ async fn an_expected_bucket_owner_that_is_not_the_account_is_denied() {
             "case {other:?}: a denied put stores nothing, got {reported:?}"
         );
     }
+}
+
+/// Who one `<Grant>` of a `<TargetGrants>` names, spelled out member by member.
+///
+/// A `Grantee` makes only its `Type` required and every id-carrying member optional
+/// (`smithy_query(query="shape",shape="TargetGrant")`), so a payload can name a grantee
+/// whose `Type` and members disagree — which no [`Logging`] row can express.
+#[derive(Debug, Clone, Copy)]
+struct RawGrantee {
+    /// The `Grantee$Type` attribute value.
+    grantee_type: &'static str,
+    /// The element naming the grantee (`ID`, `URI` or `EmailAddress`) and its value, or
+    /// `None` for a grantee that names no member at all.
+    named_by: Option<(&'static str, &'static str)>,
+}
+
+/// One `<Grant>` of a `<TargetGrants>`.
+///
+/// `TargetGrant$Grantee` and `TargetGrant$Permission` are both OPTIONAL in the model (same
+/// query), so a grant can carry neither who nor what.
+#[derive(Debug, Clone, Copy)]
+struct RawGrant {
+    grantee: Option<RawGrantee>,
+    permission: Option<&'static str>,
+}
+
+impl RawGrant {
+    fn xml(&self) -> String {
+        let mut body = String::from("<Grant>");
+        if let Some(grantee) = self.grantee {
+            body.push_str(&format!(
+                "<Grantee xmlns:xsi=\"{XSI}\" xsi:type=\"{}\">",
+                grantee.grantee_type
+            ));
+            if let Some((element, value)) = grantee.named_by {
+                body.push_str(&format!("<{element}>{value}</{element}>"));
+            }
+            body.push_str("</Grantee>");
+        }
+        if let Some(permission) = self.permission {
+            body.push_str(&format!("<Permission>{permission}</Permission>"));
+        }
+        body.push_str("</Grant>");
+        body
+    }
+}
+
+/// A `BucketLoggingStatus` enabling logging to `target_bucket` whose target grants are
+/// spelled out by [`RawGrant`], in the member order `LoggingEnabled` declares.
+fn status_payload_with_grants(
+    target_bucket: &str,
+    target_prefix: &str,
+    grants: &[RawGrant],
+) -> String {
+    let spelled: String = grants.iter().map(RawGrant::xml).collect();
+    format!(
+        "<BucketLoggingStatus xmlns=\"{XMLNS}\"><LoggingEnabled>\
+         <TargetBucket>{target_bucket}</TargetBucket>\
+         <TargetGrants>{spelled}</TargetGrants>\
+         <TargetPrefix>{target_prefix}</TargetPrefix>\
+         </LoggingEnabled></BucketLoggingStatus>"
+    )
+}
+
+/// A group URI that is not one of the predefined groups S3 publishes, so a `Group` grantee
+/// naming it names no group at all.
+const NOT_A_PREDEFINED_GROUP_URI: &str = "http://acs.amazonaws.com/groups/s3/LogDeliver";
+
+/// A canonical user id of the published form, for the rows that name a grantee properly.
+const A_CANONICAL_USER_ID: &str = "79a59df900b949e55d96a1e698fbacedfd6e09d98eacf8f8d5218e7cd47ef2be";
+
+#[tokio::test]
+async fn a_target_grant_that_is_not_a_grant_s3_can_hold_is_refused() {
+    let router = router();
+    let source = "logging-grant-rules";
+    let target = "logging-grant-rules-target";
+    bucket_in(&router, source, None).await;
+    bucket_in(&router, target, None).await;
+
+    // A status the bucket really carries, so every refusal below is asserted to leave the
+    // stored status alone as well as to be refused.
+    let baseline = Logging::to(target, "baseline/").granting(
+        GRANTEE_GROUP,
+        "URI",
+        LOG_DELIVERY_GROUP_URI,
+        "READ",
+    );
+    assert_eq!(
+        put_logging(&router, source, Some(&baseline)).await.status,
+        200,
+        "the baseline put must answer 200"
+    );
+    // Both buckets are in the account's default Region, which is one of the Regions S3 has
+    // discontinued Email Grantee ACLs in — what the email row expects a 405 for.
+    assert!(
+        EMAIL_GRANTEE_DISCONTINUED_REGIONS.contains(&DEFAULT_BUCKET_REGION),
+        "the default Region {DEFAULT_BUCKET_REGION:?} must be one of \
+         {EMAIL_GRANTEE_DISCONTINUED_REGIONS:?} for the email-grantee row to mean what it says"
+    );
+
+    let group = |named_by| RawGrantee {
+        grantee_type: GRANTEE_GROUP,
+        named_by,
+    };
+    let rows: Vec<(&str, Vec<RawGrant>, u16, &str)> = vec![
+        (
+            "a Group grantee naming no URI",
+            vec![RawGrant {
+                grantee: Some(group(None)),
+                permission: Some("READ"),
+            }],
+            400,
+            MALFORMED_ACL_CODE,
+        ),
+        (
+            "a Group grantee whose URI is blank",
+            vec![RawGrant {
+                grantee: Some(group(Some(("URI", "   ")))),
+                permission: Some("READ"),
+            }],
+            400,
+            MALFORMED_ACL_CODE,
+        ),
+        (
+            "a Group grantee naming a URI outside the predefined groups",
+            vec![RawGrant {
+                grantee: Some(group(Some(("URI", NOT_A_PREDEFINED_GROUP_URI)))),
+                permission: Some("READ"),
+            }],
+            400,
+            INVALID_ARGUMENT_CODE,
+        ),
+        (
+            "a CanonicalUser grantee naming no ID",
+            vec![RawGrant {
+                grantee: Some(RawGrantee {
+                    grantee_type: GRANTEE_CANONICAL_USER,
+                    named_by: None,
+                }),
+                permission: Some("FULL_CONTROL"),
+            }],
+            400,
+            MALFORMED_ACL_CODE,
+        ),
+        (
+            "a CanonicalUser grantee named by a URI instead of an ID",
+            vec![RawGrant {
+                grantee: Some(RawGrantee {
+                    grantee_type: GRANTEE_CANONICAL_USER,
+                    named_by: Some(("URI", LOG_DELIVERY_GROUP_URI)),
+                }),
+                permission: Some("WRITE"),
+            }],
+            400,
+            MALFORMED_ACL_CODE,
+        ),
+        (
+            "a grant naming no Permission",
+            vec![RawGrant {
+                grantee: Some(group(Some(("URI", LOG_DELIVERY_GROUP_URI)))),
+                permission: None,
+            }],
+            400,
+            MALFORMED_ACL_CODE,
+        ),
+        (
+            "a grant naming no Grantee",
+            vec![RawGrant {
+                grantee: None,
+                permission: Some("READ"),
+            }],
+            400,
+            MALFORMED_ACL_CODE,
+        ),
+        (
+            // The rule holds for EVERY grant of the list, not just for the first one.
+            "a grant S3 can hold followed by one it cannot",
+            vec![
+                RawGrant {
+                    grantee: Some(RawGrantee {
+                        grantee_type: GRANTEE_CANONICAL_USER,
+                        named_by: Some(("ID", A_CANONICAL_USER_ID)),
+                    }),
+                    permission: Some("FULL_CONTROL"),
+                },
+                RawGrant {
+                    grantee: Some(group(Some(("URI", NOT_A_PREDEFINED_GROUP_URI)))),
+                    permission: Some("READ"),
+                },
+            ],
+            400,
+            INVALID_ARGUMENT_CODE,
+        ),
+        (
+            "an email grantee, where S3 has discontinued Email Grantee ACLs",
+            vec![RawGrant {
+                grantee: Some(RawGrantee {
+                    grantee_type: GRANTEE_BY_EMAIL,
+                    named_by: Some(("EmailAddress", "log-reader@example.com")),
+                }),
+                permission: Some("READ"),
+            }],
+            405,
+            METHOD_NOT_ALLOWED_CODE,
+        ),
+    ];
+
+    for (case, grants, status, code) in rows {
+        let payload = status_payload_with_grants(target, "refused/", &grants);
+        let answer = put_logging_payload(&router, source, &payload, &[]).await;
+        assert_eq!(
+            answer.status, status,
+            "case {case:?}: expected HTTP {status}, got {} ({})",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(
+            answer.error_code(),
+            code,
+            "case {case:?}: expected error code {code:?}, got {:?}",
+            answer.error_code()
+        );
+        assert!(
+            !answer.error_message().is_empty(),
+            "case {case:?}: the refusal must carry a message saying which rule the grant \
+             breaks, got {:?}",
+            answer.error_message()
+        );
+
+        let reported = reported_logging(&get_logging(&router, source).await);
+        assert_eq!(
+            reported.as_ref(),
+            Some(&baseline),
+            "case {case:?}: a refused put stores nothing, so {baseline:?} must still be \
+             reported, got {reported:?}"
+        );
+    }
+}
+
+/// A Region S3 has NOT discontinued Email Grantee ACLs in: the first
+/// `BucketLocationConstraint` value that is a Region code (rather than the legacy `EU`
+/// alias) and is not one of `EMAIL_GRANTEE_DISCONTINUED_REGIONS`. Taken from those two
+/// published catalogs so a change to either cannot leave this row naming a Region that is
+/// in the discontinued set after all.
+fn region_still_taking_email_grantees() -> &'static str {
+    BUCKET_LOCATION_CONSTRAINT_VALUES
+        .iter()
+        .copied()
+        .find(|region| {
+            region.contains('-') && !EMAIL_GRANTEE_DISCONTINUED_REGIONS.contains(region)
+        })
+        .expect("the model must publish a Region outside the discontinued-email set")
+}
+
+#[tokio::test]
+async fn an_email_grantee_resolves_to_no_account_where_s3_still_takes_one() {
+    let router = router();
+    let region = region_still_taking_email_grantees();
+    let source = "logging-email-grantee";
+    let target = "logging-email-grantee-target";
+    // Source and target in the SAME Region, so the cross-location rule is not what refuses
+    // this put.
+    bucket_in(&router, source, Some(region)).await;
+    bucket_in(&router, target, Some(region)).await;
+
+    let payload = status_payload_with_grants(
+        target,
+        "by-email/",
+        &[RawGrant {
+            grantee: Some(RawGrantee {
+                grantee_type: GRANTEE_BY_EMAIL,
+                named_by: Some(("EmailAddress", "log-reader@example.com")),
+            }),
+            permission: Some("READ"),
+        }],
+    );
+    let answer = put_logging_payload(&router, source, &payload, &[]).await;
+    assert_eq!(
+        answer.status,
+        400,
+        "case {region:?}: an email grantee that matches no account must answer 400, got {} ({})",
+        answer.status,
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(
+        answer.error_code(),
+        UNRESOLVABLE_GRANT_BY_EMAIL_CODE,
+        "case {region:?}: expected error code {UNRESOLVABLE_GRANT_BY_EMAIL_CODE:?}, got {:?}",
+        answer.error_code()
+    );
+
+    let reported = reported_logging(&get_logging(&router, source).await);
+    assert_eq!(
+        reported, None,
+        "case {region:?}: a refused put stores nothing, got {reported:?}"
+    );
 }

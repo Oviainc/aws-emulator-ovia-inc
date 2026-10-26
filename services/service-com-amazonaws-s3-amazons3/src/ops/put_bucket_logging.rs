@@ -12,7 +12,9 @@
 //! Logs go to a bucket of the caller's own, in the Region of the bucket being logged: a
 //! target this emulator does not hold is `InvalidTargetBucketForLogging` (400) and one in
 //! another Region `CrossLocationLoggingProhibited` (403). A bucket this emulator does not
-//! hold is `NoSuchBucket` (404).
+//! hold is `NoSuchBucket` (404). A `TargetGrant` is a grant on the delivered logs, so it is
+//! judged by the published rules for one grant — the same rules, codes and statuses
+//! `PutBucketAcl` answers the very same grant with ([`crate::state::validate_acl_grants`]).
 //!
 //! ## Shape of an operation
 //!
@@ -284,23 +286,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "You use the Grantee request element to grant access to other people. The
             // Permissions request element specifies the kind of access the grantee has to
             // the logs" (this operation's own documentation): a target grant is a grant on
-            // the logs delivered to the target bucket, so the published ceiling on an
-            // access control list bounds them — "An ACL can have up to 100 grants"
-            // ([`crate::state::MAX_ACL_GRANTS`]). A status past it does not validate
-            // against the schema S3 publishes for an ACL, which is what
-            // `MalformedACLError` reports, worded by the store's own rule so one ceiling
-            // cannot be described two ways. Refusing it is also what keeps the grants one
-            // bucket can park in this process's memory bounded.
-            let grants = logging.target_grants.as_deref().unwrap_or_default();
-            if grants.len() > crate::state::MAX_ACL_GRANTS {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::state::MALFORMED_ACL_CODE,
-                    MALFORMED_ACL_STATUS,
-                    crate::state::AclRejection::TooManyGrants {
-                        count: grants.len(),
-                    }
-                    .to_string(),
-                ));
+            // the logs delivered to the target bucket, named by the very same `Grantee`
+            // every other grant in this API names its grantee by (`TargetGrant$Grantee`
+            // targets `Grantee`), so the published rules for a grant are the rules for one
+            // of these — the ceiling on how many grants one access control list may hold,
+            // the agreement between a grantee's `Type` and the member that type is named
+            // by, and the predefined group URIs. The store owns that ONE rule
+            // ([`crate::state::validate_acl_grants`]) together with the code and status
+            // each broken one is answered with, so a target grant is refused exactly as
+            // the same grant in a `PutBucketAcl` body is, rather than by a second rule
+            // stated here. Refusing a status past the ceiling is also what keeps the
+            // grants one bucket can park in this process's memory bounded.
+            let target_grants = logging.target_grants.as_deref().unwrap_or_default();
+            // The ceiling is applied to the list as it arrived, before the conversion
+            // below, so a status naming an enormous number of grants is refused for what
+            // it is without a record being built for every one of them first — the order
+            // [`crate::state::validate_acl_grants`] itself judges in, with its own
+            // rejection, so the ceiling is still stated once, in the store.
+            if target_grants.len() > crate::state::MAX_ACL_GRANTS {
+                return Err(refusal(crate::state::AclRejection::TooManyGrants {
+                    count: target_grants.len(),
+                }));
+            }
+            let mut grants: Vec<crate::state::AclGrant> = Vec::with_capacity(target_grants.len());
+            for grant in target_grants {
+                // `TargetGrant$Grantee` and `TargetGrant$Permission` are both OPTIONAL in
+                // the model (`smithy_query(query="shape",shape="TargetGrant")`), so a
+                // payload can carry a grant that grants nothing, or grants it to nobody;
+                // neither is a grant S3 can hold, which is what `MalformedACLError`
+                // reports (the refusal `PutBucketAcl` gives the same half-filled grant).
+                let (Some(grantee), Some(permission)) =
+                    (grant.grantee.as_ref(), grant.permission.as_deref())
+                else {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::MALFORMED_ACL_CODE,
+                        MALFORMED_ACL_STATUS,
+                        "every Grant of a BucketLoggingStatus carries both a Grantee and a \
+                         Permission",
+                    ));
+                };
+                grants.push(crate::state::AclGrant {
+                    grantee: crate::state::AclGrantee {
+                        grantee_type: grantee.r#type.clone(),
+                        id: grantee.id.clone(),
+                        uri: grantee.uri.clone(),
+                        email_address: grantee.email_address.clone(),
+                    },
+                    permission: permission.to_string(),
+                });
+            }
+            // The Region the grants are judged in is the Region of the bucket whose logs
+            // they are delivered with, which the two checks above have already settled is
+            // the source bucket's own.
+            if let Err(rejection) = crate::state::validate_acl_grants(&grants, &source_region) {
+                return Err(refusal(rejection));
             }
 
             // "Amazon S3 key format for log objects. Only one format, PartitionedPrefix or
@@ -337,6 +376,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Unit` output: success is the modelled 200 and an empty body.
         Ok(PutBucketLoggingOutput)
     }
+}
+
+/// The wire code and status S3 answers one broken published grant rule with.
+///
+/// The store reports WHICH rule a grant breaks ([`crate::state::AclRejection`]) and owns
+/// the code and status each one carries, the way `PutBucketAcl` renders the very same
+/// rejection; this turns that answer into this operation's error channel.
+fn refusal(rejection: crate::state::AclRejection) -> PutBucketLoggingError {
+    crate::scaffolded::Scaffolded::unmodeled(
+        rejection.code(),
+        rejection.status(),
+        rejection.to_string(),
+    )
 }
 
 /// The HTTP status AWS answers `MalformedXML` with: 400, the status S3's error-responses
