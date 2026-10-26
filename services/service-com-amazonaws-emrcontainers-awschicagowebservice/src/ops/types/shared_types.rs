@@ -425,7 +425,10 @@ emrc_schema_and_codec!(
     ),
 );
 
-#[smithy_macros::smithy(shape = "com.amazonaws.emrcontainers#Endpoint")]
+/// `createdAt` targets `Date` (`@timestampFormat("date-time")`), so this shape's schema
+/// comes from `emrc_schema_and_codec!` — see `types/date_time_wire.rs`. Member set, order
+/// and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.emrcontainers#Endpoint")`.
 #[derive(Debug, Clone, Default)]
 pub struct Endpoint {
     pub id: Option<String>,
@@ -448,6 +451,110 @@ pub struct Endpoint {
     pub failure_reason: Option<String>,
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
+
+emrc_schema_and_codec!(
+    Endpoint,
+    ENDPOINT_SCHEMA,
+    "com.amazonaws.emrcontainers#Endpoint",
+    "com.amazonaws.emrcontainers",
+    "Endpoint",
+    (M_ID, id, "id", 0, opt, string),
+    (M_NAME, name, "name", 1, opt, string),
+    (M_ARN, arn, "arn", 2, opt, string),
+    (
+        M_VIRTUAL_CLUSTER_ID,
+        virtual_cluster_id,
+        "virtualClusterId",
+        3,
+        opt,
+        string
+    ),
+    (M_TYPE, r#type, "type", 4, opt, string),
+    (M_STATE, state, "state", 5, opt, string),
+    (
+        M_RELEASE_LABEL,
+        release_label,
+        "releaseLabel",
+        6,
+        opt,
+        string
+    ),
+    (
+        M_EXECUTION_ROLE_ARN,
+        execution_role_arn,
+        "executionRoleArn",
+        7,
+        opt,
+        string
+    ),
+    (
+        M_CERTIFICATE_ARN,
+        certificate_arn,
+        "certificateArn",
+        8,
+        opt,
+        string
+    ),
+    (
+        M_CERTIFICATE_AUTHORITY,
+        certificate_authority,
+        "certificateAuthority",
+        9,
+        opt,
+        struct_of(Certificate)
+    ),
+    (
+        M_CONFIGURATION_OVERRIDES,
+        configuration_overrides,
+        "configurationOverrides",
+        10,
+        opt,
+        struct_of(ConfigurationOverrides)
+    ),
+    (M_SERVER_URL, server_url, "serverUrl", 11, opt, string),
+    (
+        M_AUTH_PROXY_URL,
+        auth_proxy_url,
+        "authProxyUrl",
+        12,
+        opt,
+        string
+    ),
+    (M_CREATED_AT, created_at, "createdAt", 13, opt, date_time),
+    (
+        M_SECURITY_GROUP,
+        security_group,
+        "securityGroup",
+        14,
+        opt,
+        string
+    ),
+    (
+        M_SUBNET_IDS,
+        subnet_ids,
+        "subnetIds",
+        15,
+        opt,
+        list_of_string
+    ),
+    (
+        M_STATE_DETAILS,
+        state_details,
+        "stateDetails",
+        16,
+        opt,
+        string
+    ),
+    (
+        M_FAILURE_REASON,
+        failure_reason,
+        "failureReason",
+        17,
+        opt,
+        string
+    ),
+    (M_TAGS, tags, "tags", 18, opt, map_of_string),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.emrcontainers#Certificate")]
 #[derive(Debug, Clone, Default)]

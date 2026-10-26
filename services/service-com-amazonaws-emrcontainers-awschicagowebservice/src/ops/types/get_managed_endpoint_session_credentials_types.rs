@@ -23,6 +23,11 @@ pub struct GetManagedEndpointSessionCredentialsInput {
     pub client_token: Option<String>,
 }
 
+/// `expiresAt` targets `Date` (`@timestampFormat("date-time")`), so the day a handler
+/// reports this shape its schema has to come from `emrc_schema_and_codec!` — see
+/// `types/date_time_wire.rs` — or the instant goes onto the wire as an epoch number.
+/// `GetManagedEndpointSessionCredentials` still answers HTTP 501, so no value of this
+/// shape reaches the wire and the derive stands until the operation is implemented.
 #[smithy_macros::smithy(shape = "com.amazonaws.emrcontainers#GetManagedEndpointSessionCredentialsResponse")]
 #[derive(Debug, Clone, Default)]
 pub struct GetManagedEndpointSessionCredentialsOutput {

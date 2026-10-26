@@ -68,7 +68,17 @@ fn matches_request_identity_arn(arn: &str) -> bool {
 ///
 /// The JSON TYPE is asserted first and on its own: a bare epoch number is the exact defect
 /// this pins, and a reader that accepted either form would not see it.
-fn assert_date_time_string(case: &str, body: &Value, pointer: &str, before: i64, after: i64) {
+///
+/// `pub(crate)` because every suite that reads a `Date` member asserts the SAME rule over
+/// it ([`crate::managed_endpoint_wire_form`] covers the endpoint read paths), so there is
+/// one definition of the wire form rather than one copy per suite.
+pub(crate) fn assert_date_time_string(
+    case: &str,
+    body: &Value,
+    pointer: &str,
+    before: i64,
+    after: i64,
+) {
     let found = field(body, pointer, case);
     assert!(
         found.as_f64().is_none(),

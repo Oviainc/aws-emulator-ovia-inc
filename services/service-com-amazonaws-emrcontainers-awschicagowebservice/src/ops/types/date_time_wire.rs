@@ -37,9 +37,9 @@
 //!   runs on operation INPUTS only (`aws_smithy_schema_server::validate_to_message`, which
 //!   the generated service calls once on the deserialized input before the handler runs).
 //!   Every structure built with these macros is output-only — no operation of this service
-//!   takes a `JobTemplate`, `JobRun`, `SecurityConfiguration`, `VirtualCluster` or a
-//!   `CreateJobTemplateResponse` as its input — so the derive's captured constraints would
-//!   be inert on them too.
+//!   takes a `JobTemplate`, `JobRun`, `SecurityConfiguration`, `VirtualCluster`,
+//!   `Endpoint` or a `CreateJobTemplateResponse` as its input — so the derive's captured
+//!   constraints would be inert on them too.
 //! * The `@http` chain. It is baked onto a shape only when the shape is an operation's
 //!   INPUT; none of these is.
 //! * Map/list sub-member schemas (`.with_map_members(..)` / `.with_list_member(..)`). Only
@@ -47,6 +47,8 @@
 //!   restJson1.
 //! * `@xmlName`/`@jsonName`. No member of the shapes below declares either: each one's
 //!   wire name IS its Smithy member name.
+//! * `@deprecated`. The codec reads no deprecation trait; a deprecated member (`Endpoint`'s
+//!   `certificateArn`) still goes onto the wire under its own name.
 //!
 //! REMOVE THIS MODULE when the vendored codegen learns `smithy.api#timestampFormat`: the
 //! fix belongs there, because every `@timestampFormat` member of every service in this
@@ -85,6 +87,9 @@ macro_rules! emrc_shape_type {
     (map_of_string) => {
         ::aws_smithy_schema::ShapeType::Map
     };
+    (list_of_string) => {
+        ::aws_smithy_schema::ShapeType::List
+    };
     (struct_of) => {
         ::aws_smithy_schema::ShapeType::Structure
     };
@@ -94,7 +99,8 @@ macro_rules! emrc_shape_type {
 /// `@timestampFormat("date-time")` chain call it cannot.
 ///
 /// `$kind` is the member's shape kind — `string` (a `string` or an `enum` shape, both
-/// string-encoded), `boolean`, `date_time`, `map_of_string` or `struct_of(T)`.
+/// string-encoded), `boolean`, `date_time`, `map_of_string`, `list_of_string` or
+/// `struct_of(T)`.
 macro_rules! emrc_member_schema {
     ($ns:literal, $local:literal, $wire:literal, $idx:literal, date_time) => {
         ::aws_smithy_schema::Schema::new_member(
@@ -125,7 +131,8 @@ macro_rules! emrc_member_schema {
 }
 
 /// Write one member, as the vendored codegen's `codegen::emit_write` does for that kind: a
-/// map writes each key and value against the MAP member's own schema.
+/// map writes each key and value, and a list each element, against the MAP or LIST member's
+/// own schema.
 macro_rules! emrc_write_member {
     ($s:ident, $m:expr, $v:expr, string) => { $s.write_string($m, $v.as_str())?; };
     ($s:ident, $m:expr, $v:expr, boolean) => { $s.write_boolean($m, *$v)?; };
@@ -139,12 +146,20 @@ macro_rules! emrc_write_member {
             Ok(())
         })?;
     };
+    ($s:ident, $m:expr, $v:expr, list_of_string) => {
+        $s.write_list($m, &|__sl| {
+            for __it in $v.iter() {
+                __sl.write_string($m, __it.as_str())?;
+            }
+            Ok(())
+        })?;
+    };
     ($s:ident, $m:expr, $v:expr, struct_of($inner:ty)) => { $s.write_struct($m, $v)?; };
 }
 
 /// Read one member, as the vendored codegen's `codegen::emit_read` does for that kind.
 ///
-/// Entry COUNTS are bounded by the request body the server already reads with a cap, and
+/// Element and entry COUNTS are bounded by the request body the server already reads with a cap, and
 /// nesting DEPTH by the codec itself: the vendored JSON deserializer takes a depth guard
 /// at the entry of `read_struct`, `read_list` and `read_map` and refuses a body nesting
 /// deeper than its `MAX_DEPTH`.
@@ -159,6 +174,14 @@ macro_rules! emrc_read_member {
         > = ::std::collections::HashMap::new();
         $d.read_map($m, &mut |__k, __dm| {
             __out.insert(__k, __dm.read_string($m)?);
+            Ok(())
+        })?;
+        __out
+    }};
+    ($d:ident, $m:expr, list_of_string) => {{
+        let mut __out: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
+        $d.read_list($m, &mut |__dl| {
+            __out.push(__dl.read_string($m)?);
             Ok(())
         })?;
         __out
