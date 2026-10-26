@@ -135,6 +135,12 @@ async fn every_page(
     (names, pages)
 }
 
+/// A collection larger than the page size a client would ask for by hand, and
+/// within the per-multiplex bound (`MAX_MULTIPLEX_PROGRAMS`): what a row uses to
+/// assert that the service never cuts a page below the `MaxResults` the request
+/// asked for.
+const A_LARGE_COLLECTION: usize = 57;
+
 /// One row of the pagination table: how many programs the multiplex holds and
 /// the page size the request asks for.
 struct Paging {
@@ -157,8 +163,8 @@ struct Paging {
 ///
 /// The rows differ along the COUNT of stored programs and the page size asked
 /// for — none, one, a size that divides the collection unevenly, no size at all,
-/// a size past the service's ceiling, and more programs than one default page
-/// holds — because that is what the rule generalises over.
+/// a size past the service's ceiling, and more programs than a hand-written page
+/// size would hold — because that is what the rule generalises over.
 #[tokio::test]
 async fn list_multiplex_programs_pages_through_every_program_in_name_order() {
     let table = [
@@ -198,10 +204,12 @@ async fn list_multiplex_programs_pages_through_every_program_in_name_order() {
             page_size: Some(MAX_LIST_PAGE_SIZE as i32 + 500),
         },
         Paging {
-            // More programs than a single default page holds, so the default
-            // page size is itself a cut and not just a ceiling nobody reaches.
-            case: "more programs than one default page holds",
-            programs: MAX_LIST_PAGE_SIZE + 7,
+            // A collection far larger than any page a caller would ask for by
+            // hand: the service's ceiling is the published `MaxResults` bound,
+            // well above what the collection can hold, so one page carries them
+            // all.
+            case: "a large collection, no page size",
+            programs: A_LARGE_COLLECTION,
             page_size: None,
         },
     ];
