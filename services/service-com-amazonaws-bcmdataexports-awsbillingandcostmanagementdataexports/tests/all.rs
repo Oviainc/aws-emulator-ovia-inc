@@ -21,6 +21,8 @@ mod catalog_schema;
 mod catalog_schema_versions;
 #[path = "all/data_query.rs"]
 mod data_query;
+#[path = "all/data_query_resolution.rs"]
+mod data_query_resolution;
 #[path = "all/delivery_executions.rs"]
 mod delivery_executions;
 #[path = "all/destination_configuration.rs"]

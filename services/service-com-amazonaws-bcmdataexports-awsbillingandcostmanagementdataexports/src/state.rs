@@ -58,10 +58,7 @@ pub mod query;
 // operations that read it, exactly as they were before the catalog grew its own module.
 // The query reader is reached as `crate::state::…` by the two operations that accept an
 // export definition, for the same reason the catalog is: both of them read it.
-pub use query::{
-    effective_table_configurations, query_tables, validate_data_query, QueryRefusal,
-    TableConfigurations,
-};
+pub use query::{resolve_data_query, QueryRefusal, TableConfigurations};
 
 // The destination reader is reached as `crate::state::…` by those same two operations:
 // a submitted destination configuration is judged the same way whichever of them
@@ -1303,7 +1300,7 @@ pub(crate) fn clip_list_for_message(items: &[&str], separator: &str, budget: usi
 
 // The export's data query — its parsing, its bounds and its refusals — lives in
 // [`query`], which `CreateExport` and `UpdateExport` both read through
-// [`validate_data_query`]: a definition cannot be judged one way by one and another way
+// [`resolve_data_query`]: a definition cannot be judged one way by one and another way
 // by the other.
 
 #[cfg(test)]

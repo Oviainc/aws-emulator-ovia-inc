@@ -218,9 +218,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it, each named table that publishes table properties must restate its
         // `TableConfigurations` entry. The whole replacement is judged BEFORE anything is
         // written, so a definition this service could not deliver never displaces the
-        // stored one. See `crate::state::query`.
-        crate::state::validate_data_query(&input.export.data_query, true).map_err(
-            |refusal| match refusal {
+        // stored one.
+        //
+        // The same ONE pass reports the table configuration the replacement is STORED
+        // with, the same way a create's is, so the stored query carries each published
+        // property of the tables it names and a definition read back through `GetExport`
+        // and handed straight to this operation keeps them. See `crate::state::query`.
+        let table_configurations = crate::state::resolve_data_query(&input.export.data_query, true)
+            .map_err(|refusal| match refusal {
                 crate::state::QueryRefusal::Invalid(invalid) => {
                     UpdateExportErrorModeled::ValidationException(invalid)
                 }
@@ -229,8 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::QueryRefusal::Internal(fault) => {
                     UpdateExportErrorModeled::InternalServerException(fault)
                 }
-            },
-        )?;
+            })?;
 
         // The REPLACEMENT destination is judged exactly as a create's is, for the same
         // reason the replacement query is: "all export parameters must be provided in the
@@ -242,22 +246,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::state::destination`.
         crate::state::validate_destination_configurations(&input.export.destination_configurations)
             .map_err(UpdateExportErrorModeled::ValidationException)?;
-
-        // The definition is stored with the table configuration IN FORCE, the same way a
-        // create's is, so the stored query carries each published property of the tables
-        // it names and a definition read back through `GetExport` and handed straight to
-        // this operation keeps them.
-        let table_configurations =
-            crate::state::effective_table_configurations(&input.export.data_query).map_err(
-                |refusal| match refusal {
-                    crate::state::QueryRefusal::Invalid(invalid) => {
-                        UpdateExportErrorModeled::ValidationException(invalid)
-                    }
-                    crate::state::QueryRefusal::Internal(fault) => {
-                        UpdateExportErrorModeled::InternalServerException(fault)
-                    }
-                },
-            )?;
 
         // SECOND critical section: the mutation. The export is resolved again, because a
         // `DeleteExport` may have removed it while the definition above was being read.

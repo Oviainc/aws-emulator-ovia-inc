@@ -213,9 +213,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // publishes — text that does not parse, a statement that is not a single SELECT,
         // one naming a table outside the catalog, or one naming a column no table it reads
         // publishes under the table configuration this request states — can never be
-        // served, so it is refused rather than persisted. See `crate::state::query`.
-        crate::state::validate_data_query(&input.export.data_query, false).map_err(
-            |refusal| match refusal {
+        // served, so it is refused rather than persisted.
+        //
+        // The same ONE pass reports what the definition is stored with: the table
+        // configuration IN FORCE for the tables it names, where a property the request did
+        // not name takes the value the table publishes as its default, which is what every
+        // later reader reports. The verdict and that configuration come from one reading of
+        // the statement, so this handler cannot accept a definition whose stored form would
+        // then be refused. See `crate::state::query`.
+        let mut export = input.export;
+        let table_configurations = crate::state::resolve_data_query(&export.data_query, false)
+            .map_err(|refusal| match refusal {
                 crate::state::QueryRefusal::Invalid(invalid) => {
                     CreateExportErrorModeled::ValidationException(invalid)
                 }
@@ -224,8 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::QueryRefusal::Internal(fault) => {
                     CreateExportErrorModeled::InternalServerException(fault)
                 }
-            },
-        )?;
+            })?;
 
         // "The compression type, file format, and overwrite preference for the data
         // export" (smithy_query shape `S3OutputConfigurations`): a destination whose
@@ -233,24 +240,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not write — a file format it does not write under the stated compression, or a
         // Region that names no bucket — can never be served, so it is refused rather than
         // persisted. See `crate::state::destination`.
-        crate::state::validate_destination_configurations(&input.export.destination_configurations)
+        crate::state::validate_destination_configurations(&export.destination_configurations)
             .map_err(CreateExportErrorModeled::ValidationException)?;
 
-        // The definition is stored with the table configuration IN FORCE for the tables
-        // it names: a property the request did not name takes the value the table
-        // publishes as its default, which is what every later reader reports.
-        let mut export = input.export;
-        export.data_query.table_configurations =
-            crate::state::effective_table_configurations(&export.data_query).map_err(
-                |refusal| match refusal {
-                    crate::state::QueryRefusal::Invalid(invalid) => {
-                        CreateExportErrorModeled::ValidationException(invalid)
-                    }
-                    crate::state::QueryRefusal::Internal(fault) => {
-                        CreateExportErrorModeled::InternalServerException(fault)
-                    }
-                },
-            )?;
+        // The definition is persisted with the configuration the pass above read in force.
+        export.data_query.table_configurations = table_configurations;
         // ONE instant answers the whole request: the `CreatedAt`/`LastUpdatedAt` this
         // create reports, the instant it materialises what the clock already owed, and the
         // instant the delivery it owes is scheduled from are all this one, so the stored

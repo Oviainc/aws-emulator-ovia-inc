@@ -48,7 +48,7 @@
 //! query documentation publishes is a SELECT over the catalog's tables (a column list,
 //! `FROM`, `WHERE`, and the joins between published tables), so a `QueryStatement` has to
 //! be ONE statement, that statement a query, and every relation it names a published
-//! table. That is checked against the PARSED statement in [`query_tables`], which is why
+//! table. That is checked against the PARSED statement in [`query_shape`], which is why
 //! all three refusals below say the same thing about a statement this service cannot read
 //! as a data query — text the parser cannot read at all, a statement that is not a query
 //! (`DELETE`, `DROP`, `INSERT`, `EXPLAIN`, …), more than one statement, and a query that
@@ -92,7 +92,7 @@
 //! Beside them, [`MAX_QUERY_RELATIONS`] bounds the catalog work the resolved relations
 //! cause.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
@@ -101,7 +101,7 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use super::{clip_for_message, field_validation_failed, table_spec};
+use super::{clip_for_message, field_validation_failed, table_spec, TableSpec};
 use crate::ops::types::{DataQuery, InternalServerException, ValidationException};
 
 /// Why a submitted `DataQuery` was refused: because of the REQUEST, or because this
@@ -245,12 +245,6 @@ fn nesting_depth(statement: &str) -> usize {
         }
     }
     deepest
-}
-
-/// Every relation `statement` names, in the order the parse walk finds them, each once —
-/// [`QueryShape::tables`] of the shape [`query_shape`] reads.
-pub fn query_tables(statement: &str) -> Result<Vec<String>, QueryRefusal> {
-    Ok(query_shape(statement)?.tables)
 }
 
 /// What one `QueryStatement` NAMES: the relations it reads, the column references it
@@ -458,17 +452,23 @@ fn collect_defined_names(body: &SetExpr, into: &mut BTreeSet<String>) {
     }
 }
 
-/// Refuse `query` unless every table it names is one this service publishes AND every
-/// column it names is one a table it reads publishes under the table configuration the
-/// request states.
+/// The modelled `TableConfigurations` map: for each table name, that table's properties
+/// by name — the shape `DataQuery$TableConfigurations` carries (smithy_query shape
+/// `DataQuery`, member `TableConfigurations`).
+pub type TableConfigurations = HashMap<String, HashMap<String, String>>;
+
+/// Judge `query` and report what it is STORED with, from ONE read of its statement: the
+/// verdict on the definition and the `TableConfigurations` in force for it.
 ///
-/// Both halves are the same published dictionary — "To view the available tables and
-/// columns, see the Data Exports table dictionary" (the modelled doc for `CreateExport`'s
-/// `Export`) — and the column half is read under the properties IN FORCE, because a table
-/// property "[changes] the data and schema of a table" (the modelled doc for
-/// `GetTableRequest$TableProperties`): a column the request's own configuration switches
-/// off is as unservable as one no table publishes at all. See this module's header for the
-/// names that are not column references.
+/// THE VERDICT. Every table the statement names is one this service publishes AND every
+/// column it names is one a table it reads publishes under the table configuration the
+/// request states. Both halves are the same published dictionary — "To view the available
+/// tables and columns, see the Data Exports table dictionary" (the modelled doc for
+/// `CreateExport`'s `Export`) — and the column half is read under the properties IN FORCE,
+/// because a table property "[changes] the data and schema of a table" (the modelled doc
+/// for `GetTableRequest$TableProperties`): a column the request's own configuration
+/// switches off is as unservable as one no table publishes at all. See this module's
+/// header for the names that are not column references.
 ///
 /// `require_table_configurations` additionally demands, for each named table that
 /// publishes table properties, that `TableConfigurations` carries that table's entry —
@@ -476,27 +476,42 @@ fn collect_defined_names(body: &SetExpr, into: &mut BTreeSet<String>) {
 /// all export parameters. All export parameters must be specified in the UpdateExport
 /// request" (smithy_query operation `UpdateExport`), so a per-table property the request
 /// leaves unsaid is not kept but unspecified.
-pub fn validate_data_query(
+///
+/// WHAT IS STORED. For every table the query names, and every table the request configures
+/// on its own, each table property that table publishes — at the requested value where the
+/// request names it and at the published default otherwise. RECORDED AWS behaviour: a
+/// reader gets the export's EFFECTIVE table configuration. The recorded `GetExport` for a
+/// created export reports the queried table's property set filled in, not only the
+/// properties the create happened to name — the same rule `GetTable` already applies to a
+/// table request ("Each table property has a default value that it assumes if not
+/// specified" — the modelled doc for `GetTableRequest$TableProperties`). The effective
+/// configuration is therefore what the definition is STORED with, so every later reader
+/// reports it and a definition read back through `GetExport` and handed straight to
+/// `UpdateExport` keeps those properties (which is also what satisfies the restatement
+/// rule above for such a round trip).
+///
+/// `Ok(None)` when no table the definition names publishes any property — there is no
+/// configuration to report then ("tables are not required to have any TableProperties" —
+/// the modelled doc for `CreateExport`).
+///
+/// ONE pass, because the verdict and the stored configuration are read off the same
+/// resolved tables: each table is resolved exactly once, by [`resolve_table`], so the
+/// statement is parsed once per submitted definition and no caller can be told that a
+/// definition is acceptable and then have a table of it refused.
+pub fn resolve_data_query(
     query: &DataQuery,
     require_table_configurations: bool,
-) -> Result<(), QueryRefusal> {
+) -> Result<Option<TableConfigurations>, QueryRefusal> {
     let shape = query_shape(&query.query_statement)?;
     let requested = query.table_configurations.as_ref();
+    let mut effective: TableConfigurations = HashMap::new();
     // The columns the statement may name: every column in force for the tables it reads,
     // under the properties THIS request puts in force.
     let mut published: BTreeSet<&'static str> = BTreeSet::new();
     for table in &shape.tables {
-        let spec = table_spec(table).ok_or_else(|| invalid_query_table(table))?;
-        if require_table_configurations && !spec.properties.is_empty() {
-            let configured =
-                requested.is_some_and(|configurations| configurations.contains_key(spec.name));
-            if !configured {
-                return Err(missing_table_configurations(spec.name).into());
-            }
-        }
-        let properties =
-            spec.effective_properties(requested.and_then(|configured| configured.get(table)))?;
+        let (spec, properties) = resolve_table(table, requested, require_table_configurations)?;
         published.extend(spec.columns_in_force(&properties).map(|column| column.name));
+        record_configuration(table, properties, &mut effective);
     }
     for reference in &shape.columns {
         // A reference resolves when one of its parts is a published column or a name the
@@ -509,62 +524,62 @@ pub fn validate_data_query(
             return Err(invalid_query_column(&reference.written).into());
         }
     }
-    Ok(())
-}
-
-/// The modelled `TableConfigurations` map: for each table name, that table's properties
-/// by name — the shape `DataQuery$TableConfigurations` carries (smithy_query shape
-/// `DataQuery`, member `TableConfigurations`).
-pub type TableConfigurations = HashMap<String, HashMap<String, String>>;
-
-/// The `TableConfigurations` an export definition is STORED with: for every table the
-/// query names, and every table the request configures, each table property that table
-/// publishes — at the requested value where the request names it and at the published
-/// default otherwise.
-///
-/// RECORDED AWS behaviour: a reader gets the export's EFFECTIVE table configuration. The
-/// recorded `GetExport` for a created export reports the queried table's property set
-/// filled in, not only the properties the create happened to name — the same rule
-/// `GetTable` already applies to a table request ("Each table property has a default
-/// value that it assumes if not specified" — the modelled doc for
-/// `GetTableRequest$TableProperties`). The effective configuration is therefore what the
-/// definition is STORED with, so every later reader reports it and a definition read back
-/// through `GetExport` and handed straight to `UpdateExport` keeps those properties
-/// (which is also what satisfies [`validate_data_query`]'s restatement rule for such a
-/// round trip).
-///
-/// `None` when no table the definition names publishes any property — there is no
-/// configuration to report then ("tables are not required to have any TableProperties" —
-/// the modelled doc for `CreateExport`).
-///
-/// Called AFTER [`validate_data_query`], whose refusals it repeats rather than hides: a
-/// table outside the catalog, a property the table does not publish, or a value outside
-/// the property's published values is the modelled 400 either way.
-pub fn effective_table_configurations(
-    query: &DataQuery,
-) -> Result<Option<TableConfigurations>, QueryRefusal> {
-    let requested = query.table_configurations.as_ref();
-    // The tables the statement reads, plus any table the request configures on its own:
-    // a configuration for a table the statement does not name is still the caller's, and
-    // its table and properties are still checked and reported.
-    let mut tables: BTreeSet<String> = query_tables(&query.query_statement)?
+    // A table the request configures but the statement does not name is still the
+    // caller's, so its table and its properties are resolved — and therefore checked and
+    // reported — exactly as a queried table's are.
+    let queried: BTreeSet<&str> = shape.tables.iter().map(String::as_str).collect();
+    let configured_only: BTreeSet<&str> = requested
         .into_iter()
+        .flatten()
+        .map(|(table, _)| table.as_str())
+        .filter(|table| !queried.contains(table))
         .collect();
-    for table in requested.into_iter().flatten().map(|(name, _)| name) {
-        tables.insert(table.clone());
-    }
-
-    let mut effective: TableConfigurations = HashMap::new();
-    for table in &tables {
-        let spec = table_spec(table).ok_or_else(|| invalid_query_table(table))?;
-        let properties =
-            spec.effective_properties(requested.and_then(|configured| configured.get(table)))?;
-        if properties.is_empty() {
-            continue;
-        }
-        effective.insert(table.clone(), properties.into_iter().collect());
+    for table in configured_only {
+        let (_, properties) = resolve_table(table, requested, require_table_configurations)?;
+        record_configuration(table, properties, &mut effective);
     }
     Ok((!effective.is_empty()).then_some(effective))
+}
+
+/// Resolve ONE table of a submitted definition: the catalog entry its name names, and the
+/// properties in force for it under the configuration the request states.
+///
+/// The single place a table name becomes a catalog entry and a requested property map
+/// becomes an effective one, for every table of every submitted definition — so the
+/// refusals are stated once (a table outside the catalog, an entry an update owes and
+/// left unsaid, a property the table does not publish, or a value outside the property's
+/// published values, each the modelled 400) and the effective properties the stored
+/// configuration reports are the very ones the verdict was read from.
+fn resolve_table(
+    table: &str,
+    requested: Option<&TableConfigurations>,
+    require_table_configurations: bool,
+) -> Result<(&'static TableSpec, BTreeMap<String, String>), QueryRefusal> {
+    let spec = table_spec(table).ok_or_else(|| invalid_query_table(table))?;
+    if require_table_configurations && !spec.properties.is_empty() {
+        let configured =
+            requested.is_some_and(|configurations| configurations.contains_key(spec.name));
+        if !configured {
+            return Err(missing_table_configurations(spec.name).into());
+        }
+    }
+    let properties =
+        spec.effective_properties(requested.and_then(|configured| configured.get(table)))?;
+    Ok((spec, properties))
+}
+
+/// Record `table`'s effective `properties` in the configuration a definition is stored
+/// with. A table publishing no property contributes no entry: there is nothing to report
+/// for it.
+fn record_configuration(
+    table: &str,
+    properties: BTreeMap<String, String>,
+    into: &mut TableConfigurations,
+) {
+    if properties.is_empty() {
+        return;
+    }
+    into.insert(table.to_string(), properties.into_iter().collect());
 }
 
 /// The modelled 400 for a `QueryStatement` this service cannot read as a data query,
