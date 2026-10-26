@@ -86,7 +86,11 @@
 //! the minted `jobId` — which identifies one across the account — each record
 //! carrying the request that started it and the instant it was created, from
 //! which a read DERIVES the status and the last-update date the clock has made
-//! due. Every
+//! due. The mutating calls already served under a `clientToken` live in
+//! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::idempotent_calls`], keyed by
+//! the operation and the token, each entry naming the request that spent the
+//! token and the resource that call acted on, which is what a retry of it
+//! replays from. Every
 //! handler reads and writes THIS struct through [`service_state`]; nothing in
 //! `src/ops/` keeps state of its own.
 
@@ -3848,6 +3852,15 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// the record. Written by `CreateBulkImportJob` and read by
     /// `DescribeBulkImportJob`; bounded by [`MAX_BULK_IMPORT_JOBS`].
     pub bulk_import_jobs: HashMap<String, BulkImportJobRecord>,
+    /// The mutating calls this store has already served under a `clientToken`,
+    /// by [`idempotency_key`] — the operation and the token — because a token is
+    /// scoped to the operation it was sent to. Each entry says which request
+    /// spent the token and which resource that call acted on, which is what
+    /// lets a retry of it replay that answer instead of mutating a second time
+    /// and a DIFFERENT request reusing the token be refused. Written by
+    /// [`Self::record_idempotent_call`], read by [`Self::idempotent_verdict`]
+    /// and bounded by [`MAX_IDEMPOTENT_CALLS`].
+    pub idempotent_calls: HashMap<String, IdempotentCall>,
 }
 
 impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
@@ -8159,4 +8172,137 @@ pub fn enrichment_job_arn(region: &str, job_id: &str) -> String {
         region,
         &format!("{ENRICHMENT_JOB_RESOURCE_TYPE}/{job_id}"),
     )
+}
+
+/// How many spent idempotency tokens the store remembers.
+///
+/// CHOSEN: a mutating call that carries a `clientToken` adds an entry and nothing
+/// else removes one, so without a bound a stream of tokens would grow one emulator
+/// process without limit. Past the cap the LEAST RECENTLY SPENT token is forgotten
+/// first, so the tokens a client could still be retrying are the ones kept.
+pub const MAX_IDEMPOTENT_CALLS: usize = 1_000;
+
+/// What one mutating call did, remembered under the `clientToken` it carried, so a
+/// retry of that call is answered from it instead of running a second time.
+#[derive(Debug, Clone)]
+pub struct IdempotentCall {
+    /// The request the token was spent on, as [`request_fingerprint`] renders it:
+    /// what tells a RETRY of that call from a different call reusing its token.
+    pub request: String,
+    /// The resource the call acted on — the id a create minted, or the id the
+    /// request addressed — which is what its operation replays its answer from.
+    pub resource_id: String,
+    /// When the token was spent, which is what the bound above evicts by.
+    pub spent_at: SystemTime,
+}
+
+/// What the `clientToken` a mutating request carries means for that request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenVerdict {
+    /// Serve the request: it carries no token, or none this store has seen.
+    Serve,
+    /// The SAME request already ran under this token, so this one is a retry of
+    /// it: answer from the resource named here and write nothing.
+    Replay(String),
+    /// A DIFFERENT request already spent this token: refuse it, naming the
+    /// resource that earlier call acted on.
+    Spent(String),
+}
+
+/// The key [`ComAmazonawsIotsitewiseAwsiotsitewiseState::idempotent_calls`] holds
+/// a spent token under: the operation and the token, because a token is scoped to
+/// the operation it was sent to — one value sent to two operations is two tokens.
+pub fn idempotency_key(operation: &str, client_token: &str) -> String {
+    format!("{operation}/{client_token}")
+}
+
+/// A canonical rendering of the members a mutating request is recognised by, so
+/// that a retry of it renders identically and any other request does not.
+///
+/// `members` are rendered in the order given — each through [`std::fmt::Debug`],
+/// so a list or a nested structure renders in full — and `tags` from its pairs
+/// SORTED, because a map has no order of its own and this rendering must not
+/// depend on one. A request carrying no tags renders like one carrying an empty
+/// set, which is the same thing it asks for.
+pub fn request_fingerprint(
+    members: &[&dyn ::std::fmt::Debug],
+    tags: Option<&HashMap<String, String>>,
+) -> String {
+    let mut rendered: Vec<String> = members.iter().map(|member| format!("{member:?}")).collect();
+    let mut pairs: Vec<String> = tags
+        .into_iter()
+        .flatten()
+        .map(|(key, value)| format!("{key:?}={value:?}"))
+        .collect();
+    pairs.sort();
+    rendered.push(pairs.join(","));
+    // A unit separator: no member of this API may carry one (every string shape
+    // that reaches here forbids the C0 controls), so no rendering of two members
+    // can be read as a rendering of one.
+    rendered.join("\u{1f}")
+}
+
+impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
+    /// What `operation` is to do with the request whose `clientToken` is `token`
+    /// and whose identifying members render as `request`.
+    ///
+    /// A pure READ: it records nothing, so asking does not spend a token.
+    pub fn idempotent_verdict(
+        &self,
+        operation: &str,
+        token: Option<&str>,
+        request: &str,
+    ) -> TokenVerdict {
+        let Some(token) = token else {
+            return TokenVerdict::Serve;
+        };
+        match self.idempotent_calls.get(&idempotency_key(operation, token)) {
+            Some(call) if call.request == request => TokenVerdict::Replay(call.resource_id.clone()),
+            Some(call) => TokenVerdict::Spent(call.resource_id.clone()),
+            None => TokenVerdict::Serve,
+        }
+    }
+
+    /// Remember that `operation` served `request` under `token`, acting on
+    /// `resource_id`, so a retry of that call replays this answer.
+    ///
+    /// Call it only where the call SUCCEEDED: a refused request changed nothing,
+    /// so the token it carried was not spent and the caller may send it again.
+    /// A request carrying no token records nothing.
+    pub fn record_idempotent_call(
+        &mut self,
+        operation: &str,
+        token: Option<&str>,
+        request: String,
+        resource_id: &str,
+        now: SystemTime,
+    ) {
+        let Some(token) = token else {
+            return;
+        };
+        let key = idempotency_key(operation, token);
+        // Bounded by [`MAX_IDEMPOTENT_CALLS`], evicting the token spent longest
+        // ago; re-recording a key already held replaces it and needs no room.
+        while !self.idempotent_calls.contains_key(&key)
+            && self.idempotent_calls.len() >= MAX_IDEMPOTENT_CALLS
+        {
+            let Some(oldest) = self
+                .idempotent_calls
+                .iter()
+                .min_by_key(|(_, call)| call.spent_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.idempotent_calls.remove(&oldest);
+        }
+        self.idempotent_calls.insert(
+            key,
+            IdempotentCall {
+                request,
+                resource_id: resource_id.to_string(),
+                spent_at: now,
+            },
+        );
+    }
 }

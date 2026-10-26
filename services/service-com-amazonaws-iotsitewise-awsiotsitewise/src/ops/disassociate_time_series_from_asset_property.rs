@@ -195,11 +195,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             internal_failure("the IoT SiteWise store is unavailable".to_string())
         })?;
-        // No member of the answer is region-scoped, so this handler builds no ARN and
-        // reads nothing from the request beyond its modelled input.
-        let _ = ctx;
+        // Read only for the ARN the conflict a reused `clientToken` carries names; no
+        // member of this operation's answer is region-scoped.
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+
+        // `clientToken` makes this call idempotent, as the member documents: "A unique
+        // case-sensitive identifier that you can provide to ensure the idempotency of
+        // the request." A retry carries the token of the call it repeats, so it
+        // succeeds and writes nothing rather than being refused the association its
+        // own first call already broke; a token already spent on a DIFFERENT request
+        // belongs to another call, which is the modelled conflict. It is the FIRST
+        // thing decided, because the call it repeats was already served.
         let mut store = state.lock();
+
+        let fingerprint = crate::state::request_fingerprint(
+            &[&input.alias, &input.asset_id, &input.property_id],
+            None,
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // Only while the asset that call wrote to is still stored: once it is
+                // gone the retry has nothing to answer from and is served as the fresh
+                // call it now is, which is the not-found refusal below.
+                if store.assets.contains_key(&replayed) {
+                    return Ok(DisassociateTimeSeriesFromAssetPropertyOutput);
+                }
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                return Err(token_spent(&region, &spent_on));
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
 
         // `assetId` and `propertyId` are `CustomID`s: a raw id, or
         // `externalId:<externalId>`. Both forms name the one stored property, resolved
@@ -238,11 +265,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // `clientToken` is NOT honoured for idempotent replay — no token -> answer
-        // mapping is stored, as in `CreateAsset` and `UpdateAssetProperty`. A replay
-        // finds the association already broken and is answered the refusal above,
-        // which is what any later caller naming an association the store does not
-        // hold is answered.
+        // `clientToken` is honoured above, so a retry of this very call succeeds
+        // rather than meeting the refusal above — which is what any OTHER caller
+        // naming an association the store does not hold is answered.
         //
         // The alias leaves the property and the alias index together, and the stream
         // it named survives as a disassociated time series: one state helper, so the
@@ -264,8 +289,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             asset.last_update_date = now;
         }
 
+        // The token is spent only now that the association has been broken: a refused
+        // request broke nothing, so the caller may send its token again. The resource
+        // the call acted on is the asset carrying the property, which is what the
+        // conflict a reused token is refused with names.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &asset_id,
+            now,
+        );
+
         Ok(DisassociateTimeSeriesFromAssetPropertyOutput)
     }
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the asset that request wrote to, so
+/// `resourceId`/`resourceArn` name it.
+fn token_spent(region: &str, asset_id: &str) -> DisassociateTimeSeriesFromAssetPropertyError {
+    DisassociateTimeSeriesFromAssetPropertyError::Modeled(
+        DisassociateTimeSeriesFromAssetPropertyErrorModeled::ConflictingOperationException(
+            ConflictingOperationException {
+                message: crate::state::already_using_message("asset", "clientToken"),
+                resource_id: asset_id.to_string(),
+                resource_arn: crate::state::asset_arn(region, asset_id),
+            },
+        ),
+    )
 }
 
 /// HTTP 404 `ResourceNotFoundException` carrying `message`.

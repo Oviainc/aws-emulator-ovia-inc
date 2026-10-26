@@ -197,9 +197,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
-        let _ = ctx;
+        // Read only for the ARN the conflict a reused `clientToken` carries names; no
+        // member of this operation's answer is region-scoped.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
+
+        // `clientToken` makes this call idempotent, as the member documents: "A unique
+        // case-sensitive identifier that you can provide to ensure the idempotency of
+        // the request." A retry carries the token of the call it repeats, so it
+        // succeeds and writes nothing rather than being refused the association its
+        // own first call already removed; a token already spent on a DIFFERENT request
+        // belongs to another call, which is the modelled conflict. Decided first,
+        // because the call it repeats was already served — but only while the parent
+        // asset that call acted on is still stored: once it is gone the retry has
+        // nothing to answer from and is served as the fresh call it now is.
+        let fingerprint = crate::state::request_fingerprint(
+            &[&input.asset_id, &input.hierarchy_id, &input.child_asset_id],
+            None,
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                if store.assets.contains_key(&replayed) {
+                    return Ok(DisassociateAssetsOutput);
+                }
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                return Err(token_spent(&region, &spent_on));
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
         // Every label is either a raw id or the `externalId:<externalId>` form; a
         // triple that names no stored parent, hierarchy or child is a refusal, and
         // the whole triple is resolved BEFORE anything is written so a refused call
@@ -223,8 +251,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // The token is spent only now that the association has been removed: a
+        // refused request removed nothing, so the caller may send its token again.
+        // The resource the call acted on is the PARENT asset.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &triple.asset_id,
+            now,
+        );
+
         Ok(DisassociateAssetsOutput)
     }
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the PARENT asset that request
+/// wrote to, so `resourceId`/`resourceArn` name it.
+fn token_spent(region: &str, asset_id: &str) -> DisassociateAssetsError {
+    DisassociateAssetsError::Modeled(
+        DisassociateAssetsErrorModeled::ConflictingOperationException(
+            ConflictingOperationException {
+                message: crate::state::already_using_message("asset", "clientToken"),
+                resource_id: asset_id.to_string(),
+                resource_arn: crate::state::asset_arn(region, asset_id),
+            },
+        ),
+    )
 }
 
 /// HTTP 404 `ResourceNotFoundException` carrying `message`.

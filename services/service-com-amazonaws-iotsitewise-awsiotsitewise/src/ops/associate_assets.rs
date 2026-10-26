@@ -192,18 +192,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             internal_failure("the IoT SiteWise store is unavailable")
         })?;
+        // Read only for the ARN the conflict a reused `clientToken` carries names;
+        // no member of this operation's answer is region-scoped.
+        let region = crate::state::request_region(ctx.parts());
 
-        // `clientToken` is NOT honoured for idempotent replay: this change stores no
-        // token -> outcome mapping, so a retry with the same token is judged on the
-        // state it finds, exactly like a first call. Deliberately left to the
-        // idempotency issue rather than half-done here, as `CreateAsset` leaves it.
+        // `clientToken` makes this call idempotent, as the member documents: "A unique
+        // case-sensitive identifier that you can provide to ensure the idempotency of
+        // the request." A retry carries the token of the call it repeats, so it
+        // succeeds and writes nothing rather than being judged on the state its own
+        // first call left behind — an association in flight or already established; a
+        // token already spent on a DIFFERENT request belongs to another call, which is
+        // the modelled conflict. It is the FIRST thing decided, because the call it
+        // repeats was already served.
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+
+        let fingerprint = crate::state::request_fingerprint(
+            &[&input.asset_id, &input.hierarchy_id, &input.child_asset_id],
+            None,
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // Only while the PARENT asset that call acted on is still stored: once
+                // it is gone the retry has nothing to answer from and is served as the
+                // fresh call it now is.
+                if store.assets.contains_key(&replayed) {
+                    return Ok(AssociateAssetsOutput);
+                }
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                let arn = store
+                    .assets
+                    .get(&spent_on)
+                    .map(|asset| asset.arn.clone())
+                    .unwrap_or_else(|| crate::state::asset_arn(&region, &spent_on));
+                return Err(conflicting_operation(
+                    crate::state::already_using_message("asset", "clientToken"),
+                    &spent_on,
+                    &arn,
+                ));
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
 
         // Each of the three ids is a `CustomID` label: the raw UUID or the
         // `externalId:<externalId>` alias form. A label that names no stored resource
@@ -383,6 +418,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         store.associate_child(&parent_id, &hierarchy_id, &child_id, now);
+
+        // The token is spent only now that the association has been recorded: a
+        // refused request recorded nothing, so the caller may send its token again.
+        // The resource the call acted on is the PARENT asset, which is what the
+        // conflict a reused token is refused with names.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &parent_id,
+            now,
+        );
 
         Ok(AssociateAssetsOutput)
     }

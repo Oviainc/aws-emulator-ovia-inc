@@ -222,12 +222,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
-        // `clientToken` is NOT honoured for idempotent replay: this change stores no
-        // token -> answer mapping, so a retry with the same token updates the model a
-        // second time rather than replaying the first answer. Left to the idempotency
-        // issue, exactly as `CreateAssetModel` and `UpdateAsset` leave it; nothing is
-        // fabricated for it.
+        // `clientToken` makes this update idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it reports that model's status and writes nothing — it neither
+        // restarts the UPDATING transition nor mints a second version; a token already
+        // spent on a DIFFERENT request belongs to another call, which is the modelled
+        // conflict. It is the FIRST thing decided, ahead even of the conditional
+        // headers: the first call moved the ETag they were written against, so a retry
+        // judged on them would be refused the precondition its own call had already
+        // satisfied.
         let mut store = state.lock();
+
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.asset_model_id,
+                &input.asset_model_name,
+                &input.asset_model_external_id,
+                &input.asset_model_description,
+                &input.asset_model_properties,
+                &input.asset_model_hierarchies,
+                &input.asset_model_composite_models,
+                &input.if_match,
+                &input.if_none_match,
+                &input.match_for_version_type,
+            ],
+            None,
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // A model deleted since leaves the retry nothing to answer from, so
+                // that retry is served as the fresh update it now is.
+                if let Some(model) = store.asset_models.get(&replayed) {
+                    return Ok(UpdateAssetModelOutput {
+                        asset_model_id: Some(model.id.clone()),
+                        asset_model_status: model.status(now),
+                    });
+                }
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                return Err(token_spent(&region, &spent_on));
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
 
         // The label is either the raw UUID or the `externalId:<externalId>` alias form.
         let id = store
@@ -525,8 +562,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // model's property and hierarchy definitions."
         store.propagate_asset_model_definitions(&id, now);
 
+        // The token is spent only now that the update has succeeded: a refused
+        // request changed nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &id,
+            now,
+        );
+
         Ok(output)
     }
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the asset model that request
+/// updated, so `resourceId`/`resourceArn` name it.
+fn token_spent(region: &str, asset_model_id: &str) -> UpdateAssetModelError {
+    UpdateAssetModelError::Modeled(
+        UpdateAssetModelErrorModeled::ConflictingOperationException(
+            ConflictingOperationException {
+                message: crate::state::already_using_message("asset model", "clientToken"),
+                resource_id: asset_model_id.to_string(),
+                resource_arn: crate::state::asset_model_arn(region, asset_model_id),
+            },
+        ),
+    )
 }
 
 /// `id`, unless it is absent or empty.

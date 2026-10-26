@@ -226,6 +226,11 @@ mod batch_put_timestamp_and_quality;
 mod bulk_import_jobs;
 // In its alphabetical place inside the sorted list, rather than appended after
 // it: the end of this file is where every concurrent iotsitewise change appends a
+// declaration of its own, and four appends there collided in a row with this one.
+#[path = "all/client_token_idempotency.rs"]
+mod client_token_idempotency;
+// In its alphabetical place inside the sorted list, rather than appended after
+// it: the end of this file is where every concurrent iotsitewise change appends a
 // declaration of its own, and each append there collided with this one.
 #[path = "all/create_computation_model_bounds.rs"]
 mod create_computation_model_bounds;

@@ -201,11 +201,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::check_tag_key(tag_key).map_err(invalid_request)?;
         }
 
-        // `clientToken` is NOT honoured for idempotent replay: this change stores no
-        // token -> created-id mapping, so a retry with the same token mints a second
-        // asset rather than replaying the first answer. Deliberately left to the
-        // idempotency issue rather than half-done here; nothing is fabricated for it.
         let mut store = state.lock();
+
+        // `clientToken` makes this create idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry — an SDK's own, after a timeout —
+        // carries the token of the call it repeats, so it answers from the asset THAT
+        // call minted and writes nothing; a token already spent on a DIFFERENT request
+        // belongs to another call, which is the modelled conflict rather than a second
+        // asset. Decided BEFORE the request is resolved against the store, because the
+        // call it repeats was already served, whatever has changed since.
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.asset_name,
+                &input.asset_model_id,
+                &input.asset_id,
+                &input.asset_external_id,
+                &input.asset_description,
+            ],
+            input.tags.as_ref(),
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // Answered from the asset the first call minted. One deleted since
+                // leaves the retry nothing to answer from, so that retry is served as
+                // the fresh create it now is.
+                if let Some(asset) = store.assets.get(&replayed) {
+                    return Ok(CreateAssetOutput {
+                        asset_id: asset.id.clone(),
+                        asset_arn: asset.arn.clone(),
+                        asset_status: asset.status(now),
+                    });
+                }
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                return Err(token_spent(&region, &spent_on));
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
 
         // The store is bounded: a create is the only thing that adds an asset and
         // nothing evicts one, so past the cap this is a quota refusal.
@@ -340,6 +373,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (property_id, value) in initial_values {
             store.record_property_value(&asset_id, &property_id, value);
         }
+        // The token is spent only now that the create has succeeded: a refused
+        // request created nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &asset_id,
+            now,
+        );
 
         Ok(output)
     }
@@ -350,6 +392,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn invalid_request(message: String) -> CreateAssetError {
     CreateAssetError::Modeled(CreateAssetErrorModeled::InvalidRequestException(
         InvalidRequestException { message },
+    ))
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the asset that request created, so
+/// `resourceId`/`resourceArn` name it — the asset the caller has to look at.
+fn token_spent(region: &str, asset_id: &str) -> CreateAssetError {
+    CreateAssetError::Modeled(CreateAssetErrorModeled::ConflictingOperationException(
+        ConflictingOperationException {
+            message: crate::state::already_using_message("asset", "clientToken"),
+            resource_id: asset_id.to_string(),
+            resource_arn: crate::state::asset_arn(region, asset_id),
+        },
     ))
 }
 

@@ -233,11 +233,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .unwrap_or_else(|| "ASSET_MODEL".to_string());
 
-        // `clientToken` is NOT honoured for idempotent replay: this change stores no
-        // token -> created-id mapping, so a retry with the same token mints a second
-        // asset model rather than replaying the first answer. Deliberately left to the
-        // idempotency issue rather than half-done here; nothing is fabricated for it.
+        // `clientToken` makes this create idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry — an SDK's own, after a timeout —
+        // carries the token of the call it repeats, so it answers from the asset model
+        // THAT call minted and writes nothing; a token already spent on a DIFFERENT
+        // request belongs to another call, which is the modelled conflict rather than a
+        // second model. Decided BEFORE the request is resolved against the store,
+        // because the call it repeats was already served.
         let mut store = state.lock();
+
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.asset_model_name,
+                &model_type,
+                &input.asset_model_id,
+                &input.asset_model_external_id,
+                &input.asset_model_description,
+                &input.asset_model_properties,
+                &input.asset_model_hierarchies,
+                &input.asset_model_composite_models,
+            ],
+            input.tags.as_ref(),
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // One deleted since leaves the retry nothing to answer from, so that
+                // retry is served as the fresh create it now is.
+                if let Some(model) = store.asset_models.get(&replayed) {
+                    return Ok(CreateAssetModelOutput {
+                        asset_model_id: model.id.clone(),
+                        asset_model_arn: model.arn.clone(),
+                        asset_model_status: model.status(now),
+                    });
+                }
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                return Err(token_spent(&region, &spent_on));
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
 
         // The store is bounded: a create is the only thing that adds an asset model
         // and nothing evicts one, so past the cap this is a quota refusal.
@@ -393,9 +428,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .insert(external, record.id.clone());
         }
         store.asset_models.insert(record.id.clone(), record);
+        // The token is spent only now that the create has succeeded: a refused
+        // request created nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &asset_model_id,
+            now,
+        );
 
         Ok(output)
     }
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the asset model that request
+/// created, so `resourceId`/`resourceArn` name it.
+fn token_spent(region: &str, asset_model_id: &str) -> CreateAssetModelError {
+    CreateAssetModelError::Modeled(
+        CreateAssetModelErrorModeled::ConflictingOperationException(
+            ConflictingOperationException {
+                message: crate::state::already_using_message("asset model", "clientToken"),
+                resource_id: asset_model_id.to_string(),
+                resource_arn: crate::state::asset_model_arn(region, asset_model_id),
+            },
+        ),
+    )
 }
 
 /// HTTP 409 `ResourceAlreadyExistsException` for a `dimension` of the request

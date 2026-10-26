@@ -212,11 +212,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
-        // `clientToken` is NOT honoured for idempotent replay — no token -> answer
-        // mapping is stored, as in `CreateAsset`. This operation is idempotent by
-        // construction anyway: it OVERWRITES the three members from the request, so
-        // a retry of the same request leaves the same property behind.
+        // `clientToken` makes this update idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats and writes nothing at all — not even the asset's last-update instant
+        // moves; a token already spent on a DIFFERENT request belongs to another call,
+        // which is the modelled conflict. It is the FIRST thing decided, because the
+        // call it repeats was already served.
         let mut store = state.lock();
+
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.asset_id,
+                &input.property_id,
+                &input.property_alias,
+                &input.property_notification_state,
+                &input.property_unit,
+            ],
+            None,
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // Only while the asset that call wrote to is still stored: once it is
+                // gone the retry has nothing to answer from and is served as the fresh
+                // call it now is, which is the not-found refusal below.
+                if store.assets.contains_key(&replayed) {
+                    return Ok(UpdateAssetPropertyOutput);
+                }
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                return Err(token_spent(&region, &spent_on));
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
 
         // Both ids are `CustomID`s: a raw id, or `externalId:<externalId>`. The asset
         // resolves through the shared resolver every other handler uses; the property
@@ -351,8 +379,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instant moves with it.
         asset.last_update_date = now;
 
+        // The token is spent only now that the update has succeeded: a refused
+        // request changed nothing, so the caller may send its token again. The
+        // resource the call acted on is the asset carrying the property, which is
+        // what the conflict a reused token is refused with names.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &asset_id,
+            now,
+        );
+
         Ok(UpdateAssetPropertyOutput)
     }
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the asset that request wrote to, so
+/// `resourceId`/`resourceArn` name it.
+fn token_spent(region: &str, asset_id: &str) -> UpdateAssetPropertyError {
+    UpdateAssetPropertyError::Modeled(
+        UpdateAssetPropertyErrorModeled::ConflictingOperationException(
+            ConflictingOperationException {
+                message: crate::state::already_using_message("asset", "clientToken"),
+                resource_id: asset_id.to_string(),
+                resource_arn: crate::state::asset_arn(region, asset_id),
+            },
+        ),
+    )
 }
 
 /// HTTP 404 `ResourceNotFoundException` carrying `message`.
