@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeBudgetActionsForAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeBudgetActionsForAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeBudgetActionsForAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports every budget action the account holds — the actions of ALL of its budgets,
+//! not one budget's — one page at a time. The order is the budgets' own (`BudgetName`,
+//! the order `DescribeBudgets` serves them in) and, within each budget, the order its
+//! actions were created in, so the offset a `NextToken` carries indexes into an order no
+//! later call reshuffles. A pure read, except for the one change the CLOCK already owed
+//! on each action: one whose `*_IN_PROGRESS` work has reached its settle instant is
+//! reported in its settled status ([`crate::state::StoredAction::settle_due`]), which
+//! was due at that instant whether or not anybody called. An account holding no actions
+//! is an empty list, never a refusal; a `NextToken` this list never minted is an
+//! `InvalidNextTokenException`.
 //!
 //! ## Shape of an operation
 //!
@@ -135,6 +137,13 @@ impl<Eng> DescribeBudgetActionsForAccount<Eng> {
     }
 }
 
+/// The biggest page this operation can report: `Actions` is `@length(max: 100)`, so a
+/// caller that named no `MaxResults` still gets at most that many actions and a
+/// `NextToken` for the rest, and no page can exceed what the output shape holds. (It is
+/// also `MaxResults`' own `@range(max: 100)` — "The maximum is 100" — which the boundary
+/// validator enforces before this handler runs.)
+const ACTIONS_MAX_PAGE: i32 = 100;
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for DescribeBudgetActionsForAccount<Eng>
 {
@@ -152,18 +161,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeBudgetActionsForAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeBudgetActionsForAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeBudgetActionsForAccount"))
+        let _ = ctx;
+        // The budgets control plane is scoped to the account the caller signed with, so
+        // an `AccountId` naming any other account is refused with the modelled 403
+        // before anything is read or written (`crate::state::foreign_account_refusal`).
+        if let Some(message) = crate::state::foreign_account_refusal(&input.account_id) {
+            return Err(
+                DescribeBudgetActionsForAccountErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeBudgetActionsForAccountErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some(
+                        "budgets is mounted on an engine that holds no state for it".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = crate::state::store_at(&state, now);
+        // Ordered by `BudgetName`, the order every other account-wide read of this
+        // service serves its budgets in: the pagination token indexes into this order, so
+        // it must not depend on `HashMap` iteration order.
+        let mut owners: Vec<&mut crate::state::StoredBudget> = store
+            .budgets
+            .iter_mut()
+            .filter(|((account, _), _)| *account == input.account_id)
+            .map(|(_, stored)| stored)
+            .collect();
+        owners.sort_by(|left, right| left.budget.budget_name.cmp(&right.budget.budget_name));
+
+        // Within one budget, the order its actions were created in — and the ONLY write
+        // this read makes: each action's settle the clock had already made due, so the
+        // statuses listed here are the ones `DescribeBudgetAction` and
+        // `DescribeBudgetActionsForBudget` report for the same actions.
+        let actions: Vec<Action> = owners
+            .into_iter()
+            .flat_map(|stored| crate::state::actions_for_budget(stored, now))
+            .collect();
+
+        let (page, next_token) = crate::state::page(
+            &actions,
+            Some(
+                input
+                    .max_results
+                    .unwrap_or(ACTIONS_MAX_PAGE)
+                    .clamp(1, ACTIONS_MAX_PAGE),
+            ),
+            input.next_token.as_deref(),
+        )
+        .ok_or_else(|| {
+            DescribeBudgetActionsForAccountErrorModeled::InvalidNextTokenException(
+                InvalidNextTokenException {
+                    message: Some("The pagination token is invalid.".to_string()),
+                },
+            )
+        })?;
+
+        Ok(DescribeBudgetActionsForAccountOutput {
+            actions: page,
+            next_token,
+        })
     }
 }

@@ -52,9 +52,12 @@ use super::budget_action_execution::{
 use super::budget_lifecycle::{caller_account, call, is_error, router, same};
 
 /// One row of the action table: a case name and the `CreateBudgetAction` body it creates.
-struct Row {
-    case: String,
-    create: Value,
+///
+/// `pub(crate)` so the sibling account-wide suite spans the same action class rather
+/// than re-typing the table.
+pub(crate) struct Row {
+    pub(crate) case: String,
+    pub(crate) create: Value,
 }
 
 /// The action table, for actions of one budget. Rows differ along every member the list
@@ -66,7 +69,7 @@ struct Row {
 ///
 /// Bounds and value sets come from the model
 /// (`smithy_query(query="shape",shape="Action,NotificationThreshold")`).
-fn action_rows(account_id: &str, budget_name: &str) -> Vec<Row> {
+pub(crate) fn action_rows(account_id: &str, budget_name: &str) -> Vec<Row> {
     let thresholds = [0.0_f64, 42.5, 15_000_000_000_000.0];
     let mut rows = Vec::new();
     for (type_index, action_type) in ACTION_TYPE_VALUES.iter().enumerate() {
@@ -110,7 +113,7 @@ fn action_rows(account_id: &str, budget_name: &str) -> Vec<Row> {
 }
 
 /// One `DescribeBudgetActionsForBudget` call.
-async fn list_actions(
+pub(crate) async fn list_actions(
     router: &MultiServiceRouter,
     account_id: &str,
     budget_name: &str,
@@ -142,7 +145,7 @@ async fn listed_actions(
 }
 
 /// The `ActionId`s of `actions`, in the order they were served.
-fn ids_of(actions: &[Value]) -> Vec<String> {
+pub(crate) fn ids_of(actions: &[Value]) -> Vec<String> {
     actions
         .iter()
         .map(|action| action["ActionId"].as_str().unwrap_or_default().to_string())
@@ -150,7 +153,11 @@ fn ids_of(actions: &[Value]) -> Vec<String> {
 }
 
 /// Create one action from `create` and answer the `ActionId` the service minted for it.
-async fn create_action(router: &MultiServiceRouter, create: &Value, case: &str) -> String {
+pub(crate) async fn create_action(
+    router: &MultiServiceRouter,
+    create: &Value,
+    case: &str,
+) -> String {
     let (status, body) = call(router, "CreateBudgetAction", create).await;
     assert_eq!(
         status, 200,

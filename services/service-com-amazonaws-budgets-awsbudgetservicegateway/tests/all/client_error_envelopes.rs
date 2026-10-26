@@ -193,31 +193,46 @@ async fn every_request_refusal_is_answered_at_http_400() {
 }
 
 /// RULE 1, the other side: folding a refusal to 400 must not flatten a status that is
-/// NOT a refusal of the request. An operation nobody has implemented still answers
-/// HTTP 501 `NotImplemented`, so a client can tell "this emulator has not written that
-/// yet" from "your request was rejected".
+/// NOT a refusal of the request. HTTP 501 `NotImplemented` means "nobody has written
+/// that operation yet", so an operation that IS written never answers it — and this
+/// service has no scaffold left, the account-wide action list having been the last one.
+/// The rows are the requests that used to reach a scaffold, each satisfying every
+/// modelled constraint on its input so that it reaches the handler rather than the
+/// validation layer in front of it.
 #[tokio::test]
-async fn a_scaffolded_operation_still_answers_501() {
+async fn no_operation_of_this_service_answers_501_any_more() {
     let router = router();
     let account_id = caller_account();
-    // Every one of these is still a stub under its own issue, and each request
-    // satisfies every modelled constraint on its input so that it reaches the stub
-    // rather than the validation layer in front of it.
-    for (operation, request) in [(
-        // `DescribeBudgetActionsForBudget` is implemented now (it lists the actions
-        // `CreateBudgetAction` writes onto a budget), so the account-wide list is
-        // the one stub row left here, still under its own issue.
-        "DescribeBudgetActionsForAccount",
-        json!({"AccountId": &account_id}),
-    )] {
+    let (status, body) = call(
+        &router,
+        "CreateBudget",
+        &json!({"AccountId": &account_id, "Budget": valid_budget("stored")}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "setup: expected CreateBudget to answer 200, got {status} {body}"
+    );
+
+    for (operation, request) in [
+        (
+            "DescribeBudgetActionsForAccount",
+            json!({"AccountId": &account_id}),
+        ),
+        (
+            "DescribeBudgetActionsForBudget",
+            json!({"AccountId": &account_id, "BudgetName": "stored"}),
+        ),
+    ] {
         let (status, body) = call(&router, operation, &request).await;
         assert_eq!(
-            status, 501,
-            "case {operation}: a scaffolded operation must answer 501, got {status} {body}"
+            status, 200,
+            "case {operation}: an implemented operation must serve the request, \
+             got {status} {body}"
         );
         assert!(
-            is_error(&body, "NotImplemented"),
-            "case {operation}: expected NotImplemented, got {body}"
+            !is_error(&body, "NotImplemented"),
+            "case {operation}: expected no NotImplemented, got {body}"
         );
     }
 }

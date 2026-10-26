@@ -35,6 +35,8 @@ mod budget_action_settle_history;
 mod budget_action_subscriber_limits;
 #[path = "all/budget_action_update_scope.rs"]
 mod budget_action_update_scope;
+#[path = "all/budget_actions_for_account.rs"]
+mod budget_actions_for_account;
 #[path = "all/budget_actions_for_budget.rs"]
 mod budget_actions_for_budget;
 #[path = "all/budget_cost_types_by_type.rs"]
