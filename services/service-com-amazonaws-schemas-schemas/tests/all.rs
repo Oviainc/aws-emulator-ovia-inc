@@ -35,6 +35,8 @@ mod discoverer_state;
 mod duplicate_create_refusals;
 #[path = "all/empty_response_framing.rs"]
 mod empty_response_framing;
+#[path = "all/empty_result_statuses.rs"]
+mod empty_result_statuses;
 #[path = "all/error_body_codes.rs"]
 mod error_body_codes;
 #[path = "all/export_reads_the_stored_schema.rs"]
