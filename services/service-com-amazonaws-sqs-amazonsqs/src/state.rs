@@ -11,6 +11,9 @@
 //! The record is the stored half; the wire half (the `Attributes` map
 //! `GetQueueAttributes` returns) is PROJECTED from it by
 //! [`Queue::reported_attributes`], so no handler assembles a response member by hand.
+//! Server-side encryption is part of that projection: which of the two mutually
+//! exclusive options a queue is on, and what it therefore reports, lives in
+//! [`encryption`], as does the KMS permission a call that uses the queue's key needs.
 //!
 //! # The message plane
 //!
@@ -71,6 +74,8 @@ use std::time::{Duration, SystemTime};
 
 use md5::{Digest, Md5};
 use sha2::Sha256;
+
+pub mod encryption;
 
 use crate::ops::types::{
     InvalidAddress, InvalidAttributeName, InvalidAttributeValue, ListMessageMoveTasksResultEntry,
@@ -369,10 +374,10 @@ pub const SETTABLE_ATTRIBUTES: &[AttributeSpec] = &[
     },
     AttributeSpec {
         // "An integer representing seconds, between 60 seconds (1 minute) and 86,400
-        // seconds (24 hours). Default: 300 (5 minutes)." The default is NOT applied at
-        // create: it is the period SQS uses once a KMS key is configured, and this
-        // slice reports only what the queue carries.
-        name: "KmsDataKeyReusePeriodSeconds",
+        // seconds (24 hours). Default: 300 (5 minutes)." The default is NOT stored at
+        // create: it is the period a KMS key is used under, so it is reported for a
+        // queue that is ON a KMS key — see [`encryption::report`].
+        name: encryption::KMS_DATA_KEY_REUSE_PERIOD_SECONDS,
         kind: AttributeKind::Integer {
             min: 60,
             max: 86_400,
@@ -383,8 +388,10 @@ pub const SETTABLE_ATTRIBUTES: &[AttributeSpec] = &[
     },
     AttributeSpec {
         // "The ID of an Amazon Web Services managed customer master key (CMK) for
-        // Amazon SQS or a custom CMK" — an opaque key id, alias or ARN.
-        name: "KmsMasterKeyId",
+        // Amazon SQS or a custom CMK" — an opaque key id, alias or ARN. An EMPTY value
+        // takes the queue off its key, which is why the form accepts any text; which
+        // option the queue is then on is [`encryption::apply_encryption_choice`].
+        name: encryption::KMS_MASTER_KEY_ID,
         kind: AttributeKind::Text,
         create_only: false,
         fifo_only: false,
@@ -450,8 +457,10 @@ pub const SETTABLE_ATTRIBUTES: &[AttributeSpec] = &[
     },
     AttributeSpec {
         // "Enables server-side queue encryption using SQS owned encryption keys."
-        // The docs state no default, so a created queue carries none.
-        name: "SqsManagedSseEnabled",
+        // No value is STORED for a create that names none — a queue carries only what
+        // its create supplied — and which option the queue is on, SQS-owned key or KMS
+        // key, is what [`encryption::report`] answers from.
+        name: encryption::SQS_MANAGED_SSE_ENABLED,
         kind: AttributeKind::Boolean,
         create_only: false,
         fifo_only: false,
@@ -817,12 +826,16 @@ pub struct Queue {
 impl Queue {
     /// Every attribute this queue has a value for: its stored configuration, the three
     /// the record itself derives (`QueueArn`, `CreatedTimestamp`,
-    /// `LastModifiedTimestamp`) and the three that count the messages it holds.
+    /// `LastModifiedTimestamp`), the three that count the messages it holds and the
+    /// encryption the queue is under ([`encryption::report`], since a queue is always
+    /// on one of the two server-side encryption options whether or not its create named
+    /// one).
     ///
     /// The two timestamps are reported "in seconds (epoch time)", per their own
     /// entries in the `AttributeNames` documentation.
     pub fn reported_attributes(&self, now: SystemTime) -> BTreeMap<String, String> {
         let mut reported = self.attributes.clone();
+        encryption::report(&self.attributes, &mut reported);
         reported.insert("QueueArn".to_string(), self.arn.clone());
         reported.insert(
             "CreatedTimestamp".to_string(),
@@ -852,6 +865,14 @@ impl Queue {
     /// attributes applicable to it.
     pub fn is_fifo(&self) -> bool {
         self.boolean(FIFO_QUEUE_ATTRIBUTE)
+    }
+
+    /// The customer master key this queue's messages are encrypted under, or `None` for
+    /// a queue on the Amazon SQS owned key — see
+    /// [`encryption::configured_master_key`]. A call that has to use the key asks
+    /// [`encryption::authorize_master_key`] about it first.
+    pub fn master_key_id(&self) -> Option<&str> {
+        encryption::configured_master_key(&self.attributes)
     }
 
     /// Whether boolean attribute `name` is set on this queue. "Valid values are true
