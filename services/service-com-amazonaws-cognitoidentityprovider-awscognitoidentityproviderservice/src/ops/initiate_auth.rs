@@ -406,9 +406,9 @@ fn password_sign_in(
             .get(client_id)
             .ok_or_else(|| client_not_found(client_id))?;
         if !client.allows_user_password_auth() {
-            return Err(invalid_parameter(format!(
-                "{USER_PASSWORD_AUTH} is not enabled for the client {client_id}"
-            )));
+            return Err(invalid_parameter(
+                crate::state::auth_flow_not_enabled_message(USER_PASSWORD_AUTH),
+            ));
         }
         let hides_user_existence = client.hides_user_existence();
         let session_validity = client.auth_session_validity();
@@ -571,9 +571,9 @@ fn email_otp_sign_in(
             .get(client_id)
             .ok_or_else(|| client_not_found(client_id))?;
         if !client.allows_user_auth() {
-            return Err(invalid_parameter(format!(
-                "{USER_AUTH} is not enabled for the client {client_id}"
-            )));
+            return Err(invalid_parameter(
+                crate::state::auth_flow_not_enabled_message(USER_AUTH),
+            ));
         }
         // `SignInPolicyType.AllowedFirstAuthFactors` is what the POOL admits as a
         // first authentication factor, so a pool that does not list this one does
@@ -683,9 +683,9 @@ fn refresh_sign_in(
             .get(client_id)
             .ok_or_else(|| client_not_found(client_id))?;
         if !client.allows_refresh_token_auth() {
-            return Err(invalid_parameter(format!(
-                "{auth_flow} is not enabled for the client {client_id}"
-            )));
+            return Err(invalid_parameter(
+                crate::state::auth_flow_not_enabled_message(auth_flow),
+            ));
         }
         let user_pool_id = pool.id.clone();
 

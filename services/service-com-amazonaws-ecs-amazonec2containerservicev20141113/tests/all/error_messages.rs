@@ -139,7 +139,7 @@ async fn a_cluster_that_does_not_exist_is_refused_with_one_fixed_sentence() {
 
     // Every implemented operation that resolves a `cluster`, each paired with a request
     // that is well formed apart from the cluster it names.
-    let requests: [OperationRow; 11] = [
+    let requests: [OperationRow; 12] = [
         ("RunTask", |cluster| {
             json!({ "cluster": cluster, "taskDefinition": FAMILY })
         }),
@@ -177,6 +177,16 @@ async fn a_cluster_that_does_not_exist_is_refused_with_one_fixed_sentence() {
         }),
         ("DescribeContainerInstances", |cluster| {
             json!({ "cluster": cluster, "containerInstances": ["a".repeat(32)] })
+        }),
+        ("DeleteAttributes", |cluster| {
+            json!({
+                "cluster": cluster,
+                "attributes": [{
+                    "name": "stack",
+                    "targetId": "a".repeat(32),
+                    "targetType": "container-instance",
+                }],
+            })
         }),
     ];
 

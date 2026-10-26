@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartTrigger
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartTrigger`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartTrigger::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts the trigger its `Name` addresses in the Region the request is served in: the
+//! stored trigger moves into the one `TriggerState` of a started trigger
+//! ([`crate::state::TRIGGER_STATE_ACTIVATED`]), which a later `GetTrigger` reports, and a
+//! started trigger that fires on nothing outside the caller — an `ON_DEMAND` one — fires
+//! here, beginning a run of the workflow it belongs to.
+//!
+//! A start is refused with `EntityNotFoundException` when this Region holds no trigger
+//! under that name, and with `ConcurrentRunsExceededException` when the run the firing
+//! would begin is past the concurrency ceiling its workflow named.
+//!
+//! Nothing here runs the jobs and crawlers a trigger's actions initiate, so the run this
+//! fire records comes to rest exactly as a run `StartWorkflowRun` began does: in the
+//! modelled error status carrying the reason nothing was executed
+//! ([`crate::state::WORKFLOW_RUN_NOT_EXECUTED_MESSAGE`]), rather than reporting a result
+//! nothing computed.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +157,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartTrigger` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartTriggerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartTrigger"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on — the same way
+            // `StartWorkflowRun` reports it.
+            return Err(StartTriggerErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue trigger store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // `Name` is `@required` with `length 1..255` and the model constrains nothing else
+        // this start carries, so every check left is one the STORE answers.
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // A trigger is served only through the endpoint that created it, so a name no
+        // trigger of THIS Region has addresses no trigger this endpoint can start.
+        let Some(trigger) = store.trigger(&region, &input.name) else {
+            return Err(StartTriggerErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::trigger_not_found(&input.name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        // What starting this trigger initiates, read off the stored definition before
+        // anything is written: the workflow a fire begins a run of, and how many actions
+        // that run's entry point initiates ("the actions initiated by this trigger when it
+        // fires").
+        let fires_on_start = trigger.trigger_type == crate::state::TRIGGER_TYPE_ON_DEMAND;
+        let workflow_name = trigger.workflow_name.clone();
+        let total_actions = i32::try_from(trigger.actions.len()).unwrap_or(i32::MAX);
+
+        // An on-demand trigger waits for nothing but a caller ("True is not supported for
+        // ON_DEMAND triggers" — `CreateTriggerRequest$StartOnCreation`), so starting it
+        // FIRES it now; every other modelled type waits for something outside the caller
+        // once started — its schedule, its predicate, or the events it batches — so
+        // starting one of those fires nothing here. A trigger that fires and belongs to a
+        // workflow begins a run of that workflow, which is the run a workflow read then
+        // reports.
+        let begun_run = match workflow_name.as_deref().filter(|_| fires_on_start) {
+            Some(workflow_name) => match store.workflow_mut(workflow_name) {
+                // The workflow a trigger names has to exist for the trigger to be created
+                // at all, so a trigger naming one that is gone begins no run rather than
+                // failing the start.
+                None => None,
+                Some(workflow) => match workflow.begin_run(None, now, total_actions) {
+                    Ok(run_id) => Some(run_id),
+                    // "You can use this parameter to prevent unwanted multiple updates to
+                    // data": the fire that would take the workflow past the ceiling it
+                    // named is refused with this operation's own modelled error, and the
+                    // trigger is left as it was.
+                    Err(_ceiling) => {
+                        return Err(
+                            StartTriggerErrorModeled::ConcurrentRunsExceededException(
+                                ConcurrentRunsExceededException {
+                                    message: Some(
+                                        crate::state::messages::concurrent_workflow_runs_exceeded(
+                                            workflow_name,
+                                        ),
+                                    ),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                },
+            },
+            None => None,
+        };
+
+        // "Starts an existing trigger": the trigger this call started is in the modelled
+        // state of a started trigger, which is the state `CreateTrigger` leaves a trigger
+        // in when the create started it. A steady state, so the clock owes it nothing
+        // further. The lock has been held since the trigger was read, so this write lands
+        // on the record that read reported.
+        if let Some(trigger) = store.trigger_mut(&region, &input.name) {
+            trigger.state = crate::state::TRIGGER_STATE_ACTIVATED.to_string();
+        }
+        ::tracing::info!(
+            operation = "StartTrigger",
+            trigger = %input.name,
+            region = %region,
+            workflow_run = begun_run.as_deref().unwrap_or("none"),
+            "started a Glue trigger"
+        );
+
+        Ok(StartTriggerOutput {
+            // "The name of the trigger that was started."
+            name: Some(input.name),
+        })
     }
 }
