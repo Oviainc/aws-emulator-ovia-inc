@@ -496,7 +496,7 @@ async fn an_arn_that_is_not_a_schedule_group_arn_is_refused() {
     let router = scheduler_router();
     let account = account_id();
     // `TagResourceArn` is modelled
-    // `^arn:aws(-[a-z]+)?:scheduler:[a-z0-9\-]+:\d{12}:schedule-group\/[0-9a-zA-Z-_.]+$`
+    // `^arn:aws[a-z-]*:scheduler:[a-z0-9\-]+:\d{12}:schedule-group\/[0-9a-zA-Z-_.]+$`
     // (`smithy_query(query="operation",operation="TagResource")`), so anything
     // else — a schedule's own ARN included — is a request-validation refusal, not
     // a missing resource.

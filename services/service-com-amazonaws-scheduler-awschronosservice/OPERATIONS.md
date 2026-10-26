@@ -26,14 +26,14 @@ contents — read that shape in the model above when you need its own members.
 
 - **Route:** `GET /tags/{ResourceArn} -> 200`
 - **Traits:** @readonly
-- **Input:** `ResourceArn` (string, len 1..1011, pattern ^arn:aws(-[a-z]+)?:scheduler:[a-z0-9\-]+:\d{12}:schedule-group\/[0-9a-zA-Z-_.]+$, @httpLabel, required)
+- **Input:** `ResourceArn` (string, len 1..1011, pattern ^arn:aws[a-z-]*:scheduler:[a-z0-9\-]+:\d{12}:schedule-group\/[0-9a-zA-Z-_.]+$, @httpLabel, required)
 - **Output:** `Tags` (list<Tag>, len 0..200)
 - **Errors:** `InternalServerException (HTTP 500)`, `ResourceNotFoundException (HTTP 404)`, `ThrottlingException (HTTP 429)`, `ValidationException (HTTP 400)`
 
 ## TagResource
 
 - **Route:** `POST /tags/{ResourceArn} -> 200`
-- **Input:** `ResourceArn` (string, len 1..1011, pattern ^arn:aws(-[a-z]+)?:scheduler:[a-z0-9\-]+:\d{12}:schedule-group\/[0-9a-zA-Z-_.]+$, @httpLabel, required), `Tags` (list<Tag>, len 0..200, required)
+- **Input:** `ResourceArn` (string, len 1..1011, pattern ^arn:aws[a-z-]*:scheduler:[a-z0-9\-]+:\d{12}:schedule-group\/[0-9a-zA-Z-_.]+$, @httpLabel, required), `Tags` (list<Tag>, len 0..200, required)
 - **Output:** (no members)
 - **Errors:** `ConflictException (HTTP 409)`, `InternalServerException (HTTP 500)`, `ResourceNotFoundException (HTTP 404)`, `ThrottlingException (HTTP 429)`, `ValidationException (HTTP 400)`
 
@@ -41,7 +41,7 @@ contents — read that shape in the model above when you need its own members.
 
 - **Route:** `DELETE /tags/{ResourceArn} -> 200`
 - **Traits:** @idempotent
-- **Input:** `ResourceArn` (string, len 1..1011, pattern ^arn:aws(-[a-z]+)?:scheduler:[a-z0-9\-]+:\d{12}:schedule-group\/[0-9a-zA-Z-_.]+$, @httpLabel, required), `TagKeys` (list<string>, len 0..200, @httpQuery(TagKeys), required)
+- **Input:** `ResourceArn` (string, len 1..1011, pattern ^arn:aws[a-z-]*:scheduler:[a-z0-9\-]+:\d{12}:schedule-group\/[0-9a-zA-Z-_.]+$, @httpLabel, required), `TagKeys` (list<string>, len 0..200, @httpQuery(TagKeys), required)
 - **Output:** (no members)
 - **Errors:** `ConflictException (HTTP 409)`, `InternalServerException (HTTP 500)`, `ResourceNotFoundException (HTTP 404)`, `ThrottlingException (HTTP 429)`, `ValidationException (HTTP 400)`
 

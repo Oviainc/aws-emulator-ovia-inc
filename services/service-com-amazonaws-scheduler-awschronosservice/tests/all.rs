@@ -27,5 +27,7 @@ mod schedule_group_read;
 mod schedule_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tagging_refusal_messages.rs"]
+mod tagging_refusal_messages;
 #[path = "all/wire_harness.rs"]
 mod wire_harness;
