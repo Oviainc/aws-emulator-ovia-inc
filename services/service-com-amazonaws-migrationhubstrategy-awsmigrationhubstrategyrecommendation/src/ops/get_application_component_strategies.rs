@@ -74,6 +74,10 @@
 //!   again.
 //! * `ResourceNotFoundException` (HTTP 404) — The specified ID in the request is not found.
 //! * `ThrottlingException` (HTTP 429) — The request was denied due to request throttling.
+//!
+//! Widened in with `extra_errors` (see the `#[operation_error]` note below):
+//!
+//! * `ValidationException` (HTTP 400) — The request body isn't valid.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -90,12 +94,23 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-migrationhubstrategy-aw
 // here — hence the `GetApplicationComponentStrategiesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.migrationhubstrategy#GetApplicationComponentStrategies")]
+// `ValidationException` is widened in with `extra_errors`: it is a shape the SERVICE
+// models (`httpError` 400, "The request body isn't valid.") that this operation's own
+// `errors` list omits, and it is what the service answers for a request whose
+// `applicationComponentId` its member's modelled `@pattern` does not admit — a value that
+// can name no component at all, rather than one that names a missing one. A narrow error
+// list is not a licence to substitute a different shape: the condition is an invalid
+// request, so the answer is the 400 and not the not-found.
+#[smithy_macros::operation_error(
+    "com.amazonaws.migrationhubstrategy#GetApplicationComponentStrategies",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum GetApplicationComponentStrategiesErrorModeled {
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -149,6 +164,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Decided from the request alone, before the store is reached: a value its member's
+        // modelled `@pattern` does not admit over its WHOLE length cannot name a component
+        // of this account at all, so it is refused as an invalid request rather than
+        // looked up (`crate::state::patterns`).
+        crate::state::patterns::check_whole_value_patterns(&input, Self::INPUT_SCHEMA)
+            .map_err(GetApplicationComponentStrategiesErrorModeled::ValidationException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 GetApplicationComponentStrategiesErrorModeled::InternalServerException(

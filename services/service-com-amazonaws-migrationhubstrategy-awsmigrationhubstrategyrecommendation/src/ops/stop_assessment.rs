@@ -146,6 +146,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Decided from the request alone, before the store is reached: a value its member's
+        // modelled `@pattern` does not admit over its whole length cannot name an
+        // assessment at all, so it is refused as an invalid request rather than reported as
+        // a resource that is not there.
+        crate::state::patterns::check_whole_value_patterns(&input, Self::INPUT_SCHEMA)
+            .map_err(StopAssessmentErrorModeled::ValidationException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StopAssessmentErrorModeled::InternalServerException(
                 InternalServerException {

@@ -93,6 +93,10 @@ pub mod analysis;
 /// portfolio the read path reports.
 pub mod import_file;
 
+/// A member's modelled `@pattern` as a requirement on the whole value, checked over an
+/// operation's input before the handler reads it.
+pub mod patterns;
+
 pub use regions::{
     request_region, ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState,
     DEFAULT_REGION, MAX_REGIONS,

@@ -53,6 +53,9 @@ mod enum_membership_other_operations;
 #[path = "all/enum_support.rs"]
 mod enum_support;
 
+#[path = "all/id_pattern_probe.rs"]
+mod id_pattern_probe;
+
 #[path = "all/import_and_assess.rs"]
 mod import_and_assess;
 
@@ -106,3 +109,6 @@ mod start_call_preconditions;
 
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+
+#[path = "all/whole_value_patterns.rs"]
+mod whole_value_patterns;
