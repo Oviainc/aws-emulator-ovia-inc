@@ -105,7 +105,10 @@ pub(crate) async fn get_context(client: &Client, profile_arn: &str, id: &str) ->
 
 /// `GET /api/v1/agent-profiles/{profileArn}/contexts`, with the paging members bound to
 /// the query string. `query` is passed as sent, empty for a request that names none.
-async fn list_contexts(client: &Client, profile_arn: &str, query: &str) -> Answer {
+/// `pub(crate)` because the contexts of a profile are enumerated by exactly ONE
+/// operation, so the deletion suite beside this one reads the list back through this
+/// helper rather than building the same request again.
+pub(crate) async fn list_contexts(client: &Client, profile_arn: &str, query: &str) -> Answer {
     let path = format!(
         "/api/v1/agent-profiles/{}/contexts",
         encode_path_segment(profile_arn)

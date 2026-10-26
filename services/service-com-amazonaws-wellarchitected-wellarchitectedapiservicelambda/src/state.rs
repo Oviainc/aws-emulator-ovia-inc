@@ -50,7 +50,7 @@
 //! `DeleteAgentGoal`) are backed the same way,
 //! each goal keyed under the profile it belongs to. The contexts recorded against a
 //! profile (`CreateAgentContext`, `GetAgentContext`, `ListAgentContexts`,
-//! `UpdateAgentContext`) are held
+//! `UpdateAgentContext`, `DeleteAgentContext`) are held
 //! exactly like the goals, keyed under the profile they belong to. The recommendation
 //! generations of a profile (`StartAgentRecommendationGeneration`,
 //! `GetAgentRecommendationGeneration`, `ListAgentRecommendationGenerations`) are held the
@@ -6023,6 +6023,27 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         id: &str,
     ) -> Option<&mut AgentContextRecord> {
         self.agent_contexts.get_mut(profile_arn)?.get_mut(id)
+    }
+
+    /// Drop one context of an agent profile and everything keyed to it, exactly as
+    /// [`Self::remove_agent_goal`] does for a goal: any create or update token that
+    /// resolved to it, and the profile's context map once its last context is gone, so an
+    /// emptied profile leaves nothing behind.
+    pub fn remove_agent_context(
+        &mut self,
+        profile_arn: &str,
+        id: &str,
+    ) -> Option<AgentContextRecord> {
+        let contexts = self.agent_contexts.get_mut(profile_arn)?;
+        let record = contexts.remove(id)?;
+        if contexts.is_empty() {
+            self.agent_contexts.remove(profile_arn);
+        }
+        self.create_agent_context_tokens
+            .retain(|token| !(token.profile_arn == profile_arn && token.context_id == id));
+        self.update_agent_context_tokens
+            .retain(|token| !(token.profile_arn == profile_arn && token.context_id == id));
+        Some(record)
     }
 
     /// How many contexts the agent profile `profile_arn` names currently holds — what

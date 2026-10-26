@@ -314,3 +314,8 @@ mod shared_resource_deletion;
 // review-template suite falls in a crowded run of this list.
 #[path = "all/review_template_imported_lens_review.rs"]
 mod review_template_imported_lens_review;
+
+// Declared last for the same reason as the declarations above: the sorted position for an
+// agent suite is the one gap of this list every new agent suite lands in.
+#[path = "all/agent_context_deletion.rs"]
+mod agent_context_deletion;

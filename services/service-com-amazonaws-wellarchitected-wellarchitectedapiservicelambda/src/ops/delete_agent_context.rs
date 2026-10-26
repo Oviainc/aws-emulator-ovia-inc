@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAgentContext
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAgentContext`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the context the request's `(profileArn, id)` pair resolves to
+//! from the agent profile that holds it, together with the create and update tokens that
+//! resolved to it, so a later `GetAgentContext` or `DeleteAgentContext` for that id
+//! answers `ResourceNotFoundException` (404), `ListAgentContexts` no longer reports it and
+//! no other context of that profile is touched.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAgentContext::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `profileArn` that names no stored agent profile is a `ResourceNotFoundException`
+//! too, and so is an `id` that names a context of a DIFFERENT profile: a context is
+//! reached only through the profile it belongs to — the order `GetAgentContext` and
+//! `UpdateAgentContext` resolve the pair in.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +145,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAgentContext` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAgentContextErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAgentContext"))
+        // The context is named by the path the request carries, this operation binds no
+        // idempotency token and nothing here is minted, so no request metadata is read.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteAgentContextErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool agent profile store is unavailable".to_string(),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // "Deletes a context associated with a profile": the profile the context is deleted
+        // FROM is resolved first, so a well-formed `AgentProfileArn` that names no stored
+        // profile is reported as the missing profile rather than as a missing context.
+        if !store.agent_profiles.contains_key(&input.profile_arn) {
+            return Err(DeleteAgentContextErrorModeled::ResourceNotFoundException(
+                crate::state::agent_profile_not_found(&input.profile_arn),
+            )
+            .into());
+        }
+
+        // The context is resolved by the SAME lookup `GetAgentContext` uses, so an id that
+        // names no context of this profile — never created, already deleted, or belonging
+        // to another profile — is that lookup's 404 and nothing is removed.
+        if store
+            .remove_agent_context(&input.profile_arn, &input.id)
+            .is_none()
+        {
+            return Err(DeleteAgentContextErrorModeled::ResourceNotFoundException(
+                crate::state::agent_context_not_found(&input.profile_arn, &input.id),
+            )
+            .into());
+        }
+
+        Ok(DeleteAgentContextOutput {})
     }
 }
