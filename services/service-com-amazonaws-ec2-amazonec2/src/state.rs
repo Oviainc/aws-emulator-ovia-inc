@@ -66,6 +66,20 @@
 //! be validated against [`availability_zones_in_region`] rather than against a second zone
 //! list.
 //!
+//! ## A prefix list is either stored or derived, by who owns it
+//!
+//! [`ComAmazonawsEc2Amazonec2State::managed_prefix_lists`] holds the prefix lists the
+//! ACCOUNT created, keyed by `PrefixListId`, as [`ManagedPrefixListRecord`]s: the modelled
+//! `ManagedPrefixList` shape beside the facts it carries no member for — the list's entries
+//! and the `create-complete` move the clock owes it.
+//! [`ComAmazonawsEc2Amazonec2State::insert_managed_prefix_list`] is the one way one is
+//! stored. The prefix lists AMAZON WEB SERVICES publishes for the services of a Region are
+//! NOT stored: no EC2 operation creates or withdraws one, so
+//! [`service_prefix_lists_in_region`] derives them from the Region the way
+//! [`availability_zones_in_region`] derives its zones. Both reports of a prefix list read
+//! the one derivation, so `DescribePrefixLists` and `DescribeManagedPrefixLists` cannot
+//! disagree about one published list's id.
+//!
 //! [`ComAmazonawsEc2Amazonec2State::local_gateway_virtual_interface_groups`] holds the
 //! account's local gateway virtual interface groups the same way, keyed by
 //! `LocalGatewayVirtualInterfaceGroupId`, so a pagination token can name the id the next
@@ -3265,6 +3279,24 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// repeat of the same request answers with that endpoint instead of creating a second
     /// one.
     pub instance_connect_endpoint_client_tokens: HashMap<String, String>,
+    /// Every managed prefix list the account holds, by `PrefixListId`, as
+    /// [`ManagedPrefixListRecord`]s — the modelled
+    /// [`crate::ops::types::ManagedPrefixList`] shape beside the facts that shape carries no
+    /// member for (its entries, and the move the clock owes it). Ordered by id, the one
+    /// stable order a report of them pages over, so a pagination token can name the id the
+    /// next page starts at.
+    ///
+    /// Starts EMPTY: a managed prefix list exists only because `CreateManagedPrefixList`
+    /// made one, which is the opposite of the Amazon Web Services SERVICE prefix lists a
+    /// Region publishes — those are facts of the Region, derived rather than stored
+    /// ([`service_prefix_lists_in_region`]).
+    /// [`Self::insert_managed_prefix_list`] is the one way a list is stored.
+    pub managed_prefix_lists: BTreeMap<String, ManagedPrefixListRecord>,
+    /// A `CreateManagedPrefixList` `ClientToken` and the prefix list id it minted, so a
+    /// repeat of the same request answers with that list instead of creating a second one:
+    /// "Unique, case-sensitive identifier you provide to ensure the idempotency of the
+    /// request" (`CreateManagedPrefixListRequest$ClientToken`).
+    pub managed_prefix_list_client_tokens: HashMap<String, String>,
 }
 
 /// A fresh account's EC2 state: the ambient network AWS gives it — the default VPC, that
@@ -3465,6 +3497,12 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // `CreateInstanceConnectEndpoint` mints one, and no token names one.
             instance_connect_endpoints: BTreeMap::new(),
             instance_connect_endpoint_client_tokens: HashMap::new(),
+            // A fresh account holds no managed prefix list until
+            // `CreateManagedPrefixList` mints one, and no token names one. The Amazon Web
+            // Services service prefix lists of a Region are NOT here: they are derived from
+            // the Region (see `service_prefix_lists_in_region`).
+            managed_prefix_lists: BTreeMap::new(),
+            managed_prefix_list_client_tokens: HashMap::new(),
         };
         // The ambient default network of [`DEFAULT_REGION`], so a request signed for the
         // emulator's own Region finds it without this store ever writing on a read. Every
@@ -5978,6 +6016,22 @@ impl ComAmazonawsEc2Amazonec2State {
                 // The transition is applied once; nothing is owed on this gateway any more.
                 false
             });
+        // A managed prefix list `CreateManagedPrefixList` answered as `create-in-progress`
+        // reaches `create-complete` once its due instant has passed, whether or not anybody
+        // called — the same contract as a `create-in-progress` IPAM scope's move below, and
+        // the reason the list's due instant is kept beside the modelled shape rather than on
+        // it.
+        for record in self.managed_prefix_lists.values_mut() {
+            let due = record
+                .pending
+                .as_ref()
+                .filter(|pending| now >= pending.due_at)
+                .map(|pending| pending.to);
+            if let Some(state) = due {
+                record.view.state = Some(state.to_string());
+                record.pending = None;
+            }
+        }
         // A permission granted over a network interface is recorded `pending` and reaches
         // `granted` at its due instant, whether or not anybody called — the permission
         // counterpart of the moves above.
@@ -7361,6 +7415,7 @@ impl ComAmazonawsEc2Amazonec2State {
             local_gateway_route_table_virtual_interface_group_associations => view,
             local_gateway_route_table_vpc_associations => view,
             local_gateway_route_tables => view,
+            managed_prefix_lists => view,
             nat_gateways,
             network_insights_access_scope_analyses => view,
             network_insights_access_scopes,
@@ -22266,6 +22321,447 @@ impl ComAmazonawsEc2Amazonec2State {
             .take_while(move |((table, _), _)| table == route_table_id)
             .map(|(_, record)| record)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Prefix lists: the managed ones an account creates, and the Amazon Web Services
+// service ones a Region publishes
+// ---------------------------------------------------------------------------
+
+/// The `ResourceType` a `CreateManagedPrefixList` tag specification may name — "The tags to
+/// apply to the prefix list during creation"
+/// (`CreateManagedPrefixListRequest$TagSpecifications`) — from the modelled catalog
+/// (`crate::ops::types::RESOURCE_TYPE_VALUES` carries `prefix-list`). It is also the type
+/// segment of a prefix list's ARN.
+pub const RESOURCE_TYPE_PREFIX_LIST: &str = "prefix-list";
+
+/// The `AddressFamily` of an IPv4 managed prefix list: "The IP address type. Valid Values:
+/// IPv4 | IPv6" (`CreateManagedPrefixListRequest$AddressFamily`).
+///
+/// Spelled with the capitals that member documents, which is NOT how IPAM's own modelled
+/// `AddressFamily` enum spells its members ([`ADDRESS_FAMILY_IPV4`] is `ipv4`): the prefix
+/// list member is a plain string with a documented value list, so the documented spelling is
+/// the one a caller sends and the one a describe reports.
+pub const PREFIX_LIST_ADDRESS_FAMILY_IPV4: &str = "IPv4";
+
+/// The `AddressFamily` of an IPv6 managed prefix list, from that same value list.
+pub const PREFIX_LIST_ADDRESS_FAMILY_IPV6: &str = "IPv6";
+
+/// Every `AddressFamily` a managed prefix list may have, in the order that member documents
+/// them. A value outside this list is refused rather than stored.
+pub const PREFIX_LIST_ADDRESS_FAMILIES: [&str; 2] = [
+    PREFIX_LIST_ADDRESS_FAMILY_IPV4,
+    PREFIX_LIST_ADDRESS_FAMILY_IPV6,
+];
+
+/// A prefix list whose creation has been asked for and has not settled yet: the
+/// `PrefixListState` enum's `create-in-progress` member
+/// ([`crate::ops::types::PREFIX_LIST_STATE_VALUES`]), which is the state
+/// `CreateManagedPrefixList` answers with.
+pub const PREFIX_LIST_STATE_CREATE_IN_PROGRESS: &str = "create-in-progress";
+
+/// A prefix list whose creation has settled: that enum's `create-complete` member, which the
+/// clock owes a [`PREFIX_LIST_STATE_CREATE_IN_PROGRESS`] list one [`TRANSITION_DELAY`] after
+/// the call that created it — the same contract as a `create-in-progress` IPAM scope's move.
+pub const PREFIX_LIST_STATE_CREATE_COMPLETE: &str = "create-complete";
+
+/// The `Version` a newly created prefix list carries: "The version of the prefix list"
+/// (`ManagedPrefixList$Version`) counts the revisions of its entry set, and a create is the
+/// first of them.
+pub const FIRST_PREFIX_LIST_VERSION: i64 = 1;
+
+/// How long a prefix list's name may be: "A name for the prefix list. Constraints: Up to 255
+/// characters in length" (`CreateManagedPrefixListRequest$PrefixListName`).
+pub const MAX_PREFIX_LIST_NAME_CHARS: usize = 255;
+
+/// The name prefix a caller's own prefix list may not take: "The name cannot start with
+/// com.amazonaws" (`CreateManagedPrefixListRequest$PrefixListName`) — that is the namespace
+/// the Amazon Web Services SERVICE prefix lists of a Region are named in
+/// ([`service_prefix_lists_in_region`]).
+pub const RESERVED_PREFIX_LIST_NAME_PREFIX: &str = "com.amazonaws";
+
+/// How long one entry's description may be: "A description for the entry. Constraints: Up to
+/// 255 characters in length" (`AddPrefixListEntry$Description`).
+pub const MAX_PREFIX_LIST_ENTRY_DESCRIPTION_CHARS: usize = 255;
+
+/// The smallest `MaxEntries` a prefix list may be created with: "The maximum number of
+/// entries for the prefix list" (`CreateManagedPrefixListRequest$MaxEntries`) — a list that
+/// may hold no entry at all is not a prefix list, so a create below this is refused.
+pub const MIN_PREFIX_LIST_MAX_ENTRIES: i32 = 1;
+
+/// The largest number of managed prefix lists this in-memory store holds.
+///
+/// A capacity bound in the same style as [`MAX_CARRIER_GATEWAYS`], not an AWS quota: each
+/// list is a record in this process's memory, so the number a caller can create has to be
+/// finite. [`ComAmazonawsEc2Amazonec2State::has_managed_prefix_list_capacity`] is the
+/// predicate a writer asks first; a create past it refuses with
+/// [`PREFIX_LIST_LIMIT_EXCEEDED`].
+pub const MAX_MANAGED_PREFIX_LISTS: usize = 1_000;
+
+/// The error code a create refuses with once the store is full, in the form EC2 names every
+/// quota refusal with (`VpcLimitExceeded`, `CarrierGatewayLimitExceeded`):
+/// `<Resource>LimitExceeded`. The ceiling it reports is this store's
+/// ([`MAX_MANAGED_PREFIX_LISTS`]), not a published AWS quota.
+pub const PREFIX_LIST_LIMIT_EXCEEDED: &str = "PrefixListLimitExceeded";
+
+/// EC2's error code for a request that named a prefix list id no prefix list of the account
+/// or of the Region has, spelled the way this service spells its other id-not-found codes
+/// ([`INVALID_VPC_ID_NOT_FOUND`], `InvalidSubnetID.NotFound`).
+pub const INVALID_PREFIX_LIST_ID_NOT_FOUND: &str = "InvalidPrefixListID.NotFound";
+
+/// Refuse a request that named a prefix list id nothing the caller can see has: HTTP 400
+/// [`INVALID_PREFIX_LIST_ID_NOT_FOUND`].
+///
+/// Built by [`id_not_found`], this crate's one writer of an `Invalid<Kind>.NotFound`, so the
+/// wording of the prefix list surface's not-found answer cannot drift from the rest of the
+/// service's.
+pub fn invalid_prefix_list_id_not_found<E>(prefix_list_id: &str) -> Scaffolded<E> {
+    id_not_found(
+        INVALID_PREFIX_LIST_ID_NOT_FOUND,
+        "prefix list ID",
+        prefix_list_id,
+    )
+}
+
+/// Refuse a create that would take the store past [`MAX_MANAGED_PREFIX_LISTS`]: HTTP 400
+/// [`PREFIX_LIST_LIMIT_EXCEEDED`].
+pub fn prefix_list_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(PREFIX_LIST_LIMIT_EXCEEDED, 400, message)
+}
+
+/// What one managed prefix list is created with, beyond everything the service itself derives
+/// ([`ComAmazonawsEc2Amazonec2State::insert_managed_prefix_list`] mints the id, builds the
+/// ARN, fills in the owning account, and sets the first version and the state the list starts
+/// in).
+#[derive(Debug, Clone, Default)]
+pub struct ManagedPrefixListSpec {
+    /// "A name for the prefix list" (`CreateManagedPrefixListRequest$PrefixListName`).
+    pub prefix_list_name: String,
+    /// One of [`PREFIX_LIST_ADDRESS_FAMILIES`].
+    pub address_family: String,
+    /// "The maximum number of entries for the prefix list"
+    /// (`CreateManagedPrefixListRequest$MaxEntries`).
+    pub max_entries: i32,
+    /// "One or more entries for the prefix list"
+    /// (`CreateManagedPrefixListRequest$Entries`), already read into the shape
+    /// `GetManagedPrefixListEntries` reports them as.
+    pub entries: Vec<crate::ops::types::PrefixListEntry>,
+    /// "The tags to apply to the prefix list during creation"
+    /// (`CreateManagedPrefixListRequest$TagSpecifications`).
+    pub tags: Vec<Tag>,
+    /// The Region the request was made in, which the list's ARN names.
+    pub region: String,
+    /// The `ClientToken` the request carried, if any: the token map keeps it for as long as
+    /// the list lives, so the bytes it holds are charged with the list's.
+    pub client_token: Option<String>,
+}
+
+/// One stored managed prefix list: the modelled shape every operation that reports one
+/// answers with, plus the facts that shape carries no member for.
+#[derive(Debug, Clone, Default)]
+pub struct ManagedPrefixListRecord {
+    /// The list as `CreateManagedPrefixList` answered it and `DescribeManagedPrefixLists`
+    /// reports it.
+    pub view: crate::ops::types::ManagedPrefixList,
+    /// The entries of the list's CURRENT version, in the order the request named them. The
+    /// modelled [`crate::ops::types::ManagedPrefixList`] carries no member for them —
+    /// `GetManagedPrefixListEntries` is what reports them (still a scaffold stub with its own
+    /// open issue) — so the entries a create accepted are kept here rather than dropped.
+    pub entries: Vec<crate::ops::types::PrefixListEntry>,
+    /// The `create-in-progress` -> `create-complete` move the clock owes the list, until
+    /// [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies it. `None` on a
+    /// list that has nothing owed.
+    pub pending: Option<ClockTransition<&'static str>>,
+}
+
+/// The caller-chosen bytes one stored managed prefix list holds for the process's lifetime:
+/// its name, its entries' CIDRs and descriptions, its tags and the client token the token map
+/// keeps. The id, the ARN, the owning account, the state and the version are derived by
+/// [`ComAmazonawsEc2Amazonec2State::insert_managed_prefix_list`], so they are bounded already
+/// and not counted here.
+///
+/// The ONE definition of that charge, the way [`carrier_gateway_payload_bytes`] is for a
+/// carrier gateway: the create asks it before the write, off the values it has in hand, and
+/// that insert charges exactly it.
+pub fn managed_prefix_list_payload_bytes(
+    prefix_list_name: &str,
+    entries: &[crate::ops::types::PrefixListEntry],
+    tags: &[Tag],
+    client_token: Option<&str>,
+) -> usize {
+    let entry_bytes: usize = entries
+        .iter()
+        .map(|entry| {
+            entry.cidr.as_ref().map_or(0, String::len)
+                + entry.description.as_ref().map_or(0, String::len)
+        })
+        .sum();
+    tag_list_bytes(tags)
+        .saturating_add(prefix_list_name.len())
+        .saturating_add(entry_bytes)
+        .saturating_add(client_token.map_or(0, str::len))
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another managed prefix list fits inside the store's ceiling
+    /// ([`MAX_MANAGED_PREFIX_LISTS`]).
+    ///
+    /// The same contract as [`Self::has_carrier_gateway_capacity`]: a create asks this first
+    /// and refuses with [`prefix_list_limit_exceeded`] when it answers `false`.
+    pub fn has_managed_prefix_list_capacity(&self) -> bool {
+        self.managed_prefix_lists.len() < MAX_MANAGED_PREFIX_LISTS
+    }
+
+    /// Insert a managed prefix list, and answer the `PrefixListId` it was given.
+    ///
+    /// Everything the service itself owns is derived here rather than taken from the caller —
+    /// the id, the ARN, the owning account, the first version and the state the list starts
+    /// in — so two writers cannot report the same list differently. The caller-chosen bytes
+    /// the record retains ([`managed_prefix_list_payload_bytes`]) are charged against the
+    /// store's byte budget here, so a writer cannot store them uncharged, and the
+    /// `create-complete` move the clock owes the list is recorded with it rather than slept
+    /// for.
+    pub fn insert_managed_prefix_list(&mut self, spec: ManagedPrefixListSpec) -> String {
+        let prefix_list_id = self.next_id(PREFIX_LIST_ID_PREFIX);
+        self.add_stored_bytes(managed_prefix_list_payload_bytes(
+            &spec.prefix_list_name,
+            &spec.entries,
+            &spec.tags,
+            spec.client_token.as_deref(),
+        ));
+        let record = ManagedPrefixListRecord {
+            view: crate::ops::types::ManagedPrefixList {
+                prefix_list_id: Some(prefix_list_id.clone()),
+                address_family: Some(spec.address_family),
+                state: Some(PREFIX_LIST_STATE_CREATE_IN_PROGRESS.to_string()),
+                state_message: None,
+                prefix_list_arn: Some(::engine::emulator_arn(
+                    "ec2",
+                    &spec.region,
+                    &format!("{RESOURCE_TYPE_PREFIX_LIST}/{prefix_list_id}"),
+                )),
+                prefix_list_name: Some(spec.prefix_list_name),
+                max_entries: Some(spec.max_entries),
+                version: Some(FIRST_PREFIX_LIST_VERSION),
+                tags: Some(spec.tags),
+                owner_id: Some(::engine::emulator_account_id().to_string()),
+                ipam_prefix_list_resolver_target_id: None,
+                ipam_prefix_list_resolver_sync_enabled: None,
+            },
+            entries: spec.entries,
+            pending: Some(ClockTransition::starting_now(
+                PREFIX_LIST_STATE_CREATE_COMPLETE,
+            )),
+        };
+        if let Some(token) = spec.client_token {
+            self.managed_prefix_list_client_tokens
+                .insert(token, prefix_list_id.clone());
+        }
+        self.managed_prefix_lists
+            .insert(prefix_list_id.clone(), record);
+        prefix_list_id
+    }
+}
+
+/// One Amazon Web Services SERVICE prefix list of one Region.
+///
+/// A prefix list of a service is a fact of a Region, not a resource a caller creates: no EC2
+/// operation adds or withdraws one, so [`service_prefix_lists_in_region`] derives them from
+/// the Region the same way [`availability_zones_in_region`] derives its zones, and the
+/// operations that report them write nothing. They live here, beside the data model, because
+/// BOTH reports of a prefix list read them — `DescribePrefixLists` reports the services
+/// ("available Amazon Web Services services in a prefix list format") and
+/// `DescribeManagedPrefixLists` reports "your managed prefix lists and any Amazon Web
+/// Services-managed prefix lists" — and the two must agree about one list's id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServicePrefixList {
+    /// `pl-0123abcd` — the id [`service_prefix_list_id`] derives for this list.
+    pub prefix_list_id: String,
+    /// `com.amazonaws.us-east-1.s3` — the service's name in this Region.
+    pub prefix_list_name: String,
+    /// The IP address ranges of the service, from [`service_prefix_list_cidrs`].
+    pub cidrs: Vec<String>,
+}
+
+impl ServicePrefixList {
+    /// This prefix list as the modelled `PrefixList` shape `DescribePrefixLists` reports,
+    /// whose three members are exactly what that operation documents reporting: the name, the
+    /// id and the ranges.
+    pub fn to_prefix_list(&self) -> crate::ops::types::PrefixList {
+        crate::ops::types::PrefixList {
+            prefix_list_id: Some(self.prefix_list_id.clone()),
+            prefix_list_name: Some(self.prefix_list_name.clone()),
+            cidrs: Some(self.cidrs.clone()),
+        }
+    }
+
+    /// This prefix list as the modelled `ManagedPrefixList` shape
+    /// `DescribeManagedPrefixLists` reports, for `region`.
+    ///
+    /// The members that are facts of the list itself are read off it: its id, its name, the
+    /// ranges' address family, and how many entries it holds, which is also the most it holds
+    /// ("The maximum number of entries for the prefix list",
+    /// `ManagedPrefixList$MaxEntries`) — nothing adds an entry to a list the account does not
+    /// own. Its owner is Amazon Web Services rather than the account
+    /// ([`AWS_MANAGED_PREFIX_LIST_OWNER`]), it carries no tag, because an account tags only
+    /// its own resources, and it is settled: a list a Region publishes has no creation still
+    /// in progress, so its state is [`PREFIX_LIST_STATE_CREATE_COMPLETE`] and its version the
+    /// first.
+    pub fn to_managed_prefix_list(&self, region: &str) -> crate::ops::types::ManagedPrefixList {
+        crate::ops::types::ManagedPrefixList {
+            prefix_list_id: Some(self.prefix_list_id.clone()),
+            address_family: Some(
+                if self.cidrs.iter().any(|cidr| cidr.contains(':')) {
+                    PREFIX_LIST_ADDRESS_FAMILY_IPV6
+                } else {
+                    PREFIX_LIST_ADDRESS_FAMILY_IPV4
+                }
+                .to_string(),
+            ),
+            state: Some(PREFIX_LIST_STATE_CREATE_COMPLETE.to_string()),
+            state_message: None,
+            prefix_list_arn: Some(::engine::emulator_arn(
+                "ec2",
+                region,
+                &format!("{RESOURCE_TYPE_PREFIX_LIST}/{}", self.prefix_list_id),
+            )),
+            prefix_list_name: Some(self.prefix_list_name.clone()),
+            max_entries: Some(i32::try_from(self.cidrs.len()).unwrap_or(i32::MAX)),
+            version: Some(FIRST_PREFIX_LIST_VERSION),
+            tags: Some(Vec::new()),
+            owner_id: Some(AWS_MANAGED_PREFIX_LIST_OWNER.to_string()),
+            ipam_prefix_list_resolver_target_id: None,
+            ipam_prefix_list_resolver_sync_enabled: None,
+        }
+    }
+}
+
+/// The `OwnerId` of a prefix list Amazon Web Services publishes rather than the account
+/// creating: "The ID of the owner of the prefix list" (`ManagedPrefixList$OwnerId`) is the
+/// account id for a list the caller created, and the service itself owns the lists it
+/// publishes, which it names `AWS` — the value the `owner-id` filter of
+/// `DescribeManagedPrefixLists` selects those lists by.
+pub const AWS_MANAGED_PREFIX_LIST_OWNER: &str = "AWS";
+
+/// The services an Amazon Web Services service prefix list is published for in every Region.
+///
+/// `DescribePrefixLists` "describes available Amazon Web Services services in a prefix list
+/// format, which includes the prefix list name and prefix list ID of the service and the IP
+/// address range for the service" (the operation's own doc), so what it reports is one prefix
+/// list per service that HAS one — the services reachable through a gateway VPC endpoint,
+/// Amazon DynamoDB and Amazon S3 (Amazon VPC User Guide, "Gateway endpoints": "You can create
+/// a gateway endpoint ... Amazon S3, Amazon DynamoDB") — which is why this catalog names
+/// services rather than reading a store.
+///
+/// Each entry is the service component of the list's name, spelled the way a gateway
+/// endpoint's service name spells it: `com.amazonaws.<region>.<service>`.
+const AWS_SERVICE_PREFIX_LIST_SERVICES: [&str; 2] = ["dynamodb", "s3"];
+
+/// The first address of the range every derived prefix list CIDR is carved out of:
+/// `198.18.0.0/15`, which IANA reserves for benchmarking (RFC 2544) and no real service
+/// answers on. See [`service_prefix_list_cidrs`].
+const BENCHMARK_RANGE_BASE: u32 = u32::from_be_bytes([198, 18, 0, 0]);
+
+/// The prefix length of that reserved range.
+const BENCHMARK_RANGE_PREFIX_LENGTH: u32 = 15;
+
+/// The prefix length of each block carved out of it: one block is one prefix list's reported
+/// range.
+const PREFIX_LIST_BLOCK_PREFIX_LENGTH: u32 = 21;
+
+/// The Amazon Web Services service prefix lists Region `region` publishes, in
+/// `PrefixListName` order — the order a `NextToken` walk of `DescribePrefixLists` resumes in,
+/// and unique by construction, one name per service of [`AWS_SERVICE_PREFIX_LIST_SERVICES`].
+pub fn service_prefix_lists_in_region(region: &str) -> Vec<ServicePrefixList> {
+    let mut lists: Vec<ServicePrefixList> = AWS_SERVICE_PREFIX_LIST_SERVICES
+        .iter()
+        .enumerate()
+        .map(|(index, service)| {
+            let prefix_list_name = format!("com.amazonaws.{region}.{service}");
+            ServicePrefixList {
+                prefix_list_id: service_prefix_list_id(&prefix_list_name),
+                cidrs: service_prefix_list_cidrs(u32::try_from(index).unwrap_or(0)),
+                prefix_list_name,
+            }
+        })
+        .collect();
+    lists.sort_by(|left, right| left.prefix_list_name.cmp(&right.prefix_list_name));
+    // `PrefixListIds` selects by id, so two lists of one Region sharing one would make a
+    // request ambiguous. The ids are derived from distinct names, which the catalog's own
+    // entries keep distinct; the assertion pins that invariant if the catalog grows.
+    debug_assert!(
+        lists
+            .windows(2)
+            .all(|pair| pair[0].prefix_list_id != pair[1].prefix_list_id),
+        "two prefix lists of one Region must not share an id"
+    );
+    lists
+}
+
+/// The id of the service prefix list named `prefix_list_name`.
+///
+/// AWS mints an opaque id of the form `pl-` followed by hexadecimal digits for every prefix
+/// list and keeps it for the life of the list, so the id here is DERIVED from the list's name
+/// — a pure function of it through [`stable_prefix_list_hash`] — which gives the same two
+/// properties without storing anything: every read of one Region's prefix list reports the
+/// same id, and two lists with different names get different ids. It carries 8 digits where
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] mints 17, so a derived id can never collide with
+/// the id of a managed prefix list a caller created.
+fn service_prefix_list_id(prefix_list_name: &str) -> String {
+    format!(
+        "{PREFIX_LIST_ID_PREFIX}-{:08x}",
+        stable_prefix_list_hash(prefix_list_name) & 0xffff_ffff
+    )
+}
+
+/// The IP address ranges this emulator reports for service number `service_index` of
+/// [`AWS_SERVICE_PREFIX_LIST_SERVICES`].
+///
+/// AWS publishes a service's real ranges per Region in its `ip-ranges.json` feed, which
+/// neither this service's model nor a request carries and this emulator holds no copy of. So a
+/// range reported here is DERIVED, and it is derived from the one thing a prefix list is scoped
+/// to within a Region — the service: one `/21` block of `198.18.0.0/15`, the range IANA
+/// reserves for benchmarking (RFC 2544), so a range this emulator reports can never be read as
+/// an address a real Amazon Web Services service answers on. Indexing the block by the service
+/// alone is what the two properties this derivation claims need, and no more: every read of one
+/// Region's list reports the same range, and two services of one Region never share a block.
+/// Two Regions DO report the same ranges for one service — the real ranges are the feed's,
+/// which this emulator does not hold, so nothing here distinguishes Regions by address.
+fn service_prefix_list_cidrs(service_index: u32) -> Vec<String> {
+    // How many blocks of [`PREFIX_LIST_BLOCK_PREFIX_LENGTH`] the reserved range holds. A
+    // catalog larger than that would have nothing left to stay inside, so the block number
+    // wraps — a derivation that keeps answering an address in the reserved range rather than a
+    // request-path panic — and the assertion catches the overgrown catalog in development,
+    // where two services would otherwise come to share a block.
+    let blocks = 1u32 << (PREFIX_LIST_BLOCK_PREFIX_LENGTH - BENCHMARK_RANGE_PREFIX_LENGTH);
+    debug_assert!(
+        u32::try_from(AWS_SERVICE_PREFIX_LIST_SERVICES.len()).unwrap_or(u32::MAX) <= blocks,
+        "the prefix list catalog must fit the blocks the reserved range holds"
+    );
+    let block = service_index % blocks;
+    let address = BENCHMARK_RANGE_BASE + block * (1u32 << (32 - PREFIX_LIST_BLOCK_PREFIX_LENGTH));
+    vec![format!(
+        "{}/{PREFIX_LIST_BLOCK_PREFIX_LENGTH}",
+        ::std::net::Ipv4Addr::from(address)
+    )]
+}
+
+/// A deterministic digest of `value`, for deriving a service prefix list's id from its name
+/// rather than storing it.
+///
+/// The standard library's hasher, seeded by its own default rather than randomly, so a digest
+/// is a pure function of its input: every read of one name answers the same value, which is
+/// what makes the derived id stable across calls. `DefaultHasher`'s output is not guaranteed
+/// stable ACROSS Rust versions, so a derived `pl-` id is stable within one build of the
+/// emulator, not across toolchains — which is all an opaque id a caller reads back from the
+/// same running emulator needs. Nothing here is a secret and nothing depends on a digest being
+/// unforgeable.
+fn stable_prefix_list_hash(value: &str) -> u64 {
+    use ::std::hash::{Hash, Hasher};
+
+    let mut hasher = ::std::hash::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 // ---------------------------------------------------------------------------

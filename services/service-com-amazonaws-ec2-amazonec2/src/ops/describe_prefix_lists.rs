@@ -173,8 +173,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
-            MAX_FILTERS, MAX_PAGE_SIZE, MAX_RESOURCE_IDS, MatchBudget, decode_page_token,
-            encode_page_token, invalid_pagination_token_for, request_region,
+            MAX_FILTERS, MAX_PAGE_SIZE, MAX_RESOURCE_IDS, MatchBudget, ServicePrefixList,
+            decode_page_token, encode_page_token, invalid_pagination_token_for, request_region,
+            service_prefix_lists_in_region,
         };
 
         // A Region's prefix lists are derived, not stored, so this operation never
@@ -289,7 +290,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .any(|list| list.prefix_list_id == id.as_str())
         }) {
-            return Err(invalid_prefix_list_id_not_found(unknown));
+            return Err(crate::state::invalid_prefix_list_id_not_found(unknown));
         }
 
         // "The default is to describe all your prefix lists": `PrefixListIds` narrows
@@ -298,7 +299,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::state::matches_every_filter` so one spelling of that rule serves every
         // describe of this service.
         let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
-        let selected: Vec<&ServicePrefixListRecord> = published
+        let selected: Vec<&ServicePrefixList> = published
             .iter()
             .filter(|list| {
                 requested_ids.is_empty()
@@ -308,7 +309,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .filter(|list| {
                 crate::state::matches_every_filter(&selectors, &mut budget, &|name| {
-                    list.filter_values(name)
+                    filter_values(list, name)
                 })
             })
             .collect();
@@ -365,197 +366,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 // The Amazon Web Services service prefix lists of a Region
 // ---------------------------------------------------------------------------
 //
-// Only this operation reads them, so they live here rather than in `crate::state`,
-// which holds the data model several operations share. A prefix list a caller CREATES
-// is a managed prefix list: that one is a stored resource, and it belongs to
-// `CreateManagedPrefixList` / `DescribeManagedPrefixLists` and their own store.
-
-/// The services an Amazon Web Services service prefix list is published for in every
-/// Region.
-///
-/// `DescribePrefixLists` "describes available Amazon Web Services services in a prefix
-/// list format, which includes the prefix list name and prefix list ID of the service and
-/// the IP address range for the service" (the operation's own doc), so what it reports is
-/// one prefix list per service that HAS one — the services reachable through a gateway VPC
-/// endpoint, Amazon DynamoDB and Amazon S3 (Amazon VPC User Guide, "Gateway endpoints":
-/// "You can create a gateway endpoint ... Amazon S3, Amazon DynamoDB"), which is why this
-/// catalog names services rather than reading a store.
-///
-/// Each entry is the service component of the list's name, spelled the way a gateway
-/// endpoint's service name spells it: `com.amazonaws.<region>.<service>`.
-const AWS_SERVICE_PREFIX_LIST_SERVICES: [&str; 2] = ["dynamodb", "s3"];
+// The derivation itself lives in `crate::state`, which holds the data model several
+// operations share: BOTH reports of a prefix list read it — this one reports the services
+// ("available Amazon Web Services services in a prefix list format") and
+// `DescribeManagedPrefixLists` reports the account's managed lists AND the published ones —
+// so neither can disagree with the other about a published list's id. What stays here is
+// what belongs to THIS operation: which filters it documents, and the values they compare
+// against.
 
 /// Every filter this operation documents, as its `Filters` member lists them
 /// (`smithy_query(query="doc",shape="DescribePrefixListsRequest",member="Filters")`:
 /// "prefix-list-id: The ID of a prefix list. prefix-list-name: The name of a prefix
-/// list."). Every entry must be answered by [`ServicePrefixListRecord::filter_values`].
+/// list."). Every entry must be answered by [`filter_values`].
 const PREFIX_LIST_FILTERS: [&str; 2] = ["prefix-list-id", "prefix-list-name"];
 
-/// The code EC2 refuses a request naming a prefix list id no prefix list has with,
-/// spelled the way this service spells its other id-not-found codes
-/// (`crate::state::INVALID_VPC_ID_NOT_FOUND`, `InvalidSubnetID.NotFound`).
-const INVALID_PREFIX_LIST_ID_NOT_FOUND: &str = "InvalidPrefixListID.NotFound";
+/// The values the EC2 filter `name` compares against the service prefix list `list`.
+///
+/// A name outside [`PREFIX_LIST_FILTERS`] compares against NO values, so it selects nothing
+/// rather than everything — the handler refuses such a name before it gets here. A filter
+/// carrying no value at all matches nothing for the same reason, there being no value for
+/// the attribute to match: the answer `DescribeVpcs` and `DescribeVpcEndpointConnections`
+/// give a valueless filter.
+fn filter_values<'a>(
+    list: &'a crate::state::ServicePrefixList,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
 
-/// The first address of the range every derived prefix list CIDR is carved out of:
-/// `198.18.0.0/15`, which IANA reserves for benchmarking (RFC 2544) and no real service
-/// answers on. See [`service_prefix_list_cidrs`].
-const BENCHMARK_RANGE_BASE: u32 = u32::from_be_bytes([198, 18, 0, 0]);
-
-/// The prefix length of that reserved range.
-const BENCHMARK_RANGE_PREFIX_LENGTH: u32 = 15;
-
-/// The prefix length of each block carved out of it: one block is one prefix list's
-/// reported range.
-const PREFIX_LIST_BLOCK_PREFIX_LENGTH: u32 = 21;
-
-/// One Amazon Web Services service prefix list of one Region, as this describe reads it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ServicePrefixListRecord {
-    /// `pl-0123abcd` — the id [`service_prefix_list_id`] derives for this list.
-    prefix_list_id: String,
-    /// `com.amazonaws.us-east-1.s3` — the service's name in this Region.
-    prefix_list_name: String,
-    /// The IP address ranges of the service, from [`service_prefix_list_cidrs`].
-    cidrs: Vec<String>,
-}
-
-impl ServicePrefixListRecord {
-    /// This prefix list as the modelled `PrefixList` shape, whose three members are
-    /// exactly what the operation documents reporting: the name, the id and the ranges.
-    fn to_prefix_list(&self) -> PrefixList {
-        PrefixList {
-            prefix_list_id: Some(self.prefix_list_id.clone()),
-            prefix_list_name: Some(self.prefix_list_name.clone()),
-            cidrs: Some(self.cidrs.clone()),
-        }
+    match name {
+        "prefix-list-id" => vec![Cow::Borrowed(list.prefix_list_id.as_str())],
+        "prefix-list-name" => vec![Cow::Borrowed(list.prefix_list_name.as_str())],
+        _ => Vec::new(),
     }
-
-    /// The values the EC2 filter `name` compares against this prefix list.
-    ///
-    /// A name outside [`PREFIX_LIST_FILTERS`] compares against NO values, so it selects
-    /// nothing rather than everything — the handler refuses such a name before it gets
-    /// here. A filter carrying no value at all matches nothing for the same reason, there
-    /// being no value for the attribute to match: the answer `DescribeVpcs` and
-    /// `DescribeVpcEndpointConnections` give a valueless filter.
-    fn filter_values(&self, name: &str) -> Vec<::std::borrow::Cow<'_, str>> {
-        use ::std::borrow::Cow;
-
-        match name {
-            "prefix-list-id" => vec![Cow::Borrowed(self.prefix_list_id.as_str())],
-            "prefix-list-name" => vec![Cow::Borrowed(self.prefix_list_name.as_str())],
-            _ => Vec::new(),
-        }
-    }
-}
-
-/// The Amazon Web Services service prefix lists Region `region` publishes, in
-/// `PrefixListName` order — the order a `NextToken` walk resumes in, and unique by
-/// construction, one name per service of [`AWS_SERVICE_PREFIX_LIST_SERVICES`].
-///
-/// A prefix list of a service is a fact of a Region, not a resource a caller creates: no
-/// EC2 operation adds or withdraws one, so this derives them from the Region the same way
-/// `crate::state::availability_zones_in_region` derives its zones, and this operation
-/// writes nothing at all.
-fn service_prefix_lists_in_region(region: &str) -> Vec<ServicePrefixListRecord> {
-    let mut lists: Vec<ServicePrefixListRecord> = AWS_SERVICE_PREFIX_LIST_SERVICES
-        .iter()
-        .enumerate()
-        .map(|(index, service)| {
-            let prefix_list_name = format!("com.amazonaws.{region}.{service}");
-            ServicePrefixListRecord {
-                prefix_list_id: service_prefix_list_id(&prefix_list_name),
-                cidrs: service_prefix_list_cidrs(u32::try_from(index).unwrap_or(0)),
-                prefix_list_name,
-            }
-        })
-        .collect();
-    lists.sort_by(|left, right| left.prefix_list_name.cmp(&right.prefix_list_name));
-    // `PrefixListIds` selects by id, so two lists of one Region sharing one would make a
-    // request ambiguous. The ids are derived from distinct names, which the catalog's own
-    // entries keep distinct; the assertion pins that invariant if the catalog grows.
-    debug_assert!(
-        lists
-            .windows(2)
-            .all(|pair| pair[0].prefix_list_id != pair[1].prefix_list_id),
-        "two prefix lists of one Region must not share an id"
-    );
-    lists
-}
-
-/// The id of the prefix list named `prefix_list_name`.
-///
-/// AWS mints an opaque id of the form `pl-` followed by hexadecimal digits for every
-/// prefix list and keeps it for the life of the list, so the id here is DERIVED from the
-/// list's name — a pure function of it through [`stable_hash`] — which gives the same two
-/// properties without storing anything: every read of one Region's prefix list reports the
-/// same id, and two lists with different names get different ids.
-fn service_prefix_list_id(prefix_list_name: &str) -> String {
-    format!("pl-{:08x}", stable_hash(prefix_list_name) & 0xffff_ffff)
-}
-
-/// The IP address ranges this emulator reports for service number `service_index` of
-/// [`AWS_SERVICE_PREFIX_LIST_SERVICES`].
-///
-/// AWS publishes a service's real ranges per Region in its `ip-ranges.json` feed, which
-/// neither this service's model nor a request carries and this emulator holds no copy of.
-/// So a range reported here is DERIVED, and it is derived from the one thing a prefix list
-/// is scoped to within a Region — the service: one `/21` block of `198.18.0.0/15`, the
-/// range IANA reserves for benchmarking (RFC 2544), so a range this emulator reports can
-/// never be read as an address a real Amazon Web Services service answers on. Indexing the
-/// block by the service alone is what the two properties this derivation claims need, and
-/// no more: every read of one Region's list reports the same range, and two services of one
-/// Region never share a block. Two Regions DO report the same ranges for one service — the
-/// real ranges are the feed's, which this emulator does not hold, so nothing here
-/// distinguishes Regions by address.
-fn service_prefix_list_cidrs(service_index: u32) -> Vec<String> {
-    // How many blocks of [`PREFIX_LIST_BLOCK_PREFIX_LENGTH`] the reserved range holds. A
-    // catalog larger than that would have nothing left to stay inside, so the block number
-    // wraps — a derivation that keeps answering an address in the reserved range rather
-    // than a request-path panic — and the assertion catches the overgrown catalog in
-    // development, where two services would otherwise come to share a block.
-    let blocks = 1u32 << (PREFIX_LIST_BLOCK_PREFIX_LENGTH - BENCHMARK_RANGE_PREFIX_LENGTH);
-    debug_assert!(
-        u32::try_from(AWS_SERVICE_PREFIX_LIST_SERVICES.len()).unwrap_or(u32::MAX) <= blocks,
-        "the prefix list catalog must fit the blocks the reserved range holds"
-    );
-    let block = service_index % blocks;
-    let address = BENCHMARK_RANGE_BASE + block * (1u32 << (32 - PREFIX_LIST_BLOCK_PREFIX_LENGTH));
-    vec![format!(
-        "{}/{PREFIX_LIST_BLOCK_PREFIX_LENGTH}",
-        ::std::net::Ipv4Addr::from(address)
-    )]
-}
-
-/// Refuse a request that named a prefix list id no prefix list has, the way EC2 does:
-/// HTTP 400 [`INVALID_PREFIX_LIST_ID_NOT_FOUND`].
-///
-/// The refusal itself comes from [`crate::state::id_not_found`], the crate's one writer of
-/// an `Invalid<Kind>.NotFound`, so the wording of this operation's not-found answer cannot
-/// drift from the rest of the service's.
-fn invalid_prefix_list_id_not_found(prefix_list_id: &str) -> DescribePrefixListsError {
-    crate::state::id_not_found(
-        INVALID_PREFIX_LIST_ID_NOT_FOUND,
-        "prefix list ID",
-        prefix_list_id,
-    )
-}
-
-/// A deterministic digest of `value`, for deriving a prefix list's id from its name rather
-/// than storing it.
-///
-/// The standard library's hasher, seeded by its own default rather than randomly, so a
-/// digest is a pure function of its input: every read of one name answers the same value,
-/// which is what makes the derived id stable across calls. `DefaultHasher`'s output is not
-/// guaranteed stable ACROSS Rust versions, so a derived `pl-` id is stable within one build
-/// of the emulator, not across toolchains — which is all an opaque id a caller reads back
-/// from the same running emulator needs. Nothing here is a secret and nothing depends on a
-/// digest being unforgeable — the same reason `crate::state`'s page-token checksum uses the
-/// same hasher; this operation keeps its own copy rather than widening that module, since
-/// the derivation is this operation's alone.
-fn stable_hash(value: &str) -> u64 {
-    use ::std::hash::{Hash, Hasher};
-
-    let mut hasher = ::std::hash::DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
 }

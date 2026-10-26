@@ -556,5 +556,11 @@ mod verified_access_instances;
 // Declared LAST for the reason the header gives: the sorted region of this file is where
 // every new ec2 suite inserts its lines. What `ValidateSecurityGroupQuotasForInterface`
 // answers every caller of this emulator, and what it leaves the store holding.
+// Declared LAST for the reason the header gives: the sorted region of this file is where
+// every new ec2 suite inserts its lines. The managed prefix list slice: what
+// `CreateManagedPrefixList` stores and refuses, and what `DescribeManagedPrefixLists`
+// reports back — the account's own lists and the ones a Region publishes.
+#[path = "all/managed_prefix_lists.rs"]
+mod managed_prefix_lists;
 #[path = "all/validate_security_group_quotas_for_interface.rs"]
 mod validate_security_group_quotas_for_interface;

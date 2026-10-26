@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateManagedPrefixList
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateManagedPrefixList`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateManagedPrefixList::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates ONE managed prefix list in [`crate::state`]: the name, address family, maximum
+//! size, entries and tags the request names, under an id, an ARN and an owning account this
+//! service derives. The list is answered in the non-terminal `create-in-progress` state the
+//! model publishes, and the clock — not a later call — owes it `create-complete` one
+//! [`crate::state::TRANSITION_DELAY`] later.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +139,305 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateManagedPrefixList` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateManagedPrefixListErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateManagedPrefixList"))
+        use crate::state;
+
+        // "The tags to apply to the prefix list during creation"
+        // (`CreateManagedPrefixListRequest$TagSpecifications`): the prefix list is the only
+        // resource this call creates, so the shared reader refuses a specification naming
+        // any other resource type and holds the tag payload to the documented bounds.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_PREFIX_LIST,
+            Self::NAME,
+        )?;
+
+        // "Unique, case-sensitive identifier you provide to ensure the idempotency of the
+        // request" (`CreateManagedPrefixListRequest$ClientToken`). The store keeps the token
+        // for as long as the list lives, so the bound this crate holds every client token to
+        // is enforced here.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {max} characters",
+                max = state::MAX_CLIENT_TOKEN_CHARS,
+            )));
+        }
+
+        // "The IP address type. Valid Values: IPv4 | IPv6"
+        // (`CreateManagedPrefixListRequest$AddressFamily`): the member is a plain string, so
+        // the boundary validator admits any text and the documented value list is applied
+        // here. The family decides which CIDR blocks the entries may carry, so a value
+        // outside it could not be read as either family.
+        if !state::PREFIX_LIST_ADDRESS_FAMILIES.contains(&input.address_family.as_str()) {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{family}' for addressFamily. Valid values: {valid}",
+                family = input.address_family,
+                valid = state::PREFIX_LIST_ADDRESS_FAMILIES.join(" | "),
+            )));
+        }
+
+        // "A name for the prefix list" (`CreateManagedPrefixListRequest$PrefixListName`) — a
+        // modelled `@required` member, which an EMPTY string still satisfies, so the
+        // parameter having a value at all is asked here.
+        if input.prefix_list_name.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter prefixListName",
+            ));
+        }
+        // "Constraints: Up to 255 characters in length. The name cannot start with
+        // com.amazonaws" — that namespace is the one the Amazon Web Services SERVICE prefix
+        // lists of a Region are named in, so a caller's own list may not take a name in it.
+        if input.prefix_list_name.chars().count() > state::MAX_PREFIX_LIST_NAME_CHARS {
+            return Err(state::invalid_parameter_value(format!(
+                "prefixListName accepts at most {max} characters",
+                max = state::MAX_PREFIX_LIST_NAME_CHARS,
+            )));
+        }
+        if input
+            .prefix_list_name
+            .starts_with(state::RESERVED_PREFIX_LIST_NAME_PREFIX)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{name}' for prefixListName. \
+                 The name cannot start with {reserved}",
+                name = input.prefix_list_name,
+                reserved = state::RESERVED_PREFIX_LIST_NAME_PREFIX,
+            )));
+        }
+
+        // "The maximum number of entries for the prefix list"
+        // (`CreateManagedPrefixListRequest$MaxEntries`). The model declares no `@range` on
+        // the member, so the handler is the only place a list that could hold no entry at
+        // all is refused.
+        if input.max_entries < state::MIN_PREFIX_LIST_MAX_ENTRIES {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{max_entries}' for maxEntries. It must be at least {min}",
+                max_entries = input.max_entries,
+                min = state::MIN_PREFIX_LIST_MAX_ENTRIES,
+            )));
+        }
+
+        // "One or more entries for the prefix list"
+        // (`CreateManagedPrefixListRequest$Entries`), read into the shape
+        // `GetManagedPrefixListEntries` reports them as. The modelled `length 0..100` has
+        // already bounded how many there may be; what each one carries is read here.
+        let entries = read_entries(
+            input.entries.as_deref().unwrap_or_default(),
+            &input.address_family,
+        )?;
+        // A prefix list cannot be created already past its own ceiling: `MaxEntries` is the
+        // most entries it may hold, the ones it is created with included.
+        if entries.len() > usize::try_from(input.max_entries).unwrap_or(usize::MAX) {
+            return Err(state::invalid_parameter_value(format!(
+                "The request carries {count} entries, which is more than the prefix list's \
+                 maximum of {max_entries} entries",
+                count = entries.len(),
+                max_entries = input.max_entries,
+            )));
+        }
+
+        // EC2 is a regional service reached through a regional endpoint: the Region the
+        // caller signed for is the Region the list is created in, and it is part of the
+        // list's ARN (`ManagedPrefixList$PrefixListArn`).
+        let region = state::request_region(ctx.parts());
+
+        // What this call would retain, counted by the ONE definition of that charge before
+        // the store is locked — a COUNT ceiling admits gigabytes on its own, the record
+        // holding strings the caller chose the length of.
+        let payload_bytes = state::managed_prefix_list_payload_bytes(
+            &input.prefix_list_name,
+            &entries,
+            &tags,
+            input.client_token.as_deref(),
+        );
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock-owed move a stored list may already be due: a list an earlier call
+        // answered as `create-in-progress` is `create-complete` once its due instant has
+        // passed, whether or not anybody called, so applying it here is what keeps a replay
+        // below from reporting a state `DescribeManagedPrefixLists` no longer reports.
+        store.materialize_due_transitions();
+
+        // Idempotency: one token names the one prefix list it created, so a replay of the
+        // SAME request reports that list and creates nothing. Read here and answered below
+        // the DryRun check, because a replay stores nothing and so passes the ceilings a
+        // fresh create has to clear.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.managed_prefix_list_client_tokens.get(token).cloned());
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of. A
+        // replay stores nothing, so it is charged nothing and clears both gates.
+        if replayed.is_none() && !store.has_managed_prefix_list_capacity() {
+            return Err(state::prefix_list_limit_exceeded(format!(
+                "This emulator holds {max} managed prefix lists, which is as many as it \
+                 stores",
+                max = state::MAX_MANAGED_PREFIX_LISTS,
+            )));
+        }
+        if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::prefix_list_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves the store untouched. "If you have the required permissions, the error
+        // response is DryRunOperation" (`CreateManagedPrefixListRequest$DryRun`), and every
+        // caller of this emulator holds them.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        let prefix_list_id = match replayed {
+            Some(prefix_list_id) => {
+                // A token is idempotent only for the REQUEST it was first given with:
+                // replayed with a different parameter it names a list the caller did not ask
+                // for, which EC2 refuses rather than answers — the same contract every other
+                // create of this crate that reads a client token has.
+                let stored = store
+                    .managed_prefix_lists
+                    .get(&prefix_list_id)
+                    .ok_or_else(|| {
+                        state::internal_error(format!(
+                            "a client token names prefix list '{prefix_list_id}', which is \
+                             not stored"
+                        ))
+                    })?;
+                if !same_request(stored, &input, &entries, &tags) {
+                    return Err(state::idempotent_parameter_mismatch());
+                }
+                prefix_list_id
+            }
+            None => store.insert_managed_prefix_list(state::ManagedPrefixListSpec {
+                prefix_list_name: input.prefix_list_name.clone(),
+                address_family: input.address_family.clone(),
+                max_entries: input.max_entries,
+                entries,
+                tags,
+                region,
+                // The token is recorded with the list it minted, so a replay of this request
+                // reports that list instead of creating a second one.
+                client_token: input.client_token.clone(),
+            }),
+        };
+
+        // Read the answer back OUT of the store, so the caller sees what a later
+        // `DescribeManagedPrefixLists` will see rather than the request object.
+        store
+            .managed_prefix_lists
+            .get(&prefix_list_id)
+            .map(|record| CreateManagedPrefixListOutput {
+                prefix_list: Some(record.view.clone()),
+            })
+            .ok_or_else(|| {
+                state::internal_error(format!(
+                    "the newly created prefix list '{prefix_list_id}' could not be read back"
+                ))
+            })
     }
+}
+
+/// The request's `Entries` as the stored, reported [`PrefixListEntry`] shape, or the refusal
+/// one of them earns.
+///
+/// Each entry is "a CIDR block and an optional description" (`CreateManagedPrefixList`), and
+/// the CIDR is read against the list's own `AddressFamily`: a block of the other family — or
+/// a value that is no CIDR block at all — is refused rather than stored, an entry of the
+/// wrong family having no address the list could ever be consulted for. A block is stored in
+/// CANONICAL form, with its host bits clear, the way every other caller-supplied range of
+/// this service is ([`crate::state::canonical_cidr_block`]), so two spellings of one range
+/// are one entry. `family` is one of [`crate::state::PREFIX_LIST_ADDRESS_FAMILIES`].
+fn read_entries(
+    entries: &[AddPrefixListEntry],
+    family: &str,
+) -> Result<Vec<PrefixListEntry>, CreateManagedPrefixListError> {
+    use crate::state;
+
+    let wants_ipv6 = family == state::PREFIX_LIST_ADDRESS_FAMILY_IPV6;
+    let mut read: Vec<PrefixListEntry> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let canonical = match state::canonical_cidr_block(&entry.cidr) {
+            Some(canonical) if entry.cidr.contains(':') == wants_ipv6 => canonical,
+            _ => {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({cidr}) for parameter cidr is invalid. \
+                     This is not a valid {family} CIDR block.",
+                    cidr = entry.cidr,
+                )))
+            }
+        };
+        if entry
+            .description
+            .as_deref()
+            .is_some_and(|description| {
+                description.chars().count() > state::MAX_PREFIX_LIST_ENTRY_DESCRIPTION_CHARS
+            })
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "The description of entry {cidr} accepts at most {max} characters",
+                cidr = entry.cidr,
+                max = state::MAX_PREFIX_LIST_ENTRY_DESCRIPTION_CHARS,
+            )));
+        }
+        // One range is one entry: a second entry for a range the list already carries has no
+        // defined winner, so it is refused rather than stored twice.
+        if read
+            .iter()
+            .any(|stored| stored.cidr.as_deref() == Some(canonical.as_str()))
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({cidr}) for parameter cidr is invalid. \
+                 The prefix list cannot carry one CIDR block twice.",
+                cidr = entry.cidr,
+            )));
+        }
+        read.push(PrefixListEntry {
+            cidr: Some(canonical),
+            description: entry.description.clone(),
+        });
+    }
+    Ok(read)
+}
+
+/// Does `stored` — the prefix list a replayed `ClientToken` names — hold what THIS request
+/// asks for?
+///
+/// Every member the request decides is compared, so a token replayed with any different
+/// parameter is refused with `IdempotentParameterMismatch` rather than answered with a list
+/// the caller did not ask for. The members this service derives (the id, the ARN, the owning
+/// account, the version and the state the clock moves) are not compared: they follow from the
+/// ones that are. Tags are a SET, compared through the crate's one reader of a tag list
+/// ([`crate::state::tag_pairs`]); entries are a SEQUENCE, their order being the order the
+/// list reports them in.
+fn same_request(
+    stored: &crate::state::ManagedPrefixListRecord,
+    input: &CreateManagedPrefixListInput,
+    entries: &[PrefixListEntry],
+    tags: &[Tag],
+) -> bool {
+    let entry_pairs = |entries: &[PrefixListEntry]| -> Vec<(Option<String>, Option<String>)> {
+        entries
+            .iter()
+            .map(|entry| (entry.cidr.clone(), entry.description.clone()))
+            .collect()
+    };
+    let view = &stored.view;
+    view.prefix_list_name.as_deref() == Some(input.prefix_list_name.as_str())
+        && view.address_family.as_deref() == Some(input.address_family.as_str())
+        && view.max_entries == Some(input.max_entries)
+        && entry_pairs(&stored.entries) == entry_pairs(entries)
+        && crate::state::tag_pairs(view.tags.as_deref().unwrap_or_default())
+            == crate::state::tag_pairs(tags)
 }

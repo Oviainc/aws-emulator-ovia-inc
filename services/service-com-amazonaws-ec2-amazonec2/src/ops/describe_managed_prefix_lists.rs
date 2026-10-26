@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeManagedPrefixLists
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeManagedPrefixLists`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeManagedPrefixLists::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the prefix lists the caller can see: the account's own managed prefix lists out
+//! of [`crate::state`], and the ones Amazon Web Services publishes for the services of the
+//! Region the request was signed for ([`crate::state::service_prefix_lists_in_region`]) —
+//! "your managed prefix lists and any Amazon Web Services-managed prefix lists" — narrowed
+//! by the request's `PrefixListIds` and `Filters` and cut into `MaxResults`-sized pages. A
+//! reporting operation only: the one write it makes is the clock-owed
+//! `create-in-progress` -> `create-complete` move already due on a list at the instant of
+//! the call.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +142,246 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeManagedPrefixLists` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeManagedPrefixListsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state;
+
+        // "The token for the next page of results"
+        // (`DescribeManagedPrefixListsRequest$NextToken`) — anything else is refused rather
+        // than read as an id, and it is refused before any other member is looked at, so
+        // whether a bogus token is caught never depends on the rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                state::decode_page_token(token)
+                    .ok_or_else(|| state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // Matching cost is filters x values x value length x candidate lists, and the model
+        // bounds none of them (`FilterList` and `Filter$Values` carry no `@length`), so every
+        // request-controlled factor is capped HERE, before any work proportional to it is
+        // done and before the store is locked — the same ceilings the other describes of this
+        // crate enforce, from `crate::state`.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > state::MAX_FILTERS {
+            return Err(state::invalid_parameter_value(format!(
+                "The request carries {count} filters, above the maximum of {max}",
+                count = filters.len(),
+                max = state::MAX_FILTERS,
+            )));
+        }
+        // A filter name this operation does not document is refused whether or not any list
+        // would have matched it, so an unsupported filter can never read as "no results".
+        // Each value is compiled into its pattern ONCE here, rather than recompiled for every
+        // candidate list.
+        let mut compiled: Vec<state::CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !MANAGED_PREFIX_LIST_FILTERS.contains(&name) {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > state::MAX_FILTER_VALUES {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {count} values, above the maximum of {max}",
+                    count = values.len(),
+                    max = state::MAX_FILTER_VALUES,
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so a value's size is bounded
+            // here too.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > state::MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {size} bytes, above the maximum \
+                     of {max}",
+                    size = oversize.len(),
+                    max = state::MAX_FILTER_VALUE_BYTES,
+                )));
+            }
+            compiled.push(state::CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "One or more prefix list IDs" (`DescribeManagedPrefixListsRequest$PrefixListIds`)
+        // is caller-sized as well, and each entry is resolved against the candidates, so it
+        // is capped the way every other EC2 operation of this crate caps a resource-id list.
+        let requested: &[String] = input.prefix_list_ids.as_deref().unwrap_or_default();
+        if requested.len() > state::MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "PrefixListIds carries {count} ids, above the maximum of {max}",
+                count = requested.len(),
+                max = state::MAX_RESOURCE_IDS,
+            )));
+        }
+
+        // `DryRun` sits after every parameter has been validated: the flag asks whether the
+        // request WOULD have succeeded, so one that would have been refused for its own
+        // reason is refused with that reason instead. Every caller of this emulator is
+        // permitted, so a dry run reports that outcome and reads nothing.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        // EC2 is a regional service reached through a regional endpoint: the Region the
+        // caller signed for is the Region whose published prefix lists it can see, and the
+        // Region is part of each published list's name.
+        let region = state::request_region(ctx.parts());
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock-owed transition this read is allowed to apply, the same call
+        // `DescribeCarrierGateways` makes: a list `CreateManagedPrefixList` answered as
+        // `create-in-progress` is `create-complete` once its due instant has passed, whether
+        // or not anybody called, so applying it here changes nothing a later caller would not
+        // have seen anyway.
+        store.materialize_due_transitions();
+
+        // "Describes your managed prefix lists and any Amazon Web Services-managed prefix
+        // lists": the account's stored lists, and the ones the Region publishes for its
+        // services — the SAME derivation `DescribePrefixLists` reports, so one published
+        // list has one id whichever operation is asked.
+        let mut candidates: Vec<ManagedPrefixList> = store
+            .managed_prefix_lists
+            .values()
+            .map(|record| record.view.clone())
+            .collect();
+        candidates.extend(
+            state::service_prefix_lists_in_region(&region)
+                .iter()
+                .map(|published| published.to_managed_prefix_list(&region)),
+        );
+        // The store's lock is not held across the matching below: every candidate is owned
+        // by now, and nothing else about the store is read.
+        drop(store);
+
+        // An id that names none of those lists is an error, not an absent row — the same
+        // answer `DescribeVpcs` gives for an unknown VPC id.
+        if let Some(unknown) = requested.iter().find(|id| {
+            !candidates
+                .iter()
+                .any(|list| list.prefix_list_id.as_deref() == Some(id.as_str()))
+        }) {
+            return Err(state::invalid_prefix_list_id_not_found(unknown));
+        }
+
+        // `PrefixListIds` narrows the candidates to the ids named, and every filter must then
+        // hold ("If you specify multiple filters, the filters are joined with an AND" —
+        // `Filter`), evaluated by `crate::state::matches_every_filter` so one spelling of
+        // that rule serves every describe of this service.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeManagedPrefixLists"))
+        // Every comparison is charged to ONE budget, so the product of candidate lists,
+        // filters, values and value length is bounded however the caller combines them.
+        let mut budget = state::MatchBudget::new(state::MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<&ManagedPrefixList> = Vec::new();
+        for list in &candidates {
+            if budget.exhausted() {
+                break;
+            }
+            let id = list.prefix_list_id.as_deref().unwrap_or_default();
+            if !requested.is_empty() && !requested.iter().any(|asked| asked == id) {
+                continue;
+            }
+            if state::matches_every_filter(&compiled, &mut budget, &|name| {
+                filter_values(list, name)
+            }) {
+                selected.push(list);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so rather than given a silently narrowed page.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {max} comparisons to \
+                     evaluate; narrow them or page with MaxResults",
+                    max = state::MAX_FILTER_MATCH_STEPS,
+                ),
+            ));
+        }
+
+        // Page in `PrefixListId` order, which the cursor below names a position in: an id is
+        // unique across the account's lists and the Region's published ones, so a token
+        // naming the list the next page starts at always advances.
+        selected.sort_by(|left, right| left.prefix_list_id.cmp(&right.prefix_list_id));
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|list| {
+                list.prefix_list_id.as_deref().unwrap_or_default() < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "The maximum number of results to return with a single call"
+        // (`DescribeManagedPrefixListsRequest$MaxResults`). A request that names none gets
+        // the largest page the model publishes, so the `NextToken` path below behaves the
+        // same whether or not a page size was asked for. The model's `range 1..100` has
+        // already refused anything outside it, so the only value that cannot convert is one
+        // the boundary validator would have rejected.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+
+        // "This value is null when there are no more results to return"
+        // (`DescribeManagedPrefixListsResult$NextToken`): a token only when a prefix list
+        // follows this page.
+        let next_token = page
+            .get(limit)
+            .and_then(|list| list.prefix_list_id.as_deref())
+            .map(state::encode_page_token);
+
+        Ok(DescribeManagedPrefixListsOutput {
+            prefix_lists: Some(page.iter().take(limit).map(|list| (*list).clone()).collect()),
+            next_token,
+        })
+    }
+}
+
+/// The page size a request that names no `MaxResults` gets: the largest the model publishes
+/// (`PrefixListMaxResults`, `range 1..100`), which is also the most EC2 returns in one page.
+const DEFAULT_MAX_RESULTS: usize = 100;
+
+/// The filter names this operation documents, from
+/// `DescribeManagedPrefixListsRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeManagedPrefixListsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// "owner-id - The ID of the prefix list owner. prefix-list-id - The ID of the prefix list.
+/// prefix-list-name - The name of the prefix list." No `tag:` or `tag-key` family: this
+/// operation documents none, and it reports lists Amazon Web Services owns beside the
+/// account's own. Every entry must be answered by [`filter_values`].
+const MANAGED_PREFIX_LIST_FILTERS: [&str; 3] =
+    ["owner-id", "prefix-list-id", "prefix-list-name"];
+
+/// The values the EC2 filter `name` compares against the prefix list `list`.
+///
+/// A filter naming an attribute this list does not carry compares against NO values, so it
+/// selects nothing rather than everything; `name` is one of
+/// [`MANAGED_PREFIX_LIST_FILTERS`], the handler having refused every other name before this
+/// is reached.
+fn filter_values<'a>(
+    list: &'a ManagedPrefixList,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "owner-id" => text(list.owner_id.as_deref()),
+        "prefix-list-id" => text(list.prefix_list_id.as_deref()),
+        "prefix-list-name" => text(list.prefix_list_name.as_deref()),
+        // Unreachable: the handler has already refused every other name. An undefined name
+        // compares against nothing, so it could never widen a result even if that check were
+        // bypassed.
+        _ => Vec::new(),
     }
 }
