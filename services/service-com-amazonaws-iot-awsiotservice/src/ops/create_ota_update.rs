@@ -409,6 +409,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             targets: ota_update.targets.clone(),
             target_selection: ota_update.target_selection.clone(),
             in_progress_timeout_minutes,
+            // An OTA update names no substitution parameters: `CreateOTAUpdate` models
+            // no `documentParameters`, so the job it deploys carries none.
+            document_parameters: ::std::collections::BTreeMap::new(),
             created_at: now_seconds,
         };
 

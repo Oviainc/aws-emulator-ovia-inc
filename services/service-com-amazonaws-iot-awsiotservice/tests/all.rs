@@ -23,6 +23,8 @@ mod command_registry;
 mod describe_endpoint;
 #[path = "all/indexing_configuration.rs"]
 mod indexing_configuration;
+#[path = "all/job_document_read.rs"]
+mod job_document_read;
 #[path = "all/job_execution_read.rs"]
 mod job_execution_read;
 #[path = "all/job_targeting.rs"]

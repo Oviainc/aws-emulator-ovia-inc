@@ -20,6 +20,14 @@
 //! each one carries — is bounded by [`crate::state::MAX_JOB_TARGETS`] before any work
 //! proportional to it, and refused past it with the modelled `LimitExceededException`.
 //!
+//! `documentParameters` are the values the document's substitution parameters resolve
+//! to, so they are persisted with the job and the executions carry the RESOLVED
+//! document, which is what the device acts on; `GetJobDocument` then reports either
+//! view. A request whose parameters expand the document past what `JobDocument` may
+//! carry, or that names more of them than
+//! [`crate::state::MAX_JOB_DOCUMENT_PARAMETERS`], is refused before anything is
+//! written.
+//!
 //! What this handler does not honour, and how it answers instead:
 //!
 //! * `schedulingConfig` — a scheduled job queues no execution until its window opens,
@@ -297,6 +305,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let targeted_things = fanout.things;
         let targeted_groups = fanout.groups;
 
+        // `documentParameters` are the values the document's substitution parameters
+        // resolve to, so they are persisted with the job: a reader reports the document
+        // as written OR with every parameter resolved, and a device is handed the
+        // resolved one. `ParameterMap` is modelled with no maximum entry count, so how
+        // many substitutions a stored job imposes on its readers is bounded HERE, at
+        // the write, and refused past the ceiling with the modelled error.
+        let document_parameters: ::std::collections::BTreeMap<String, String> = input
+            .document_parameters
+            .as_ref()
+            .map(|parameters| {
+                parameters
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if document_parameters.len() > crate::state::MAX_JOB_DOCUMENT_PARAMETERS {
+            return Err(over_limit(format!(
+                "a job may carry at most {} document parameters, got {}",
+                crate::state::MAX_JOB_DOCUMENT_PARAMETERS,
+                document_parameters.len()
+            )));
+        }
+        // The document a device is handed is the RESOLVED one, so a request whose
+        // parameters expand the document past what `JobDocument` may carry is refused
+        // before anything is written, rather than stored as a job no reader can report.
+        let resolved_document = match input.document.as_deref() {
+            Some(document) => {
+                match crate::state::resolve_job_document(document, &document_parameters) {
+                    Ok(resolved) => Some(resolved),
+                    Err(length) => {
+                        return Err(invalid(format!(
+                            "the job document is {length} bytes once its document \
+                             parameters are resolved; a job document may be at most {} \
+                             bytes",
+                            crate::state::MAX_JOB_DOCUMENT_BYTES
+                        )));
+                    }
+                }
+            }
+            None => None,
+        };
+
         let region = crate::state::request_region(ctx.parts());
         let now = ::service_common::iot_job_executions::now_epoch_seconds();
         let job = crate::state::RegisteredJob {
@@ -311,6 +362,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .timeout_config
                 .as_ref()
                 .and_then(|config| config.in_progress_timeout_in_minutes),
+            document_parameters,
             created_at: now,
         };
 
@@ -354,7 +406,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Err(quota) = crate::state::queue_job_executions(
             &mut pending,
             &job.job_id,
-            job.document.as_deref(),
+            resolved_document.as_deref(),
             job.in_progress_timeout_minutes,
             &targeted_things,
             now,
