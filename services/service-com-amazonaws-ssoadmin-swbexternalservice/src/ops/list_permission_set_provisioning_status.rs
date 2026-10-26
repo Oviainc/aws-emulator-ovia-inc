@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPermissionSetProvisioningStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPermissionSetProvisioningStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: enumerates the permission-set provisioning requests the instance the
+//! request names TRACKS, oldest first, each as the tracking view of its stored record, and
+//! keeps only the ones whose status as of this instant is the one `Filter` asked for. This
+//! is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPermissionSetProvisioningStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A READ: every status it reports is DERIVED from the due instant the
+//! `ProvisionPermissionSet` call stored, so enumerating neither advances a workflow nor
+//! creates one, and the ids it hands back are exactly the ids
+//! `DescribePermissionSetProvisioningStatus` resolves (both ask the store the same
+//! question), so the list and the describe cannot disagree about which ids exist.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +163,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPermissionSetProvisioningStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPermissionSetProvisioningStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPermissionSetProvisioningStatus"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPermissionSetProvisioningStatusErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // The `StatusValues` the request filters by ("filters the list operations result
+        // based on the status attribute"). The model declares `Filter$Status` as that
+        // enum, so a value outside it is refused by the constraint walk before this
+        // handler runs; a value inside it that no tracked provisioning is in selects no
+        // row, which is an empty page rather than a refusal.
+        let filter = input
+            .filter
+            .as_ref()
+            .and_then(|filter| filter.status.as_deref());
+
+        // The cursor is scoped to THIS enumeration: the operation and the whole filter
+        // that selected the rows, since the page key only distinguishes rows within it.
+        let scope =
+            crate::state::cursor_permission_set_provisioning_status(&input.instance_arn, filter);
+        let after = crate::state::cursor_after(&scope, input.next_token.as_deref()).map_err(
+            |message| {
+                ListPermissionSetProvisioningStatusErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message.to_string()),
+                        reason: None,
+                    },
+                )
+            },
+        )?;
+
+        let now = ::std::time::SystemTime::now();
+        let ordered: Vec<(String, PermissionSetProvisioningStatusMetadata)> = {
+            let mut store = state.lock();
+            // A READ, except for what the CLOCK already owes — the instances themselves,
+            // the account's ambient instance if nothing has enabled one yet, and the copy
+            // an earlier provisioning has become due to deliver: enumerating tracked
+            // workflows neither advances one nor creates one.
+            store.on_request(&crate::state::request_region(ctx.parts()), now);
+            // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup:
+            // permission sets are a feature of an organization instance, so on an account
+            // instance no provisioning can ever have run and the enumeration is refused
+            // rather than answered empty. An ARN this account holds no instance for is NOT
+            // this refusal — it falls through to the 404 below.
+            if store.permission_set_surface_withdrawn(&input.instance_arn) {
+                return Err(
+                    ListPermissionSetProvisioningStatusErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
+                            ),
+                            // The model's `ValidationExceptionReason` enum carries only
+                            // KMS key states, none of which this refusal is.
+                            reason: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            if store.instance(&input.instance_arn).is_none() {
+                return Err(
+                    ListPermissionSetProvisioningStatusErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "No instance found with the ARN {}",
+                                input.instance_arn
+                            )),
+                            reason: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // Exactly the provisionings this instance tracks, each once, in the order the
+            // history happened, kept only when the status the clock implies for it at this
+            // instant is the one the request asked for. Ordered by the page key explicitly:
+            // the page a cursor resumes is defined by that order, so it is established here
+            // rather than inherited from the order the records happen to be stored in.
+            let mut rows: Vec<(String, PermissionSetProvisioningStatusMetadata)> = store
+                .tracked_permission_set_provisionings(&input.instance_arn)
+                .into_iter()
+                .filter(|record| filter.is_none_or(|wanted| wanted == record.status(now)))
+                .map(|record| (record.page_key(), record.to_metadata_shape(now)))
+                .collect();
+            rows.sort_by(|left, right| left.0.cmp(&right.0));
+            rows
+        };
+
+        let (permission_sets_provisioning_status, next_token) =
+            crate::state::page(&scope, ordered, after.as_deref(), input.max_results);
+        Ok(ListPermissionSetProvisioningStatusOutput {
+            permission_sets_provisioning_status: Some(permission_sets_provisioning_status),
+            next_token,
+        })
     }
 }
