@@ -186,10 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|stored| stored.development.etag.clone())
         else {
             return Err(UpdateFunctionErrorModeled::NoSuchFunctionExists(
-                crate::state::no_such_function_exists(
-                    &input.name,
-                    crate::state::FUNCTION_STAGE_DEVELOPMENT,
-                ),
+                crate::state::no_such_function_exists(),
             )
             .into());
         };
@@ -252,10 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
         ) else {
             return Err(UpdateFunctionErrorModeled::NoSuchFunctionExists(
-                crate::state::no_such_function_exists(
-                    &input.name,
-                    crate::state::FUNCTION_STAGE_DEVELOPMENT,
-                ),
+                crate::state::no_such_function_exists(),
             )
             .into());
         };
