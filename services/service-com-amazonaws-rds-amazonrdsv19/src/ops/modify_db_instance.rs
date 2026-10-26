@@ -358,14 +358,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx)
             .map_err(ModifyDBInstanceError::validation)?;
         // "This value is stored as a lowercase string" — for the instance being
-        // modified and for the new identifier it may be renamed to.
+        // modified and for the new identifier it may be renamed to. The constraints are
+        // checked against the value the REQUEST carried, so the refusal quotes what the
+        // caller sent rather than the folded form.
         let identifier = input.db_instance_identifier.to_ascii_lowercase();
         let renamed_to = match &input.new_db_instance_identifier {
             Some(requested) => {
-                let renamed = requested.to_ascii_lowercase();
-                crate::state::check_identifier("NewDBInstanceIdentifier", &renamed, 63)
-                    .map_err(ModifyDBInstanceError::validation)?;
-                Some(renamed)
+                crate::state::check_identifier("NewDBInstanceIdentifier", requested, 63)
+                    .map_err(ModifyDBInstanceError::invalid_parameter_value)?;
+                Some(requested.to_ascii_lowercase())
             }
             None => None,
         };

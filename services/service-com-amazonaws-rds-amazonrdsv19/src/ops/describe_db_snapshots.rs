@@ -178,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = crate::state::check_max_records(input.max_records)
             .map_err(DescribeDBSnapshotsError::invalid_parameter_value)?;
         let filters = input.filters.unwrap_or_default();
-        check_filter_names(&filters).map_err(DescribeDBSnapshotsError::validation)?;
+        check_filter_names(&filters).map_err(DescribeDBSnapshotsError::invalid_parameter_value)?;
         crate::state::check_filter_terms(&filters)
             .map_err(DescribeDBSnapshotsError::validation)?;
 
@@ -204,7 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         DescribeDBSnapshotsError::from(
                             DescribeDBSnapshotsErrorModeled::DBSnapshotNotFoundFault(
                                 DBSnapshotNotFoundFault {
-                                    message: Some(format!("DBSnapshot {requested} not found.")),
+                                    message: Some(format!("DBSnapshot not found: {requested}")),
                                 },
                             ),
                         )

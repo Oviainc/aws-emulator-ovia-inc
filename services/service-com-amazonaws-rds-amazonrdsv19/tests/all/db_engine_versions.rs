@@ -608,7 +608,7 @@ async fn a_filter_name_this_operation_does_not_support_is_refused() {
             )
             .await,
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         );
     }
 }

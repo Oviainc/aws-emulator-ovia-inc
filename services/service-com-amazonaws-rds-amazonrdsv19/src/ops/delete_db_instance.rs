@@ -266,7 +266,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 snapshot_identifier,
                 255,
             )
-            .map_err(DeleteDBInstanceError::validation)?;
+            .map_err(DeleteDBInstanceError::invalid_parameter_value)?;
         }
 
         // "The database can't be deleted when deletion protection is enabled."

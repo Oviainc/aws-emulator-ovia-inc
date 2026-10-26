@@ -156,7 +156,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         check_selection(&input).map_err(DescribeOptionGroupsError::validation)?;
         if let Some(engine_name) = &input.engine_name {
             crate::state::check_option_group_engine_name(engine_name)
-                .map_err(DescribeOptionGroupsError::validation)?;
+                .map_err(DescribeOptionGroupsError::invalid_parameter_value)?;
         }
 
         // No store means this service was mounted on an engine it has no state in,
