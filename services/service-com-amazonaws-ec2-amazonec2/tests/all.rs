@@ -77,6 +77,12 @@ mod local_gateway_routes;
 mod transit_gateway_prefix_list_references;
 #[path = "all/ec2_query_error_envelope.rs"]
 mod ec2_query_error_envelope;
+// The same envelope rule, driven over seven further operations and the four refusal kinds
+// they answer. Declared beside the suite that owns the rule rather than in sorted position,
+// for the reason this file's header note gives: the sorted neighbourhood is where every new
+// ec2 suite inserts its two lines.
+#[path = "all/ec2_query_error_envelope_operations.rs"]
+mod ec2_query_error_envelope_operations;
 // What `CreatePublicIpv4Pool` mints and persists, read back through the describe. Declared
 // here rather than in sorted position, for the reason the suites above give: the sorted
 // neighbourhood is where every new ec2 suite inserts its lines, and these two lines have

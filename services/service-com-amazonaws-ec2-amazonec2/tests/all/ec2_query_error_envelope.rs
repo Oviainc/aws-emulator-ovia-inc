@@ -335,7 +335,11 @@ fn last_root_child(case: &str, body: &str) -> String {
 
 /// The one request id a REFUSAL reports, having checked the rest of the error envelope is
 /// intact: the expected `<Code>`, a non-empty `<Message>`, and `<RequestID>` last.
-fn refusal_request_id(case: &str, body: &str, expected_code: &str) -> String {
+///
+/// `pub(crate)` so a suite that brings FURTHER operations under this rule
+/// ([`super::ec2_query_error_envelope_operations`]) reads the envelope through this one
+/// reader rather than declaring a second one.
+pub(crate) fn refusal_request_id(case: &str, body: &str, expected_code: &str) -> String {
     let parsed = document(case, body);
     let root = parsed.root_element();
     let error = child(root, "Errors")
