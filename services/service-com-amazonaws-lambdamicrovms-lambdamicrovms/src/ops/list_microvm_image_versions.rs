@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMicrovmImageVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMicrovmImageVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMicrovmImageVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages through the versions the MicroVM image this request addresses holds, in the
+//! `major.minor` order of the versions themselves (so `1.10` follows `1.9`) and under
+//! the operation's `@paginated` contract: `maxResults` caps the page and a `nextToken`
+//! is issued, and accepted, while versions remain.
+//!
+//! Each entry is the summary of the stored version record, together with the ARN of the
+//! image holding it, so a version whose asynchronous build is still in flight is
+//! reported `IN_PROGRESS`/`INACTIVE` and the same version reads `SUCCESSFUL`/`ACTIVE`
+//! once the clock has made that build due. `items` is `@required`, so it is always
+//! projected, an empty page included.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +156,170 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMicrovmImageVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMicrovmImageVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMicrovmImageVersions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListMicrovmImageVersionsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the MicroVM image store is unavailable".to_string()),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        let _ = ctx;
+
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_token(token)?),
+            None => None,
+        };
+        // `maxResults` carries `@range(min: 1, max: 50)`, which the boundary validator
+        // has already enforced; the clamp is a second line of defence, so a page size
+        // can never be zero or unbounded however the value arrived.
+        let page_size = input
+            .max_results
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(crate::state::MAX_LIST_PAGE)
+            .clamp(1, crate::state::MAX_LIST_PAGE);
+
+        let mut store = state.lock();
+        store.materialize_due(::std::time::Instant::now());
+
+        // `MicrovmImageIdentifier` is "The ARN or ID of the MicroVmImage", so the
+        // identifier is resolved as an id this account holds and, failing that, read as
+        // an ARN — the same resolution the image's own read path takes, because this
+        // listing addresses that same image. The outcomes mean different things to a
+        // caller polling an image it believes is being built: a value that is no
+        // identifier this API can address is a request that can NEVER succeed (400),
+        // and only a well-formed identifier naming no image of this account is the
+        // not-yet-created condition a poll may retry (404).
+        let image = match store.resolve_image_reference(&input.image_identifier) {
+            crate::state::ImageReference::Resolved(name) => store.images.get(&name),
+            crate::state::ImageReference::Absent => None,
+            crate::state::ImageReference::Malformed => {
+                return Err(ListMicrovmImageVersionsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::invalid_arn_format_message(
+                            &input.image_identifier,
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
+        let Some(image) = image else {
+            // `ResourceNotFoundException` models `message` as the only required member;
+            // `resourceType` and `resourceId` are optional and this service leaves them
+            // unset, so the message — built from the identifier the request carried — is
+            // the whole envelope.
+            return Err(
+                ListMicrovmImageVersionsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::image_not_found_message(&input.image_identifier),
+                        resource_type: None,
+                        resource_id: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The versions enumerate in ONE stable order, the `major.minor` order the
+        // versions themselves name (`crate::state::version_order`), so "after this
+        // version" is a cursor that stays valid even when another version is built
+        // between two pages.
+        let mut ordered: Vec<&crate::state::MicrovmImageVersion> =
+            image.versions.values().collect();
+        ordered.sort_by_key(|version| crate::state::version_order(&version.image_version));
+
+        let mut remaining = ordered.into_iter().filter(|version| {
+            after.as_deref().is_none_or(|cursor| {
+                crate::state::version_order(&version.image_version)
+                    > crate::state::version_order(cursor)
+            })
+        });
+        let page: Vec<&crate::state::MicrovmImageVersion> =
+            remaining.by_ref().take(page_size).collect();
+
+        // A `nextToken` is issued only when the page did not exhaust the versions.
+        let next_token = match (page.last(), remaining.next()) {
+            (Some(last), Some(_)) => Some(encode_token(&last.image_version)),
+            _ => None,
+        };
+
+        Ok(ListMicrovmImageVersionsOutput {
+            next_token,
+            // `items` is `@required`, so it is always projected — an empty page included.
+            items: page
+                .into_iter()
+                .map(|version| summary_of(&image.image_arn, version))
+                .collect(),
+        })
     }
+}
+
+/// The modelled summary of one stored version of the image whose ARN is `image_arn`.
+fn summary_of(
+    image_arn: &str,
+    version: &crate::state::MicrovmImageVersion,
+) -> MicrovmImageVersionSummary {
+    MicrovmImageVersionSummary {
+        image_arn: image_arn.to_string(),
+        image_version: version.image_version.clone(),
+        state: version.state.clone(),
+        status: version.status.clone(),
+        base_image_arn: version.base_image_arn.clone(),
+        base_image_version: version.base_image_version.clone(),
+        build_role_arn: version.build_role_arn.clone(),
+        description: version.description.clone(),
+        code_artifact: version.code_artifact.clone(),
+        logging: version.logging.clone(),
+        egress_network_connectors: crate::state::wire_list(&version.egress_network_connectors),
+        cpu_configurations: crate::state::wire_list(&version.cpu_configurations),
+        resources: crate::state::wire_list(&version.resources),
+        additional_os_capabilities: crate::state::wire_list(&version.additional_os_capabilities),
+        hooks: version.hooks.clone(),
+        environment_variables: crate::state::wire_map(&version.environment_variables),
+        created_at: version.created_at,
+        updated_at: version.updated_at,
+        // "The reason for the current state. For example, one or more builds failed":
+        // a version's state is the settlement of its per-target builds, so the reason it
+        // reports is the reason one of those builds recorded, and a version none of
+        // whose builds recorded one has nothing to report.
+        state_reason: version
+            .builds
+            .values()
+            .find_map(|build| build.state_reason.clone()),
+        tags: crate::state::wire_map(&version.tags),
+    }
+}
+
+/// The marker every `nextToken` this operation issues carries, so a token the service
+/// did not mint is refused rather than silently positioning the listing.
+const TOKEN_MARKER: &str = "ListMicrovmImageVersions/1:";
+
+/// The opaque `nextToken` for a cursor: the version of the last entry served.
+fn encode_token(image_version: &str) -> String {
+    ::hex::encode(format!("{TOKEN_MARKER}{image_version}").as_bytes())
+}
+
+/// The cursor a `nextToken` carries. A token this service did not mint is refused
+/// with the modelled 400 rather than silently restarting or skipping the listing.
+fn decode_token(token: &str) -> Result<String, ListMicrovmImageVersionsError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|decoded| {
+            decoded
+                .strip_prefix(TOKEN_MARKER)
+                .map(::std::string::ToString::to_string)
+        })
+        .ok_or_else(|| {
+            ListMicrovmImageVersionsErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    "nextToken is not a pagination token this service issued".to_string(),
+                ),
+            })
+            .into()
+        })
 }
