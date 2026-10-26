@@ -1431,31 +1431,54 @@ impl Workspace {
         reached
     }
 
-    /// The definition that gives one property of a component its meaning: the
-    /// component's OWN definition where it declares one, else the definition it
-    /// inherits from the component type the component instantiates (or from a
-    /// type that type extends).
+    /// The definition that gives one property of a component its meaning,
+    /// RESOLVED over every declaration that reaches the property: the
+    /// component's own declaration where it has one, then the declarations of
+    /// the component type it instantiates and of the types that type extends,
+    /// nearest first.
     ///
     /// A component may carry a property its entity's create never restated —
     /// naming the component's `componentTypeId` is what gives the component that
     /// type's properties — so a reader of a property's definition, its default
     /// value or its data type resolves it through here rather than off the
-    /// component alone.
-    pub fn effective_property_definition<'a>(
-        &'a self,
+    /// component alone. A nearer declaration may also REFINE a further one
+    /// rather than replace it (every member of `PropertyDefinitionRequest` is
+    /// optional, so a declaration can restate only the members it changes),
+    /// which is why the whole set of declarations is folded
+    /// ([`refined_property_definition`]) instead of the nearest one being taken
+    /// whole. `None` when no declaration reaches the property at all.
+    pub fn effective_property_definition(
+        &self,
         component_type_id: Option<&str>,
-        properties: &'a BTreeMap<String, PropertyRecord>,
+        properties: &BTreeMap<String, PropertyRecord>,
         property_name: &str,
-    ) -> Option<&'a crate::ops::types::PropertyDefinitionRequest> {
-        if let Some(definition) = properties
+    ) -> Option<crate::ops::types::PropertyDefinitionRequest> {
+        let own = properties
             .get(property_name)
-            .and_then(|property| property.definition.as_ref())
-        {
-            return Some(definition);
-        }
-        self.component_type_chain(component_type_id?)
-            .into_iter()
-            .find_map(|component_type| component_type.property_definitions.get(property_name))
+            .and_then(|property| property.definition.as_ref());
+        let chain = component_type_id
+            .map(|component_type_id| self.component_type_chain(component_type_id))
+            .unwrap_or_default();
+        refined_property_definition(own.into_iter().chain(
+            chain
+                .iter()
+                .filter_map(|component_type| component_type.property_definitions.get(property_name)),
+        ))
+    }
+
+    /// The component types one component type INHERITS from: the `extendsFrom`
+    /// chain behind it, nearest first, without the component type itself.
+    ///
+    /// What a reader of a component type's own schema needs in order to report
+    /// the schema the type effectively has: the declarations these contribute
+    /// are the inherited ones. The walk is
+    /// [`component_type_closure`](Self::component_type_closure)'s, seeded with
+    /// the type's declared parents rather than with the type, so a parent this
+    /// workspace does not hold (a built-in of the real service this emulator
+    /// does not model) contributes nothing rather than failing the walk.
+    pub fn inherited_component_types(&self, component_type: &ComponentType) -> Vec<&ComponentType> {
+        let (chain, _, _) = self.component_type_closure(component_type.extends_from.iter().cloned());
+        chain
     }
 
     /// The property group `group_name` as it applies to a component: the group
@@ -1595,7 +1618,8 @@ impl Workspace {
             if !definition.is_external_id.unwrap_or(false) {
                 continue;
             }
-            if let Some(value) = latest_property_value(properties.get(property_name), Some(definition))
+            if let Some(value) =
+                latest_property_value(properties.get(property_name), Some(&definition))
             {
                 // Only a STRING value is an external id: `externalId` on the
                 // filter is a string, so a property of any other data type
@@ -2099,15 +2123,24 @@ impl ComponentType {
 
     /// Whether the component type "has a schema initializer and the schema
     /// initializer has run" (the `isSchemaInitialized` member's own
-    /// documentation): it has one when its `functions` carry
-    /// [`SCHEMA_INITIALIZER_FUNCTION`], and that initializer has run once the
-    /// component type has settled, which is exactly when the stored state is
+    /// documentation): it has one when the `functions` it EFFECTIVELY has carry
+    /// [`SCHEMA_INITIALIZER_FUNCTION`] — its own, or one a component type on its
+    /// `extendsFrom` chain declares and it never restated
+    /// ([`Workspace::inherited_component_types`], which is what the caller
+    /// passes as `inherited`) — and that initializer has run once the component
+    /// type has settled, which is exactly when the stored state is
     /// [`STATE_ACTIVE`]: neither a create nor an update still in flight has
     /// finished running it.
-    pub fn is_schema_initialized(&self) -> bool {
-        self.functions.contains_key(SCHEMA_INITIALIZER_FUNCTION) && self.state == STATE_ACTIVE
+    pub fn is_schema_initialized(&self, inherited: &[&ComponentType]) -> bool {
+        let has_initializer = std::iter::once(self)
+            .chain(inherited.iter().copied())
+            .any(|component_type| {
+                component_type
+                    .functions
+                    .contains_key(SCHEMA_INITIALIZER_FUNCTION)
+            });
+        has_initializer && self.state == STATE_ACTIVE
     }
-
 }
 
 /// Whether a `MetadataTransferJobState` is TERMINAL — a state the job has
@@ -2729,6 +2762,57 @@ pub fn property_groups_violation(workspace: &Workspace, record: &ComponentType) 
     None
 }
 
+/// One property definition RESOLVED over the declarations that reach it,
+/// NEAREST declaration first: every member is the value the nearest declaration
+/// that SETS it gives, and the members no declaration sets stay unset. `None`
+/// when no declaration reaches the property at all.
+///
+/// Every member of `PropertyDefinitionRequest` is optional, so a declaration
+/// may REFINE an inherited definition — restate only the members it changes,
+/// `dataType` included — rather than replace it, which is exactly why a writer
+/// accepts a definition without a `dataType` wherever one is inherited
+/// ([`property_definition_needs_data_type`]). A reader therefore folds the whole
+/// set of declarations that reach a property instead of taking the nearest one
+/// whole, so the definition it reports carries the refined members and the
+/// inherited values of everything the refinement left alone.
+///
+/// Shared by every resolver of a definition — a component's
+/// ([`Workspace::effective_property_definition`]) and a component type's own —
+/// so one property is resolved one way wherever it is read.
+pub fn refined_property_definition<'a>(
+    declarations: impl IntoIterator<Item = &'a crate::ops::types::PropertyDefinitionRequest>,
+) -> Option<crate::ops::types::PropertyDefinitionRequest> {
+    let mut declarations = declarations.into_iter();
+    let mut resolved = declarations.next()?.clone();
+    for inherited in declarations {
+        resolved.data_type = resolved
+            .data_type
+            .take()
+            .or_else(|| inherited.data_type.clone());
+        resolved.is_required_in_entity = resolved
+            .is_required_in_entity
+            .or(inherited.is_required_in_entity);
+        resolved.is_external_id = resolved.is_external_id.or(inherited.is_external_id);
+        resolved.is_stored_externally = resolved
+            .is_stored_externally
+            .or(inherited.is_stored_externally);
+        resolved.is_time_series = resolved.is_time_series.or(inherited.is_time_series);
+        resolved.default_value = resolved
+            .default_value
+            .take()
+            .or_else(|| inherited.default_value.clone());
+        resolved.configuration = resolved
+            .configuration
+            .take()
+            .or_else(|| inherited.configuration.clone());
+        resolved.display_name = resolved
+            .display_name
+            .take()
+            .or_else(|| inherited.display_name.clone());
+    }
+    Some(resolved)
+}
+
 /// One stored `PropertyDefinitionRequest` as the modelled
 /// `PropertyDefinitionResponse` a read reports.
 ///
@@ -2736,9 +2820,17 @@ pub fn property_groups_violation(workspace: &Workspace, record: &ComponentType) 
 /// properties (`GetEntity`) and a component type's own property definitions
 /// (`GetComponentType`) — so both report one definition the same way.
 ///
-/// `None` when the stored definition carries no `dataType`, which the response
-/// shape requires: the writers refuse a new definition without one, so this
-/// stays fallible rather than inventing a `Type` the model does not define.
+/// `definition` is the RESOLVED definition, the one
+/// [`refined_property_definition`] folded out of every declaration that reaches
+/// the property, so a declaration that refines an inherited one is reported with
+/// the inherited values of the members it left alone.
+///
+/// `None` when even the resolved definition carries no `dataType`, which the
+/// response shape requires: a writer refuses a definition without one wherever
+/// nothing is inherited, and a declaration that omits it takes its parent's, so
+/// what is left is a chain reaching a built-in of the real service this emulator
+/// does not model — this stays fallible rather than inventing a `Type` the model
+/// does not define.
 ///
 /// `is_inherited` is what the caller resolved this definition through: a
 /// definition the component or component type declared itself is its own, and
@@ -2753,9 +2845,10 @@ pub fn property_definition_response(
 ) -> Option<crate::ops::types::PropertyDefinitionResponse> {
     let Some(data_type) = definition.data_type.clone() else {
         // Logged rather than dropped silently so a regression in a writer that
-        // is supposed to refuse a definition without a `dataType` is visible
-        // instead of quietly costing the member.
-        ::tracing::warn!("a stored property definition carries no dataType; omitting it");
+        // is supposed to refuse a definition without a `dataType`, or a
+        // resolution that failed to inherit one, is visible instead of quietly
+        // costing the member.
+        ::tracing::warn!("a resolved property definition carries no dataType; omitting it");
         return None;
     };
     Some(crate::ops::types::PropertyDefinitionResponse {

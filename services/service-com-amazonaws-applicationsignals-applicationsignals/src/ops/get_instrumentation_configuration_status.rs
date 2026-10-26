@@ -169,11 +169,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// [`crate::state::ComAmazonawsApplicationsignalsApplicationsignalsState::expire_instrumentation_configurations`].
     ///
     /// The events are those of ONE status (the requested one, else `ACTIVE`) that fall in the
-    /// requested window (else the last hour), most recent first. The configuration itself is
-    /// resolved under the identity the request names — a `LocationIdentifier` is "either full
-    /// code location or a pre-computed hash" — and an identity that names no stored
-    /// configuration is the modelled `ResourceNotFoundException`; a stored configuration
-    /// nothing has reported for has an empty event list, which is not an error.
+    /// requested window (else the last hour), most recent first. Each one is reported at the
+    /// minute it was recorded for — `InstrumentationStatusEvent.Time` is "the time when the
+    /// status was reported, rounded to the nearest minute" — which is also the instant the
+    /// window selects it by. The configuration itself is resolved under the identity the
+    /// request names — a `LocationIdentifier` is "either full code location or a pre-computed
+    /// hash" — and an identity that names no stored configuration is the modelled
+    /// `ResourceNotFoundException`; a stored configuration nothing has reported for has an
+    /// empty event list, which is not an error.
     async fn handle(
         &self,
         input: Self::Input,

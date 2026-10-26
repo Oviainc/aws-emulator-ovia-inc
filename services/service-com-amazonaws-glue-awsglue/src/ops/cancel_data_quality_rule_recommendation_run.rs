@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelDataQualityRuleRecommendationRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelDataQualityRuleRecommendationRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelDataQualityRuleRecommendationRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cancels the rule recommendation run `StartDataQualityRuleRecommendationRun` recorded
+//! under this `RunId`: a run still in flight is moved into `STOPPING`, and the clock owes
+//! it `STOPPED` one span later
+//! ([`crate::state::DATA_QUALITY_RULE_RECOMMENDATION_RUN_SETTLES_AFTER`]), so the cancel is
+//! observable while it is draining. A run that has already reached a terminal status is
+//! left exactly as it is: this operation models no state error, and the run the caller
+//! asked to stop has already stopped.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +137,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelDataQualityRuleRecommendationRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelDataQualityRuleRecommendationRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelDataQualityRuleRecommendationRun"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no store fault of its own, so an unreachable store is
+            // reported as its timeout error, the way the catalog's other handlers report it.
+            return Err(
+                CancelDataQualityRuleRecommendationRunErrorModeled::OperationTimeoutException(
+                    OperationTimeoutException {
+                        message: Some("the Glue Data Catalog store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Everything the clock already owed the stored runs is materialised first, so a run
+        // the clock has already finished is not moved into `STOPPING` afterwards.
+        store.settle_due_data_quality_rule_recommendation_runs(now);
+
+        // `RunId` is `@required` with `length 1..255`, so an absent or over-long one is
+        // refused at the boundary: reaching here, the only question is whether this account
+        // holds a run under that id.
+        let Some(run) = store.data_quality_rule_recommendation_run_mut(&input.run_id) else {
+            return Err(
+                CancelDataQualityRuleRecommendationRunErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(
+                            crate::state::messages::data_quality_rule_recommendation_run_not_found(
+                                &input.run_id,
+                            ),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        let stopping = run.cancel(now);
+        ::tracing::info!(
+            operation = "CancelDataQualityRuleRecommendationRun",
+            run = %input.run_id,
+            stopping,
+            "cancelled a Glue data quality rule recommendation run"
+        );
+
+        // The response carries no member: what the caller reads back is the run's status,
+        // through `GetDataQualityRuleRecommendationRun`.
+        Ok(CancelDataQualityRuleRecommendationRunOutput {})
     }
 }

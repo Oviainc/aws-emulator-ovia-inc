@@ -627,6 +627,25 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
             .count()
     }
 
+    /// The ids of the Malware Protection plans `region`'s endpoint serves, in a
+    /// total order.
+    ///
+    /// The listing counterpart of [`Self::malware_protection_plan_in`], regional for
+    /// the same reason, and the same set [`Self::malware_protection_plan_count_in`]
+    /// counts — so a plan a delete removed stops being listed. The order is total,
+    /// which is what makes a page token mean the same entry on the call that hands
+    /// it back.
+    pub fn malware_protection_plan_ids_in(&self, region: &str) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .malware_protection_plans
+            .values()
+            .filter(|plan| plan.region == region)
+            .map(|plan| plan.id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
     /// Would a detector created through `region`'s endpoint partition the detector
     /// store into one Region more than it will hold
     /// ([`MAX_DETECTOR_REGIONS`])?

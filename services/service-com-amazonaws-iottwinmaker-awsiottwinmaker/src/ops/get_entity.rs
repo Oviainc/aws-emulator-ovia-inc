@@ -414,9 +414,10 @@ fn property_response(
 ) -> PropertyResponse {
     let definition =
         workspace.effective_property_definition(component_type_id, properties, property_name);
-    let value = crate::state::latest_property_value(properties.get(property_name), definition);
+    let value =
+        crate::state::latest_property_value(properties.get(property_name), definition.as_ref());
     PropertyResponse {
-        definition: definition.and_then(|definition| {
+        definition: definition.as_ref().and_then(|definition| {
             crate::state::property_definition_response(
                 definition,
                 crate::state::property_definition_is_inherited(properties, property_name),

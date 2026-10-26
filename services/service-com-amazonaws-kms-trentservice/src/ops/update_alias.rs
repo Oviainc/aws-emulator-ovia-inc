@@ -251,6 +251,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reported as a target that was not found.
         let target = match state.resolve(&region, &input.target_key_id) {
             crate::state::KeyRef::Found(key) => key,
+            crate::state::KeyRef::UnauthorizedAccount => {
+                return Err(crate::state::unauthorized_account(
+                    Self::NAME,
+                    &input.target_key_id,
+                ));
+            }
             crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
                 return Err(UpdateAliasErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::key_not_found_message(

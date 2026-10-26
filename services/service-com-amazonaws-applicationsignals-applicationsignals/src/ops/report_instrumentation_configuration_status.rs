@@ -146,8 +146,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// rather than silently accepted. Every report is attempted: one that names nothing does
     /// not stop the rest of the batch from being recorded.
     ///
-    /// The operation is `@idempotent`, so re-reporting the same status at the same instant
-    /// for the same configuration records the same single event rather than a second one.
+    /// A reported event is recorded for the MINUTE its `Time` falls on, since the event a read
+    /// reports carries "the time when the status was reported, rounded to the nearest minute":
+    /// two reports of one status inside one minute are therefore one event. The operation is
+    /// `@idempotent` too, so re-reporting the same status for the same configuration records
+    /// the same single event rather than a second one.
     async fn handle(
         &self,
         input: Self::Input,
