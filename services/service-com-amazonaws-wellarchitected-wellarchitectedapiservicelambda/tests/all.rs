@@ -305,3 +305,7 @@ mod lens_notifications;
 // a new suite does not collide with another insertion.
 #[path = "all/template_share_deletion.rs"]
 mod template_share_deletion;
+
+// Declared last for the same reason as the declaration above.
+#[path = "all/shared_resource_deletion.rs"]
+mod shared_resource_deletion;
