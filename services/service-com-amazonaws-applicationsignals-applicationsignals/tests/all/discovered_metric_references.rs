@@ -36,8 +36,10 @@ const REGION: &str = "eu-west-2";
 /// `APPLICATION_SIGNALS_NAMESPACE`).
 const NAMESPACE: &str = "ApplicationSignals";
 
-/// A router with just this service mounted on a fresh engine.
-fn router() -> MultiServiceRouter {
+/// A router with just this service mounted on a fresh engine. Shared with the suites that
+/// assert the same rule on one read in depth (`service_operation_metric_references`), so
+/// the harness is written out ONCE for them.
+pub fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -48,7 +50,8 @@ fn router() -> MultiServiceRouter {
 }
 
 /// Send one request and return its status and parsed JSON body (`Value::Null` when empty).
-async fn call(
+/// Shared, as [`router`] is.
+pub async fn call(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -78,15 +81,16 @@ async fn call(
 }
 
 /// Seconds since the epoch, for a window around the instant the stored SLOs are created at.
-fn now_seconds() -> i64 {
+/// Shared, as [`router`] is.
+pub fn now_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("the clock is after the epoch")
         .as_secs() as i64
 }
 
-/// Create one SLO and assert it was stored.
-async fn create_slo(router: &MultiServiceRouter, case: &str, body: Value) {
+/// Create one SLO and assert it was stored. Shared, as [`router`] is.
+pub async fn create_slo(router: &MultiServiceRouter, case: &str, body: Value) {
     let (status, answer) = call(router, "POST", "/slo", Some(body)).await;
     assert_eq!(
         status, 200,
@@ -147,8 +151,8 @@ pub fn dimensions_of(reference: &Value) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// The expected dimension set, written the way a row states it.
-fn dimension_set(dimensions: &[&str]) -> BTreeSet<String> {
+/// The expected dimension set, written the way a row states it. Shared, as [`router`] is.
+pub fn dimension_set(dimensions: &[&str]) -> BTreeSet<String> {
     dimensions.iter().map(ToString::to_string).collect()
 }
 
