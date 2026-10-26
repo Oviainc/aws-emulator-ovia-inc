@@ -38,7 +38,7 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::TAG_QUOTA;
 use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFIX};
 
 /// `AddTags`: `POST /2021-01-01/tags`.
-async fn add_tags(emulator: &Emulator, arn: &str, tag_list: Value) -> Answer {
+pub(crate) async fn add_tags(emulator: &Emulator, arn: &str, tag_list: Value) -> Answer {
     emulator
         .call(
             "POST",
@@ -49,7 +49,7 @@ async fn add_tags(emulator: &Emulator, arn: &str, tag_list: Value) -> Answer {
 }
 
 /// `ListTags`: `GET /2021-01-01/tags?arn=<ARN>`.
-async fn list_tags(emulator: &Emulator, arn: &str) -> Answer {
+pub(crate) async fn list_tags(emulator: &Emulator, arn: &str) -> Answer {
     emulator
         .call("GET", &format!("{PREFIX}/tags?arn={arn}"), None)
         .await
@@ -80,7 +80,7 @@ async fn domain_arn(emulator: &Emulator, name: &str) -> String {
 
 /// The `TagList` of a `ListTags` answer as (key, value) pairs sorted by key, so a
 /// case compares SETS rather than the order one listing happened to use.
-fn reported_tags(answer: &Answer, case: &str) -> Vec<(String, String)> {
+pub(crate) fn reported_tags(answer: &Answer, case: &str) -> Vec<(String, String)> {
     let list = answer.body["TagList"].as_array().unwrap_or_else(|| {
         panic!(
             "case {case}: expected a TagList array, got {:?}",

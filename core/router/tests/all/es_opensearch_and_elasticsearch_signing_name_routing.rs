@@ -384,10 +384,13 @@ fn the_es_endpoint_serves_both_api_versions() {
                     expected_absent: &["router-os-domain"],
                 },
                 Call {
-                    // The issue's own request. `CreateApplication` is declared only by the
-                    // modern model and is still scaffolded, so the honest answer is that
-                    // model's `501 NotImplemented` naming it — not the router's `500
-                    // AmbiguousService`, which is what made the whole surface unreachable.
+                    // The issue's own request. `CreateApplication` is declared only by
+                    // the modern model, so the honest answer is that model's own — the
+                    // application it minted, named and ARN'd under this service — and
+                    // not the router's `500 AmbiguousService`, which is what made the
+                    // whole surface unreachable. Asserting the minted record rather
+                    // than a bare status is what keeps this row about WHICH model
+                    // served it.
                     case: "CreateApplication reaches the modern model",
                     method: "POST",
                     path: "/2021-01-01/opensearch/application",
@@ -398,9 +401,9 @@ fn the_es_endpoint_serves_both_api_versions() {
                                 "arn:aws:aoss:us-east-1:000000000000:collection/abc123xyz"
                         }],
                     })),
-                    expected_status: 501,
-                    expected_error: Some("NotImplemented"),
-                    expected_contains: &["CreateApplication"],
+                    expected_status: 200,
+                    expected_error: None,
+                    expected_contains: &["sim2real-app", ":application/"],
                     expected_absent: &[],
                 },
                 Call {

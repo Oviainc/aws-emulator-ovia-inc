@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints the ONE OpenSearch UI application the call asks for, as a
+//! [`crate::state::Application`] held beside the domains, and answers with the stored
+//! record — so the create's answer and a later `GetApplication` cannot disagree.
+//!
+//! The application's `name` is unique per account and Region, so a name this account
+//! already holds an application under is the modelled conflict
+//! ([`crate::state::application_name_taken`]) rather than a second record, and a
+//! `clientToken` a create was already served under answers with THAT application
+//! rather than minting another.
+//!
+//! The application is minted in a transient status: it is `CREATING` the instant the
+//! call returns and the clock owes it the status provisioning leaves it in
+//! ([`crate::state::PROVISIONING`]), which whichever later call reads the record
+//! materialises.
 //!
 //! ## Shape of an operation
 //!
@@ -111,6 +117,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    application_arn, application_endpoint, application_name_taken, application_quota_exceeded,
+    datetime, request_region, service_state, state_unavailable,
+    stored_iam_identity_center_options, tag_quota_exceeded_on_create, tag_set, Application,
+    OwedStatus, APPLICATION_QUOTA, APPLICATION_STATUS_ACTIVE, APPLICATION_STATUS_CREATING,
+    PROVISIONING, TAG_QUOTA,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -184,18 +198,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApplication"))
+        let state = service_state(&*self.engine).ok_or_else(state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let region = request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // Whatever the clock already owed the applications this call reads is
+        // materialised first, so the decisions below are made on the set at `now`.
+        store.settle_applications(now);
+
+        // "Unique, case-sensitive identifier to ensure idempotency of the request": a
+        // repeat of a create this account already served is answered with the record
+        // the first one made, so a client that retries gets one application rather than
+        // two. What the token identifies is the create of ONE application, and the
+        // request's `name` is what names that application — its only required member,
+        // and the value that is unique per account and Region — so a token the account
+        // holds a record under for a DIFFERENT name is not a repeat of that request at
+        // all: it is one token for two creates, which cannot both be the one the token
+        // identifies, so it is the modelled conflict.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(served) = store.application_of_client_token(token) {
+                if served.name != input.name {
+                    return Err(CreateApplicationErrorModeled::ConflictException(
+                        ConflictException {
+                            message: Some(format!(
+                                "ClientToken {token} already identifies the application created \
+                                 for {}.",
+                                served.name
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                return Ok(created(served));
+            }
+        }
+
+        // "Names must be unique within an Amazon Web Services Region for each account"
+        // (`CreateApplicationRequest$name`), so a second create of a name this account
+        // already holds an application under is the modelled conflict, not a second
+        // record.
+        if store.application_named(&input.name).is_some() {
+            return Err(CreateApplicationErrorModeled::ConflictException(
+                application_name_taken(&input.name),
+            )
+            .into());
+        }
+
+        // The store is bounded: past its quota a create is refused rather than adding
+        // another record, so a caller looping with fresh names cannot grow the state
+        // without end.
+        if store.applications.len() >= APPLICATION_QUOTA {
+            return Err(
+                CreateApplicationErrorModeled::ValidationException(application_quota_exceeded())
+                    .into(),
+            );
+        }
+
+        // An application is created carrying the tags the request named, and the same
+        // bound holds on them as on a later `AddTags`: a resource carries at most
+        // `TAG_QUOTA` tags, so a create naming more is refused rather than storing a
+        // set no `AddTags` could have built. This operation models no
+        // `LimitExceededException`, so that bound is reported through the client-input
+        // error it does model.
+        let tags = tag_set(input.tag_list.unwrap_or_default());
+        if tags.len() > TAG_QUOTA {
+            return Err(CreateApplicationErrorModeled::ValidationException(
+                tag_quota_exceeded_on_create("tagList", tags.len()),
+            )
+            .into());
+        }
+
+        let id = store.mint_application_id();
+        let application = Application {
+            arn: application_arn(&id, &region),
+            endpoint: application_endpoint(&id, &region),
+            id,
+            name: input.name,
+            // The application is not up the instant the call returns: it is being
+            // provisioned, and the clock owes it the status that provisioning leaves it
+            // in once the span has passed.
+            status: APPLICATION_STATUS_CREATING.to_string(),
+            owed: Some(OwedStatus {
+                status: APPLICATION_STATUS_ACTIVE.to_string(),
+                message: None,
+                due: now + PROVISIONING,
+            }),
+            data_sources: input.data_sources.unwrap_or_default(),
+            app_configs: input.app_configs.unwrap_or_default(),
+            iam_identity_center_options: input
+                .iam_identity_center_options
+                .map(stored_iam_identity_center_options),
+            kms_key_arn: input.kms_key_arn,
+            tags,
+            created_at: now,
+            // Nothing has changed the application since the call that minted it, so the
+            // instant it was last changed IS the instant it was created.
+            last_updated_at: now,
+            client_token: input.client_token,
+        };
+
+        // Answered from the STORED record, so the create's answer and a later read of
+        // the same application report one application.
+        Ok(created(store.insert_application(application)))
+    }
+}
+
+/// The stored application as this operation answers with it.
+///
+/// Both the first create and a repeat of it under the same `clientToken` answer
+/// through here, so a retry cannot report the application differently from the call
+/// that made it.
+fn created(application: &Application) -> CreateApplicationOutput {
+    CreateApplicationOutput {
+        id: Some(application.id.clone()),
+        name: Some(application.name.clone()),
+        arn: Some(application.arn.clone()),
+        data_sources: application.reported_data_sources(),
+        iam_identity_center_options: application.iam_identity_center_options.clone(),
+        app_configs: application.reported_app_configs(),
+        tag_list: application.reported_tag_list(),
+        created_at: Some(datetime(application.created_at)),
+        kms_key_arn: application.kms_key_arn.clone(),
     }
 }

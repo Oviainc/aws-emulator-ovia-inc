@@ -30,21 +30,22 @@ use crate::ops::types::{
     AIMLOptionsInput, AIMLOptionsOutput, AIMLOptionsStatus, AWSDomainInformation,
     AccessPoliciesStatus, AdditionalLimit,
     AdvancedOptionsStatus, AdvancedSecurityOptions, AdvancedSecurityOptionsInput,
-    AdvancedSecurityOptionsStatus, AuthorizedPrincipal,
+    AdvancedSecurityOptionsStatus, AppConfig, AuthorizedPrincipal,
     AutoTune, AutoTuneDetails,
     AutoTuneOptions, AutoTuneOptionsInput, AutoTuneOptionsOutput,
     AutoTuneOptionsStatus, AutoTuneStatus, AutomatedSnapshotPauseOptions,
     AutomatedSnapshotPauseOptionsStatus, AutomatedSnapshotPauseRequestOptions,
     ChangeProgressDetails, ChangeProgressStatusDetails, ClusterConfig, ClusterConfigStatus,
     CognitoOptions, CognitoOptionsStatus, ConflictException, ConnectionProperties,
-    DataSourceDetails, DataSourceType,
+    DataSource as LinkedDataSource, DataSourceDetails, DataSourceType,
     DeploymentStrategyOptions,
     DeploymentStrategyOptionsStatus, DomainConfig, DomainEndpointOptions,
     DomainEndpointOptionsStatus, DomainInfo, DomainInformationContainer, DomainPackageDetails,
     DomainStatus, EBSOptions,
     EBSOptionsStatus,
     EncryptionAtRestOptions, EncryptionAtRestOptionsStatus, EngineModeStatus,
-    IAMFederationOptionsOutput, IPAddressTypeStatus, IdentityCenterOptions,
+    IAMFederationOptionsOutput, IPAddressTypeStatus, IamIdentityCenterOptions,
+    IamIdentityCenterOptionsInput, IdentityCenterOptions,
     IdentityCenterOptionsInput, IdentityCenterOptionsStatus, InboundConnection,
     InboundConnectionStatus, Insight, InsightEntity, InsightField,
     InstanceCountLimits, InstanceLimits,
@@ -308,6 +309,18 @@ pub fn tag_quota_exceeded(arn: &str, requested: usize) -> LimitExceededException
     LimitExceededException {
         message: Some(format!(
             "{arn} would carry {requested} tags, more than the {TAG_QUOTA} a resource may have."
+        )),
+    }
+}
+
+/// The same bound as [`tag_quota_exceeded`], reported through the client-input error
+/// channel for a CREATE whose model declares no `LimitExceededException`: the resource
+/// does not exist yet, so the refusal names the member that carried the tags rather
+/// than an ARN nothing has been minted under.
+pub fn tag_quota_exceeded_on_create(member: &str, requested: usize) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "{member} carries {requested} tags, more than the {TAG_QUOTA} a resource may have."
         )),
     }
 }
@@ -922,6 +935,172 @@ pub fn vpc_endpoint_missing(vpc_endpoint_id: &str) -> VpcEndpointError {
         vpc_endpoint_id: Some(vpc_endpoint_id.to_string()),
         error_code: Some(VPC_ENDPOINT_ERROR_ENDPOINT_NOT_FOUND.to_string()),
         error_message: Some(ENDPOINT_DOES_NOT_EXIST.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OpenSearch UI applications
+//
+// An application is the OpenSearch user interface over an account's data, and
+// an ACCOUNT resource of this control plane rather than a sub-resource of a
+// domain: it is addressed by its own id and names no domain at all.
+// `CreateApplication` mints one and `GetApplication` reports it, both from the
+// ONE [`Application`] record below, so the answer a create gives and the answer
+// a later read gives cannot disagree.
+// ---------------------------------------------------------------------------
+
+/// `ApplicationStatus`'s `CREATING` value: the application has been asked for and is
+/// being provisioned.
+pub const APPLICATION_STATUS_CREATING: &str = "CREATING";
+
+/// `ApplicationStatus`'s `ACTIVE` value: the application is up and can be used.
+pub const APPLICATION_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// How many OpenSearch UI applications this account holds before
+/// `CreateApplication` refuses to mint another.
+///
+/// Like [`DOMAIN_QUOTA`] this is the emulator's OWN bound on the store — it models
+/// neither Service Quotas nor an account's adjustments — and it is what stops a caller
+/// looping with fresh names from growing the state without end: every record it counts
+/// is released when the application is deleted, which is `DeleteApplication`'s to do
+/// once that operation is written.
+pub const APPLICATION_QUOTA: usize = 100;
+
+/// One OpenSearch UI application of this account, as this emulator persists it.
+#[derive(Debug, Clone)]
+pub struct Application {
+    /// The application's `Id`: unique per application, so it IS the key the store
+    /// holds the record under, and the value every read path addresses it by.
+    pub id: String,
+    /// `ApplicationName`: "the unique name of the OpenSearch application. Names must
+    /// be unique within an Amazon Web Services Region for each account", which is
+    /// what [`ComAmazonawsOpensearchAmazonopensearchserviceState::application_named`]
+    /// resolves a create against.
+    pub name: String,
+    /// The application's `ARN`, built by [`application_arn`] from the id the store
+    /// minted.
+    pub arn: String,
+    /// "The endpoint URL of an OpenSearch application" ([`application_endpoint`]).
+    pub endpoint: String,
+    /// Where the application is in its lifecycle: one of `ApplicationStatus`'s
+    /// values.
+    pub status: String,
+    /// The status move the clock owes this application, if any is outstanding.
+    pub owed: Option<OwedStatus>,
+    /// The `DataSources` the application was created with, stored as the modelled
+    /// shape every read path reports rather than as a second mirror of its members.
+    ///
+    /// The modelled shape is imported as `LinkedDataSource` because this module also
+    /// holds a [`DataSource`] of its own — a domain's direct-query data source, a
+    /// different resource that happens to share the model's name.
+    pub data_sources: Vec<LinkedDataSource>,
+    /// The `AppConfigs` the application was created with, stored as the modelled
+    /// shape every read path reports.
+    pub app_configs: Vec<AppConfig>,
+    /// The IAM Identity Center settings the application carries, absent where the
+    /// create asked for none ([`stored_iam_identity_center_options`]).
+    pub iam_identity_center_options: Option<IamIdentityCenterOptions>,
+    /// `KmsKeyArn`: the customer-managed key the application's data is encrypted
+    /// with. Absent where the create named none — "if omitted, the application uses
+    /// an AWS-managed key", and that key's ARN is KMS's to mint rather than this
+    /// emulator's to invent.
+    pub kms_key_arn: Option<String>,
+    /// The application's tags, keyed by tag key the way every taggable resource of
+    /// this store holds them, so the tagging operations read and write THIS set.
+    pub tags: TagSet,
+    /// When the application was created.
+    pub created_at: SystemTime,
+    /// When the application was last changed — the creation instant for one no call
+    /// has changed since.
+    pub last_updated_at: SystemTime,
+    /// The request's `ClientToken`, absent where it carried none: "unique,
+    /// case-sensitive identifier to ensure idempotency of the request", so a repeat
+    /// of the same create is answered with THIS record rather than minting a second
+    /// application.
+    pub client_token: Option<String>,
+}
+
+impl Application {
+    /// Materialise the status move the clock owes this application, if `now` is past
+    /// its due instant: one that was being provisioned becomes one that is up.
+    ///
+    /// This is the only write a reporting operation makes, and it writes only what was
+    /// already owed at the same instant had nobody called.
+    pub fn settle(&mut self, now: SystemTime) {
+        let Some(owed) = self.owed.take_if(|owed| now >= owed.due) else {
+            return;
+        };
+        self.status = owed.status;
+    }
+
+    /// The application's data sources as a response reports them: absent where it
+    /// holds none, because a member the application has nothing for is one the
+    /// service leaves out rather than one it answers with an empty list.
+    pub fn reported_data_sources(&self) -> Option<Vec<LinkedDataSource>> {
+        (!self.data_sources.is_empty()).then(|| self.data_sources.clone())
+    }
+
+    /// The application's configuration settings as a response reports them, on the
+    /// same rule as [`Self::reported_data_sources`].
+    pub fn reported_app_configs(&self) -> Option<Vec<AppConfig>> {
+        (!self.app_configs.is_empty()).then(|| self.app_configs.clone())
+    }
+
+    /// The application's tags as a response reports them, on the same rule as
+    /// [`Self::reported_data_sources`].
+    pub fn reported_tag_list(&self) -> Option<Vec<Tag>> {
+        (!self.tags.is_empty()).then(|| tag_list(&self.tags))
+    }
+}
+
+/// An application's ARN: `arn:aws:es:<region>:<account-id>:application/<id>`.
+///
+/// The same namespace as [`domain_arn`] — one service, one `arnNamespace` — with the
+/// resource type the application is addressed as.
+pub fn application_arn(id: &str, region: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("application/{id}"))
+}
+
+/// The URL an OpenSearch UI application is reached on: the application's own id, the
+/// Region it was created in, then the user-interface host of this service.
+///
+/// The model types the member as a plain string, so its SHAPE is the service's to
+/// pick: it is derived from the id rather than the name, so two applications never
+/// share an endpoint and renaming one cannot move it.
+pub fn application_endpoint(id: &str, region: &str) -> String {
+    format!("https://{id}.{region}.opensearch.amazonaws.com")
+}
+
+/// The `ConflictException` payload for a create whose `name` is already an
+/// application's of this account.
+///
+/// "Names must be unique within an Amazon Web Services Region for each account", so a
+/// second create of the same name asks for a second application under one name and is
+/// refused rather than minting one.
+pub fn application_name_taken(name: &str) -> ConflictException {
+    ConflictException {
+        message: Some(format!("Application with name {name} already exists.")),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for an id that names no application of
+/// this account — the application mirror of [`domain_not_found`].
+pub fn application_not_found(id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Application not found: {id}")),
+    }
+}
+
+/// The `ValidationException` payload for a create made while the account already holds
+/// [`APPLICATION_QUOTA`] applications.
+///
+/// `CreateApplication` models no `LimitExceededException`, so the bound on the store is
+/// reported through the client-input error it does model.
+pub fn application_quota_exceeded() -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "This account already holds the maximum of {APPLICATION_QUOTA} applications."
+        )),
     }
 }
 
@@ -5156,6 +5335,15 @@ pub struct ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// Drives
     /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_vpc_endpoint_id`].
     pub vpc_endpoint_seq: u64,
+    /// Every OpenSearch UI application of this account, keyed by its `Id` — unique
+    /// per application, so the id IS the key. `CreateApplication` mints one and
+    /// `GetApplication` reports it, from THIS one record. Iterating a `BTreeMap` is
+    /// order-stable, which is what lets two reads of the set report it in the same
+    /// order.
+    pub applications: BTreeMap<String, Application>,
+    /// Drives
+    /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_application_id`].
+    pub application_seq: u64,
 }
 
 impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
@@ -5178,6 +5366,8 @@ impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
             package_vending_entitled: false,
             vpc_endpoints: BTreeMap::new(),
             vpc_endpoint_seq: 0,
+            applications: BTreeMap::new(),
+            application_seq: 0,
         }
     }
 }
@@ -5211,6 +5401,11 @@ const CONNECTION_ID_OFFSET: u128 = 51_539_607_551;
 /// from the two above for the same reason: three counters that start at zero must not
 /// render the same token.
 const VPC_ENDPOINT_ID_OFFSET: u128 = 8_589_934_591;
+
+/// The bijection's constant term for an OpenSearch UI application's id. Different
+/// from the three above for the same reason: counters that all start at zero must not
+/// render the same token.
+const APPLICATION_ID_OFFSET: u128 = 137_438_953_471;
 
 /// The opaque lowercase-alphanumeric token seed `seq` scrambles to, through the
 /// bijection described on [`SUFFIX_MULTIPLIER`]: distinct seeds under one `offset`
@@ -5268,6 +5463,72 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
             "aos-{}",
             opaque_token(self.vpc_endpoint_seq, VPC_ENDPOINT_ID_OFFSET)
         )
+    }
+
+    /// Mint the identifier an OpenSearch UI application is addressed by, so two
+    /// applications never share one.
+    ///
+    /// `Id` is `^[a-z0-9]{3,30}$` — an opaque lowercase token — so the whole id is
+    /// minted off its own counter through the same bijection as
+    /// [`Self::mint_endpoint_suffix`], which renders exactly that alphabet and never
+    /// repeats.
+    pub fn mint_application_id(&mut self) -> String {
+        self.application_seq = self.application_seq.wrapping_add(1);
+        opaque_token(self.application_seq, APPLICATION_ID_OFFSET)
+    }
+
+    /// Materialise the status move the clock owes every stored application, for a
+    /// caller about to report on any of them.
+    pub fn settle_applications(&mut self, now: SystemTime) {
+        for application in self.applications.values_mut() {
+            application.settle(now);
+        }
+    }
+
+    /// The application a create carrying `client_token` already minted, if this
+    /// account holds one: "unique, case-sensitive identifier to ensure idempotency of
+    /// the request", so a repeat of the same create is answered with the record the
+    /// first one made rather than minting a second application.
+    ///
+    /// Reads ONLY.
+    pub fn application_of_client_token(&self, client_token: &str) -> Option<&Application> {
+        self.applications
+            .values()
+            .find(|application| application.client_token.as_deref() == Some(client_token))
+    }
+
+    /// The application `name` names, if this account holds one. An application name is
+    /// unique per account and Region, so this is the one lookup a create resolves its
+    /// `name` against.
+    ///
+    /// Reads ONLY.
+    pub fn application_named(&self, name: &str) -> Option<&Application> {
+        self.applications
+            .values()
+            .find(|application| application.name == name)
+    }
+
+    /// Store `application` and hand back the stored copy, so a create answers with the
+    /// record this service persisted rather than a copy beside it.
+    ///
+    /// The id comes from [`Self::mint_application_id`], a bijection over its own
+    /// counter, so the key cannot already be taken; the entry API is used so no path
+    /// can overwrite a record this store already holds under one.
+    pub fn insert_application(&mut self, application: Application) -> &Application {
+        let id = application.id.clone();
+        self.applications.entry(id).or_insert(application)
+    }
+
+    /// The application `id` names, with any status move the clock owes it already
+    /// materialised — the one lookup a read of a single application goes through.
+    pub fn settled_application_mut(
+        &mut self,
+        id: &str,
+        now: SystemTime,
+    ) -> Option<&mut Application> {
+        let application = self.applications.get_mut(id)?;
+        application.settle(now);
+        Some(application)
     }
 
     /// Materialise the status move the clock owes every stored VPC endpoint, for a
@@ -5443,27 +5704,35 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
 
     /// The tag set of the resource `arn` names, for a caller about to READ it.
     ///
-    /// A domain is the taggable resource this store persists an ARN for
-    /// ([`domain_arn`]); the other two the tagging operations name — a data source
-    /// and an application — have no stored ARN to resolve against (a data source is
-    /// addressed by its domain and name, and no operation that mints an application
-    /// is implemented), so an ARN naming neither resolves to nothing and the caller
-    /// refuses it.
+    /// A domain and an application are the taggable resources this store persists an
+    /// ARN for ([`domain_arn`], [`application_arn`]); the data source the tagging
+    /// operations also name has no stored ARN to resolve against (it is addressed by
+    /// its domain and name), so an ARN naming none of them resolves to nothing and the
+    /// caller refuses it.
     pub fn tagged_resource(&self, arn: &str) -> Option<&TagSet> {
         self.domains
             .values()
             .find(|domain| domain.arn == arn)
             .map(|domain| &domain.tags)
+            .or_else(|| {
+                self.applications
+                    .values()
+                    .find(|application| application.arn == arn)
+                    .map(|application| &application.tags)
+            })
     }
 
     /// The tag set of the resource `arn` names, for a caller about to WRITE it —
     /// resolved exactly as [`Self::tagged_resource`] resolves it, so a tag write and
     /// a tag read can never disagree about which resource an ARN names.
     pub fn tagged_resource_mut(&mut self, arn: &str) -> Option<&mut TagSet> {
-        self.domains
+        if let Some(domain) = self.domains.values_mut().find(|domain| domain.arn == arn) {
+            return Some(&mut domain.tags);
+        }
+        self.applications
             .values_mut()
-            .find(|domain| domain.arn == arn)
-            .map(|domain| &mut domain.tags)
+            .find(|application| application.arn == arn)
+            .map(|application| &mut application.tags)
     }
 
     /// The package `package_name` names, if the account holds one.
@@ -5835,6 +6104,23 @@ pub fn stored_identity_center_options(input: IdentityCenterOptionsInput) -> Iden
         roles_key: input.roles_key,
         identity_center_application_arn: None,
         identity_store_id: None,
+    }
+}
+
+/// `IamIdentityCenterOptionsInput` as the service reports it back.
+///
+/// The same reasoning as [`stored_identity_center_options`]: the IAM Identity Center
+/// application's own ARN is minted by Identity Center itself, which this emulator does
+/// not model, so it stays absent rather than being invented.
+pub fn stored_iam_identity_center_options(
+    input: IamIdentityCenterOptionsInput,
+) -> IamIdentityCenterOptions {
+    IamIdentityCenterOptions {
+        enabled: input.enabled,
+        iam_identity_center_instance_arn: input.iam_identity_center_instance_arn,
+        iam_role_for_identity_center_application_arn: input
+            .iam_role_for_identity_center_application_arn,
+        iam_identity_center_application_arn: None,
     }
 }
 
