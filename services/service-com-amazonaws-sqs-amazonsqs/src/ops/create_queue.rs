@@ -214,11 +214,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state;
 
+        let supplied = input.attributes.unwrap_or_default();
+        // "If you don't specify the FifoQueue attribute, Amazon SQS creates a standard
+        // queue" — and it is being FIFO that makes the FIFO-only attributes applicable,
+        // and the `.fifo` suffix part of the rule the name has to satisfy.
+        let fifo = supplied
+            .get(state::FIFO_QUEUE_ATTRIBUTE)
+            .is_some_and(|value| value == "true");
+
         // `QueueName` carries no modelled constraint, so the member's own rule is
-        // enforced here. The operation models no error for a malformed member, hence
-        // the 400 `ValidationException` channel rather than a 501.
-        if let Some(why) = state::queue_name_refusal(&input.queue_name) {
-            return Err(crate::scaffolded::Scaffolded::validation(why));
+        // enforced here. The fault is in the NAME the request supplied, whichever half
+        // of that rule it broke, so it is refused as a parameter value — the suffix
+        // included, because the suffix is part of the rule the name must satisfy and not
+        // a property of the attribute that asked for a FIFO queue.
+        if let Some(why) = state::queue_name_refusal(&input.queue_name, fifo) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
         }
 
         // The tags the create carries are bounded exactly as `TagQueue`'s are, so the
@@ -227,6 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let supplied_tags = input.tags;
         let no_tags = ::std::collections::HashMap::new();
         if let Some(why) = state::tag_refusal(
+            &input.queue_name,
             &::std::collections::BTreeMap::new(),
             supplied_tags.as_ref().unwrap_or(&no_tags),
         ) {
@@ -237,12 +248,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tags: Option<::std::collections::BTreeMap<String, String>> =
             supplied_tags.map(|tags| tags.into_iter().collect());
 
-        let supplied = input.attributes.unwrap_or_default();
-        // "If you don't specify the FifoQueue attribute, Amazon SQS creates a standard
-        // queue" — and it is being FIFO that makes the FIFO-only attributes applicable.
-        let fifo = supplied
-            .get(state::FIFO_QUEUE_ATTRIBUTE)
-            .is_some_and(|value| value == "true");
         state::validate_attributes(&supplied, true, fifo).map_err(|refusal| match refusal {
             state::AttributeRefusal::Name(error) => {
                 CreateQueueErrorModeled::InvalidAttributeName(error)
@@ -251,18 +256,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 CreateQueueErrorModeled::InvalidAttributeValue(error)
             }
         })?;
-
-        if fifo && !input.queue_name.ends_with(state::FIFO_QUEUE_NAME_SUFFIX) {
-            return Err(CreateQueueErrorModeled::InvalidAttributeValue(InvalidAttributeValue {
-                message: Some(format!(
-                    "Invalid value for the parameter {}: a FIFO queue name must end with the {} suffix, but {} does not.",
-                    state::FIFO_QUEUE_ATTRIBUTE,
-                    state::FIFO_QUEUE_NAME_SUFFIX,
-                    input.queue_name,
-                )),
-            })
-            .into());
-        }
 
         // The documented defaults, overlaid with what this request supplied: the
         // attribute set the queue carries, and the one a re-create of the same name is

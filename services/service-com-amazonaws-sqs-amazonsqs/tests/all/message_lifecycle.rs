@@ -522,7 +522,7 @@ async fn max_number_of_messages_caps_the_batch_across_its_documented_range() {
             .await;
         assert_eq!(
             (status, error_code(&answer).as_str()),
-            (400, "ValidationException"),
+            (400, "InvalidParameterValue"),
             "case MaxNumberOfMessages={outside}: expected a refusal, got {status} {answer:?}"
         );
     }
@@ -651,7 +651,7 @@ async fn a_delayed_message_is_withheld_until_its_delay_elapses() {
             .await;
         assert_eq!(
             (status, error_code(&answer).as_str()),
-            (400, "ValidationException"),
+            (400, "InvalidParameterValue"),
             "case DelaySeconds={outside}: expected a refusal, got {status} {answer:?}"
         );
     }
@@ -717,7 +717,7 @@ async fn a_long_polling_receive_waits_for_the_requested_time() {
             .await;
         assert_eq!(
             (status, error_code(&answer).as_str()),
-            (400, "ValidationException"),
+            (400, "InvalidParameterValue"),
             "case WaitTimeSeconds={outside}: expected a refusal, got {status} {answer:?}"
         );
     }
@@ -948,15 +948,19 @@ async fn send_message_refuses_the_members_it_cannot_honour() {
             .await;
         assert_eq!(
             (status, error_code(&answer).as_str()),
-            (400, "ValidationException"),
+            (400, "InvalidParameterValue"),
             "case {label}: expected a refusal, got {status} {answer:?}"
         );
     }
 
-    let unsupported: [(&str, Value); 2] = [
+    // `(label, the extra members, the code the refusal carries)`: a member that applies
+    // only to the other queue type is a fault in that parameter's value, while a member
+    // this emulator does not honour at all is not a parameter fault.
+    let unsupported: [(&str, Value, &str); 2] = [
         (
             "MessageDeduplicationId",
             json!({ "MessageDeduplicationId": "dedup-1" }),
+            "InvalidParameterValue",
         ),
         (
             "MessageSystemAttributes",
@@ -965,9 +969,10 @@ async fn send_message_refuses_the_members_it_cannot_honour() {
                     "AWSTraceHeader": { "DataType": "String", "StringValue": "Root=1-00-00" },
                 },
             }),
+            "UnsupportedOperation",
         ),
     ];
-    for (label, extra) in &unsupported {
+    for (label, extra, code) in &unsupported {
         let mut body = json!({ "QueueUrl": url, "MessageBody": "payload" });
         for (member, value) in extra.as_object().expect("an object of members") {
             body[member] = value.clone();
@@ -975,7 +980,7 @@ async fn send_message_refuses_the_members_it_cannot_honour() {
         let (status, answer) = sqs.call("SendMessage", &body).await;
         assert_eq!(
             (status, error_code(&answer).as_str()),
-            (400, "ValidationException"),
+            (400, *code),
             "case {label}: expected a refusal naming the member, got {status} {answer:?}"
         );
         assert!(
@@ -1047,7 +1052,7 @@ async fn a_message_over_the_queues_maximum_message_size_is_refused() {
             } else {
                 assert_eq!(
                     (status, error_code(&answer).as_str()),
-                    (400, "ValidationException"),
+                    (400, "InvalidParameterValue"),
                     "case maximum {maximum} / {label}: expected a refusal, got {status} {answer:?}"
                 );
             }
@@ -1084,7 +1089,7 @@ async fn a_message_over_the_queues_maximum_message_size_is_refused() {
         } else {
             assert_eq!(
                 (status, error_code(&answer).as_str()),
-                (400, "ValidationException"),
+                (400, "InvalidParameterValue"),
                 "case {count} attributes: expected a refusal, got {status} {answer:?}"
             );
         }

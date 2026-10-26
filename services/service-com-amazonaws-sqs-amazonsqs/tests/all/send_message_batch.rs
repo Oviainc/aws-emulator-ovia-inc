@@ -440,11 +440,13 @@ async fn an_entry_the_queue_will_not_take_fails_on_its_own() {
             enqueued: &["good"],
         },
         Case {
-            label: "a FIFO member on a standard queue",
-            attributes: json!({}),
+            label: "an entry whose MessageDeduplicationId is not a token",
+            attributes: json!({ "FifoQueue": "true" }),
             entries: json!([
-                { "Id": "good", "MessageBody": "one" },
-                { "Id": "bad", "MessageBody": "two", "MessageDeduplicationId": "token" },
+                { "Id": "good", "MessageBody": "one", "MessageGroupId": "g",
+                  "MessageDeduplicationId": "token" },
+                { "Id": "bad", "MessageBody": "two", "MessageGroupId": "g",
+                  "MessageDeduplicationId": "not a token" },
             ]),
             failures: &[("bad", "InvalidParameterValue")],
             enqueued: &["good"],

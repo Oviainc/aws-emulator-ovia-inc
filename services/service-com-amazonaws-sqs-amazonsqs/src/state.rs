@@ -103,6 +103,20 @@ pub fn invalid_body_character(body: &str) -> Option<char> {
     })
 }
 
+/// How a refusal states that the body holds `character`, which is outside the allowed
+/// set: the character that was found, as the code point the published set is written
+/// in, and that set.
+///
+/// One wording for every call that takes a message body, so `SendMessage` and a
+/// `SendMessageBatch` entry cannot drift on how they state the same defect.
+pub fn invalid_body_character_message(character: char) -> String {
+    format!(
+        "Invalid binary character '#x{:X}' was found in the message body, the set of allowed \
+         characters is #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF].",
+        character as u32
+    )
+}
+
 /// The suffix a FIFO queue's name must carry: "A FIFO queue name must end with the
 /// .fifo suffix" (`CreateQueueRequest$QueueName` docs).
 pub const FIFO_QUEUE_NAME_SUFFIX: &str = ".fifo";
@@ -181,23 +195,24 @@ pub const SEQUENCE_NUMBER_BASE: u128 = 10_u128.pow(19);
 /// either.
 pub fn message_token_refusal(member: &str, token: &str) -> Option<String> {
     let length = token.chars().count();
-    if length == 0 || length > MAX_MESSAGE_TOKEN_LENGTH {
-        return Some(format!(
-            "{member} must be between 1 and {MAX_MESSAGE_TOKEN_LENGTH} characters long, but was \
-             {length}."
-        ));
-    }
-    if let Some(character) = token
+    let within_length = (1..=MAX_MESSAGE_TOKEN_LENGTH).contains(&length);
+    let printable = token
         .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || c.is_ascii_punctuation()))
-    {
-        return Some(format!(
-            "{member} may hold only alphanumeric characters and punctuation, but holds \
-             U+{:04X}.",
-            character as u32
-        ));
+        .all(|c| c.is_ascii_alphanumeric() || c.is_ascii_punctuation());
+    if within_length && printable {
+        return None;
     }
-    None
+    // One wording for both halves of the one rule the member publishes, because that is
+    // how the rule is published: the accepted characters and the accepted length in a
+    // single sentence naming the member.
+    Some(invalid_parameter_message(
+        token,
+        member,
+        &format!(
+            "{member} can only include alphanumeric and punctuation characters. 1 to \
+             {MAX_MESSAGE_TOKEN_LENGTH} in length."
+        ),
+    ))
 }
 
 /// How many cost allocation tags one queue may carry.
@@ -548,9 +563,10 @@ pub const LIST_QUEUES_MAX_RESULTS_RANGE: (i32, i32) = (1, 1_000);
 /// parameter it was given for, and the reason it was refused.
 pub fn max_results_refusal(parameter: &str, (min, max): (i32, i32), requested: i32) -> Option<String> {
     (requested < min || requested > max).then(|| {
-        format!(
-            "Value {requested} for parameter {parameter} is invalid. \
-             Reason: must be between {min} and {max}."
+        invalid_parameter_message(
+            &requested.to_string(),
+            parameter,
+            &format!("must be between {min} and {max}."),
         )
     })
 }
@@ -1858,6 +1874,16 @@ pub const MAX_BATCH_ENTRIES: usize = 10;
 /// (`DeleteMessageBatchRequestEntry$Id`).
 pub const MAX_BATCH_ENTRY_ID_LEN: usize = 80;
 
+/// How a refusal of an empty batch states it: the operation's own request-entry shape
+/// is what the request should have carried at least one of.
+///
+/// One wording for every batch operation, so two of them cannot drift on how they state
+/// the same defect; `operation` is the operation's name, whose request entry shape is
+/// `<operation>RequestEntry`.
+pub fn empty_batch_message(operation: &str) -> String {
+    format!("There should be at least one {operation}RequestEntry in the request.")
+}
+
 /// Whether `id` is a batch entry id the specification admits.
 ///
 /// "The following characters are accepted: alphanumeric characters, hyphens(-), and
@@ -1870,6 +1896,109 @@ pub fn is_valid_batch_entry_id(id: &str) -> bool {
         && id
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+}
+
+// ---------------------------------------------------------------------------
+// Parameter-level refusals
+// ---------------------------------------------------------------------------
+//
+// This service's model shapes an error for an ATTRIBUTE fault — `InvalidAttributeName`,
+// `InvalidAttributeValue` — and one for each batch fault, but a fault in a PARAMETER is
+// carried by two codes it documents without shaping: one for a parameter the call
+// requires and did not get, one for a parameter whose value it does not accept. The
+// error channel owns those two codes and their variants
+// ([`crate::scaffolded::Scaffolded::missing_parameter`] and
+// [`crate::scaffolded::Scaffolded::invalid_parameter_value`]); the TEXT they carry is
+// worded HERE, once, in the templates the service builds from the request, so no handler
+// and no batch entry invents a second wording for the same class of refusal.
+
+/// How a refusal states that `parameter` was absent. The one wording for that class:
+/// [`crate::scaffolded::MissingParameter`] builds its payload from it, and a batch entry
+/// reporting the condition per entry uses it too.
+pub fn missing_parameter_message(parameter: &str) -> String {
+    format!("The request must contain the parameter {parameter}.")
+}
+
+/// How a refusal states that `value`, supplied for `parameter`, is not one this service
+/// accepts: the offending value, the parameter it was supplied for, and the rule it
+/// broke. `reason` is a whole sentence and carries its own terminal period.
+pub fn invalid_parameter_message(value: &str, parameter: &str, reason: &str) -> String {
+    format!("Value {value} for parameter {parameter} is invalid. Reason: {reason}")
+}
+
+/// The same template for a refusal that does NOT name the value: the one to use where
+/// the value is a string whose length is the very thing being refused, so echoing it
+/// would hand an unbounded value back to the caller.
+pub fn invalid_parameter_message_without_value(parameter: &str, reason: &str) -> String {
+    format!("Value for parameter {parameter} is invalid. Reason: {reason}")
+}
+
+/// How a refusal states a rule the request broke as a whole rather than through one
+/// named parameter. `reason` is a whole sentence and carries its own terminal period.
+pub fn invalid_parameters_message(reason: &str) -> String {
+    format!("One or more parameters are invalid. Reason: {reason}")
+}
+
+/// The message system attribute names in the order the model DECLARES them, which is the
+/// order a refusal lists the accepted set in.
+///
+/// Source: `smithy_query(query="shape", shape="MessageSystemAttributeName",
+/// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`.
+/// It holds exactly the values the generated
+/// `MESSAGE_SYSTEM_ATTRIBUTE_NAME_VALUES` carries — membership is still checked against
+/// that generated set — but the generated one is sorted, and a published value set is
+/// stated in the order it is published.
+pub const MESSAGE_SYSTEM_ATTRIBUTE_NAMES: &[&str] = &[
+    "All",
+    "SenderId",
+    "SentTimestamp",
+    "ApproximateReceiveCount",
+    "ApproximateFirstReceiveTimestamp",
+    "SequenceNumber",
+    "MessageDeduplicationId",
+    "MessageGroupId",
+    "AWSTraceHeader",
+    "DeadLetterQueueSourceArn",
+];
+
+/// How a refusal states that the queue a message movement task names as its source is
+/// not one it can move messages out of.
+///
+/// The sentence is `StartMessageMoveTask`'s own documented rule, carried verbatim rather
+/// than paraphrased: "This action is currently limited to supporting message redrive from
+/// queues that are configured as dead-letter queues (DLQs) of other Amazon SQS queues
+/// only." The source queue the request named is not such a queue, which is the whole
+/// reason the call cannot be served.
+pub const DEAD_LETTER_SOURCE_REQUIRED: &str =
+    "This action is currently limited to supporting message redrive from queues that are \
+     configured as dead-letter queues (DLQs) of other Amazon SQS queues only.";
+
+/// The reason a refusal gives for a parameter that does not apply to the KIND of queue
+/// the call addresses: a FIFO-only member supplied to a standard queue, or a
+/// per-message member a FIFO queue accepts only as a queue attribute.
+pub const QUEUE_TYPE_PARAMETER_REASON: &str =
+    "The request include parameter that is not valid for this queue type.";
+
+/// How a refusal states that a FIFO send carried no deduplication token and the queue it
+/// addresses derives none: "If you don't provide a MessageDeduplicationId and the queue
+/// doesn't have ContentBasedDeduplication set, the action fails with an error"
+/// (`SendMessageRequest$MessageDeduplicationId`).
+pub const NO_DEDUPLICATION_ID: &str = "The queue should either have ContentBasedDeduplication \
+                                       enabled or MessageDeduplicationId provided explicitly";
+
+/// How a refusal states that a parameter's value is not one this service accepts, where
+/// it names the parameter and nothing else: what that parameter accepts is published
+/// with the parameter, not restated per call.
+pub fn invalid_value_message(parameter: &str) -> String {
+    format!("Invalid value for the parameter {parameter}.")
+}
+
+/// The modelled refusal for an attribute value the call does not accept: it names the
+/// attribute whose value was refused, which is all this refusal states.
+pub fn invalid_attribute_value(attribute: &str) -> InvalidAttributeValue {
+    InvalidAttributeValue {
+        message: Some(invalid_value_message(attribute)),
+    }
 }
 
 /// The modelled refusal for an attribute name the call does not accept: it names no
@@ -1978,14 +2107,7 @@ fn check_attribute_value(spec: &AttributeSpec, value: &str) -> Result<(), Attrib
         _ => true,
     };
     if !bounded {
-        return Err(AttributeRefusal::Value(InvalidAttributeValue {
-            message: Some(format!(
-                "Invalid value for the parameter {}: at most {MAX_ATTRIBUTE_VALUE_BYTES} bytes \
-                 were expected, and {} were supplied.",
-                spec.name,
-                value.len()
-            )),
-        }));
+        return Err(AttributeRefusal::Value(invalid_attribute_value(spec.name)));
     }
     let accepted = match spec.kind {
         AttributeKind::Integer { min, max } => match value.parse::<i64>() {
@@ -2000,46 +2122,51 @@ fn check_attribute_value(spec: &AttributeSpec, value: &str) -> Result<(), Attrib
     if accepted {
         return Ok(());
     }
-    let expected = match spec.kind {
-        AttributeKind::Integer { min, max } => format!("an integer from {min} to {max}"),
-        AttributeKind::Boolean => "true or false".to_string(),
-        AttributeKind::OneOf(allowed) => format!("one of {}", allowed.join(", ")),
-        AttributeKind::Json => "a valid JSON document".to_string(),
-        // `Text` accepts everything, so it never reaches here.
-        AttributeKind::Text => "any string".to_string(),
-    };
-    Err(AttributeRefusal::Value(InvalidAttributeValue {
-        message: Some(format!(
-            "Invalid value for the parameter {}: {expected} was expected.",
-            spec.name
-        )),
-    }))
+    // The refusal names the attribute and nothing else: what that attribute accepts is
+    // published with the attribute, not restated per call.
+    Err(AttributeRefusal::Value(invalid_attribute_value(spec.name)))
 }
 
 /// Why a `QueueName` was refused, as the text of the refusal a caller has to fix the
-/// request from.
+/// request from, or `None` when the name is one this service accepts.
 ///
 /// The rule is the member's own: "A queue name can have up to 80 characters. Valid
 /// values: alphanumeric characters, hyphens (-), and underscores (_). A FIFO queue
-/// name must end with the .fifo suffix."
-pub fn queue_name_refusal(name: &str) -> Option<String> {
-    let body = name.strip_suffix(FIFO_QUEUE_NAME_SUFFIX).unwrap_or(name);
-    if name.is_empty() || name.chars().count() > MAX_QUEUE_NAME_LENGTH {
-        return Some(format!(
-            "QueueName must be between 1 and {MAX_QUEUE_NAME_LENGTH} characters long, but was {}",
-            name.chars().count()
-        ));
-    }
-    if body.is_empty()
-        || !body
+/// name must end with the .fifo suffix." `fifo` says whether the request asks for a
+/// FIFO queue, which is what makes the suffix part of the rule — and makes the refusal
+/// state the whole rule a FIFO name has to satisfy, suffix included.
+pub fn queue_name_refusal(name: &str, fifo: bool) -> Option<String> {
+    // The suffix is part of a FIFO queue's name and of nothing else: a standard queue's
+    // name may hold only the characters the member lists, so a `.fifo` name is accepted
+    // for a FIFO queue and refused for a standard one.
+    let body = if fifo {
+        name.strip_suffix(FIFO_QUEUE_NAME_SUFFIX).unwrap_or(name)
+    } else {
+        name
+    };
+    let well_formed = (1..=MAX_QUEUE_NAME_LENGTH).contains(&name.chars().count())
+        && !body.is_empty()
+        && body
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Some(format!(
-            "QueueName {name} is invalid: a queue name may hold only alphanumeric characters, hyphens (-) and underscores (_), optionally followed by the {FIFO_QUEUE_NAME_SUFFIX} suffix"
-        ));
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    let suffixed = !fifo || name.ends_with(FIFO_QUEUE_NAME_SUFFIX);
+    if well_formed && suffixed {
+        return None;
     }
-    None
+    // The refusal states the rule, not which half of it this name broke: a caller fixes
+    // the name against the whole rule either way.
+    Some(if fifo {
+        format!(
+            "The name of a FIFO queue can only include alphanumeric characters, hyphens, or \
+             underscores, must end with {FIFO_QUEUE_NAME_SUFFIX} suffix and be 1 to \
+             {MAX_QUEUE_NAME_LENGTH} in length."
+        )
+    } else {
+        format!(
+            "Can only include alphanumeric characters, hyphens, or underscores. 1 to \
+             {MAX_QUEUE_NAME_LENGTH} in length"
+        )
+    })
 }
 
 /// Why a `tags` map a caller supplied was refused, as the text of the refusal a caller
@@ -2047,14 +2174,16 @@ pub fn queue_name_refusal(name: &str) -> Option<String> {
 ///
 /// `existing` is the tag map the queue carries today, so the count is checked against
 /// what the call would LEAVE the queue with: a key the request repeats overwrites the
-/// existing tag rather than adding one. Keys are visited in order, so a map with two
-/// bad tags is always refused for the same one.
+/// existing tag rather than adding one. `queue` names the queue the call addresses, the
+/// way a refusal of its tag count states it. Keys are visited in order, so a map with
+/// two bad tags is always refused for the same one.
 ///
 /// The rules are the tag restrictions the `tags` member's own documentation points at:
 /// at most [`MAX_TAGS_PER_QUEUE`] tags per queue, a key of 1 to
 /// [`MAX_TAG_KEY_LENGTH`] characters, a value of up to [`MAX_TAG_VALUE_LENGTH`], and no
 /// key in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace.
 pub fn tag_refusal(
+    queue: &str,
     existing: &BTreeMap<String, String>,
     supplied: &HashMap<String, String>,
 ) -> Option<String> {
@@ -2067,33 +2196,36 @@ pub fn tag_refusal(
         // never echoes an unbounded string back to the caller.
         let length = key.chars().count();
         if length == 0 || length > MAX_TAG_KEY_LENGTH {
-            return Some(format!(
-                "Value for parameter TagKey is invalid. \
-                 Reason: must be between 1 and {MAX_TAG_KEY_LENGTH} characters long, but was \
-                 {length}."
+            return Some(invalid_parameter_message_without_value(
+                "TagKey",
+                &format!(
+                    "must be between 1 and {MAX_TAG_KEY_LENGTH} characters long, but was {length}."
+                ),
             ));
         }
         if is_reserved_tag_key(key) {
-            return Some(format!(
-                "Value {key} for parameter TagKey is invalid. \
-                 Reason: must not start with the reserved prefix {RESERVED_TAG_KEY_PREFIX}."
+            return Some(invalid_parameter_message(
+                key,
+                "TagKey",
+                &format!(
+                    "must not start with the reserved prefix {RESERVED_TAG_KEY_PREFIX}."
+                ),
             ));
         }
         let value_length = supplied[*key].chars().count();
         if value_length > MAX_TAG_VALUE_LENGTH {
-            return Some(format!(
-                "Value for parameter TagValue is invalid. \
-                 Reason: the value of tag key {key} must be at most {MAX_TAG_VALUE_LENGTH} \
-                 characters long, but was {value_length}."
+            return Some(invalid_parameter_message_without_value(
+                "TagValue",
+                &format!(
+                    "the value of tag key {key} must be at most {MAX_TAG_VALUE_LENGTH} \
+                     characters long, but was {value_length}."
+                ),
             ));
         }
     }
     let merged: BTreeSet<&String> = existing.keys().chain(supplied.keys()).collect();
     if merged.len() > MAX_TAGS_PER_QUEUE {
-        return Some(format!(
-            "A queue may carry up to {MAX_TAGS_PER_QUEUE} tags, but this request would leave it with {}",
-            merged.len()
-        ));
+        return Some(format!("Too many tags added for queue {queue}."));
     }
     None
 }
