@@ -99,6 +99,14 @@
 //! — `GetResourcePolicyRequest$ResourceArn`), which is therefore keyed by the Data
 //! Catalog's own ARN ([`catalog_arn`]).
 //!
+//! WORKFLOWS — the containers for the dependent jobs and crawlers `CreateWorkflow`
+//! registers — sit beside that tree in a per-account namespace keyed by workflow name
+//! ([`ComAmazonawsGlueAwsglueState::workflows`]): "The name to be assigned to the
+//! workflow. It should be unique within your account" (`CreateWorkflowRequest$Name`), and
+//! every operation that addresses a workflow (`GetWorkflow`, `UpdateWorkflow`,
+//! `DeleteWorkflow`, `StartWorkflowRun`) names it by `Name` alone, with no `CatalogId`
+//! member.
+//!
 //! DATA QUALITY RULE RECOMMENDATION RUNS — the runs `StartDataQualityRuleRecommendationRun`
 //! starts over one data source (a catalog table) — sit beside the catalog tree in the same
 //! per-account list as the column statistics task runs
@@ -128,7 +136,7 @@ use crate::ops::types::{
     CodeGenConfigurationNode, Column, ColumnStatisticsTaskRun, Connection, ConnectionInput,
     ConnectionPasswordEncryption, ConnectionsList, Crawler, CrawlerTargets, CreateCrawlerInput,
     CreateCustomEntityTypeInput, CreateGlossaryInput, CreateGlossaryTermInput, CreateJobInput,
-    CreateSecurityConfigurationInput, CustomEntityType,
+    CreateSecurityConfigurationInput, CreateWorkflowInput, CustomEntityType,
     DataCatalogEncryptionSettings, DataLakePrincipal,
     DataQualityRuleRecommendationRunAdditionalRunOptions,
     DataSource, Database, DatabaseIdentifier, DatabaseInput,
@@ -143,7 +151,7 @@ use crate::ops::types::{
     StartColumnStatisticsTaskRunInput,
     StartDataQualityRuleRecommendationRunInput,
     StartJobRunInput, StorageDescriptor, Table, TableIdentifier, TableInput, TableVersion,
-    UpdateCrawlerInput,
+    UpdateCrawlerInput, Workflow, WorkflowGraph,
 };
 
 /// Ceiling on the databases one catalog may hold.
@@ -285,6 +293,12 @@ pub const MAX_ASSET_TYPES: usize = 1_000;
 /// rather than stored; `CreateGlossary` models no limit error, so the refusal is the
 /// closest client error it does model (`InvalidInputException`).
 pub const MAX_GLOSSARIES: usize = 1_000;
+
+/// Ceiling on the workflows this emulator will hold, for the same reason as
+/// [`MAX_CRAWLERS`]: `CreateWorkflow` writes a record any caller can reach, so the number
+/// of records one process will hold is bounded here. A create past the ceiling is refused
+/// with `CreateWorkflow`'s own modelled `ResourceNumberLimitExceededException`.
+pub const MAX_WORKFLOWS: usize = 1_000;
 
 /// Ceiling on the glossary terms this emulator will hold, for the same reason as
 /// [`MAX_GLOSSARIES`]: `CreateGlossaryTerm` writes a record any caller can reach, each one
@@ -685,6 +699,16 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// name ONE record. Ordered, so `GetResourcePolicies` has one deterministic order to
     /// page over, and bounded by [`MAX_RESOURCE_POLICIES`].
     pub resource_policies: BTreeMap<String, ResourcePolicyEntry>,
+    /// Every workflow this emulator holds, keyed by its name.
+    ///
+    /// Per account and beside the catalog tree, like crawlers and custom entity types:
+    /// `GetWorkflow`, `UpdateWorkflow`, `DeleteWorkflow` and `StartWorkflowRun` address a
+    /// workflow by `Name` alone, with no `CatalogId` member, and `CreateWorkflowRequest$Name`
+    /// is documented as unique per account ("It should be unique within your account").
+    /// Ordered, so `ListWorkflows` has one deterministic order to page over, and bounded by
+    /// [`MAX_WORKFLOWS`]. The key is the name exactly as sent — the model documents no case
+    /// fold for a workflow name.
+    pub workflows: BTreeMap<String, WorkflowEntry>,
 }
 
 impl ComAmazonawsGlueAwsglueState {
@@ -1104,6 +1128,23 @@ impl ComAmazonawsGlueAwsglueState {
             .iter()
             .filter(|(resource_arn, _)| !names_a_catalog(resource_arn))
             .collect()
+    }
+
+    /// Whether the store can hold another workflow, i.e. is below [`MAX_WORKFLOWS`].
+    pub fn can_store_workflow(&self) -> bool {
+        self.workflows.len() < MAX_WORKFLOWS
+    }
+
+    /// The stored workflow `name`, or `None` when this account holds no such workflow.
+    pub fn workflow(&self, name: &str) -> Option<&WorkflowEntry> {
+        self.workflows.get(name)
+    }
+
+    /// Store `entry` as this account's workflow under its own name, which is the key every
+    /// read addresses it by ([`Self::workflow`]) — so the namespace's key form lives here
+    /// rather than in each handler that writes to it.
+    pub fn insert_workflow(&mut self, entry: WorkflowEntry) {
+        self.workflows.insert(entry.name.clone(), entry);
     }
 
     /// Whether the store can hold another crawler, i.e. is below [`MAX_CRAWLERS`].
@@ -4822,6 +4863,21 @@ pub mod messages {
     /// requested name.
     pub const REGISTRY_ALREADY_EXISTS: &str = "Registry already exists.";
 
+    /// `CreateWorkflow` for a `Name` this account already holds a workflow under. NOT
+    /// recorded: inferred from the recorded `CreateDatabase` duplicate, like
+    /// [`REGISTRY_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of
+    /// the requested name.
+    pub const WORKFLOW_ALREADY_EXISTS: &str = "Workflow already exists.";
+
+    /// Any workflow operation whose `Name` names no workflow this account holds
+    /// (`GetWorkflow`, and the same miss on every sibling that addresses one by name). NOT
+    /// recorded: what is pinned is the behaviour — 400 with the operation's modelled
+    /// `EntityNotFoundException` — and the sentence follows [`database_not_found`]'s
+    /// per-resource template, built from the requested name alone.
+    pub fn workflow_not_found(name: &str) -> String {
+        format!("Workflow {name} not found.")
+    }
+
     /// A data quality rule recommendation run lookup
     /// (`GetDataQualityRuleRecommendationRun`) for an id no run in this account has. NOT
     /// recorded: the sentence follows the per-resource template of
@@ -5550,6 +5606,101 @@ pub fn table_column_names(table: &TableEntry) -> Vec<String> {
                 .collect::<Vec<String>>()
         })
         .unwrap_or_default()
+}
+
+/// A stored workflow: the container for the dependent jobs and crawlers
+/// `CreateWorkflow` registers, and the resource an EVENT trigger attaches to.
+///
+/// Every member of the modelled `Workflow` shape a create can set is held here, plus the
+/// create's `Tags`, which that shape does not carry. The two server-set members are the
+/// instants the record was written at; the members only a RUN or a BLUEPRINT produces
+/// (`LastRun`, `BlueprintDetails`) belong to the operations that produce them, so a
+/// workflow a create wrote carries neither.
+#[derive(Debug, Clone)]
+pub struct WorkflowEntry {
+    /// The workflow's name, which is also its key in
+    /// [`ComAmazonawsGlueAwsglueState::workflows`].
+    pub name: String,
+    /// "A description of the workflow", stored exactly as sent, and absent for a create
+    /// that named none.
+    pub description: Option<String>,
+    /// "A collection of properties to be used as part of each execution of the workflow."
+    /// A create that named none stores NO properties rather than an empty map, so a read
+    /// reports the absence the create expressed.
+    pub default_run_properties: Option<HashMap<String, String>>,
+    /// The ceiling on this workflow's concurrent runs. "If you leave this parameter
+    /// blank, there is no limit to the number of concurrent workflow runs", so an absent
+    /// member is stored absent rather than as a number.
+    pub max_concurrent_runs: Option<i32>,
+    /// Server-set, written once at create so every later read reports the same instant.
+    pub created_on: SystemTime,
+    /// Server-set; moves with every write to this workflow.
+    pub last_modified_on: SystemTime,
+    /// The create's `Tags`, which are not part of the `Workflow` shape.
+    ///
+    /// Kept so the create does not discard what the client sent, but NOT yet reachable
+    /// through the tagging operations, for the reason [`CustomEntityTypeEntry::tags`]
+    /// gives: [`TaggedResourceKind`] carries no workflow variant yet, and resolving one
+    /// belongs to the tagging operations' own issues.
+    pub tags: HashMap<String, String>,
+}
+
+impl WorkflowEntry {
+    /// Build a stored workflow from a `CreateWorkflow` request plus the one thing the
+    /// SERVICE fills: the instant the record was written at, which is both its create
+    /// and its last-modified instant until a write moves the latter.
+    pub fn from_create_input(input: &CreateWorkflowInput, now: SystemTime) -> Self {
+        Self {
+            name: input.name.clone(),
+            description: input.description.clone(),
+            default_run_properties: input.default_run_properties.clone(),
+            max_concurrent_runs: input.max_concurrent_runs,
+            created_on: now,
+            last_modified_on: now,
+            tags: input.tags.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Rebuild the modelled `Workflow` shape from what is stored, so a listing reports
+    /// the same workflow a single read does.
+    ///
+    /// `include_graph` is the reader's own `IncludeGraph` ("Specifies whether to include a
+    /// graph when returning the workflow resource metadata"): a reader that asked for none
+    /// is answered without one at all, and one that asked for the graph gets the graph of
+    /// the components this workflow holds ([`workflow_graph`]).
+    pub fn to_workflow(&self, include_graph: bool) -> Workflow {
+        Workflow {
+            name: Some(self.name.clone()),
+            description: self.description.clone(),
+            default_run_properties: self.default_run_properties.clone(),
+            created_on: Some(to_date_time(self.created_on)),
+            last_modified_on: Some(to_date_time(self.last_modified_on)),
+            // "The information about the last execution of the workflow": a workflow no
+            // run has been started of has had no last execution.
+            last_run: None,
+            graph: include_graph.then(workflow_graph),
+            max_concurrent_runs: self.max_concurrent_runs,
+            // "The details of the blueprint that this particular workflow is created
+            // from": a workflow `CreateWorkflow` registered was created from none.
+            blueprint_details: None,
+        }
+    }
+}
+
+/// A workflow's graph: "all the Glue components present in the workflow and all the
+/// directed connections between them".
+///
+/// The nodes are the triggers, jobs and crawlers attached to a workflow and the edges are
+/// the dependencies between them. Nothing can be attached to a workflow until the trigger
+/// operations are implemented, so the graph does not depend on the stored record yet: a
+/// workflow nothing is attached to is reported as the graph it is — present, with no
+/// components and no connections — rather than as no graph at all, which is what an
+/// unasked-for graph is.
+pub fn workflow_graph() -> WorkflowGraph {
+    WorkflowGraph {
+        nodes: Some(Vec::new()),
+        edges: Some(Vec::new()),
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

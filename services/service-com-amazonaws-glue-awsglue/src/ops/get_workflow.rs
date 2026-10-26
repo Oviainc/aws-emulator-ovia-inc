@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetWorkflow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetWorkflow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetWorkflow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads back the workflow record `CreateWorkflow` stored in this account's workflow
+//! namespace ([`crate::state::ComAmazonawsGlueAwsglueState::workflows`]). Reporting only:
+//! every member comes from the store, so two reads of one workflow agree and a read
+//! changes nothing a later caller sees.
+//!
+//! A name this account holds no workflow under earns the modelled
+//! `EntityNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +143,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetWorkflow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetWorkflowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetWorkflow"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(GetWorkflowErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue workflow store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // Read-only: the stored workflow is projected out and nothing is written.
+        let store = state.lock();
+        let Some(entry) = store.workflow(&input.name) else {
+            return Err(GetWorkflowErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::workflow_not_found(&input.name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // "Specifies whether to include a graph when returning the workflow resource
+        // metadata": the reader that did not ask for one is answered without it, which is
+        // also what a request that named no `IncludeGraph` asked for.
+        Ok(GetWorkflowOutput {
+            workflow: Some(entry.to_workflow(input.include_graph.unwrap_or(false))),
+        })
     }
 }
