@@ -18,8 +18,9 @@
 //! operation ids and four drift statuses, so a row's expected instances distinguish it from
 //! every other row.
 //!
-//! The store's WRITERS are `CreateStackSet` and `CreateStackInstances`, each still a scaffold
-//! with its own stub issue, so the records below are seeded straight into the store through
+//! The store's WRITERS are `CreateStackSet`, which creates a StackSet but no instance of one,
+//! and `CreateStackInstances`, still a scaffold with its own stub issue, so the records below
+//! are seeded straight into the store through
 //! `state::ComAmazonawsCloudformationCloudformationState::record_stack_set` — the same device
 //! `hook_result_invocations.rs` and `extension_registry.rs` use for records whose writers are
 //! not available. Every READ goes through the real request path (form-encoded body in, XML

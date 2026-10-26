@@ -2,7 +2,7 @@
 
 //! @op GetTemplateSummary
 //! What this operation answers is computed from ONE template body: the one the request
-//! carries, or the one the stack it names holds. It reports what that body
+//! carries, or the one the stack or the StackSet it names holds. It reports what that body
 //! DECLARES — its format version, its `Description`, its `Metadata` section, one
 //! declaration per parameter, the capabilities its resources require, the resource types
 //! it defines and the transforms it declares — and writes nothing, so two callers
@@ -16,12 +16,10 @@
 //! has been deleted", which is as long as this store keeps a deleted stack at all, and "if
 //! the template doesn't exist, a ValidationError is returned".
 //!
-//! Two parts of the surface are NOT summarised here, each for a reason the handler states
-//! where it answers: a `StackSetName`, because this store holds a StackSet's identity and
-//! its stack instances but no template for it, and `ResourceIdentifierSummaries`, whose
-//! identifier properties are a resource type's published primary identifier — something
-//! this emulator's type catalogue deliberately carries none of
-//! ([`crate::state::resource_schema`]).
+//! One part of the surface is NOT summarised here, for a reason the handler states where it
+//! answers: `ResourceIdentifierSummaries`, whose identifier properties are a resource type's
+//! published primary identifier — something this emulator's type catalogue deliberately
+//! carries none of ([`crate::state::resource_schema`]).
 //!
 //! ## Shape of an operation
 //!
@@ -407,22 +405,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // exist"). `CallAs` chooses which administrator account the call is made
                 // from, and this emulator holds one such account's StackSets, so either
                 // value reads the same store.
-                store.resolve_stack_set(&region, name_or_id).ok_or_else(|| {
-                    GetTemplateSummaryErrorModeled::StackSetNotFoundException(
-                        StackSetNotFoundException {
-                            message: Some(crate::state::stack_set_does_not_exist(name_or_id)),
-                        },
-                    )
-                })?;
-                // The store keeps a StackSet's identity and its stack instances, not the
-                // template it deploys: the operations that would put one there
-                // (`CreateStackSet`, `UpdateStackSet`) are scaffold stubs with issues of
-                // their own, so there is no template to summarise and this answers 501
-                // rather than an empty summary.
-                return Err(crate::scaffolded::Scaffolded::not_implemented(
-                    "GetTemplateSummary for a StackSet (this emulator stores no StackSet \
-                     template yet)",
-                ));
+                let stack_set =
+                    store.resolve_stack_set(&region, name_or_id).ok_or_else(|| {
+                        GetTemplateSummaryErrorModeled::StackSetNotFoundException(
+                            StackSetNotFoundException {
+                                message: Some(crate::state::stack_set_does_not_exist(name_or_id)),
+                            },
+                        )
+                    })?;
+                // The template the StackSet was created with, which is the one it deploys.
+                // A StackSet record carrying none has no template to summarise, and the
+                // refusal is worded for a StackSet rather than for a stack.
+                match &stack_set.template_body {
+                    Some(body) => body.clone(),
+                    None => {
+                        return Err(crate::scaffolded::Scaffolded::validation_error(
+                            crate::state::stack_set_template_does_not_exist(name_or_id),
+                        ))
+                    }
+                }
             }
         };
 

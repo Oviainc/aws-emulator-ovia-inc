@@ -3969,9 +3969,24 @@ pub const STACK_NAME_MAX_LEN: usize = 128;
 /// Shared by `CreateStack` and `CreateChangeSet`, which both name a stack that does not
 /// exist yet and so both have to hold its name to the same rule.
 pub fn validate_stack_name(name: &str) -> Result<(), String> {
+    validate_name("stackName", name)
+}
+
+/// The same rule for a STACK SET's name, which `CreateStackSetInput$StackSetName` documents
+/// in the very same words ("A stack name can contain only alphanumeric characters
+/// (case-sensitive) and hyphens. It must start with an alphabetic character and can't be
+/// longer than 128 characters"), reported against its own member.
+pub fn validate_stack_set_name(name: &str) -> Result<(), String> {
+    validate_name("stackSetName", name)
+}
+
+/// The one implementation of CloudFormation's documented name rule, reported against the
+/// `member` the request named it in: a name no longer than [`STACK_NAME_MAX_LEN`] that
+/// starts with an ASCII letter and carries only ASCII letters, digits and hyphens.
+fn validate_name(member: &str, name: &str) -> Result<(), String> {
     if name.len() > STACK_NAME_MAX_LEN {
         return Err(format!(
-            "1 validation error detected: Value '{name}' at 'stackName' failed to satisfy \
+            "1 validation error detected: Value '{name}' at '{member}' failed to satisfy \
              constraint: Member must have length less than or equal to {STACK_NAME_MAX_LEN}"
         ));
     }
@@ -3979,7 +3994,7 @@ pub fn validate_stack_name(name: &str) -> Result<(), String> {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
     if !well_formed {
         return Err(format!(
-            "1 validation error detected: Value '{name}' at 'stackName' failed to satisfy \
+            "1 validation error detected: Value '{name}' at '{member}' failed to satisfy \
              constraint: Member must satisfy regular expression pattern: {STACK_NAME_PATTERN}"
         ));
     }
@@ -4248,6 +4263,17 @@ pub fn stack_does_not_exist(name_or_id: &str) -> String {
 /// read a stack's template cannot drift about it.
 pub fn template_does_not_exist(name_or_id: &str, status: &str) -> String {
     format!("Template does not exist for stack [{name_or_id}] in {status} state")
+}
+
+/// The message answered when a STACK SET is addressable but carries no template.
+///
+/// The stack wording ([`template_does_not_exist`]) names a stack and interpolates a stack's
+/// own status, neither of which holds for a request that named a `StackSetName`: a StackSet
+/// carries a `StackSetStatus`, so the refusal names the StackSet the request addressed and
+/// nothing else. Worded once, so every operation that reads a StackSet's template cannot
+/// drift about it.
+pub fn stack_set_template_does_not_exist(name_or_id: &str) -> String {
+    format!("Template does not exist for StackSet [{name_or_id}]")
 }
 
 /// The `StackSetNotFoundException` message CloudFormation answers when a request names a

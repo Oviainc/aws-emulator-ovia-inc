@@ -143,6 +143,8 @@ mod stack_resource_provisioning;
 mod stack_resources;
 #[path = "all/stack_role_trust.rs"]
 mod stack_role_trust;
+#[path = "all/stack_set_lifecycle.rs"]
+mod stack_set_lifecycle;
 #[path = "all/stack_tag_propagation.rs"]
 mod stack_tag_propagation;
 #[path = "all/state_roundtrip.rs"]

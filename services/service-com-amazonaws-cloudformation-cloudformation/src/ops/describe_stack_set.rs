@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeStackSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeStackSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeStackSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the StackSet the request addresses, every member read off the
+//! stored record `CreateStackSet` wrote — its configuration — or counted off the stack
+//! instances it holds: the Regions it is deployed in, the organizational units its
+//! instances sit in and its drift details. A `StackSetName` that resolves to no StackSet of
+//! this administrator account and Region is refused with the modelled
+//! `StackSetNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +72,47 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::stack_sets::StoredStackSet;
+
+/// One stored StackSet as the modelled `StackSet`.
+///
+/// The configuration members are read off the record the call that created the StackSet
+/// wrote, and the three derived ones are counted off the instances it holds, so this read
+/// and `ListStackInstances` cannot disagree about where a StackSet is deployed. A member the
+/// StackSet does not carry — a description nobody gave it, a role a service-managed StackSet
+/// has none of, the auto-deployment settings of one that was created without them — is
+/// absent rather than reported empty.
+fn stack_set_view(stored: &StoredStackSet) -> StackSet {
+    StackSet {
+        stack_set_name: Some(stored.stack_set_name.clone()),
+        stack_set_id: Some(stored.stack_set_id.clone()),
+        description: stored.description.clone(),
+        status: Some(stored.status.clone()),
+        template_body: stored.template_body.clone(),
+        parameters: crate::state::parameter_views(&stored.parameters),
+        capabilities: crate::state::non_empty(stored.capabilities.clone()),
+        tags: crate::state::tag_views(&stored.tags),
+        stack_set_arn: Some(stored.stack_set_arn.clone()),
+        administration_role_arn: stored.administration_role_arn.clone(),
+        execution_role_name: stored.execution_role_name.clone(),
+        stack_set_drift_detection_details: Some(crate::state::stack_sets::drift_detection_details(
+            stored,
+        )),
+        auto_deployment: stored.auto_deployment.as_ref().map(|auto_deployment| {
+            AutoDeployment {
+                enabled: auto_deployment.enabled,
+                retain_stacks_on_account_removal: auto_deployment.retain_stacks_on_account_removal,
+                depends_on: crate::state::non_empty(auto_deployment.depends_on.clone()),
+            }
+        }),
+        permission_model: Some(stored.permission_model.clone()),
+        organizational_unit_ids: crate::state::non_empty(stored.organizational_unit_ids()),
+        managed_execution: Some(ManagedExecution {
+            active: Some(stored.managed_execution_active),
+        }),
+        regions: crate::state::non_empty(stored.deployed_regions()),
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -144,18 +182,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeStackSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeStackSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeStackSet"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no StackSet store to read, so this
+            // answers 501 rather than a description of a StackSet nobody holds.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DescribeStackSet",
+            ));
+        };
+
+        // `CallAs` chooses which administrator account the call is made from — the
+        // management account itself or a delegated administrator in a member account. This
+        // emulator holds one administrator account's StackSets, so either value reads the
+        // same store, and the operation models no error to refuse one with.
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a status transition the clock
+        // had already made due, which was owed whether or not anyone called.
+        store.settle(::std::time::SystemTime::now());
+
+        // "The name or unique ID of the StackSet whose description you want", and a
+        // `StackSetName` this administrator account and Region holds no StackSet for is the
+        // modelled `StackSetNotFoundException` ("The specified StackSet doesn't exist").
+        let stored = store
+            .resolve_stack_set(&region, &input.stack_set_name)
+            .ok_or_else(|| {
+                DescribeStackSetErrorModeled::StackSetNotFoundException(StackSetNotFoundException {
+                    message: Some(crate::state::stack_set_does_not_exist(&input.stack_set_name)),
+                })
+            })?;
+
+        Ok(DescribeStackSetOutput {
+            stack_set: Some(stack_set_view(stored)),
+        })
     }
 }

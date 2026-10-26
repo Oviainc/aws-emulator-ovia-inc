@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStackSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStackSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStackSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: creates a StackSet in the administrator account and Region the call was
+//! signed for, recording the configuration the request stated — its template, the
+//! parameters in force over that template, capabilities, tags, roles, permission model and
+//! execution settings — so `DescribeStackSet` reads back exactly what this call wrote. The
+//! StackSet is ACTIVE as soon as the call answers, which is what CloudFormation returns.
+//! A name this account and Region already holds a StackSet for is refused with the modelled
+//! `NameAlreadyExistsException`, unless the request carries the same `ClientRequestToken` as
+//! the call that created it — the documented retry, which answers that StackSet's id again —
+//! and a store already holding its ceiling of StackSets answers the modelled
+//! `LimitExceededException`.
 //!
 //! ## Shape of an operation
 //!
@@ -144,6 +145,25 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::stack_sets::{self, StoredAutoDeployment, StoredStackInstance, StoredStackSet};
+
+/// The stack a request's `StackId` names, as the import needs it: "the stack ID you are
+/// importing into a new StackSet."
+///
+/// Read out of the store in one short critical section so the template it carries — a
+/// caller-sized document, bounded by [`crate::state::TEMPLATE_BODY_MAX_BYTES`] — is parsed
+/// with the store UNLOCKED, the way every other operation of this service reads a body.
+struct ImportedStack {
+    /// The stack's own id, which the resulting stack instance reports as its `StackId`.
+    stack_id: String,
+    /// The Region the stack is deployed in — the instance's Region, which is the Region
+    /// the imported stack really lives in rather than the administrator's.
+    region: String,
+    /// The stack's status, for the refusal naming a stack that carries no template.
+    status: String,
+    /// The template the stack was deployed with, which becomes the StackSet's.
+    template_body: Option<String>,
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -215,18 +235,286 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStackSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStackSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStackSet"))
+        // `StackSetName`: "The name must be unique in the Region where you create your
+        // StackSet. A stack name can contain only alphanumeric characters (case-sensitive)
+        // and hyphens. It must start with an alphabetic character and can't be longer than
+        // 128 characters." The model carries no pattern for the member, so the handler is
+        // what holds the name to it — through the one implementation of that rule this
+        // service shares with the operations that name a stack.
+        crate::state::validate_stack_set_name(&input.stack_set_name)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        // Which template the StackSet deploys. Conditional: "You must specify either the
+        // TemplateBody or the TemplateURL parameter, but not both."
+        let submitted_body = match (&input.template_body, &input.template_url) {
+            (Some(body), None) => Some(body.clone()),
+            (Some(_), Some(_)) => {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    "You cannot specify both TemplateBody and TemplateURL",
+                ))
+            }
+            // A `TemplateURL` names a template in an Amazon S3 bucket or a Systems Manager
+            // document, which would have to be fetched over the network — this emulator
+            // makes no outbound connections, so it is answered 501 rather than with a
+            // StackSet created from a template nobody read.
+            (None, Some(_)) => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "CreateStackSet with TemplateURL (fetching a template from Amazon S3)",
+                ))
+            }
+            // Neither: the StackSet's template is then the one the stack being IMPORTED
+            // carries. That is what `StackId` states — "the stack ID you are importing into
+            // a new StackSet" — so an import submits no template of its own, and a request
+            // naming no stack either states no template at all.
+            (None, None) => None,
+        };
+        if submitted_body.is_none() && input.stack_id.is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "Either TemplateBody or TemplateURL must be specified",
+            ));
+        }
+        // A submitted body is held to the same rules every operation that takes one holds
+        // it to: the documented maximum, the acknowledgement a template declaring a macro
+        // or an IAM resource needs, the documented per-template quotas and the recognised
+        // resource types. Done BEFORE the store is read, so a template real AWS refuses
+        // outright never reaches a write.
+        if let Some(body) = &submitted_body {
+            crate::state::validate_template_body(body)
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+            // "In some cases, you must explicitly acknowledge that your StackSet template
+            // contains certain capabilities in order for CloudFormation to create the
+            // StackSet and related stack instances."
+            let missing = crate::state::missing_auto_expand_capability(
+                body,
+                input.capabilities.as_deref().unwrap_or_default(),
+            );
+            if !missing.is_empty() {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::template::insufficient_capabilities_message(&missing),
+                ));
+            }
+            if let Some(message) = crate::state::insufficient_capabilities(
+                body,
+                input.capabilities.as_deref().unwrap_or_default(),
+            ) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(message));
+            }
+            crate::state::validate_template_quotas(body)
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+            crate::state::validate_resource_types(body)
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        }
+        // `Parameter$UsePreviousValue` is an UPDATE instruction, and a StackSet being
+        // created has no previous values at all: that is the shared resolution with an
+        // empty previous set, exactly as a stack's create resolves it.
+        let supplied_parameters = crate::state::merged_parameters(&[], input.parameters.as_deref())
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This service was mounted on an engine that is not the shared in-memory one,
+            // so there is no store to create the StackSet in: nothing was written, and 501
+            // is the only honest answer.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateStackSet",
+            ));
+        };
+        // "The Amazon Resource Name (ARN) of the IAM role to use to create this StackSet" —
+        // a role whose trust policy does not let CloudFormation assume it is one no StackSet
+        // operation could ever run under, so the request is refused before anything is
+        // written, the way a stack's `RoleARN` is.
+        crate::state::refuse_unassumable_role(
+            &*self.engine,
+            input.administration_role_arn.as_deref(),
+        )?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // "The stack ID you are importing into a new StackSet": the stack is read here, in
+        // its own short critical section, so the template it carries is parsed below with
+        // the store unlocked.
+        let imported = match &input.stack_id {
+            None => None,
+            Some(stack_id) => {
+                let mut store = state.lock();
+                // The only write a read of the store makes: materialising the status
+                // transitions the clock had already made due.
+                store.settle(now);
+                let stack = store.resolve(&region, stack_id).ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::stack_does_not_exist(stack_id),
+                    )
+                })?;
+                Some(ImportedStack {
+                    stack_id: stack.stack_id.clone(),
+                    region: stack.region.clone(),
+                    status: stack.status.clone(),
+                    template_body: stack.template_body.clone(),
+                })
+            }
+        };
+
+        // The template the StackSet is created with: the submitted body, or the imported
+        // stack's own. A stack carrying no template at all (one a `CREATE` change set
+        // created and nothing executed) is refused with the wording every read of a
+        // template that does not exist gives it.
+        let template_body = match (&submitted_body, &imported) {
+            (Some(body), _) => body.clone(),
+            (None, Some(imported)) => match &imported.template_body {
+                Some(body) => body.clone(),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::template_does_not_exist(
+                            &imported.stack_id,
+                            &imported.status,
+                        ),
+                    ))
+                }
+            },
+            // Defensive: a request that submits no template and imports no stack is
+            // already refused above, before the store is read. There is no second path
+            // that reaches here, and the refusal is repeated rather than assumed away.
+            (None, None) => {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    "Either TemplateBody or TemplateURL must be specified",
+                ))
+            }
+        };
+        // What the StackSet reports as `Parameters`: the values the request supplied, plus
+        // the template's own `Default` for a declared parameter it passed none for — the
+        // same resolution a stack's parameters go through, over the template in force.
+        let parameters = crate::state::parameters_in_force(&template_body, supplied_parameters);
+
+        // "By default, SELF-MANAGED is specified."
+        let permission_model = input
+            .permission_model
+            .clone()
+            .unwrap_or_else(|| stack_sets::DEFAULT_PERMISSION_MODEL.to_string());
+        let self_managed = permission_model == stack_sets::permission_model::SELF_MANAGED;
+
+        let mut store = state.lock();
+        store.settle(now);
+
+        // "The name must be unique in the Region where you create your StackSet", so a name
+        // this administrator account and Region already holds a StackSet for is the modelled
+        // `NameAlreadyExistsException` ("The specified name is already in use"). The one
+        // exception is the documented RETRY: "Specify this token if you plan to retry
+        // requests so that CloudFormation knows that you're not attempting to create another
+        // StackSet with the same name" — a request repeating the token the existing StackSet
+        // was created with is that same call, and is answered with that StackSet's id again
+        // rather than refused, and nothing is created a second time.
+        if let Some(held) = store.resolve_stack_set(&region, &input.stack_set_name) {
+            let retry_of_the_call_that_created_it = input.client_request_token.is_some()
+                && input.client_request_token == held.client_request_token;
+            if retry_of_the_call_that_created_it {
+                return Ok(CreateStackSetOutput {
+                    stack_set_id: Some(held.stack_set_id.clone()),
+                });
+            }
+            return Err(CreateStackSetErrorModeled::NameAlreadyExistsException(
+                NameAlreadyExistsException {
+                    // "The specified name is already in use", worded as this service words
+                    // every other refusal naming a StackSet (`stack_set_does_not_exist`),
+                    // with the name taken from the request rather than from any one record.
+                    message: Some(format!("StackSet {} already exists", input.stack_set_name)),
+                },
+            )
+            .into());
+        }
+        // "The quota for the resource has already been reached": the store holds at most
+        // `MAX_STACK_SETS` StackSets ACROSS every Region a caller signs for, which is what
+        // bounds its growth — the Region a request is signed for is a value the caller
+        // chooses, so the ceiling is the whole store's, the way `CreateStack`'s own
+        // account-wide bound is. Nothing above this point wrote a StackSet, so a refused
+        // request adds none.
+        if store.stack_sets.len() >= stack_sets::MAX_STACK_SETS {
+            return Err(CreateStackSetErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Limit for stack sets exceeded: no more than {} stack sets can exist \
+                         in this account",
+                        stack_sets::MAX_STACK_SETS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut stack_set = StoredStackSet::new(&input.stack_set_name, &region);
+        stack_set.description = input.description.clone();
+        stack_set.template_body = Some(template_body);
+        stack_set.parameters = parameters;
+        stack_set.capabilities = input.capabilities.clone().unwrap_or_default();
+        stack_set.tags = crate::state::stored_tags(input.tags.as_deref().unwrap_or_default());
+        // What the request STATED is what the record carries: a role the caller named is
+        // recorded whichever permission model the StackSet was created under, so nothing a
+        // request supplied is dropped on the floor. ("Valid only if the permissions model is
+        // SELF_MANAGED" governs which role a StackSet OPERATION runs under, and the model
+        // declares no error for the combination, so a stated role is not refused here
+        // either.)
+        stack_set.administration_role_arn = input.administration_role_arn.clone();
+        // "If you do not specify an execution role, CloudFormation uses the
+        // AWSCloudFormationStackSetExecutionRole role for the StackSet operation" — the role
+        // in force, which is what a read of the StackSet reports. The default belongs to the
+        // self-managed model, where the account creates those roles itself; with
+        // service-managed permissions "StackSets automatically creates the IAM roles", so a
+        // request that named none leaves the member absent rather than claiming that one.
+        stack_set.execution_role_name = input
+            .execution_role_name
+            .clone()
+            .or_else(|| self_managed.then(|| stack_sets::DEFAULT_EXECUTION_ROLE_NAME.to_string()));
+        stack_set.permission_model = permission_model;
+        stack_set.auto_deployment =
+            input
+                .auto_deployment
+                .as_ref()
+                .map(|auto_deployment| StoredAutoDeployment {
+                    enabled: auto_deployment.enabled,
+                    retain_stacks_on_account_removal: auto_deployment
+                        .retain_stacks_on_account_removal,
+                    depends_on: auto_deployment.depends_on.clone().unwrap_or_default(),
+                });
+        // "When false (default), StackSets performs one operation at a time in request
+        // order."
+        stack_set.managed_execution_active = input
+            .managed_execution
+            .as_ref()
+            .and_then(|managed_execution| managed_execution.active)
+            .unwrap_or(false);
+        stack_set.client_request_token = input.client_request_token.clone();
+
+        // The imported stack becomes the StackSet's one stack instance: it is "a reference
+        // to a stack in a target account within a Region", and that stack already exists and
+        // already carries this StackSet's template, so the instance is CURRENT ("the stack
+        // is currently up to date with the StackSet") and the import that put it there
+        // SUCCEEDED. The account is the one the stack's own id names.
+        if let Some(imported) = &imported {
+            let account = imported
+                .stack_id
+                .split(':')
+                .nth(4)
+                .filter(|account| !account.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| ::emulator_server::emulator_account_id().to_string());
+            // The import is a StackSet operation, so the instance records the id of the one
+            // that put it there; `CreateStackSet` reports no `OperationId` of its own.
+            let mut instance = StoredStackInstance::new(
+                account,
+                imported.region.clone(),
+                crate::state::new_operation_id(),
+            );
+            instance.stack_id = Some(imported.stack_id.clone());
+            instance.status = stack_sets::instance_status::CURRENT.to_string();
+            instance.detailed_status = stack_sets::detailed_status::SUCCEEDED.to_string();
+            stack_set.record_instance(instance);
+        }
+
+        let stack_set_id = stack_set.stack_set_id.clone();
+        // The ONE way a StackSet enters the store, so this write and the reads over it
+        // cannot disagree about what the store holds.
+        store.record_stack_set(stack_set);
+
+        Ok(CreateStackSetOutput {
+            stack_set_id: Some(stack_set_id),
+        })
     }
 }

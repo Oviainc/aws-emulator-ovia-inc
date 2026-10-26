@@ -32,10 +32,13 @@
 //!
 //! ## What writes it
 //!
-//! A stack set is written by `CreateStackSet`, and its instances and operations by
-//! `CreateStackInstances`, `UpdateStackSet` and `DeleteStackInstances`; every one of those
-//! operations is still a
-//! scaffold answering 501, each with its own stub issue. The ONE way a record enters this
+//! A stack set is written by `CreateStackSet`, which records the configuration it was
+//! created with — its template, parameters, capabilities, tags, roles, permission model and
+//! deployment settings — so `DescribeStackSet` reports exactly what that call stated rather
+//! than anything recomputed from a request. Its instances and the operations performed on it
+//! are written by `CreateStackInstances`, `UpdateStackSet` and `DeleteStackInstances`, each
+//! of which is still a scaffold answering 501 with its own stub issue. The ONE way a record
+//! enters this
 //! store is
 //! [`crate::state::ComAmazonawsCloudformationCloudformationState::record_stack_set`], so
 //! those writers — and the suites that cover the reads over records no wire call can create
@@ -64,6 +67,42 @@ pub const MAX_INSTANCES_PER_STACK_SET: usize = 2_000;
 /// against it, so the store bounds it. Chosen, like every other count here, and far above
 /// any client workflow.
 pub const MAX_OPERATIONS_PER_STACK_SET: usize = 500;
+
+/// The model's `StackSetStatus`: "The status of the StackSet"
+/// (`smithy_query(query="shape", shape="StackSetStatus")`).
+pub mod status {
+    /// A StackSet that exists: what `CreateStackSet` leaves behind.
+    pub const ACTIVE: &str = "ACTIVE";
+    /// A StackSet `DeleteStackSet` has deleted.
+    pub const DELETED: &str = "DELETED";
+}
+
+/// The model's `PermissionModels`: how "the IAM roles required for StackSet operations are
+/// created" (`smithy_query(query="shape", shape="PermissionModels")`).
+pub mod permission_model {
+    /// "With self-managed permissions, you must create the administrator and execution
+    /// roles required to deploy to target accounts."
+    pub const SELF_MANAGED: &str = "SELF_MANAGED";
+    /// "With service-managed permissions, StackSets automatically creates the IAM roles
+    /// required to deploy to accounts managed by Organizations."
+    pub const SERVICE_MANAGED: &str = "SERVICE_MANAGED";
+}
+
+/// The permission model a StackSet is created under when the request names none:
+/// `CreateStackSetInput$PermissionModel` — "By default, SELF-MANAGED is specified."
+pub const DEFAULT_PERMISSION_MODEL: &str = permission_model::SELF_MANAGED;
+
+/// The execution role a self-managed StackSet uses when the request names none:
+/// `CreateStackSetInput$ExecutionRoleName` — "If you do not specify an execution role,
+/// CloudFormation uses the AWSCloudFormationStackSetExecutionRole role for the StackSet
+/// operation."
+pub const DEFAULT_EXECUTION_ROLE_NAME: &str = "AWSCloudFormationStackSetExecutionRole";
+
+/// The model's `StackSetDriftDetectionStatus` value a COMPLETED detection carries:
+/// "COMPLETED: The drift detection operation completed without failing on any stack
+/// instances" (`smithy_query(query="shape", shape="StackSetDriftDetectionDetails",
+/// member="DriftDetectionStatus")`).
+pub const DRIFT_DETECTION_COMPLETED: &str = "COMPLETED";
 
 /// The model's `StackInstanceStatus`: the instance's status "in terms of its synchronization
 /// with its associated stack set" (`smithy_query(query="shape",
@@ -153,7 +192,36 @@ pub fn new_stack_set_id(stack_set_name: &str) -> String {
     format!("{stack_set_name}:{}", super::new_identifier(stack_set_name))
 }
 
-/// ONE stack set: how it is addressed, and the instances it carries.
+/// A stack set's ARN, which is what `StackSet$StackSetARN` reports: the stack set's id
+/// under the `stackset/` resource path of this account and Region, built by the
+/// emulator-wide ARN helper every other identifier of this service goes through.
+pub fn new_stack_set_arn(region: &str, stack_set_id: &str) -> String {
+    ::emulator_server::emulator_arn(
+        super::ARN_NAMESPACE,
+        region,
+        &format!("stackset/{stack_set_id}"),
+    )
+}
+
+/// `AutoDeployment` as the call that set it supplied: "whether StackSets automatically
+/// deploys to Organizations accounts that are added to a target organization or
+/// organizational unit (OU)".
+#[derive(Debug, Clone, Default)]
+pub struct StoredAutoDeployment {
+    /// `Enabled`: "If set to true, StackSets automatically deploys additional stack
+    /// instances to Organizations accounts that are added to a target organization or
+    /// organizational unit (OU) in the specified Regions."
+    pub enabled: Option<bool>,
+    /// `RetainStacksOnAccountRemoval`: "If set to true, stack resources are retained when
+    /// an account is removed from a target organization or OU."
+    pub retain_stacks_on_account_removal: Option<bool>,
+    /// `DependsOn`: "A list of StackSet ARNs that this StackSet depends on for
+    /// auto-deployment operations."
+    pub depends_on: Vec<String>,
+}
+
+/// ONE stack set: how it is addressed, the configuration it was created with, and the
+/// instances it carries.
 #[derive(Debug, Clone)]
 pub struct StoredStackSet {
     /// `StackSetId`, which is also what `StackInstanceSummary$StackSetId` reports: a stack
@@ -165,6 +233,46 @@ pub struct StoredStackSet {
     /// The Region the stack set was created in. A read answers for the Region its request
     /// was signed for, the way every other read of this service does.
     pub region: String,
+    /// `StackSet$StackSetARN`: "The Amazon Resource Name (ARN) of the StackSet", minted
+    /// once with the record by [`new_stack_set_arn`] so every read reports the same ARN.
+    pub stack_set_arn: String,
+    /// `StackSet$Status`: the model's `StackSetStatus` ([`status`]). A stack set
+    /// `CreateStackSet` has created is ACTIVE — CloudFormation answers that call with a
+    /// stack set that already exists, so there is no transient status to settle.
+    pub status: String,
+    /// `StackSet$Description`: "A description of the StackSet that you specify when the
+    /// StackSet is created or updated."
+    pub description: Option<String>,
+    /// `StackSet$TemplateBody`: "The structure that contains the body of the template that
+    /// was used to create or update the StackSet." `None` for a record written without one.
+    pub template_body: Option<String>,
+    /// `StackSet$Parameters`: "A list of input parameters for a StackSet", resolved against
+    /// the template in force the way a stack's are.
+    pub parameters: Vec<super::StoredParameter>,
+    /// `StackSet$Capabilities`: "The capabilities that are allowed in the StackSet."
+    pub capabilities: Vec<String>,
+    /// `StackSet$Tags`: "A list of tags that specify information about the StackSet."
+    pub tags: Vec<super::StoredTag>,
+    /// `StackSet$AdministrationRoleARN`: "The Amazon Resource Name (ARN) of the IAM role
+    /// used to create or update the StackSet", as the call that set it named it.
+    pub administration_role_arn: Option<String>,
+    /// `StackSet$ExecutionRoleName`: "The name of the IAM execution role used to create or
+    /// update the StackSet."
+    pub execution_role_name: Option<String>,
+    /// `StackSet$PermissionModel`: the model's `PermissionModels` ([`permission_model`]).
+    pub permission_model: String,
+    /// `StackSet$AutoDeployment`, as supplied: "Valid only if the StackSet uses
+    /// service-managed permissions."
+    pub auto_deployment: Option<StoredAutoDeployment>,
+    /// `StackSet$ManagedExecution$Active`: "When true, CloudFormation performs
+    /// non-conflicting operations concurrently and queues conflicting operations [...] When
+    /// false (default), StackSets performs one operation at a time in request order."
+    pub managed_execution_active: bool,
+    /// The `ClientRequestToken` the call that created this stack set carried — "Specify this
+    /// token if you plan to retry requests so that CloudFormation knows that you're not
+    /// attempting to create another StackSet with the same name", which is what makes a
+    /// retry of that same call idempotent rather than a name collision.
+    pub client_request_token: Option<String>,
     /// The stack set's instances, in the order they entered it, so a paginated read is a
     /// stable window over them. Bounded at [`MAX_INSTANCES_PER_STACK_SET`].
     pub instances: Vec<StoredStackInstance>,
@@ -175,14 +283,30 @@ pub struct StoredStackSet {
 }
 
 impl StoredStackSet {
-    /// A stack set of `stack_set_name` in `region`, with no instances yet and a freshly
-    /// minted id.
+    /// A stack set of `stack_set_name` in `region`, with no instances yet, a freshly minted
+    /// id and ARN, and the configuration defaults the model documents for a request that
+    /// names nothing: ACTIVE, self-managed, one operation at a time.
     pub fn new(stack_set_name: impl Into<String>, region: impl Into<String>) -> Self {
         let stack_set_name = stack_set_name.into();
+        let region = region.into();
+        let stack_set_id = new_stack_set_id(&stack_set_name);
         Self {
-            stack_set_id: new_stack_set_id(&stack_set_name),
+            stack_set_arn: new_stack_set_arn(&region, &stack_set_id),
+            stack_set_id,
             stack_set_name,
-            region: region.into(),
+            region,
+            status: status::ACTIVE.to_string(),
+            description: None,
+            template_body: None,
+            parameters: Vec::new(),
+            capabilities: Vec::new(),
+            tags: Vec::new(),
+            administration_role_arn: None,
+            execution_role_name: None,
+            permission_model: DEFAULT_PERMISSION_MODEL.to_string(),
+            auto_deployment: None,
+            managed_execution_active: false,
+            client_request_token: None,
             instances: Vec::new(),
             operations: Vec::new(),
         }
@@ -193,6 +317,36 @@ impl StoredStackSet {
     pub fn is_addressed_by(&self, region: &str, name_or_id: &str) -> bool {
         self.region == region
             && (self.stack_set_name == name_or_id || self.stack_set_id == name_or_id)
+    }
+
+    /// `StackSet$Regions`: "a list of all Amazon Web Services Regions the given StackSet has
+    /// stack instances deployed in" — read off the instances it holds, first-seen order,
+    /// each Region once however many accounts it is deployed to there.
+    pub fn deployed_regions(&self) -> Vec<String> {
+        let mut regions: Vec<String> = Vec::new();
+        for instance in &self.instances {
+            if !regions.iter().any(|held| held == &instance.region) {
+                regions.push(instance.region.clone());
+            }
+        }
+        regions
+    }
+
+    /// `StackSet$OrganizationalUnitIds`: "[Service-managed permissions] The organization
+    /// root ID or organizational unit (OU) IDs" its instances were deployed to, each once.
+    /// A self-managed StackSet's instances carry none, so the list is empty for one.
+    pub fn organizational_unit_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        for id in self
+            .instances
+            .iter()
+            .filter_map(|instance| instance.organizational_unit_id.as_ref())
+        {
+            if !ids.iter().any(|held| held == id) {
+                ids.push(id.clone());
+            }
+        }
+        ids
     }
 
     /// Put `instance` in this stack set, replacing the one for the same account and Region
@@ -375,6 +529,68 @@ impl StoredStackSetOperation {
         self.status_reason = owed.status_reason;
         self.failed_stack_instances_count = owed.failed_stack_instances_count;
         self.end = Some(owed.due_at);
+    }
+}
+
+/// What a read reports as a stack set's `StackSetDriftDetectionDetails`: "information about
+/// the last *completed* drift operation performed on the StackSet".
+///
+/// Every member is counted off the INSTANCES the stack set holds, which is where a drift
+/// result for one lives, so this read and `ListStackInstances` cannot disagree about which
+/// instances have drifted. A stack set no detection has covered reports NOT_CHECKED with no
+/// detection status and no instant — "this value will be NULL for any StackSet that drift
+/// detection hasn't yet been performed on" — and nothing here is in progress, since a
+/// detection is in flight only while the operation that started it is.
+pub fn drift_detection_details(
+    stack_set: &StoredStackSet,
+) -> crate::ops::types::StackSetDriftDetectionDetails {
+    let instances = &stack_set.instances;
+    let counted = |drift_status: &str| -> i32 {
+        instances
+            .iter()
+            .filter(|instance| instance.drift_status == drift_status)
+            .count()
+            .try_into()
+            .unwrap_or(i32::MAX)
+    };
+    let drifted = counted(super::DRIFT_STATUS_DRIFTED);
+    // "FAILED: the drift detection operation failed" for that instance, which is the
+    // instance whose own drift result could not be determined.
+    let failed = counted(super::DRIFT_STATUS_UNKNOWN);
+    let checked = instances
+        .iter()
+        .filter(|instance| instance.last_drift_check.is_some())
+        .count();
+    let last_drift_check = instances
+        .iter()
+        .filter_map(|instance| instance.last_drift_check)
+        .max();
+    // "DRIFTED: One or more of the stack instances belonging to the StackSet differs from
+    // the expected template and parameter configuration"; "IN_SYNC: All of the stack
+    // instances belonging to the StackSet stack match"; "NOT_CHECKED: CloudFormation hasn't
+    // checked the StackSet for drift."
+    let drift_status = if drifted > 0 {
+        super::DRIFT_STATUS_DRIFTED
+    } else if checked > 0 && checked == instances.len() {
+        super::DRIFT_STATUS_IN_SYNC
+    } else {
+        super::DRIFT_STATUS_NOT_CHECKED
+    };
+    crate::ops::types::StackSetDriftDetectionDetails {
+        drift_status: Some(drift_status.to_string()),
+        // The status of the drift-detection OPERATION, which exists only once one has run
+        // over this stack set's instances.
+        drift_detection_status: last_drift_check
+            .map(|_| DRIFT_DETECTION_COMPLETED.to_string()),
+        last_drift_check_timestamp: last_drift_check.map(super::timestamp),
+        total_stack_instances_count: Some(instances.len().try_into().unwrap_or(i32::MAX)),
+        drifted_stack_instances_count: Some(drifted),
+        in_sync_stack_instances_count: Some(counted(super::DRIFT_STATUS_IN_SYNC)),
+        // Nothing is being checked: a stack instance is in progress only while the
+        // detection operation covering it is, and such an operation does not outlive the
+        // call that started it here.
+        in_progress_stack_instances_count: Some(0),
+        failed_stack_instances_count: Some(failed),
     }
 }
 
