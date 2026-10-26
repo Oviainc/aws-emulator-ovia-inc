@@ -367,16 +367,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(CreateDBClusterError::invalid_parameter_value)?;
         let multi_az_cluster = crate::state::is_multi_az_db_cluster(&input.engine);
 
-        // "This parameter is stored as a lowercase string" — folded before it is
-        // validated, stored or echoed, so every later lookup folds the same way. The
-        // length bound is the one its own constraints give this cluster type.
-        let identifier = input.db_cluster_identifier.to_ascii_lowercase();
+        // The constraints are checked against the value the REQUEST carried, so the
+        // refusal quotes what the caller sent; "this parameter is stored as a lowercase
+        // string", so the folded form is what is stored and echoed and every later lookup
+        // folds the same way. The length bound is the one its own constraints give this
+        // cluster type.
         crate::state::check_identifier(
             "DBClusterIdentifier",
-            &identifier,
+            &input.db_cluster_identifier,
             crate::state::db_cluster_identifier_max_len(&input.engine),
         )
-        .map_err(CreateDBClusterError::validation)?;
+        .map_err(CreateDBClusterError::invalid_parameter_value)?;
+        let identifier = input.db_cluster_identifier.to_ascii_lowercase();
 
         // `ManageMasterUserPassword` has RDS "generate and manage the master user password
         // in Amazon Web Services Secrets Manager" and report the secret it created as

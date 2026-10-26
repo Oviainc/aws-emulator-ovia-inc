@@ -204,13 +204,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // One endpoint per (Outpost, subnet, security group): a repeat of the
         // same request would commit a second range of the same subnet to the
-        // same Outpost, which is the conflict this operation models.
-        if let Some(existing) = store.endpoints.values().find(|endpoint| {
-            endpoint.owner_account == caller
-                && endpoint.outpost_id == input.outpost_id
-                && endpoint.subnet_id == input.subnet_id
-                && endpoint.security_group_id == input.security_group_id
-        }) {
+        // same Outpost, which is the conflict this operation models. None of
+        // the three resources is the caller's own, so the endpoint already
+        // holding them conflicts whoever owns it — including the account that
+        // shared this Outpost with the caller, whose endpoint the Outpost's own
+        // listing reports to this caller as well.
+        if let Some(existing) =
+            store.endpoint_committing(&input.outpost_id, &input.subnet_id, &input.security_group_id)
+        {
             return Err(CreateEndpointErrorModeled::ConflictException(
                 ConflictException {
                     message: Some(format!(

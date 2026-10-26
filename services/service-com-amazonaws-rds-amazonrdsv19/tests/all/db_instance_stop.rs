@@ -20,7 +20,8 @@
 //! and Aurora PostgreSQL), is `InvalidDBInstanceStateFault` (HTTP 400); one that belongs
 //! to a DB cluster, whose stop is `StopDBCluster`'s, is `InvalidDBClusterStateFault`; a
 //! `DBSnapshotIdentifier` already in use is `DBSnapshotAlreadyExistsFault`; and one
-//! outside the member's documented identifier constraints is a 400 `ValidationException`.
+//! outside the member's documented identifier constraints is a 400
+//! `InvalidParameterValue`.
 //!
 //! The tables below span what the rules generalise over: the engine families and instance
 //! classes an instance-level stop applies to, both forms of the snapshot parameter
@@ -730,7 +731,7 @@ async fn the_snapshot_the_stop_takes_is_held_to_the_members_own_rules() {
             )
             .await,
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         );
         assert!(
             text(&body, "Message").contains("DBSnapshotIdentifier"),

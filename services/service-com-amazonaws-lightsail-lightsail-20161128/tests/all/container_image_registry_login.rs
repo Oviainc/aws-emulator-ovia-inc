@@ -17,11 +17,11 @@
 //!   hostname this emulator does not answer. A request naming no host names no
 //!   endpoint to announce, and then no address is reported at all;
 //! * that address is served BY THE EMULATOR, and it authenticates: a client
-//!   presenting a set of credentials this account was handed is logged in (and
-//!   answered `501`, because no container image registry protocol is served
-//!   here), and one presenting anything else — no credentials, another password,
-//!   an unknown username, another region's set — is refused with `401` and an
-//!   HTTP Basic challenge.
+//!   presenting a set of credentials this account was handed reaches the registry
+//!   behind it (whose own API is driven in
+//!   `container_image_push_and_register.rs`), and one presenting anything else —
+//!   no credentials, another password, an unknown username, another region's set
+//!   — is refused with `401` and an HTTP Basic challenge.
 //!
 //! Every control-plane case goes through the same front door a client uses
 //! (`POST /` with `X-Amz-Target: Lightsail_20161128.<Operation>` and an
@@ -347,12 +347,14 @@ fn assert_refused(case: &str, answer: &Answer) {
     );
 }
 
-/// Assert that `answer` is what a logged-in client is answered: `501`, because the
-/// container image registry protocol itself is not served here.
-fn assert_logged_in(case: &str, answer: &Answer) {
+/// Assert that `answer` is what a logged-in client is answered: the answer the
+/// registry behind the address gives that request — `want_status`, carrying the
+/// registry's own refusal envelope when it is a refusal — and never the `401`
+/// challenge a client that did not log in is refused with.
+fn assert_logged_in(case: &str, answer: &Answer, want_status: u16) {
     assert_eq!(
-        answer.status, 501,
-        "case {case}: expected HTTP 501 for a logged-in client, got {answer:?}"
+        answer.status, want_status,
+        "case {case}: expected the registry's own HTTP {want_status}, got {answer:?}"
     );
     assert!(
         answer.challenge.is_none(),
@@ -363,6 +365,33 @@ fn assert_logged_in(case: &str, answer: &Answer) {
         "case {case}: expected this service to serve it, not an AWS error envelope, got \
          {answer:?}"
     );
+    // A refusal from the registry is the registry API's own envelope, not one of
+    // this service's modelled shapes.
+    if want_status >= 400 && !answer.body.is_empty() {
+        let parsed: Value = serde_json::from_str(&answer.body).unwrap_or(Value::Null);
+        assert!(
+            parsed["errors"][0]["code"].is_string(),
+            "case {case}: expected the registry API's error envelope, got {answer:?}"
+        );
+    }
+}
+
+/// The status the registry answers `method` on the path `suffix` beneath the
+/// announced address with — which is what
+/// [`the_registry_protocol_paths_under_the_address_reach_the_same_registry`]
+/// drives: the version check is served, a blob upload starts, a manifest nothing
+/// pushed is unknown, a manifest put with no manifest in it is invalid, and every
+/// other method on those paths is one the registry API does not serve there.
+fn registry_status(suffix: &str, method: &str) -> u16 {
+    match (suffix, method) {
+        ("/v2/", "GET" | "HEAD") => 200,
+        ("/v2/myservice.web/blobs/uploads/", "POST") => 202,
+        ("/v2/myservice.web/manifests/latest", "GET" | "HEAD") => 404,
+        ("/v2/myservice.web/manifests/latest", "PUT") => 400,
+        // The announced address itself is not an API path, and the methods left
+        // are not served on these ones.
+        _ => 405,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -469,10 +498,15 @@ async fn a_request_naming_no_host_announces_no_registry_address() {
     }
 }
 
+/// The status the announced address itself answers a logged-in client with: it
+/// is not a path of the registry API, whose own space is `/v2/`, so the registry
+/// serves nothing there.
+const ADDRESS_ITSELF_STATUS: u16 = 405;
+
 /// RULE: the announced address is served by the emulator and authenticates against
-/// the credentials this account was handed — a client presenting a live set is
-/// logged in, and the answer behind the log in is the honest `501`, since no
-/// container image registry protocol is served here.
+/// the credentials this account was handed — a client presenting a live set
+/// reaches the registry behind the address, and logging in changes nothing a
+/// later caller sees.
 #[tokio::test]
 async fn the_announced_address_logs_a_client_in_with_the_credentials_it_created() {
     let emulator = Emulator::new();
@@ -480,12 +514,7 @@ async fn the_announced_address_logs_a_client_in_with_the_credentials_it_created(
         let login = emulator.login(case, Some(host), region).await;
         let credentials = Some((login.username.as_str(), login.password.as_str()));
         let answer = emulator.reach_registry(case, &login, credentials).await;
-        assert_logged_in(case, &answer);
-        assert_eq!(
-            answer.content_type.as_deref(),
-            Some(REGISTRY_CONTENT_TYPE),
-            "case {case}: expected the registry's own content type, got {answer:?}"
-        );
+        assert_logged_in(case, &answer, ADDRESS_ITSELF_STATUS);
 
         // Logging in is a pure read: the same credentials work again afterwards,
         // and so does a second set created later.
@@ -504,7 +533,7 @@ async fn the_announced_address_logs_a_client_in_with_the_credentials_it_created(
                     Some((set.username.as_str(), set.password.as_str())),
                 )
                 .await;
-            assert_logged_in(&case, &answer);
+            assert_logged_in(&case, &answer, ADDRESS_ITSELF_STATUS);
         }
     }
 }
@@ -536,12 +565,15 @@ async fn the_registry_protocol_paths_under_the_address_reach_the_same_registry()
             let answer = emulator
                 .reach(method, &host, &path, credentials)
                 .await;
-            assert_logged_in(&case, &answer);
-            assert_eq!(
-                answer.body.is_empty(),
-                method == "HEAD",
-                "case {case}: expected a body on everything but HEAD, got {answer:?}"
-            );
+            assert_logged_in(&case, &answer, registry_status(suffix, method));
+            if method == "HEAD" {
+                // A `HEAD` carries the metadata of what a `GET` would answer and
+                // no body, whatever the registry makes of the path.
+                assert!(
+                    answer.body.is_empty(),
+                    "case {case}: expected no body on a HEAD, got {answer:?}"
+                );
+            }
             // And the same path with no credentials is refused there too.
             let case = format!("{case} unauthenticated");
             let refused = emulator.reach(method, &host, &path, None).await;
@@ -610,7 +642,11 @@ async fn a_client_presenting_no_live_set_of_credentials_is_refused() {
             Some((first.username.as_str(), first.password.as_str())),
         )
         .await;
-    assert_logged_in("the set that belongs to this registry", &answer);
+    assert_logged_in(
+        "the set that belongs to this registry",
+        &answer,
+        ADDRESS_ITSELF_STATUS,
+    );
     let answer = emulator
         .reach_registry(
             "the other region's set at its own address",
@@ -618,7 +654,11 @@ async fn a_client_presenting_no_live_set_of_credentials_is_refused() {
             Some((elsewhere.username.as_str(), elsewhere.password.as_str())),
         )
         .await;
-    assert_logged_in("the other region's set at its own address", &answer);
+    assert_logged_in(
+        "the other region's set at its own address",
+        &answer,
+        ADDRESS_ITSELF_STATUS,
+    );
 }
 
 /// RULE: the credentials are read from the `Authorization` header the way RFC 9110
@@ -648,7 +688,7 @@ async fn the_authorization_header_is_read_as_the_rfc_defines_it() {
         let answer = emulator
             .reach_with_authorization("GET", &host, &path, Some(&header))
             .await;
-        assert_logged_in(case, &answer);
+        assert_logged_in(case, &answer, ADDRESS_ITSELF_STATUS);
     }
 
     for (case, header) in [
@@ -682,6 +722,7 @@ async fn credentials_created_in_one_emulator_log_in_nowhere_else() {
     assert_logged_in(
         "its own emulator",
         &first.reach_registry("its own emulator", &login, credentials).await,
+        ADDRESS_ITSELF_STATUS,
     );
     assert_refused(
         "another emulator",

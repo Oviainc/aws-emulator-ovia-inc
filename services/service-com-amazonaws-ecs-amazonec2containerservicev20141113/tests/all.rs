@@ -69,6 +69,8 @@ mod load_balancer_target_groups;
 mod reserved_tag_prefix;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/service_delete_drain.rs"]
+mod service_delete_drain;
 #[path = "all/service_derived_members.rs"]
 mod service_derived_members;
 #[path = "all/service_lifecycle.rs"]

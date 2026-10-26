@@ -37,5 +37,7 @@ mod seeded_support_plan;
 mod state_roundtrip;
 #[path = "all/support_level_gate.rs"]
 mod support_level_gate;
+#[path = "all/support_level_gate_request_independence.rs"]
+mod support_level_gate_request_independence;
 #[path = "all/validation_message_rendering.rs"]
 mod validation_message_rendering;

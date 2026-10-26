@@ -566,8 +566,8 @@ async fn a_deleted_service_stays_describable_as_inactive_and_refuses_updates() {
     let definition_arn = register_definition(&router, "deletingfamily", "setup").await;
 
     // The rows differ along what the service still holds when it is deleted and how the
-    // request addresses it: a service scaled to zero needs no cleanup and is INACTIVE at
-    // once, while one that still runs tasks is DRAINING until they stop.
+    // request addresses it. Whatever it held, the delete leaves it DRAINING: the move to
+    // the terminal INACTIVE is owed by the clock.
     let cases: [(&str, &str, i64, bool, bool); 4] = [
         ("a service scaled to zero", "idle", 0, false, false),
         ("a service still running tasks, forced", "busy", 2, true, false),
@@ -629,10 +629,9 @@ async fn a_deleted_service_stays_describable_as_inactive_and_refuses_updates() {
             "case {case:?}: a deleted service keeps no tasks, got {deleted}"
         );
         let status = string(&deleted, "status", case);
-        let expected = if desired > 0 { "DRAINING" } else { "INACTIVE" };
         assert_eq!(
-            status, expected,
-            "case {case:?}: expected the deletion to leave the service {expected}, got \
+            status, "DRAINING",
+            "case {case:?}: expected the deletion to leave the service DRAINING, got \
              {deleted}"
         );
 

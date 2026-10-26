@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/alias_viewer_certificate.rs"]
 mod alias_viewer_certificate;
+#[path = "all/anycast_ip_list_lifecycle.rs"]
+mod anycast_ip_list_lifecycle;
 #[path = "all/cache_policy_lifecycle.rs"]
 mod cache_policy_lifecycle;
 #[path = "all/cache_policy_list.rs"]

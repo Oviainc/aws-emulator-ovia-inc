@@ -14,9 +14,10 @@
 //!   `registrationId`), so writing the same TRN again updates that one record
 //!   and a TRN the account does not hold yet gets its own id.
 //! * only a jurisdiction this service supports supplemental registration in may
-//!   hold one, and an `authorityId` that names no live registration cannot be
-//!   deleted — the two rules this suite gained with the supplemental-TRN
-//!   write-path issue.
+//!   hold one — the boundary is observed behaviour, not a model constraint, and
+//!   a country code outside the member's own constraint takes the same refusal
+//!   class — and an `authorityId` that names no live registration cannot be
+//!   deleted.
 //!
 //! Every table below spans the class its rule generalises over rather than one
 //! recorded request: several address shapes and country codes, the published
@@ -35,7 +36,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
     ComAmazonawsTaxsettingsTaxsettingsState, ERROR_CODE_FIELD_VALIDATION_FAILED,
     ERROR_CODE_INVALID_TOKEN, ERROR_CODE_MALFORMED_TOKEN, SETTLED_REGISTRATION_STATUS,
-    STATUS_PENDING, SUPPLEMENTAL_TAX_REGISTRATIONS_PAGE_BOUNDS, SUPPLEMENTAL_TRN_COUNTRIES,
+    STATUS_PENDING, SUPPLEMENTAL_COUNTRY_NOT_SUPPORTED,
+    SUPPLEMENTAL_TAX_REGISTRATIONS_PAGE_BOUNDS, SUPPLEMENTAL_TRN_COUNTRIES,
 };
 
 use crate::declared_member_defaults::address_as_stored;
@@ -181,8 +183,16 @@ pub(crate) async fn put(
 
 /// RULE: a supplemental TRN is stored only for a jurisdiction this service
 /// supports supplemental registration in; an entry for any other country is
-/// refused with the modelled `ValidationException` (HTTP 400) and creates
+/// refused with the modelled `ValidationException` (HTTP 400), stating that the
+/// country is not supported and naming the member it is about, and creates
 /// nothing.
+///
+/// The jurisdiction boundary is observed behaviour, not a model constraint (see
+/// `crate::state::SUPPLEMENTAL_TRN_COUNTRIES`), so both sides of it are pinned
+/// here: a supported jurisdiction stores and reads back, and the refusal reaches
+/// countries the model's two-letter `countryCode` admits and no constraint
+/// excludes — including ones no observation has placed on either side of the
+/// boundary.
 #[tokio::test]
 async fn only_a_supported_jurisdiction_can_hold_a_supplemental_registration() {
     assert!(
@@ -201,11 +211,13 @@ async fn only_a_supported_jurisdiction_can_hold_a_supplemental_registration() {
                 answer.status, 200,
                 "case {case:?}: a supported jurisdiction must store, got {answer:?}"
             );
+            let authority_id = answer
+                .get("authorityId")
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
             assert!(
-                answer
-                    .get("authorityId")
-                    .as_str()
-                    .is_some_and(|id| !id.is_empty() && id.chars().count() <= 200),
+                !authority_id.is_empty() && authority_id.chars().count() <= 200,
                 "case {case:?}: the write must report the authority it filed, got {:?}",
                 answer.body
             );
@@ -215,17 +227,42 @@ async fn only_a_supported_jurisdiction_can_hold_a_supplemental_registration() {
                 "case {case:?}: the write reports the status it stored, got {:?}",
                 answer.body
             );
+            // The record is readable back under the authority the write minted,
+            // with the country code as submitted: the write stored it, it did
+            // not merely answer 200.
+            let listed = list_all(&router, None).await;
             assert_eq!(
-                list_all(&router, None).await.len(),
+                listed.len(),
                 1,
-                "case {case:?}: the registration must be readable back"
+                "case {case:?}: the registration must be readable back, got {listed:?}"
+            );
+            let record = &listed[0];
+            assert_eq!(
+                record.get("authorityId").and_then(Value::as_str),
+                Some(authority_id.as_str()),
+                "case {case:?}: the record is reported under the authority the write minted, got \
+                 {record:?}"
+            );
+            assert_eq!(
+                record
+                    .get("address")
+                    .and_then(|address| address.get("countryCode"))
+                    .and_then(Value::as_str),
+                Some(spelling.as_str()),
+                "case {case:?}: the record reports the country code as submitted, got {record:?}"
             );
         }
     }
 
-    // The unsupported side: the countries the recorded case cites (FR, GB) and
-    // several it does not.
-    for country_code in ["FR", "GB", "DE", "US", "IN", "JP", "BR", "ZA", "au"] {
+    // The unsupported side spans the class the rule generalises over rather than
+    // one request: the two countries the recorded refusal cites (FR, GB), the
+    // further EU jurisdictions a VAT number is held in (DE, ES, NL, ie), and
+    // other continents (US, IN, JP, BR, ZA, au) — in both cases the member's
+    // pattern admits. None is excluded by any model constraint, so each is
+    // refused for its jurisdiction alone.
+    for country_code in [
+        "FR", "GB", "DE", "ES", "NL", "ie", "US", "IN", "JP", "BR", "ZA", "au",
+    ] {
         if SUPPLEMENTAL_TRN_COUNTRIES
             .iter()
             .any(|(code, _)| code.eq_ignore_ascii_case(country_code))
@@ -249,9 +286,90 @@ async fn only_a_supported_jurisdiction_can_hold_a_supplemental_registration() {
             "case {country_code:?}: the refusal carries the field-validation code, got {:?}",
             answer.body
         );
+        assert_eq!(
+            answer.get("message").as_str(),
+            Some(SUPPLEMENTAL_COUNTRY_NOT_SUPPORTED),
+            "case {country_code:?}: the refusal states that the country is not supported, got {:?}",
+            answer.body
+        );
+        let fields: Vec<&str> = answer
+            .get("fieldList")
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            fields,
+            vec!["COUNTRY_CODE"],
+            "case {country_code:?}: the refusal names the member it is about, got {:?}",
+            answer.body
+        );
         assert!(
             list_all(&router, None).await.is_empty(),
             "case {country_code:?}: a refused write must create nothing"
+        );
+    }
+}
+
+/// RULE: a `countryCode` outside its modelled constraint (exactly two letters)
+/// takes the same 400 `ValidationException` class as an unsupported
+/// jurisdiction, so the refusal does not depend on WHY the country cannot be
+/// registered for, and neither kind of refused write stores anything.
+#[tokio::test]
+async fn a_country_code_outside_its_modelled_constraint_is_refused_too() {
+    // `Address$countryCode` is `@required` with `@length 2..2` and pattern
+    // `^[a-zA-Z]+$` (`smithy_query(query="shape",
+    // shape="com.amazonaws.taxsettings#Address")`): one character either side of
+    // the published bound, a non-letter inside it, and the member omitted.
+    // `None` is the omission. The body of a boundary refusal is the request
+    // walk's, which states the constraint that failed rather than this
+    // service's own field-validation code, so the class and a stated reason are
+    // what is asserted.
+    let cases: Vec<(&str, Option<Value>)> = vec![
+        ("one letter, below the length bound", Some(json!("C"))),
+        ("three letters, above the length bound", Some(json!("CHE"))),
+        ("empty", Some(json!(""))),
+        ("a letter and a digit", Some(json!("C1"))),
+        ("two digits", Some(json!("41"))),
+        ("punctuation", Some(json!("C-"))),
+        ("the required member omitted", None),
+    ];
+    for (case, country_code) in &cases {
+        let router = emulator();
+        let mut entry = entry_for("CH", "CHE123456789", "Acme AG");
+        let address = entry
+            .get_mut("address")
+            .and_then(Value::as_object_mut)
+            .expect("the entry's address is an object");
+        match country_code {
+            Some(value) => {
+                address.insert("countryCode".to_string(), value.clone());
+            }
+            None => {
+                address.remove("countryCode");
+            }
+        }
+        let answer = put(&router, &entry).await;
+        assert_eq!(
+            (answer.status, answer.error_code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: a country code outside its constraint must be refused, got {answer:?}"
+        );
+        assert!(
+            answer
+                .get("message")
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+            "case {case:?}: a refusal states what it refused, got {:?}",
+            answer.body
+        );
+        assert!(
+            list_all(&router, None).await.is_empty(),
+            "case {case:?}: a refused write must create nothing"
         );
     }
 }

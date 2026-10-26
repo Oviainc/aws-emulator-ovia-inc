@@ -272,7 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 snapshot_identifier,
                 MAX_FINAL_DB_SNAPSHOT_IDENTIFIER_LEN,
             )
-            .map_err(DeleteDBClusterError::validation)?;
+            .map_err(DeleteDBClusterError::invalid_parameter_value)?;
             // The request is well formed and asks for a DB cluster snapshot to outlive the
             // cluster. A DB cluster snapshot is a resource of its own and this crate holds
             // no store for one, so the honest answer is the 501 channel: accepting the

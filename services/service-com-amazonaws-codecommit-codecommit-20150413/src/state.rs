@@ -2544,6 +2544,18 @@ pub struct PullRequestRecord {
     /// applied: the ones derived from the repository's associated approval rule
     /// templates when it was created, and any rule added to it later.
     pub approval_rules: Vec<ApprovalRuleRecord>,
+    /// The approval state each reviewer has recorded on this pull request, keyed
+    /// by that reviewer's identity ARN and holding one of
+    /// [`APPROVAL_STATE_APPROVE`] / [`APPROVAL_STATE_REVOKE`]. What an approval
+    /// rule's conditions are counted against
+    /// ([`PullRequestRecord::approval_rules_not_satisfied`]), so a rule is met by
+    /// the approvals the pull request HOLDS rather than by anything a request
+    /// says.
+    pub approvals: BTreeMap<String, String>,
+    /// Whether the approval rules of this pull request are currently overridden
+    /// ([`OVERRIDE_STATUS_OVERRIDE`]), which is what lets it be merged while a
+    /// rule still states conditions its approvals do not meet.
+    pub approval_rules_overridden: bool,
     /// How many times the reviewable state of this pull request has moved. It
     /// is what distinguishes one `revisionId` from the next — see
     /// [`PullRequestRecord::revision_id`] — so a caller that holds a revision id
@@ -2568,6 +2580,43 @@ impl PullRequestRecord {
         self.approval_rules
             .iter()
             .find(|rule| rule.approval_rule_name == name)
+    }
+
+    /// The reviewers whose LAST recorded approval state on this pull request is
+    /// an approval — the approvals an approval rule's conditions are counted
+    /// against.
+    pub fn approvers(&self) -> BTreeSet<&str> {
+        self.approvals
+            .iter()
+            .filter(|(_, state)| state.as_str() == APPROVAL_STATE_APPROVE)
+            .map(|(reviewer, _)| reviewer.as_str())
+            .collect()
+    }
+
+    /// The names of the approval rules applied to this pull request whose
+    /// conditions its approvals do not meet, in the order the rules were applied.
+    ///
+    /// Each rule is read the one way this crate reads an approval rule document
+    /// ([`approval_rule_satisfied`]), so the rules a merge is refused for are the
+    /// same ones an evaluation of this pull request reports.
+    pub fn approval_rules_not_satisfied(&self) -> Vec<String> {
+        let approvers = self.approvers();
+        self.approval_rules
+            .iter()
+            .filter(|rule| !approval_rule_satisfied(&rule.content, &approvers))
+            .map(|rule| rule.approval_rule_name.clone())
+            .collect()
+    }
+
+    /// Does every approval rule applied to this pull request state conditions its
+    /// approvals meet — or have its rules been overridden?
+    ///
+    /// The question a merge asks before it writes anything: "the pull request
+    /// cannot be merged because one or more approval rules applied to the pull
+    /// request have conditions that have not been met", and an override is what
+    /// sets those conditions aside.
+    pub fn approval_rules_satisfied(&self) -> bool {
+        self.approval_rules_overridden || self.approval_rules_not_satisfied().is_empty()
     }
 
     /// The system-generated `revisionId` of this pull request's CURRENT
@@ -3040,6 +3089,117 @@ pub const CONCURRENT_REFERENCE_UPDATE_MESSAGE: &str =
     "The merge cannot be completed because the target branch has been modified. Another user might \
      have modified the target branch while the merge was in progress. Wait a few minutes, and then \
      try again.";
+
+/// `PullRequestApprovalRulesNotSatisfiedException`'s message: the FIXED sentence
+/// pair CodeCommit answers that code with — the failure, then where the rules that
+/// still have requirements are reported. Echoes nothing from the request, and is
+/// worded here once for every operation that refuses to merge a pull request whose
+/// approval rules still state requirements its approvals do not meet. (The model's
+/// documentation for the shape states the same refusal in other words; the service's
+/// own sentences are these.)
+pub const PULL_REQUEST_APPROVAL_RULES_NOT_SATISFIED_MESSAGE: &str =
+    "You cannot merge the pull request because the requirements for one or more approval rules \
+     have not been met. For details about the approval rules that still have requirements, use \
+     EvaluatePullRequestApprovalRules.";
+
+/// `approvalState` values the model's `ApprovalState` declares
+/// (`smithy_query(query="shape",shape="ApprovalState")`): the two states one
+/// reviewer's approval of a pull request can hold.
+pub const APPROVAL_STATE_APPROVE: &str = "APPROVE";
+pub const APPROVAL_STATE_REVOKE: &str = "REVOKE";
+
+/// `overrideStatus` values the model's `OverrideStatus` declares
+/// (`smithy_query(query="shape",shape="OverrideStatus")`): whether the approval
+/// rules of a pull request are set aside or held again.
+pub const OVERRIDE_STATUS_OVERRIDE: &str = "OVERRIDE";
+pub const OVERRIDE_STATUS_REVOKE: &str = "REVOKE";
+
+/// Is this approval rule document's set of conditions met by `approvers`?
+///
+/// An approval rule document carries one or more `Approvers` statements (the shape
+/// [`is_approval_rule_template_content`] accepts), each stating how many approvals
+/// it needs and, where present, the pool of identities whose approvals count
+/// towards it: a statement is met once at least that many of the pull request's
+/// approvers are in its pool, a statement that names no pool counts every
+/// approver, and the rule is met only when every one of its statements is.
+///
+/// A document this service cannot read states conditions that cannot be counted at
+/// all, so it is reported UNMET rather than silently met.
+fn approval_rule_satisfied(content: &str, approvers: &BTreeSet<&str>) -> bool {
+    let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(content) else {
+        return false;
+    };
+    let Some(statements) = document
+        .get("Statements")
+        .and_then(::serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    if statements.is_empty() {
+        return false;
+    }
+    statements.iter().all(|statement| {
+        let Some(needed) = statement
+            .get("NumberOfApprovalsNeeded")
+            .and_then(::serde_json::Value::as_i64)
+        else {
+            return false;
+        };
+        let pool = statement
+            .get("ApprovalPoolMembers")
+            .and_then(::serde_json::Value::as_array);
+        let counted = approvers
+            .iter()
+            .filter(|approver| match pool {
+                Some(pool) => pool
+                    .iter()
+                    .filter_map(::serde_json::Value::as_str)
+                    .any(|member| approval_pool_includes(member, approver)),
+                None => true,
+            })
+            .count();
+        i64::try_from(counted).unwrap_or(i64::MAX) >= needed
+    })
+}
+
+/// Does one `ApprovalPoolMembers` entry name this identity?
+///
+/// An entry is an identity the approvals of which count towards the statement,
+/// written as that identity's ARN, in which `*` stands for any sequence of
+/// characters — the wildcard CodeCommit's approval rule template schema allows in
+/// a pool member, so one entry can name every session of an assumed role.
+///
+/// Every slice taken below is at a boundary the check above it established — a
+/// prefix stripped, a suffix confirmed, an occurrence found — so no caller-supplied
+/// entry can index outside the identity it is matched against.
+fn approval_pool_includes(member: &str, identity: &str) -> bool {
+    let segments: Vec<&str> = member.split('*').collect();
+    let (Some(first), Some(last)) = (segments.first(), segments.last()) else {
+        return false;
+    };
+    if segments.len() == 1 {
+        // No wildcard at all: the entry names exactly one identity.
+        return member == identity;
+    }
+    // The text before the FIRST wildcard is anchored at the start of the identity,
+    // and the text after the LAST one at its end.
+    let Some(rest) = identity.strip_prefix(*first) else {
+        return false;
+    };
+    if !rest.ends_with(*last) {
+        return false;
+    }
+    let mut rest = &rest[..rest.len() - last.len()];
+    // Every segment BETWEEN two wildcards matches the next occurrence of it,
+    // leaving the rest of the identity for the segments after it.
+    for segment in &segments[1..segments.len() - 1] {
+        match rest.find(segment) {
+            Some(at) => rest = &rest[at + segment.len()..],
+            None => return false,
+        }
+    }
+    true
+}
 
 /// Does an approval rule template's content apply to a pull request whose
 /// destination is this fully qualified reference?

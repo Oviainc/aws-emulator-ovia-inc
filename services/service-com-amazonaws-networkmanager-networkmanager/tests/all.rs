@@ -33,6 +33,8 @@ mod connection_lifecycle;
 mod core_network_change_events;
 #[path = "all/core_network_change_set.rs"]
 mod core_network_change_set;
+#[path = "all/core_network_change_set_execution.rs"]
+mod core_network_change_set_execution;
 #[path = "all/core_network_lifecycle.rs"]
 mod core_network_lifecycle;
 #[path = "all/core_network_policy_version_listing.rs"]

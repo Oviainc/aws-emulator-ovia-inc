@@ -1,15 +1,37 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDisassociateProjectAssets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDisassociateProjectAssets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes every asset the request names from the membership stored on
+//! the project's own record, so `ListProjectAssets` reads back exactly what this call
+//! left behind.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDisassociateProjectAssets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this handler does
+//!
+//! The removal side of a Monitor project's membership, the
+//! [`crate::state::ProjectRecord::asset_ids`] set `BatchAssociateProjectAssets`
+//! grows: the assets the request names go, and the rest of the membership stays
+//! exactly as it was.
+//!
+//! Every resource the request names has to be one this service holds — the project
+//! the path addresses and every `assetIds` entry, which targets `ID`, the raw UUID
+//! form — and both are checked BEFORE anything is written, so a refused call removes
+//! nothing at all. Neither absence can be reported per asset: the only
+//! `AssetErrorCode` the model declares is `INTERNAL_FAILURE` (smithy_query
+//! query="shape" shape="AssetErrorCode"), which is why the whole request is refused,
+//! in the one wording every not-found refusal of this service carries, exactly as
+//! the association side refuses it.
+//!
+//! Because the membership is a SET, removing an asset the project does not hold
+//! takes nothing out and fails nothing — the project ends up holding exactly what
+//! the caller asked it to hold — and an id repeated inside one request is removed
+//! once. So every request this handler accepts answers an EMPTY per-asset error
+//! list.
+//!
+//! `clientToken` is NOT honoured for idempotent replay — this store keeps no
+//! token -> answer mapping — which changes no answer here: the removal is already
+//! idempotent, so a retry carrying the same token is judged on the state it finds
+//! and answers as the first call did. The token itself is left to the idempotency
+//! issue, as `CreateProject` and `BatchAssociateProjectAssets` leave it.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +176,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDisassociateProjectAssets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDisassociateProjectAssetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDisassociateProjectAssets"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_failure)?;
+        let _ = ctx;
+
+        let mut store = state.lock();
+
+        // The project is what the membership is held ON, so an id that resolves to no
+        // stored project names no membership to remove anything from. Resolved first,
+        // as every project-scoped handler in this crate resolves the resource its
+        // path names before reading the body.
+        if !store.projects.contains_key(&input.project_id) {
+            return Err(not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_PROJECT,
+                &input.project_id,
+            )));
+        }
+
+        // Every asset the request names has to exist, the same rule the association
+        // side enforces: `assetIds` targets `ID`, the raw UUID form, so this is a
+        // direct lookup, and the per-asset `errors` list cannot carry the refusal.
+        // Checked BEFORE anything is written, so a refused call disassociates nothing.
+        for asset_id in &input.asset_ids {
+            if !store.assets.contains_key(asset_id) {
+                return Err(not_found(crate::state::not_found_message(
+                    crate::state::RESOURCE_ASSET,
+                    asset_id,
+                )));
+            }
+        }
+
+        // What the project holds once this request lands: its membership without the
+        // assets the request named. The membership is a set, so an asset the project
+        // does not hold and an id repeated inside one request each take one asset out
+        // at most, and the assets the request did not name are untouched.
+        let Some(project) = store.projects.get_mut(&input.project_id) else {
+            return Err(internal_failure());
+        };
+        for asset_id in &input.asset_ids {
+            project.asset_ids.remove(asset_id);
+        }
+
+        // "A list of associated error information, if any": none, so the list is
+        // empty. Nothing in this handler can fail for one asset while succeeding for
+        // another — the only `AssetErrorCode` the model declares is INTERNAL_FAILURE,
+        // and this store either holds every asset the request named or refuses the
+        // whole request above.
+        Ok(BatchDisassociateProjectAssetsOutput {
+            errors: Some(Vec::new()),
+        })
     }
 }
+
+/// HTTP 500 `InternalFailureException`: the store this operation needs is not there.
+fn internal_failure() -> BatchDisassociateProjectAssetsError {
+    BatchDisassociateProjectAssetsErrorModeled::InternalFailureException(InternalFailureException {
+        message: "the IoT SiteWise store is unavailable".to_string(),
+    })
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` for an id that names no stored resource, in
+/// the one wording every not-found refusal in this service carries.
+fn not_found(message: String) -> BatchDisassociateProjectAssetsError {
+    BatchDisassociateProjectAssetsErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException { message },
+    )
+    .into()
+}
+

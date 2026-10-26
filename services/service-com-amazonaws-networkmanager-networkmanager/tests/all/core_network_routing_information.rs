@@ -30,7 +30,6 @@
 //! schema's, the same source the other suites build documents from.
 
 use std::collections::BTreeSet;
-use std::time::SystemTime;
 
 use serde_json::{json, Value};
 
@@ -216,26 +215,44 @@ async fn connect_peer(
 
 /// Put `document` in force on `core_network`, as its next executed policy version.
 ///
-/// A policy document is only put IN FORCE by the create of a core network and by
-/// `ExecuteCoreNetworkChangeSet`, which is still a scaffold stub with its own issue
-/// (`networkmanager ExecuteCoreNetworkChangeSet`), so the one thing this suite cannot drive
-/// through an operation is a SECOND policy version taking effect — and a `create-route`
-/// action names the attachments it reaches by id, which exist only after the core network
-/// does. Everything else here is created and read back through an operation.
-fn put_policy_in_force(engine: &engine::InMemoryEngine, core_network: &str, document: String) {
-    let store = state::service_state(engine).expect("the networkmanager store must be reachable");
-    let mut guard = store.lock();
-    let record = guard
-        .core_networks
-        .get_mut(core_network)
-        .unwrap_or_else(|| panic!("the subject core network {core_network} must be stored"));
-    record.topology = state::policy_topology(&document);
-    record.add_policy_version(document, None, None, SystemTime::now(), true);
+/// A policy document is put IN FORCE by the create of a core network and by
+/// `ExecuteCoreNetworkChangeSet` executing the change set a `PutCoreNetworkPolicy`
+/// prepared, so this drives both of those operations: this suite needs a SECOND policy
+/// version to take effect, because a `create-route` action names the attachments it reaches
+/// by id and those exist only after the core network does. Everything here is created and
+/// read back through an operation.
+async fn put_policy_in_force(emulator: &Emulator, core_network: &str, document: String) {
+    let (status, put) = emulator
+        .post(
+            &format!("/core-networks/{core_network}/core-network-policy"),
+            json!({ "PolicyDocument": document }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "PutCoreNetworkPolicy expected 200, got {status} with {put}"
+    );
+    let version = put["CoreNetworkPolicy"]["PolicyVersionId"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("no CoreNetworkPolicy.PolicyVersionId in {put}"));
+    // A change set is only executable once the generation span the clock owes it has
+    // fallen due.
+    tokio::time::sleep(PAST_SETTLE).await;
+    let (status, executed) = emulator
+        .post(
+            &format!("/core-networks/{core_network}/core-network-change-sets/{version}/execute"),
+            json!({}),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "ExecuteCoreNetworkChangeSet expected 200, got {status} with {executed}"
+    );
 }
 
 /// Build the subject, then put in force a policy whose `create-route` actions name the
 /// attachments it has just created.
-async fn subject(emulator: &Emulator, engine: &engine::InMemoryEngine) -> Subject {
+async fn subject(emulator: &Emulator) -> Subject {
     let global_network = emulator.create_global_network("routing information").await;
     let (status, created) = create_core_network(
         emulator,
@@ -284,7 +301,7 @@ async fn subject(emulator: &Emulator, engine: &engine::InMemoryEngine) -> Subjec
     // western-only segment, one prefix whose destination names no stored attachment, and one
     // action acting on a segment the document never declares.
     put_policy_in_force(
-        engine,
+        emulator,
         &core_network,
         policy_document(&json!([
             {
@@ -318,7 +335,8 @@ async fn subject(emulator: &Emulator, engine: &engine::InMemoryEngine) -> Subjec
                 "destinations": ["blackhole"],
             },
         ])),
-    );
+    )
+    .await;
 
     // Every attachment and every peering owes the clock its `CREATING` -> `AVAILABLE`
     // transition, and a route is held only through a next hop that is available, so the
@@ -556,8 +574,8 @@ fn listing_cases(subject: &Subject) -> Vec<ListingCase> {
 
 #[tokio::test]
 async fn every_route_a_segment_holds_at_an_edge_is_reported_from_the_stored_policy_and_peerings() {
-    let (emulator, engine) = Emulator::with_engine();
-    let subject = subject(&emulator, &engine).await;
+    let emulator = Emulator::new();
+    let subject = subject(&emulator).await;
 
     for case in listing_cases(&subject) {
         let name = case.name;
@@ -765,8 +783,8 @@ fn filter_cases(subject: &Subject) -> Vec<FilterCase> {
 
 #[tokio::test]
 async fn every_match_narrows_the_listing_to_the_routes_whose_attribute_it_names() {
-    let (emulator, engine) = Emulator::with_engine();
-    let subject = subject(&emulator, &engine).await;
+    let emulator = Emulator::new();
+    let subject = subject(&emulator).await;
     let held = west_shared(&subject);
 
     for case in filter_cases(&subject) {
@@ -796,8 +814,8 @@ async fn every_match_narrows_the_listing_to_the_routes_whose_attribute_it_names(
 
 #[tokio::test]
 async fn a_page_reports_at_most_max_results_routes_and_a_token_resumes_after_the_last_of_them() {
-    let (emulator, engine) = Emulator::with_engine();
-    let subject = subject(&emulator, &engine).await;
+    let emulator = Emulator::new();
+    let subject = subject(&emulator).await;
     let held = west_shared(&subject);
 
     // The largest page a caller may ask for is 500 (`MaxResults` is modelled `range 1..500`,
@@ -915,8 +933,8 @@ fn refusal_cases() -> Vec<RefusalCase> {
 
 #[tokio::test]
 async fn a_request_that_addresses_no_route_table_is_refused_on_the_member_that_carried_it() {
-    let (emulator, engine) = Emulator::with_engine();
-    let subject = subject(&emulator, &engine).await;
+    let emulator = Emulator::new();
+    let subject = subject(&emulator).await;
 
     for case in refusal_cases() {
         let name = case.name;
@@ -971,8 +989,8 @@ fn match_filter(member: &str, values: Vec<String>) -> Value {
 
 #[tokio::test]
 async fn a_match_filter_carrying_more_values_than_the_bound_allows_is_refused_on_its_member() {
-    let (emulator, engine) = Emulator::with_engine();
-    let subject = subject(&emulator, &engine).await;
+    let emulator = Emulator::new();
+    let subject = subject(&emulator).await;
 
     // One row per list a request matches on: the four BGP-attribute lists, and one value
     // list of the next-hop filter map, each named by the member a refusal reports.

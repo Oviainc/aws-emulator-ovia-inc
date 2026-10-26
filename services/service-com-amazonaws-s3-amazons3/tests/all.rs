@@ -95,6 +95,8 @@ mod multipart_part_upload;
 mod multipart_upload_initiation;
 #[path = "all/multipart_upload_listing.rs"]
 mod multipart_upload_listing;
+#[path = "all/object_acl.rs"]
+mod object_acl;
 #[path = "all/object_and_policy.rs"]
 mod object_and_policy;
 #[path = "all/object_and_tagging_roundtrip.rs"]

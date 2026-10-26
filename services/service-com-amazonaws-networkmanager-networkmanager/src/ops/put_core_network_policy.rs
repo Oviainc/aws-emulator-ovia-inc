@@ -5,7 +5,7 @@
 //! Appends a new, immutable version to a core network's policy history: the document is
 //! checked, stored verbatim as the next `PolicyVersionId` and reported with the change-set
 //! state of a version WAITING to be executed. A put never moves the LIVE policy — only
-//! `ExecuteCoreNetworkChangeSet` (still a scaffold stub) does — so the core network's
+//! `ExecuteCoreNetworkChangeSet` does — so the core network's
 //! reported topology is untouched by one. This is the ONLY file to touch for this
 //! operation.
 //!

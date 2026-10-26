@@ -741,7 +741,7 @@ async fn the_final_snapshot_members_are_refused_as_the_api_documents_them() {
             )
             .await,
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         );
         assert!(
             text(&refused, "Message").contains("FinalDBSnapshotIdentifier"),

@@ -220,11 +220,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .values()
             .filter(|service| service.cluster_name == cluster_name)
             // A DELETED service is no longer one of the cluster's services: the
-            // `DeleteService` doc names the operation that still reports one — "Services
-            // in the DRAINING or INACTIVE status can still be viewed with the
-            // DescribeServices API operation" — so a service still being drained away is
-            // listed and one that has finished draining is not.
-            .filter(|service| service.status != crate::state::SERVICE_INACTIVE)
+            // `DeleteService` doc — "the service status moves from ACTIVE to DRAINING, and
+            // the service is no longer visible in the console or in the ListServices API
+            // operation" — so a service being drained away is already gone from this
+            // listing, and the operation that still reports it is the one that doc names
+            // ("Services in the DRAINING or INACTIVE status can still be viewed with the
+            // DescribeServices API operation").
+            .filter(|service| service.is_active())
             // "The launch type to use when filtering the ListServices results." A service
             // placed through a capacity-provider strategy has NO launch type, so no
             // launch-type filter selects it.

@@ -219,6 +219,8 @@ mod iam_role_id_agrees_with_sts;
 mod iam_access_key_signs_as_its_user;
 #[path = "all/iam_signing_name_routing.rs"]
 mod iam_signing_name_routing;
+#[path = "all/iot_command_deprecation_is_observable_on_the_data_plane.rs"]
+mod iot_command_deprecation_is_observable_on_the_data_plane;
 #[path = "all/iot_command_execution_lifecycle.rs"]
 mod iot_command_execution_lifecycle;
 // Declared HERE, beside the command-execution suite it is the sibling of, rather than

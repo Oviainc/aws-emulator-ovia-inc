@@ -897,7 +897,7 @@ async fn the_report_filters_and_pages_the_clusters_it_holds() {
         )
         .await,
         400,
-        "ValidationException",
+        "InvalidParameterValue",
     );
 
     // `MaxRecords` pages the report, and the marker it hands back resumes it.
@@ -969,7 +969,7 @@ async fn a_request_outside_a_documented_constraint_is_refused_and_stores_nothing
                 ("Engine", "aurora-mysql".to_string()),
             ],
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         ),
         (
             "an Aurora identifier one character past the 63 it allows",
@@ -978,7 +978,7 @@ async fn a_request_outside_a_documented_constraint_is_refused_and_stores_nothing
                 ("Engine", "aurora-mysql".to_string()),
             ],
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         ),
         (
             "a Multi-AZ identifier one character past the 52 it allows",
@@ -991,7 +991,7 @@ async fn a_request_outside_a_documented_constraint_is_refused_and_stores_nothing
                 ("Iops", "1000".to_string()),
             ],
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         ),
         (
             "a second create under an identifier one cluster already has",

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AcceptAgreementPaymentRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AcceptAgreementPaymentRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AcceptAgreementPaymentRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -157,6 +148,29 @@ impl<Eng> AcceptAgreementPaymentRequest<Eng> {
     }
 }
 
+/// The `AcceptAgreementPaymentRequest` answer for the payment request this call
+/// has just approved.
+///
+/// Every member is read from the stored record — `name`, `description`,
+/// `chargeAmount` and `currencyCode` are the ones the send recorded,
+/// `createdAt` is "when the payment request was originally created" and
+/// `updatedAt` "when the payment request was accepted" — so nothing here is
+/// echoed from this call's own input, and a later `GetAgreementPaymentRequest`
+/// of the same request reports the same values from the same record.
+fn to_output(stored: &crate::state::PaymentRequest) -> AcceptAgreementPaymentRequestOutput {
+    AcceptAgreementPaymentRequestOutput {
+        payment_request_id: Some(stored.id.clone()),
+        agreement_id: Some(stored.agreement_id.clone()),
+        status: Some(stored.status.clone()),
+        name: Some(stored.name.clone()),
+        description: stored.description.clone(),
+        charge_amount: Some(stored.charge_amount.clone()),
+        currency_code: stored.currency_code.clone(),
+        created_at: Some(::aws_smithy_types::DateTime::from(stored.created_at)),
+        updated_at: Some(::aws_smithy_types::DateTime::from(stored.updated_at)),
+    }
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for AcceptAgreementPaymentRequest<Eng>
 {
@@ -174,18 +188,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AcceptAgreementPaymentRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AcceptAgreementPaymentRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AcceptAgreementPaymentRequest"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                AcceptAgreementPaymentRequestErrorModeled::InternalServerException(
+                    crate::state::store_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A payment request is a child of the agreement it was sent under, and
+        // this call names both. Resolution goes PARENT-FIRST, so
+        // `ResourceNotFoundException`'s `resourceType` and `resourceId` name the
+        // OUTERMOST resource that failed to resolve, the way the sibling
+        // `RejectAgreementPaymentRequest` and `GetAgreementPaymentRequest`
+        // resolve the same pair.
+        if !store.agreements.contains_key(&input.agreement_id) {
+            return Err(crate::state::not_found(
+                AcceptAgreementPaymentRequestErrorModeled::ResourceNotFoundException(
+                    crate::state::agreement_not_found(&input.agreement_id),
+                ),
+            ));
+        }
+
+        // The agreement resolved, so the child is what this call acts on. Both
+        // ids are required and both select: a payment request of another
+        // agreement is not the one this call names.
+        let found = store
+            .payment_requests
+            .get(&input.payment_request_id)
+            .filter(|request| request.agreement_id == input.agreement_id);
+        let Some(request) = found else {
+            return Err(crate::state::not_found(
+                AcceptAgreementPaymentRequestErrorModeled::ResourceNotFoundException(
+                    crate::state::payment_request_not_found(&input.payment_request_id),
+                ),
+            ));
+        };
+
+        // "Only payment requests in PENDING_APPROVAL status can be accepted. A
+        // ConflictException is thrown if the payment request is in any other
+        // status." Every other `PaymentRequestStatus` value is one the request
+        // has already been moved to, so accepting it now would move it a second
+        // time — which also makes a replayed accept of the same request a
+        // conflict rather than a second approval.
+        if !request.is_pending_approval() {
+            let status = request.status.clone();
+            return Err(
+                AcceptAgreementPaymentRequestErrorModeled::ConflictException(
+                    crate::state::conflict(
+                        crate::state::RESOURCE_TYPE_PAYMENT_REQUEST,
+                        &input.payment_request_id,
+                        format!(
+                            "payment request {} is {status}, and only a {} payment request can be \
+                             accepted",
+                            input.payment_request_id,
+                            crate::state::PAYMENT_REQUEST_STATUS_PENDING_APPROVAL
+                        ),
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // "Once accepted, the payment request transitions to APPROVED status and
+        // the charge will be processed", and the buyer may "optionally provide a
+        // purchase order reference" to associate the request with their own
+        // purchase order system — both written through
+        // [`crate::state::ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::approve_payment_request`],
+        // the one writer of that transition, which mints the charge the approval
+        // creates and records the reference as that charge's association. So
+        // `GetAgreementPaymentRequest` and `ListAgreementPaymentRequests` report
+        // the approved request, and `ListAgreementCharges` its charge, from the
+        // records this call wrote. APPROVED is terminal, so nothing is owed to
+        // the clock here.
+        let approved = store.approve_payment_request(
+            &input.payment_request_id,
+            input.purchase_order_reference,
+            now,
+        );
+        let Some(approved) = approved else {
+            // Unreachable: the request was resolved just above, under the lock
+            // still held here. Spelled as the refusal an id naming no stored
+            // request earns rather than as a success that approved nothing.
+            return Err(crate::state::not_found(
+                AcceptAgreementPaymentRequestErrorModeled::ResourceNotFoundException(
+                    crate::state::payment_request_not_found(&input.payment_request_id),
+                ),
+            ));
+        };
+        crate::state::audit(
+            Self::NAME,
+            "approved",
+            &input.payment_request_id,
+            ctx.parts(),
+        );
+
+        Ok(to_output(&approved))
     }
 }

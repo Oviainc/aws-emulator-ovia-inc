@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteService
-//! Deletes a service in a cluster and reports the deleted service. The stored record is
-//! KEPT in the status the deletion leaves it — the operation's own doc: "if there are
-//! still running tasks that require cleanup, the service status moves from ACTIVE to
-//! DRAINING ... After all tasks have transitioned to either STOPPING or STOPPED status,
-//! the service status moves from DRAINING to INACTIVE. Services in the DRAINING or
-//! INACTIVE status can still be viewed with the DescribeServices API operation" — so a
-//! `DescribeServices` after a delete reports the service rather than a MISSING failure.
+//! Deletes a service in a cluster and reports the service the deletion left DRAINING —
+//! the operation's own doc: "if there are still running tasks that require cleanup, the
+//! service status moves from ACTIVE to DRAINING ... After all tasks have transitioned to
+//! either STOPPING or STOPPED status, the service status moves from DRAINING to INACTIVE.
+//! Services in the DRAINING or INACTIVE status can still be viewed with the
+//! DescribeServices API operation". The cleanup the second sentence waits for is not done
+//! in the instant the first one starts it, so this call reports the DRAINING service, with
+//! the task sets it is draining away, and the CLOCK moves it to INACTIVE; the stored
+//! record is KEPT, so a `DescribeServices` after a delete reports the service rather than
+//! a MISSING failure.
 //!
 //! ## Shape of an operation
 //!
@@ -237,9 +240,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The record is KEPT, in the status the deletion leaves it: "Services in the
-        // DRAINING or INACTIVE status can still be viewed with the DescribeServices API
-        // operation", which is what tells a deleted service apart from one that never
+        // The record is KEPT, in the status the deletion leaves it: the delete starts the
+        // service DRAINING and the clock finishes that drain, and either way "Services in
+        // the DRAINING or INACTIVE status can still be viewed with the DescribeServices
+        // API operation", which is what tells a deleted service apart from one that never
         // existed. Deleting an already-INACTIVE service changes nothing more.
         guard.drain_service(&key, now);
 

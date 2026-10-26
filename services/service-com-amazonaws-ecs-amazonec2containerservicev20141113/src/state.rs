@@ -1061,6 +1061,12 @@ pub const TASK_SET_ACTIVE: &str = "ACTIVE";
 /// `TaskSet$status` for the task set that IS serving production traffic.
 pub const TASK_SET_PRIMARY: &str = "PRIMARY";
 
+/// `TaskSet$status` for a task set whose tasks are being taken away. The member's doc:
+/// "DRAINING: The tasks in the task set are being stopped, and their corresponding targets
+/// are being deregistered from their target group" — which is what the delete of the
+/// service that holds the task set starts.
+pub const TASK_SET_DRAINING: &str = "DRAINING";
+
 /// `StabilityStatus` for a task set that has reached its steady state. The
 /// `TaskSet$stabilityStatus` doc: the task set is in `STEADY_STATE` when "The task
 /// `runningCount` is equal to the `computedDesiredCount`" and "The `pendingCount` is 0";
@@ -2624,6 +2630,14 @@ pub struct ServiceRecord {
     /// that deployment. `ServiceCurrentRevisionSummary$arn`: "The ARN of the current
     /// service revision."
     pub service_revision_arn: String,
+    /// When the `DRAINING` this service was left in is owed its `INACTIVE`, or `None` for
+    /// a service no delete has started draining (and once the drain has finished).
+    /// `DeleteService`: "After all tasks have transitioned to either STOPPING or STOPPED
+    /// status, the service status moves from DRAINING to INACTIVE" — a span the CLOCK
+    /// settles ([`TRANSITION_SPAN`]), so the call that deletes the service never answers
+    /// with the terminal status and a caller watching for `DRAINING` -> `INACTIVE` sees
+    /// both.
+    pub drain_due_at: Option<SystemTime>,
     /// When the current deployment's rollout is owed its steady state, or `None` once it
     /// has reached one. `Deployment$rolloutState`: "When a service deployment is started,
     /// it begins in an IN_PROGRESS state. When the service reaches a steady state, the
@@ -3262,8 +3276,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     && tally.pending == 0
             });
             // `DeleteService`: "After all tasks have transitioned to either STOPPING or
-            // STOPPED status, the service status moves from DRAINING to INACTIVE."
+            // STOPPED status, the service status moves from DRAINING to INACTIVE" — which
+            // needs BOTH the instant the drain falls due and the tasks it was cleaning up
+            // actually gone.
             let drained = service.status == SERVICE_DRAINING
+                && service.drain_due_at.is_some_and(|due| due <= now)
                 && !self.service_has_active_tasks(&key.0, &key.1);
             // The SAME rollout, as the service-deployment resource: it finishes with the
             // steady state the service reaches, not a moment before or after.
@@ -3323,6 +3340,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             }
             if drained {
                 service.status = SERVICE_INACTIVE.to_string();
+                service.drain_due_at = None;
             }
             if !replaced.is_empty() {
                 service
@@ -3342,6 +3360,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                         deployment.finished_at = Some(DateTime::from(due));
                     }
                 }
+            }
+            if drained {
+                // The drain is over, so the task sets that were draining away with the
+                // service are no longer its task sets: a task set belongs to the service
+                // it was created in, and that service has finished being deleted.
+                self.task_sets.retain(|(cluster, service, _), _| {
+                    (cluster, service) != (&key.0, &key.1)
+                });
             }
         }
     }
@@ -4242,18 +4268,27 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             .any(|task_set| task_set.status == TASK_SET_PRIMARY)
     }
 
-    /// Drain a DELETED service: it keeps nothing running and keeps no task set.
+    /// Drain a DELETED service: it keeps nothing running, and the task sets it holds are
+    /// drained away with it.
     ///
     /// `DeleteService`: "When you delete a service, if there are still running tasks that
     /// require cleanup, the service status moves from ACTIVE to DRAINING ... After all
     /// tasks have transitioned to either STOPPING or STOPPED status, the service status
-    /// moves from DRAINING to INACTIVE." The record is KEPT either way: "Services in the
-    /// DRAINING or INACTIVE status can still be viewed with the DescribeServices API
-    /// operation."
+    /// moves from DRAINING to INACTIVE." The deletion is what starts that drain, so the
+    /// call leaves the service `DRAINING` and the CLOCK finishes it ([`Self::settle_services`]):
+    /// the cleanup the second sentence waits for is never done in the same instant the
+    /// first one begins. The record is KEPT either way: "Services in the DRAINING or
+    /// INACTIVE status can still be viewed with the DescribeServices API operation."
+    ///
+    /// Deleting a service whose drain already finished changes nothing: the delete is
+    /// `@idempotent` and an `INACTIVE` service has nothing left to drain.
     pub fn drain_service(&mut self, key: &(String, String), now: SystemTime) {
         let Some(service) = self.services.get(key) else {
             return;
         };
+        if service.status == SERVICE_INACTIVE {
+            return;
+        }
         let mut task_arns: Vec<String> = self
             .tasks
             .values()
@@ -4270,17 +4305,16 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         for arn in &task_arns {
             self.stop_service_task(arn, now, &format!("Service {name} was deleted"));
         }
-        let still_cleaning_up = self.service_has_active_tasks(&key.0, &key.1);
         let Some(service) = self.services.get_mut(key) else {
             return;
         };
         service.desired_count = 0;
-        service.status = if still_cleaning_up {
-            SERVICE_DRAINING
-        } else {
-            SERVICE_INACTIVE
-        }
-        .to_string();
+        // The drain the delete starts: the service is DRAINING, and the move to the
+        // terminal INACTIVE is owed by the clock. An already-draining service keeps the
+        // instant its own delete put it on, so repeating the delete does not push the
+        // drain further out.
+        service.status = SERVICE_DRAINING.to_string();
+        service.drain_due_at = Some(service.drain_due_at.unwrap_or(now + TRANSITION_SPAN));
         // A deleted service has no rollout left to settle.
         service.deployment_steady_due_at = None;
         // And the rollout that was still under way ends here with it, rather than being
@@ -4292,11 +4326,19 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             SERVICE_DEPLOYMENT_STOPPED,
             &format!("Service {name} was deleted"),
         );
-        // A task set belongs to the service it was created in, so a deleted service keeps
-        // none: the tasks it placed were stopped above with every other task of the
-        // service.
-        self.task_sets
-            .retain(|(cluster, service, _), _| (cluster, service) != (&key.0, &key.1));
+        // A task set belongs to the service it was created in, so the task sets of a
+        // service being drained away are being drained away with it — their tasks were
+        // stopped above with every other task of the service, which is exactly what
+        // `TaskSet$status` DRAINING describes. They stop being the service's task sets
+        // where the drain finishes ([`Self::settle_services`]).
+        for task_set in self.task_sets.values_mut().filter(|task_set| {
+            (&task_set.cluster_name, &task_set.service_name) == (&key.0, &key.1)
+        }) {
+            if task_set.status != TASK_SET_DRAINING {
+                task_set.status = TASK_SET_DRAINING.to_string();
+                task_set.updated_at = DateTime::from(now);
+            }
+        }
     }
 
     /// The task sets of ONE service, oldest first.
@@ -4426,9 +4468,15 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             service_registries: Some(task_set.service_registries.clone()),
             scale: Some(task_set.scale.clone()),
             // "The task `runningCount` is equal to the `computedDesiredCount`" and "The
-            // `pendingCount` is 0"; otherwise the task set is still stabilizing.
+            // `pendingCount` is 0"; otherwise the task set is still stabilizing. A task
+            // set being drained away meets neither reading of a steady state: its tasks
+            // "are being stopped, and their corresponding targets are being deregistered
+            // from their target group", which is work still under way.
             stability_status: Some(
-                if tally.running == computed_desired_count && tally.pending == 0 {
+                if task_set.status != TASK_SET_DRAINING
+                    && tally.running == computed_desired_count
+                    && tally.pending == 0
+                {
                     STABILITY_STATUS_STEADY_STATE
                 } else {
                     STABILITY_STATUS_STABILIZING

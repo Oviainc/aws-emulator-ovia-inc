@@ -95,6 +95,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The filter-matching rule every list operation of this service shares, so a change to
+// it (normalising a compared identifier, say) narrows every listing the same way; see
+// `crate::state` for how a sent filter member becomes the set it matches against.
+// `parentIdentifiers` is matched with `selected_optional`, because a control
+// `EnableControl` applies directly to its target inherits from nothing and so has no
+// parent value for a filter to match.
+use crate::state::{filter_set, selected, selected_optional};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -129,45 +137,6 @@ impl From<ListEnabledControlsErrorModeled> for ListEnabledControlsError {
     fn from(modeled: ListEnabledControlsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
-}
-
-/// Whether `actual` is selected by a filter: a member the caller did not send selects
-/// every control, and one they did selects the controls whose value its set holds.
-fn selected(filter: &Filter<'_>, actual: &str) -> bool {
-    filter
-        .as_ref()
-        .is_none_or(|values| values.contains(actual))
-}
-
-/// As [`selected`], for a member a control may not have at all: an absent value is
-/// selected only by an absent filter, so filtering on `parentIdentifiers` returns the
-/// controls that have a parent and that parent is among the values asked for.
-fn selected_optional(filter: &Filter<'_>, actual: Option<&str>) -> bool {
-    match (filter.as_ref(), actual) {
-        (None, _) => true,
-        (Some(_), None) => false,
-        (Some(values), Some(actual)) => values.contains(actual),
-    }
-}
-
-/// A filter list the caller sent, as the handler matches it: the values as a SET, so
-/// testing one control against it costs `O(log k)` rather than a scan, and the whole
-/// per-request scan is bounded by the store's own [`MAX_ENABLED_CONTROLS`] cap.
-///
-/// Every enum-typed member of `EnabledControlFilter` deserializes to a plain string, but
-/// the schema front door has already refused a value the model's value set does not
-/// declare (HTTP 400, as `tests/all/front_door_validation.rs` pins), so reaching this
-/// handler means each value is one of the modelled ones — and each of these lists is
-/// modelled `@length min 1, max 1`, so the front door has bounded its length too.
-///
-/// [`MAX_ENABLED_CONTROLS`]: crate::state::MAX_ENABLED_CONTROLS
-type Filter<'a> = Option<::std::collections::BTreeSet<&'a str>>;
-
-/// The values of one filter member as a [`Filter`] set, or `None` when the caller sent
-/// that member no list at all. Built BEFORE the state lock is taken, so no caller-sized
-/// work happens while the lock is held.
-fn filter_set(values: Option<&Vec<String>>) -> Filter<'_> {
-    values.map(|values| values.iter().map(String::as_str).collect())
 }
 
 /// The `ListEnabledControls` operation.

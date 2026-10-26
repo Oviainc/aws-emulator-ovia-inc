@@ -159,7 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = crate::state::check_max_records(input.max_records)
             .map_err(DescribeDBInstancesError::invalid_parameter_value)?;
         let filters = input.filters.unwrap_or_default();
-        check_filter_names(&filters).map_err(DescribeDBInstancesError::validation)?;
+        check_filter_names(&filters).map_err(DescribeDBInstancesError::invalid_parameter_value)?;
         crate::state::check_filter_terms(&filters)
             .map_err(DescribeDBInstancesError::validation)?;
 

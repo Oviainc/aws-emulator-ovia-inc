@@ -33,6 +33,8 @@ mod cognito_resource_types;
 mod content_delivery_stack_outputs;
 #[path = "all/drift_and_resource_reads.rs"]
 mod drift_and_resource_reads;
+#[path = "all/dynamic_references.rs"]
+mod dynamic_references;
 #[path = "all/ecs_elbv2_stack_identifiers.rs"]
 mod ecs_elbv2_stack_identifiers;
 // An EMPTY, moved-out suite: its rows now live in `all/nested_resource_outputs.rs` and

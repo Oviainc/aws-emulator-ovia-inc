@@ -104,6 +104,8 @@ fn object(body: &[u8]) -> Object {
         restore: None,
         // And it attaches no annotation; `PutObjectAnnotation` is what does.
         annotations: BTreeMap::new(),
+        // Nor an ACL; `PutObjectAcl` is what sets one.
+        acl: None,
     }
 }
 

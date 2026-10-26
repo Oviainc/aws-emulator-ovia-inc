@@ -91,6 +91,8 @@ mod option_group_setting_catalog;
 mod option_groups;
 #[path = "all/orderable_db_instance_options.rs"]
 mod orderable_db_instance_options;
+#[path = "all/parameter_refusal_codes.rs"]
+mod parameter_refusal_codes;
 #[path = "all/query_catalog_reads.rs"]
 mod query_catalog_reads;
 #[path = "all/query_error_envelope.rs"]

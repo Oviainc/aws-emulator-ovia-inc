@@ -9,6 +9,12 @@
 //! token hands the identical batch and receipt handles back. It is the ONLY file to
 //! touch for `ReceiveMessage`.
 //!
+//! A message in a queue encrypted with a customer managed KMS key is sealed under a data
+//! key only KMS can open, so the receive is gated on that key being usable and on this
+//! caller holding the decrypt grant ([`crate::state::encryption::authorize_queue_key`]):
+//! a consumer the key does not permit is answered the `Kms*` error of its class and is
+//! handed no body.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -287,8 +293,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
-
         // "The maximum number of messages to return. ... Valid values: 1 to 10.
         // Default: 1." (ReceiveMessageRequest$MaxNumberOfMessages)
         let max_messages = input.max_number_of_messages.unwrap_or(1);
@@ -366,6 +370,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = sqs::service_state(&*self.engine).ok_or_else(|| {
             ReceiveMessageErrorModeled::UnsupportedOperation(sqs::store_unavailable())
         })?;
+
+        // A message in a queue encrypted with a customer managed key is sealed under a
+        // data key only KMS can open, so a consumer the key does not permit to decrypt
+        // is refused before anything is handed over — and before anything is made
+        // invisible, so a refused receive takes nothing out of the queue.
+        sqs::encryption::authorize_queue_key(
+            &*self.engine,
+            ctx,
+            &input.queue_url,
+            sqs::encryption::DECRYPT_ACTION,
+        )
+        .map_err(kms_refusal)?;
 
         let started = SystemTime::now();
         loop {
@@ -534,6 +550,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tokio::time::sleep((wait - elapsed).min(POLL_INTERVAL)).await;
         }
     }
+}
+
+/// The KMS refusal of the queue's key, as this operation's own modelled error.
+///
+/// Each class answers with the code KMS answers it with — the `awsQueryError` codes the
+/// model carries for these shapes (`KMS.NotFoundException`, `KMS.DisabledException`,
+/// `KMS.InvalidStateException`, `KMS.InvalidKeyUsageException`,
+/// `KMS.AccessDeniedException`) — carrying the message KMS words that refusal in.
+fn kms_refusal(refusal: sqs::encryption::KeyRefusal) -> ReceiveMessageError {
+    use sqs::encryption::KeyRefusal;
+    match refusal {
+        KeyRefusal::NotFound(message) => ReceiveMessageErrorModeled::KmsNotFound(KmsNotFound {
+            message: Some(message),
+        }),
+        KeyRefusal::Disabled(message) => ReceiveMessageErrorModeled::KmsDisabled(KmsDisabled {
+            message: Some(message),
+        }),
+        KeyRefusal::InvalidState(message) => {
+            ReceiveMessageErrorModeled::KmsInvalidState(KmsInvalidState {
+                message: Some(message),
+            })
+        }
+        KeyRefusal::InvalidKeyUsage(message) => {
+            ReceiveMessageErrorModeled::KmsInvalidKeyUsage(KmsInvalidKeyUsage {
+                message: Some(message),
+            })
+        }
+        KeyRefusal::AccessDenied(message) => {
+            ReceiveMessageErrorModeled::KmsAccessDenied(KmsAccessDenied {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
 }
 
 /// Refuse a name neither of this operation's system-attribute name members accepts.

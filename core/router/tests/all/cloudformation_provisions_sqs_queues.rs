@@ -399,17 +399,31 @@ const UPDATE_ROWS: &[UpdateRow] = &[
         expected_tags: &[],
     },
     UpdateRow {
-        case: "a boolean attribute flipped and an opaque text attribute re-pointed",
+        case: "an opaque text attribute re-pointed at another key",
+        stack_name: "update-rekey-stack",
+        declared_name: Some("update-rekey-queue"),
+        created: r#"{"QueueName":"update-rekey-queue","SqsManagedSseEnabled":false,
+             "KmsMasterKeyId":"alias/aws/sqs"}"#,
+        updated: r#"{"QueueName":"update-rekey-queue","SqsManagedSseEnabled":false,
+             "KmsMasterKeyId":"alias/aws/s3"}"#,
+        expected_attributes: &[
+            ("SqsManagedSseEnabled", "false"),
+            ("KmsMasterKeyId", "alias/aws/s3"),
+        ],
+        expected_tags: &[],
+    },
+    UpdateRow {
+        case: "a boolean attribute flipped, which takes the queue off its KMS key",
         stack_name: "update-boolean-stack",
         declared_name: Some("update-boolean-queue"),
         created: r#"{"QueueName":"update-boolean-queue","SqsManagedSseEnabled":false,
              "KmsMasterKeyId":"alias/aws/sqs"}"#,
+        // Only one server-side encryption option is supported per queue, so enabling the
+        // Amazon SQS owned key goes with clearing the KMS key the queue was on — and the
+        // queue then reports the one option it is on, the cleared key id gone with it.
         updated: r#"{"QueueName":"update-boolean-queue","SqsManagedSseEnabled":true,
-             "KmsMasterKeyId":"alias/stack-managed"}"#,
-        expected_attributes: &[
-            ("SqsManagedSseEnabled", "true"),
-            ("KmsMasterKeyId", "alias/stack-managed"),
-        ],
+             "KmsMasterKeyId":""}"#,
+        expected_attributes: &[("SqsManagedSseEnabled", "true")],
         expected_tags: &[],
     },
     UpdateRow {

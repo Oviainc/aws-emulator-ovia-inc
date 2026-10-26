@@ -234,14 +234,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `DBSnapshotIdentifier` names a snapshot this call would MINT, so its form is
         // checked before anything is written. The model carries no pattern for it, so the
-        // member's documented constraints are refused here as a 400 `ValidationException`.
+        // member's documented constraints are refused here as a 400 `InvalidParameterValue`.
         if let Some(snapshot_identifier) = &input.db_snapshot_identifier {
             crate::state::check_identifier(
                 "DBSnapshotIdentifier",
                 snapshot_identifier,
                 MAX_SNAPSHOT_IDENTIFIER_LEN,
             )
-            .map_err(StopDBInstanceError::validation)?;
+            .map_err(StopDBInstanceError::invalid_parameter_value)?;
         }
 
         // "This command doesn't apply to RDS Custom, Aurora MySQL, and Aurora

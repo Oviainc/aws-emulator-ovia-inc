@@ -695,14 +695,16 @@ async fn deleting_a_service_drains_its_tasks_and_settles_on_the_clock() {
     // Rows span the desiredCount the service was left at and whether the caller forced
     // the delete: "You can delete a service if you have no running tasks in it and the
     // desired task count is zero", and `force` is what lifts that for a replica service.
-    let rows: [(&str, i64, bool, bool); 4] = [
-        ("scaled to zero, no force", 0, false, false),
-        ("scaled up, forced", 2, true, true),
-        ("scaled to one, forced", 1, true, true),
-        ("scaled up, no force", 3, false, false),
+    // The delete that goes through leaves the service DRAINING whatever it was holding:
+    // the move to INACTIVE is owed by the clock, not by the call that starts the drain.
+    let rows: [(&str, i64, bool); 4] = [
+        ("scaled to zero, no force", 0, false),
+        ("scaled up, forced", 2, true),
+        ("scaled to one, forced", 1, true),
+        ("scaled up, no force", 3, false),
     ];
 
-    for (case, desired, force, expect_draining) in rows {
+    for (case, desired, force) in rows {
         let cluster = format!("svc{}", desired * 2 + i64::from(force));
         ok(
             &router,
@@ -767,8 +769,9 @@ async fn deleting_a_service_drains_its_tasks_and_settles_on_the_clock() {
         );
         assert_eq!(
             string(deleted_service, "status", case),
-            if expect_draining { "DRAINING" } else { "INACTIVE" },
-            "case {case:?}: unexpected status for a deleted service, got {deleted}"
+            "DRAINING",
+            "case {case:?}: expected the delete to leave the service draining, got \
+             {deleted}"
         );
 
         // Read it back through DescribeServices: the record is kept, not dropped.

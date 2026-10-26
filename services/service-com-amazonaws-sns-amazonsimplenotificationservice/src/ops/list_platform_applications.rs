@@ -139,16 +139,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_PLATFORM_APPLICATIONS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
-    /// One page of the platform applications this account holds.
+    /// One page of the platform applications this account holds IN THE REGION THE
+    /// REQUEST ADDRESSES.
     ///
     /// A pure REPORT of persisted state: every entry comes from a record the
     /// mobile-push create wrote, carrying the ARN that record is held under and the
-    /// attributes it holds, and nothing here writes.
+    /// attributes it holds, and nothing here writes. The operation takes no scoping
+    /// input but the pagination token, so the regional endpoint the request reached IS
+    /// the scope of the listing.
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let region = state::request_region(ctx.parts());
         let Some(store) = state::service_state(&*self.engine) else {
             return Err(ListPlatformApplicationsErrorModeled::InternalErrorException(
                 InternalErrorException {
@@ -160,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = store.lock();
 
         let all: Vec<PlatformApplication> = store
-            .platform_applications_in_order()
+            .platform_applications_in_region(&region)
             .into_iter()
             .map(|application| PlatformApplication {
                 platform_application_arn: Some(application.arn.clone()),
@@ -175,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(ListPlatformApplicationsErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(state::INVALID_NEXT_TOKEN_REFUSAL.to_string()),
+                    message: Some(state::MOBILE_PUSH_INVALID_NEXT_TOKEN_REFUSAL.to_string()),
                 },
             )
             .into());

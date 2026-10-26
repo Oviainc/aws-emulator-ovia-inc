@@ -527,7 +527,8 @@ async fn parameters_outside_what_the_members_document_are_refused() {
     // The shapes `DBShardGroupIdentifier`'s own constraints refuse: one past the published
     // length, a leading non-letter, a trailing hyphen, two consecutive hyphens, and a
     // character outside the alphabet. The input member carries no modelled constraint, so
-    // the handler is what refuses them — with the validation code, not a 501.
+    // the handler is what refuses them — with the `InvalidParameterValue` code RDS answers
+    // a value its member does not accept with, not a 501.
     let too_long = format!("{LONGEST_IDENTIFIER}f");
     for identifier in [
         too_long.as_str(),
@@ -549,7 +550,7 @@ async fn parameters_outside_what_the_members_document_are_refused() {
             )
             .await,
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         );
     }
 

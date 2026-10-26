@@ -13,7 +13,9 @@
 //! not evaluate on (10, 20, 30 or a multiple of 60), a total evaluation period
 //! (`Period` x `EvaluationPeriods`) past the published ceiling, a `Period` no clock boundary
 //! matches on an alarm whose `EvaluationWindow` is a wall clock window, and a `Metrics` query
-//! array that does not resolve to the single time series an alarm watches. Each is checked
+//! array that does not resolve to the single time series an alarm watches, and an action
+//! naming a Region other than the alarm's own (CloudWatch executes an alarm's actions in the
+//! alarm's Region). Each is checked
 //! before the write, so a refused request stores nothing.
 //!
 //! ## Shape of an operation
@@ -686,13 +688,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation_error(message));
         }
 
+        let region = crate::state::request_region(ctx.parts());
+        // An alarm's actions are executed in the Region the alarm lives in, so one naming
+        // another Region could never run. Refused before the write, like the preconditions
+        // above, so nothing is created and an alarm this call would have replaced keeps the
+        // actions it already had.
+        if let Some(message) = crate::state::foreign_action_region_error(
+            [
+                input.ok_actions.as_deref(),
+                input.alarm_actions.as_deref(),
+                input.insufficient_data_actions.as_deref(),
+            ],
+            &region,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(message));
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             PutMetricAlarmErrorModeled::InternalServiceFault(InternalServiceFault {
                 message: Some("the CloudWatch alarm store is unavailable".into()),
             })
         })?;
 
-        let region = crate::state::request_region(ctx.parts());
         let now = crate::state::now_secs();
         // The store's lock is held for the write only, and released before the alarms are
         // settled below: an alarm evaluation takes it itself, and the notifications it owes

@@ -3,11 +3,11 @@
 //! Engine state for the com-amazonaws-sesv2-simpleemailservice-v2 service.
 //!
 //! Everything the implemented operations answer with is computed from the records
-//! below: the email-identity table, the contact-list table, the suppression-list
-//! table, the outbound-message log, the per-account send counters and the
-//! account-level attributes. Nothing here is
-//! per-request scratch — the whole struct lives in the one shared engine (see
-//! [`service_state`]).
+//! below: the email-identity table, the contact-list table, the configuration-set
+//! table, the suppression-list table, the multi-region-endpoint table, the
+//! outbound-message log, the per-account send counters and the account-level
+//! attributes. Nothing here is per-request scratch — the whole struct lives in the one
+//! shared engine (see [`service_state`]).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -73,6 +73,52 @@ pub const MAX_CONTACT_LISTS: usize = 1_000;
 /// `CreateContact`.
 pub const MAX_CONTACTS_PER_LIST: usize = 10_000;
 
+/// How long after `CreateMultiRegionEndpoint` an endpoint's `CREATING` -> `READY`
+/// transition becomes due.
+///
+/// The create call answers with the non-terminal `CREATING` ("the resource is being
+/// provisioned") and the resource becomes `READY` once provisioning finishes, which
+/// nothing here performs, so the span is CHOSEN, not documented: it is long enough
+/// that a caller reading straight back still sees the transient state, and the due
+/// instant is stored on the record so nothing ever sleeps for it.
+pub const ENDPOINT_PROVISIONING_SETTLE: Duration = Duration::from_millis(500);
+
+/// How long after `DeleteMultiRegionEndpoint` the deletion that call started is
+/// complete.
+///
+/// The delete answers with the non-terminal `DELETING` ("the resource is being deleted
+/// as requested"), so the endpoint is still there, being torn down, until this span
+/// falls due: a read reports it as `DELETING`, a second delete collides with the one
+/// already in flight, and once the span falls due the endpoint and its name are gone.
+/// CHOSEN — AWS documents no duration for a tear-down — but deliberately not
+/// sub-second like [`ENDPOINT_PROVISIONING_SETTLE`], which covers a resource becoming
+/// usable. What this one covers is a refusal: the collision is a 5xx, so a client's
+/// SDK retries the same delete for seconds before surfacing it, and a tear-down that
+/// finished inside that retry chain would answer the retrying client `404` for a
+/// resource it is still deleting — which is not what the service does. Stored as a due
+/// instant, so nothing ever sleeps for it, and stated here ONCE: this constant is the
+/// emulator's single knob for the span, and every call and test reads it from here.
+pub const ENDPOINT_DELETION_SETTLE: Duration = Duration::from_secs(10);
+
+/// The lifecycle status an endpoint whose deletion is still running is in, as AWS
+/// names it when it refuses a second delete of that endpoint.
+pub const DEPROVISIONING_STATUS: &str = "DEPROVISIONING";
+
+/// Multi-region endpoints the store holds, across every primary region.
+///
+/// A CHOSEN bound, not an AWS one (SES states its quota per account per Region, and
+/// this emulator serves one account): an endpoint is created by a request, so a
+/// long-lived emulator must not grow without limit while serving them, and the bound
+/// is on the WHOLE table — the region a record is keyed under comes from the request,
+/// so a per-region bound would not bound anything. `CreateMultiRegionEndpoint` refuses
+/// past it with the `LimitExceededException` its model binds.
+pub const MAX_MULTI_REGION_ENDPOINTS: usize = 1_000;
+
+/// Tags one resource may carry.
+///
+/// From the model's `Tag` documentation: "A resource can have as many as 50 tags."
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
 /// Tenants the account may hold.
 ///
 /// CHOSEN for the same reason as [`MAX_CONTACT_LISTS`]: one record per accepted
@@ -105,8 +151,13 @@ pub const TENANT_SENDING_STATUS_CREATED: &str = "ENABLED";
 /// account-level suppression list".
 pub const DEFAULT_SUPPRESSION_SCOPE: &str = "ACCOUNT";
 
-/// The region to stamp into the ARNs a request mints: the SigV4 credential
-/// scope's region, else [`DEFAULT_REGION`].
+/// The AWS-Region this request executes in, which is also the region to stamp into
+/// the ARNs it mints: the SigV4 credential scope's region, else [`DEFAULT_REGION`].
+///
+/// A multi-region endpoint's primary region is "the AWS-Region where the operation is
+/// executed", and only endpoints whose primary region is the Region a call executes in
+/// are visible to it, so every multi-region-endpoint operation resolves the Region
+/// here too.
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
@@ -196,6 +247,12 @@ pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
     /// opaque name the API echoes back as given, so it is keyed exactly as supplied.
     /// Ordered, so `ListContactLists` enumerates and pages deterministically.
     pub contact_lists: BTreeMap<String, ContactListRecord>,
+    /// Multi-region endpoints, keyed by their primary region and then by the
+    /// `EndpointName` they were created with. An endpoint is managed only from its
+    /// primary region, so the region is part of the key: the same name in another
+    /// region names another resource. Ordered, so `ListMultiRegionEndpoints`
+    /// enumerates and pages deterministically within one region.
+    pub multi_region_endpoints: BTreeMap<(String, String), MultiRegionEndpointRecord>,
     /// Configuration sets, keyed by the `ConfigurationSetName` they were created
     /// with. The name is an identifier the API echoes back as given and compares
     /// exactly, so it is keyed exactly as supplied. Ordered, so
@@ -218,10 +275,15 @@ pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
     /// Monotonic counter feeding [`Self::next_message_id`], so two sends in the
     /// same microsecond still get different message ids.
     pub message_sequence: u64,
+    /// Monotonic counter feeding [`Self::next_endpoint_id`], so two endpoints
+    /// created in the same microsecond still get different ids.
+    pub endpoint_sequence: u64,
 }
 
 impl ComAmazonawsSesv2SimpleemailserviceV2State {
-    /// Materialise every verification transition the clock already owes at `now`.
+    /// Materialise every transition the clock already owes at `now`: an identity's
+    /// verification, an endpoint's provisioning and the completion of an endpoint's
+    /// deletion.
     ///
     /// A reporting operation may call this: the transition was due at `now` whether
     /// or not anybody called, so applying it changes nothing a later caller would
@@ -230,6 +292,13 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
         for identity in self.identities.values_mut() {
             identity.settle(now);
         }
+        for endpoint in self.multi_region_endpoints.values_mut() {
+            endpoint.settle(now);
+        }
+        // A deletion that was due at `now` has completed, whether or not anybody
+        // called, so the endpoint it was tearing down — and its name — are gone.
+        self.multi_region_endpoints
+            .retain(|_, endpoint| !endpoint.deletion_complete(now));
         // `sent_last_24h` is a view of the log over the trailing window, not an
         // independent tally: recompute it here so it cannot drift as the window
         // moves past entries that no longer count.
@@ -310,6 +379,41 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
             .as_millis();
         let sequence = self.message_sequence;
         format!("0100{millis:012x}-{sequence:016x}-000000")
+    }
+
+    /// Mint the id of a new multi-region endpoint.
+    ///
+    /// `EndpointId` carries no documented format beyond being "the ID of the
+    /// multi-region endpoint", so the shape mirrors the dashed 8-4-4-4-12 hex id SES
+    /// hands back while the only guarantees this makes are the ones a client depends
+    /// on: the id is unique across endpoints and stable for as long as the endpoint
+    /// holds it (it is minted once, at create, and read back from the record
+    /// afterwards). Uniqueness is structural — the monotonic sequence number is
+    /// hashed in — so two endpoints created in the same millisecond still differ.
+    pub fn next_endpoint_id(&mut self, name: &str, region: &str, now: SystemTime) -> String {
+        self.endpoint_sequence += 1;
+        let nanos = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut hex = String::with_capacity(32);
+        for salt in [0_u64, u64::from_be_bytes(*b"Endpoint")] {
+            let mut hasher = DefaultHasher::new();
+            salt.hash(&mut hasher);
+            name.hash(&mut hasher);
+            region.hash(&mut hasher);
+            nanos.hash(&mut hasher);
+            self.endpoint_sequence.hash(&mut hasher);
+            write!(hex, "{:016x}", hasher.finish()).expect("writing to a String cannot fail");
+        }
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..]
+        )
     }
 
     /// Mint the next `TenantId`.
@@ -794,6 +898,181 @@ pub fn contact_not_found(contact_list_name: &str, email_address: &str) -> String
         "Contact with email address: {email_address} doesn't exist in list: \
          {contact_list_name}."
     )
+}
+
+/// The status of a multi-region endpoint, from the model's `Status` enum.
+///
+/// The enum also carries `FAILED` ("the resource failed to be provisioned"), which
+/// nothing here reaches: provisioning an emulated endpoint is bookkeeping and cannot
+/// fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointStatus {
+    /// `CREATING`: the resource is being provisioned.
+    Creating,
+    /// `READY`: the resource is ready to use.
+    Ready,
+    /// `DELETING`: the resource is being deleted as requested.
+    Deleting,
+}
+
+impl EndpointStatus {
+    /// The modelled `Status` value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Creating => "CREATING",
+            Self::Ready => "READY",
+            Self::Deleting => "DELETING",
+        }
+    }
+}
+
+/// One multi-region endpoint (global-endpoint): the regions its sending traffic is
+/// split between, its provisioning status and its tags.
+#[derive(Debug, Clone)]
+pub struct MultiRegionEndpointRecord {
+    /// The `EndpointName` this record is keyed by, as the request spelled it.
+    pub name: String,
+    /// The `EndpointId` minted for it at create time, stable for the life of the
+    /// endpoint.
+    pub endpoint_id: String,
+    /// The primary region: the Region the create call executed in, which is also
+    /// the only Region the endpoint can be read, listed or deleted from.
+    pub primary_region: String,
+    /// The secondary regions the create request's route details named, in the order
+    /// they were supplied.
+    pub secondary_regions: Vec<String>,
+    /// The provisioning status.
+    pub status: EndpointStatus,
+    /// Tags, in the order they were supplied.
+    pub tags: Vec<(String, String)>,
+    /// When the endpoint was created.
+    pub created_at: SystemTime,
+    /// When the endpoint was last changed.
+    pub last_updated_at: SystemTime,
+    /// When the `CREATING` -> `READY` transition falls due.
+    pub ready_due_at: SystemTime,
+    /// When the deletion of this endpoint completes, once one has been requested.
+    pub deletion_due_at: Option<SystemTime>,
+}
+
+impl MultiRegionEndpointRecord {
+    /// An endpoint as `CreateMultiRegionEndpoint` stores it: being provisioned, with
+    /// its `READY` transition already due at a known instant.
+    pub fn new(
+        name: &str,
+        endpoint_id: String,
+        primary_region: &str,
+        secondary_regions: Vec<String>,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            endpoint_id,
+            primary_region: primary_region.to_string(),
+            secondary_regions,
+            status: EndpointStatus::Creating,
+            tags: Vec::new(),
+            created_at: now,
+            last_updated_at: now,
+            ready_due_at: now
+                .checked_add(ENDPOINT_PROVISIONING_SETTLE)
+                .unwrap_or(now),
+            deletion_due_at: None,
+        }
+    }
+
+    /// Start tearing this endpoint down, as `DeleteMultiRegionEndpoint` does: it
+    /// carries the non-terminal `DELETING` status until the deletion completes.
+    pub fn start_deletion(&mut self, now: SystemTime) {
+        self.status = EndpointStatus::Deleting;
+        self.last_updated_at = now;
+        self.deletion_due_at = Some(
+            now.checked_add(ENDPOINT_DELETION_SETTLE)
+                .unwrap_or(now),
+        );
+    }
+
+    /// Whether a deletion of this endpoint is still running at `now`.
+    pub fn deletion_in_flight(&self, now: SystemTime) -> bool {
+        self.deletion_due_at
+            .is_some_and(|due_at| due_at > now)
+    }
+
+    /// Whether the deletion of this endpoint has completed at `now`, which is when
+    /// the endpoint stops existing at all.
+    pub fn deletion_complete(&self, now: SystemTime) -> bool {
+        self.deletion_due_at.is_some_and(|due_at| due_at <= now)
+    }
+
+    /// Apply the provisioning transition if it is due at `now`.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.status == EndpointStatus::Creating && now >= self.ready_due_at {
+            self.status = EndpointStatus::Ready;
+            self.last_updated_at = self.ready_due_at;
+        }
+    }
+
+    /// The regions traffic is split between: the primary region first, then the
+    /// secondary regions the create request named.
+    ///
+    /// "From the data flow standpoint there is no difference between primary and
+    /// secondary regions - sending traffic is divided between the two", so both the
+    /// `Regions` a listing reports and the `Routes` a read reports are this one
+    /// projection, and a create and the reads after it cannot disagree.
+    pub fn regions(&self) -> Vec<String> {
+        let mut regions = Vec::with_capacity(1 + self.secondary_regions.len());
+        regions.push(self.primary_region.clone());
+        regions.extend(self.secondary_regions.iter().cloned());
+        regions
+    }
+
+    /// The modelled `Routes` view of this record.
+    pub fn routes(&self) -> Vec<crate::ops::types::Route> {
+        self.regions()
+            .into_iter()
+            .map(|region| crate::ops::types::Route { region })
+            .collect()
+    }
+
+    /// The modelled `MultiRegionEndpoint` view of this record, as
+    /// `ListMultiRegionEndpoints` reports it.
+    pub fn summary(&self) -> crate::ops::types::MultiRegionEndpoint {
+        crate::ops::types::MultiRegionEndpoint {
+            endpoint_name: Some(self.name.clone()),
+            status: Some(self.status.as_str().to_string()),
+            endpoint_id: Some(self.endpoint_id.clone()),
+            regions: Some(self.regions()),
+            created_timestamp: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            last_updated_timestamp: Some(::aws_smithy_types::DateTime::from(self.last_updated_at)),
+        }
+    }
+}
+
+/// How this service words `NotFoundException` for a multi-region endpoint the Region
+/// the call executes in does not hold.
+///
+/// A read answers it with no message at all — the error code is the whole answer —
+/// while a delete of an endpoint that is not there says so
+/// ([`multi_region_endpoint_not_found_to_delete`]), so this is the one place that
+/// states both.
+pub fn multi_region_endpoint_not_found() -> crate::ops::types::NotFoundException {
+    crate::ops::types::NotFoundException { message: None }
+}
+
+/// How this service words `NotFoundException` when a delete names an endpoint the
+/// Region does not hold.
+pub fn multi_region_endpoint_not_found_to_delete() -> crate::ops::types::NotFoundException {
+    crate::ops::types::NotFoundException {
+        message: Some("Endpoint does not exist.".to_string()),
+    }
+}
+
+/// How this service words the refusal of a delete that collides with a tear-down
+/// already running: the refusal names the status the resource is in, which for this
+/// refusal is always [`DEPROVISIONING_STATUS`] — the one status a delete cannot act
+/// on, because it is the one a delete put the resource into.
+pub fn unable_to_delete_while_deprovisioning() -> String {
+    format!("Unable to delete resource in {DEPROVISIONING_STATUS} status.")
 }
 
 /// One configuration set: the rules a send that names it is subject to.
@@ -1389,6 +1668,9 @@ pub const CONTACT_LISTS_PAGE_TOKEN_TAG: &str = "sesv2:contact-lists:";
 
 /// The tag `ListContacts`'s own tokens carry.
 pub const CONTACTS_PAGE_TOKEN_TAG: &str = "sesv2:contacts:";
+
+/// The tag `ListMultiRegionEndpoints`'s own tokens carry.
+pub const MULTI_REGION_ENDPOINTS_PAGE_TOKEN_TAG: &str = "sesv2:multi-region-endpoints:";
 
 /// Encode a `NextToken` that resumes the listing tagged `tag` after `last_returned`.
 ///

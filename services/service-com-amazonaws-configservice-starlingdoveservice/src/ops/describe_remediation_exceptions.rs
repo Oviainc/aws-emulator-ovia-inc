@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeRemediationExceptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeRemediationExceptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeRemediationExceptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the remediation exceptions one Config rule holds ("A detailed view of a
+//! remediation exception for a set of resources that includes an explanation of an
+//! exception and the time when the exception will be deleted").
+//!
+//! The rules this handler applies: a request naming resource keys reports the exceptions
+//! the rule holds for exactly those resources, and a request naming none reports every
+//! exception the rule holds, paged ("Limit and next token are not applicable if you
+//! request resources in batch. It is only applicable, when you request all resources");
+//! an exception the clock has already taken past its `ExpirationTime` is reported by
+//! neither.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +161,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeRemediationExceptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeRemediationExceptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeRemediationExceptions"))
+        // `ctx` carries request metadata only; this report is computed from state.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // A resource key names ONE resource by its type and its id, so a key missing
+        // either names no resource to report on. Both members are optional in the model,
+        // so this is judged here rather than at the boundary.
+        let selected = input.resource_keys.unwrap_or_default();
+        if let Some(incomplete) = selected.iter().find(|key| {
+            key.resource_type
+                .as_deref()
+                .is_none_or(|resource_type| resource_type.trim().is_empty())
+                || key
+                    .resource_id
+                    .as_deref()
+                    .is_none_or(|resource_id| resource_id.trim().is_empty())
+        }) {
+            return Err(
+                DescribeRemediationExceptionsErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "A ResourceKey must name both a resourceType and a resourceId; \
+                             got resourceType '{}' and resourceId '{}'.",
+                            incomplete.resource_type.clone().unwrap_or_default(),
+                            incomplete.resource_id.clone().unwrap_or_default(),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Limit and next token are not applicable if you request resources in batch. It
+        // is only applicable, when you request all resources": a request that names its
+        // resources is answered with the exceptions of exactly those, so neither is read.
+        let batch = !selected.is_empty();
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input.next_token.as_deref().filter(|_| !batch) {
+            None => None,
+            Some(token) => match crate::state::decode_remediation_exception_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(
+                        DescribeRemediationExceptionsErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // "The maximum number of RemediationExceptionResourceKey returned on each page.
+        // The default is 25. If you specify 0, Config uses the default", and a page can
+        // carry no more than the modelled `RemediationExceptions` length maximum however
+        // large a limit the caller asks for.
+        let page_size = usize::try_from(input.limit)
+            .ok()
+            .filter(|limit| *limit > 0)
+            .unwrap_or(REMEDIATION_EXCEPTIONS_DEFAULT_PAGE_SIZE)
+            .min(REMEDIATION_EXCEPTIONS_MAX_PAGE_SIZE);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // An exception the clock has already taken past its expiration time is gone
+        // whether or not anybody deleted it, so the deletions the clock owes are
+        // materialised before this report says what the rule holds.
+        store.expire_remediation_exceptions(now);
+
+        // Page over the store's own key ordering, so a token holds the resource key the
+        // next page resumes at and survives exceptions added or removed between pages.
+        // The key carries the rule first, so one rule's exceptions are a contiguous run
+        // of it.
+        let mut page = Vec::new();
+        let mut next_token = None;
+        for (key, exception) in &store.remediation_exceptions {
+            let (rule_name, resource_type, resource_id) = key;
+            if rule_name != &input.config_rule_name {
+                continue;
+            }
+            if resume_at.as_ref().is_some_and(|(from_type, from_id)| {
+                (resource_type, resource_id) < (from_type, from_id)
+            }) {
+                continue;
+            }
+            if batch
+                && !selected.iter().any(|named| {
+                    named.resource_type.as_deref() == Some(resource_type.as_str())
+                        && named.resource_id.as_deref() == Some(resource_id.as_str())
+                })
+            {
+                continue;
+            }
+            // A request that names its resources is answered with all of them, so only a
+            // report of every exception the rule holds is cut into pages.
+            if !batch && page.len() == page_size {
+                next_token = Some(crate::state::encode_remediation_exception_token(&(
+                    resource_type.clone(),
+                    resource_id.clone(),
+                )));
+                break;
+            }
+            page.push(exception.to_shape());
+        }
+
+        Ok(DescribeRemediationExceptionsOutput {
+            remediation_exceptions: Some(page),
+            next_token,
+        })
     }
 }
+
+/// The page this report serves a request that asks for no size of its own
+/// (`DescribeRemediationExceptionsRequest$Limit`: "The maximum number of
+/// RemediationExceptionResourceKey returned on each page. The default is 25. If you
+/// specify 0, Config uses the default").
+const REMEDIATION_EXCEPTIONS_DEFAULT_PAGE_SIZE: usize = 25;
+
+/// The largest page this report serves, which is the modelled maximum length of the list
+/// it answers with (`DescribeRemediationExceptionsResponse$RemediationExceptions`,
+/// length 0..25).
+const REMEDIATION_EXCEPTIONS_MAX_PAGE_SIZE: usize = 25;
