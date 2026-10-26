@@ -393,6 +393,35 @@ fn table(keys: &[String]) -> Vec<Profile> {
     ]
 }
 
+/// Store ONE field-level encryption profile under `reference` and report the id the service
+/// minted for it.
+///
+/// The profile surface's own create path — a public key uploaded through the public key
+/// surface and a profile that encrypts with it — so a suite that needs a profile to point at
+/// (the field-level encryption CONFIGURATION surface, whose mappings name one) starts from a
+/// profile this service really stored rather than from an id made up there.
+pub(crate) async fn store_profile(router: &MultiServiceRouter, reference: &str) -> String {
+    let key = upload_key(router, 0).await;
+    let row = Profile::new(
+        "a stored profile",
+        reference,
+        None,
+        vec![Entity::new(&key, "provider-one", &["CreditCard"])],
+    );
+    let answer = create_profile(router, &row.xml()).await;
+    assert_eq!(
+        answer.status, 201,
+        "case storing the profile {reference:?}: expected HTTP 201, got {} with {}",
+        answer.status, answer.raw
+    );
+    let id = answer.root().text_at("Id").unwrap_or_default().to_string();
+    assert!(
+        is_profile_id(&id),
+        "case storing the profile {reference:?}: expected a minted profile id, got {id:?}"
+    );
+    id
+}
+
 /// Upload the public keys the table's rows encrypt with.
 async fn upload_keys(router: &MultiServiceRouter) -> Vec<String> {
     let mut keys = Vec::new();

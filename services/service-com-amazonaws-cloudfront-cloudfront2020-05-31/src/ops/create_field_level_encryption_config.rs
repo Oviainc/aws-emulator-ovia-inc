@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFieldLevelEncryptionConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFieldLevelEncryptionConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFieldLevelEncryptionConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one field-level encryption configuration: the call MINTS the configuration's
+//! identity (an id and a version token), records the instant it was written and PERSISTS the
+//! configuration as submitted, so `GetFieldLevelEncryption` and
+//! `GetFieldLevelEncryptionConfig` answer from that record rather than from the request being
+//! served.
+//!
+//! A mutating operation and the only path by which a field-level encryption configuration
+//! enters this service's store.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +161,203 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFieldLevelEncryptionConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFieldLevelEncryptionConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let config = input.field_level_encryption_config;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Materialise whatever the clock owes the rest of the store before this call reads
+        // it, as every handler here does. A field-level encryption configuration itself has
+        // no transition owed: the model gives it no status, so one this service accepts is
+        // usable at once.
+        store.settle(now);
+
+        // Every CloudFront list travels in a wrapper that states its own length beside the
+        // list itself, and a request whose `Quantity` disagrees with its `Items` describes no
+        // list at all. The sentence the refusal carries is the one CloudFront sends for it,
+        // built from the request: "The specified quantity of <wrapper> (<stated>) does not
+        // match the actual quantity supplied (<carried>)." Checked over every wrapper this
+        // configuration reaches — the `QueryArgProfiles` and the `ContentTypeProfiles` —
+        // before anything is minted.
+        if let Some(message) = crate::state::field_level_encryption_config_quantity_mismatch(&config)
+        {
+            return Err(
+                CreateFieldLevelEncryptionConfigErrorModeled::InconsistentQuantities(
+                    InconsistentQuantities {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "An optional comment about the configuration. The comment cannot be longer than 128
+        // characters." The member carries no `@length` in the model, so the documented bound
+        // is refused here — with the refusal this operation models for an unusable argument —
+        // BEFORE anything is minted.
+        let comment_length = config.comment.as_deref().unwrap_or_default().chars().count();
+        if comment_length > crate::state::MAX_FIELD_LEVEL_ENCRYPTION_CONFIG_COMMENT {
+            return Err(CreateFieldLevelEncryptionConfigErrorModeled::InvalidArgument(
+                crate::state::comment_too_long(comment_length),
+            )
+            .into());
+        }
+
+        let query_arg_profiles: &[QueryArgProfile] = config
+            .query_arg_profile_config
+            .as_ref()
+            .and_then(|query_arg| query_arg.query_arg_profiles.as_ref())
+            .and_then(|profiles| profiles.items.as_deref())
+            .unwrap_or_default();
+        let content_type_profiles: &[ContentTypeProfile] = config
+            .content_type_profile_config
+            .as_ref()
+            .and_then(|content_type| content_type.content_type_profiles.as_ref())
+            .and_then(|profiles| profiles.items.as_deref())
+            .unwrap_or_default();
+
+        // `QueryArgProfile$ProfileId` is "ID of profile to use for field-level encryption
+        // query argument-profile mapping": a mapping pairs a query argument with the profile
+        // the matching fields are encrypted under, so one that states no profile maps its
+        // argument to nothing — "No profile specified for the field-level encryption query
+        // argument."
+        if query_arg_profiles
+            .iter()
+            .any(|profile| profile.profile_id.trim().is_empty())
+        {
+            return Err(CreateFieldLevelEncryptionConfigErrorModeled::QueryArgProfileEmpty(
+                crate::state::query_arg_profile_empty(),
+            )
+            .into());
+        }
+
+        // Each mapping list is stored WHOLE inside the configuration record, so its length is
+        // bounded before anything is minted, each with the refusal the model names for it.
+        if query_arg_profiles.len() > crate::state::MAX_FIELD_LEVEL_ENCRYPTION_QUERY_ARG_PROFILES {
+            return Err(
+                CreateFieldLevelEncryptionConfigErrorModeled::TooManyFieldLevelEncryptionQueryArgProfiles(
+                    crate::state::too_many_field_level_encryption_query_arg_profiles(),
+                )
+                .into(),
+            );
+        }
+        if content_type_profiles.len()
+            > crate::state::MAX_FIELD_LEVEL_ENCRYPTION_CONTENT_TYPE_PROFILES
+        {
+            return Err(
+                CreateFieldLevelEncryptionConfigErrorModeled::TooManyFieldLevelEncryptionContentTypeProfiles(
+                    crate::state::too_many_field_level_encryption_content_type_profiles(),
+                )
+                .into(),
+            );
+        }
+
+        // A caller reference identifies ONE configuration for its whole life: it is "a unique
+        // number that ensures the request can't be replayed", so a repeat under a reference
+        // the store already holds is either the SAME request again or a second configuration
+        // under a taken reference. What separates the two is the content of the configuration
+        // — the rule this service's distribution, origin access identity, public key and
+        // field-level encryption profile creates follow for their own references: a repeat
+        // whose configuration is the one that reference already names is answered with that
+        // configuration, its version and its location (creating nothing), and a repeat that
+        // changes the configuration is refused.
+        if let Some(existing) =
+            store.field_level_encryption_config_by_caller_reference(&config.caller_reference)
+        {
+            if crate::state::same_field_level_encryption_config(&existing.config, &config) {
+                // The same request again: the record the first create left behind, at its
+                // current version. Nothing is minted and nothing is stored.
+                return Ok(CreateFieldLevelEncryptionConfigOutput {
+                    field_level_encryption: Some(existing.to_field_level_encryption()),
+                    location: Some(crate::state::location_uri(
+                        &crate::state::field_level_encryption_config_path(&existing.id),
+                    )),
+                    e_tag: Some(existing.etag.clone()),
+                });
+            }
+            let message =
+                crate::state::field_level_encryption_config_already_exists_message(&existing.id);
+            return Err(
+                CreateFieldLevelEncryptionConfigErrorModeled::FieldLevelEncryptionConfigAlreadyExists(
+                    FieldLevelEncryptionConfigAlreadyExists {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Both mapping kinds name the PROFILE whose encryption entities the matching fields
+        // are encrypted under — `QueryArgProfile$ProfileId` for the profile a query argument
+        // selects, `ContentTypeProfile$ProfileId` for the one a content type is encrypted
+        // under — so an id no stored profile carries names no profile to encrypt with and no
+        // configuration can be built from it. `ContentTypeProfile$ProfileId` is optional, and
+        // a mapping that names none selects no profile at all rather than an unknown one.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFieldLevelEncryptionConfig"))
+        // Checked AFTER the caller reference above, because the replay that reference answers
+        // creates nothing: it reports the configuration the first create already stored, whose
+        // profiles were resolved then, so a repeat of that request stays idempotent even if
+        // one of the profiles it named has since been deleted.
+        let names_unknown_profile = query_arg_profiles
+            .iter()
+            .map(|profile| profile.profile_id.as_str())
+            .chain(
+                content_type_profiles
+                    .iter()
+                    .filter_map(|profile| profile.profile_id.as_deref()),
+            )
+            .any(|profile_id| store.field_level_encryption_profile(profile_id).is_none());
+        if names_unknown_profile {
+            return Err(
+                CreateFieldLevelEncryptionConfigErrorModeled::NoSuchFieldLevelEncryptionProfile(
+                    crate::state::no_such_field_level_encryption_profile(),
+                )
+                .into(),
+            );
+        }
+
+        // "The maximum number of configurations for field-level encryption have been
+        // created." A configuration record is what a later read answers from, so it cannot be
+        // evicted: the bound is an entry count refused BEFORE anything is minted.
+        if store.field_level_encryption_configs.len()
+            >= crate::state::MAX_FIELD_LEVEL_ENCRYPTION_CONFIGS
+        {
+            return Err(
+                CreateFieldLevelEncryptionConfigErrorModeled::TooManyFieldLevelEncryptionConfigs(
+                    crate::state::too_many_field_level_encryption_configs(),
+                )
+                .into(),
+            );
+        }
+
+        let id = store.allocate_field_level_encryption_config_id();
+        let etag = store.next_etag();
+        let stored = crate::state::StoredFieldLevelEncryptionConfig {
+            id: id.clone(),
+            // "The last time the field-level encryption configuration was changed": for a
+            // configuration nothing has changed yet, the instant this call stored it.
+            last_modified_time: now,
+            // Stored whole: a later read answers from this record, never from the request
+            // that was served.
+            config,
+            etag: etag.clone(),
+        };
+        // Read from the record just built, never from the request.
+        let field_level_encryption = stored.to_field_level_encryption();
+        let location =
+            crate::state::location_uri(&crate::state::field_level_encryption_config_path(&id));
+        store.field_level_encryption_configs.insert(id, stored);
+
+        Ok(CreateFieldLevelEncryptionConfigOutput {
+            // "Returned when you create a new field-level encryption configuration."
+            field_level_encryption: Some(field_level_encryption),
+            // "The fully qualified URI of the new configuration resource just created."
+            location: Some(location),
+            // "The current version of the field level encryption configuration" — the token
+            // an `If-Match` against this configuration is checked against.
+            e_tag: Some(etag),
+        })
     }
 }
