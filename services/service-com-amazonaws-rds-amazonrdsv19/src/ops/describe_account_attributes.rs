@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAccountAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAccountAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports each published Amazon RDS account quota with the
+//! usage read off this service's store. This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAccountAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The records the usage is counted from, and the limits this service enforces on them,
+//! live in [`crate::state`] beside the operations that create them, so a quota this
+//! report names cannot disagree with the create that refuses past it.
 //!
 //! ## Shape of an operation
 //!
@@ -130,18 +127,393 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAccountAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAccountAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAccountAttributes"))
+        // "This command doesn't take any parameters": the input shape has no members,
+        // so there is nothing to read off the request but the region it was signed for.
+        let _ = &input;
+        let region = crate::state::request_region(ctx)
+            .map_err(DescribeAccountAttributesError::validation)?;
+
+        // No store means this service was mounted on an engine it has no state in,
+        // so it cannot serve the operation at all. Unreachable with the engine the
+        // router builds; 501 is the honest answer, never a fabricated quota report.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due: the ones
+        // owed at this instant whether or not anybody called. A record whose deletion
+        // the clock has finished no longer consumes its quota.
+        store.settle_due_transitions(&region);
+
+        // Every quota of the catalog, in the order `AccountQuota` documents them, each
+        // one's usage counted out of the records the signed region holds.
+        let account_quotas = ACCOUNT_QUOTAS
+            .iter()
+            .map(|quota| AccountQuota {
+                account_quota_name: Some(quota.name.to_string()),
+                used: Some((quota.used)(&store, &region)),
+                max: Some(quota.max),
+            })
+            .collect();
+
+        Ok(DescribeAccountAttributesOutput {
+            account_quotas: Some(account_quotas),
+        })
     }
+}
+
+/// This service's store, as the usage readers below take it.
+type Store = crate::state::ComAmazonawsRdsAmazonrdsv19State;
+
+/// One quota of the account-quota catalog: the name it is reported under, the maximum
+/// reported for it, and how the usage toward it is read out of the store.
+struct Quota {
+    /// `AccountQuotaName` — "the name of the Amazon RDS quota for this Amazon Web
+    /// Services account".
+    name: &'static str,
+    /// `Max` — "the maximum allowed value for the quota". For every resource this
+    /// service stores, the limit its own create path enforces, so this report and the
+    /// quota-exceeded refusal state one and the same number; for a resource no
+    /// implemented operation creates yet, Amazon RDS's published default quota.
+    max: i64,
+    /// `Used` — "the amount currently used toward the quota maximum", counted out of
+    /// the records the signed region holds.
+    used: fn(&Store, &str) -> i64,
+}
+
+/// The `SnapshotType` of a snapshot a caller asked for, which is what the two manual
+/// snapshot quotas count; `crate::state::SNAPSHOT_TYPES` has the documented values.
+const MANUAL_SNAPSHOT: &str = "manual";
+
+/// The total allocated storage, in GiB, one account may hold: Amazon RDS's published
+/// default quota ("Total storage for all DB instances": 100,000 GiB). No implemented
+/// operation enforces a total, so the published allowance is what is reported.
+const TOTAL_ALLOCATED_STORAGE_GIB: i64 = 100_000;
+
+/// How many DB security groups one account may hold: Amazon RDS's published default
+/// quota ("DB security groups": 25), which covers EC2-Classic only. This service stores
+/// no DB security group, so nothing is used toward it.
+const DB_SECURITY_GROUP_QUOTA: i64 = 25;
+
+/// How many ingress rules ONE DB security group may hold: Amazon RDS's published default
+/// quota ("Authorizations per DB security group": 20).
+const AUTHORIZATIONS_PER_DB_SECURITY_GROUP_QUOTA: i64 = 20;
+
+/// How many custom endpoints ONE DB cluster may hold: Amazon Aurora's published default
+/// quota ("Custom endpoints per DB cluster": 5).
+const CUSTOM_ENDPOINTS_PER_DB_CLUSTER_QUOTA: i64 = 5;
+
+/// How many IAM roles may be associated with ONE DB cluster or ONE DB instance: Amazon
+/// RDS's published default quota ("IAM roles per DB cluster" and "IAM roles per DB
+/// instance": 5 each).
+const IAM_ROLES_PER_RESOURCE_QUOTA: i64 = 5;
+
+/// How many read replicas ONE DB instance may have: Amazon RDS's published default quota
+/// ("Read replicas per primary": 15).
+const READ_REPLICAS_PER_MASTER_QUOTA: i64 = 15;
+
+/// How many reserved DB instances one account may hold: Amazon RDS's published default
+/// quota ("Reserved DB instances": 40 per Region). This service stores no reservation,
+/// so nothing is used toward it.
+const RESERVED_DB_INSTANCES_QUOTA: i64 = 40;
+
+/// The account quotas this service reports, in the order the `AccountQuota` shape's own
+/// documentation lists them (`smithy_query(query="doc",shape="AccountQuota")`), each
+/// with the usage that documentation defines for it.
+const ACCOUNT_QUOTAS: &[Quota] = &[
+    // "The total allocated storage per account, in GiB."
+    Quota {
+        name: "AllocatedStorage",
+        max: TOTAL_ALLOCATED_STORAGE_GIB,
+        used: allocated_storage_used,
+    },
+    // "The number of ingress rules per DB security group. The used value is the highest
+    // number of ingress rules in a DB security group in the account."
+    Quota {
+        name: "AuthorizationsPerDBSecurityGroup",
+        max: AUTHORIZATIONS_PER_DB_SECURITY_GROUP_QUOTA,
+        used: db_security_group_ingress_used,
+    },
+    // "The number of custom endpoints per DB cluster. The used value is the highest
+    // number of custom endpoints in a DB clusters in the account."
+    Quota {
+        name: "CustomEndpointsPerDBCluster",
+        max: CUSTOM_ENDPOINTS_PER_DB_CLUSTER_QUOTA,
+        used: custom_endpoints_used,
+    },
+    // "The number of DB cluster parameter groups per account, excluding default
+    // parameter groups." A `default.<family>` group is the service's own and is not a
+    // stored record, so the stored groups are exactly the nondefault ones.
+    Quota {
+        name: "DBClusterParameterGroups",
+        max: crate::state::DB_CLUSTER_PARAMETER_GROUP_QUOTA_PER_REGION as i64,
+        used: cluster_parameter_groups_used,
+    },
+    // "The number of associated ... (IAM) roles per DB cluster. The used value is the
+    // highest number of associated IAM roles for a DB cluster in the account."
+    Quota {
+        name: "DBClusterRoles",
+        max: IAM_ROLES_PER_RESOURCE_QUOTA,
+        used: cluster_roles_used,
+    },
+    // "The number of DB clusters per account."
+    Quota {
+        name: "DBClusters",
+        max: crate::state::DB_CLUSTER_QUOTA_PER_REGION as i64,
+        used: clusters_used,
+    },
+    // "The number of associated IAM roles per DB instance. The used value is the highest
+    // number of associated IAM roles for a DB instance in the account."
+    Quota {
+        name: "DBInstanceRoles",
+        max: IAM_ROLES_PER_RESOURCE_QUOTA,
+        used: instance_roles_used,
+    },
+    // "The number of DB instances per account."
+    Quota {
+        name: "DBInstances",
+        max: crate::state::DB_INSTANCE_QUOTA_PER_REGION as i64,
+        used: instances_used,
+    },
+    // "The number of DB parameter groups per account, excluding default parameter
+    // groups."
+    Quota {
+        name: "DBParameterGroups",
+        max: crate::state::DB_PARAMETER_GROUP_QUOTA_PER_REGION as i64,
+        used: parameter_groups_used,
+    },
+    // "The number of DB security groups (not VPC security groups) per account, excluding
+    // the default security group."
+    Quota {
+        name: "DBSecurityGroups",
+        max: DB_SECURITY_GROUP_QUOTA,
+        used: db_security_groups_used,
+    },
+    // "The number of DB subnet groups per account."
+    Quota {
+        name: "DBSubnetGroups",
+        max: crate::state::DB_SUBNET_GROUP_QUOTA_PER_REGION as i64,
+        used: db_subnet_groups_used,
+    },
+    // "The number of event subscriptions per account."
+    Quota {
+        name: "EventSubscriptions",
+        max: crate::state::EVENT_SUBSCRIPTION_QUOTA_PER_REGION as i64,
+        used: event_subscriptions_used,
+    },
+    // "The number of manual DB cluster snapshots per account."
+    Quota {
+        name: "ManualClusterSnapshots",
+        max: crate::state::DB_CLUSTER_SNAPSHOT_QUOTA_PER_REGION as i64,
+        used: manual_cluster_snapshots_used,
+    },
+    // "The number of manual DB instance snapshots per account."
+    Quota {
+        name: "ManualSnapshots",
+        max: crate::state::DB_SNAPSHOT_QUOTA_PER_REGION as i64,
+        used: manual_snapshots_used,
+    },
+    // "The number of DB option groups per account, excluding default option groups." A
+    // `default:<engine>-<version>` group is the service's own and is not a stored
+    // record, so the stored groups are exactly the nondefault ones.
+    Quota {
+        name: "OptionGroups",
+        max: crate::state::OPTION_GROUP_QUOTA_PER_REGION as i64,
+        used: option_groups_used,
+    },
+    // "The number of read replicas per DB instance. The used value is the highest number
+    // of read replicas for a DB instance in the account."
+    Quota {
+        name: "ReadReplicasPerMaster",
+        max: READ_REPLICAS_PER_MASTER_QUOTA,
+        used: read_replicas_used,
+    },
+    // "The number of reserved DB instances per account. The used value is the count of
+    // the active reserved DB instances in the account."
+    Quota {
+        name: "ReservedDBInstances",
+        max: RESERVED_DB_INSTANCES_QUOTA,
+        used: reserved_db_instances_used,
+    },
+    // "The number of subnets per DB subnet group. The used value is highest number of
+    // subnets for a DB subnet group in the account."
+    Quota {
+        name: "SubnetsPerDBSubnetGroup",
+        max: crate::state::MAX_SUBNETS_PER_DB_SUBNET_GROUP as i64,
+        used: subnets_per_group_used,
+    },
+];
+
+/// How many records of one kind the region holds, as a `Used` value.
+fn count(records: usize) -> i64 {
+    i64::try_from(records).unwrap_or(i64::MAX)
+}
+
+/// The storage the region's DB instances allocate, summed. An Aurora cluster's storage
+/// is the cluster's own, managed concern rather than an allocation a request makes, so
+/// the instances are what carry usage toward this quota.
+fn allocated_storage_used(store: &Store, region: &str) -> i64 {
+    store
+        .instances_in(region)
+        .into_iter()
+        .map(|record| i64::from(record.allocated_storage.unwrap_or(0)))
+        .sum()
+}
+
+/// The ingress rules of the fullest DB security group. No implemented operation creates
+/// a DB security group (they are EC2-Classic, which RDS retired), so the region holds
+/// none and none of them holds a rule.
+fn db_security_group_ingress_used(_store: &Store, _region: &str) -> i64 {
+    0
+}
+
+/// The DB security groups the region holds — none, for the reason
+/// [`db_security_group_ingress_used`] gives.
+fn db_security_groups_used(_store: &Store, _region: &str) -> i64 {
+    0
+}
+
+/// The custom endpoints of the DB cluster that has the most of them, read off the
+/// clusters' own reports so this count cannot disagree with `DescribeDBClusters`.
+fn custom_endpoints_used(store: &Store, region: &str) -> i64 {
+    store
+        .clusters_in(region)
+        .into_iter()
+        .map(|record| {
+            count(
+                store
+                    .cluster_to_wire(record)
+                    .custom_endpoints
+                    .map_or(0, |endpoints| endpoints.len()),
+            )
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The nondefault cluster parameter groups the region holds — the count
+/// `CreateDBClusterParameterGroup` compares against its limit.
+fn cluster_parameter_groups_used(store: &Store, region: &str) -> i64 {
+    count(store.cluster_parameter_groups_in(region).len())
+}
+
+/// The IAM roles of the DB cluster that has the most of them.
+fn cluster_roles_used(store: &Store, region: &str) -> i64 {
+    store
+        .clusters_in(region)
+        .into_iter()
+        .map(|record| count(record.associated_roles.len()))
+        .max()
+        .unwrap_or(0)
+}
+
+/// The DB clusters the region holds — the count `CreateDBCluster` compares against its
+/// limit.
+fn clusters_used(store: &Store, region: &str) -> i64 {
+    count(store.clusters_in(region).len())
+}
+
+/// The IAM roles of the DB instance that has the most of them, read off the instances'
+/// own reports so this count cannot disagree with `DescribeDBInstances`.
+fn instance_roles_used(store: &Store, region: &str) -> i64 {
+    store
+        .instances_in(region)
+        .into_iter()
+        .map(|record| {
+            count(
+                record
+                    .to_wire()
+                    .associated_roles
+                    .map_or(0, |roles| roles.len()),
+            )
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The DB instances the region holds — the count `CreateDBInstance` compares against its
+/// limit.
+fn instances_used(store: &Store, region: &str) -> i64 {
+    count(store.instances_in(region).len())
+}
+
+/// The nondefault DB parameter groups the region holds — the count
+/// `CreateDBParameterGroup` compares against its limit.
+fn parameter_groups_used(store: &Store, region: &str) -> i64 {
+    count(store.parameter_groups_in(region).len())
+}
+
+/// The DB subnet groups the region holds — the count `CreateDBSubnetGroup` compares
+/// against its limit. The account-owned `default` group is the service's own and is not
+/// a stored record, so it consumes none of the allowance.
+fn db_subnet_groups_used(store: &Store, region: &str) -> i64 {
+    count(store.db_subnet_groups_in(region).len())
+}
+
+/// The event notification subscriptions the region holds — the count
+/// `CreateEventSubscription` compares against its limit.
+fn event_subscriptions_used(store: &Store, region: &str) -> i64 {
+    count(store.event_subscriptions_in(region).len())
+}
+
+/// The manual DB cluster snapshots the region holds.
+fn manual_cluster_snapshots_used(store: &Store, region: &str) -> i64 {
+    count(
+        store
+            .cluster_snapshots_in(region)
+            .into_iter()
+            .filter(|record| record.snapshot_type == MANUAL_SNAPSHOT)
+            .count(),
+    )
+}
+
+/// The manual DB instance snapshots the region holds.
+fn manual_snapshots_used(store: &Store, region: &str) -> i64 {
+    count(
+        store
+            .snapshots_in(region)
+            .into_iter()
+            .filter(|record| record.snapshot_type == MANUAL_SNAPSHOT)
+            .count(),
+    )
+}
+
+/// The nondefault option groups the region holds — the count `CreateOptionGroup`
+/// compares against its limit.
+fn option_groups_used(store: &Store, region: &str) -> i64 {
+    count(store.option_groups_in(region).len())
+}
+
+/// The read replicas of the DB instance that has the most of them, read off the
+/// instances' own reports so this count cannot disagree with `DescribeDBInstances`.
+fn read_replicas_used(store: &Store, region: &str) -> i64 {
+    store
+        .instances_in(region)
+        .into_iter()
+        .map(|record| {
+            count(
+                record
+                    .to_wire()
+                    .read_replica_db_instance_identifiers
+                    .map_or(0, |replicas| replicas.len()),
+            )
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The active reserved DB instances the region holds. No implemented operation purchases
+/// a reservation, so it holds none.
+fn reserved_db_instances_used(_store: &Store, _region: &str) -> i64 {
+    0
+}
+
+/// The subnets of the DB subnet group that names the most of them.
+fn subnets_per_group_used(store: &Store, region: &str) -> i64 {
+    store
+        .db_subnet_groups_in(region)
+        .into_iter()
+        .map(|record| count(record.subnet_ids.len()))
+        .max()
+        .unwrap_or(0)
 }
