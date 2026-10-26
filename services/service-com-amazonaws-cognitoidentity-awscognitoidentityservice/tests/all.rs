@@ -15,8 +15,12 @@
 mod anonymous_credential_exchange;
 #[path = "all/anonymous_credential_vend.rs"]
 mod anonymous_credential_vend;
+#[path = "all/basic_flow_gate.rs"]
+mod basic_flow_gate;
 #[path = "all/control_plane_audit.rs"]
 mod control_plane_audit;
+#[path = "all/describe_identity.rs"]
+mod describe_identity;
 #[path = "all/developer_credentials_authorization.rs"]
 mod developer_credentials_authorization;
 #[path = "all/developer_identity_tokens.rs"]
@@ -37,6 +41,8 @@ mod lookup_developer_identity;
 mod open_id_token;
 #[path = "all/principal_tag_attribute_map.rs"]
 mod principal_tag_attribute_map;
+#[path = "all/redeemed_token_methods.rs"]
+mod redeemed_token_methods;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/response_request_id.rs"]
