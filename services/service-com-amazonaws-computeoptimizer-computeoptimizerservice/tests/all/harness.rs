@@ -300,6 +300,44 @@ pub(crate) fn error_code(body: &Value) -> String {
     body["__type"].as_str().unwrap_or_default().to_string()
 }
 
+/// The `s3Destination` members an accepted `Export*Recommendations` call answered:
+/// (bucket, key, metadataKey). Shared so no export suite reads the destination differently.
+pub(crate) fn export_destination(case: &str, body: &Value) -> (String, String, String) {
+    let destination = &body["s3Destination"];
+    let member = |name: &str| {
+        destination[name]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: an accepted export answers s3Destination.{name}, got {body}")
+            })
+            .to_string()
+    };
+    (member("bucket"), member("key"), member("metadataKey"))
+}
+
+/// One export file as rows of cells, read with the same `csv` codec it is written with.
+pub(crate) fn csv_rows(document: &str) -> Vec<Vec<String>> {
+    ::csv::ReaderBuilder::new()
+        .has_headers(false)
+        .from_reader(document.as_bytes())
+        .records()
+        .map(|record| {
+            let record = record
+                .unwrap_or_else(|error| panic!("the export file is comma-separated values: {error}"));
+            record.iter().map(ToString::to_string).collect()
+        })
+        .collect()
+}
+
+/// The cell of `row` under `column`, by the header the document carries.
+pub(crate) fn cell<'a>(header: &[String], row: &'a [String], column: &str) -> &'a str {
+    header
+        .iter()
+        .position(|held| held == column)
+        .and_then(|at| row.get(at))
+        .map_or("", String::as_str)
+}
+
 /// Opt the account in, which every preference operation requires.
 pub(crate) async fn opt_in(router: &MultiServiceRouter) {
     let (status, body) = call(
