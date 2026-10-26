@@ -151,8 +151,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // A pure read: the resource's tags are reported exactly as they are stored, and
-        // nothing is written, so a later caller sees what this one saw.
-        let _ = ctx;
+        // nothing is written, so a later caller sees what this one saw. The resource is
+        // resolved in this request's own region's view of the account — one of another
+        // region is not a resource this request can be answered about.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(
                 ListTagsForResourceErrorModeled::InternalServerException,
@@ -166,14 +168,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        let tags = crate::state::resource_tags(&state.lock(), &input.resource_arn).ok_or_else(
-            || {
+        let tags = crate::state::resource_tags(&state.lock(), &input.resource_arn, &region)
+            .ok_or_else(|| {
                 crate::state::resource_not_found(
                     ListTagsForResourceErrorModeled::ResourceNotFoundException,
                     &input.resource_arn,
                 )
-            },
-        )?;
+            })?;
 
         // `tags` is `@required` on the output: a resource carrying none answers the empty
         // map, which is not the same answer as a missing member.

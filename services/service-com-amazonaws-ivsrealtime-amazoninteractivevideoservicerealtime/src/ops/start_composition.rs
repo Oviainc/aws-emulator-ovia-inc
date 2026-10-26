@@ -315,7 +315,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // covers. Both are decided before anything is minted, so neither grows the store.
         if let Some(token) = input.idempotency_token.as_deref() {
             let started = store
-                .composition_by_idempotency_token(token)
+                .composition_by_idempotency_token(&region, token)
                 .map(|composition| (composition.arn.clone(), composition.request_fingerprint.clone()));
             if let Some((arn, started_fingerprint)) = started {
                 if started_fingerprint != fingerprint {
@@ -329,8 +329,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // rather than as an empty 200, which a client could not tell from a real
                 // composition.
                 let composition = store
-                    .compositions
-                    .get(&arn)
+                    .composition_in(&region, &arn)
                     .map(crate::state::CompositionRecord::to_composition)
                     .ok_or_else(|| {
                         crate::state::store_unavailable(
@@ -344,8 +343,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The stage being composited has to exist: a composition is "a Composition from
-        // a stage", so there is nothing to composite otherwise.
-        if !store.stages.contains_key(&input.stage_arn) {
+        // a stage", so there is nothing to composite otherwise. It, and every resource a
+        // destination refers to below, is resolved in this request's own region's view of
+        // the account.
+        if store.stage_in(&region, &input.stage_arn).is_none() {
             return Err(crate::state::resource_not_found(
                 StartCompositionErrorModeled::ResourceNotFoundException,
                 &input.stage_arn,
@@ -360,7 +361,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for destination in &input.destinations {
             if let Some(channel) = destination.channel.as_ref() {
                 if let Some(arn) = channel.encoder_configuration_arn.as_deref() {
-                    if !store.encoder_configurations.contains_key(arn) {
+                    if store.encoder_configuration_in(&region, arn).is_none() {
                         return Err(crate::state::resource_not_found(
                             StartCompositionErrorModeled::ResourceNotFoundException,
                             arn,
@@ -369,9 +370,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             if let Some(s3) = destination.s3.as_ref() {
-                if !store
-                    .storage_configurations
-                    .contains_key(&s3.storage_configuration_arn)
+                if store
+                    .storage_configuration_in(&region, &s3.storage_configuration_arn)
+                    .is_none()
                 {
                     return Err(crate::state::resource_not_found(
                         StartCompositionErrorModeled::ResourceNotFoundException,
@@ -379,7 +380,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ));
                 }
                 for arn in &s3.encoder_configuration_arns {
-                    if !store.encoder_configurations.contains_key(arn) {
+                    if store.encoder_configuration_in(&region, arn).is_none() {
                         return Err(crate::state::resource_not_found(
                             StartCompositionErrorModeled::ResourceNotFoundException,
                             arn,

@@ -162,11 +162,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing here reads request metadata: the page this reports is named entirely by
-        // the request's own members, whose modelled lengths, patterns and ranges the
-        // framework's constraint walk refuses with a 400 `ValidationException` before
-        // `handle` runs.
-        let _ = ctx;
+        // The page is this request's own region's view of the account: an ingest
+        // configuration belongs to the region its ARN names. Nothing else here reads
+        // request metadata — the page is named by the request's own members, whose
+        // modelled lengths, patterns and ranges the framework's constraint walk refuses
+        // with a 400 `ValidationException` before `handle` runs.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(
                 ListIngestConfigurationsErrorModeled::InternalServerException,
@@ -235,7 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // filter nothing matches selects nothing — this operation models no
         // `ResourceNotFoundException`, and an empty page is what "nothing matches" is.
         let matching: Vec<&crate::state::IngestConfigurationRecord> = store
-            .ingest_configurations_in_order()
+            .ingest_configurations_in_order(&region)
             .into_iter()
             .filter(|record| {
                 input

@@ -163,7 +163,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The configuration and the stage it is to be associated with are both resolved
+        // in this request's own region's view of the account: a resource of another
+        // region is not one this request can read or change.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(
                 UpdateIngestConfigurationErrorModeled::InternalServerException,
@@ -175,8 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ResourceNotFoundException` (HTTP 404), the same answer `GetIngestConfiguration`
         // and `DeleteIngestConfiguration` give for an ARN nothing answers for.
         let record = store
-            .ingest_configurations
-            .get(&input.arn)
+            .ingest_configuration_in(&region, &input.arn)
             .ok_or_else(|| {
                 crate::state::resource_not_found(
                     UpdateIngestConfigurationErrorModeled::ResourceNotFoundException,
@@ -192,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (HTTP 400) rather than a persisted association nothing can serve, and it is
         // refused before the record is touched, so a refused update changes nothing.
         let stage_arn =
-            crate::state::resolved_stage_association(&store, Self::NAME, input.stage_arn)
+            crate::state::resolved_stage_association(&store, Self::NAME, input.stage_arn, &region)
                 .map_err(|message| {
                     crate::state::validation_failed(
                         UpdateIngestConfigurationErrorModeled::ValidationException,
@@ -228,12 +230,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modelled default, so an omitted member is indistinguishable from `false` on the
         // wire, and honouring it would turn a stage move into a change of the ingest paths
         // this operation documents itself as leaving alone.
-        let updated = store.ingest_configurations.get_mut(&input.arn).ok_or_else(|| {
-            crate::state::resource_not_found(
-                UpdateIngestConfigurationErrorModeled::ResourceNotFoundException,
-                &input.arn,
-            )
-        })?;
+        let updated = store
+            .ingest_configuration_in_mut(&region, &input.arn)
+            .ok_or_else(|| {
+                crate::state::resource_not_found(
+                    UpdateIngestConfigurationErrorModeled::ResourceNotFoundException,
+                    &input.arn,
+                )
+            })?;
         updated.stage_arn = stage_arn;
 
         // The configuration as it now stands, read back out of the store the way
@@ -241,12 +245,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // same computation over the same record. Beside it, the CORS/security restriction
         // headers this output shape binds (`crate::state::ResponseHeaderPolicy`): the
         // endpoint's answer policy, carried by every response of this service.
-        let record = store.ingest_configurations.get(&input.arn).ok_or_else(|| {
-            crate::state::resource_not_found(
-                UpdateIngestConfigurationErrorModeled::ResourceNotFoundException,
-                &input.arn,
-            )
-        })?;
+        let record = store
+            .ingest_configuration_in(&region, &input.arn)
+            .ok_or_else(|| {
+                crate::state::resource_not_found(
+                    UpdateIngestConfigurationErrorModeled::ResourceNotFoundException,
+                    &input.arn,
+                )
+            })?;
         Ok(UpdateIngestConfigurationOutput {
             ingest_configuration: Some(record.to_ingest_configuration(&store)),
             ..Default::default()

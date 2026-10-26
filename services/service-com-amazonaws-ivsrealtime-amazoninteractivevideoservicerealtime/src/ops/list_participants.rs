@@ -189,11 +189,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing here reads request metadata: the session this reports is named
+        // The only request metadata this reads is the region it was processed in, which
+        // is the account view the session is resolved in: the session is otherwise named
         // entirely by the `stageArn` and `sessionId` members, whose modelled lengths
         // and patterns the framework's constraint walk refuses with a 400
         // `ValidationException` before `handle` runs.
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(ListParticipantsErrorModeled::InternalServerException)
         })?;
@@ -271,10 +272,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.session_id,
         );
         // Join order, so a participant joining or leaving mid-pagination cannot shift
-        // a later page onto an already-returned one. A pair this store holds no
-        // session for selects nothing: see the module note.
+        // a later page onto an already-returned one. A pair this request's region holds
+        // no session for — including one naming a stage of another region — selects
+        // nothing: see the module note.
         let matching: Vec<&crate::state::ParticipantRecord> = store
-            .stage_session(&input.stage_arn, &input.session_id)
+            .stage_session_in(&region, &input.stage_arn, &input.session_id)
             .map(crate::state::StageSessionRecord::participants_in_join_order)
             .unwrap_or_default()
             .into_iter()

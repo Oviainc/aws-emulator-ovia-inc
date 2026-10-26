@@ -149,14 +149,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::state::COMPOSITION_STOP_SPAN` apart — each whether or not anybody
         // called, so two reads at the same instant answer alike and a later caller sees
         // exactly what this one saw. The operation is `@readonly` in the model and
-        // nothing else here changes state.
-        let _ = ctx;
+        // nothing else here changes state. The composition is read from this request's
+        // own region's view of the account — one of another region is not a resource this
+        // request can be answered about.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(GetCompositionErrorModeled::InternalServerException)
         })?;
         let mut store = state.lock();
         store.materialize_due_compositions(::std::time::SystemTime::now());
-        let record = store.compositions.get(&input.arn).ok_or_else(|| {
+        let record = store.composition_in(&region, &input.arn).ok_or_else(|| {
             crate::state::resource_not_found(
                 GetCompositionErrorModeled::ResourceNotFoundException,
                 &input.arn,

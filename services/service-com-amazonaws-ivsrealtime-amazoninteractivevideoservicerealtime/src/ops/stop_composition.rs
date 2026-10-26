@@ -146,7 +146,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The composition is resolved in this request's own region's view of the account:
+        // one of another region is not a composition this request can stop.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(StopCompositionErrorModeled::InternalServerException)
         })?;
@@ -158,7 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // found here rather than stopped a second time.
         store.materialize_due_compositions(now);
 
-        let Some(composition) = store.compositions.get_mut(&input.arn) else {
+        let Some(composition) = store.composition_in_mut(&region, &input.arn) else {
             return Err(crate::state::resource_not_found(
                 StopCompositionErrorModeled::ResourceNotFoundException,
                 &input.arn,

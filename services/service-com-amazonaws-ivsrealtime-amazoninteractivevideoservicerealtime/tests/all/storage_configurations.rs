@@ -162,13 +162,19 @@ impl RealTime {
 
     /// Read `arn` back, asserting the read succeeded.
     async fn get(&self, case: &str, arn: &str) -> Value {
+        self.get_in(case, "us-east-1", arn).await
+    }
+
+    /// [`Self::get`] asked through `region`'s endpoint: a configuration is read back
+    /// through the region it was created in, which is the account view holding it.
+    async fn get_in(&self, case: &str, region: &str, arn: &str) -> Value {
         let (status, response) = self
-            .call("GetStorageConfiguration", &json!({ "arn": arn }))
+            .call_in(region, "GetStorageConfiguration", &json!({ "arn": arn }))
             .await;
         assert_eq!(
             status, 200,
-            "case {case:?}: GetStorageConfiguration on {arn} must answer HTTP 200, \
-             got {status} {response}"
+            "case {case:?}: GetStorageConfiguration on {arn} in {region} must answer \
+             HTTP 200, got {status} {response}"
         );
         response["storageConfiguration"].clone()
     }
@@ -395,7 +401,7 @@ async fn a_minted_arn_names_the_signing_region_and_identifies_the_configuration(
         // Both are separately readable, so neither create overwrote the other.
         for created in [&first, &second] {
             let configuration_arn = member(created, "arn");
-            let read = emulator.get(&case, &configuration_arn).await;
+            let read = emulator.get_in(&case, region, &configuration_arn).await;
             assert_eq!(
                 read, *created,
                 "case {case:?}: expected {configuration_arn} to be readable on its own, \

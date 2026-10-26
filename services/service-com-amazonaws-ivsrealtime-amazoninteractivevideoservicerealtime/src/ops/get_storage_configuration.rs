@@ -145,20 +145,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // A pure read (`@readonly` in the model, and "Gets the storage configuration for
         // the specified ARN"): the configuration is reported exactly as it is stored and
-        // nothing is written, so a later caller sees what this one saw.
-        let _ = ctx;
+        // nothing is written, so a later caller sees what this one saw. It is read from
+        // this request's own region's view of the account — one of another region is not a
+        // resource this request can be answered about.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(
                 GetStorageConfigurationErrorModeled::InternalServerException,
             )
         })?;
         let store = state.lock();
-        let record = store.storage_configurations.get(&input.arn).ok_or_else(|| {
-            crate::state::resource_not_found(
-                GetStorageConfigurationErrorModeled::ResourceNotFoundException,
-                &input.arn,
-            )
-        })?;
+        let record = store
+            .storage_configuration_in(&region, &input.arn)
+            .ok_or_else(|| {
+                crate::state::resource_not_found(
+                    GetStorageConfigurationErrorModeled::ResourceNotFoundException,
+                    &input.arn,
+                )
+            })?;
         Ok(GetStorageConfigurationOutput {
             storage_configuration: Some(record.to_storage_configuration()),
         })

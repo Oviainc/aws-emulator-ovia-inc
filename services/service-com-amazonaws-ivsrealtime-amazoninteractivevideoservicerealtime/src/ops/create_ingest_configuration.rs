@@ -262,7 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // consulted, so a request this operation cannot satisfy leaves no configuration
         // behind and is answered as the bad input it is.
         let stage_arn =
-            crate::state::resolved_stage_association(&store, Self::NAME, input.stage_arn)
+            crate::state::resolved_stage_association(&store, Self::NAME, input.stage_arn, &region)
                 .map_err(|message| {
                     crate::state::validation_failed(
                         CreateIngestConfigurationErrorModeled::ValidationException,

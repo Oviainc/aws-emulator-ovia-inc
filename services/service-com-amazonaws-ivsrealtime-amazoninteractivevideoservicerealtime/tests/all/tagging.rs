@@ -16,8 +16,11 @@
 //!    resource-type element as `[a-z-]`, matching exactly ONE character, which no IVS
 //!    resource type satisfies; so admission cannot turn on the type's LENGTH, and every
 //!    resource type this model declares an ARN shape for is admitted alike.
-//! 2. EXISTENCE. An admitted ARN that names no resource this store holds is the modelled
-//!    `ResourceNotFoundException` (HTTP 404), not a validation failure.
+//! 2. EXISTENCE. An admitted ARN that names no resource the region the request was
+//!    processed in holds is the modelled `ResourceNotFoundException` (HTTP 404), not a
+//!    validation failure. A resource belongs to the region its ARN names, so each test
+//!    addresses its fixture through the region the fixture was created in; the region
+//!    scoping itself is asserted in `region_scoped_resources.rs`.
 //! 3. ROUND TRIP. `TagResource` is additive — a key the resource carries takes the new
 //!    value, every other key is kept — and what it writes is what `ListTagsForResource`
 //!    and the resource's own `GetStage` read back. `UntagResource` removes exactly the
@@ -44,6 +47,9 @@ use service_com_amazonaws_ivsrealtime_amazoninteractivevideoservicerealtime::Emu
 /// A SigV4 `Authorization` header is how a request names the service and the region it
 /// is addressed to, so every call carries one. The signature itself is never checked
 /// here: request authentication is off unless a router turns it on.
+///
+/// The region every test that does not vary it signs for — and so the region those tests
+/// create their fixtures in, since a resource is addressed through the region holding it.
 const AUTHORIZATION_REGION: &str = "us-east-1";
 
 /// The account id every ARN this emulator mints carries, and so the account every ARN
@@ -120,8 +126,15 @@ impl RealTime {
     /// An operation bound to `POST /<Operation>`, which is every operation of this
     /// service except the three tagging ones.
     async fn call(&self, operation: &str, body: &Value) -> Reply {
+        self.call_in(AUTHORIZATION_REGION, operation, body).await
+    }
+
+    /// [`Self::call`] signed for `region`: the region a request is processed in is the
+    /// account view it is answered from, so a resource is addressed through the region it
+    /// was created in.
+    async fn call_in(&self, region: &str, operation: &str, body: &Value) -> Reply {
         self.send(
-            AUTHORIZATION_REGION,
+            region,
             "POST",
             &format!("/{operation}"),
             Some(bytes::Bytes::from(body.to_string())),
@@ -132,9 +145,22 @@ impl RealTime {
     /// One of the three operations bound to `/tags/{resourceArn}`, carrying the ARN in
     /// the URI the way a client does: percent-encoded into one path segment.
     async fn tagging(&self, method: &str, arn: &str, query: &str, body: Option<Value>) -> Reply {
+        self.tagging_in(AUTHORIZATION_REGION, method, arn, query, body)
+            .await
+    }
+
+    /// [`Self::tagging`] signed for `region`.
+    async fn tagging_in(
+        &self,
+        region: &str,
+        method: &str,
+        arn: &str,
+        query: &str,
+        body: Option<Value>,
+    ) -> Reply {
         let path = format!("/tags/{}{query}", encode_path_label(arn));
         self.send(
-            AUTHORIZATION_REGION,
+            region,
             method,
             &path,
             body.map(|body| bytes::Bytes::from(body.to_string())),
@@ -203,10 +229,16 @@ impl RealTime {
 
     /// The tags the tagging surface answers for `arn`, as a map.
     async fn tags_of(&self, case: &str, arn: &str) -> HashMap<String, String> {
-        let reply = self.tagging("GET", arn, "", None).await;
+        self.tags_of_in(case, AUTHORIZATION_REGION, arn).await
+    }
+
+    /// [`Self::tags_of`] asked through `region`'s endpoint.
+    async fn tags_of_in(&self, case: &str, region: &str, arn: &str) -> HashMap<String, String> {
+        let reply = self.tagging_in(region, "GET", arn, "", None).await;
         assert_eq!(
             reply.status, 200,
-            "case {case:?}: ListTagsForResource on {arn} must answer HTTP 200, got {} {}",
+            "case {case:?}: ListTagsForResource on {arn} in {region} must answer HTTP 200, \
+             got {} {}",
             reply.status, reply.body
         );
         serde_json::from_value(reply.body["tags"].clone()).unwrap_or_default()
@@ -215,10 +247,22 @@ impl RealTime {
     /// The tags `GetStage` reports for `arn` — the same state, read through the resource's
     /// own reader rather than the tagging surface.
     async fn tags_on_stage(&self, case: &str, arn: &str) -> HashMap<String, String> {
-        let reply = self.call("GetStage", &json!({ "arn": arn })).await;
+        self.tags_on_stage_in(case, AUTHORIZATION_REGION, arn).await
+    }
+
+    /// [`Self::tags_on_stage`] asked through `region`'s endpoint.
+    async fn tags_on_stage_in(
+        &self,
+        case: &str,
+        region: &str,
+        arn: &str,
+    ) -> HashMap<String, String> {
+        let reply = self
+            .call_in(region, "GetStage", &json!({ "arn": arn }))
+            .await;
         assert_eq!(
             reply.status, 200,
-            "case {case:?}: GetStage on {arn} must answer HTTP 200, got {} {}",
+            "case {case:?}: GetStage on {arn} in {region} must answer HTTP 200, got {} {}",
             reply.status, reply.body
         );
         serde_json::from_value(reply.body["stage"]["tags"].clone()).unwrap_or_default()
@@ -311,7 +355,8 @@ type RoundTripRow = (
 /// The rows differ along what the rule generalises over: the region element of the ARN
 /// (so the pattern's region class is exercised beyond one value), whether the stage was
 /// created carrying tags, and the SIZE of the write — one entry, several, and the modelled
-/// maximum.
+/// maximum. Each row addresses its stage through the region the stage was created in,
+/// which is the account view that holds it.
 #[tokio::test]
 async fn tags_round_trip_through_the_tagging_surface_for_any_admitted_stage() {
     let realtime = RealTime::new();
@@ -351,7 +396,7 @@ async fn tags_round_trip_through_the_tagging_surface_for_any_admitted_stage() {
             "case {case:?}: the stage must be minted in {region}, got {stage_arn:?}"
         );
         assert_eq!(
-            realtime.tags_of(case, &stage_arn).await,
+            realtime.tags_of_in(case, region, &stage_arn).await,
             at_creation,
             "case {case:?}: the surface must answer the tags the create persisted"
         );
@@ -359,19 +404,19 @@ async fn tags_round_trip_through_the_tagging_surface_for_any_admitted_stage() {
         // The write: a key the stage already carries takes the new value, and every other
         // tag it carries is kept.
         let reply = realtime
-            .tagging("POST", &stage_arn, "", Some(json!({ "tags": written })))
+            .tagging_in(region, "POST", &stage_arn, "", Some(json!({ "tags": written })))
             .await;
         assert_no_content(case, "TagResource", &reply);
 
         let mut expected = at_creation.clone();
         expected.extend(written.clone());
         assert_eq!(
-            realtime.tags_of(case, &stage_arn).await,
+            realtime.tags_of_in(case, region, &stage_arn).await,
             expected,
             "case {case:?}: tagging is additive and replaces only the keys it carries"
         );
         assert_eq!(
-            realtime.tags_on_stage(case, &stage_arn).await,
+            realtime.tags_on_stage_in(case, region, &stage_arn).await,
             expected,
             "case {case:?}: GetStage must report the same tags the surface wrote"
         );
@@ -389,7 +434,7 @@ async fn tags_round_trip_through_the_tagging_surface_for_any_admitted_stage() {
             .join("&");
         for round in 0..2 {
             let reply = realtime
-                .tagging("DELETE", &stage_arn, &format!("?{query}"), None)
+                .tagging_in(region, "DELETE", &stage_arn, &format!("?{query}"), None)
                 .await;
             assert_no_content(
                 &format!("{case} round {round}"),
@@ -401,7 +446,7 @@ async fn tags_round_trip_through_the_tagging_surface_for_any_admitted_stage() {
                 remaining.remove(key);
             }
             assert_eq!(
-                realtime.tags_of(case, &stage_arn).await,
+                realtime.tags_of_in(case, region, &stage_arn).await,
                 remaining,
                 "case {case:?} round {round}: exactly the named keys are gone"
             );
@@ -774,9 +819,12 @@ async fn a_tag_key_in_the_reserved_namespace_is_refused_by_tag_resource() {
 #[tokio::test]
 async fn a_tag_key_in_the_reserved_namespace_is_refused_by_untag_resource() {
     let realtime = RealTime::new();
+    // The fixture stage lives in one region and is addressed through that region, which
+    // is the account view holding it.
+    let region = "eu-west-1";
     let stage_arn = realtime
         .create_stage_in(
-            "eu-west-1",
+            region,
             &json!({ "name": "reserved", "tags": { "env": "prod", "team": "video" } }),
         )
         .await;
@@ -822,7 +870,7 @@ async fn a_tag_key_in_the_reserved_namespace_is_refused_by_untag_resource() {
             .collect::<Vec<String>>()
             .join("&");
         let reply = realtime
-            .tagging("DELETE", &stage_arn, &format!("?{query}"), None)
+            .tagging_in(region, "DELETE", &stage_arn, &format!("?{query}"), None)
             .await;
         assert_validation_refusal(
             case,
@@ -831,7 +879,7 @@ async fn a_tag_key_in_the_reserved_namespace_is_refused_by_untag_resource() {
             &reserved_refusal("UntagResource", "tagKeys", &offending),
         );
         assert_eq!(
-            realtime.tags_of(case, &stage_arn).await,
+            realtime.tags_of_in(case, region, &stage_arn).await,
             held,
             "case {case:?}: a refused UntagResource must remove nothing, not even the \
              removable keys named beside the reserved one"
@@ -849,8 +897,11 @@ async fn a_tag_key_in_the_reserved_namespace_is_refused_by_untag_resource() {
 #[tokio::test]
 async fn a_key_that_only_looks_reserved_is_an_ordinary_key() {
     let realtime = RealTime::new();
+    // The fixture stage lives in one region and is addressed through that region, which
+    // is the account view holding it.
+    let region = "ap-southeast-2";
     let stage_arn = realtime
-        .create_stage_in("ap-southeast-2", &json!({ "name": "lookalike" }))
+        .create_stage_in(region, &json!({ "name": "lookalike" }))
         .await;
 
     let rows: [(&str, &str); 4] = [
@@ -862,7 +913,8 @@ async fn a_key_that_only_looks_reserved_is_an_ordinary_key() {
 
     for (case, key) in rows {
         let reply = realtime
-            .tagging(
+            .tagging_in(
+                region,
                 "POST",
                 &stage_arn,
                 "",
@@ -874,24 +926,24 @@ async fn a_key_that_only_looks_reserved_is_an_ordinary_key() {
         let expected: HashMap<String, String> =
             HashMap::from([(key.to_string(), "accepted".to_string())]);
         assert_eq!(
-            realtime.tags_of(case, &stage_arn).await,
+            realtime.tags_of_in(case, region, &stage_arn).await,
             expected,
             "case {case:?}: an ordinary key must round-trip through ListTagsForResource"
         );
         assert_eq!(
-            realtime.tags_on_stage(case, &stage_arn).await,
+            realtime.tags_on_stage_in(case, region, &stage_arn).await,
             expected,
             "case {case:?}: GetStage must report it too"
         );
 
         let reply = realtime
-            .tagging("DELETE", &stage_arn, &format!("?tagKeys={key}"), None)
+            .tagging_in(region, "DELETE", &stage_arn, &format!("?tagKeys={key}"), None)
             .await;
         assert_no_content(case, "UntagResource", &reply);
         assert!(
-            realtime.tags_of(case, &stage_arn).await.is_empty(),
+            realtime.tags_of_in(case, region, &stage_arn).await.is_empty(),
             "case {case:?}: an ordinary key must be removable, got {:?}",
-            realtime.tags_of(case, &stage_arn).await
+            realtime.tags_of_in(case, region, &stage_arn).await
         );
     }
 }

@@ -145,20 +145,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // specified IngestConfiguration"): the configuration is reported exactly as it
         // is stored — the same ingest key and participant id `CreateIngestConfiguration`
         // minted, and the `state` its stage's publishers make true right now — and
-        // nothing is written, so a later caller sees what this one saw.
-        let _ = ctx;
+        // nothing is written, so a later caller sees what this one saw. It is read from
+        // this request's own region's view of the account — one of another region is not a
+        // resource this request can be answered about.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(
                 GetIngestConfigurationErrorModeled::InternalServerException,
             )
         })?;
         let store = state.lock();
-        let record = store.ingest_configurations.get(&input.arn).ok_or_else(|| {
-            crate::state::resource_not_found(
-                GetIngestConfigurationErrorModeled::ResourceNotFoundException,
-                &input.arn,
-            )
-        })?;
+        let record = store
+            .ingest_configuration_in(&region, &input.arn)
+            .ok_or_else(|| {
+                crate::state::resource_not_found(
+                    GetIngestConfigurationErrorModeled::ResourceNotFoundException,
+                    &input.arn,
+                )
+            })?;
         Ok(GetIngestConfigurationOutput {
             ingest_configuration: Some(record.to_ingest_configuration(&store)),
         })

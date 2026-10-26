@@ -151,7 +151,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The region the request was processed in is the account view the source stage
+        // is resolved in.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(
                 ListParticipantReplicasErrorModeled::InternalServerException,
@@ -189,15 +191,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stable key a page resumes from, so starting a further replication
         // mid-pagination cannot shift a later page onto an already-returned one.
         //
-        // A source stage this store holds no replica for answers an empty page rather
-        // than a failure: this operation models no `ResourceNotFoundException`, so "no
-        // replicas" is the only answer it has for a stage or participant it knows
-        // nothing about.
+        // A source stage this request's region holds no replica for — one of another
+        // region included — answers an empty page rather than a failure: this operation
+        // models no `ResourceNotFoundException`, so "no replicas" is the only answer it
+        // has for a stage or participant it knows nothing about.
         let remaining: Vec<&crate::state::ParticipantReplicaRecord> = store
-            .participant_replicas
-            .get(&input.source_stage_arn)
-            .into_iter()
-            .flatten()
+            .participant_replicas_in(&region, &input.source_stage_arn)
+            .iter()
             .filter(|replica| {
                 replica.participant_id == input.participant_id
                     && resume_after.is_none_or(|after| replica.sequence > after)

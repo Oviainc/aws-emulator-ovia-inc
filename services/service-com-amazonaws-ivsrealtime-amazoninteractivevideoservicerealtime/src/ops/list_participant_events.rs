@@ -174,11 +174,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing here reads request metadata: the events this reports are named
+        // The only request metadata this reads is the region it was processed in, which
+        // is the account view the session is resolved in: the events are otherwise named
         // entirely by the `stageArn`, `sessionId` and `participantId` members, whose
         // modelled lengths and patterns the framework's constraint walk refuses with a
         // 400 `ValidationException` before `handle` runs.
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(
                 ListParticipantEventsErrorModeled::InternalServerException,
@@ -220,9 +221,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // page onto an already-returned one. An event belongs to the participant that
         // triggered it (`Event$participantId`), so an occurrence of another participant
         // is not this one's even where it names it as the remote participant. A pair
-        // this store holds no session for selects nothing: see the module note.
+        // this request's region holds no session for — including one naming a stage of
+        // another region — selects nothing: see the module note.
         let matching: Vec<&crate::state::EventRecord> = store
-            .stage_session(&input.stage_arn, &input.session_id)
+            .stage_session_in(&region, &input.stage_arn, &input.session_id)
             .map(crate::state::StageSessionRecord::events_in_occurrence_order)
             .unwrap_or_default()
             .iter()

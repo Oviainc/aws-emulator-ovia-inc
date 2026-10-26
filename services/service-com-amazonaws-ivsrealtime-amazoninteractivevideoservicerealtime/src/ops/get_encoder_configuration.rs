@@ -145,20 +145,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // A pure read: the configuration is reported exactly as it is stored, and nothing
         // is written, so a later caller sees what this one saw. The operation is
-        // `@readonly` in the model.
-        let _ = ctx;
+        // `@readonly` in the model. The configuration is read from this request's own
+        // region's view of the account — one of another region is not a resource this
+        // request can be answered about.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(
                 GetEncoderConfigurationErrorModeled::InternalServerException,
             )
         })?;
         let store = state.lock();
-        let record = store.encoder_configurations.get(&input.arn).ok_or_else(|| {
-            crate::state::resource_not_found(
-                GetEncoderConfigurationErrorModeled::ResourceNotFoundException,
-                &input.arn,
-            )
-        })?;
+        let record = store
+            .encoder_configuration_in(&region, &input.arn)
+            .ok_or_else(|| {
+                crate::state::resource_not_found(
+                    GetEncoderConfigurationErrorModeled::ResourceNotFoundException,
+                    &input.arn,
+                )
+            })?;
         Ok(GetEncoderConfigurationOutput {
             encoder_configuration: Some(record.to_encoder_configuration()),
         })

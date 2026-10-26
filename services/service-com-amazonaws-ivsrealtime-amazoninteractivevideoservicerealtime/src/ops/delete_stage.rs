@@ -144,17 +144,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The stage is resolved in this request's own region's view of the account: a
+        // stage of another region is not one this request can delete.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(DeleteStageErrorModeled::InternalServerException)
         })?;
         let mut store = state.lock();
-        if store.stages.remove(&input.arn).is_none() {
+        if store.stage_in(&region, &input.arn).is_none() {
             return Err(crate::state::resource_not_found(
                 DeleteStageErrorModeled::ResourceNotFoundException,
                 &input.arn,
             ));
         }
+        store.stages.remove(&input.arn);
         // The tokens were issued against this stage, so they go with it.
         store.participant_tokens.remove(&input.arn);
         // So do its sessions: the operation "shuts down and deletes the specified

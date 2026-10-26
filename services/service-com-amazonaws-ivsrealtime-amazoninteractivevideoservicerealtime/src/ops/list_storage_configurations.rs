@@ -148,8 +148,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // A pure read over the stored storage configurations (`@readonly` in the model,
         // and "Gets summary information about all storage configurations in your
-        // account"); nothing is written.
-        let _ = ctx;
+        // account, in the AWS region where the API request is processed"); nothing is
+        // written, and the page is this request's own region's view of the account.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(
                 ListStorageConfigurationsErrorModeled::InternalServerException,
@@ -186,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let remaining: Vec<&crate::state::StorageConfigurationRecord> = store
-            .storage_configurations_in_order()
+            .storage_configurations_in_order(&region)
             .into_iter()
             .filter(|record| resume_after.is_none_or(|after| record.sequence > after))
             .collect();

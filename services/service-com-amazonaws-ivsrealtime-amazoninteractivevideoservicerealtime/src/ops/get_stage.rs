@@ -142,13 +142,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // A pure read: the stage is reported exactly as it is stored, and nothing is
-        // written, so a later caller sees what this one saw.
-        let _ = ctx;
+        // written, so a later caller sees what this one saw. The stage is read from this
+        // request's own region's view of the account — a stage of another region is not
+        // one this request can be answered about.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(GetStageErrorModeled::InternalServerException)
         })?;
         let store = state.lock();
-        let record = store.stages.get(&input.arn).ok_or_else(|| {
+        let record = store.stage_in(&region, &input.arn).ok_or_else(|| {
             crate::state::resource_not_found(
                 GetStageErrorModeled::ResourceNotFoundException,
                 &input.arn,

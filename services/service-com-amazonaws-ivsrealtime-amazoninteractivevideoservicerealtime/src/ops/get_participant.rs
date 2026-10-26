@@ -169,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // entirely by the `stageArn`, `sessionId` and `participantId` members, whose
         // modelled lengths and patterns the framework's constraint walk refuses with a
         // 400 `ValidationException` before `handle` runs.
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(GetParticipantErrorModeled::InternalServerException)
         })?;
@@ -178,16 +178,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Each of the three identifiers is resolved in turn, and the one that resolves
         // to nothing is the one the 404 names: a session id names a session of ONE
         // stage and a participant id a participant of ONE session, so a request naming
-        // a stage this store does not hold is never answered from another stage's
-        // records.
-        if !store.stages.contains_key(&input.stage_arn) {
+        // a stage this request's region does not hold is never answered from another
+        // stage's records.
+        if store.stage_in(&region, &input.stage_arn).is_none() {
             return Err(crate::state::resource_not_found(
                 GetParticipantErrorModeled::ResourceNotFoundException,
                 &input.stage_arn,
             ));
         }
         let session = store
-            .stage_session(&input.stage_arn, &input.session_id)
+            .stage_session_in(&region, &input.stage_arn, &input.session_id)
             .ok_or_else(|| {
                 crate::state::resource_not_found(
                     GetParticipantErrorModeled::ResourceNotFoundException,

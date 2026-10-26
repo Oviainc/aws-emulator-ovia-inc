@@ -196,7 +196,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
-        if !store.stages.contains_key(&input.stage_arn) {
+        // The stage is resolved in this request's own region's view of the account: a
+        // stage of another region is not one this request can issue a token against.
+        let region = crate::state::request_region(ctx);
+        if store.stage_in(&region, &input.stage_arn).is_none() {
             return Err(crate::state::resource_not_found(
                 CreateParticipantTokenErrorModeled::ResourceNotFoundException,
                 &input.stage_arn,

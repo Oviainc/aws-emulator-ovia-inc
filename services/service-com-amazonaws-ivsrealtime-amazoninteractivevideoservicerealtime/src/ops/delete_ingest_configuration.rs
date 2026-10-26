@@ -148,7 +148,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The configuration is resolved in this request's own region's view of the
+        // account: one of another region is not a resource this request can delete.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(
                 DeleteIngestConfigurationErrorModeled::InternalServerException,
@@ -161,8 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `DeleteEncoderConfiguration` give — so a second delete of the same ARN is
         // refused rather than silently accepted.
         let configuration = store
-            .ingest_configurations
-            .get(&input.arn)
+            .ingest_configuration_in(&region, &input.arn)
             .ok_or_else(|| {
                 crate::state::resource_not_found(
                     DeleteIngestConfigurationErrorModeled::ResourceNotFoundException,

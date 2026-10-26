@@ -184,7 +184,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The region the request was processed in is the account view both stages below
+        // are resolved in.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(
                 StartParticipantReplicationErrorModeled::InternalServerException,
@@ -230,9 +232,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
-        // Both stages have to exist: one to publish in, one to replicate into.
+        // Both stages have to exist in this request's own region's view of the account:
+        // one to publish in, one to replicate into.
         for stage_arn in [&input.source_stage_arn, &input.destination_stage_arn] {
-            if !store.stages.contains_key(stage_arn) {
+            if store.stage_in(&region, stage_arn).is_none() {
                 return Err(crate::state::resource_not_found(
                     StartParticipantReplicationErrorModeled::ResourceNotFoundException,
                     stage_arn,

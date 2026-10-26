@@ -147,7 +147,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // A pure read over the stored stages; nothing is written.
-        let _ = ctx;
+        //
+        // "all stages in your account, in the AWS region where the API request is
+        // processed": the page is this request's own region's view of the account, which
+        // is the region its credential scope names.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(ListStagesErrorModeled::InternalServerException)
         })?;
@@ -177,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let remaining: Vec<&crate::state::StageRecord> = store
-            .stages_in_order()
+            .stages_in_order(&region)
             .into_iter()
             .filter(|record| resume_after.is_none_or(|after| record.sequence > after))
             .collect();

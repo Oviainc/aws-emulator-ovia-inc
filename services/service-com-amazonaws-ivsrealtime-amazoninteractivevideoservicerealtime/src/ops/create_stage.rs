@@ -217,6 +217,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &store,
             Self::NAME,
             input.auto_participant_recording_configuration,
+            // Resolved in this request's own region's view of the account: a storage
+            // configuration of another region is not one this request can record into.
+            &region,
         )
         .map_err(|message| {
             crate::state::validation_failed(

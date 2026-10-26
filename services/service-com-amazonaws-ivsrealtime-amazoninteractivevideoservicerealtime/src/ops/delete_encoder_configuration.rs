@@ -139,7 +139,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The configuration is resolved in this request's own region's view of the
+        // account: one of another region is not a resource this request can delete.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(
                 DeleteEncoderConfigurationErrorModeled::InternalServerException,
@@ -155,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A delete of a resource this store does not hold is the modelled
         // `ResourceNotFoundException` (HTTP 404), the same answer `DeleteStage` gives —
         // so a second delete of the same ARN is refused rather than silently accepted.
-        if !store.encoder_configurations.contains_key(&input.arn) {
+        if store.encoder_configuration_in(&region, &input.arn).is_none() {
             return Err(crate::state::resource_not_found(
                 DeleteEncoderConfigurationErrorModeled::ResourceNotFoundException,
                 &input.arn,

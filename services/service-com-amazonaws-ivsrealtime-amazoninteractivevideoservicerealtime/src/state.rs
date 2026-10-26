@@ -267,14 +267,20 @@ const STORAGE_CONFIGURATION_RESOURCE: &str = "storage configuration";
 ///
 /// The empty string names no resource — it is the documented "no storage configuration"
 /// value — so it is resolved by nothing and keeps the documented reset.
+///
+/// The reference is resolved in `region`'s view of the store, the region the calling
+/// request was processed in: a configuration of another region is not one this account
+/// view holds, so it resolves to nothing exactly as an ARN nothing was ever created for
+/// does ([`in_request_region`]).
 pub fn resolved_recording_configuration(
     state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
     operation: &str,
     requested: Option<AutoParticipantRecordingConfiguration>,
+    region: &str,
 ) -> Result<AutoParticipantRecordingConfiguration, String> {
     let configuration = effective_recording_configuration(requested);
     let arn = configuration.storage_configuration_arn.as_str();
-    if !arn.is_empty() && !state.storage_configurations.contains_key(arn) {
+    if !arn.is_empty() && state.storage_configuration_in(region, arn).is_none() {
         return Err(unresolved_reference_message(
             operation,
             RECORDING_STORAGE_CONFIGURATION_MEMBER,
@@ -310,13 +316,18 @@ const STAGE_RESOURCE: &str = "stage";
 /// An absent member, and the empty string the modelled `IngestConfigurationStageArn`
 /// admits, both name no stage — [`NO_ASSOCIATED_STAGE_ARN`] — so they are resolved by
 /// nothing.
+///
+/// The reference is resolved in `region`'s view of the store, the region the calling
+/// request was processed in, the same way a stage's recording reference is: a stage of
+/// another region is not one this account view holds.
 pub fn resolved_stage_association(
     state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
     operation: &str,
     requested: Option<String>,
+    region: &str,
 ) -> Result<String, String> {
     let stage_arn = requested.unwrap_or_else(|| NO_ASSOCIATED_STAGE_ARN.to_string());
-    if stage_arn != NO_ASSOCIATED_STAGE_ARN && !state.stages.contains_key(&stage_arn) {
+    if stage_arn != NO_ASSOCIATED_STAGE_ARN && state.stage_in(region, &stage_arn).is_none() {
         return Err(unresolved_reference_message(
             operation,
             INGEST_CONFIGURATION_STAGE_MEMBER,
@@ -2943,12 +2954,12 @@ fn supersedes(candidate: &ParticipantReplication, held: &ParticipantReplication)
 
 /// Per-service state for com-amazonaws-ivsrealtime-amazoninteractivevideoservicerealtime. A handler reaches it through [`service_state`].
 ///
-/// ONE store per engine, not one per region: the minted ARN names the region the
-/// creating request was signed for, but a stage is reachable from a request signed for
-/// any region, which is how this tree stores every service's resources. The real service
-/// is region-scoped; partitioning this store by region is a change for the slice that
-/// implements the operations that would make the difference observable (a stage session
-/// or participant in one region), not something to half-apply here.
+/// ONE store per engine, holding the resources of every region a caller has addressed,
+/// each keyed by its own ARN — and an ARN names the region its resource was created in.
+/// A request is answered from the view of the region IT was processed in, so the region
+/// is a term of every lookup over these maps rather than a partition of them: the
+/// accessors below take the region and the listings page in it ([`in_request_region`]),
+/// and a request signed for one region finds nothing another region's endpoint created.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
     /// Every live stage, keyed by its ARN.
@@ -2987,62 +2998,210 @@ impl ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
         self.next_id
     }
 
-    /// Every stage in creation order — the order `ListStages` pages over.
-    pub fn stages_in_order(&self) -> Vec<&StageRecord> {
-        let mut stages: Vec<&StageRecord> = self.stages.values().collect();
+    // -----------------------------------------------------------------------
+    // The region's view of this store
+    //
+    // Every accessor below takes the region the calling request was processed in and
+    // answers about that region's resources only, through the one region term
+    // [`in_request_region`] states: a resource belongs to the region its ARN names, and
+    // an operation answers from the view of its own request's region. The maps
+    // themselves are reached directly only by the writers that already know which
+    // region's resource they hold (a create, and the data-plane helpers that follow a
+    // stored reference).
+    // -----------------------------------------------------------------------
+
+    /// The stage `arn` names in `region`'s view, or `None` when that view holds none.
+    pub fn stage_in(&self, region: &str, arn: &str) -> Option<&StageRecord> {
+        self.stages.get(request_scoped(arn, region)?)
+    }
+
+    /// [`Self::stage_in`], to be changed in place.
+    pub fn stage_in_mut(&mut self, region: &str, arn: &str) -> Option<&mut StageRecord> {
+        self.stages.get_mut(request_scoped(arn, region)?)
+    }
+
+    /// The ingest configuration `arn` names in `region`'s view, or `None` when that view
+    /// holds none.
+    pub fn ingest_configuration_in(
+        &self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&IngestConfigurationRecord> {
+        self.ingest_configurations
+            .get(request_scoped(arn, region)?)
+    }
+
+    /// [`Self::ingest_configuration_in`], to be changed in place.
+    pub fn ingest_configuration_in_mut(
+        &mut self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&mut IngestConfigurationRecord> {
+        self.ingest_configurations
+            .get_mut(request_scoped(arn, region)?)
+    }
+
+    /// The encoder configuration `arn` names in `region`'s view, or `None` when that
+    /// view holds none.
+    pub fn encoder_configuration_in(
+        &self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&EncoderConfigurationRecord> {
+        self.encoder_configurations
+            .get(request_scoped(arn, region)?)
+    }
+
+    /// [`Self::encoder_configuration_in`], to be changed in place.
+    pub fn encoder_configuration_in_mut(
+        &mut self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&mut EncoderConfigurationRecord> {
+        self.encoder_configurations
+            .get_mut(request_scoped(arn, region)?)
+    }
+
+    /// The storage configuration `arn` names in `region`'s view, or `None` when that
+    /// view holds none.
+    pub fn storage_configuration_in(
+        &self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&StorageConfigurationRecord> {
+        self.storage_configurations
+            .get(request_scoped(arn, region)?)
+    }
+
+    /// [`Self::storage_configuration_in`], to be changed in place.
+    pub fn storage_configuration_in_mut(
+        &mut self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&mut StorageConfigurationRecord> {
+        self.storage_configurations
+            .get_mut(request_scoped(arn, region)?)
+    }
+
+    /// The composition `arn` names in `region`'s view, or `None` when that view holds
+    /// none. Call it after [`Self::materialize_due_compositions`], so a composition
+    /// whose ephemeral resource the clock has reclaimed is not reported as live.
+    pub fn composition_in(&self, region: &str, arn: &str) -> Option<&CompositionRecord> {
+        self.compositions.get(request_scoped(arn, region)?)
+    }
+
+    /// [`Self::composition_in`], to be changed in place.
+    pub fn composition_in_mut(
+        &mut self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&mut CompositionRecord> {
+        self.compositions.get_mut(request_scoped(arn, region)?)
+    }
+
+    /// Every stage of `region` in creation order — the order `ListStages` pages over.
+    pub fn stages_in_order(&self, region: &str) -> Vec<&StageRecord> {
+        let mut stages: Vec<&StageRecord> = self
+            .stages
+            .values()
+            .filter(|record| in_request_region(&record.arn, region))
+            .collect();
         stages.sort_by_key(|record| record.sequence);
         stages
     }
 
-    /// Every composition in start order — the order `ListCompositions` pages over, so a
-    /// composition starting or being reclaimed mid-pagination cannot shift a later page
-    /// onto an already-returned one.
-    pub fn compositions_in_order(&self) -> Vec<&CompositionRecord> {
-        let mut compositions: Vec<&CompositionRecord> = self.compositions.values().collect();
+    /// Every composition of `region` in start order — the order `ListCompositions` pages
+    /// over, so a composition starting or being reclaimed mid-pagination cannot shift a
+    /// later page onto an already-returned one.
+    pub fn compositions_in_order(&self, region: &str) -> Vec<&CompositionRecord> {
+        let mut compositions: Vec<&CompositionRecord> = self
+            .compositions
+            .values()
+            .filter(|record| in_request_region(&record.arn, region))
+            .collect();
         compositions.sort_by_key(|record| record.sequence);
         compositions
     }
 
-    /// Every ingest configuration in creation order — the order
+    /// Every ingest configuration of `region` in creation order — the order
     /// `ListIngestConfigurations` pages over, so a configuration created or deleted
     /// mid-pagination cannot shift a later page onto an already-returned one.
-    pub fn ingest_configurations_in_order(&self) -> Vec<&IngestConfigurationRecord> {
-        let mut configurations: Vec<&IngestConfigurationRecord> =
-            self.ingest_configurations.values().collect();
+    pub fn ingest_configurations_in_order(&self, region: &str) -> Vec<&IngestConfigurationRecord> {
+        let mut configurations: Vec<&IngestConfigurationRecord> = self
+            .ingest_configurations
+            .values()
+            .filter(|record| in_request_region(&record.arn, region))
+            .collect();
         configurations.sort_by_key(|record| record.sequence);
         configurations
     }
 
-    /// Every storage configuration in creation order — the order
+    /// Every storage configuration of `region` in creation order — the order
     /// `ListStorageConfigurations` pages over.
-    pub fn storage_configurations_in_order(&self) -> Vec<&StorageConfigurationRecord> {
-        let mut configurations: Vec<&StorageConfigurationRecord> =
-            self.storage_configurations.values().collect();
+    pub fn storage_configurations_in_order(
+        &self,
+        region: &str,
+    ) -> Vec<&StorageConfigurationRecord> {
+        let mut configurations: Vec<&StorageConfigurationRecord> = self
+            .storage_configurations
+            .values()
+            .filter(|record| in_request_region(&record.arn, region))
+            .collect();
         configurations.sort_by_key(|record| record.sequence);
         configurations
     }
 
     /// Every session the stage `stage_arn` has had, in start order — the order
     /// `ListStageSessions` pages over, so a session opening or ending mid-pagination
-    /// cannot shift a later page onto an already-returned one. A stage this store
-    /// holds no session for (one that never had a participant, or one it does not hold
-    /// at all) has none.
-    pub fn stage_sessions_in_start_order(&self, stage_arn: &str) -> Vec<&StageSessionRecord> {
-        let mut sessions: Vec<&StageSessionRecord> = self
-            .stage_sessions
-            .get(stage_arn)
+    /// cannot shift a later page onto an already-returned one. A stage `region`'s view
+    /// holds no session for (one that never had a participant, one it does not hold at
+    /// all, or one of another region) has none.
+    pub fn stage_sessions_in_start_order(
+        &self,
+        region: &str,
+        stage_arn: &str,
+    ) -> Vec<&StageSessionRecord> {
+        let mut sessions: Vec<&StageSessionRecord> = request_scoped(stage_arn, region)
+            .and_then(|stage_arn| self.stage_sessions.get(stage_arn))
             .map(|sessions| sessions.iter().collect())
             .unwrap_or_default();
         sessions.sort_by_key(|record| record.sequence);
         sessions
     }
 
-    /// The session `session_id` of the stage `stage_arn`, or `None` when this store
-    /// holds no such session for that stage.
+    /// The session `session_id` of the stage `stage_arn` in `region`'s view, or `None`
+    /// when that view holds no such session for that stage.
     ///
     /// The lookup is by BOTH keys: a session id names a session of one stage, so a
     /// session of another stage is not found here even though every id this store
     /// mints is unique.
+    pub fn stage_session_in(
+        &self,
+        region: &str,
+        stage_arn: &str,
+        session_id: &str,
+    ) -> Option<&StageSessionRecord> {
+        self.stage_session(request_scoped(stage_arn, region)?, session_id)
+    }
+
+    /// The replications sourced from the stage `stage_arn` in `region`'s view, in the
+    /// order they were started. Empty for a stage that view holds no replication for.
+    pub fn participant_replicas_in(
+        &self,
+        region: &str,
+        stage_arn: &str,
+    ) -> &[ParticipantReplicaRecord] {
+        request_scoped(stage_arn, region)
+            .and_then(|stage_arn| self.participant_replicas.get(stage_arn))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// The session `session_id` of the stage `stage_arn`, whatever region that stage is
+    /// in, or `None` when this store holds no such session for it.
+    ///
+    /// The region-less lookup, for the writers and the data-plane helpers that already
+    /// hold the stage: a handler resolving an ARN a REQUEST supplied uses
+    /// [`Self::stage_session_in`] instead, so it answers only about its own region.
     pub fn stage_session(&self, stage_arn: &str, session_id: &str) -> Option<&StageSessionRecord> {
         self.stage_sessions
             .get(stage_arn)?
@@ -3068,16 +3227,24 @@ impl ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
             .retain(|_, composition| !composition.is_reclaimed(now));
     }
 
-    /// The composition started under the `@idempotencyToken` `token`, if this store
-    /// holds one.
+    /// The composition of `region` started under the `@idempotencyToken` `token`, if that
+    /// region's view holds one.
     ///
     /// A composition is keyed by its own ARN, so the token is searched for rather than
     /// indexed: the store is bounded by [`MAX_COMPOSITIONS`], and a repeat of a start
-    /// request is what this answers.
-    pub fn composition_by_idempotency_token(&self, token: &str) -> Option<&CompositionRecord> {
-        self.compositions
-            .values()
-            .find(|composition| composition.idempotency_token.as_deref() == Some(token))
+    /// request is what this answers. A token is a token of the region it was first used
+    /// in — the composition it names exists only there — so the same token offered
+    /// through another region's endpoint names nothing and starts a composition of its
+    /// own.
+    pub fn composition_by_idempotency_token(
+        &self,
+        region: &str,
+        token: &str,
+    ) -> Option<&CompositionRecord> {
+        self.compositions.values().find(|composition| {
+            composition.idempotency_token.as_deref() == Some(token)
+                && in_request_region(&composition.arn, region)
+        })
     }
 
     /// The composition using the resource `arn` right now, if this store holds one: the
@@ -3577,13 +3744,14 @@ pub fn disassociate_stage_from_ingest_configurations(
     }
 }
 
-/// The region a minted ARN names: the one the request was signed for, so a caller
-/// reads back the region it addressed.
+/// The region the request was processed in: the one its SigV4 credential scope names, so
+/// a caller reads back the region it addressed and is answered from that region's view of
+/// the account ([`in_request_region`]).
 ///
 /// Falls back to [`DEFAULT_REGION`] for an unsigned request, and for a credential scope
 /// whose region is not a token the model's ARN patterns accept (`[a-z0-9-]+`). It lives
-/// here, beside that constant, because it is the rule for every ARN this service mints,
-/// not just the stage ARNs of this slice.
+/// here, beside that constant, because it is the rule for every ARN this service mints
+/// and for every resource it reports, not just the stage ARNs of this slice.
 pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
     emulator_server::sigv4_credential_scope(&ctx.parts().headers)
         .map(|scope| scope.region)
@@ -3594,6 +3762,33 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
                     .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         })
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The region element of an IVS ARN: the fourth `:`-field of the form every ARN shape in
+/// this model pins (`arn:aws:ivs:<region>:<account>:<type>/<id>`), or `None` when the
+/// string carries no such field.
+pub fn arn_region(arn: &str) -> Option<&str> {
+    arn.split(':').nth(3)
+}
+
+/// Whether the resource `arn` names is one a request processed in `region` is answered
+/// about.
+///
+/// Each resource of this service is created through one region's endpoint and carries
+/// that region in its ARN ([`request_region`] is what every mint fills the element
+/// from), and an operation answers from the account view of the region ITS OWN request
+/// was processed in, so an ARN naming another region names nothing it can report, change
+/// or delete. Every record is keyed by its own ARN, so this predicate over the ARN a
+/// request supplied is the region term of the lookup — the one place that term is
+/// stated, used by the accessors below and by the listings' page order.
+pub fn in_request_region(arn: &str, region: &str) -> bool {
+    arn_region(arn) == Some(region)
+}
+
+/// `arn` itself when [`in_request_region`] holds for it, so a region-scoped lookup reads
+/// `self.stages.get(request_scoped(arn, region)?)`.
+fn request_scoped<'a>(arn: &'a str, region: &str) -> Option<&'a str> {
+    in_request_region(arn, region).then_some(arn)
 }
 
 /// What one request supplies for one participant token: the four members
@@ -4558,8 +4753,8 @@ pub fn arn_resource_type(arn: &str) -> Option<&str> {
     arn.split(':').nth(5)?.split('/').next()
 }
 
-/// The tags attached to the resource `arn` names, or `None` when this store holds no
-/// such resource.
+/// The tags attached to the resource `arn` names in `region`'s view, or `None` when that
+/// view holds no such resource.
 ///
 /// A stage, an ingest configuration, an encoder configuration, a storage configuration
 /// and a composition are the resource types this store can hold: `CreateStage`,
@@ -4569,15 +4764,20 @@ pub fn arn_resource_type(arn: &str) -> Option<&str> {
 /// and a well-formed ARN naming one is answered exactly as an ARN naming a deleted stage
 /// is — not found. Each remaining create is its own gap issue, and when one lands its
 /// record joins the match below.
+///
+/// `region` is the region the tagging request was processed in, and the lookups go
+/// through the region-scoped accessors, so a resource of another region is not found
+/// here either: the tagging surface answers about exactly the resources that region's
+/// own readers report ([`in_request_region`]).
 pub fn resource_tags(
     state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
     arn: &str,
+    region: &str,
 ) -> Option<HashMap<String, String>> {
     match arn_resource_type(arn)? {
-        "stage" => state.stages.get(arn).map(|stage| stage.tags.clone()),
+        "stage" => state.stage_in(region, arn).map(|stage| stage.tags.clone()),
         "composition" => state
-            .compositions
-            .get(arn)
+            .composition_in(region, arn)
             // This reader holds the store immutably, so a composition the clock has
             // already reclaimed is skipped rather than dropped: the reclaim deadline is
             // computed from the instant the stop recorded, so a tag listing answers for
@@ -4586,47 +4786,41 @@ pub fn resource_tags(
             .filter(|composition| !composition.is_reclaimed(SystemTime::now()))
             .map(|composition| composition.tags.clone()),
         "ingest-configuration" => state
-            .ingest_configurations
-            .get(arn)
+            .ingest_configuration_in(region, arn)
             .map(|configuration| configuration.tags.clone()),
         "encoder-configuration" => state
-            .encoder_configurations
-            .get(arn)
+            .encoder_configuration_in(region, arn)
             .map(|configuration| configuration.tags.clone()),
         "storage-configuration" => state
-            .storage_configurations
-            .get(arn)
+            .storage_configuration_in(region, arn)
             .map(|configuration| configuration.tags.clone()),
         _ => None,
     }
 }
 
-/// The `tags` of the resource `arn` names, to be changed in place. `None` when this
-/// store holds no such resource; see [`resource_tags`].
+/// The `tags` of the resource `arn` names in `region`'s view, to be changed in place.
+/// `None` when that view holds no such resource; see [`resource_tags`].
 pub fn resource_tags_mut<'a>(
     state: &'a mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
     arn: &str,
+    region: &str,
 ) -> Option<&'a mut HashMap<String, String>> {
     // A composition's own lifetime is the clock's: materialise what it already owed, so
     // a tag cannot be written onto a composition that no longer exists.
     state.materialize_due_compositions(SystemTime::now());
     match arn_resource_type(arn)? {
-        "stage" => state.stages.get_mut(arn).map(|stage| &mut stage.tags),
+        "stage" => state.stage_in_mut(region, arn).map(|stage| &mut stage.tags),
         "composition" => state
-            .compositions
-            .get_mut(arn)
+            .composition_in_mut(region, arn)
             .map(|composition| &mut composition.tags),
         "ingest-configuration" => state
-            .ingest_configurations
-            .get_mut(arn)
+            .ingest_configuration_in_mut(region, arn)
             .map(|configuration| &mut configuration.tags),
         "encoder-configuration" => state
-            .encoder_configurations
-            .get_mut(arn)
+            .encoder_configuration_in_mut(region, arn)
             .map(|configuration| &mut configuration.tags),
         "storage-configuration" => state
-            .storage_configurations
-            .get_mut(arn)
+            .storage_configuration_in_mut(region, arn)
             .map(|configuration| &mut configuration.tags),
         _ => None,
     }

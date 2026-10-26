@@ -164,11 +164,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing here reads request metadata: the participant this disconnects is named
-        // entirely by the `stageArn` and `participantId` members, whose modelled lengths
-        // and patterns the framework's constraint walk refuses with a 400
+        // The only request metadata this reads is the region it was processed in, which
+        // is the account view the stage is resolved in: the participant is otherwise
+        // named entirely by the `stageArn` and `participantId` members, whose modelled
+        // lengths and patterns the framework's constraint walk refuses with a 400
         // `ValidationException` before `handle` runs.
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(
                 DisconnectParticipantErrorModeled::InternalServerException,
@@ -177,11 +178,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // Both identifiers the request carries name a resource, so neither being held is
-        // the modelled `ResourceNotFoundException` (HTTP 404) — the stage first, then the
-        // participant "attached" to it, resolved through the ONE lookup for "does this
-        // stage have this participant" (`crate::state::stage_participant`) that
-        // `StartParticipantReplication` resolves one with.
-        if !store.stages.contains_key(&input.stage_arn) {
+        // the modelled `ResourceNotFoundException` (HTTP 404) — the stage first, in this
+        // request's own region's view of the account, then the participant "attached" to
+        // it, resolved through the ONE lookup for "does this stage have this participant"
+        // (`crate::state::stage_participant`) that `StartParticipantReplication` resolves
+        // one with.
+        if store.stage_in(&region, &input.stage_arn).is_none() {
             return Err(crate::state::resource_not_found(
                 DisconnectParticipantErrorModeled::ResourceNotFoundException,
                 &input.stage_arn,

@@ -159,11 +159,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and a later caller sees what this one saw. The operation is `@readonly` in the
         // model and nothing else here changes state.
         //
-        // Nothing reads request metadata: the page this reports is named entirely by the
-        // request's own members, whose modelled lengths, patterns and ranges the
-        // framework's constraint walk refuses with a 400 `ValidationException` before
-        // `handle` runs.
-        let _ = ctx;
+        // Nothing reads request metadata beyond the region the request was processed in,
+        // which is the account view this page reports: the rest of the page is named
+        // entirely by the request's own members, whose modelled lengths, patterns and
+        // ranges the framework's constraint walk refuses with a 400 `ValidationException`
+        // before `handle` runs.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(ListCompositionsErrorModeled::InternalServerException)
         })?;
@@ -210,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store holds no composition for selects nothing — this operation models no
         // `ResourceNotFoundException`, and an empty page is what "nothing matches" is.
         let matching: Vec<&crate::state::CompositionRecord> = store
-            .compositions_in_order()
+            .compositions_in_order(&region)
             .into_iter()
             .filter(|record| {
                 input

@@ -150,7 +150,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The region the request was processed in is the account view the resource is
+        // resolved in: a resource of another region is not one this request can tag.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(TagResourceErrorModeled::InternalServerException)
         })?;
@@ -180,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
-        let tags = crate::state::resource_tags_mut(&mut store, &input.resource_arn)
+        let tags = crate::state::resource_tags_mut(&mut store, &input.resource_arn, &region)
             .ok_or_else(|| {
                 crate::state::resource_not_found(
                     TagResourceErrorModeled::ResourceNotFoundException,

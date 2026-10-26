@@ -154,12 +154,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The stage is resolved in this request's own region's view of the account: a
+        // stage of another region is not one this request can change.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(UpdateStageErrorModeled::InternalServerException)
         })?;
         let mut store = state.lock();
-        if !store.stages.contains_key(&input.arn) {
+        if store.stage_in(&region, &input.arn).is_none() {
             return Err(crate::state::resource_not_found(
                 UpdateStageErrorModeled::ResourceNotFoundException,
                 &input.arn,
@@ -177,6 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &store,
                     Self::NAME,
                     Some(configuration),
+                    &region,
                 )
                 .map_err(|message| {
                     crate::state::validation_failed(
@@ -188,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        let record = store.stages.get_mut(&input.arn).ok_or_else(|| {
+        let record = store.stage_in_mut(&region, &input.arn).ok_or_else(|| {
             crate::state::resource_not_found(
                 UpdateStageErrorModeled::ResourceNotFoundException,
                 &input.arn,

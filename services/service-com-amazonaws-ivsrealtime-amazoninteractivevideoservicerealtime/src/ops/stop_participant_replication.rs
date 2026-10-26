@@ -162,11 +162,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing here reads request metadata: the replication this stops is named
-        // entirely by the three members of the request, whose modelled lengths and
+        // The only request metadata this reads is the region it was processed in, which
+        // is the account view both stages are resolved in: the replication is otherwise
+        // named entirely by the three members of the request, whose modelled lengths and
         // patterns the framework's constraint walk refuses with a 400
         // `ValidationException` before `handle` runs.
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(
                 StopParticipantReplicationErrorModeled::InternalServerException,
@@ -189,10 +190,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         // Both stages the request names are resources of this service, so neither being
-        // held is the modelled `ResourceNotFoundException` (HTTP 404) — the same two
-        // lookups, in the same order, that starting the replication resolved.
+        // held in this request's own region's view of the account is the modelled
+        // `ResourceNotFoundException` (HTTP 404) — the same two lookups, in the same
+        // order, that starting the replication resolved.
         for stage_arn in [&input.source_stage_arn, &input.destination_stage_arn] {
-            if !store.stages.contains_key(stage_arn) {
+            if store.stage_in(&region, stage_arn).is_none() {
                 return Err(crate::state::resource_not_found(
                     StopParticipantReplicationErrorModeled::ResourceNotFoundException,
                     stage_arn,

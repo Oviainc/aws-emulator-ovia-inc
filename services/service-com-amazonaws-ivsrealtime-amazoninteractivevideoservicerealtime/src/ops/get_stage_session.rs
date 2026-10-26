@@ -165,11 +165,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing here reads request metadata: the session this reports is named
+        // The only request metadata this reads is the region it was processed in, which
+        // is the account view the session is resolved in: the session is otherwise named
         // entirely by the `stageArn` and `sessionId` members, whose modelled lengths
         // and patterns the framework's constraint walk refuses with a 400
         // `ValidationException` before `handle` runs.
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(GetStageSessionErrorModeled::InternalServerException)
         })?;
@@ -177,16 +178,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Each identifier is resolved in turn, and the one that resolves to nothing is
         // the one the 404 names: a session id names a session of ONE stage, so a
-        // request naming a stage this store does not hold is never answered from
-        // another stage's records.
-        if !store.stages.contains_key(&input.stage_arn) {
+        // request naming a stage this request's region does not hold is never answered
+        // from another stage's records.
+        if store.stage_in(&region, &input.stage_arn).is_none() {
             return Err(crate::state::resource_not_found(
                 GetStageSessionErrorModeled::ResourceNotFoundException,
                 &input.stage_arn,
             ));
         }
         let session = store
-            .stage_session(&input.stage_arn, &input.session_id)
+            .stage_session_in(&region, &input.stage_arn, &input.session_id)
             .ok_or_else(|| {
                 crate::state::resource_not_found(
                     GetStageSessionErrorModeled::ResourceNotFoundException,
