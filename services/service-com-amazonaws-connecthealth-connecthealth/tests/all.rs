@@ -35,6 +35,8 @@ mod region_scoping;
 mod reserved_tag_key_prefix;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/shared_pagination_policy.rs"]
+mod shared_pagination_policy;
 #[path = "all/start_patient_insights_job_write_discipline.rs"]
 mod start_patient_insights_job_write_discipline;
 #[path = "all/state_roundtrip.rs"]
