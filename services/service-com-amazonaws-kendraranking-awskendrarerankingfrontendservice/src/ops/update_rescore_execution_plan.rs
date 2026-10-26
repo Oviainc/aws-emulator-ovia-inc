@@ -227,22 +227,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // A transition the clock already owes is materialised first, so this call
-        // decides against the status a reader sees now rather than a stale one.
-        plan.settle_status(now);
         // A plan the service is still provisioning cannot take another change: that is
-        // the modelled `ConflictException` ("A conflict occurred with the request").
-        if plan.status != crate::state::STATUS_ACTIVE {
+        // the modelled `ConflictException` ("A conflict occurred with the request"). The
+        // service's ONE mid-transition rule settles the status the clock owes and states
+        // the refusal, the same one every other mutating path applies; this handler only
+        // names the mutation and lifts the error into its own enum.
+        if let Err(conflict) = plan.settle_for_mutation(now, crate::state::MUTATION_UPDATED) {
             return Err(
-                UpdateRescoreExecutionPlanErrorModeled::ConflictException(ConflictException {
-                    message: Some(format!(
-                        "Rescore execution plan {} is {} and can only be updated while it is {}.",
-                        plan.id,
-                        plan.status,
-                        crate::state::STATUS_ACTIVE
-                    )),
-                })
-                .into(),
+                UpdateRescoreExecutionPlanErrorModeled::ConflictException(conflict).into(),
             );
         }
 

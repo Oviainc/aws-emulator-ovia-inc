@@ -205,24 +205,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // A transition the clock already owes is materialised first, so this call
-        // decides against the status a reader sees now rather than a stale one.
-        plan.settle_status(now);
         // A plan the service is still provisioning cannot be deleted out from under
         // that work, and neither can one already being torn down: that is the modelled
         // `ConflictException` ("A conflict occurred with the request. Please fix any
-        // inconsistencies with your resources and try again.").
-        if plan.status != crate::state::STATUS_ACTIVE {
+        // inconsistencies with your resources and try again."). The service's ONE
+        // mid-transition rule settles the status the clock owes and states the refusal,
+        // the same one every other mutating path applies; this handler only names the
+        // mutation and lifts the error into its own enum.
+        if let Err(conflict) = plan.settle_for_mutation(now, crate::state::MUTATION_DELETED) {
             return Err(
-                DeleteRescoreExecutionPlanErrorModeled::ConflictException(ConflictException {
-                    message: Some(format!(
-                        "Rescore execution plan {} is {} and can only be deleted while it is {}.",
-                        plan.id,
-                        plan.status,
-                        crate::state::STATUS_ACTIVE
-                    )),
-                })
-                .into(),
+                DeleteRescoreExecutionPlanErrorModeled::ConflictException(conflict).into(),
             );
         }
 

@@ -29,6 +29,8 @@ mod plan_capacity_quota;
 mod plan_capacity_units;
 #[path = "all/plan_deletion_window.rs"]
 mod plan_deletion_window;
+#[path = "all/plan_mutation_conflict_single_source.rs"]
+mod plan_mutation_conflict_single_source;
 #[path = "all/plan_update.rs"]
 mod plan_update;
 #[path = "all/regional_isolation.rs"]

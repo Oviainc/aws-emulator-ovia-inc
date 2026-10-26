@@ -8,8 +8,8 @@ use aws_smithy_schema_server::constraints::path;
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    CapacityUnitsConfiguration, ResourceNotFoundException, ResourceUnavailableException,
-    ServiceQuotaExceededException, Tag, ValidationException,
+    CapacityUnitsConfiguration, ConflictException, ResourceNotFoundException,
+    ResourceUnavailableException, ServiceQuotaExceededException, Tag, ValidationException,
 };
 
 /// The `RescoreExecutionPlanStatus` value a plan that is ready to serve `Rescore`
@@ -121,6 +121,41 @@ pub fn resource_unavailable(resource_arn: &str) -> ResourceUnavailableException 
 pub fn plan_not_active() -> ValidationException {
     ValidationException {
         message: Some(PLAN_NOT_ACTIVE_MESSAGE.to_string()),
+    }
+}
+
+/// How the refusal of a mutating call names what the caller asked to do to the plan: the
+/// past participle a `DeleteRescoreExecutionPlan` call puts in
+/// [`plan_mutation_conflict_message`].
+pub const MUTATION_DELETED: &str = "deleted";
+
+/// [`MUTATION_DELETED`] for an `UpdateRescoreExecutionPlan` call.
+pub const MUTATION_UPDATED: &str = "updated";
+
+/// How this service states that a plan is mid-transition, so it cannot take the mutating
+/// call that reached it: `plan_id` is the plan the call addressed, `status` the
+/// `RescoreExecutionPlanStatus` value it carries now, and `verb` what the caller asked to
+/// do to it ([`MUTATION_DELETED`], [`MUTATION_UPDATED`]).
+///
+/// The sentence names the plan, the status that refuses the call and the only status in
+/// which the call would have been served, so every mutating operation states the same
+/// rule and differs only in the verb.
+pub fn plan_mutation_conflict_message(plan_id: &str, status: &str, verb: &str) -> String {
+    format!(
+        "Rescore execution plan {plan_id} is {status} and can only be {verb} while it is \
+         {STATUS_ACTIVE}."
+    )
+}
+
+/// The modelled `ConflictException` a mutating call against a plan that is not
+/// [`STATUS_ACTIVE`] is refused with — the ONE place that message is built, so every
+/// mutating path states it identically, exactly as [`plan_not_found`] does for the
+/// id-addressed lookups. Reached through
+/// [`settle_for_mutation`](RescoreExecutionPlan::settle_for_mutation), which is also the
+/// one place the predicate behind it lives.
+pub fn plan_mutation_conflict(plan_id: &str, status: &str, verb: &str) -> ConflictException {
+    ConflictException {
+        message: Some(plan_mutation_conflict_message(plan_id, status, verb)),
     }
 }
 
@@ -424,6 +459,30 @@ impl RescoreExecutionPlan {
             } else {
                 self.pending_status = Some(pending);
             }
+        }
+    }
+
+    /// Settle the transition the clock already owes this plan and decide whether it may
+    /// take a mutating call: `Ok(())` for a plan that is [`STATUS_ACTIVE`] once settled,
+    /// otherwise the modelled refusal naming it, the status that refuses the call and
+    /// `verb` — what the caller asked to do to it ([`MUTATION_DELETED`],
+    /// [`MUTATION_UPDATED`]).
+    ///
+    /// The ONE place a mutating operation makes that decision, so the predicate and its
+    /// sentence cannot drift between the operations that mutate a plan; the caller only
+    /// lifts the error into its own operation's error enum. Settling first is what makes
+    /// the decision agree with the status a reader sees at the same instant rather than a
+    /// stale one.
+    pub fn settle_for_mutation(
+        &mut self,
+        now_millis: i64,
+        verb: &str,
+    ) -> Result<(), ConflictException> {
+        self.settle_status(now_millis);
+        if self.status == STATUS_ACTIVE {
+            Ok(())
+        } else {
+            Err(plan_mutation_conflict(&self.id, &self.status, verb))
         }
     }
 
