@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetPartition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetPartition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetPartition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Reports, for each value list the request names, the partition that list addresses on
+//! the table the request names — what a partition create stored, projected exactly as
+//! [`crate::ops::get_partition`] projects one. A value list the table holds no partition
+//! for is OMITTED from the answer rather than failing the request, and is NOT reported as
+//! an unprocessed key: `UnprocessedKeys` is how this read says it did not get to a key —
+//! the truncation a batch too large to answer in one response is reported by — while a key
+//! whose partition does not exist was answered, and the answer is that there is no such
+//! partition. So a client learns which of its keys are missing by diffing its request
+//! against `Partitions`, and an `UnprocessedKeys` entry means something else entirely. An
+//! absent database or table is `EntityNotFoundException`, as it is for the
+//! single-partition read.
+//!
+//! A value list whose length is not the table's partition-key count addresses no slice of
+//! that table, so it is a miss like any other key this table holds no partition for. The
+//! write path words that condition as its own refusal
+//! ([`crate::state::messages::partition_values_do_not_match_keys`]) because a create has to
+//! say what it would not store; a read of such a list has no partition to report either
+//! way, and the single-partition read answers it as the same miss
+//! (`Partition [..] not found.`), so the two reads agree.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +182,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetPartition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetPartitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetPartition"))
+        let _ = ctx;
+        // `AuditContext` is "a structure containing the Lake Formation audit context" and
+        // `QuerySessionContext` "a protocol between query engines and Lake Formation or
+        // Glue" carrying "a Lake Formation generated authorization identifier": both ask
+        // this read to take part in a Lake Formation integration — a record to write, a
+        // query session to be authorized against — that this emulator keeps nothing of.
+        // Accepting either and dropping it would report a logged or session-scoped read
+        // nothing logged or scoped, so the batch is served only when it asks for neither.
+        // The single-partition read refuses an audit context for the same reason
+        // (`crate::ops::get_partition`).
+        if input.audit_context.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "BatchGetPartition with AuditContext",
+            ));
+        }
+        if input.query_session_context.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "BatchGetPartition with QuerySessionContext",
+            ));
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchGetPartitionErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let store = state.lock();
+        let Some(database) = store.database(&catalog_id, &input.database_name) else {
+            return Err(BatchGetPartitionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::database_not_found(
+                        &input.database_name,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        let Some(table) = database
+            .tables
+            .get(&crate::state::fold_name(&input.table_name))
+        else {
+            return Err(BatchGetPartitionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::table_not_found(&input.table_name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // Each requested value list is looked up on its own, in the order it was sent, and
+        // matched exactly as sent — a partition is addressed by its values WITHIN its
+        // table (`crate::ops::get_partition`), and the catalog's Hive case fold covers a
+        // database and a table name, never table data. A list this table holds no
+        // partition for contributes nothing: this read reports "a list of the requested
+        // partitions", so a miss is an absence and not a failure of the whole batch, and a
+        // request that names the same values twice is answered twice, once per item.
+        let partitions: Vec<Partition> = input
+            .partitions_to_get
+            .iter()
+            .filter_map(|requested| table.partition(&requested.values))
+            .map(|partition| partition.to_partition(table))
+            .collect();
+        ::tracing::info!(
+            operation = "BatchGetPartition",
+            catalog_id = %catalog_id,
+            database = %database.name,
+            table = %table.name,
+            requested = input.partitions_to_get.len(),
+            found = partitions.len(),
+            "read Data Catalog partitions in a batch"
+        );
+
+        Ok(BatchGetPartitionOutput {
+            partitions: Some(partitions),
+            // No key went unanswered: the whole batch is read under one lock, with no
+            // response-size truncation and no per-request work budget to run out of. A key
+            // whose partition does not exist is not an unprocessed key — see the module
+            // docs for why reporting it here would say something this read did not do.
+            unprocessed_keys: None,
+        })
     }
 }

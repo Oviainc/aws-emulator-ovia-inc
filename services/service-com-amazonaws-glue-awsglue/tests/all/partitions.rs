@@ -33,7 +33,7 @@ use crate::wire::{assert_echoed, call, emulator, ok, ACCOUNT_ID, ERROR_DETAIL_TA
 const MAX_PARTITIONS_PER_BATCH: usize = 100;
 
 /// Create `database` holding `table`, partitioned by `keys` (one `Column` per key).
-async fn seed_table(
+pub(crate) async fn seed_table(
     router: &MultiServiceRouter,
     database: &str,
     table: &str,
@@ -61,7 +61,7 @@ async fn seed_table(
 }
 
 /// Submit one `BatchCreatePartition` that must answer 200, and return its body.
-async fn batch_create(
+pub(crate) async fn batch_create(
     router: &MultiServiceRouter,
     database: &str,
     table: &str,
@@ -81,7 +81,7 @@ async fn batch_create(
 
 /// The `Errors` list of a batch create response, which the service reports whether or
 /// not anything failed.
-fn partition_errors(body: &Value) -> &[Value] {
+pub(crate) fn partition_errors(body: &Value) -> &[Value] {
     body["Errors"]
         .as_array()
         .map(Vec::as_slice)
@@ -89,7 +89,7 @@ fn partition_errors(body: &Value) -> &[Value] {
 }
 
 /// Read one partition back, returning the HTTP status and body.
-async fn get_partition(
+pub(crate) async fn get_partition(
     router: &MultiServiceRouter,
     database: &str,
     table: &str,
@@ -108,7 +108,7 @@ async fn get_partition(
 }
 
 /// The `Values` a `PartitionInput` carries, as the list a read addresses it by.
-fn values_of(input: &Value) -> Vec<&str> {
+pub(crate) fn values_of(input: &Value) -> Vec<&str> {
     input["Values"]
         .as_array()
         .expect("the input carries Values")
@@ -122,7 +122,7 @@ fn values_of(input: &Value) -> Vec<&str> {
 /// An instant is asserted on its numeric value instead ([`instant`]): awsJson renders a
 /// timestamp as a JSON number, and whether that number is spelled with a fractional part
 /// is the serializer's choice, not part of the value.
-fn without_instants(input: &Value) -> Value {
+pub(crate) fn without_instants(input: &Value) -> Value {
     let mut copy = input.clone();
     if let Some(members) = copy.as_object_mut() {
         members.remove("LastAccessTime");
@@ -132,7 +132,7 @@ fn without_instants(input: &Value) -> Value {
 }
 
 /// One member's instant as epoch seconds, or `None` when it carries none.
-fn instant(value: &Value, member: &str) -> Option<f64> {
+pub(crate) fn instant(value: &Value, member: &str) -> Option<f64> {
     value.get(member).and_then(Value::as_f64)
 }
 

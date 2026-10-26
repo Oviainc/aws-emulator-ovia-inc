@@ -15,6 +15,8 @@
 mod asset_types;
 #[path = "all/batch_get_jobs.rs"]
 mod batch_get_jobs;
+#[path = "all/batch_get_partition.rs"]
+mod batch_get_partition;
 #[path = "all/batch_stop_job_run.rs"]
 mod batch_stop_job_run;
 #[path = "all/catalog_identity.rs"]
