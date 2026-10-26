@@ -181,8 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An authorizer is a CHILD of an api: it is addressed through the api that owns
         // it, so an api that does not exist holds no authorizer to remove.
         let Some(api) = store.apis.get_mut(&input.api_id) else {
-            return Err(not_found(crate::state::invalid_identifier_message(
-                "API",
+            return Err(not_found(crate::state::invalid_api_identifier_message(
                 &input.api_id,
             )));
         };
@@ -191,9 +190,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that names an authorizer of ANOTHER api is not found here either — the same
         // addressing `GetAuthorizer` reports on.
         let Some(authorizer) = api.authorizers.get(&input.authorizer_id) else {
-            return Err(not_found(
-                crate::state::INVALID_AUTHORIZER_IDENTIFIER_MESSAGE.to_string(),
-            ));
+            return Err(not_found(crate::state::invalid_identifier_message(
+                crate::state::AUTHORIZER_RESOURCE,
+            )));
         };
         // The refusal below names the authorizer the way its caller configured it, so the
         // name is read off the record before the reference scan borrows the api again.

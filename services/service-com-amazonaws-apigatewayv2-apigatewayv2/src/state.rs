@@ -10,6 +10,13 @@
 //! The records here are the service's own, not the wire shapes: a record keeps a
 //! value the api always has (its id, its name, its creation instant) as a plain
 //! field, and `to_wire` projects it onto the modelled shape the handlers serialize.
+//!
+//! The pagination a collection reader serves — the page size a caller may ask for and
+//! the opaque `NextToken` that resumes a walk — lives in [`paging`], the module that
+//! holds those bounds, and is re-exported here so a handler reaches it the way it
+//! reaches everything else in this module.
+
+pub mod paging;
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
@@ -37,6 +44,75 @@ const ID_MULTIPLIER: u128 = 1_000_000_007;
 
 /// The bijection's constant term, so the first id minted is not a run of leading `a`s.
 const ID_OFFSET: u128 = 734_291;
+
+/// Which KIND of resource an id is minted for.
+///
+/// Every collection counts its own ids from a seed of its own, so an api's first route
+/// and its first integration are minted from the SAME seed. An identifier has to denote
+/// one resource, though — a client that reads an `IntegrationId` out of a refusal must
+/// not get a string that is also a `RouteId` — so the kind is folded into the id's
+/// pre-image (see [`mint_id`]) and ids of two different kinds are never equal, whatever
+/// their seeds.
+#[derive(Debug, Clone, Copy)]
+enum IdKind {
+    Api,
+    Portal,
+    PortalProduct,
+    VpcLink,
+    DomainName,
+    Route,
+    Integration,
+    Model,
+    Deployment,
+    Authorizer,
+    RouteResponse,
+    IntegrationResponse,
+    ProductPage,
+    ProductRestEndpointPage,
+}
+
+impl IdKind {
+    /// Every kind there is, so [`ID_KIND_STRIDE`] can be checked to cover them all.
+    const ALL: &'static [IdKind] = &[
+        IdKind::Api,
+        IdKind::Portal,
+        IdKind::PortalProduct,
+        IdKind::VpcLink,
+        IdKind::DomainName,
+        IdKind::Route,
+        IdKind::Integration,
+        IdKind::Model,
+        IdKind::Deployment,
+        IdKind::Authorizer,
+        IdKind::RouteResponse,
+        IdKind::IntegrationResponse,
+        IdKind::ProductPage,
+        IdKind::ProductRestEndpointPage,
+    ];
+
+    /// The kind declared LAST, whose ordinal is therefore the largest. Named so the
+    /// assertions below can check that [`Self::ALL`] lists every variant (its length is
+    /// the last ordinal plus one) and that the largest ordinal still has a residue class
+    /// of its own: a variant added to the enum and forgotten in `ALL`, or one added past
+    /// [`ID_KIND_STRIDE`], fails the build rather than minting another kind's id.
+    const LAST: IdKind = IdKind::ProductRestEndpointPage;
+
+    /// This kind's residue class in the id space, below [`ID_KIND_STRIDE`].
+    const fn ordinal(self) -> u128 {
+        self as u128
+    }
+}
+
+/// How many residue classes of the id space are reserved for [`IdKind`]s: one per kind,
+/// so `seed * ID_KIND_STRIDE + kind` is injective in `(kind, seed)`.
+const ID_KIND_STRIDE: u128 = 16;
+
+/// Every kind must have a residue class of its own, or two kinds would mint one id: the
+/// kinds are counted AND the largest ordinal is checked, so a variant added to
+/// [`IdKind`] without a seat in [`ID_KIND_STRIDE`] fails the build.
+const _: () = assert!(IdKind::ALL.len() as u128 <= ID_KIND_STRIDE);
+const _: () = assert!(IdKind::LAST.ordinal() + 1 == IdKind::ALL.len() as u128);
+const _: () = assert!(IdKind::LAST.ordinal() < ID_KIND_STRIDE);
 
 /// The `RouteSelectionExpression` an HTTP API gets when the request names none.
 ///
@@ -402,12 +478,9 @@ pub const MAX_INTEGRATION_TIMEOUT_MILLIS: i32 = 30_000;
 pub const DEFAULT_WEBSOCKET_TIMEOUT_MILLIS: i32 = 29_000;
 
 /// The largest page either paginated operation serves, and the page size it uses when
-/// the request names no `MaxResults`.
-///
-/// A caller-supplied `MaxResults` is clamped DOWN to it, so no single request can walk
-/// and serialize the whole store: the work one call costs is bounded server-side, and
-/// what does not fit is reported through `NextToken`.
-pub const MAX_PAGE_SIZE: usize = 100;
+/// the request names no `MaxResults` — see [`paging::MAX_PAGE_SIZE`], which is defined
+/// with the helpers that enforce it.
+pub use paging::MAX_PAGE_SIZE;
 
 /// The most VPC links one account may hold, after which CreateVpcLink is refused.
 ///
@@ -487,7 +560,7 @@ impl ComAmazonawsApigatewayv2Apigatewayv2State {
     /// Mint a fresh `ApiId`: ten lowercase alphanumerics, never one already minted.
     pub fn mint_api_id(&mut self) -> String {
         self.api_id_seed = self.api_id_seed.wrapping_add(1);
-        mint_id(self.api_id_seed)
+        mint_id(IdKind::Api, self.api_id_seed)
     }
 
     /// Mint a fresh `PortalId`: ten lowercase alphanumerics, never one already minted.
@@ -497,7 +570,7 @@ impl ComAmazonawsApigatewayv2Apigatewayv2State {
     /// [`ID_ALPHABET`], so every minted id satisfies that constraint by construction.
     pub fn mint_portal_id(&mut self) -> String {
         self.portal_id_seed = self.portal_id_seed.wrapping_add(1);
-        mint_id(self.portal_id_seed)
+        mint_id(IdKind::Portal, self.portal_id_seed)
     }
 
     /// Mint a fresh `PortalProductId`: ten lowercase alphanumerics, never one already
@@ -506,13 +579,13 @@ impl ComAmazonawsApigatewayv2Apigatewayv2State {
     /// alphanumeric id satisfies.
     pub fn mint_portal_product_id(&mut self) -> String {
         self.portal_product_id_seed = self.portal_product_id_seed.wrapping_add(1);
-        mint_id(self.portal_product_id_seed)
+        mint_id(IdKind::PortalProduct, self.portal_product_id_seed)
     }
 
     /// Mint a fresh `VpcLinkId`: ten lowercase alphanumerics, never one already minted.
     pub fn mint_vpc_link_id(&mut self) -> String {
         self.vpc_link_id_seed = self.vpc_link_id_seed.wrapping_add(1);
-        mint_id(self.vpc_link_id_seed)
+        mint_id(IdKind::VpcLink, self.vpc_link_id_seed)
     }
 
     /// Mint the id of the regional host a custom domain name is served on: ten
@@ -520,7 +593,7 @@ impl ComAmazonawsApigatewayv2Apigatewayv2State {
     /// so minting a domain name never shifts the ids apis get.
     pub fn mint_domain_name_id(&mut self) -> String {
         self.domain_name_id_seed = self.domain_name_id_seed.wrapping_add(1);
-        mint_id(self.domain_name_id_seed)
+        mint_id(IdKind::DomainName, self.domain_name_id_seed)
     }
 }
 
@@ -577,35 +650,35 @@ impl Api {
     /// this api already minted.
     pub fn mint_route_id(&mut self) -> String {
         self.route_id_seed = self.route_id_seed.wrapping_add(1);
-        mint_id(self.route_id_seed)
+        mint_id(IdKind::Route, self.route_id_seed)
     }
 
     /// Mint a fresh `IntegrationId` for this api: ten lowercase alphanumerics, never
     /// one this api already minted.
     pub fn mint_integration_id(&mut self) -> String {
         self.integration_id_seed = self.integration_id_seed.wrapping_add(1);
-        mint_id(self.integration_id_seed)
+        mint_id(IdKind::Integration, self.integration_id_seed)
     }
 
     /// Mint a fresh `ModelId` for this api: ten lowercase alphanumerics, never one
     /// this api already minted.
     pub fn mint_model_id(&mut self) -> String {
         self.model_id_seed = self.model_id_seed.wrapping_add(1);
-        mint_id(self.model_id_seed)
+        mint_id(IdKind::Model, self.model_id_seed)
     }
 
     /// Mint a fresh `DeploymentId` for this api: ten lowercase alphanumerics, never
     /// one this api already minted.
     pub fn mint_deployment_id(&mut self) -> String {
         self.deployment_id_seed = self.deployment_id_seed.wrapping_add(1);
-        mint_id(self.deployment_id_seed)
+        mint_id(IdKind::Deployment, self.deployment_id_seed)
     }
 
     /// Mint a fresh `AuthorizerId` for this api: ten lowercase alphanumerics, never
     /// one this api already minted.
     pub fn mint_authorizer_id(&mut self) -> String {
         self.authorizer_id_seed = self.authorizer_id_seed.wrapping_add(1);
-        mint_id(self.authorizer_id_seed)
+        mint_id(IdKind::Authorizer, self.authorizer_id_seed)
     }
 
     /// Release a deployment of this api's current configuration BY THE SERVICE, for a
@@ -814,7 +887,7 @@ impl Route {
     /// never one this route already minted.
     pub fn mint_route_response_id(&mut self) -> String {
         self.route_response_id_seed = self.route_response_id_seed.wrapping_add(1);
-        mint_id(self.route_response_id_seed)
+        mint_id(IdKind::RouteResponse, self.route_response_id_seed)
     }
 
     /// Project the record onto the modelled `Route` shape.
@@ -936,7 +1009,7 @@ impl Integration {
     /// alphanumerics, never one this integration already minted.
     pub fn mint_integration_response_id(&mut self) -> String {
         self.integration_response_id_seed = self.integration_response_id_seed.wrapping_add(1);
-        mint_id(self.integration_response_id_seed)
+        mint_id(IdKind::IntegrationResponse, self.integration_response_id_seed)
     }
 
     /// Project the record onto the modelled `Integration` shape.
@@ -1529,21 +1602,74 @@ pub fn validate_route_key_variables<'a>(
 pub const UNRESOLVED_AUTHORIZER_MESSAGE: &str = "Invalid authorizer ID specified. Setting \
     the authorization type to CUSTOM or COGNITO_USER_POOLS requires a valid authorizer.";
 
-/// The sentence this service answers `NotFoundException` with for an `AuthorizerId` no
-/// authorizer of the addressed api carries.
+/// The sentence this service answers `NotFoundException` with for an identifier that
+/// names no resource of `resource`'s kind.
 ///
-/// API Gateway answers an unknown authorizer identifier with this sentence alone: unlike
-/// the api-level [`invalid_identifier_message`], it names neither the account nor the
-/// identifier the request carried.
-pub const INVALID_AUTHORIZER_IDENTIFIER_MESSAGE: &str = "Invalid Authorizer identifier specified";
+/// API Gateway reports an unknown identifier of a resource that is ADDRESSED WITHIN
+/// another — a route, a deployment, a stage, an authorizer of an api, a response of a
+/// route — with the resource's kind alone: the sentence carries neither the identifier
+/// the request already holds nor the account the api is scoped to. Only the API's own
+/// identifier is reported account-qualified, by
+/// [`invalid_api_identifier_message`].
+///
+/// Shared by every reader and writer of a child resource, so one kind of resource
+/// cannot be reported two ways, and the operation names the kind it ADDRESSED: a caller
+/// reading the refusal learns which resource of the request resolved to nothing.
+pub fn invalid_identifier_message(resource: &str) -> String {
+    format!("Invalid {resource} identifier specified")
+}
 
-/// The message this service answers `NotFoundException` with for a request naming a
-/// resource no record holds: the sentence API Gateway answers an unknown identifier
-/// with, for the resource named ("Invalid API identifier specified
-/// {account}:{identifier}").
-pub fn invalid_identifier_message(resource: &str, id: &str) -> String {
+/// How [`invalid_identifier_message`] names a ROUTE of an api. API Gateway spells this
+/// kind in lower case ("Invalid route identifier specified"), where it capitalises
+/// others — the sentence is per kind, so each kind's spelling lives in one place and
+/// every operation that addresses a route reports the same one.
+pub const ROUTE_RESOURCE: &str = "route";
+
+/// How [`invalid_identifier_message`] names a ROUTE RESPONSE of a route.
+pub const ROUTE_RESPONSE_RESOURCE: &str = "RouteResponse";
+
+/// How [`invalid_identifier_message`] names a DEPLOYMENT of an api ("Invalid Deployment
+/// identifier specified").
+pub const DEPLOYMENT_RESOURCE: &str = "Deployment";
+
+/// How [`invalid_identifier_message`] names an INTEGRATION of an api.
+pub const INTEGRATION_RESOURCE: &str = "Integration";
+
+/// How [`invalid_identifier_message`] names an INTEGRATION RESPONSE of an integration.
+pub const INTEGRATION_RESPONSE_RESOURCE: &str = "IntegrationResponse";
+
+/// How [`invalid_identifier_message`] names a STAGE of an api, which API Gateway spells
+/// in lower case.
+pub const STAGE_RESOURCE: &str = "stage";
+
+/// How [`invalid_identifier_message`] names a MODEL of an api.
+pub const MODEL_RESOURCE: &str = "Model";
+
+/// How [`invalid_identifier_message`] names an AUTHORIZER of an api ("Invalid Authorizer
+/// identifier specified").
+pub const AUTHORIZER_RESOURCE: &str = "Authorizer";
+
+/// How [`invalid_identifier_message`] names a PORTAL, which API Gateway spells in lower
+/// case.
+pub const PORTAL_RESOURCE: &str = "portal";
+
+/// How [`invalid_identifier_message`] names a PORTAL PRODUCT.
+pub const PORTAL_PRODUCT_RESOURCE: &str = "PortalProduct";
+
+/// How [`invalid_identifier_message`] names a PRODUCT PAGE of a portal product.
+pub const PRODUCT_PAGE_RESOURCE: &str = "ProductPage";
+
+/// How [`invalid_identifier_message`] names a VPC LINK, spelled the way the operations
+/// that address one do ("Invalid VPC link identifier specified").
+pub const VPC_LINK_RESOURCE: &str = "VPC link";
+
+/// The sentence this service answers `NotFoundException` with for an `ApiId` no api
+/// holds: the account-qualified form API Gateway reports an unknown API identifier in
+/// ("Invalid API identifier specified {account}:{ApiId}"), because an `ApiId` is
+/// addressed within an account rather than within another resource.
+pub fn invalid_api_identifier_message(api_id: &str) -> String {
     format!(
-        "Invalid {resource} identifier specified {}:{id}",
+        "Invalid API identifier specified {}:{api_id}",
         ::engine::emulator_account_id()
     )
 }
@@ -2414,7 +2540,10 @@ impl PortalProduct {
     pub fn mint_product_rest_endpoint_page_id(&mut self) -> String {
         self.product_rest_endpoint_page_id_seed =
             self.product_rest_endpoint_page_id_seed.wrapping_add(1);
-        mint_id(self.product_rest_endpoint_page_id_seed)
+        mint_id(
+            IdKind::ProductRestEndpointPage,
+            self.product_rest_endpoint_page_id_seed,
+        )
     }
 
     /// Mint a fresh `ProductPageId` for this product: ten lowercase alphanumerics, never
@@ -2423,7 +2552,7 @@ impl PortalProduct {
     /// [`mint_id`]'s ten-character lowercase alphanumeric id satisfies by construction.
     pub fn mint_product_page_id(&mut self) -> String {
         self.product_page_id_seed = self.product_page_id_seed.wrapping_add(1);
-        mint_id(self.product_page_id_seed)
+        mint_id(IdKind::ProductPage, self.product_page_id_seed)
     }
 
     /// Project the record onto the members every portal-product reader reports.
@@ -3469,14 +3598,17 @@ pub fn to_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_secs(i64::try_from(secs).unwrap_or(i64::MAX))
 }
 
-/// Mint one id from `seed`: [`ID_LEN`] characters drawn from [`ID_ALPHABET`].
+/// Mint one id from `kind` and `seed`: [`ID_LEN`] characters drawn from
+/// [`ID_ALPHABET`].
 ///
-/// `seed -> seed * ID_MULTIPLIER + ID_OFFSET (mod ID_SPACE)` is a bijection (see
+/// `(kind, seed) -> seed * ID_KIND_STRIDE + kind` is injective, and
+/// `preimage -> preimage * ID_MULTIPLIER + ID_OFFSET (mod ID_SPACE)` is a bijection (see
 /// [`ID_MULTIPLIER`]), so consecutive seeds give unpredictable-looking ids that never
-/// repeat. That makes uniqueness structural: no collision retry, no exhaustion branch
-/// and no random source.
-fn mint_id(seed: u64) -> String {
-    let mut scrambled = (u128::from(seed) * ID_MULTIPLIER + ID_OFFSET) % ID_SPACE;
+/// repeat AND two kinds never mint the same id. That makes uniqueness structural: no
+/// collision retry, no exhaustion branch and no random source.
+fn mint_id(kind: IdKind, seed: u64) -> String {
+    let preimage = u128::from(seed) * ID_KIND_STRIDE + kind.ordinal();
+    let mut scrambled = (preimage * ID_MULTIPLIER + ID_OFFSET) % ID_SPACE;
     let mut id = Vec::with_capacity(ID_LEN as usize);
     for _ in 0..ID_LEN {
         let digit = usize::try_from(scrambled % 36).unwrap_or(0);
@@ -3548,123 +3680,19 @@ pub fn parse_boolean_query(member: &str, raw: Option<&str>) -> Result<bool, Stri
     }
 }
 
-/// Resolve a `MaxResults` query value into the page size to serve.
-///
-/// `MaxResults` is modelled as `__string` on these operations, so the numeric rule is
-/// the handler's to enforce: a positive decimal integer. The result is clamped to
-/// [`MAX_PAGE_SIZE`], which is also the page size an absent `MaxResults` gets, so the
-/// page size is always bounded server-side rather than by what the caller asked for.
-/// `Err` carries the message for the operation's `BadRequestException`.
-pub fn parse_max_results(raw: Option<&str>) -> Result<usize, String> {
-    let Some(raw) = raw else {
-        return Ok(MAX_PAGE_SIZE);
-    };
-    match raw.parse::<i64>() {
-        Ok(n) if n >= 1 => Ok(usize::try_from(n).unwrap_or(MAX_PAGE_SIZE).min(MAX_PAGE_SIZE)),
-        _ => Err(format!(
-            "Invalid value for MaxResults: '{raw}'. MaxResults must be a positive integer."
-        )),
-    }
-}
+/// Resolve a `MaxResults` query value into the page size to serve — see
+/// [`paging::parse_max_results`], which clamps it to [`MAX_PAGE_SIZE`].
+pub use paging::parse_max_results;
 
-/// The sentence a paginated reader refuses a `NextToken` it did not issue with.
-///
-/// A pagination token is OPAQUE: the service mints it and the caller echoes it back
-/// unchanged, so a string that is not one of this service's tokens for the collection
-/// being read names no position in it, and the request is not valid
-/// (`BadRequestException`: "The request is not valid, for example, the input is
-/// incomplete or incorrect"). API Gateway names the pagination cursor the POSITION in
-/// the collection, and this is the one sentence it refuses a cursor it cannot read
-/// with: it names nothing from the request, so the refusal a caller sees does not vary
-/// with the token it sent.
-pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "Invalid position parameter";
+/// The sentence a paginated reader refuses a `NextToken` it did not issue with — see
+/// [`paging::INVALID_NEXT_TOKEN_MESSAGE`].
+pub use paging::INVALID_NEXT_TOKEN_MESSAGE;
 
-/// Separates the collection a token was issued for from the key its page resumes at.
-/// A unit separator, so it cannot occur in either part.
-const PAGE_TOKEN_SEPARATOR: char = '\u{1f}';
+/// The collection a pagination token is issued for — see [`paging::page_scope`].
+pub use paging::page_scope;
 
-/// The collection a pagination token is issued for: `Stage`s of one api, `Api`s of the
-/// account, and so on. Two readers of different collections never accept each other's
-/// tokens, so `parts` is every name that identifies the collection — the resource path
-/// of the collection being read.
-pub fn page_scope(parts: &[&str]) -> String {
-    parts.join("/")
-}
-
-/// Mint the opaque `NextToken` that resumes `scope` at `key`.
-///
-/// The token's CONTENT is the service's own: the model documents `NextToken` only as
-/// "The next page of elements from this collection", so what a caller may do with one
-/// is echo it back. Hex, so the token needs no escaping in a query string and carries
-/// no resource name in the clear, and the collection travels with the key so a token
-/// is only ever accepted by the reader that issued it.
-fn encode_page_token(scope: &str, key: &str) -> String {
-    ::hex::encode(format!("{scope}{PAGE_TOKEN_SEPARATOR}{key}"))
-}
-
-/// The longest a token this service minted can be, in bytes.
-///
-/// A minted token is hex over the collection's resource path, one separator and a key —
-/// and every key this store holds is bounded (a `StageName` by
-/// [`MAX_STAGE_NAME_LEN`], the others comparably), so a token past this length is one
-/// this service cannot have issued. Checked BEFORE the decode, so the work a rejected
-/// token costs does not grow with the length a caller chose for it.
-const MAX_PAGE_TOKEN_LEN: usize = 2048;
-
-/// The key a token issued for `scope` resumes at, or `Err` when this service did not
-/// issue `token` for that collection.
-fn decode_page_token(scope: &str, token: &str) -> Result<String, String> {
-    if token.len() > MAX_PAGE_TOKEN_LEN {
-        return Err(INVALID_NEXT_TOKEN_MESSAGE.to_string());
-    }
-    let decoded = ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(|| INVALID_NEXT_TOKEN_MESSAGE.to_string())?;
-    let (token_scope, key) = decoded
-        .split_once(PAGE_TOKEN_SEPARATOR)
-        .ok_or_else(|| INVALID_NEXT_TOKEN_MESSAGE.to_string())?;
-    if token_scope != scope {
-        return Err(INVALID_NEXT_TOKEN_MESSAGE.to_string());
-    }
-    Ok(key.to_string())
-}
-
-/// One page of the key-ordered collection `scope`.
-///
-/// Walks `items` in key order from where `next_token` left off (inclusive) and takes at
-/// most `max_results`. The returned token resumes at the first item that did NOT fit, so
-/// it is present only when more remain and resuming from it continues exactly where this
-/// page stopped. `Err` carries the message for the operation's `BadRequestException`:
-/// a token this service did not issue for `scope` is refused rather than served as a
-/// page of its own.
-pub fn page<'a, V>(
-    items: &'a BTreeMap<String, V>,
-    scope: &str,
-    next_token: Option<&str>,
-    max_results: usize,
-) -> Result<(Vec<&'a V>, Option<String>), String> {
-    let resume = match next_token {
-        Some(token) => Some(decode_page_token(scope, token)?),
-        None => None,
-    };
-    // `range` seeks straight to the resume key, so a full paginated walk costs one
-    // traversal rather than one scan per page.
-    let start = match &resume {
-        Some(key) => ::std::ops::Bound::Included(key.as_str()),
-        None => ::std::ops::Bound::Unbounded,
-    };
-    let mut rest = items.range::<str, _>((start, ::std::ops::Bound::Unbounded));
-    let page: Vec<&V> = rest
-        .by_ref()
-        .take(max_results)
-        .map(|(_, value)| value)
-        .collect();
-    let token = rest
-        .next()
-        .map(|(key, _)| encode_page_token(scope, key.as_str()));
-    Ok((page, token))
-}
+/// One page of a key-ordered collection — see [`paging::page`].
+pub use paging::page;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

@@ -61,31 +61,49 @@ pub(crate) async fn import(
     .await
 }
 
-/// Every route of an api, as `RouteKey -> Target`, read back through `GetRoutes`.
+/// Every route of an api, as `RouteKey -> Target`, read back through `GetRoutes` — every
+/// PAGE of it, so the answer is the api's whole route set and not whichever routes the
+/// first page's `RouteId` order happens to put in it.
 pub(crate) async fn stored_routes(
     router: &MultiServiceRouter,
     api_id: &str,
 ) -> BTreeMap<String, Option<String>> {
-    let (status, body) = call(router, "GET", &format!("/v2/apis/{api_id}/routes"), None).await;
-    assert_eq!(
-        status, 200,
-        "expected 200 from GetRoutes for api {api_id}, got {status} {body}"
-    );
-    body["items"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .map(|route| {
-            (
-                as_str(route, "routeKey"),
-                route
-                    .get("target")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string),
-            )
-        })
-        .collect()
+    let mut routes = BTreeMap::new();
+    let mut next_token: Option<String> = None;
+    loop {
+        let uri = match next_token.as_deref() {
+            Some(token) => format!("/v2/apis/{api_id}/routes?nextToken={token}"),
+            None => format!("/v2/apis/{api_id}/routes"),
+        };
+        let (status, body) = call(router, "GET", &uri, None).await;
+        assert_eq!(
+            status, 200,
+            "expected 200 from GetRoutes for api {api_id}, got {status} {body}"
+        );
+        routes.extend(
+            body["items"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|route| {
+                    (
+                        as_str(route, "routeKey"),
+                        route
+                            .get("target")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string),
+                    )
+                }),
+        );
+        next_token = body
+            .get("nextToken")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        if next_token.is_none() {
+            return routes;
+        }
+    }
 }
 
 /// Every integration of an api, as `IntegrationId -> Integration`, read back through

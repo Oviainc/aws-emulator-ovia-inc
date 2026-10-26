@@ -2435,6 +2435,31 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
         parents
     }
 
+    /// The composite alarms whose CONFIGURATION references `name`: the ones whose `AlarmRule`
+    /// names it ([`Self::composite_alarm_parents`]) and the ones that use it as their
+    /// `ActionsSuppressor` ("The actions suppressor alarm is specified by its ARN or name" —
+    /// `CompositeAlarm$ActionsSuppressor`, so either form resolves to the name the store keys
+    /// on). The alarm itself is never among them, and the list is ordered and without repeats.
+    ///
+    /// This is every reference that would dangle if the alarm named went away.
+    pub fn composite_alarm_referrers(&self, name: &str) -> Vec<String> {
+        let mut referrers = self.composite_alarm_parents(name);
+        referrers.extend(
+            self.composite_alarms
+                .iter()
+                .filter(|(parent, stored)| {
+                    parent.as_str() != name
+                        && stored.alarm.actions_suppressor.as_deref().is_some_and(
+                            |suppressor| alarm_rule_reference_name(suppressor) == name,
+                        )
+                })
+                .map(|(parent, _)| parent.clone()),
+        );
+        referrers.sort();
+        referrers.dedup();
+        referrers
+    }
+
     /// The managed Contributor Insights rules this store holds for `resource_arn`, as
     /// (rule name, rule) pairs ordered by template name and then rule name.
     ///

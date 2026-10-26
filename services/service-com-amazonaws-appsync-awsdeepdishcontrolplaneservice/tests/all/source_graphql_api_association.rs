@@ -282,13 +282,13 @@ async fn an_association_created_from_the_merged_api_side_is_persisted_as_configu
                 refused.error_type,
                 refused.body
             );
-            // The model states this error's own text, so it is the text the refusal
-            // carries — request-independent, naming nothing of the call that met it.
+            // The conflict is scoped to the Merged API whose associations are being
+            // updated, so the refusal names it however the request addressed it.
             assert_eq!(
                 refused.body["message"].as_str(),
-                Some(state::CONCURRENT_MODIFICATION_MESSAGE),
-                "case {:?}: expected the modelled concurrent-modification text from {side}, got \
-                 {:?}",
+                Some(state::associations_being_updated_message(&merged.id).as_str()),
+                "case {:?}: expected the association-scoped concurrent-modification text from \
+                 {side}, got {:?}",
                 case.label,
                 refused.body["message"]
             );

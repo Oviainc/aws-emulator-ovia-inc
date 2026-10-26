@@ -60,17 +60,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The page-size bound this operation enforces itself, and the page it serves when the
-/// caller asks for no `maxResults` (the maximum).
-///
-/// Treat it as THIS EMULATOR's cap on one page: the generated "Modeled contract" header
-/// above lists `maxResults` without a range, so the handler enforces the bound itself
-/// (refusing, never clamping) rather than relying on the boundary validator.
-/// `smithy_query(query="operation", operation="ListDomains")` does report a
-/// `range {min: 1, max: 100}` for the member, which is where these numbers come from.
-const MIN_PAGE_SIZE: i32 = 1;
-const MAX_PAGE_SIZE: i32 = 100;
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -166,44 +155,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
-        // Absent `maxResults` means a full page. A value outside the bound is REFUSED
-        // rather than quietly clamped, here in the handler, so the answer does not
-        // depend on whether the boundary validator also refuses it.
-        let page_size = match input.max_results {
-            None => MAX_PAGE_SIZE,
-            Some(requested) if (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&requested) => requested,
-            Some(requested) => {
-                // Worded as AWS words a constraint violation, and in the one place that
-                // sentence is written (`crate::service::error_detail`), so this refusal
-                // reads identically to the boundary validator's for the same violation.
-                return Err(crate::scaffolded::Scaffolded::validation(
-                    crate::service::error_detail::range_violation_message(
-                        "maxResults",
-                        requested,
-                        MIN_PAGE_SIZE,
-                        MAX_PAGE_SIZE,
-                    ),
-                ))
-            }
-        };
-        let page_size = usize::try_from(page_size).unwrap_or(1);
-
-        // The cursor is the last key of the previous page: resume strictly after it,
-        // whether or not that domain still exists. A token is used as a resume point
-        // only when it is one THIS listing issued — a fabricated token, or one another
-        // listing minted, is refused rather than answered with a page computed from a
-        // resume point the service never handed out.
-        let scope = crate::state::domains_page_scope(&region);
-        let resume_after = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => match crate::state::decode_page_token(&scope, token) {
-                Some(key) => Some(key),
-                None => {
-                    return Err(crate::scaffolded::Scaffolded::validation(
-                        "nextToken is not a token this service issued",
-                    ))
-                }
-            },
+        // The page this request asks for: the page size it bounds the answer with, and
+        // the cursor it resumes from. Both are decided by the pagination rule this
+        // service states ONCE in `crate::state::Page`, which the other listing obeys
+        // too; what belongs to this operation is only the channel a refusal travels on —
+        // and this operation's model declares no error at all, so a refusal is the only
+        // channel it has.
+        let page = match crate::state::Page::resolve(
+            crate::state::domains_page_scope(&region),
+            input.max_results,
+            input.next_token.as_deref(),
+        ) {
+            Ok(page) => page,
+            Err(detail) => return Err(crate::scaffolded::Scaffolded::validation(detail)),
         };
 
         let mut store = state.lock();
@@ -214,15 +178,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut matching = store
             .domains_in(&region)
             .filter(|domain| wanted.is_none_or(|status| domain.status == status))
-            .filter(|domain| {
-                resume_after
-                    .as_deref()
-                    .is_none_or(|after| domain.domain_id.as_str() > after)
-            });
+            .filter(|domain| page.starts_after(&domain.domain_id));
 
         let domains: Vec<DomainSummary> = matching
             .by_ref()
-            .take(page_size)
+            .take(page.size())
             .map(|domain| DomainSummary {
                 domain_id: domain.domain_id.clone(),
                 arn: domain.arn.clone(),
@@ -232,12 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
         // A token only when a matching domain is left after this page.
-        let next_token = match (matching.next(), domains.last()) {
-            (Some(_), Some(last)) => {
-                Some(crate::state::encode_page_token(&scope, &last.domain_id))
-            }
-            _ => None,
-        };
+        let next_token = page.next_token(
+            matching.next().is_some(),
+            domains.last().map(|last| last.domain_id.as_str()),
+        );
 
         Ok(ListDomainsOutput {
             domains,

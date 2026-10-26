@@ -3256,10 +3256,11 @@ pub fn wait_duration(value: &str) -> Result<Duration, WaitDurationProblem> {
 /// admissible — `targets` is not `@required` on the create, and an action that needs none
 /// (the built-in wait) runs without one.
 ///
-/// Two rules the model cannot express, both stated by `CreateExperimentTemplateTargetInput`
-/// itself ("You must specify at least one Amazon Resource Name (ARN) or at least one
-/// resource tag. You cannot specify both ARNs and tags"), which is why `resourceArns` and
-/// `resourceTags` are modelled as two independent optional members:
+/// The rules the model cannot express. Two of them are stated by
+/// `CreateExperimentTemplateTargetInput` itself ("You must specify at least one Amazon
+/// Resource Name (ARN) or at least one resource tag. You cannot specify both ARNs and
+/// tags"), which is why `resourceArns` and `resourceTags` are modelled as two independent
+/// optional members:
 ///
 /// * a target identifies its resources by EXACTLY ONE of them, so one that names both and
 ///   one that names neither are each refused rather than stored;
@@ -3269,6 +3270,19 @@ pub fn wait_duration(value: &str) -> Result<Duration, WaitDurationProblem> {
 /// An EMPTY `resourceArns` list, and an empty `resourceTags` map, name no resource and no
 /// tag: both are "not specified" here, which is what the documented sentence requires of
 /// them ("at least one").
+///
+/// The other two are the published target-resource-type contract, the same one
+/// [`TARGET_RESOURCE_TYPE_CATALOG`] serves to `ListTargetResourceTypes` and
+/// `GetTargetResourceType` — the counterpart of what [`actions_refusal`] applies to an
+/// action from [`ACTION_CATALOG`]:
+///
+/// * `resourceType` is "the resource type", one of the target resource types FIS
+///   PUBLISHES, so a type the catalog holds no entry for — the same miss
+///   `GetTargetResourceType` answers `ResourceNotFoundException` for — is refused rather
+///   than stored;
+/// * the parameters that type's catalogued contract marks required are supplied, because
+///   `TargetResourceTypeParameter$required` says a target of that type HAS TO set them and
+///   a target without them names a resolution the published contract cannot identify.
 pub fn targets_refusal(
     targets: &HashMap<String, ExperimentTemplateTarget>,
 ) -> Option<ValidationException> {
@@ -3277,6 +3291,16 @@ pub fn targets_refusal(
     let mut entries: Vec<(&String, &ExperimentTemplateTarget)> = targets.iter().collect();
     entries.sort_by_key(|(name, _)| *name);
     for (name, target) in entries {
+        // `resourceType` is required on the create's and the update's target input alike, so
+        // a stored target always carries one; a record without one names no published
+        // resource type and is refused by this rule.
+        let resource_type = target.resource_type.as_deref().unwrap_or_default();
+        let Some(entry) = target_resource_type_catalog_entry(resource_type) else {
+            return Some(invalid_input(format!(
+                "targets.{name}.resourceType must be a resource type FIS publishes, \
+                 got {resource_type:?}"
+            )));
+        };
         let names_arns = target.resource_arns.as_ref().is_some_and(|arns| !arns.is_empty());
         let names_tags = target
             .resource_tags
@@ -3302,6 +3326,39 @@ pub fn targets_refusal(
                 "targets.{name}.selectionMode must be {SELECTION_MODE_ALL}, \
                  {SELECTION_MODE_COUNT_PREFIX}n) or {SELECTION_MODE_PERCENT_PREFIX}n), \
                  got {selection_mode:?}"
+            )));
+        }
+        if let Some(refusal) = target_parameters_refusal(name, target, entry) {
+            return Some(refusal);
+        }
+    }
+    None
+}
+
+/// `None` when `target` supplies every parameter its resource type's catalogued contract
+/// `entry` marks required; otherwise the `ValidationException` that refuses the template.
+///
+/// `TargetResourceTypeParameter$required` is reported by `GetTargetResourceType` for every
+/// published resource type, so which parameters a target of that type needs is part of the
+/// contract this service already serves — the same table decides it here, exactly as
+/// [`action_parameters_refusal`] decides an action's. The parameters are judged in the
+/// order the catalogued entry records them (sorted by name), so a target missing several of
+/// them always earns the same message.
+fn target_parameters_refusal(
+    name: &str,
+    target: &ExperimentTemplateTarget,
+    entry: &TargetResourceTypeCatalogEntry,
+) -> Option<ValidationException> {
+    let resource_type = entry.id;
+    for parameter in entry.parameters.iter().filter(|parameter| parameter.required) {
+        if target
+            .parameters
+            .as_ref()
+            .is_none_or(|parameters| !parameters.contains_key(parameter.name))
+        {
+            return Some(invalid_input(format!(
+                "targets.{name}.parameters must carry '{}' for resource type {resource_type}.",
+                parameter.name
             )));
         }
     }
@@ -3522,7 +3579,8 @@ pub enum TemplateRefusal {
 pub fn template_refusal(template: &ExperimentTemplateRecord) -> Option<TemplateRefusal> {
     // What the model cannot express is that `roleArn` names an IAM ROLE, what FIS documents
     // for a stop condition's `source`/`value` pair, which values the two `experimentOptions`
-    // enums admit, how a target identifies its resources and scopes them, and the actions
+    // enums admit, how a target identifies its resources and scopes them, the resource types
+    // FIS publishes with the parameters each one requires of a target, and the actions
     // FIS publishes with the parameters and the targets each one takes. The modelled
     // constraints — the required members, the lengths and patterns, the 50-entry tag map —
     // were already refused at the boundary.
@@ -3541,8 +3599,10 @@ pub fn template_refusal(template: &ExperimentTemplateRecord) -> Option<TemplateR
         return Some(TemplateRefusal::Invalid(refusal));
     }
     // The targets are judged BEFORE the actions, because an action refers to them: a
-    // template whose target is not one FIS admits is refused on that target rather than on
-    // the action that happens to name it.
+    // template whose target is not one FIS admits — one naming no published resource type,
+    // one missing a parameter that type requires, one identifying its resources by both or
+    // by neither member, one scoped outside the documented forms — is refused on that target
+    // rather than on the action that happens to name it.
     if let Some(refusal) = targets_refusal(&template.targets) {
         return Some(TemplateRefusal::Invalid(refusal));
     }

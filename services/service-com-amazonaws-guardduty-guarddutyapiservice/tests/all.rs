@@ -155,6 +155,8 @@ mod threat_entity_set_delete;
 mod threat_entity_set_lifecycle;
 #[path = "all/threat_entity_set_listing.rs"]
 mod threat_entity_set_listing;
+#[path = "all/threat_entity_set_update.rs"]
+mod threat_entity_set_update;
 #[path = "all/threat_intel_set_delete.rs"]
 mod threat_intel_set_delete;
 #[path = "all/threat_intel_set_listing.rs"]

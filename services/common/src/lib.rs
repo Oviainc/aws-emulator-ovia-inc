@@ -241,6 +241,10 @@ pub mod json_document;
 /// line and column — for every service whose refusal carries its JSON parser's own
 /// diagnostic.
 pub mod json_parse_fault;
+/// The ONE reading of a compact JWS (a JSON Web Token) a service is handed as a
+/// caller-supplied string, for every service that has to decide whether a value is a token
+/// at all before it reads a claim out of it.
+pub mod jwt;
 pub mod lex;
 pub mod management_events;
 pub mod network;

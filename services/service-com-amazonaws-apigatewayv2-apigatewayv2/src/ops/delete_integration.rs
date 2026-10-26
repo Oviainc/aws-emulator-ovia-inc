@@ -176,10 +176,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         let Some(api) = store.apis.get_mut(&input.api_id) else {
-            return Err(not_found(format!(
-                "Invalid API identifier specified {}:{}",
-                ::engine::emulator_account_id(),
-                input.api_id
+            return Err(not_found(crate::state::invalid_api_identifier_message(
+                &input.api_id,
             )));
         };
 
@@ -187,10 +185,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that names an integration of ANOTHER api is not found here either — the same
         // addressing `GetIntegration` reports on.
         if !api.integrations.contains_key(&input.integration_id) {
-            return Err(not_found(format!(
-                "Invalid Integration identifier specified {}:{}",
-                ::engine::emulator_account_id(),
-                input.integration_id
+            return Err(not_found(crate::state::invalid_identifier_message(
+                crate::state::INTEGRATION_RESOURCE,
             )));
         }
 
@@ -198,14 +194,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `integrations/{IntegrationId}` target. Removing the integration would leave
         // those routes wired to nothing, so the delete is refused while any of them
         // exists and the store is left exactly as it was: the caller unwires or deletes
-        // the routes first. The ids are listed so the caller knows which ones.
+        // the routes first. The refusal is BUILT FROM STATE — it lists the `RouteId` of
+        // every route that blocks it, which is the only thing that tells the caller
+        // WHICH routes to retarget.
         let dependents = api.routes_targeting_integration(&input.integration_id);
         if !dependents.is_empty() {
             return Err(DeleteIntegrationErrorModeled::ConflictException(
                 ConflictException {
                     message: Some(format!(
-                        "Integration {} cannot be deleted while route(s) {} target it.",
-                        input.integration_id,
+                        "Cannot delete Integration because it is referenced by the \
+                         following Routes with Ids: [{}]",
                         dependents.join(", ")
                     )),
                 },
@@ -224,7 +222,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// This operation's "the resource specified in the request was not found" refusal, as
 /// every other reader and writer of an api's child resources spells it: the modelled
-/// `NotFoundException`, whose message names the identifier that resolved to nothing.
+/// `NotFoundException`, whose message names what resolved to nothing.
 fn not_found(message: String) -> DeleteIntegrationError {
     DeleteIntegrationErrorModeled::NotFoundException(NotFoundException {
         message: Some(message),

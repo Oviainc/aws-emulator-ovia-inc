@@ -536,6 +536,20 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| FALLBACK_REGION.to_string())
 }
 
+/// An optional free-text member as it is STORED: a value that carries no characters is
+/// stored as absent.
+///
+/// `Category` and `Description` are "optional" free text on every resource that has them
+/// (`CreateJobTemplate$Category`: "Optional. A category for the job template you are
+/// creating", and the same sentence on a preset and on a queue's description). A value
+/// made only of whitespace carries no more information than the member's absence, so it
+/// is never stored as a member a later read would echo back blank, and a value like it
+/// sent to an `Update*` CLEARS the stored one. One place, so every resource with such a
+/// member is stored the same way and no reader has to allow for a blank one.
+pub fn optional_free_text(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
 /// How this service words a `NotFoundException`: it names the REQUEST MEMBER that
 /// pointed at the resource, not the value the caller supplied.
 ///

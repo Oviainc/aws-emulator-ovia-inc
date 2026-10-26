@@ -131,7 +131,7 @@ const MEMBERSHIP_CASES: &[MembershipCase] = &[
 ];
 
 /// Create one RBAC user, asserting the create itself succeeded.
-async fn create_user(emulator: &Emulator, case: &str, id: &str) {
+pub async fn create_user(emulator: &Emulator, case: &str, id: &str) {
     let created = emulator
         .call(
             "CreateUser",
@@ -166,7 +166,7 @@ async fn create_user_group(emulator: &Emulator, case: &str, id: &str, members: &
 }
 
 /// `ModifyUserGroup` for `group`, asking for `add`, `remove` and `engine`.
-async fn modify_user_group(
+pub async fn modify_user_group(
     emulator: &Emulator,
     group: &str,
     add: &[&str],
@@ -194,7 +194,7 @@ async fn modify_user_group(
 
 /// Read one group back through the implemented reader, asserting the read
 /// succeeded.
-async fn describe_user_group(emulator: &Emulator, case: &str, group: &str) -> Reply {
+pub async fn describe_user_group(emulator: &Emulator, case: &str, group: &str) -> Reply {
     let described = emulator
         .call("DescribeUserGroups", &params(&[("UserGroupId", group)]))
         .await;
@@ -209,7 +209,7 @@ async fn describe_user_group(emulator: &Emulator, case: &str, group: &str) -> Re
 /// Wait out the span this service publishes for a user group's transition, so
 /// the clock owes it its next status. Only the test waits; nothing sleeps in a
 /// handler.
-fn wait_out_the_transition() {
+pub fn wait_out_the_transition() {
     assert!(
         PAST_TRANSITION > state::CLUSTER_TRANSITION,
         "this suite waits {PAST_TRANSITION:?}, which must out-last the transition span ({:?}) \

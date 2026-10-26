@@ -67,6 +67,8 @@ mod list_terms;
 mod list_user_pools;
 #[path = "all/list_users_in_group.rs"]
 mod list_users_in_group;
+#[path = "all/log_delivery_configuration.rs"]
+mod log_delivery_configuration;
 #[path = "all/resend_confirmation_code.rs"]
 mod resend_confirmation_code;
 #[path = "all/resource_server_lifecycle.rs"]
@@ -109,3 +111,5 @@ mod user_pool_mfa_config;
 mod verification_code_pipeline;
 #[path = "all/web_authn_registration.rs"]
 mod web_authn_registration;
+#[path = "all/zz_probe.rs"]
+mod zz_probe;

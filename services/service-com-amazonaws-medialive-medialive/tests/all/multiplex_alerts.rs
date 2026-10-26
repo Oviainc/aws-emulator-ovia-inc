@@ -782,23 +782,27 @@ async fn alerts_are_filtered_by_state_and_paged_in_the_order_they_were_raised() 
     }
 }
 
-/// Rule: the service's own page-size ceiling cuts a listing a request asked no
-/// page size for, so a multiplex carrying more alerts than one page holds still
-/// reports every one of them across the pages its token walks.
+/// Rule: a page carries as many alerts as the request's `MaxResults` asks for,
+/// so a multiplex carrying more alerts than one such page holds reports every one
+/// of them across the pages its token walks — and a request that names no
+/// `MaxResults` reports them all in ONE page, since the service's ceiling is the
+/// published `MaxResults` bound rather than a short page size of its own.
 #[tokio::test]
-async fn the_default_page_size_cuts_a_long_alert_listing() {
-    let case = "more alerts than one default page holds";
+async fn an_asked_for_page_size_cuts_a_long_alert_listing() {
+    let case = "more alerts than one asked-for page holds";
     // Two occurrences per program (one cleared, one set), so this many programs
-    // carry more alerts than the ceiling admits in one page.
-    let programs = MAX_LIST_PAGE_SIZE / 2 + 2;
+    // carry more alerts than the asked-for page holds.
+    let programs = 12;
+    let asked_for = 5;
     let router = medialive();
     let multiplex_id = mixed_alerts(&router, case, programs).await;
 
-    let (first, token) = page(&router, case, &multiplex_id, "").await;
+    let (first, token) = page(&router, case, &multiplex_id, &format!("?maxResults={asked_for}"))
+        .await;
     assert_eq!(
         first.len(),
-        MAX_LIST_PAGE_SIZE,
-        "case {case:?}: expected the default page to carry the service's ceiling, got {}",
+        asked_for,
+        "case {case:?}: expected the page to carry the {asked_for} alerts asked for, got {}",
         first.len()
     );
     assert!(
@@ -806,17 +810,38 @@ async fn the_default_page_size_cuts_a_long_alert_listing() {
         "case {case:?}: expected a token beside a full page with alerts left over"
     );
 
-    let (every, pages) = every_alert(&router, case, &multiplex_id, None, None).await;
+    let (every, pages) =
+        every_alert(&router, case, &multiplex_id, None, Some(asked_for as i32)).await;
+    let total = 2 * programs;
     assert_eq!(
         every.len(),
-        2 * programs,
+        total,
         "case {case:?}: expected every alert across the pages, got {} in pages {pages:?}",
         every.len()
     );
+    // Every page but the last carries exactly what was asked for; the last
+    // carries the remainder.
+    let expected_pages: Vec<usize> = (0..total.div_ceil(asked_for))
+        .map(|index| asked_for.min(total - index * asked_for))
+        .collect();
     assert_eq!(
-        pages,
-        vec![MAX_LIST_PAGE_SIZE, 2 * programs - MAX_LIST_PAGE_SIZE],
-        "case {case:?}: expected the ceiling to cut the listing, got {pages:?}"
+        pages, expected_pages,
+        "case {case:?}: expected the asked-for size to cut the listing into \
+         {expected_pages:?}, got {pages:?}"
+    );
+
+    // No `MaxResults` at all: the whole listing in one page, with no token,
+    // because the service's ceiling is far above what the multiplex holds.
+    let (whole, token) = page(&router, case, &multiplex_id, "").await;
+    assert_eq!(
+        whole.len(),
+        2 * programs,
+        "case {case:?}: expected every alert in one default page, got {}",
+        whole.len()
+    );
+    assert!(
+        token.is_none(),
+        "case {case:?}: expected no token beside a page holding every alert, got {token:?}"
     );
 }
 

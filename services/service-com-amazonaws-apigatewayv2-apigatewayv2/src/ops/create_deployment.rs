@@ -183,10 +183,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(api) = store.apis.get_mut(&input.api_id) else {
             return Err(CreateDeploymentErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!(
-                        "Invalid API identifier specified {}:{}",
-                        ::engine::emulator_account_id(),
-                        input.api_id
+                    message: Some(crate::state::invalid_api_identifier_message(
+                        &input.api_id,
                     )),
                     resource_type: ::std::option::Option::None,
                 },
@@ -201,10 +199,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !api.stages.contains_key(stage_name) {
                 return Err(CreateDeploymentErrorModeled::NotFoundException(
                     NotFoundException {
-                        message: Some(format!(
-                            "Invalid stage identifier specified {}:{}",
-                            ::engine::emulator_account_id(),
-                            stage_name
+                        message: Some(crate::state::invalid_identifier_message(
+                            crate::state::STAGE_RESOURCE,
                         )),
                         resource_type: ::std::option::Option::None,
                     },

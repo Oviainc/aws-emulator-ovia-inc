@@ -200,3 +200,5 @@ mod delete_domain_name;
 mod stage_export_documentation;
 #[path = "all/update_domain_name.rs"]
 mod update_domain_name;
+#[path = "all/test_invoke_method.rs"]
+mod test_invoke_method;

@@ -94,7 +94,11 @@ fn training_job_definition(s3_output: &str) -> Value {
 
 /// A valid `CreateHyperParameterTuningJob` body: a Bayesian search over one integer and
 /// one continuous hyperparameter, with a single training job definition.
-fn valid_body(name: &str) -> Value {
+///
+/// Shared with [`crate::rejection_fidelity`], so the one valid body of this operation is
+/// written once: a suite that varies ONE member of it starts from the same request this
+/// one accepts.
+pub(crate) fn valid_body(name: &str) -> Value {
     json!({
         "HyperParameterTuningJobName": name,
         "HyperParameterTuningJobConfig": {

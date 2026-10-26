@@ -382,6 +382,18 @@ pub const MAX_PORTALS: usize = 1_000;
 /// cap. The emulator's own bound, not a published AWS default.
 pub const MAX_PROJECTS: usize = 1_000;
 
+/// How many assets one IoT SiteWise Monitor project holds.
+///
+/// The same kind of bound, and for the same reason, as
+/// [`MAX_CHILDREN_PER_HIERARCHY`]: `BatchAssociateProjectAssets` is the only thing
+/// that grows a project's asset membership, so the set needs a maximum size, and
+/// that operation declares the modelled `LimitExceededException` (HTTP 410) — "this
+/// can occur if you're trying to associate more than the allowed number of child
+/// assets" — which is how this store refuses past the cap. The emulator's own
+/// bound, not a published AWS default, and high enough that no ordinary workflow
+/// meets it.
+pub const MAX_ASSETS_PER_PROJECT: usize = 1_000;
+
 /// The `AuthMode` value of a portal that authenticates its users through IAM
 /// Identity Center, as `AuthMode` spells it (smithy_query query="shape"
 /// shape="AuthMode": `IAM` | `SSO`).
@@ -2031,6 +2043,18 @@ pub struct ProjectRecord {
     pub creation_date: SystemTime,
     pub last_update_date: SystemTime,
     pub tags: HashMap<String, String>,
+    /// The assets associated with the project, which `ListProjectAssets` reports
+    /// and `BatchAssociateProjectAssets` grows.
+    ///
+    /// A SET: an asset is either in the project or it is not, so associating one
+    /// that is already there adds nothing and a request naming the same asset
+    /// twice associates it once. Ordered by id — a `BTreeSet` rather than a
+    /// `HashSet` — because the listing pages through this membership and a
+    /// resumable `nextToken` needs a stable total order. Held on the project's own
+    /// record, so a deleted project takes its membership with it and no second map
+    /// can disagree about which assets a project holds; the other end of the same
+    /// association is pruned by [`Self::forget_asset`].
+    pub asset_ids: BTreeSet<String>,
 }
 
 impl ProjectRecord {
@@ -4410,7 +4434,8 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     }
 
     /// Forget an asset and everything keyed off it: its external-id entry, its
-    /// property series, its property aliases and its hierarchy associations.
+    /// property series, its property aliases, its hierarchy associations and its
+    /// membership of every IoT SiteWise Monitor project.
     pub fn forget_asset(&mut self, asset_id: &str) -> Option<AssetRecord> {
         let record = self.assets.remove(asset_id)?;
         if let Some(external) = record.external_id.as_deref() {
@@ -4428,6 +4453,12 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             .retain(|_, children| !children.is_empty());
         self.asset_hierarchy_settles_at
             .retain(|(asset, _, child), _| asset != asset_id && child != asset_id);
+        // A project's membership names assets, so an asset this service no longer
+        // holds is in no project: dropping the entry here is what keeps
+        // `ListProjectAssets` from reporting an asset nothing can address.
+        for project in self.projects.values_mut() {
+            project.asset_ids.remove(asset_id);
+        }
         Some(record)
     }
 

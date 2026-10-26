@@ -256,7 +256,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .property_definitions
                     .iter()
                     .filter_map(|(property_name, definition)| {
-                        crate::state::property_definition_response(definition)
+                        // The component type's OWN definitions: a definition
+                        // this record carries was declared on it, which is what
+                        // makes it not inherited.
+                        crate::state::property_definition_response(definition, false)
                             .map(|response| (property_name.clone(), response))
                     })
                     .collect(),

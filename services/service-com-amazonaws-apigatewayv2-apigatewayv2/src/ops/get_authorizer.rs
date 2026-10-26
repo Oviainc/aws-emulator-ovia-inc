@@ -195,9 +195,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // account nor the identifier the request carried.
             return Err(GetAuthorizerErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(
-                        crate::state::INVALID_AUTHORIZER_IDENTIFIER_MESSAGE.to_string(),
-                    ),
+                    message: Some(crate::state::invalid_identifier_message(
+                        crate::state::AUTHORIZER_RESOURCE,
+                    )),
                     resource_type: ::std::option::Option::None,
                 },
             )

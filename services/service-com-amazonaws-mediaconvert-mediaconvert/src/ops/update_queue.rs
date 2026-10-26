@@ -299,7 +299,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Each remaining member is "the new <member> ... if you are changing it": one the
         // request carries replaces the stored value, one it omits leaves the stored value
-        // exactly as it was. The description is kept verbatim, as `CreateQueue` keeps it.
+        // exactly as it was. `Description` is free text, where — as on `CreateQueue` — a
+        // value carrying no characters carries no more information than absence, so
+        // sending a blank one CLEARS the member.
         //
         // "Pause or activate a queue by changing its status between ACTIVE and PAUSED."
         // A queue going back to ACTIVE is also what releases the jobs it was holding, so
@@ -314,7 +316,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => false,
         };
         if let Some(description) = input.description {
-            record.description = Some(description);
+            record.description = crate::state::optional_free_text(Some(description));
         }
         if let Some(concurrent_jobs) = input.concurrent_jobs {
             record.concurrent_jobs = concurrent_jobs;

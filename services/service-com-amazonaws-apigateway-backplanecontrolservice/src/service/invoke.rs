@@ -83,6 +83,17 @@
 //! body: evaluating Velocity is not something this emulator does, and a hand-written
 //! subset of it would silently produce the wrong body, so such a template is an
 //! integration this call cannot perform rather than a body built by guesswork.
+//!
+//! # The half `TestInvokeMethod` shares
+//!
+//! `TestInvokeMethod` simulates "the invocation of a Method in your RestApi" — the same
+//! integration, read out of the same records, for a request that never reached a socket. So
+//! the performing half of this module takes no wire request: [`perform_integration`] reads
+//! what an integration needs through [`MethodRequest`], and [`refusal_rendering`] gives the
+//! status and body a call no integration can serve is answered with. That operation REPORTS
+//! what this module SENDS, so neither can answer one stored configuration differently.
+
+use std::collections::BTreeMap;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_types::body::SdkBody;
@@ -164,7 +175,10 @@ const IDENTITY_SOURCE_QUERY_PREFIX: &str = "method.request.querystring.";
 /// with. API Gateway's own default gateway-response templates are
 /// `application/json`-keyed, and a `MOCK` integration with no response template answers an
 /// empty JSON body.
-const JSON_CONTENT_TYPE: &str = "application/json";
+///
+/// `pub` because a caller that REPORTS a rendering instead of sending it
+/// (`TestInvokeMethod`) has to report the media type it was rendered with.
+pub const JSON_CONTENT_TYPE: &str = "application/json";
 
 /// The `passthroughBehavior` that passes an unmapped body through whenever no template
 /// keys the request's content type; the default one
@@ -206,6 +220,16 @@ pub struct GatewayRefusal {
     response_type: &'static str,
     /// The sentence the uncustomized response body carries.
     message: &'static str,
+}
+
+impl GatewayRefusal {
+    /// The `GatewayResponseType` this refusal is answered through — the one a developer's
+    /// `PutGatewayResponse` customization of it would apply to. Read by the caller that
+    /// REPORTS a refusal rather than answering it on the wire (`TestInvokeMethod`'s
+    /// execution log), so the report names the same gateway response the data plane uses.
+    pub fn response_type(&self) -> &'static str {
+        self.response_type
+    }
 }
 
 /// The API, the stage or the endpoint does not serve this request at all: API Gateway
@@ -554,7 +578,6 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
         return refusal_response(None, FORBIDDEN);
     };
     let api = resolved.api;
-    let api_id = api.id.as_str();
     if api.disable_execute_api_endpoint {
         // `disableExecuteApiEndpoint`: "Specifies whether clients can invoke your API by
         // using the default execute-api endpoint." Turned off, the endpoint serves nothing.
@@ -600,17 +623,23 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
         return refusal_response(Some(api), INVALID_API_KEY);
     }
 
-    let Some(integration) = live_method.and_then(|method| method.integration.as_ref()) else {
-        tracing::warn!(
-            %api_id,
-            stage = %stage.stage_name,
-            path = %matched_path,
-            verb = %verb,
-            "the deployed method carries no integration, so the stage has nothing to call"
-        );
-        return refusal_response(Some(api), API_CONFIGURATION_ERROR);
-    };
-    serve_integration(api, live_method, integration, req)
+    // The integration is what answers, and performing it is the half this module shares
+    // with `TestInvokeMethod`: the SAME records decide a simulated invocation and a real
+    // one, so the two cannot answer one configuration differently.
+    match perform_integration(live_method, &MethodRequest::of_request(req)) {
+        Ok(served) => served_response(served),
+        Err(unserved) => {
+            tracing::warn!(
+                api_id = %api.id,
+                stage = %stage.stage_name,
+                path = %matched_path,
+                verb = %verb,
+                reason = %unserved.reason,
+                "the stage cannot serve this call through the method's integration"
+            );
+            refusal_response(Some(api), unserved.refusal)
+        }
+    }
 }
 
 /// The refusal the method's `authorizationType` earns this request, or `None` when the
@@ -757,40 +786,123 @@ fn associates_stage(
     metered_for_stage || key.stage_keys.contains(&format!("{}/{stage}", api.id))
 }
 
-/// Serve the call through the method's integration.
+/// What an integration reads off the METHOD REQUEST it serves: the media type the request
+/// declares, which selects the integration REQUEST template, and the media type the caller
+/// accepts, which selects the integration RESPONSE template.
 ///
-/// `MOCK` is the one type that needs no backend, and it is served in full from the API's
-/// records. Every other type names a backend this emulator cannot call, which is an
-/// integration this call cannot perform — see the module docs.
-fn serve_integration(
-    api: &RestApiEntry,
-    method: Option<&MethodEntry>,
-    integration: &GetIntegrationOutput,
-    req: &RtRequest,
-) -> RtResponse {
-    let integration_type = integration.r#type.as_deref().unwrap_or_default();
-    if integration_type != MOCK_INTEGRATION_TYPE {
-        tracing::warn!(
-            integration_type,
-            uri = integration.uri.as_deref().unwrap_or_default(),
-            "the integration names a backend this emulator cannot call: no deployment \
-             package runs in process and no outbound connection is made, so no backend \
-             answer exists to map"
-        );
-        return refusal_response(Some(api), API_CONFIGURATION_ERROR);
+/// Both callers of [`perform_integration`] build one — the data plane off the wire
+/// ([`Self::of_request`]), `TestInvokeMethod` out of the members a caller simulates a
+/// request with ([`Self::simulated`]) — so an invocation that reached a socket and one that
+/// never did select the same templates from the same records.
+#[derive(Debug)]
+pub struct MethodRequest {
+    /// The media type the request declares, as a `requestTemplates` key is compared.
+    media_type: String,
+    /// The first media type of the request's `Accept`, or `None` when it accepts anything.
+    accepted: Option<String>,
+}
+
+impl MethodRequest {
+    /// What a request off the wire declares and accepts.
+    fn of_request(req: &RtRequest) -> Self {
+        Self {
+            media_type: declared_media_type(req.headers().get("content-type")),
+            accepted: first_media_type(req.headers().get("accept")),
+        }
     }
 
-    // A `MOCK` invokes nothing: the integration REQUEST template this call selects IS what
-    // the integration returns, and the `statusCode` that template carries names the
-    // integration response the call maps to. A call no template maps is passed through or
-    // refused as `passthroughBehavior` says, and one whose mapping names no stored response
-    // maps to the DEFAULT integration response — the one with no `selectionPattern`, since
-    // a `MOCK` produces no backend response for a pattern to match.
-    let mapped_status = match request_mapping(integration, req) {
+    /// What a SIMULATED request declares and accepts, from the two header values a caller
+    /// supplied as members rather than on the wire.
+    pub fn simulated(content_type: Option<&str>, accept: Option<&str>) -> Self {
+        Self {
+            media_type: declared_media_type(content_type),
+            accepted: first_media_type(accept),
+        }
+    }
+
+    /// The media type this request declares; named in the sentence a refusal of an
+    /// unmapped content type carries.
+    pub fn media_type(&self) -> &str {
+        &self.media_type
+    }
+}
+
+/// The response an integration this emulator CAN perform produces, every part of it
+/// computed from the API's own records.
+#[derive(Debug)]
+pub struct IntegratedResponse {
+    /// The status code of the integration response the call mapped to.
+    pub status: u16,
+    /// The media type the rendered body is keyed by.
+    pub content_type: String,
+    /// The rendered body, empty when no response template applies.
+    pub body: Vec<u8>,
+    /// The mapped response headers the method response declares, keyed by the header name
+    /// as the mapping declares it. `content-type` is NOT among them: it is
+    /// [`Self::content_type`].
+    pub headers: BTreeMap<String, String>,
+}
+
+/// An integration this call cannot be performed through: the GATEWAY RESPONSE it is
+/// answered by, and why in one sentence — for the server log, and for the execution log
+/// `TestInvokeMethod` reports to its caller.
+#[derive(Debug)]
+pub struct UnservedIntegration {
+    /// The refusal the call earns; see [`GatewayRefusal`].
+    pub refusal: GatewayRefusal,
+    /// Why the integration could not be performed. States the configuration, never a
+    /// backend answer, because there is no backend answer.
+    pub reason: String,
+}
+
+/// Perform the call through the method's integration, answering the response the API's
+/// records produce for it.
+///
+/// `MOCK` is the one type that needs no backend, and it is performed in full from those
+/// records: the integration REQUEST template this call selects IS what the integration
+/// returns, and the `statusCode` that template carries names the integration response the
+/// call maps to. A call no template maps is passed through or refused as
+/// `passthroughBehavior` says, and one whose mapping names no stored response maps to the
+/// DEFAULT integration response — the one with no `selectionPattern`, since a `MOCK`
+/// produces no backend response for a pattern to match.
+///
+/// Every other type names a backend this emulator cannot call, which is an integration
+/// this call cannot perform rather than one whose answer is invented — see the module docs.
+pub fn perform_integration(
+    method: Option<&MethodEntry>,
+    call: &MethodRequest,
+) -> Result<IntegratedResponse, UnservedIntegration> {
+    let Some(integration) = method.and_then(|method| method.integration.as_ref()) else {
+        return Err(UnservedIntegration {
+            refusal: API_CONFIGURATION_ERROR,
+            reason: "the method carries no integration, so there is nothing to call"
+                .to_string(),
+        });
+    };
+    let integration_type = integration.r#type.as_deref().unwrap_or_default();
+    if integration_type != MOCK_INTEGRATION_TYPE {
+        return Err(UnservedIntegration {
+            refusal: API_CONFIGURATION_ERROR,
+            reason: format!(
+                "the {integration_type} integration names a backend this emulator cannot \
+                 call: no deployment package runs in process and no outbound connection is \
+                 made, so no backend answer exists to map"
+            ),
+        });
+    }
+
+    let mapped_status = match request_mapping(integration, call) {
         RequestMapping::Mapped(template) => mock_status_code(template),
         RequestMapping::PassedThrough => None,
         RequestMapping::Unsupported => {
-            return refusal_response(Some(api), UNSUPPORTED_MEDIA_TYPE);
+            return Err(UnservedIntegration {
+                refusal: UNSUPPORTED_MEDIA_TYPE,
+                reason: format!(
+                    "no integration request template maps {}, and the integration's \
+                     passthroughBehavior does not pass an unmapped body through",
+                    call.media_type
+                ),
+            });
         }
     };
     let selected = mapped_status
@@ -802,40 +914,60 @@ fn serve_integration(
         })
         .or_else(|| default_integration_response(integration));
     let Some(selected) = selected else {
-        tracing::warn!(
-            "the MOCK integration has no integration response for this call, so it maps to \
-             no method response"
-        );
-        return refusal_response(Some(api), API_CONFIGURATION_ERROR);
+        return Err(UnservedIntegration {
+            refusal: API_CONFIGURATION_ERROR,
+            reason: "the MOCK integration has no integration response for this call, so it \
+                     maps to no method response"
+                .to_string(),
+        });
     };
     let Some(status) = selected
         .status_code
         .as_deref()
         .and_then(|code| code.parse::<u16>().ok())
     else {
-        return refusal_response(Some(api), API_CONFIGURATION_ERROR);
+        return Err(UnservedIntegration {
+            refusal: API_CONFIGURATION_ERROR,
+            reason: "the integration response this call maps to carries no status code the \
+                     response can be sent with"
+                .to_string(),
+        });
     };
 
-    let (content_type, body) = match response_body(selected, req) {
-        Ok(rendered) => rendered,
-        Err(template) => {
-            tracing::warn!(
-                content_type = %template.content_type,
-                bytes = template.bytes,
-                "the response template is a Velocity template, which this emulator does not \
-                 evaluate: no body is invented for it"
-            );
-            return refusal_response(Some(api), API_CONFIGURATION_ERROR);
+    let (content_type, body) = response_body(selected, call).map_err(|template| {
+        UnservedIntegration {
+            refusal: API_CONFIGURATION_ERROR,
+            reason: format!(
+                "the {} response template of {} bytes is a Velocity template, which this \
+                 emulator does not evaluate: no body is invented for it",
+                template.content_type, template.bytes
+            ),
         }
-    };
+    })?;
+    Ok(IntegratedResponse {
+        status,
+        content_type,
+        body,
+        headers: mapped_response_headers(method, selected, status),
+    })
+}
 
-    let mut response = response_with(status, &content_type, body);
-    // API Gateway returns only the headers the METHOD response declares, mapped as the
-    // INTEGRATION response says. A `MOCK` has no backend response to map from, so the one
-    // mapping it can resolve is the documented static value in single quotes.
+/// The response headers the call answers with: API Gateway returns only the headers the
+/// METHOD response declares, mapped as the INTEGRATION response says.
+///
+/// A `MOCK` has no backend response to map from, so the one mapping it can resolve is the
+/// documented static value in single quotes ([`is_static_mapping_value`]): the literal
+/// between the quotes is the header's value. Read by stripping the quotes rather than by an
+/// index, so neither the read nor the length arithmetic can fail whatever was stored.
+fn mapped_response_headers(
+    method: Option<&MethodEntry>,
+    selected: &GetIntegrationResponseOutput,
+    status: u16,
+) -> BTreeMap<String, String> {
     let declared = method
         .and_then(|method| method.method_responses.get(&status.to_string()))
         .and_then(|response| response.response_parameters.as_ref());
+    let mut mapped = BTreeMap::new();
     for (key, value) in selected.response_parameters.iter().flatten() {
         let Some(name) = key.strip_prefix(METHOD_RESPONSE_HEADER_PREFIX) else {
             continue;
@@ -843,29 +975,38 @@ fn serve_integration(
         if declared.is_none_or(|declared| !declared.contains_key(key)) {
             continue;
         }
-        // A `MOCK` has no backend response to map from, so the one mapping it can resolve
-        // is the documented static value in single quotes
-        // ([`is_static_mapping_value`]): the literal between the quotes is the header's
-        // value. Read by stripping the quotes rather than by an index, so neither the read
-        // nor the length arithmetic can fail whatever was stored.
         let literal = is_static_mapping_value(value)
             .then(|| value.strip_prefix('\'').and_then(|rest| rest.strip_suffix('\'')))
             .flatten();
         if let Some(literal) = literal {
-            // `try_insert`, not the panicking `insert`: the name and the value come from
-            // records a control-plane request wrote, and a stored mapping the wire cannot
-            // carry (a value with a newline in it, say) must not fail the REQUEST — it is
-            // skipped, and said so, so the rest of the response is still served.
-            if let Err(refused) = response
-                .headers_mut()
-                .try_insert(name.to_ascii_lowercase(), literal.to_string())
-            {
-                tracing::warn!(
-                    header = %name,
-                    error = %refused,
-                    "the mapped response header cannot be sent on the wire and is skipped"
-                );
-            }
+            mapped.insert(name.to_string(), literal.to_string());
+        }
+    }
+    mapped
+}
+
+/// The wire response a performed integration answers with.
+///
+/// A mapped header's name is lowercased on the way out, as HTTP/2 carries one; the name the
+/// mapping declared is kept on [`IntegratedResponse::headers`] for the caller that REPORTS
+/// the response instead of sending it.
+///
+/// A header is inserted with `try_insert`, not the panicking `insert`: its name and
+/// value come from records a control-plane request wrote, and a stored mapping the wire
+/// cannot carry (a value with a newline in it, say) must not fail the REQUEST — it is
+/// skipped, and said so, so the rest of the response is still served.
+fn served_response(served: IntegratedResponse) -> RtResponse {
+    let mut response = response_with(served.status, &served.content_type, served.body);
+    for (name, value) in served.headers {
+        if let Err(refused) = response
+            .headers_mut()
+            .try_insert(name.to_ascii_lowercase(), value)
+        {
+            tracing::warn!(
+                header = %name,
+                error = %refused,
+                "the mapped response header cannot be sent on the wire and is skipped"
+            );
         }
     }
     response
@@ -895,7 +1036,7 @@ enum RequestMapping<'i> {
 /// read as the JSON one, the type API Gateway assumes for template selection.
 fn request_mapping<'i>(
     integration: &'i GetIntegrationOutput,
-    req: &RtRequest,
+    call: &MethodRequest,
 ) -> RequestMapping<'i> {
     let behaviour = integration
         .passthrough_behavior
@@ -914,8 +1055,7 @@ fn request_mapping<'i>(
             RequestMapping::PassedThrough
         };
     };
-    let declared = request_media_type(req);
-    if let Some(template) = templates.get(&declared) {
+    if let Some(template) = templates.get(&call.media_type) {
         return RequestMapping::Mapped(template);
     }
     // Templates exist but none keys this content type: `WHEN_NO_MATCH` is the only
@@ -927,12 +1067,11 @@ fn request_mapping<'i>(
     }
 }
 
-/// The media type the request declares, as a `requestTemplates` key is compared: the
-/// `Content-Type` header with any parameter (`; charset=…`) dropped and the type
+/// The media type a request declares, as a `requestTemplates` key is compared: the
+/// `Content-Type` value with any parameter (`; charset=…`) dropped and the type
 /// lowercased, defaulting to [`JSON_CONTENT_TYPE`] when the request declares none.
-fn request_media_type(req: &RtRequest) -> String {
-    req.headers()
-        .get("content-type")
+fn declared_media_type(declared: Option<&str>) -> String {
+    declared
         .map(|value| {
             value
                 .split(';')
@@ -943,6 +1082,16 @@ fn request_media_type(req: &RtRequest) -> String {
         })
         .filter(|media| !media.is_empty())
         .unwrap_or_else(|| JSON_CONTENT_TYPE.to_string())
+}
+
+/// The media type a request ACCEPTS, as a `responseTemplates` key is compared: the first
+/// entry of the `Accept` value with its parameters dropped, or `None` when the request
+/// accepts anything.
+fn first_media_type(accepted: Option<&str>) -> Option<String> {
+    accepted
+        .and_then(|accept| accept.split(',').next())
+        .map(|media| media.split(';').next().unwrap_or(media).trim().to_string())
+        .filter(|media| !media.is_empty())
 }
 
 /// The integration-response status code the selected `MOCK` request template names, or
@@ -1012,7 +1161,7 @@ struct UnrenderableTemplate {
 /// Velocity, which this emulator does not do.
 fn response_body(
     selected: &GetIntegrationResponseOutput,
-    req: &RtRequest,
+    call: &MethodRequest,
 ) -> Result<(String, Vec<u8>), UnrenderableTemplate> {
     let Some(templates) = selected
         .response_templates
@@ -1021,12 +1170,8 @@ fn response_body(
     else {
         return Ok((JSON_CONTENT_TYPE.to_string(), Vec::new()));
     };
-    let accepted = req
-        .headers()
-        .get("accept")
-        .and_then(|accept| accept.split(',').next())
-        .map(|media| media.split(';').next().unwrap_or(media).trim().to_string());
-    let chosen = accepted
+    let chosen = call
+        .accepted
         .as_deref()
         .and_then(|media| templates.get_key_value(media))
         .or_else(|| templates.get_key_value(JSON_CONTENT_TYPE))
@@ -1229,7 +1374,13 @@ pub fn carries_sigv4_credential(req: &RtRequest) -> bool {
         .any(|pair| pair.starts_with("X-Amz-Credential="))
 }
 
-/// One gateway-response refusal, rendered as the API serves it.
+/// One gateway-response refusal, rendered as the API serves it on the wire.
+fn refusal_response(api: Option<&RestApiEntry>, refusal: GatewayRefusal) -> RtResponse {
+    let (status, body) = refusal_rendering(api, refusal);
+    response_with(status, JSON_CONTENT_TYPE, body)
+}
+
+/// The status and body one gateway-response refusal renders to, as the API answers it.
 ///
 /// The status code is the API's customization of this response type when it has one, then
 /// its customization of the whole class (`DEFAULT_4XX` / `DEFAULT_5XX`), then the status
@@ -1237,7 +1388,11 @@ pub fn carries_sigv4_credential(req: &RtRequest) -> bool {
 /// `application/json` template when that template is a literal, and otherwise the default
 /// `{"message": …}` body — a template carrying Velocity is not evaluated here, for the
 /// reason the module docs give.
-fn refusal_response(api: Option<&RestApiEntry>, refusal: GatewayRefusal) -> RtResponse {
+///
+/// Separate from [`refusal_response`] because the data plane SENDS this rendering while
+/// `TestInvokeMethod` REPORTS it as the simulated response, and a developer's
+/// customization must reach both.
+pub fn refusal_rendering(api: Option<&RestApiEntry>, refusal: GatewayRefusal) -> (u16, Vec<u8>) {
     let documented = crate::state::default_gateway_status_code(refusal.response_type)
         .and_then(|code| code.parse::<u16>().ok())
         .unwrap_or(UNPLACEABLE_REFUSAL_STATUS);
@@ -1261,7 +1416,7 @@ fn refusal_response(api: Option<&RestApiEntry>, refusal: GatewayRefusal) -> RtRe
             .to_string()
             .into_bytes(),
     };
-    response_with(status, JSON_CONTENT_TYPE, body)
+    (status, body)
 }
 
 /// One data-plane response: a status, a content type and a body.
