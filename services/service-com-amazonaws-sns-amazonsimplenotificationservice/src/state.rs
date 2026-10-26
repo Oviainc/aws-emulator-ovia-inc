@@ -892,6 +892,20 @@ pub const SUBSCRIPTION_ROLE_ARN_ATTRIBUTE: &str = "SubscriptionRoleArn";
 /// The member of a redrive policy that names the dead-letter queue.
 pub const DEAD_LETTER_TARGET_ARN: &str = "deadLetterTargetArn";
 
+/// The dead-letter queue `attributes` name, or `None` when they ask for no redrive.
+///
+/// "RedrivePolicy – When specified, sends undeliverable messages to the specified
+/// Amazon SQS dead-letter queue" (`SetSubscriptionAttributesInput$AttributeName` doc):
+/// the queue is the document's [`DEAD_LETTER_TARGET_ARN`] member, which is the member
+/// every stored redrive policy carries, since a document without it is refused
+/// ([`REDRIVE_POLICY_MISSING_VALUE_REFUSAL`]).
+pub fn dead_letter_target_arn(attributes: &HashMap<String, String>) -> Option<String> {
+    json_object(attributes.get(REDRIVE_POLICY_ATTRIBUTE)?)?
+        .get(DEAD_LETTER_TARGET_ARN)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
 /// What `RawMessageDelivery` is when raw delivery is asked for — the counterpart of
 /// [`RAW_MESSAGE_DELIVERY_DISABLED`], and the only other value the flag takes.
 pub const RAW_MESSAGE_DELIVERY_ENABLED: &str = "true";
@@ -924,10 +938,40 @@ fn json_object(value: &str) -> Option<serde_json::Map<String, serde_json::Value>
 }
 
 /// The sentence SNS refuses a `FilterPolicy` it could not parse with: the attribute
-/// and the parse that failed. (The service appends its parser's own location detail,
-/// which is an implementation diagnostic of that parser rather than a rule.)
+/// and the parse that failed, which the parser's own diagnostic is appended to (see
+/// [`filter_policy_parse_refusal`]).
 pub const FILTER_POLICY_PARSE_REFUSAL: &str =
     "Invalid parameter: Attributes Reason: FilterPolicy: failed to parse JSON.";
+
+/// The WHOLE sentence SNS refuses an unparseable `FilterPolicy` with: the leading
+/// clause ([`FILTER_POLICY_PARSE_REFUSAL`]) followed by the parser's own diagnostic of
+/// where the document stopped parsing.
+///
+/// A document that stops on an unquoted word where a value belongs is reported by
+/// naming that word, which is what lets a caller whose policy was built by templating
+/// or string concatenation locate the fault; every other fault names the character the
+/// parse stopped on, or the end of the input. Both readings — and the line and column
+/// in the location clause — are the tree's shared one
+/// ([`::service_common::json_parse_fault`]), taken from the parse that actually ran, so
+/// the position is the parser's rather than a guess. Nothing in the sentence echoes the
+/// document back: its source is reported as redacted.
+fn filter_policy_parse_refusal(value: &str, error: &serde_json::Error) -> String {
+    use ::service_common::json_parse_fault as fault;
+
+    let diagnosis = match fault::unrecognized_token(value, error) {
+        Some((word, line, column)) => format!(
+            "Unrecognized token '{word}': was expecting (JSON String, Number, Array, \
+             Object or token 'null', 'true' or 'false'){}",
+            fault::source_location(line, column)
+        ),
+        None => format!(
+            "{}{}",
+            fault::unexpected_input(value, error),
+            fault::source_location(error.line(), error.column())
+        ),
+    };
+    format!("{FILTER_POLICY_PARSE_REFUSAL} {diagnosis}")
+}
 
 /// The sentence SNS refuses a NESTED filter policy scoped to the message attributes
 /// with: a message attribute is a flat name and value, so only a policy scoped to the
@@ -1018,8 +1062,9 @@ pub fn subscription_attribute_refusal(name: &str, value: &str) -> Option<String>
         // matched property by property, so it has to be an object to match anything.
         FILTER_POLICY_ATTRIBUTE => match serde_json::from_str::<serde_json::Value>(value) {
             // What SNS reports when its parse of the document failed, naming the
-            // attribute and the parse rather than the document the caller sent.
-            Err(_) => Some(FILTER_POLICY_PARSE_REFUSAL.to_string()),
+            // attribute, the parse and where in the document it stopped — never the
+            // document the caller sent.
+            Err(error) => Some(filter_policy_parse_refusal(value, &error)),
             Ok(serde_json::Value::Object(_)) => None,
             Ok(_) => Some(attribute_reason(format!(
                 "{name} - the value must be a filter policy document: a JSON object of \
@@ -1239,8 +1284,8 @@ pub const NO_DESTINATION_REFUSAL: &str =
 /// The sentence SNS refuses a publish that names MORE than one destination with: a
 /// message goes to one destination, so the destination members cannot be combined.
 pub const DESTINATIONS_NOT_EXCLUSIVE_REFUSAL: &str =
-    "Invalid parameter: TopicArn Reason: Both TopicArn and TargetArn cannot be \
-     specified at the same time.";
+    "Invalid parameter: TopicArn Reason: Both TopicArn and TargetArn specified. Use \
+     only one or the other.";
 
 /// The sentence SNS refuses a publish with no message body with.
 ///

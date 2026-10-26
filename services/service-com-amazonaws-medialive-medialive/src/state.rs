@@ -999,6 +999,16 @@ pub const MAX_BATCH_DELETE_IDS: usize = 100;
 /// `BadRequestException`, which is the refusal for a batch above this bound.
 pub const MAX_BATCH_STOP_IDS: usize = MAX_BATCH_DELETE_IDS;
 
+/// The most resource ids ONE `BatchStart` call may name, counting its
+/// `ChannelIds` and `MultiplexIds` together.
+///
+/// The same ceiling as [`MAX_BATCH_STOP_IDS`] and for the same reason: the
+/// model targets both members at plain `__listOf__string` with no length
+/// constraint, and each named id costs a lookup and a projection under the state
+/// guard plus one entry in the response. `BatchStart` models
+/// `BadRequestException`, which is the refusal for a batch above this bound.
+pub const MAX_BATCH_START_IDS: usize = MAX_BATCH_STOP_IDS;
+
 /// The state a channel's in-flight transition settles into once it comes due.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Settled {
@@ -4637,6 +4647,31 @@ pub fn channel_not_running_message(channel_id: &str, state: &str) -> String {
     format!(
         "Channel {channel_id} is in state {state} and can only be stopped from {}",
         channel_state::RUNNING
+    )
+}
+
+/// The message a channel start refused on the channel's state carries: the
+/// channel the request named, the state it is in, and the state a start acts
+/// from — a channel runs from a stopped one, so every other state is refused.
+///
+/// ONE helper, for the same reason as [`channel_not_running_message`]:
+/// `StartChannel` and `BatchStart` refuse the same channel, so they cannot word
+/// the refusal two ways.
+pub fn channel_not_startable_message(channel_id: &str, state: &str) -> String {
+    format!(
+        "Channel {channel_id} is in state {state} and can only be started from {}",
+        channel_state::IDLE
+    )
+}
+
+/// The message a multiplex start refused on the multiplex's state carries, with
+/// the same shape and for the same reason as
+/// [`channel_not_startable_message`]: `StartMultiplex` and `BatchStart` refuse
+/// the same multiplex, so they cannot word the refusal two ways.
+pub fn multiplex_not_startable_message(multiplex_id: &str, state: &str) -> String {
+    format!(
+        "Multiplex {multiplex_id} is in state {state} and can only be started from {}",
+        multiplex_state::IDLE
     )
 }
 

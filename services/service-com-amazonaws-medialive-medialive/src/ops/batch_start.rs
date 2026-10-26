@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchStart
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchStart`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts every stopped resource the request names, one resource at a time, and
+//! reports a per-resource outcome. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchStart::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Each named channel and multiplex is attempted on its own under the rule its
+//! single-resource start follows, so one refusal never hides another resource's
+//! accepted start: the call answers 200 with the accepted ones in `Successful`
+//! and the refused ones in `Failed`. Both kinds run only from the stopped state
+//! their own state enum models, so a resource that is still coming up, already
+//! starting or running, stopping, deleting or deleted is refused exactly as
+//! `StartChannel` and `StartMultiplex` refuse it. An accepted start puts the
+//! resource in the `STARTING` state its own state enum models, which the clock
+//! then settles into `RUNNING`.
+//!
+//! The batch itself is bounded: the ids one call may name are capped by
+//! [`crate::state::MAX_BATCH_START_IDS`], refused with the operation's modelled
+//! `BadRequestException` before the state guard is taken, because the model puts
+//! no length constraint on the two id lists and each id costs a lookup and a
+//! projection plus one entry in the response.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +163,197 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchStart` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchStartErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchStart"))
+        let _ = ctx;
+
+        // The request's two id lists carry no modelled length constraint, and
+        // each id costs a lookup and a projection plus one result entry, so the
+        // batch is bounded BEFORE the state guard is taken: the guard is never
+        // held for an amount of work the caller chose.
+        let named = input.channel_ids.as_ref().map_or(0, Vec::len)
+            + input.multiplex_ids.as_ref().map_or(0, Vec::len);
+        if named > crate::state::MAX_BATCH_START_IDS {
+            return Err(BatchStartErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "BatchStart names {named} resources, more than the {} one call may name",
+                    crate::state::MAX_BATCH_START_IDS
+                )),
+            })
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        // Transitions the clock had already made due were owed whether or not
+        // this call ran, so they are materialised before anything is read: a
+        // resource whose `CREATING` span has passed is `IDLE`, and that is the
+        // state this start is judged against.
+        state.settle(now);
+
+        // "Starts existing resources": each named resource is attempted on its
+        // own and reported on its own, so the call itself answers 200 even when
+        // every resource named in it was refused.
+        let mut results = Results::default();
+        for id in input.channel_ids.unwrap_or_default() {
+            results.push(start_channel(&mut state, &id, now)?);
+        }
+        for id in input.multiplex_ids.unwrap_or_default() {
+            results.push(start_multiplex(&mut state, &id, now)?);
+        }
+
+        Ok(BatchStartOutput {
+            failed: Some(results.failed),
+            successful: Some(results.successful),
+        })
     }
+}
+
+/// This service's state, named once so the per-resource helpers below read.
+type State = crate::state::ComAmazonawsMedialiveMedialiveState;
+
+/// The two output lists, filled in the order the request listed the resources.
+#[derive(Debug, Default)]
+struct Results {
+    failed: Vec<BatchFailedResultModel>,
+    successful: Vec<BatchSuccessfulResultModel>,
+}
+
+impl Results {
+    fn push(&mut self, outcome: Outcome) {
+        match outcome {
+            Outcome::Successful(result) => self.successful.push(result),
+            Outcome::Failed(result) => self.failed.push(result),
+        }
+    }
+}
+
+/// What attempting one resource's start produced.
+#[derive(Debug)]
+enum Outcome {
+    Successful(BatchSuccessfulResultModel),
+    Failed(BatchFailedResultModel),
+}
+
+/// The `Code` a failed entry carries ("Error code for the failed operation"):
+/// the wire error code of the refusal the single-resource start of that resource
+/// answers with, which on this service is the modelled exception's shape name
+/// (`smithy_query(query="operation", operation="StartChannel")`).
+mod failure_code {
+    /// No resource of that kind has that id — `NotFoundException` (404), which
+    /// both single-resource starts in this service model.
+    pub const NOT_FOUND: &str = "NotFoundException";
+    /// The resource exists but its current state does not allow a start —
+    /// `ConflictException` (409), which both single-resource starts answer for a
+    /// resource that has not stopped.
+    pub const CONFLICT: &str = "ConflictException";
+}
+
+/// A failed entry for an id no resource of that kind has. No `Arn`: there is no
+/// resource to name one for.
+fn not_found(resource_type: &str, id: &str) -> Outcome {
+    Outcome::Failed(BatchFailedResultModel {
+        arn: None,
+        code: Some(failure_code::NOT_FOUND.to_string()),
+        id: Some(id.to_string()),
+        message: Some(crate::state::not_found_message(resource_type, id)),
+    })
+}
+
+/// A failed entry for a resource that exists: it carries the resource's own ARN
+/// beside the code and the message of the refusal.
+fn refused(id: &str, arn: Option<String>, code: &str, message: String) -> Outcome {
+    Outcome::Failed(BatchFailedResultModel {
+        arn,
+        code: Some(code.to_string()),
+        id: Some(id.to_string()),
+        message: Some(message),
+    })
+}
+
+/// A successful entry: the resource's id and ARN, and the state the accepted
+/// start left it in, both read back out of the store.
+///
+/// The read-back is the operation's own view of what it wrote, so a description
+/// that is suddenly missing is a server fault, not an accepted start with empty
+/// members — the same `unavailable()` `StartChannel` answers for it.
+fn accepted(
+    id: &str,
+    description: Option<(Option<String>, Option<String>)>,
+) -> Result<Outcome, BatchStartError> {
+    let (arn, state) = description.ok_or_else(unavailable)?;
+    Ok(Outcome::Successful(BatchSuccessfulResultModel {
+        arn,
+        id: Some(id.to_string()),
+        state,
+    }))
+}
+
+/// One channel's start, under exactly `StartChannel`'s rule: a channel runs only
+/// from the stopped `IDLE` — every other state (still creating, already
+/// starting, running, stopping, deleting, deleted) is refused — and an accepted
+/// start puts it in `STARTING`, owing the `RUNNING` the clock then makes due.
+fn start_channel(
+    state: &mut State,
+    id: &str,
+    now: ::std::time::SystemTime,
+) -> Result<Outcome, BatchStartError> {
+    let Some(channel) = state.channels.get_mut(id) else {
+        return Ok(not_found("Channel", id));
+    };
+    if !channel.is_idle() {
+        return Ok(refused(
+            id,
+            Some(channel.arn.clone()),
+            failure_code::CONFLICT,
+            crate::state::channel_not_startable_message(id, &channel.state),
+        ));
+    }
+    crate::state::begin_start(channel, now);
+
+    // Read the result back out of the store, so the entry reports what was
+    // written rather than what this handler meant to write.
+    accepted(
+        id,
+        state
+            .channel_description(id)
+            .map(|channel| (channel.arn, channel.state)),
+    )
+}
+
+/// One multiplex's start, under exactly `StartMultiplex`'s rule: a multiplex
+/// runs only from the stopped `IDLE`, so one in any other state is refused
+/// rather than treated as a no-op, and an accepted start puts it in `STARTING`,
+/// owing the `RUNNING` the clock then makes due. This is the asymmetry with
+/// `BatchStop`, which a multiplex that is not running answers as a no-op.
+fn start_multiplex(
+    state: &mut State,
+    id: &str,
+    now: ::std::time::SystemTime,
+) -> Result<Outcome, BatchStartError> {
+    match state.start_multiplex(id, now) {
+        Ok(()) => accepted(
+            id,
+            state
+                .multiplex_description(id)
+                .map(|multiplex| (multiplex.arn, multiplex.state)),
+        ),
+        Err(crate::state::MultiplexStartRefusal::NotFound) => Ok(not_found("Multiplex", id)),
+        Err(crate::state::MultiplexStartRefusal::NotStartable(current)) => Ok(refused(
+            id,
+            state.multiplex_description(id).and_then(|m| m.arn),
+            failure_code::CONFLICT,
+            crate::state::multiplex_not_startable_message(id, &current),
+        )),
+    }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there are no resources to start. A modelled server error, never a fresh
+/// engine (which would drop every transition on return).
+fn unavailable() -> BatchStartError {
+    BatchStartErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

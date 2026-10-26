@@ -198,9 +198,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // deleting is a conflict, not a no-op.
         if !channel.is_idle() {
             return Err(StartChannelErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Channel {} is in state {} and can only be started from IDLE",
-                    channel.id, channel.state
+                // The wording lives in the state module, so this refusal and the
+                // one `BatchStart` makes for the same channel cannot drift apart.
+                message: Some(crate::state::channel_not_startable_message(
+                    &channel.id,
+                    &channel.state,
                 )),
             })
             .into());

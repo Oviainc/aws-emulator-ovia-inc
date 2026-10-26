@@ -163,11 +163,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
         state.settle_due();
 
-        let Some(connector) = state.connectors.get_mut(&input.connector_arn) else {
+        // A regional endpoint resolves only its own region's connectors, so a
+        // connectorArn minted in another region deletes nothing and is answered
+        // exactly as an ARN this service never minted.
+        let Some(connector) = state.connector_in_mut(&region, &input.connector_arn) else {
             return Err(DeleteConnectorErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::invalid_parameter_because(
                     "connectorArn",

@@ -406,6 +406,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `create-complete` without anyone asking: the same clock-owed span a volume's
             // `creating` -> `available` move takes in this crate.
             create_complete_at: now + TRANSITION_DELAY,
+            // Nobody has asked to delete an endpoint that is being created.
+            delete_complete_at: None,
         };
         if let Some(token) = input.client_token.clone() {
             store

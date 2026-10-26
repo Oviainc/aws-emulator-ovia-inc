@@ -717,14 +717,25 @@ async fn an_unconfigured_channel_cannot_be_updated_or_deleted() {
         "the neighbouring configuration must be created"
     );
 
-    // Rows: an unknown team with a known channel, a known team with an unknown
-    // channel, both unknown, and the longest legal ids.
+    // Rows: another registered team with a known channel, the stored team with an
+    // unknown channel, the shortest legal ids, and a channel id one character longer
+    // than the stored one. Each row's workspace is registered below, because a channel
+    // configuration can only be missing from a workspace the account HAS: an
+    // unregistered `teamId` is the documented conflict instead, covered in
+    // [`crate::channel_configuration_workspace_precondition`].
     let absent: [(&str, &str); 4] = [
         ("T99999ZZZZZ", "C01234A5BCD"),
         ("T012ABCDEFG", "C99999ZZZZZ"),
         ("T", "C"),
         ("T012ABCDEFG", "C01234A5BCDx"),
     ];
+    for (team_id, _) in absent {
+        assert_eq!(
+            emulator.register_workspace(team_id).await.status,
+            200,
+            "case {team_id:?}: the workspace the row looks a channel up in must be registered"
+        );
+    }
     for (team_id, channel_id) in absent {
         for (operation, reply) in [
             (

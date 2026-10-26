@@ -166,13 +166,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
         state.settle_due();
 
-        let Some(worker) = state
-            .worker_configurations
-            .get_mut(&input.worker_configuration_arn)
+        // A regional endpoint resolves only its own region's configurations, so
+        // a workerConfigurationArn minted in another region deletes nothing and
+        // is answered exactly as an ARN this service never minted.
+        let Some(worker) =
+            state.worker_configuration_in_mut(&region, &input.worker_configuration_arn)
         else {
             return Err(DeleteWorkerConfigurationErrorModeled::NotFoundException(
                 NotFoundException {

@@ -172,7 +172,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         state.settle_due();
 
-        let Some(connector) = state.connectors.get(&input.connector_arn) else {
+        // A regional endpoint acts only on its own region's connectors, so a
+        // connectorArn minted in another region restarts nothing and is
+        // answered exactly as an ARN this service never minted.
+        let Some(connector) = state.connector_in(&region, &input.connector_arn) else {
             return Err(RestartConnectorErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::invalid_parameter_because(
                     "connectorArn",
@@ -240,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reaches its terminal state and not before. A caller that reads it
         // meanwhile still sees the transient state, and a further call against
         // it is refused while that restart is still running.
-        if let Some(connector) = state.connectors.get_mut(&connector_arn) {
+        if let Some(connector) = state.connector_in_mut(&region, &connector_arn) {
             connector.state = crate::state::CONNECTOR_RESTARTING.to_string();
             connector.pending = Some(operation.connector_settle());
         }

@@ -71,7 +71,7 @@ const DETECTOR_ID_OPERATIONS: [(&str, &str, &str, Option<&str>); 8] = [
 /// ALPHABET. The model's own constraint is `len 1..300`
 /// (`smithy_query(shape="DetectorId")`) — far wider than the id format — so every
 /// row below reaches the handler instead of being refused at the boundary.
-const MALFORMED_DETECTOR_IDS: [(&str, &str); 7] = [
+pub(crate) const MALFORMED_DETECTOR_IDS: [(&str, &str); 7] = [
     (
         // 62 characters: the length the recorded rejection carried.
         "7a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8",
