@@ -198,6 +198,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.domain_name,
             ))
         })?;
+        // An index is served by the CLUSTER, so every file its analysis settings name
+        // has to be there to be read: each path they name under a custom package's
+        // mount point is resolved against the packages this domain holds in place, and
+        // one that resolves to nothing cannot be applied. Decided before the index is
+        // borrowed, so the refusals below keep their order, and before anything is
+        // written, so a refused update leaves the index exactly as it was.
+        let unresolved = domain.unresolved_package_reference(&input.index_schema);
         // The domain exists; the name it carries names no index OF it. An update
         // mints nothing (`CreateIndex` is what creates an index), so that is the
         // modelled missing-resource refusal.
@@ -206,6 +213,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.index_name,
             ))
         })?;
+        if let Some(reference) = unresolved {
+            return Err(UpdateIndexErrorModeled::ValidationException(
+                crate::state::package_file_not_readable(&reference.setting),
+            )
+            .into());
+        }
 
         // A field's type is settled by the write that first maps it: a later update
         // may add to that field's mapping but not re-type it. Checked against the

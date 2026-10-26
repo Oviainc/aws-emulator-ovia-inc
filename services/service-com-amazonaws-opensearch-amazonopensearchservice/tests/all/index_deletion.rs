@@ -43,8 +43,9 @@ async fn delete(emulator: &Emulator, domain: &str, index: &str) -> Answer {
         .await
 }
 
-/// A delete that must be accepted, asserting the status it reports.
-async fn deleted_index(emulator: &Emulator, domain: &str, index: &str, case: &str) {
+/// A delete that must be accepted, asserting the status it reports. A sibling suite
+/// drives the same path, rather than growing a second copy of it.
+pub(crate) async fn deleted_index(emulator: &Emulator, domain: &str, index: &str, case: &str) {
     let answer = delete(emulator, domain, index).await;
     assert_eq!(
         answer.status, 200,

@@ -34,8 +34,9 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::INDEX_STATU
 use super::data_source_registry::created_domain;
 use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFIX};
 
-/// `CreateIndex`: `POST /opensearch/domain/{DomainName}/index`.
-async fn create(emulator: &Emulator, domain: &str, body: Value) -> Answer {
+/// `CreateIndex`: `POST /opensearch/domain/{DomainName}/index`. A sibling suite drives
+/// the same path for the creates it refuses, rather than growing a second copy of it.
+pub(crate) async fn create(emulator: &Emulator, domain: &str, body: Value) -> Answer {
     emulator
         .call(
             "POST",
