@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTableBucket
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTableBucket`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTableBucket::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -138,6 +129,16 @@ impl From<CreateTableBucketErrorModeled> for CreateTableBucketError {
     }
 }
 
+/// `BadRequestException` (HTTP 400) — "The request is invalid or malformed."
+/// The refusal this operation models for a request the boundary accepted but
+/// the service's own rules reject.
+fn bad_request(message: String) -> CreateTableBucketError {
+    CreateTableBucketErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The `CreateTableBucket` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -174,18 +175,149 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTableBucket` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTableBucketErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTableBucket"))
+        use crate::state::{
+            BucketEncryption, SseAlgorithm, StorageClass, TableBucket, TableBucketType,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateTableBucketErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the S3 Tables table bucket store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // The modeled length (3..63) and character set (`^[0-9a-z-]*$`) are
+        // refused at the boundary. What the pattern cannot express is that a
+        // name begins and ends with a letter or a digit, so a hyphen only ever
+        // sits between them.
+        if !crate::state::name_begins_and_ends_alphanumeric(&input.name) {
+            return Err(bad_request(format!(
+                "The table bucket name {} is not valid. A table bucket name must begin and end \
+                 with a letter or number.",
+                input.name
+            )));
+        }
+
+        // `encryptionConfiguration`: the algorithm must be one the model
+        // declares, and the model documents `kmsKeyArn` as "required only when
+        // `sseAlgorithm` is set to `aws:kms`" — so it is required with that
+        // algorithm and meaningless without it. A value outside the enum is
+        // refused at the boundary, so reaching here with an unknown one would
+        // mean the model changed under us; refuse it rather than silently
+        // picking an algorithm.
+        let encryption = match input.encryption_configuration {
+            None => None,
+            Some(configuration) => {
+                let algorithm = SseAlgorithm::from_wire(&configuration.sse_algorithm)
+                    .ok_or_else(|| {
+                        bad_request(format!(
+                            "The server-side encryption algorithm {} is not supported.",
+                            configuration.sse_algorithm
+                        ))
+                    })?;
+                match (algorithm.takes_kms_key(), &configuration.kms_key_arn) {
+                    (true, None) => {
+                        return Err(bad_request(format!(
+                            "kmsKeyArn is required when sseAlgorithm is {}.",
+                            algorithm.as_wire()
+                        )));
+                    }
+                    (false, Some(_)) => {
+                        return Err(bad_request(format!(
+                            "kmsKeyArn is not valid when sseAlgorithm is {}.",
+                            algorithm.as_wire()
+                        )));
+                    }
+                    _ => {}
+                }
+                Some(BucketEncryption {
+                    sse_algorithm: algorithm,
+                    kms_key_arn: configuration.kms_key_arn,
+                })
+            }
+        };
+
+        // `storageClassConfiguration`: same contract — one of the modeled
+        // storage classes, or the request names a class this service has no
+        // storage for.
+        let storage_class = match input.storage_class_configuration {
+            None => None,
+            Some(configuration) => Some(
+                StorageClass::from_wire(&configuration.storage_class).ok_or_else(|| {
+                    bad_request(format!(
+                        "The storage class {} is not supported.",
+                        configuration.storage_class
+                    ))
+                })?,
+            ),
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::table_bucket_arn(&region, &input.name);
+        let tags: ::std::collections::BTreeMap<String, String> =
+            input.tags.into_iter().flatten().collect();
+
+        let mut store = state.lock();
+
+        // A table bucket name is unique within an account and Region, and the
+        // store is keyed by the ARN that carries both. A second create of a
+        // resident name is the conflict with a previous write the model's
+        // `ConflictException` (HTTP 409) names.
+        if store.table_buckets.contains_key(&arn) {
+            return Err(CreateTableBucketErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "A table bucket with the name {} already exists.",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The store is BOUNDED: past the cap a create is refused, so a caller
+        // cannot grow the process's memory without limit by creating table
+        // buckets it never deletes.
+        if store.is_at_bucket_quota() {
+            return Err(bad_request(format!(
+                "This account already holds the maximum of {} table buckets.",
+                crate::state::TABLE_BUCKETS_PER_ACCOUNT
+            )));
+        }
+
+        let bucket_id = store.mint_bucket_id();
+        let bucket = TableBucket {
+            name: input.name,
+            arn: arn.clone(),
+            owner_account_id: ::engine::emulator_account_id().to_string(),
+            bucket_id: bucket_id.clone(),
+            // This operation is how a CUSTOMER creates a table bucket; the
+            // other modeled type is for the buckets Amazon Web Services
+            // creates on an account's behalf.
+            bucket_type: TableBucketType::Customer,
+            created_at: ::std::time::SystemTime::now(),
+            encryption,
+            storage_class,
+            tags,
+        };
+        store.table_buckets.insert(arn.clone(), bucket);
+        // The lock covers the state change only; everything below is owned.
+        drop(store);
+
+        // The access record for a state-changing operation: who, what and the
+        // outcome. Metadata only — never a tag key or value, and never the
+        // encryption configuration.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            table_bucket_id = ?bucket_id,
+            region = ?region,
+            outcome = "created",
+            "table bucket created",
+        );
+
+        Ok(CreateTableBucketOutput { arn })
     }
 }
