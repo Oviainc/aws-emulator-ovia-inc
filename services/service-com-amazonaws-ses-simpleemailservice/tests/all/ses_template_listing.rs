@@ -6,7 +6,8 @@
 //! is a real awsQuery request against the service: form-urlencoded body in, XML
 //! out, one shared engine behind it. The templates the listing reports are the
 //! ones in this service's store, seeded through the same `state` API the handlers
-//! use (`CreateTemplate` is still a stub and has its own issue), so what is
+//! use (`CreateTemplate` over the wire is `tests/all/ses_template_creation.rs`'s
+//! subject), so what is
 //! asserted is the RULE the operation follows over a SET of inputs rather than one
 //! recorded request:
 //!

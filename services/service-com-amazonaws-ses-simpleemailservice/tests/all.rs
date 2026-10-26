@@ -27,6 +27,8 @@ mod ses_receipt_rule_set_listing;
 mod ses_receipt_rule_sets;
 #[path = "all/ses_store_bounds.rs"]
 mod ses_store_bounds;
+#[path = "all/ses_template_creation.rs"]
+mod ses_template_creation;
 #[path = "all/ses_template_listing.rs"]
 mod ses_template_listing;
 #[path = "all/state_roundtrip.rs"]
