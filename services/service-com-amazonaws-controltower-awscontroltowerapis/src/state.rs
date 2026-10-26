@@ -1930,18 +1930,17 @@ fn identifier_seed() -> u64 {
     })
 }
 
-/// A fresh `OperationIdentifier`: the lowercase-hex hyphenated UUID form the model's
-/// pattern requires
-/// (`^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`, len 36), with
-/// RFC 4122's version-4 and variant bits set.
+/// 16 fresh bytes nothing in the request determines: the entropy every identifier this
+/// service mints is drawn from.
 ///
-/// The single identifier-generation site in this service. The 16 bytes are the first
-/// half of a SHA-256 over this process's seed, the mint counter and the clock: the
-/// counter makes two identifiers minted in one tick distinct, the clock separates two
-/// processes that drew the same seed, and the hash spreads all three over the whole
-/// width. Nothing from the request reaches it, so an identifier is never derivable
-/// from the call that asked for it.
-pub fn new_operation_identifier() -> String {
+/// The single entropy source in this service, shared by both identifier FORMS
+/// ([`new_operation_identifier`] and [`new_resource_id`]) so neither can drift from the
+/// other's uniqueness guarantee. The bytes are the first half of a SHA-256 over this
+/// process's seed, the mint counter and the clock: the counter makes two identifiers
+/// minted in one tick distinct, the clock separates two processes that drew the same
+/// seed, and the hash spreads all three over the whole width. Nothing from the request
+/// reaches it, so an identifier is never derivable from the call that asked for it.
+fn fresh_identifier_bytes() -> [u8; 16] {
     use ::sha2::Digest as _;
 
     let counter = IDENTIFIER_SEQUENCE.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
@@ -1957,6 +1956,48 @@ pub fn new_operation_identifier() -> String {
 
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
+    bytes
+}
+
+/// How many characters a minted resource id carries, and the alphabet it draws them
+/// from: the form `BaselineArn`'s pattern spells out for this service's resource ids,
+/// `^arn:[a-z-]+:controltower:[a-z0-9-]*:[0-9]{0,12}:baseline/[A-Z0-9]{16}$`.
+const RESOURCE_ID_LENGTH: usize = 16;
+
+/// The `[A-Z0-9]` characters of a resource id, digits first so the value's lowest
+/// base-36 digit maps to `'0'`.
+const RESOURCE_ID_ALPHABET: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+/// A fresh resource id for a resource THIS ACCOUNT holds — a landing zone, an enabled
+/// control, an enabled baseline: [`RESOURCE_ID_LENGTH`] characters of `[A-Z0-9]`.
+///
+/// This service's resource ids and its `OperationIdentifier`s are different kinds of
+/// token: the model constrains an operation identifier as a hyphenated lowercase-hex
+/// UUID and a resource id (`BaselineArn`) as 16 characters of `[A-Z0-9]`, so a resource
+/// id must never be minted in the operation-identifier form or the two become
+/// confusable in one response body. The id is the base-36 rendering of
+/// [`fresh_identifier_bytes`] read low digit first, keeping the full width's entropy
+/// and the ARN inside `Arn`'s `^arn:aws[0-9a-zA-Z_\-:\/]+$` pattern.
+pub fn new_resource_id() -> String {
+    let mut value = u128::from_le_bytes(fresh_identifier_bytes());
+    let mut id = String::with_capacity(RESOURCE_ID_LENGTH);
+    for _ in 0..RESOURCE_ID_LENGTH {
+        let digit = (value % RESOURCE_ID_ALPHABET.len() as u128) as usize;
+        value /= RESOURCE_ID_ALPHABET.len() as u128;
+        id.push(char::from(RESOURCE_ID_ALPHABET[digit]));
+    }
+    id
+}
+
+/// A fresh `OperationIdentifier`: the lowercase-hex hyphenated UUID form the model's
+/// pattern requires
+/// (`^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`, len 36), with
+/// RFC 4122's version-4 and variant bits set.
+///
+/// Drawn from [`fresh_identifier_bytes`], so two operation identifiers minted in the
+/// same clock tick still differ and neither is derivable from the request.
+pub fn new_operation_identifier() -> String {
+    let mut bytes = fresh_identifier_bytes();
     // RFC 4122 §4.4: version 4 in the high nibble of octet 6, variant 0b10 in the two
     // high bits of octet 8 — the form the model's pattern describes.
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -1989,10 +2030,10 @@ pub fn enabled_baseline_arn(region: &str, enabled_baseline_id: &str) -> String {
 
 /// A fresh `EnabledBaseline` resource id, used as the ARN's resource segment.
 ///
-/// The same 36-character lowercase-hex UUID form as an `OperationIdentifier`, which
-/// keeps the minted ARN inside `Arn`'s `^arn:aws[0-9a-zA-Z_\-:\/]+$` pattern.
+/// This service's resource-id form ([`new_resource_id`]), not an operation
+/// identifier's.
 pub fn new_enabled_baseline_id() -> String {
-    new_operation_identifier()
+    new_resource_id()
 }
 
 /// One entry of this service's BASELINE CATALOG: an AWS-managed baseline a caller may
@@ -2837,10 +2878,10 @@ pub fn non_landing_zone_identifier_message(identifier: &str) -> Option<String> {
 
 /// A fresh landing zone resource id, used as the ARN's resource segment.
 ///
-/// The same 36-character lowercase-hex UUID form as an `OperationIdentifier`, which
-/// keeps the minted ARN inside `Arn`'s `^arn:aws[0-9a-zA-Z_\-:\/]+$` pattern.
+/// This service's resource-id form ([`new_resource_id`]), not an operation
+/// identifier's.
 pub fn new_landing_zone_id() -> String {
-    new_operation_identifier()
+    new_resource_id()
 }
 
 /// `arn:aws:controltower:<region>:<account>:landingzone/<id>`.
@@ -2857,10 +2898,10 @@ pub fn landing_zone_arn(region: &str, landing_zone_id: &str) -> String {
 
 /// A fresh enabled-control resource id, used as the ARN's resource segment.
 ///
-/// The same 36-character lowercase-hex UUID form as an `OperationIdentifier`, which
-/// keeps the minted ARN inside `Arn`'s `^arn:aws[0-9a-zA-Z_\-:\/]+$` pattern.
+/// This service's resource-id form ([`new_resource_id`]), not an operation
+/// identifier's.
 pub fn new_enabled_control_id() -> String {
-    new_operation_identifier()
+    new_resource_id()
 }
 
 /// `arn:aws:controltower:<region>:<account>:enabledcontrol/<id>`.

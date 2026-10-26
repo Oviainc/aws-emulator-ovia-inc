@@ -34,6 +34,7 @@ use crate::enabled_control_lifecycle::{
     control, details, enable, enabled_control_prefix, entries, ou,
 };
 use crate::landing_zone_lifecycle::{call, emulator, is_operation_identifier, past_the_settle_span};
+use crate::resource_identifier_form::is_resource_id;
 use crate::resource_tags::{read_tags, reported_tags, tags};
 
 /// `ListEnabledControls`' entry for `arn`, asserting the listing answered, or
@@ -193,11 +194,12 @@ async fn every_enablement_mints_its_own_arn_and_operation_identifier() {
         let prefix = enabled_control_prefix();
         let resource_id = arn.strip_prefix(&prefix).unwrap_or_default();
         assert!(
-            // The resource segment carries the same 36-character lowercase-hex UUID form
-            // as an `OperationIdentifier`, which keeps the ARN inside `Arn`'s pattern.
-            is_operation_identifier(resource_id),
-            "case {case:?}: expected an ARN {prefix:?} plus a UUID resource id, got \
-             {arn:?}"
+            // The resource segment carries this service's resource-id form — 16
+            // characters of `[A-Z0-9]`, pinned in
+            // `tests/all/resource_identifier_form.rs` — not an operation identifier's.
+            is_resource_id(resource_id),
+            "case {case:?}: expected an ARN {prefix:?} plus a 16-character [A-Z0-9] \
+             resource id, got {arn:?}"
         );
         assert!(
             is_operation_identifier(&operation),
