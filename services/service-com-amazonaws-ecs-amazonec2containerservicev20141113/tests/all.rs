@@ -47,6 +47,8 @@ mod ecs_wire;
 mod error_messages;
 #[path = "all/express_gateway_services.rs"]
 mod express_gateway_services;
+#[path = "all/integer_bound_refusals.rs"]
+mod integer_bound_refusals;
 #[path = "all/invalid_request_refusals.rs"]
 mod invalid_request_refusals;
 #[path = "all/list_attributes.rs"]

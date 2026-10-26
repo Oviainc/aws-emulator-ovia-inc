@@ -310,6 +310,15 @@ pub const DEFAULT_LIST_PAGE_SIZE: usize = 100;
 /// The largest `maxResults` a list operation accepts, from the same doc sentence.
 pub const MAX_LIST_PAGE_SIZE: i32 = 100;
 
+/// The smallest `maxResults` a list operation accepts — the other end of the same
+/// sentence ("This value can be between 1 and 100").
+pub const MIN_LIST_PAGE_SIZE: i32 = 1;
+
+/// The fewest tasks one `RunTask` call may place: the `count` doc asks for "the number of
+/// instantiations of the specified task to place", so a call that would place none names a
+/// count below the range.
+pub const MIN_RUN_TASK_COUNT: i32 = 1;
+
 /// `ListServices`'s page size when the caller gives no `maxResults`. Its own
 /// `maxResults` doc differs from the sentence [`DEFAULT_LIST_PAGE_SIZE`] quotes: "This
 /// value can be between 1 and 100. If this parameter isn't used, then ListServices
@@ -698,13 +707,23 @@ pub const MAX_UPDATE_TASK_PROTECTION_TASKS: usize = 10;
 /// `GetTaskProtection$tasks`: "A list of up to 100 task IDs or full ARN entries."
 pub const MAX_GET_TASK_PROTECTION_TASKS: usize = 100;
 
-/// `InvalidParameterException$message` for an `expiresInMinutes` outside the period the
-/// member documents: it names the member and both bounds, and echoes no value.
-pub fn task_protection_period_message() -> String {
-    format!(
-        "expiresInMinutes must be a value from {MIN_TASK_PROTECTION_MINUTES} to \
-         {MAX_TASK_PROTECTION_MINUTES} minutes."
-    )
+/// `InvalidParameterException$message` for an integer member whose value falls outside the
+/// inclusive range its own doc states, or `None` when the value is inside it. Amazon ECS
+/// names the member and the ONE bound the value crossed — "<member> must be at least
+/// <min>" below the range, "<member> must be at most <max>" above it — and echoes neither
+/// the value the request carried nor the bound it did not cross.
+///
+/// Spelled once for every bounded integer in this crate (`expiresInMinutes`, a page's
+/// `maxResults`, a `RunTask` `count`), so the refusal cannot drift between the operations
+/// that carry one.
+pub fn integer_bound_message(member: &str, value: i32, min: i32, max: i32) -> Option<String> {
+    if value < min {
+        Some(format!("{member} must be at least {min}"))
+    } else if value > max {
+        Some(format!("{member} must be at most {max}"))
+    } else {
+        None
+    }
 }
 
 /// The launch type a task takes when the request names neither a `launchType` nor a

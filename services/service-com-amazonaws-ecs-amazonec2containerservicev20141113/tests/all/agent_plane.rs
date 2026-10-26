@@ -951,14 +951,26 @@ async fn scale_in_protection_is_set_and_read_back_from_what_was_stored() {
     }
 
     // "You can specify a value from 1 minute to up to 2,880 minutes (48 hours)": each
-    // published bound is accepted and one past it is refused, and a refusal protects
-    // nothing.
-    for (case, minutes, accepted) in [
-        ("one minute", 1, true),
-        ("the longest period", 2_880, true),
-        ("zero minutes", 0, false),
-        ("one past the longest period", 2_881, false),
-        ("a negative period", -1, false),
+    // published bound is accepted and one past it is refused naming the bound it crossed,
+    // and a refusal protects nothing.
+    for (case, minutes, refusal_message) in [
+        ("one minute", 1, None),
+        ("the longest period", 2_880, None),
+        (
+            "zero minutes",
+            0,
+            Some("expiresInMinutes must be at least 1"),
+        ),
+        (
+            "one past the longest period",
+            2_881,
+            Some("expiresInMinutes must be at most 2880"),
+        ),
+        (
+            "a negative period",
+            -1,
+            Some("expiresInMinutes must be at least 1"),
+        ),
     ] {
         let request = json!({
             "cluster": CLUSTER,
@@ -966,33 +978,35 @@ async fn scale_in_protection_is_set_and_read_back_from_what_was_stored() {
             "protectionEnabled": true,
             "expiresInMinutes": minutes,
         });
-        if accepted {
-            let body = ok(&router, "UpdateTaskProtection", request, case).await;
-            let protected = list(&body, "protectedTasks", case);
-            assert_eq!(
-                protected.len(),
-                1,
-                "case {case:?}: expected the task back protected, got {body}"
-            );
-            assert_eq!(
-                protected[0]["protectionEnabled"].as_bool(),
-                Some(true),
-                "case {case:?}: an accepted period protects the task, got {body}"
-            );
-            assert!(
-                protected[0]["expirationDate"].is_number(),
-                "case {case:?}: a protected task reports when protection expires, got {body}"
-            );
-        } else {
-            let (code, message) = refusal(&router, "UpdateTaskProtection", request, case).await;
-            assert_eq!(
-                (code.as_str(), message.as_str()),
-                (
-                    "InvalidParameterException",
-                    "expiresInMinutes must be a value from 1 to 2880 minutes."
-                ),
-                "case {case:?}: expected the period refusal, got {code} with {message:?}"
-            );
+        match refusal_message {
+            None => {
+                let body = ok(&router, "UpdateTaskProtection", request, case).await;
+                let protected = list(&body, "protectedTasks", case);
+                assert_eq!(
+                    protected.len(),
+                    1,
+                    "case {case:?}: expected the task back protected, got {body}"
+                );
+                assert_eq!(
+                    protected[0]["protectionEnabled"].as_bool(),
+                    Some(true),
+                    "case {case:?}: an accepted period protects the task, got {body}"
+                );
+                assert!(
+                    protected[0]["expirationDate"].is_number(),
+                    "case {case:?}: a protected task reports when protection expires, got \
+                     {body}"
+                );
+            }
+            Some(expected) => {
+                let (code, message) =
+                    refusal(&router, "UpdateTaskProtection", request, case).await;
+                assert_eq!(
+                    (code.as_str(), message.as_str()),
+                    ("InvalidParameterException", expected),
+                    "case {case:?}: expected the period refusal, got {code} with {message:?}"
+                );
+            }
         }
     }
 

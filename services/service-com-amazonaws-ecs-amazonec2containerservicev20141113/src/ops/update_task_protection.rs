@@ -205,21 +205,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "You can specify a value from 1 minute to up to 2,880 minutes (48 hours)" — a
-        // period outside that is refused, and nothing is protected.
-        let requested_minutes = input
-            .expires_in_minutes
-            .unwrap_or(crate::state::DEFAULT_TASK_PROTECTION_MINUTES);
-        if !(crate::state::MIN_TASK_PROTECTION_MINUTES
-            ..=crate::state::MAX_TASK_PROTECTION_MINUTES)
-            .contains(&requested_minutes)
-        {
+        // period outside that is refused naming the bound it crossed, and nothing is
+        // protected. "If you don't specify the time, then the task is automatically
+        // protected for 120 minutes (2 hours)", which is inside the range by definition and
+        // so is never the value that is checked.
+        if let Some(message) = input.expires_in_minutes.and_then(|minutes| {
+            crate::state::integer_bound_message(
+                "expiresInMinutes",
+                minutes,
+                crate::state::MIN_TASK_PROTECTION_MINUTES,
+                crate::state::MAX_TASK_PROTECTION_MINUTES,
+            )
+        }) {
             return Err(UpdateTaskProtectionErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(crate::state::task_protection_period_message()),
+                    message: Some(message),
                 },
             )
             .into());
         }
+        let requested_minutes = input
+            .expires_in_minutes
+            .unwrap_or(crate::state::DEFAULT_TASK_PROTECTION_MINUTES);
 
         let cluster_name = crate::state::cluster_name_from_reference(Some(&input.cluster));
         let region = crate::state::request_region(ctx);

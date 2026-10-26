@@ -186,13 +186,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which is how "this parameter isn't used" reaches a handler.
         let max_page = i32::try_from(crate::state::ACCOUNT_SETTINGS_PAGE_SIZE)
             .expect("the documented page cap fits an i32");
-        if input.max_results != 0 && !(1..=max_page).contains(&input.max_results) {
+        // A `maxResults` of 0 is the modelled default, i.e. "this parameter isn't used", so
+        // only a value the caller really named is bounded.
+        let requested_page = Some(input.max_results).filter(|max_results| *max_results != 0);
+        if let Some(message) = requested_page.and_then(|max_results| {
+            crate::state::integer_bound_message(
+                "maxResults",
+                max_results,
+                crate::state::MIN_LIST_PAGE_SIZE,
+                max_page,
+            )
+        }) {
             return Err(ListAccountSettingsErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(format!(
-                        "maxResults must be between 1 and {max_page}; got {}",
-                        input.max_results
-                    )),
+                    message: Some(message),
                 },
             )
             .into());

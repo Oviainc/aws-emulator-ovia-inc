@@ -300,13 +300,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let count = input.count.unwrap_or(1);
-        if !(1..=crate::state::MAX_RUN_TASK_COUNT).contains(&count) {
+        // "You can specify up to 10 tasks for each call."
+        if let Some(message) = crate::state::integer_bound_message(
+            "count",
+            count,
+            crate::state::MIN_RUN_TASK_COUNT,
+            crate::state::MAX_RUN_TASK_COUNT,
+        ) {
             return Err(RunTaskErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(format!(
-                        "count must be between 1 and {}; got {count}",
-                        crate::state::MAX_RUN_TASK_COUNT
-                    )),
+                    message: Some(message),
                 },
             )
             .into());

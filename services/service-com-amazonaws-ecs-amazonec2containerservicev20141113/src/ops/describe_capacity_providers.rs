@@ -195,22 +195,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         // "This value can be between 1 and 10."
-        if let Some(max_results) = input.max_results {
-            let page_size = i32::try_from(crate::state::DESCRIBE_CAPACITY_PROVIDERS_PAGE_SIZE)
-                .unwrap_or(i32::MAX);
-            if !(1..=page_size).contains(&max_results) {
-                return Err(
-                    DescribeCapacityProvidersErrorModeled::InvalidParameterException(
-                        InvalidParameterException {
-                            message: Some(format!(
-                                "maxResults must be between 1 and {page_size}; got \
-                                 {max_results}"
-                            )),
-                        },
-                    )
-                    .into(),
-                );
-            }
+        let page_size =
+            i32::try_from(crate::state::DESCRIBE_CAPACITY_PROVIDERS_PAGE_SIZE).unwrap_or(i32::MAX);
+        if let Some(message) = input.max_results.and_then(|max_results| {
+            crate::state::integer_bound_message(
+                "maxResults",
+                max_results,
+                crate::state::MIN_LIST_PAGE_SIZE,
+                page_size,
+            )
+        }) {
+            return Err(
+                DescribeCapacityProvidersErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
         }
 
         let include_tags = crate::state::include_requests_tags(input.include.as_ref());

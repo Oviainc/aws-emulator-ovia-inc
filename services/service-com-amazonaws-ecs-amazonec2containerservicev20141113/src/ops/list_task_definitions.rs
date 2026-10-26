@@ -180,18 +180,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // "This value can be between 1 and 100."
-        if let Some(max_results) = input.max_results {
-            if !(1..=crate::state::MAX_LIST_PAGE_SIZE).contains(&max_results) {
-                return Err(ListTaskDefinitionsErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(format!(
-                            "maxResults must be between 1 and {}; got {max_results}",
-                            crate::state::MAX_LIST_PAGE_SIZE
-                        )),
-                    },
-                )
-                .into());
-            }
+        if let Some(message) = input.max_results.and_then(|max_results| {
+            crate::state::integer_bound_message(
+                "maxResults",
+                max_results,
+                crate::state::MIN_LIST_PAGE_SIZE,
+                crate::state::MAX_LIST_PAGE_SIZE,
+            )
+        }) {
+            return Err(ListTaskDefinitionsErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
         }
 
         // "By default, only ACTIVE task definitions are listed. By setting this parameter
