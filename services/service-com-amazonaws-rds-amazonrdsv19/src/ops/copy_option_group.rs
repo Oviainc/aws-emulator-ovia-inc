@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CopyOptionGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CopyOptionGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Copies an option group this service holds: the copy carries the source's engine, its
+//! major engine version and every option the source holds, under a new name and
+//! description, and records the source it was copied from. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CopyOptionGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The copy's record and the projection onto the modelled `OptionGroup` wire shape live
+//! in [`crate::state`], shared with `CreateOptionGroup` and `DescribeOptionGroups`, so a
+//! describe of the copy reports exactly what this call stored.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +149,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CopyOptionGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CopyOptionGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CopyOptionGroup"))
+        let region =
+            crate::state::request_region(ctx).map_err(CopyOptionGroupError::validation)?;
+        // `TargetOptionGroupIdentifier` constraints: "Can't be null, empty, or blank.
+        // Must contain from 1 to 255 letters, numbers, or hyphens. First character must
+        // be a letter. Can't end with a hyphen or contain two consecutive hyphens." —
+        // the rule the identifier members share, at this member's bound.
+        let target = input.target_option_group_identifier;
+        crate::state::check_identifier("TargetOptionGroupIdentifier", &target, 255)
+            .map_err(CopyOptionGroupError::invalid_parameter_value)?;
+        // Nothing caller-sized reaches the store unchecked: the description and the tags
+        // are both STORED on the copy.
+        crate::state::check_free_form(
+            "TargetOptionGroupDescription",
+            &input.target_option_group_description,
+        )
+        .map_err(CopyOptionGroupError::validation)?;
+        let tags = input.tags.unwrap_or_default();
+        crate::state::check_tags(&tags).map_err(CopyOptionGroupError::invalid_parameter_value)?;
+
+        // No store means this service was mounted on an engine it has no state in, so
+        // it cannot serve the operation at all. Unreachable with the engine the router
+        // builds; 501 is the honest answer, never a fabricated option group.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // `SourceOptionGroupIdentifier` "must specify a valid option group": RDS is
+        // regional, so the source is resolved in the region the request was signed for,
+        // by name or by the group's own ARN, and a value that names no group there is the
+        // modelled 404 in the wording this fault class uses throughout the service.
+        let source_named = input.source_option_group_identifier;
+        let Some(source) = store.resolve_option_group(&region, &source_named) else {
+            return Err(CopyOptionGroupErrorModeled::OptionGroupNotFoundFault(
+                OptionGroupNotFoundFault {
+                    message: Some(format!(
+                        "Specified OptionGroupName: {source_named} not found."
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The copy is a NEW group of the source's engine and major version holding the
+        // source's options — "copies the specified option group" — under the name and
+        // description the request gives, with the request's own tags and the provenance
+        // the three copy members of `OptionGroup` report.
+        let record = crate::state::OptionGroupRecord {
+            name: target.clone(),
+            region: region.clone(),
+            description: input.target_option_group_description,
+            engine_name: source.engine_name.clone(),
+            major_engine_version: source.major_engine_version.clone(),
+            tags,
+            options: source.options.clone(),
+            copied_from: Some(crate::state::CopiedOptionGroup {
+                // The SOURCE's stored name, so a source named by ARN is reported by the
+                // name the group itself carries, and a copy of a copy names the group it
+                // was copied from rather than that group's own source.
+                source_option_group: source.name.clone(),
+                source_account_id: emulator_server::emulator_account_id().to_string(),
+                copy_timestamp: crate::state::now_as_wire_timestamp(),
+            }),
+        };
+
+        // RDS is regional: one name can be a different option group in each region, and
+        // the name is stored and matched exactly as given — `OptionGroupName` carries no
+        // "isn't case-sensitive" note, unlike the members that fold case.
+        let key = (region.clone(), target.clone());
+        if store.option_groups.contains_key(&key) {
+            return Err(CopyOptionGroupErrorModeled::OptionGroupAlreadyExistsFault(
+                OptionGroupAlreadyExistsFault {
+                    // Built from the request, so it names the group the caller asked for
+                    // and no other, in the wording this fault class uses ("The option
+                    // group you are trying to create already exists").
+                    message: Some(format!("An option group named {target} already exists.")),
+                },
+            )
+            .into());
+        }
+        // The region's option group quota, and the number of regions this store keeps
+        // records for at all: the store cannot be grown without bound, and the modelled
+        // fault says exactly this.
+        if store.option_groups_in(&region).len() >= crate::state::OPTION_GROUP_QUOTA_PER_REGION
+            || !store.has_room_for_region(&region)
+        {
+            return Err(CopyOptionGroupErrorModeled::OptionGroupQuotaExceededFault(
+                OptionGroupQuotaExceededFault {
+                    message: Some(format!(
+                        "the request would exceed the allowed number of option groups \
+                         ({} per region, in at most {} regions)",
+                        crate::state::OPTION_GROUP_QUOTA_PER_REGION,
+                        crate::state::MAX_REGIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The answer is the record this call stored, so a following describe reports the
+        // same group.
+        let option_group = record.to_wire();
+        store.option_groups.insert(key, record);
+
+        Ok(CopyOptionGroupOutput {
+            option_group: Some(option_group),
+        })
     }
 }

@@ -220,6 +220,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default(),
             // A group is created EMPTY: options are added to it by `ModifyOptionGroup`.
             options: std::collections::BTreeMap::new(),
+            // Created rather than copied, so the group names no source option group.
+            copied_from: None,
         };
         let option_group = record.to_wire();
         store.option_groups.insert(key, record);

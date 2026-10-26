@@ -83,6 +83,8 @@ mod modify_custom_db_engine_version;
 mod modify_event_subscription;
 #[path = "all/not_found_paths.rs"]
 mod not_found_paths;
+#[path = "all/option_group_copy.rs"]
+mod option_group_copy;
 #[path = "all/option_group_deletion.rs"]
 mod option_group_deletion;
 #[path = "all/option_group_options.rs"]

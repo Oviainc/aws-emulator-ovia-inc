@@ -50,7 +50,10 @@ pub(crate) type IncludeSpec<'a> = (&'a str, &'a [(&'a str, &'a str)]);
 /// A major engine version in the form the engine family writes it — free-form input as
 /// far as `CreateOptionGroup` is concerned, so this only keeps the test's groups
 /// plausible.
-fn major_engine_version(engine_name: &str) -> &'static str {
+///
+/// `pub(crate)` so the sibling suites of this one test target name their groups' versions
+/// the same way rather than keeping a second copy of this table.
+pub(crate) fn major_engine_version(engine_name: &str) -> &'static str {
     if engine_name.starts_with("mariadb") {
         "10.11"
     } else if engine_name.starts_with("mysql") {

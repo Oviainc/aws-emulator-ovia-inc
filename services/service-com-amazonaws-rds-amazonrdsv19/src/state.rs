@@ -1631,6 +1631,31 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         range_in(&self.option_groups, region)
     }
 
+    /// The option group `named` resolves to in `region`, or `None` when nothing of that
+    /// name exists there.
+    ///
+    /// A member that must "specify a valid option group" names it either by its
+    /// `OptionGroupName` or by the `OptionGroupArn` this service reports for it, so both
+    /// forms resolve to the one record. `OptionGroupName` carries no "isn't
+    /// case-sensitive" note — the members that fold case say so explicitly — so the name
+    /// is matched exactly as the store keys it.
+    pub fn resolve_option_group(&self, region: &str, named: &str) -> Option<&OptionGroupRecord> {
+        if let Some(stored) = self
+            .option_groups
+            .get(&(region.to_string(), named.to_string()))
+        {
+            return Some(stored);
+        }
+        // Only an ARN can match the scan below, so a plain name that named nothing does
+        // not pay for rendering a region's stored ARNs.
+        if !named.starts_with("arn:") {
+            return None;
+        }
+        self.option_groups_in(region)
+            .into_iter()
+            .find(|record| record.arn() == named)
+    }
+
     /// The DB subnet groups stored in `region`, in name order.
     pub fn db_subnet_groups_in(&self, region: &str) -> Vec<&DbSubnetGroupRecord> {
         range_in(&self.db_subnet_groups, region)
@@ -3151,6 +3176,27 @@ pub struct OptionGroupRecord {
     /// read, and keyed by name, so adding an option twice updates its configuration
     /// instead of storing a second copy of it.
     pub options: BTreeMap<String, OptionRecord>,
+    /// Where this group was copied from, for a group `CopyOptionGroup` produced, and
+    /// `None` for one created from scratch — whose `SourceOptionGroup`,
+    /// `SourceAccountId` and `CopyTimestamp` are then reported not at all, because
+    /// nothing was copied for them to describe.
+    pub copied_from: Option<CopiedOptionGroup>,
+}
+
+/// The copy provenance of an option group `CopyOptionGroup` produced: the three members
+/// `OptionGroup` publishes for a copied group, recorded ONCE when the copy is taken, so
+/// every later read of the group reports the same answer.
+#[derive(Debug, Clone)]
+pub struct CopiedOptionGroup {
+    /// `SourceOptionGroup` — "the name of the option group from which this option group
+    /// is copied": the source's own name, whichever form the request named it by.
+    pub source_option_group: String,
+    /// `SourceAccountId` — "the Amazon Web Services account ID for the option group from
+    /// which this option group is copied".
+    pub source_account_id: String,
+    /// `CopyTimestamp` — "when the option group was copied", fixed at the instant the
+    /// copy was taken.
+    pub copy_timestamp: ::aws_smithy_types::DateTime,
 }
 
 impl OptionGroupRecord {
@@ -3184,13 +3230,25 @@ impl OptionGroupRecord {
             allows_vpc_and_non_vpc_instance_memberships: Some(options.is_empty()),
             options: Some(options),
             option_group_arn: Some(self.arn()),
+            // `SourceOptionGroup`, `SourceAccountId` and `CopyTimestamp` describe a group
+            // that was COPIED from another one, so they are reported exactly for a group
+            // this service holds that provenance for, and not at all for one created from
+            // scratch — a group nothing was copied to make has no source to name.
+            source_option_group: self
+                .copied_from
+                .as_ref()
+                .map(|copy| copy.source_option_group.clone()),
+            source_account_id: self
+                .copied_from
+                .as_ref()
+                .map(|copy| copy.source_account_id.clone()),
+            copy_timestamp: self.copied_from.as_ref().map(|copy| copy.copy_timestamp),
             // `VpcId` belongs to a group bound to ONE VPC, which nothing here creates:
             // "If AllowsVpcAndNonVpcInstanceMemberships is false, this field is blank.
             // If AllowsVpcAndNonVpcInstanceMemberships is true and this field is blank,
             // then this option group can be applied to both VPC and non-VPC
-            // instances." `SourceOptionGroup`/`SourceAccountId`/`CopyTimestamp` belong
-            // to a group `CopyOptionGroup` produced. None describes a group created
-            // here, so none is reported rather than carrying a made-up value.
+            // instances." No group here is bound to a VPC, so the member is left
+            // unreported rather than carrying a made-up value.
             ..OptionGroup::default()
         }
     }
@@ -4567,8 +4625,10 @@ fn identifier_subject(member: &str) -> Option<&'static str> {
         // The identifier of a DB instance, whether `CreateDBInstance` is naming the one to
         // create or `ModifyDBInstance` the one to rename to.
         "DBInstanceIdentifier" | "NewDBInstanceIdentifier" => Some("database identifier"),
-        // The name of an option group, on create and on modify alike.
-        "OptionGroupName" => Some("option group name"),
+        // The name of an option group: on create, on modify, and the name a COPY of a
+        // group is created under, which is an option group's name too — so a caller
+        // reading the refusal cannot tell those paths apart by its wording.
+        "OptionGroupName" | "TargetOptionGroupIdentifier" => Some("option group name"),
         _ => None,
     }
 }
