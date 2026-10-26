@@ -27,6 +27,8 @@ mod firewall_domains;
 mod harness;
 #[path = "all/outpost_resolvers.rs"]
 mod outpost_resolvers;
+#[path = "all/resolver_config_reads.rs"]
+mod resolver_config_reads;
 #[path = "all/resolver_configs.rs"]
 mod resolver_configs;
 #[path = "all/resolver_dnssec_config_listing.rs"]
