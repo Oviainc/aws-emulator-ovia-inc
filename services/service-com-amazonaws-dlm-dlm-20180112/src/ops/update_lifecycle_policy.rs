@@ -280,6 +280,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The one member of that configuration an update may not CHANGE:
+        // `UpdateLifecyclePolicyRequest$PolicyDetails` is "the configuration of
+        // the lifecycle policy. You cannot update the policy type or the resource
+        // type". A configuration restating the type the policy already holds
+        // states the configuration it has, so it is accepted and changes nothing;
+        // one naming a different type asks for the change the model rules out.
+        // A policy holding no resource type at all has none to change, so a
+        // configuration stating one fills in the single stored copy. Refused
+        // before the first write, so the stored policy is left exactly as it was.
+        if let Some(stated) = input
+            .policy_details
+            .as_ref()
+            .and_then(|details| details.resource_type.as_deref())
+        {
+            if let Some(stored) = policy.default_policy_type.as_deref() {
+                if stored != stated {
+                    return Err(
+                        UpdateLifecyclePolicyErrorModeled::InvalidRequestException(
+                            crate::state::resource_type_cannot_be_updated(stated, stored),
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+
         // The documented numeric domain of a default policy's cadence, as at
         // create: the creation frequency's 1-to-7 days, the retention period's
         // 2-to-14 days, and a retention period greater than the creation
@@ -326,13 +352,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // As at create: the replacement configuration is stored with the
             // service-materialized members stamped onto it, and a default
             // policy's `[Default policies only]` members are MOVED out of it
-            // onto the record, the one place this service keeps them. The
-            // structure is "the configuration of the lifecycle policy", so it
-            // replaces that configuration WHOLESALE: the members it states take
-            // effect and the ones it omits go back to their documented defaults.
-            // A policy that is not a default policy holds none of those members
-            // and may state none (refused above), so for one of those this moves
-            // nothing and replaces nothing.
+            // onto the record, the one place this service keeps them — the
+            // resource type included, so no copy of it is left inside the stored
+            // structure for a read or the `resourceTypes` filter to disagree
+            // over. The structure is "the configuration of the lifecycle
+            // policy", so it replaces that configuration WHOLESALE: the members
+            // it states take effect and the ones it omits go back to their
+            // documented defaults, except the resource type an update cannot
+            // change. A policy that is not a default policy holds none of those
+            // members and may state none (refused above), so for one of those
+            // this moves nothing and replaces nothing.
             let mut details = crate::state::materialized_policy_details(policy_details);
             let configuration =
                 crate::state::DefaultPolicyConfiguration::taken_from_policy_details(&mut details);
@@ -373,7 +402,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// list — as `create_lifecycle_policy.rs` does for the create's own input.
 ///
 /// `PolicyDetails$ResourceType` has no request-body counterpart to read: the
-/// resource type is not something an update may change.
+/// resource type is not something an update may change, so the update refuses a
+/// configuration naming a different one
+/// ([`crate::state::resource_type_cannot_be_updated`]) rather than reading it as
+/// an alternative form of some body member.
 fn default_policy_only_body_parameters(
     input: &UpdateLifecyclePolicyInput,
 ) -> crate::state::DefaultPolicyOnlyParameters {

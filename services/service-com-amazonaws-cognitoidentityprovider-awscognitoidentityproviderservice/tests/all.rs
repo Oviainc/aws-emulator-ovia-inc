@@ -85,6 +85,8 @@ mod terms_documents;
 mod token_signing;
 #[path = "all/update_group.rs"]
 mod update_group;
+#[path = "all/update_resource_server.rs"]
+mod update_resource_server;
 #[path = "all/update_terms.rs"]
 mod update_terms;
 #[path = "all/update_user_attributes.rs"]

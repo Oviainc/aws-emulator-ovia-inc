@@ -272,8 +272,9 @@ pub(crate) use alarm_templates::alarm_template_output;
 pub mod multiplexes;
 
 pub use multiplexes::{
-    multiplex_alert_state, multiplex_alert_type, multiplex_state,
-    MultiplexProgramRecord, MultiplexProgramRefusal,
+    multiplex_alert_state, multiplex_alert_type, multiplex_program_not_found_message,
+    multiplex_state,
+    MultiplexProgramDeleteRefusal, MultiplexProgramRecord, MultiplexProgramRefusal,
     MultiplexProgramSettingsRefusal, MultiplexProgramUpdateRefusal, MultiplexRecord,
     MultiplexRefusal, MultiplexSettingOutOfRange, MultiplexStartRefusal, MultiplexStopRefusal,
     MultiplexUpdateRefusal, MAX_MULTIPLEXES,

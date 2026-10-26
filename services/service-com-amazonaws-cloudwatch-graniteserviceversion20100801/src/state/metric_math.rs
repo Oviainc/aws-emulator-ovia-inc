@@ -28,6 +28,27 @@ pub struct MathSeries {
     pub label: String,
     /// The series' points, oldest first.
     pub points: Vec<(f64, f64)>,
+    /// The metric and statistic this series was RETRIEVED for, when it is one metric's series
+    /// rather than a value computed from others.
+    ///
+    /// It is what an anomaly detector is keyed by ([`SeriesSource::anomaly_model`]), so only a
+    /// series that still IS a metric's series carries it: every series an operator or a
+    /// function computes is a new series, which no detector was created for.
+    pub metric: Option<SeriesMetric>,
+}
+
+/// The metric one series was retrieved for: the identity of the stored series, and the
+/// statistic it was folded by.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeriesMetric {
+    /// The metric's namespace.
+    pub namespace: String,
+    /// The metric's name.
+    pub metric_name: String,
+    /// The metric's normalised dimension set.
+    pub dimensions: BTreeMap<String, String>,
+    /// The statistic the series' points were folded by.
+    pub stat: String,
 }
 
 impl MathSeries {
@@ -36,7 +57,14 @@ impl MathSeries {
         Self {
             label: label.into(),
             points,
+            metric: None,
         }
+    }
+
+    /// The same series, remembering the metric it was retrieved for.
+    pub fn of_metric(mut self, metric: SeriesMetric) -> Self {
+        self.metric = Some(metric);
+        self
     }
 }
 
@@ -85,7 +113,9 @@ pub trait SeriesSource {
     ///
     /// A band is the detector's: only a trained model says what a value is expected to be, so
     /// a series the lookup finds no detector for has no band — which is what
-    /// `ANOMALY_DETECTION_BAND` then reports.
+    /// `ANOMALY_DETECTION_BAND` then reports. The lookup is keyed on the metric the series was
+    /// retrieved for ([`MathSeries::metric`]), because that is what a detector is created
+    /// for.
     fn anomaly_model(&self, series: &MathSeries) -> Option<AnomalyModel>;
 }
 
@@ -999,6 +1029,8 @@ impl<'a> Evaluation<'a> {
         MathSeries {
             label: series.label,
             points,
+            // A transformed series is a new series, not the metric's own.
+            metric: None,
         }
     }
 
@@ -1106,6 +1138,8 @@ impl<'a> Evaluation<'a> {
         MathSeries {
             label: series.label,
             points,
+            // A combined series is a new series, not the metric's own.
+            metric: None,
         }
     }
 
@@ -1481,6 +1515,8 @@ impl<'a> Evaluation<'a> {
         MathSeries {
             label: series.label.clone(),
             points,
+            // A sequence function's series is a new series, not the metric's own.
+            metric: None,
         }
     }
 
@@ -1821,6 +1857,8 @@ fn fill_series(series: &MathSeries, grid: &[f64], mode: FillMode) -> MathSeries 
     MathSeries {
         label: series.label.clone(),
         points,
+        // A filled series is a new series, not the metric's own.
+        metric: None,
     }
 }
 

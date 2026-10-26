@@ -29,6 +29,8 @@ mod contact_channel_updates;
 mod contact_lifecycle;
 #[path = "all/contact_plan_references.rs"]
 mod contact_plan_references;
+#[path = "all/contact_rotation_membership.rs"]
+mod contact_rotation_membership;
 #[path = "all/contact_updates.rs"]
 mod contact_updates;
 #[path = "all/create_contact_plan_resolution.rs"]

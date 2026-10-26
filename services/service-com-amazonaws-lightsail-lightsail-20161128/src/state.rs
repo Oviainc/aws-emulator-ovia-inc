@@ -656,6 +656,8 @@ pub const OPERATION_TYPE_DELETE_BUCKET_ACCESS_KEY: &str = "DeleteBucketAccessKey
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISTRIBUTION: &str = "CreateDistribution";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_DELETE_DISTRIBUTION: &str = "DeleteDistribution";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_ALLOCATE_STATIC_IP: &str = "AllocateStaticIp";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_PUT_ALARM: &str = "PutAlarm";
@@ -10780,6 +10782,23 @@ impl ComAmazonawsLightsailLightsail20161128State {
     pub fn insert_distribution(&mut self, distribution: StoredDistribution) {
         self.distributions
             .insert(distribution.name.clone(), distribution);
+    }
+
+    /// Remove the CDN distribution `name` names, answering the record that was
+    /// stored under it, or `None` when this account holds no distribution of
+    /// that name.
+    ///
+    /// Everything a distribution carries lives ON this record — its origin, its
+    /// cache behaviours, its tags, the certificate it names and the last reset
+    /// of its cached content — so removing the record is what removes them all.
+    /// A certificate itself is NOT removed with it: a certificate is a resource
+    /// of its own, and the number of resources it is attached to is counted from
+    /// the distributions that name it ([`Self::certificate_in_use_resource_count`]),
+    /// so it is released by this removal rather than deleted by it. The
+    /// operation log is append-only, so the entries a deleted distribution's
+    /// earlier calls wrote stay readable.
+    pub fn remove_distribution(&mut self, name: &str) -> Option<StoredDistribution> {
+        self.distributions.remove(name)
     }
 
     /// What the origin name `name` addresses in `region`, or `None` when this
