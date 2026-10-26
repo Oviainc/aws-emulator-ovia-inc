@@ -115,7 +115,8 @@ use crate::ops::types::{
     CreateExperimentTemplateExperimentOptionsInput, CreateExperimentTemplateInput,
     CreateExperimentTemplateLogConfigurationInput,
     CreateExperimentTemplateReportConfigurationInput, CreateExperimentTemplateStopConditionInput,
-    CreateExperimentTemplateTargetInput, Experiment, ExperimentAction, ExperimentActionState,
+    CreateExperimentTemplateTargetInput, CreateTargetAccountConfigurationInput, Experiment,
+    ExperimentAction, ExperimentActionState,
     ExperimentCloudWatchLogsLogConfiguration, ExperimentLogConfiguration, ExperimentOptions,
     ExperimentReport, ExperimentReportConfiguration,
     ExperimentReportConfigurationCloudWatchDashboard, ExperimentReportConfigurationDataSources,
@@ -1045,14 +1046,6 @@ pub struct TargetAccountConfigurationRecord {
     /// with characters in it or has none, so an omitted description and an explicitly
     /// empty one are the one same stored value.
     pub description: Option<String>,
-    /// The `@idempotencyToken` of the request that created this configuration, when it
-    /// carried one.
-    ///
-    /// This sub-resource is named by its (template, account) pair, so a token cannot be
-    /// resolved through [`ComAmazonawsFisFaultinjectionsimulatorState::idempotency`],
-    /// which maps a token to a single minted id; the token is kept on the record and
-    /// compared by [`TargetAccountConfigurationRecord::is_replay_of`] instead.
-    pub client_token: Option<String>,
 }
 
 /// A `TargetAccountConfigurationDescription` as this service STORES it: a description
@@ -1073,31 +1066,13 @@ pub fn stored_description(description: Option<&str>) -> Option<String> {
 
 impl TargetAccountConfigurationRecord {
     /// The record `CreateTargetAccountConfiguration` persists for one account.
-    pub fn new(
-        account_id: String,
-        role_arn: String,
-        description: Option<String>,
-        client_token: Option<String>,
-    ) -> Self {
+    pub fn new(account_id: String, role_arn: String, description: Option<String>) -> Self {
         Self {
             account_id,
             role_arn,
             // Normalized on the way in, so the store holds one representation of "this
             // configuration has no description" (see [`stored_description`]).
             description: stored_description(description.as_deref()),
-            client_token,
-        }
-    }
-
-    /// True when a create request carrying `client_token` is a RETRY of the request that
-    /// created this record, rather than a second create for the same account.
-    ///
-    /// A request that carries no token is never a replay: there is nothing to match it
-    /// against, so a second create for the same account is a conflict.
-    pub fn is_replay_of(&self, client_token: Option<&str>) -> bool {
-        match (self.client_token.as_deref(), client_token) {
-            (Some(stored), Some(offered)) => stored == offered,
-            _ => false,
         }
     }
 
@@ -1112,8 +1087,8 @@ impl TargetAccountConfigurationRecord {
     /// configuration is left with no description at all rather than with an empty one.
     ///
     /// The `accountId` names the record and so is never changed by an update, and the
-    /// creating `@idempotencyToken` is kept: a retry of the create still resolves to this
-    /// record, and reports it in whatever state it is now in.
+    /// creating `@idempotencyToken` keeps resolving to this record: a retry of the create
+    /// reports it in whatever state it is now in.
     pub fn apply_update(&mut self, role_arn: Option<&str>, description: Option<&str>) {
         if let Some(role_arn) = role_arn {
             self.role_arn = role_arn.to_string();
@@ -2168,6 +2143,22 @@ pub fn safety_lever_engaged_refusal(status: SafetyLeverStatusKind) -> ConflictEx
 pub enum IdempotentResource {
     ExperimentTemplate,
     Experiment,
+    /// A target account configuration, named by the (template, account) pair rather than
+    /// by a minted id — see [`target_account_configuration_name`].
+    TargetAccountConfiguration,
+}
+
+/// The NAME of a target account configuration as one string, for the idempotency map,
+/// which addresses a resource by a single value.
+///
+/// This sub-resource carries no minted id: it is named by the (`experimentTemplateId`,
+/// `accountId`) pair, so the two halves are joined here and split apart by
+/// [`ComAmazonawsFisFaultinjectionsimulatorState::target_account_configuration`]. The
+/// template id comes first because the store only ever holds configurations under ids
+/// this service minted ([`format_id`], which emits no `/`), so the FIRST separator always
+/// ends the template id whatever an `accountId` happens to contain.
+pub fn target_account_configuration_name(experiment_template_id: &str, account_id: &str) -> String {
+    format!("{experiment_template_id}/{account_id}")
 }
 
 /// What one `@idempotencyToken` created, and the request it created it from.
@@ -2288,6 +2279,9 @@ impl ComAmazonawsFisFaultinjectionsimulatorState {
                 self.experiment_templates.contains_key(&record.id)
             }
             IdempotentResource::Experiment => self.experiments.contains_key(&record.id),
+            IdempotentResource::TargetAccountConfiguration => {
+                self.target_account_configuration(&record.id).is_some()
+            }
         };
         if !live {
             return TokenReplay::Fresh;
@@ -2320,6 +2314,47 @@ impl ComAmazonawsFisFaultinjectionsimulatorState {
     pub fn forget_tokens_for(&mut self, resource: IdempotentResource, id: &str) {
         self.idempotency
             .retain(|(kind, _), created| *kind != resource || created.id != id);
+    }
+
+    /// The target account configuration one [`target_account_configuration_name`] names,
+    /// or `None` when this store holds no such sub-resource.
+    ///
+    /// The configuration lives on the template that owns it, so resolving the name means
+    /// splitting it back into its two halves and walking that template's map.
+    pub fn target_account_configuration(
+        &self,
+        name: &str,
+    ) -> Option<&TargetAccountConfigurationRecord> {
+        let (experiment_template_id, account_id) = name.split_once('/')?;
+        self.experiment_templates
+            .get(experiment_template_id)?
+            .target_account_configurations
+            .get(account_id)
+    }
+
+    /// Drop the idempotency entries of a template's target account configurations: the one
+    /// account `account_id` names, or EVERY account of the template when it is `None`
+    /// (which is what deleting the template takes with it).
+    pub fn forget_target_account_configuration_tokens(
+        &mut self,
+        experiment_template_id: &str,
+        account_id: Option<&str>,
+    ) {
+        self.idempotency.retain(|(kind, _), created| {
+            if *kind != IdempotentResource::TargetAccountConfiguration {
+                return true;
+            }
+            match account_id {
+                Some(account_id) => {
+                    created.id
+                        != target_account_configuration_name(experiment_template_id, account_id)
+                }
+                None => created
+                    .id
+                    .split_once('/')
+                    .is_none_or(|(template, _)| template != experiment_template_id),
+            }
+        });
     }
 
     /// How many experiments still occupy an active slot at `now`.
@@ -4209,6 +4244,29 @@ pub fn start_experiment_fingerprint(input: &StartExperimentInput) -> String {
             .as_ref()
             .and_then(|options| options.actions_mode.clone()),
         "tags": ordered_entries(input.tags.as_ref()),
+    })
+    .to_string()
+}
+
+/// The canonical rendering of the `CreateTargetAccountConfiguration` request a
+/// `clientToken` belongs to.
+///
+/// Every member of the request that decides which configuration it creates and what that
+/// configuration holds — the template and the account that NAME it, plus the `roleArn` and
+/// the `description` it carries — so two requests with the same rendering create the same
+/// configuration and one is a retry of the other, while a request differing in ANY of them
+/// is a different request wearing the same token. The description is rendered as the store
+/// would hold it ([`stored_description`]), because an omitted description and an empty one
+/// leave the very same configuration behind. See [`start_experiment_fingerprint`] for why
+/// the rendering is JSON.
+pub fn target_account_configuration_fingerprint(
+    input: &CreateTargetAccountConfigurationInput,
+) -> String {
+    ::serde_json::json!({
+        "experimentTemplateId": input.experiment_template_id,
+        "accountId": input.account_id,
+        "roleArn": input.role_arn,
+        "description": stored_description(input.description.as_deref()),
     })
     .to_string()
 }

@@ -154,11 +154,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // The idempotency tokens that created it go with it: the record they name is
         // gone, so a later replay of one has nothing to report and creates afresh. Its
-        // target account configurations live on the record, so they go with it too.
+        // target account configurations live on the record, so they go with it too — and
+        // so do the tokens that created them.
         store.forget_tokens_for(
             crate::state::IdempotentResource::ExperimentTemplate,
             &input.id,
         );
+        store.forget_target_account_configuration_tokens(&input.id, None);
 
         Ok(DeleteExperimentTemplateOutput {
             experiment_template: Some(record.to_experiment_template()),

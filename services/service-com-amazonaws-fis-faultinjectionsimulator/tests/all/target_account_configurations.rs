@@ -14,9 +14,10 @@
 //!   them unchanged (an explicitly empty `description` is normalized like an omitted one,
 //!   the rule `target_account_configuration_description.rs` owns);
 //! * a create naming an account the template is already configured for answers
-//!   `ConflictException` (HTTP 409), unless it replays the `@idempotencyToken` that
-//!   created that configuration — in which case it reports that configuration back
-//!   instead of a second one;
+//!   `ConflictException` (HTTP 409), unless it REPEATS the request that created that
+//!   configuration under the same `@idempotencyToken` — in which case it reports that
+//!   configuration back instead of a second one (what that token is bound to is the rule
+//!   `target_account_configuration_idempotency.rs` owns);
 //! * `UpdateTargetAccountConfiguration` is a PARTIAL update of the configuration that
 //!   name already holds: a member the request carries (`roleArn`, `description` — both
 //!   optional, unlike the create's required `roleArn`) replaces the stored value, a
@@ -845,7 +846,10 @@ async fn a_request_outside_a_modelled_bound_is_refused() {
                 // agree about which account the role belongs to.
                 &owned_role_arn(&account_id, "fis-bounds"),
                 description.as_deref(),
-                Some("token-bounds"),
+                // Its OWN token: an `@idempotencyToken` is bound to the request that
+                // first carried it, so each row — a different request — carries a
+                // different one and what is under test is the bound and not the token.
+                Some(&crate::resource_tagging::client_token("bounds", &case)),
             ),
         )
         .await;
@@ -885,7 +889,12 @@ async fn a_request_outside_a_modelled_bound_is_refused() {
             &router,
             &template_id,
             "151515151515",
-            create_body(&role_arn, None, Some("token-role-bounds")),
+            create_body(
+                &role_arn,
+                None,
+                // Per row, for the reason the rows above carry their own token.
+                Some(&crate::resource_tagging::client_token("role-bounds", case)),
+            ),
         )
         .await;
         assert_eq!(
@@ -1230,7 +1239,12 @@ async fn an_update_outside_a_modelled_bound_is_refused_and_persists_nothing() {
                 create_body(
                     &baseline_role_arn(&account_id),
                     None,
-                    Some("token-update-account-bounds"),
+                    // Per row: each row creates a DIFFERENT configuration, so each one
+                    // is a different request and carries its own token.
+                    Some(&crate::resource_tagging::client_token(
+                        "update-account-bounds",
+                        case,
+                    )),
                 ),
             )
             .await;

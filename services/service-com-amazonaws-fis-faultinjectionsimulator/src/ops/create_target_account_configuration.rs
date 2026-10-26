@@ -7,8 +7,10 @@
 //! the `accountId` it configures, and returns it. The configuration is a sub-resource of
 //! the template, so a request naming a template the store does not hold answers
 //! `ResourceNotFoundException`, and one naming an account the template is already
-//! configured for answers `ConflictException` — unless it replays the
-//! `@idempotencyToken` that created that configuration, which reports it back.
+//! configured for answers `ConflictException` — unless it REPEATS the request that created
+//! that configuration under the same `@idempotencyToken`, which reports it back. That
+//! token identifies a request, so carrying it on any other request answers
+//! `ConflictException` too, and persists nothing.
 //!
 //! A configuration belongs to a template that targets MULTIPLE accounts: the template's
 //! `experimentOptions.accountTargeting` and the configurations it holds state which
@@ -188,10 +190,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The configuration belongs to an experiment template: with no such template
-        // there is nothing to configure.
+        // there is nothing to configure. Read through a SHARED borrow, because the token
+        // resolution below reads the store too; the write takes the mutable borrow once
+        // every refusal is behind us.
         let Some(template) = store
             .experiment_templates
-            .get_mut(&input.experiment_template_id)
+            .get(&input.experiment_template_id)
         else {
             return Err(
                 CreateTargetAccountConfigurationErrorModeled::ResourceNotFoundException(
@@ -211,16 +215,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        if let Some(existing) = template.target_account_configurations.get(&input.account_id) {
-            // `clientToken` is an `@idempotencyToken`: a retry of the request that
-            // created this configuration reports that configuration back, so a retried
-            // create never looks like a second one. Anything else naming an account the
-            // template is already configured for is a conflict.
-            if existing.is_replay_of(input.client_token.as_deref()) {
-                return Ok(CreateTargetAccountConfigurationOutput {
-                    target_account_configuration: Some(existing.to_target_account_configuration()),
-                });
+        // `clientToken` is an `@idempotencyToken`, so it identifies the REQUEST it was
+        // first used with and not merely the resource that request created: a retry of
+        // that same request reports the configuration it created, while the same token
+        // carrying a request that differs in any member — another account, another role,
+        // another description, another template — is a parameter mismatch FIS refuses with
+        // `ConflictException`, changing nothing. The token is resolved through the one
+        // per-service map every `@idempotencyToken` of this service is resolved through,
+        // so reuse across accounts and across templates is seen as well.
+        let fingerprint = crate::state::target_account_configuration_fingerprint(&input);
+        if let Some(client_token) = input.client_token.as_deref() {
+            match store.replayed(
+                crate::state::IdempotentResource::TargetAccountConfiguration,
+                client_token,
+                &fingerprint,
+            ) {
+                crate::state::TokenReplay::Replay(name) => {
+                    if let Some(record) = store.target_account_configuration(&name) {
+                        return Ok(CreateTargetAccountConfigurationOutput {
+                            target_account_configuration: Some(
+                                record.to_target_account_configuration(),
+                            ),
+                        });
+                    }
+                }
+                crate::state::TokenReplay::Mismatch => {
+                    return Err(
+                        CreateTargetAccountConfigurationErrorModeled::ConflictException(
+                            crate::state::token_conflict(client_token),
+                        )
+                        .into(),
+                    )
+                }
+                crate::state::TokenReplay::Fresh => {}
             }
+        }
+
+        // The same template, now borrowed for the write: the store lock has been held
+        // throughout, so this resolves the record the refusals above were judged over.
+        let Some(template) = store
+            .experiment_templates
+            .get_mut(&input.experiment_template_id)
+        else {
+            return Err(
+                CreateTargetAccountConfigurationErrorModeled::ResourceNotFoundException(
+                    crate::state::template_not_found(),
+                )
+                .into(),
+            );
+        };
+
+        // Anything naming an account the template is already configured for is a conflict:
+        // a create does not overwrite a configuration, and a request that got this far is
+        // not a retry of the one that created it.
+        if template
+            .target_account_configurations
+            .contains_key(&input.account_id)
+        {
             return Err(
                 CreateTargetAccountConfigurationErrorModeled::ConflictException(
                     crate::state::target_account_configuration_exists(
@@ -254,7 +305,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // leave the configuration with no description
             // ([`crate::state::stored_description`]).
             input.description.clone(),
-            input.client_token.clone(),
         );
         // Built from the record that is about to be stored, so what the caller sees is
         // what a later `GetTargetAccountConfiguration` reads back.
@@ -262,6 +312,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         template
             .target_account_configurations
             .insert(input.account_id.clone(), record);
+        if let Some(client_token) = input.client_token.as_deref() {
+            // What this token created, and the request it created it from, so a retry
+            // reports this configuration and any other request wearing the token is
+            // refused.
+            store.remember_token(
+                crate::state::IdempotentResource::TargetAccountConfiguration,
+                client_token,
+                &crate::state::target_account_configuration_name(
+                    &input.experiment_template_id,
+                    &input.account_id,
+                ),
+                &fingerprint,
+            );
+        }
 
         Ok(CreateTargetAccountConfigurationOutput {
             target_account_configuration: Some(target_account_configuration),

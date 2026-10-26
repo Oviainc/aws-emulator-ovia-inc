@@ -182,10 +182,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // The idempotency token that created it goes with it: the sub-resource it names is
+        // gone, so a later create carrying that token has nothing to report and creates
+        // afresh.
+        store.forget_target_account_configuration_tokens(
+            &input.experiment_template_id,
+            Some(&input.account_id),
+        );
+
         // Built from the record as it stood when it was removed, so this answer reports
-        // exactly what the store held — and the creating `@idempotencyToken` goes with it,
-        // because the token lives on the record: a later create replaying it finds nothing
-        // and creates afresh. The owning template's `lastUpdateTime` is not moved: this
+        // exactly what the store held. The owning template's `lastUpdateTime` is not moved: this
         // call changes a sub-resource, not the template itself, exactly as the create and
         // the update of the same sub-resource leave it alone.
         Ok(DeleteTargetAccountConfigurationOutput {

@@ -63,6 +63,8 @@ mod state_roundtrip;
 mod target_account_configuration_description;
 #[path = "all/target_account_configuration_errors.rs"]
 mod target_account_configuration_errors;
+#[path = "all/target_account_configuration_idempotency.rs"]
+mod target_account_configuration_idempotency;
 #[path = "all/target_account_configurations.rs"]
 mod target_account_configurations;
 #[path = "all/target_account_role_ownership.rs"]
