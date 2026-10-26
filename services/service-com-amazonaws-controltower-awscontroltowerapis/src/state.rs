@@ -1168,22 +1168,26 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
         any_operation_in_flight(&self.landing_zone_operations, arn)
     }
 
-    /// The control already enabled for `control_identifier` on `target_identifier`, or
+    /// The control already enabled for `control` on `target_identifier`, or
     /// `None` when that pair is not enabled.
     ///
     /// A control is enabled at most once per target, so this is what `EnableControl`
-    /// reads to refuse a repeat. The ARN tie-break keeps the answer independent of the
-    /// map's iteration order should a pair ever appear twice.
+    /// reads to refuse a repeat. The control is named by the CATALOG ENTRY a caller's
+    /// identifier resolved to ([`resolve_control`]), not by that identifier's text: a
+    /// control is published under two ARN forms in every partition and region, so many
+    /// identifiers name one control and each stored identifier is resolved before it is
+    /// compared. The ARN tie-break keeps the answer independent of the map's iteration
+    /// order should a pair ever appear twice.
     pub fn enabled_control_on_target(
         &self,
-        control_identifier: &str,
+        control: &CatalogControl,
         target_identifier: &str,
     ) -> Option<&EnabledControl> {
         self.enabled_controls
             .values()
-            .filter(|control| {
-                control.control_identifier == control_identifier
-                    && control.target_identifier == target_identifier
+            .filter(|enabled| {
+                resolve_control(&enabled.control_identifier) == Some(control)
+                    && enabled.target_identifier == target_identifier
             })
             .min_by(|a, b| a.arn.cmp(&b.arn))
     }
@@ -1452,20 +1456,27 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             .map(|(arn, _)| arn.clone())
     }
 
-    /// The ARN of the enabled baseline that already applies `baseline_identifier` to
+    /// The ARN of the enabled baseline that already applies `baseline` to
     /// `target_identifier`, or `None` when that pair is not enabled. Call [`settle`]
     /// first, so a pair whose DISABLE has become due reads as not enabled.
+    ///
+    /// The baseline is named by the CATALOG ENTRY a caller's identifier resolved to
+    /// ([`resolve_baseline`]), not by that identifier's text: the same catalog is
+    /// published in every partition, region and account, so many identifiers name one
+    /// baseline and each stored identifier is resolved before it is compared. A stored
+    /// identifier always resolves, because an enablement is only ever written for a
+    /// baseline this service publishes.
     ///
     /// [`settle`]: Self::settle
     pub fn enabled_baseline_on_target(
         &self,
-        baseline_identifier: &str,
+        baseline: &CatalogBaseline,
         target_identifier: &str,
     ) -> Option<String> {
         self.enabled_baselines
             .values()
             .filter(|enabled| {
-                enabled.baseline_identifier == baseline_identifier
+                resolve_baseline(&enabled.baseline_identifier) == Some(baseline)
                     && enabled.target_identifier == target_identifier
             })
             // The ARN orders the candidates totally, so the answer does not depend on the
@@ -2859,6 +2870,31 @@ pub fn selected_optional(filter: &Filter<'_>, actual: Option<&str>) -> bool {
         (Some(_), None) => false,
         (Some(values), Some(actual)) => values.contains(actual),
     }
+}
+
+/// As [`selected`], for a filter member whose values REFERENCE a resource this service
+/// resolves (a baseline, a control) rather than carrying its identity directly.
+///
+/// The caller's values and the record's own value are both put through `resolve` before
+/// they are compared, so a value written in any of the equivalent forms that name one
+/// resource selects every record naming that resource — which is the same rule the
+/// resolution itself follows ([`resolve_baseline`], [`resolve_control`]). A filter value
+/// that names no resource at all selects nothing, since every record here was written
+/// for a resource this service publishes.
+pub fn selected_resolved<Entry: PartialEq>(
+    filter: &Filter<'_>,
+    actual: &str,
+    resolve: impl Fn(&str) -> Option<Entry>,
+) -> bool {
+    let Some(values) = filter.as_ref() else {
+        return true;
+    };
+    let Some(actual) = resolve(actual) else {
+        return false;
+    };
+    values
+        .iter()
+        .any(|value| resolve(value).as_ref() == Some(&actual))
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

@@ -279,9 +279,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A control is enabled at most once per target. A repeat while the first
         // enablement is still deploying would race it, which is the inconsistent state
         // `ConflictException` reports; once it is deployed the request asks for something
-        // that already exists.
-        if let Some(existing) =
-            store.enabled_control_on_target(&input.control_identifier, &input.target_identifier)
+        // that already exists. The pair is read off the CATALOG ENTRY this request
+        // resolved to, not off the identifier's text, so a repeat written with the
+        // control's other published ARN form is the same pair.
+        if let Some(existing) = store.enabled_control_on_target(control, &input.target_identifier)
         {
             let existing_arn = existing.arn.clone();
             if existing.status == crate::state::EnablementStatus::UnderChange {
