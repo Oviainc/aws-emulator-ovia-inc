@@ -730,6 +730,21 @@ impl Feed {
         due
     }
 
+    /// Put this feed into a SETTLED status, immediately — the counterpart of
+    /// [`Self::enter_transient`] for an operation that COMPLETES when it answers, so the
+    /// feed owes the clock nothing once it has.
+    ///
+    /// As with a transient move, it is this outcome that decides where the feed goes, so
+    /// a reconfiguration whose span had not yet fallen due no longer has a status to
+    /// settle back into ([`Self::settles_into`]) — the payload that reconfiguration
+    /// stored is on the record already, and the status it suspended has been overtaken
+    /// by this one.
+    pub fn settle_into(&mut self, status: FeedStatus) {
+        self.status = status;
+        self.transition_due_at = None;
+        self.settles_into = None;
+    }
+
     /// Whether any of this feed's outputs references `dictionary_id`, i.e. names it in
     /// its subtitling config ([`Output::referenced_dictionary`]).
     pub fn references_dictionary(&self, dictionary_id: &str) -> bool {

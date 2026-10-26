@@ -57,12 +57,19 @@
 //!   [`MAX_TAGS_PER_RESOURCE`] entries and `TagResource` is REFUSED past that count (see
 //!   [`merge_tags`]), so repeating it with fresh keys cannot grow the store either.
 //!
+//! The LIST operations over these stores all narrow their listing the same way, so the
+//! rule lives here once rather than in each handler: [`Filter`] is one `filter` member as
+//! a handler matches it, [`filter_set`] turns a sent member into that set and
+//! [`selected`]/[`selected_optional`] test one stored record against it. Every list
+//! operation of this crate reaches the rule through these, so narrowing by a filter
+//! member cannot drift between them.
+//!
 //! [`merge_tags`]: ComAmazonawsControltowerAwscontroltowerapisState::merge_tags
 //!
 //! [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
 //! [`record_enablement`]: ComAmazonawsControltowerAwscontroltowerapisState::record_enablement
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 /// The ARN namespace (and SigV4 signing name) this service's ARNs carry, from the
@@ -2804,6 +2811,53 @@ pub fn latest_available_version(deployed: &str, catalog: &str) -> String {
             catalog.to_string()
         }
         _ => deployed.to_string(),
+    }
+}
+
+/// One `filter` member of a list operation, as a handler matches it: the values the
+/// caller sent as a SET, or `None` when they sent that member no list at all.
+///
+/// A set, so testing one stored record against it costs `O(log k)` rather than a scan,
+/// and the whole per-request scan is bounded by the store's own cap
+/// ([`MAX_ENABLED_CONTROLS`], [`MAX_ENABLED_BASELINES`], [`MAX_CONTROL_OPERATIONS`]).
+///
+/// Every enum-typed filter member deserializes to a plain string, but the schema front
+/// door has already refused a value the model's value set does not declare (HTTP 400, as
+/// `tests/all/front_door_validation.rs` pins), so reaching a handler means each value is
+/// one of the modelled ones — and these lists carry a modelled maximum length, so the
+/// front door has bounded their lengths too.
+pub type Filter<'a> = Option<BTreeSet<&'a str>>;
+
+/// The values of one filter member as a [`Filter`] set, or `None` when the caller sent
+/// that member no list at all.
+///
+/// The one place every list operation of this service turns a sent filter member into the
+/// set it matches against, so they all narrow a listing by the same rule. Called BEFORE
+/// the state lock is taken, so no caller-sized work happens while the lock is held.
+pub fn filter_set(values: Option<&Vec<String>>) -> Filter<'_> {
+    values.map(|values| values.iter().map(String::as_str).collect())
+}
+
+/// Whether `actual` is selected by a filter member: a member the caller did not send
+/// selects every record, and one they did selects the records whose value its set holds.
+pub fn selected(filter: &Filter<'_>, actual: &str) -> bool {
+    filter.as_ref().is_none_or(|values| values.contains(actual))
+}
+
+/// As [`selected`], for a member a record may have no value for at all: an absent value
+/// is selected only by an absent filter.
+///
+/// So filtering on a member only some records carry (a parent identifier, a drift status
+/// that is assessed for some resources only) returns just the records that have a value
+/// and whose value is among the ones asked for — and a filter on a member NO record here
+/// carries selects nothing, which is [`selected_optional(filter, None)`].
+///
+/// [`selected_optional(filter, None)`]: selected_optional
+pub fn selected_optional(filter: &Filter<'_>, actual: Option<&str>) -> bool {
+    match (filter.as_ref(), actual) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(values), Some(actual)) => values.contains(actual),
     }
 }
 

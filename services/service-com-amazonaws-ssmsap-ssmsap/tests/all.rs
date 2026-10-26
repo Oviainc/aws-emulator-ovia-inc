@@ -55,6 +55,8 @@ mod registered_database_arn;
 mod region_scoping;
 #[path = "all/registration_derived_state.rs"]
 mod registration_derived_state;
+#[path = "all/resource_permission_reads.rs"]
+mod resource_permission_reads;
 #[path = "all/resource_permissions.rs"]
 mod resource_permissions;
 #[path = "all/resource_tags.rs"]

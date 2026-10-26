@@ -153,7 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // already the resource it addressed, and API Gateway reports the kind of
             // identifier that was not found rather than echoing it back.
             return Err(GetDomainNameErrorModeled::NotFoundException(NotFoundException {
-                message: Some("Invalid domain name identifier specified".to_string()),
+                message: Some(crate::state::INVALID_DOMAIN_NAME_IDENTIFIER.to_string()),
                 resource_type: ::std::option::Option::None,
             })
             .into());

@@ -35,6 +35,8 @@ mod purge_queue;
 mod queue_configuration;
 #[path = "all/queue_does_not_exist.rs"]
 mod queue_does_not_exist;
+#[path = "all/queue_encryption.rs"]
+mod queue_encryption;
 #[path = "all/queue_lifecycle.rs"]
 mod queue_lifecycle;
 #[path = "all/queue_tags.rs"]

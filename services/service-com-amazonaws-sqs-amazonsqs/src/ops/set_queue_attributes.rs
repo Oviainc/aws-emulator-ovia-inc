@@ -20,6 +20,16 @@
 //! of `FifoQueue`'s "You can provide this attribute only during queue creation. You
 //! can't change it for an existing queue."
 //!
+//! Server-side encryption is the one pair of attributes a change to either reaches the
+//! other: "only one server-side encryption option is supported per queue", so a call
+//! naming a `KmsMasterKeyId` takes the queue off the Amazon SQS owned key, a call
+//! clearing that key id takes the queue off the KMS key (and off the data key reuse
+//! period that key was used under) without re-enabling the SQS-owned one, enabling
+//! `SqsManagedSseEnabled` takes the queue off whatever KMS key it was on, and a call
+//! naming BOTH options at once is refused
+//! ([`crate::state::encryption::apply_encryption_choice`],
+//! [`crate::state::encryption::encryption_choice_refusal`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -247,13 +257,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (attribute, value) in &input.attributes {
             would_carry.insert(attribute.clone(), value.clone());
         }
+        // The two server-side encryption options are exclusive, and a request naming one
+        // takes the queue off the other — including the empty `KmsMasterKeyId` that takes
+        // it off its KMS key. A request naming BOTH asks for something no queue can be.
+        if let Some(error) = state::encryption::encryption_choice_refusal(&input.attributes) {
+            return Err(SetQueueAttributesErrorModeled::InvalidAttributeName(error).into());
+        }
+        state::encryption::apply_encryption_choice(&mut would_carry, &input.attributes);
         if let Some(error) = state::attribute_combination_refusal(&would_carry) {
             return Err(SetQueueAttributesErrorModeled::InvalidAttributeValue(error).into());
         }
 
-        for (attribute, value) in &input.attributes {
-            queue.attributes.insert(attribute.clone(), value.clone());
-        }
+        queue.attributes = would_carry;
         let now = ::std::time::SystemTime::now();
         queue.last_modified_at = now;
         // What the new values make the clock owe, applied at once rather than left for

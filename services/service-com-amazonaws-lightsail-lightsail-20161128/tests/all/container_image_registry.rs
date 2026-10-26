@@ -17,10 +17,11 @@
 //!   service nothing has been pushed to, and the service's `DoesNotExist`
 //!   rejection for a name that names no container service in that region. It is a
 //!   report: two reads in a row answer the same thing.
-//! * `RegisterContainerImage` registers an image that is already in that
-//!   service's private registry, so a digest nothing pushed there is refused with
-//!   the same `DoesNotExist` envelope, and the registry it reports stays
-//!   unchanged.
+//! * `RegisterContainerImage` registers an image that is already in the
+//!   account's container image registry, so a digest nothing pushed there is
+//!   refused with the same `DoesNotExist` envelope, and the registry it reports
+//!   stays unchanged. (The push-and-register path itself is driven in
+//!   `container_image_push_and_register.rs`.)
 //! * `DeleteContainerImage` enforces only its PARENT resource: it removes the
 //!   named image when that registry holds it and is accepted as a no-op when it
 //!   does not — a never-registered name, a name of another service, a
@@ -71,23 +72,24 @@ impl Emulator {
         Self { router, engine }
     }
 
-    /// Put `images` in the registry of the container service `name` in `region`,
-    /// as a `docker push` to that service's private registry followed by a
-    /// registration would.
+    /// Put the `(label, version)` images in the registry of the container
+    /// service `name` in `region`, as a push to the account's container image
+    /// registry followed by a registration would.
     ///
-    /// No API call can do this: the emulator serves no container image registry
-    /// to push to, so `RegisterContainerImage` refuses every digest and the
-    /// registry is otherwise always empty. Seeding the store the handlers read
-    /// (`state::with_state`) is therefore the only way to drive the case where
-    /// the registry HOLDS the image a delete names.
-    fn push(&self, region: &str, name: &str, images: &[&str]) {
+    /// Seeded straight into the store the handlers read (`state::with_state`)
+    /// rather than driven through the API, because a row here starts a label at
+    /// an ARBITRARY version — which registering walks up to one at a time. The
+    /// push-and-register path itself is driven end to end over the wire in
+    /// `container_image_push_and_register.rs`.
+    fn push(&self, region: &str, name: &str, images: &[(&str, i32)]) {
         let seeded = state::with_state(&*self.engine, |store| {
             let Some(service) = store.container_service_mut(region, name) else {
                 return false;
             };
-            for (index, image) in images.iter().enumerate() {
+            for (index, (label, version)) in images.iter().enumerate() {
                 service.images.push(StoredContainerImage {
-                    image: (*image).to_string(),
+                    label: (*label).to_string(),
+                    version: *version,
                     digest: format!("sha256:{:064x}", index + 1),
                     created_at_ms: 1_770_000_000_000 + index as i64,
                 });
@@ -338,7 +340,7 @@ const DIGEST_ROWS: &[DigestRow] = &[
 struct HeldImage {
     case: &'static str,
     label: &'static str,
-    version: u32,
+    version: i32,
 }
 
 /// The table of images a registry holds.
@@ -370,6 +372,15 @@ impl HeldImage {
     fn name(&self, service: &str) -> String {
         format!(":{service}.{}.{}", self.label, self.version)
     }
+}
+
+/// The table of held images as the seeding helper takes them: the label each
+/// was registered under and the version it is at.
+fn held_rows() -> Vec<(&'static str, i32)> {
+    HELD_IMAGES
+        .iter()
+        .map(|image| (image.label, image.version))
+        .collect()
 }
 
 /// The image names a delete is driven with that the registry does NOT hold. The
@@ -557,8 +568,7 @@ async fn deleting_an_image_the_registry_holds_removes_it() {
                 .iter()
                 .map(|image| image.name(service.name))
                 .collect();
-            let borrowed: Vec<&str> = seeded.iter().map(String::as_str).collect();
-            emulator.push(service.region, service.name, &borrowed);
+            emulator.push(service.region, service.name, &held_rows());
 
             let target = held.name(service.name);
             let (status, body) = emulator
@@ -604,8 +614,7 @@ async fn deleting_an_image_the_registry_does_not_hold_is_a_no_op() {
             .iter()
             .map(|image| image.name(service.name))
             .collect();
-        let borrowed: Vec<&str> = seeded.iter().map(String::as_str).collect();
-        emulator.push(service.region, service.name, &borrowed);
+        emulator.push(service.region, service.name, &held_rows());
 
         for (row, image) in UNHELD_IMAGES {
             let image = image.replace("{service}", service.name);
@@ -636,12 +645,7 @@ async fn repeating_the_delete_of_a_held_image_keeps_succeeding() {
     for service in SERVICE_ROWS {
         let emulator = Emulator::new();
         emulator.create_service(service.region, service.name).await;
-        let seeded: Vec<String> = HELD_IMAGES
-            .iter()
-            .map(|image| image.name(service.name))
-            .collect();
-        let borrowed: Vec<&str> = seeded.iter().map(String::as_str).collect();
-        emulator.push(service.region, service.name, &borrowed);
+        emulator.push(service.region, service.name, &held_rows());
 
         for held in HELD_IMAGES {
             let target = held.name(service.name);
@@ -670,9 +674,7 @@ async fn repeating_the_delete_of_a_held_image_keeps_succeeding() {
 
 /// RULE: an empty registry holds nothing to remove, so EVERY delete against a
 /// service nothing has been pushed to is the same accepted no-op and the
-/// registry still reads as empty afterwards — which is the state every service of
-/// this emulator is in until a container image registry can be pushed to (see
-/// `RegisterContainerImage`).
+/// registry still reads as empty afterwards.
 #[tokio::test]
 async fn deleting_from_an_empty_registry_always_succeeds() {
     for service in SERVICE_ROWS {

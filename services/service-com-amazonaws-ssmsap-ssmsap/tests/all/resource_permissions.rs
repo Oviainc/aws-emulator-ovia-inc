@@ -176,13 +176,16 @@ async fn put_in_region(
 }
 
 /// `PutResourcePermission` at [`REGION`]'s endpoint.
-async fn put(emulator: &Emulator, resource: &str, action: &str, source: &str) -> Reply {
+///
+/// `pub(crate)` because the suites of this target drive ONE permissions harness:
+/// `tests/all/resource_permission_reads.rs` grants through this same call.
+pub(crate) async fn put(emulator: &Emulator, resource: &str, action: &str, source: &str) -> Reply {
     put_in_region(emulator, REGION, resource, action, source).await
 }
 
 /// `GetResourcePermission` at `region`'s endpoint, with an `ActionType` when `action` is
 /// given.
-async fn get_in_region(
+pub(crate) async fn get_in_region(
     emulator: &Emulator,
     region: &str,
     resource: &str,
@@ -198,12 +201,17 @@ async fn get_in_region(
 }
 
 /// `GetResourcePermission` at [`REGION`]'s endpoint.
-async fn get(emulator: &Emulator, resource: &str, action: Option<&str>) -> Reply {
+pub(crate) async fn get(emulator: &Emulator, resource: &str, action: Option<&str>) -> Reply {
     get_in_region(emulator, REGION, resource, action).await
 }
 
 /// Register `body` at `region`'s endpoint, asserting the registration was accepted.
-async fn register_in_region(emulator: &Emulator, case: &str, region: &str, body: Value) {
+pub(crate) async fn register_in_region(
+    emulator: &Emulator,
+    case: &str,
+    region: &str,
+    body: Value,
+) {
     let reply = emulator
         .send_in_region(region, "/register-application", body)
         .await;
@@ -214,7 +222,7 @@ async fn register_in_region(emulator: &Emulator, case: &str, region: &str, body:
 }
 
 /// The `Policy` member of a reply, which must be present.
-fn policy(reply: &Reply, case: &str) -> String {
+pub(crate) fn policy(reply: &Reply, case: &str) -> String {
     assert_eq!(
         reply.status, 200,
         "case {case:?}: expected HTTP 200, got {reply:?}"
@@ -285,44 +293,65 @@ fn assert_policy_grants(
     expected_sources: &BTreeSet<String>,
     case: &str,
 ) {
-    let statements = statements(document, case);
+    assert_policy_grants_for_actions(document, resource, &[action], expected_sources, case);
+}
+
+/// Assert that `document` is exactly the policy of `resource` granting each of `actions`
+/// to `expected_sources`: one `Allow` statement per (action, source) pair, each naming the
+/// source as its principal and the target as its resource, and nothing else.
+///
+/// `pub(crate)` because the suites of this target check the projection ONE way: a read
+/// narrowed to one `ActionType` passes that one action, an unnarrowed read passes every
+/// type the model declares (`tests/all/resource_permission_reads.rs`).
+pub(crate) fn assert_policy_grants_for_actions(
+    document: &str,
+    resource: &str,
+    actions: &[&str],
+    expected_sources: &BTreeSet<String>,
+    case: &str,
+) {
+    let listed = statements(document, case);
+    let expected: BTreeSet<(String, String)> = actions
+        .iter()
+        .flat_map(|action| {
+            let action = permission_policy_action(action);
+            expected_sources
+                .iter()
+                .map(move |source| (action.clone(), source.clone()))
+        })
+        .collect();
     assert_eq!(
-        statements.len(),
-        expected_sources.len(),
-        "case {case:?}: expected {} statement(s) for {:?}, got {statements:?}",
-        expected_sources.len(),
-        expected_sources
+        listed.len(),
+        expected.len(),
+        "case {case:?}: expected {} statement(s) for {expected:?}, got {listed:?}",
+        expected.len()
     );
-    let expected_action = permission_policy_action(action);
-    let mut seen = BTreeSet::new();
-    for statement in &statements {
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for statement in &listed {
         assert_eq!(
             statement.effect, POLICY_EFFECT_ALLOW,
             "case {case:?}: a granted permission must allow, got {statement:?}"
-        );
-        assert_eq!(
-            statement.action, expected_action,
-            "case {case:?}: expected Action {expected_action:?}, got {statement:?}"
         );
         assert_eq!(
             statement.resource, resource,
             "case {case:?}: expected Resource {resource:?}, got {statement:?}"
         );
         assert!(
-            seen.insert(statement.principal.clone()),
-            "case {case:?}: principal {:?} appears twice in {statements:?}",
-            statement.principal
+            seen.insert((statement.action.clone(), statement.principal.clone())),
+            "case {case:?}: the (Action, Principal) pair of {statement:?} appears twice in \
+             {listed:?}"
         );
     }
     assert_eq!(
-        &seen, expected_sources,
-        "case {case:?}: expected the granted sources as principals, got {seen:?}"
+        &seen, &expected,
+        "case {case:?}: expected the granted (Action, Principal) pairs {expected:?}, got \
+         {seen:?}"
     );
 }
 
 /// Assert the call was refused as the modelled `ResourceNotFoundException`, naming the
 /// ARN the request carried.
-fn assert_not_found(reply: &Reply, arn: &str, case: &str) {
+pub(crate) fn assert_not_found(reply: &Reply, arn: &str, case: &str) {
     assert_eq!(
         reply.status, 404,
         "case {case:?}: expected HTTP 404 for an ARN naming no resource, got {reply:?}"

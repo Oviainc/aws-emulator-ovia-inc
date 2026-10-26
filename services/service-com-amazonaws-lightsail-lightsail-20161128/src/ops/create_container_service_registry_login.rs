@@ -31,10 +31,10 @@
 //! The set is recorded in this service's store
 //! (`ComAmazonawsLightsailLightsail20161128State::registry_logins`), so a client
 //! that logs in at the announced address with the credentials it was handed is
-//! recognised there — and one that presents anything else is not. This emulator
-//! serves no container image registry protocol behind that address, which is why
-//! an authenticated request to it answers 501 (see `crate::service`) and why
-//! `RegisterContainerImage` finds no pushed digest to register.
+//! recognised there — and one that presents anything else is not. Behind that
+//! address the emulator serves the container image registry itself
+//! (`crate::service::container_image_registry`), so a push reaches a registry
+//! that stores it and `RegisterContainerImage` has a pushed digest to register.
 //!
 //! ## Shape of an operation
 //!

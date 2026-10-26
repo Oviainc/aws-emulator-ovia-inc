@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutObjectAcl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutObjectAcl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutObjectAcl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets the access control list of the addressed object version from the ONE ACL the
+//! request names — a canned ACL in `x-amz-acl`, explicit grants in the `x-amz-grant-*`
+//! headers, or an `AccessControlPolicy` body — and that ACL becomes the object's ACL in
+//! full, which `GetObjectAcl` then reports. A bucket whose Object Ownership setting
+//! disables ACLs refuses the write, and so does a public ACL on a bucket that blocks
+//! public ACLs; either way the ACL the object carries is left exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -162,15 +160,24 @@ use super::types::*;
 // `PutObjectAclError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `PutObjectAclError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#PutObjectAcl")]
+// The operation's MODELED errors, widened with `extra_errors` by two shapes this SERVICE
+// models.
+//
+// The model lists `NoSuchKey` for this operation, and `Bucket` is an @httpLabel too, so a
+// request can name a bucket this emulator does not hold — AWS answers the service-wide
+// `NoSuchBucket` ("The specified bucket does not exist", `httpError 404`) for that. A
+// request naming its ACL in two of the three ways at once is one whose "parameter or
+// header in your request isn't valid", which is `InvalidRequest` (`httpError 400`) — the
+// same two widenings `PutBucketAcl` takes, for the same two causes.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#PutObjectAcl",
+    extra_errors = ["NoSuchBucket", "InvalidRequest"]
+)]
 #[derive(Debug)]
 pub enum PutObjectAclErrorModeled {
+    NoSuchBucket(NoSuchBucket),
     NoSuchKey(NoSuchKey),
+    InvalidRequest(InvalidRequest),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -224,18 +231,370 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutObjectAcl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutObjectAclErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutObjectAcl"))
+        // Everything this write needs is in its deserialized input: the canned ACL, the
+        // five grant headers, the version id and the expected owner all travel as members.
+        // `ContentMD5` and `ChecksumAlgorithm` are integrity checks over the RAW request
+        // body, which this handler never sees — the boundary has already parsed that body
+        // into `AccessControlPolicy` — so they are left where `PutBucketAcl` leaves them.
+        let _ = ctx;
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — `PutObjectAclRequest$ExpectedBucketOwner`, judged the way every other
+        // handler in this crate judges it: this emulator serves one account, so that
+        // account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                ACCESS_DENIED_MESSAGE,
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store the ACL cannot be recorded at all, and no modelled error
+            // says that, so the scaffold's 501 carries what is true: this emulator cannot
+            // serve the request.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutObjectAcl",
+            ));
+        };
+
+        // The BUCKET is resolved FIRST, so a request naming a bucket this emulator does
+        // not hold answers that rather than reporting whatever is wrong with an ACL that
+        // bucket could never have carried — the order `PutBucketAcl` keeps. The bucket's
+        // Region is also what decides how an email grantee is refused.
+        let mut store = state.lock();
+        let version_id = input.version_id.clone();
+        let version_id = version_id.as_deref();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(PutObjectAclErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        let region = bucket.region.clone();
+        let acls_disabled = bucket.acls_disabled();
+        let blocks_public_acls = bucket
+            .public_access_block()
+            .is_some_and(|settings| settings.block_public_acls);
+
+        // Both the ACL the request names and the published rules it is judged against are
+        // decided BEFORE anything is written, so a refused put leaves the object's current
+        // ACL exactly as it was.
+        let grants = requested_grants(&input)?;
+        crate::state::validate_acl_grants(&grants, &region).map_err(refusal)?;
+
+        // Block Public Access: with `BlockPublicAcls` on, S3 "causes the following
+        // behavior: PUT Bucket ACL and PUT Object ACL calls fail if the specified ACL is
+        // public" (`PublicAccessBlockConfiguration$BlockPublicAcls`). It is a GUARDRAIL
+        // over the ACL the request names, judged ahead of the bucket's Object Ownership
+        // precondition: a public ACL is denied for being public whether or not ACLs are
+        // disabled on the bucket, and the refusal names the principal, the action, the
+        // resource and the setting that prevented it. The stored ACL is left exactly as it
+        // was.
+        if blocks_public_acls && crate::state::acl_grants_public_access(&grants) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                crate::state::block_public_acls_denial(
+                    PUT_OBJECT_ACL_ACTION,
+                    &crate::state::object_arn(&input.bucket, &input.key),
+                ),
+            ));
+        }
+
+        // "If your bucket uses the bucket owner enforced setting for S3 Object Ownership,
+        // ACLs are disabled and no longer affect permissions. … Requests to set ACLs or
+        // update ACLs fail and return the AccessControlListNotSupported error code" (this
+        // operation's own documentation) — a precondition of the BUCKET, so it is judged
+        // before anything about the object itself, exactly as `PutBucketAcl` judges it.
+        if acls_disabled {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACL_NOT_SUPPORTED_CODE,
+                ACL_REFUSAL_STATUS,
+                crate::state::ACL_NOT_SUPPORTED_MESSAGE,
+            ));
+        }
+
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(PutObjectAclErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        // A delete marker has no object behind it to carry an ACL: 405, the status S3
+        // answers an object-level call on a marker with, as `GetObjectAcl` answers it for
+        // the same cause.
+        if version_id.is_some_and(|named| {
+            bucket
+                .stored_version(&input.key, named)
+                .is_some_and(|stored| stored.as_delete_marker().is_some())
+        }) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::METHOD_NOT_ALLOWED_CODE,
+                crate::state::METHOD_NOT_ALLOWED_STATUS,
+                crate::state::METHOD_NOT_ALLOWED_MESSAGE,
+            ));
+        }
+        // "Version ID used to reference a specific version of the object"
+        // (`PutObjectAclRequest$VersionId`), and with none the key's current object — the
+        // address every object subresource write in this crate resolves the same way. A
+        // `versionId` this store never minted is the service's `NoSuchVersion` rather than
+        // the key-level 404.
+        if bucket.addressed_object(&input.key, version_id).is_none() {
+            return Err(match version_id {
+                Some(_) => crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::NO_SUCH_VERSION_CODE,
+                    404,
+                    crate::state::NO_SUCH_VERSION_MESSAGE,
+                ),
+                None => PutObjectAclErrorModeled::NoSuchKey(NoSuchKey {}).into(),
+            });
+        }
+
+        // The ACL the request names becomes the object version's ACL in full, whether it
+        // had one already or still carried the default. The store reports what the write
+        // did, because it may refuse: an ACL is retained with the object, so one that would
+        // take the bucket or the whole store past the byte budgets this emulator keeps is
+        // refused rather than recorded.
+        let outcome = store.replace_object_acl(&input.bucket, &input.key, version_id, grants);
+        match outcome {
+            Some(crate::state::ObjectAclWrite::Applied) => {}
+            // Unreachable through this handler (the address was just resolved under the
+            // same lock), and answered rather than asserted so a future caller of this
+            // state seam cannot turn a vanished address into a panic.
+            None => return Err(PutObjectAclErrorModeled::NoSuchBucket(NoSuchBucket {}).into()),
+            Some(crate::state::ObjectAclWrite::NoSuchObject) => {
+                return Err(PutObjectAclErrorModeled::NoSuchKey(NoSuchKey {}).into())
+            }
+            // The emulator's own ceilings, not AWS limits (S3 bounds neither the number of
+            // objects nor their total size), so no AWS error code describes them: they go
+            // out through the framework's 400 `ValidationException` channel, the same
+            // channel `PutObjectTagging` uses for the same two budgets.
+            Some(crate::state::ObjectAclWrite::ByteBudgetReached { would_hold }) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "setting the ACL of {:?} would leave the bucket {:?} holding \
+                     {would_hold} bytes of objects, past the {} bytes this emulator keeps \
+                     per bucket",
+                    input.key,
+                    input.bucket,
+                    crate::state::MAX_OBJECT_BYTES_PER_BUCKET
+                )));
+            }
+            Some(crate::state::ObjectAclWrite::TotalByteBudgetReached { would_hold }) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "setting the ACL of {:?} would leave this emulator holding {would_hold} \
+                     bytes of objects across every bucket, past the {} bytes it keeps in \
+                     total",
+                    input.key,
+                    crate::state::MAX_OBJECT_BYTES_TOTAL
+                )));
+            }
+        }
+
+        Ok(PutObjectAclOutput {
+            // "If present, indicates that the requester was successfully charged for the
+            // request" (`PutObjectAclOutput$RequestCharged`): this emulator models no
+            // Requester Pays charge, so nothing is claimed about one.
+            request_charged: None,
+        })
     }
 }
+
+/// The ACL this request names, or the refusal it earns.
+///
+/// S3 offers THREE ways to name one ACL and accepts exactly one of them: "Specify a canned
+/// ACL with the x-amz-acl request header[;] Specify access permissions explicitly with the
+/// x-amz-grant-read, x-amz-grant-read-acp, x-amz-grant-write-acp, and
+/// x-amz-grant-full-control headers[;] … you can choose to set the ACL on an object using
+/// either the request body or the headers" (this operation's own documentation). So a
+/// request naming two of them is refused, a request naming none carries no ACL to apply,
+/// and the one it does name is expanded into the grants the object stores — the rule
+/// `PutBucketAcl` applies to a bucket's ACL, over this operation's own members and the
+/// OBJECT canned-ACL table.
+fn requested_grants(
+    input: &PutObjectAclInput,
+) -> Result<Vec<crate::state::AclGrant>, PutObjectAclError> {
+    // The five explicit-grant headers, each with the ONE `Permission` it stands for, in
+    // the model's own member order (`smithy_query(query="operation",
+    // operation="PutObjectAcl")`: GrantFullControl, GrantRead, GrantReadACP, GrantWrite,
+    // GrantWriteACP) — which is the order the grants they name are applied in.
+    let grant_headers: [(&str, Option<&str>, &str); 5] = [
+        (
+            "x-amz-grant-full-control",
+            input.grant_full_control.as_deref(),
+            crate::state::PERMISSION_FULL_CONTROL,
+        ),
+        (
+            "x-amz-grant-read",
+            input.grant_read.as_deref(),
+            crate::state::PERMISSION_READ,
+        ),
+        (
+            "x-amz-grant-read-acp",
+            input.grant_read_acp.as_deref(),
+            crate::state::PERMISSION_READ_ACP,
+        ),
+        (
+            "x-amz-grant-write",
+            input.grant_write.as_deref(),
+            crate::state::PERMISSION_WRITE,
+        ),
+        (
+            "x-amz-grant-write-acp",
+            input.grant_write_acp.as_deref(),
+            crate::state::PERMISSION_WRITE_ACP,
+        ),
+    ];
+    let headers_name_an_acl = grant_headers.iter().any(|(_, value, _)| value.is_some());
+
+    // An `AccessControlPolicy` naming neither grants nor an owner carries no ACL — the
+    // state an absent body deserializes to — so it is read as no body at all rather than
+    // as an ACL with nothing in it.
+    let policy = input
+        .access_control_policy
+        .as_ref()
+        .filter(|policy| policy.grants.is_some() || policy.owner.is_some());
+
+    if (policy.is_some() && (input.acl.is_some() || headers_name_an_acl))
+        || (input.acl.is_some() && headers_name_an_acl)
+    {
+        return Err(PutObjectAclErrorModeled::InvalidRequest(InvalidRequest {}).into());
+    }
+
+    if let Some(policy) = policy {
+        // An ACL grants permissions; it does not transfer the object. The owner a reader
+        // reports is always the one account this emulator serves, so a policy naming a
+        // DIFFERENT owner is refused rather than applied with its own owner quietly
+        // dropped.
+        if let Some(id) = policy
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.id.as_deref())
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            if id != crate::state::canonical_user_id() {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    format!(
+                        "AccessControlPolicy.Owner.ID names {id:?}, which does not own this \
+                         object; an ACL cannot change an object's owner"
+                    ),
+                ));
+            }
+        }
+
+        // `Grant$Grantee` and `Grant$Permission` are both OPTIONAL in the model
+        // (`smithy_query(query="shape",shape="Grant")`), so a body can carry a `Grant`
+        // that grants nothing, or grants it to nobody. Neither is an ACL S3 can apply.
+        let mut grants: Vec<crate::state::AclGrant> = Vec::new();
+        for grant in policy.grants.as_deref().unwrap_or_default() {
+            let (Some(grantee), Some(permission)) =
+                (grant.grantee.as_ref(), grant.permission.as_deref())
+            else {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::MALFORMED_ACL_CODE,
+                    ACL_REFUSAL_STATUS,
+                    "every Grant of an AccessControlPolicy carries both a Grantee and a \
+                     Permission",
+                ));
+            };
+            grants.push(crate::state::AclGrant {
+                grantee: crate::state::AclGrantee {
+                    grantee_type: grantee.r#type.clone(),
+                    id: grantee.id.clone(),
+                    uri: grantee.uri.clone(),
+                    email_address: grantee.email_address.clone(),
+                },
+                permission: permission.to_string(),
+            });
+        }
+        return Ok(grants);
+    }
+
+    if headers_name_an_acl {
+        // Explicit grant headers replace the ACL with exactly the grants they name: they
+        // carry "explicit access permissions and grantees", with no canned expansion behind
+        // them — which is why the documentation tells a caller who wants to keep the
+        // owner's control to name the owner's own grant too.
+        let mut grants: Vec<crate::state::AclGrant> = Vec::new();
+        for (header, value, permission) in grant_headers {
+            let Some(value) = value else { continue };
+            match crate::state::acl_grants_from_header(value, permission) {
+                Ok(parsed) => grants.extend(parsed),
+                Err(pair) => {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_ARGUMENT_CODE,
+                        crate::state::INVALID_ARGUMENT_STATUS,
+                        format!(
+                            "{header} names the grantee {pair:?}, which is not a type=value \
+                             pair whose type is id, uri or emailAddress"
+                        ),
+                    ))
+                }
+            }
+        }
+        return Ok(grants);
+    }
+
+    if let Some(canned) = input.acl.as_deref() {
+        // `ACL` targets the `ObjectCannedACL` enum, so the boundary has already refused a
+        // value outside `OBJECT_CANNED_A_C_L_VALUES` before this handler ran; the refusal
+        // below is what keeps that true if the expansion table and the enum ever part.
+        return crate::state::object_canned_acl_grants(canned).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_ARGUMENT_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                format!(
+                    "x-amz-acl must name one of {:?}, got {canned:?}",
+                    crate::state::OBJECT_CANNED_A_C_L_VALUES
+                ),
+            )
+        });
+    }
+
+    // No canned ACL, no grant header and no body: the request names no ACL at all, so
+    // there is nothing to set. S3 answers a request that carries no document where one is
+    // required with `MissingRequestBodyError` ("Request body is empty", HTTP 400).
+    Err(crate::scaffolded::Scaffolded::unmodeled(
+        crate::state::MISSING_REQUEST_BODY_CODE,
+        ACL_REFUSAL_STATUS,
+        crate::state::MISSING_REQUEST_BODY_MESSAGE,
+    ))
+}
+
+/// The wire code and status S3 answers one broken published ACL rule with.
+///
+/// The store reports WHICH rule an ACL breaks ([`crate::state::AclRejection`]) and owns the
+/// code and status each one carries ([`crate::state::AclRejection::code`]), the same answer
+/// `PutBucketAcl` renders for a bucket's ACL; this turns it into this operation's error
+/// channel.
+fn refusal(rejection: crate::state::AclRejection) -> PutObjectAclError {
+    crate::scaffolded::Scaffolded::unmodeled(
+        rejection.code(),
+        rejection.status(),
+        rejection.to_string(),
+    )
+}
+
+/// The HTTP status the ACL refusals above that are not one of
+/// [`crate::state::AclRejection`]'s are rendered with: 400, the status S3's
+/// error-responses list carries for `MalformedACLError`, `MissingRequestBodyError` and
+/// `AccessControlListNotSupported` alike.
+const ACL_REFUSAL_STATUS: u16 = crate::state::ACL_REFUSAL_STATUS;
+
+/// The code S3 answers a request whose `x-amz-expected-bucket-owner` is not the bucket's
+/// owner with, and the status and message its error-responses list carries for it — also
+/// the code and status the Block Public Access guardrail denies a public ACL with, whose
+/// message is the guardrail's own ([`crate::state::block_public_acls_denial`]).
+const ACCESS_DENIED_CODE: &str = "AccessDenied";
+/// See [`ACCESS_DENIED_CODE`].
+const ACCESS_DENIED_STATUS: u16 = 403;
+/// See [`ACCESS_DENIED_CODE`].
+const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
+
+/// The IAM action this operation is performed under — `s3:<OperationName>`, as the IAM
+/// Service Authorization Reference names the actions of Amazon S3 — which is what a refusal
+/// of this call names.
+const PUT_OBJECT_ACL_ACTION: &str = "s3:PutObjectAcl";

@@ -59,6 +59,8 @@ mod landing_zone_validation;
 mod list_baselines;
 #[path = "all/list_enabled_baselines.rs"]
 mod list_enabled_baselines;
+#[path = "all/list_filter_narrowing.rs"]
+mod list_filter_narrowing;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
 #[path = "all/resource_tags.rs"]

@@ -12,9 +12,14 @@
 //!   call's success again and writes nothing
 //!   (`crate::state::Feed::has_served_release_of`): a caller whose first response was
 //!   lost must not be told the release failed when it succeeded;
-//! * only a feed that currently HOLDS an association can release one — a feed in any
-//!   other status is refused with the modelled `ValidationException`, and that refusal
-//!   REPORTS the status the feed was found in
+//! * only a feed that currently HOLDS an association can release one, and that is the
+//!   association the feed STORES rather than the status it reports: a feed being
+//!   reconfigured in place carries a transient status that suspends the settled one
+//!   without touching the resource that holds it, so the release a caller issues
+//!   straight after an update still releases what the feed holds. A feed that stores no
+//!   association, and one already on its way OUT of the store (whose removal a release
+//!   may not discard), are refused with the modelled `ValidationException`, and that
+//!   refusal REPORTS the status the feed was found in
 //!   (`crate::state::feed_not_associated_message`), which is what decided it, so a
 //!   caller can tell a settled feed that was never associated from one already released
 //!   or on its way out;
@@ -231,21 +236,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        // The feed's status is the precondition: releasing a resource is only possible
-        // for the one status that means a resource is held (ACTIVE). Every other status
-        // — a feed that was never associated, one already released, one whose deletion
-        // has been accepted — has nothing to release. The refusal is a
-        // ValidationException (400): that is what the recorded behaviour of a release on
-        // a never-associated feed answers.
+        // The precondition is that the feed HOLDS a resource to release, and which
+        // resource a feed holds is a STORED fact — its association — not its status. A
+        // feed being reconfigured in place carries a transient status that SUSPENDS the
+        // settled one and leaves the association exactly as it was, so a reconfiguration
+        // neither grants nor revokes one and the release that follows an update releases
+        // what the feed still holds.
         //
-        // A feed whose deletion has been accepted is DELETING, so it is refused here
-        // too: the release can neither run nor discard the removal the clock owes.
+        // Two conditions have nothing to release, and both are refused with the modelled
+        // ValidationException (400) — what the recorded behaviour of a release on a
+        // never-associated feed answers:
+        //
+        // * the feed stores NO association: it was never claimed, or its resource has
+        //   already been released;
+        // * the feed is on its way OUT of the store (DELETING): the removal the clock
+        //   already owes cannot be discarded by a release, so the release can neither run
+        //   nor cancel it, whatever the feed was holding when the removal was accepted.
         //
         // The refusal REPORTS the status it was decided from, as the recorded one does
         // ("It has status AVAILABLE which indicate that it's not currently associated
         // with a resource"): that status is the information the refusal exists to give,
         // so it is read from the stored feed rather than fixed in the sentence.
-        if feed.status != crate::state::FeedStatus::Active {
+        if feed.status == crate::state::FeedStatus::Deleting
+            || feed.associated_resource_name().is_none()
+        {
             return Err(DisassociateFeedErrorModeled::ValidationException(
                 ValidationException {
                     message: crate::state::feed_not_associated_message(feed.status),
@@ -254,12 +268,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // ACTIVE is exactly the status that carries an association, so the name is
-        // there to compare against: the caller must name the resource that actually
-        // holds the feed. The mismatch is decided from the stored association, so the
-        // message is the rule's invariant sentence: it reports neither the name the
-        // request carried nor the resource the feed is really associated with, which a
-        // caller that named a different one is not entitled to learn.
+        // The feed holds an association, so the name is there to compare against: the
+        // caller must name the resource that actually holds the feed. The mismatch is
+        // decided from that same stored association, so the message is the rule's
+        // invariant sentence: it reports neither the name the request carried nor the
+        // resource the feed is really associated with, which a caller that named a
+        // different one is not entitled to learn.
         if feed.associated_resource_name() != Some(input.associated_resource_name.as_str()) {
             return Err(DisassociateFeedErrorModeled::ValidationException(
                 ValidationException {
@@ -293,8 +307,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation in the service produces it, and the recorded behaviour of a release
         // is that it archives the feed IRREVERSIBLY — a released feed is not handed back
         // to the pool of feeds a resource can claim.
-        feed.status = crate::state::FeedStatus::Archived;
-        feed.transition_due_at = None;
+        //
+        // The release is what decides where the feed goes, so a reconfiguration of the
+        // payload that had not yet fallen due no longer has a status to settle back into
+        // (`crate::state::Feed::settle_into`): the payload it stored is on the record
+        // already, and the status it suspended is not one a released feed returns to.
+        feed.settle_into(crate::state::FeedStatus::Archived);
         // The release has now been SERVED under this name, which is what makes a retry of
         // it recognisable as the same release rather than a new request (the check at the
         // top). Recorded only here, on the call that actually released the resource: a

@@ -11,6 +11,12 @@
 //! `ContentBasedDeduplication`) and assigns the message a `SequenceNumber`. It is the
 //! ONLY file to touch for `SendMessage`.
 //!
+//! A queue encrypted with a customer managed KMS key is one whose key Amazon SQS has to
+//! generate a data key under before it can seal the message, as the CALLER — so the
+//! send is gated on that key being usable and on this caller holding the grant, which is
+//! [`crate::state::encryption::authorize_queue_key`]; its refusal is answered as the
+//! `Kms*` error the model declares for each class.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -244,8 +250,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
-
         // "The message to send. The minimum size is one character": a `MessageBody`
         // holding no character is the required parameter not supplied, which is what
         // `MissingParameter` reports. Refused before the store is touched, so nothing is
@@ -273,6 +277,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = sqs::service_state(&*self.engine).ok_or_else(|| {
             SendMessageErrorModeled::UnsupportedOperation(sqs::store_unavailable())
         })?;
+
+        // A queue encrypted with a customer managed key is one Amazon SQS has to have
+        // KMS generate a data key under, as this caller, before it can seal the message:
+        // a caller the key does not permit — or a key KMS cannot use — is refused here,
+        // so nothing is enqueued for a message that could not have been encrypted.
+        sqs::encryption::authorize_queue_key(
+            &*self.engine,
+            ctx,
+            &input.queue_url,
+            sqs::encryption::GENERATE_DATA_KEY_ACTION,
+        )
+        .map_err(kms_refusal)?;
+
         let mut state = store.lock();
 
         let now = SystemTime::now();
@@ -505,4 +522,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sequence_number,
         })
     }
+}
+
+/// The KMS refusal of the queue's key, as this operation's own modelled error.
+///
+/// Each class answers with the code KMS answers it with — the `awsQueryError` codes the
+/// model carries for these shapes (`KMS.NotFoundException`, `KMS.DisabledException`,
+/// `KMS.InvalidStateException`, `KMS.InvalidKeyUsageException`,
+/// `KMS.AccessDeniedException`) — carrying the message KMS words that refusal in.
+fn kms_refusal(refusal: sqs::encryption::KeyRefusal) -> SendMessageError {
+    use sqs::encryption::KeyRefusal;
+    match refusal {
+        KeyRefusal::NotFound(message) => SendMessageErrorModeled::KmsNotFound(KmsNotFound {
+            message: Some(message),
+        }),
+        KeyRefusal::Disabled(message) => SendMessageErrorModeled::KmsDisabled(KmsDisabled {
+            message: Some(message),
+        }),
+        KeyRefusal::InvalidState(message) => {
+            SendMessageErrorModeled::KmsInvalidState(KmsInvalidState {
+                message: Some(message),
+            })
+        }
+        KeyRefusal::InvalidKeyUsage(message) => {
+            SendMessageErrorModeled::KmsInvalidKeyUsage(KmsInvalidKeyUsage {
+                message: Some(message),
+            })
+        }
+        KeyRefusal::AccessDenied(message) => {
+            SendMessageErrorModeled::KmsAccessDenied(KmsAccessDenied {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
 }

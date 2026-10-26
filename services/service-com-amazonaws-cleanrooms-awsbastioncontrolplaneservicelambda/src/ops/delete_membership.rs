@@ -7,6 +7,15 @@
 //! DOES declare `ResourceNotFoundException` (404), so an unknown membership id is
 //! answered with that modelled error rather than a success.
 //!
+//! A membership is deletable only once nothing depends on it. The collaboration an
+//! account CREATED depends on that account's membership — the creator is the one party
+//! that cannot leave, since "DeleteCollaboration … can only be called by the
+//! collaboration owner" is how the collaboration itself goes — so deleting the creator's
+//! own membership while its collaboration still exists is refused with the
+//! `ConflictException` (409) this operation models. Every other member may leave at any
+//! time, and the creator's membership becomes deletable once the collaboration is gone
+//! (the delete cascades it to `COLLABORATION_DELETED` first).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -154,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let membership_id = input.membership_identifier;
         let mut store = state.lock();
-        let Some(removed) = store.memberships.remove(&membership_id) else {
+        let Some(membership) = store.memberships.get(&membership_id).cloned() else {
             return Err(DeleteMembershipErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: st::membership_not_found_message(
@@ -167,11 +176,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The collaboration an account created depends on that account's membership, so
+        // the creator cannot leave its own live collaboration: what removes that
+        // membership is deleting the collaboration. The state of the membership is what
+        // refuses the call, so it is the ConflictException this operation models.
+        let creator_of_live_collaboration = store
+            .collaborations
+            .get(&membership.collaboration_id)
+            .is_some_and(|record| record.creator_account_id == st::caller_account_id());
+        if creator_of_live_collaboration {
+            return Err(DeleteMembershipErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(st::creator_membership_not_deletable_message(
+                        &membership.id,
+                        &membership.collaboration_id,
+                    )),
+                    resource_id: Some(membership.id.clone()),
+                    resource_type: Some(st::RESOURCE_TYPE_MEMBERSHIP.to_string()),
+                    reason: Some(st::CONFLICT_REASON_INVALID_STATE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        store.memberships.remove(&membership_id);
         store.membership_order.retain(|id| id != &membership_id);
-        store.tags.remove(&removed.arn);
+        store.tags.remove(&membership.arn);
         store
             .membership_by_collaboration
             .retain(|_, id| id != &membership_id);
+        // The configured table associations of this membership are sub-resources of it,
+        // reachable only through it, so they go with it.
+        store.remove_configured_table_associations_of(&membership_id);
         Ok(DeleteMembershipOutput {})
     }
 }

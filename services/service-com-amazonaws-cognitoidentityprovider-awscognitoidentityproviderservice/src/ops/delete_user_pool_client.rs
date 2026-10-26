@@ -190,6 +190,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         pool.terms
             .retain(|_, terms| terms.client_id != input.client_id);
 
+        // A managed login branding style is assigned to ONE app client of the
+        // pool — "Each style is linked to an app client until you delete it"
+        // (`CreateManagedLoginBranding.ClientId`) — so the deleted client's
+        // style goes with it rather than outliving the client it is linked to.
+        pool.managed_login_branding
+            .retain(|_, branding| branding.client_id != input.client_id);
+
         // "After you delete an app client, users can no longer sign in to the
         // associated application" (this operation's documentation): a challenge
         // this client started can never be answered, because every response to it

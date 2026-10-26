@@ -238,11 +238,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // A charge carries ONE purchase order reference, so associating a charge
-        // that already carries one REPLACES it: this operation associates
-        // purchase orders "with agreement charges after an agreement is
-        // created", which is an update of the charge's association and not a
-        // second association beside it.
         let mut updated: Vec<String> = Vec::new();
         for (index, agreement_id, association) in plan {
             let Some(agreement) = store.agreements.get_mut(&agreement_id) else {
@@ -253,17 +248,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // reported as a success.
                 return Err(refuse(index, "chargeId"));
             };
-            match agreement
-                .purchase_orders
-                .iter_mut()
-                .find(|held| held.charge_id == association.charge_id)
-            {
-                Some(held) => *held = association,
-                None => agreement.purchase_orders.push(association),
-            }
-            // The agreement's own record changed, which is what
-            // `AgreementViewSummary$lastUpdateTime` reports.
-            agreement.updated_at = now;
+            // A charge carries ONE purchase order reference, so associating a
+            // charge that already carries one REPLACES it: this operation
+            // associates purchase orders "with agreement charges after an
+            // agreement is created", which is an update of the charge's
+            // association and not a second association beside it. The write
+            // goes through the agreement's own single writer of its
+            // associations, which also stamps `updated_at`.
+            agreement.associate_purchase_order(association, now);
             if !updated.contains(&agreement_id) {
                 updated.push(agreement_id);
             }

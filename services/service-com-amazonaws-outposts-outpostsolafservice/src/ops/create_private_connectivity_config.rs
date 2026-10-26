@@ -10,6 +10,12 @@
 //!   an Outpost this store does not hold is 404 `NotFoundException`;
 //! * the `VpcInformationList` the caller sent is stored as sent and reported back
 //!   from what was stored;
+//! * the configuration reports the IAM roles AWS Outposts uses for it, in the
+//!   modelled `RoleArn` form for the request's partition and the emulator account:
+//!   `RoleArn`, the service-linked role scoped to this Outpost, for every
+//!   configuration, and `ProvisioningRoleArn` only for one that is VPC
+//!   endpoint-based — the single condition that member's documentation attaches to
+//!   it — i.e. whose VPC information names an interface VPC endpoint;
 //! * a configured Outpost reports the terminal `ENABLED` status: the modelled
 //!   `PrivateConnectivityStatus` enum has no provisioning value, so nothing is owed
 //!   on it afterwards;
@@ -213,20 +219,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let config = PrivateConnectivityConfig {
-            // The VPC, its subnets and the VPC endpoint are the caller's, stored as
-            // sent so every later read answers the request's own values.
-            vpc_information_list: Some(input.vpc_information_list),
-            private_connectivity_status: Some(
-                crate::state::PRIVATE_CONNECTIVITY_ENABLED.to_string(),
-            ),
-            // `RoleArn` and `ProvisioningRoleArn` name IAM roles AWS Outposts
-            // assumes to provision and run the service link. This emulator has no
-            // IAM role behind this configuration, so it reports none rather than an
-            // ARN naming a role that does not exist.
-            role_arn: None,
-            provisioning_role_arn: None,
-        };
+        // The configuration this Outpost now holds: the caller's VPC information as
+        // sent, the terminal `ENABLED` status, and the IAM roles AWS Outposts uses
+        // for private connectivity — the service-linked role of this Outpost, and
+        // the provisioning role for a configuration that is VPC endpoint-based. One
+        // builder, so the configuration reported here is the one stored for every
+        // later read.
+        let config = crate::state::private_connectivity_config(
+            &region,
+            &outpost_id,
+            input.vpc_information_list,
+        );
         record.private_connectivity = Some(config.clone());
 
         Ok(CreatePrivateConnectivityConfigOutput {

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListNotifications
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListNotifications`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListNotifications::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports one notification per LENS REVIEW — of a workload or of a review
+//! template — that is pinned at a version its lens has published past, the
+//! `LENS_VERSION_UPGRADED` notification an upgrade of that review clears, narrowed to one
+//! workload by `WorkloadId` or to one review template by `ResourceArn` and paged by
+//! `MaxResults` / `NextToken`. A reporting operation: it writes nothing. The two selectors
+//! are mutually exclusive, so a request setting both is a `ValidationException` (400); the
+//! operation models no `ResourceNotFoundException`, so a `WorkloadId` or `ResourceArn` no
+//! stored resource answers to selects nothing and gets an empty page, while a `NextToken`
+//! this service did not issue is a `ValidationException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +153,280 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListNotifications` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListNotificationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListNotificationsErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool workload store is unavailable".to_string(),
+            })
+        })?;
+
+        // `MaxResults` is modelled `@range(min: 1, max: 50)`; a request that omits it asks
+        // for a full page, so the modelled maximum is the default. One helper restates that
+        // bound for every paginated operation of this service.
+        let page_size = crate::state::page_size(input.max_results);
+
+        // "Only one of WorkloadID or ResourceARN should be specified"
+        // (`smithy_query(query="doc", shape="ListNotificationsInput", member="ResourceArn")`):
+        // the two selectors name resources of DIFFERENT kinds, so a request setting both
+        // asks two questions at once and is refused rather than answered by one of them.
+        // The finding is reported on both members, because either one is the caller's to
+        // drop.
+        if input.workload_id.is_some() && input.resource_arn.is_some() {
+            let fields: Vec<(String, String)> = [WORKLOAD_ID_MEMBER, RESOURCE_ARN_MEMBER]
+                .into_iter()
+                .map(|member| (member.to_string(), ONE_SELECTOR_MESSAGE.to_string()))
+                .collect();
+            return Err(ListNotificationsErrorModeled::ValidationException(
+                crate::state::field_validation_exception(&fields),
+            )
+            .into());
+        }
+
+        // An opaque token this service did not issue is a bad request, not an empty page.
+        // Classified `CANNOT_PARSE` like every other cursor in this service: a caller cannot
+        // correct a token it did not compose, only start the pagination again — and the
+        // finding still names the member whose value could not be decoded.
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_lens_notification_next_token(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(ListNotificationsErrorModeled::ValidationException(
+                        crate::state::cannot_parse_exception(
+                            crate::state::NEXT_TOKEN_MEMBER,
+                            crate::state::INVALID_NEXT_TOKEN_MESSAGE,
+                        ),
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let store = state.lock();
+        // A lens is reported by its ARN, which for an AWS-official lens is built from the
+        // Region the request was signed for.
+        let region = crate::state::request_region(ctx.parts());
+
+        // The resources whose lens reviews this request asks about. `ResourceArn` selects
+        // review templates and `WorkloadId` workloads, so a request naming one selector
+        // reaches no resource of the other kind; a request naming neither asks about every
+        // resource of the account that holds lens reviews. Neither selector is a lookup:
+        // the operation models no `ResourceNotFoundException`, so a value no stored resource
+        // answers to selects nothing and the answer is an empty page rather than a refusal.
+        let mut covered: Vec<ReviewedResource<'_>> = Vec::new();
+        if input.resource_arn.is_none() {
+            let workloads: Vec<&crate::state::WorkloadRecord> = match input.workload_id.as_deref()
+            {
+                Some(workload_id) => store.workloads.get(workload_id).into_iter().collect(),
+                None => store.workloads.values().collect(),
+            };
+            covered.extend(workloads.into_iter().map(|workload| ReviewedResource {
+                key: workload.workload_id.as_str(),
+                named: ResourceNaming::Workload {
+                    workload_id: workload.workload_id.as_str(),
+                    workload_name: workload.workload_name.as_str(),
+                },
+                reviews: pinned_reviews(workload.lens_reviews(), |lens| {
+                    workload.lens_review_version(lens)
+                }),
+            }));
+        }
+        if input.workload_id.is_none() {
+            let templates: Vec<&crate::state::ReviewTemplateRecord> =
+                match input.resource_arn.as_deref() {
+                    Some(template_arn) => {
+                        store.review_templates.get(template_arn).into_iter().collect()
+                    }
+                    None => store.review_templates.values().collect(),
+                };
+            covered.extend(templates.into_iter().map(|template| ReviewedResource {
+                key: template.template_arn.as_str(),
+                named: ResourceNaming::ReviewTemplate {
+                    template_arn: template.template_arn.as_str(),
+                    template_name: template.template_name.as_str(),
+                },
+                reviews: pinned_reviews(template.lens_reviews(), |lens| {
+                    template.lens_review_version(lens)
+                }),
+            }));
+        }
+
+        // A lens notification is OUTSTANDING work on one lens review: `LensUpgradeSummary`
+        // reports the version that review is pinned at beside the version the lens itself is
+        // at (`CurrentLensVersion` / `LatestLensVersion`), so a review whose two versions
+        // AGREE is a review of the lens as it stands and has nothing to report. A lens's
+        // versions only ever accumulate, so a pinned version differing from the lens's
+        // latest is one the lens has published past — `LENS_VERSION_UPGRADED` — and
+        // `UpgradeLensReview` / `UpgradeReviewTemplateLensReview` is what clears it
+        // (`crate::state::...::superseded_lens_review` is the one place that comparison
+        // lives).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListNotifications"))
+        // Each notification is carried beside the pair that NAMES its review, which is what
+        // the enumeration is ordered and the pages are cut on.
+        let mut outstanding: Vec<((&str, &str), NotificationSummary)> = Vec::new();
+        for resource in &covered {
+            for &(alias, lens, pinned) in &resource.reviews {
+                let Some((current, latest)) = store.superseded_lens_review(lens, pinned) else {
+                    continue;
+                };
+                outstanding.push((
+                    (resource.key, alias),
+                    NotificationSummary {
+                        r#type: Some(
+                            crate::state::LENS_NOTIFICATION_VERSION_UPGRADED.to_string(),
+                        ),
+                        lens_upgrade_summary: Some(resource.named.lens_upgrade_summary(
+                            lens,
+                            store.lens_arn_of(lens, &region),
+                            current,
+                            latest,
+                        )),
+                    },
+                ));
+            }
+        }
+
+        // The model publishes no order for `NotificationSummaries`, so this is the
+        // emulator's own: the pair that names the review — the key of the resource holding
+        // it beside the lens alias the review is one review under — whose two halves are
+        // each fixed for the life of what they name, where `WorkloadName` is a member
+        // `UpdateWorkload` can move and `TemplateName` one `UpdateReviewTemplate` can, so
+        // the order is total and stable across requests.
+        outstanding.sort_by_key(|(key, _)| *key);
+
+        // The cursor is start-EXCLUSIVE: the page resumes just past the review already
+        // served, so every notification is enumerated at most once across the pages.
+        let resume_after = cursor
+            .as_ref()
+            .map(|(resource_key, alias)| (resource_key.as_str(), alias.as_str()));
+        let matching: Vec<((&str, &str), NotificationSummary)> = outstanding
+            .into_iter()
+            .filter(|(key, _)| resume_after.is_none_or(|served| *key > served))
+            .collect();
+
+        let page_length = matching.len().min(page_size);
+        // A cursor is issued only when the selection did NOT fit in this page, so the last
+        // page omits `NextToken` and a caller following it terminates.
+        let next_token = match matching[..page_length].last() {
+            Some(((resource_key, alias), _)) if matching.len() > page_length => Some(
+                crate::state::encode_lens_notification_next_token(resource_key, alias),
+            ),
+            _ => None,
+        };
+
+        Ok(ListNotificationsOutput {
+            notification_summaries: Some(
+                matching
+                    .into_iter()
+                    .take(page_length)
+                    .map(|(_, summary)| summary)
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// The member a selector finding names (`ListNotificationsInput$WorkloadId`).
+const WORKLOAD_ID_MEMBER: &str = "WorkloadId";
+
+/// The member a selector finding names (`ListNotificationsInput$ResourceArn`).
+const RESOURCE_ARN_MEMBER: &str = "ResourceArn";
+
+/// The sentence a request naming BOTH selectors is refused with: the rule the model states
+/// for them ("Only one of WorkloadID or ResourceARN should be specified",
+/// `smithy_query(query="doc", shape="ListNotificationsInput", member="ResourceArn")`), in
+/// the member spellings this API uses. One sentence for both members, because the rule is
+/// the relationship between them rather than a bound on either one's value.
+const ONE_SELECTOR_MESSAGE: &str = "Only one of WorkloadId or ResourceArn should be specified.";
+
+/// One resource whose lens reviews this report covers.
+///
+/// Both kinds of resource that hold lens reviews are reported here, so the enumeration is
+/// built once over this shape rather than twice over the two records: `key` is what the
+/// report is ordered and paged by — the key the resource's own map is held under, fixed for
+/// its whole life — `named` is how a summary identifies it, and `reviews` is one entry per
+/// lens review it has.
+struct ReviewedResource<'a> {
+    key: &'a str,
+    named: ResourceNaming<'a>,
+    /// `(lens alias, the lens as the apply recorded it, the version the review pins)`, in
+    /// the lens-alias order a page over these reviews follows.
+    reviews: Vec<(&'a str, &'a str, Option<&'a str>)>,
+}
+
+/// The members of `LensUpgradeSummary` that NAME the resource one lens review belongs to:
+/// the workload members for a workload's review and the resource members for a review
+/// template's (`smithy_query(query="shape", shape="LensUpgradeSummary")`, whose `ResourceArn`
+/// is patterned for a `review-template` ARN alone).
+#[derive(Debug, Clone, Copy)]
+enum ResourceNaming<'a> {
+    Workload {
+        workload_id: &'a str,
+        workload_name: &'a str,
+    },
+    ReviewTemplate {
+        template_arn: &'a str,
+        template_name: &'a str,
+    },
+}
+
+impl ResourceNaming<'_> {
+    /// The `LensUpgradeSummary` of one superseded lens review of this resource: the lens as
+    /// the apply recorded it and the ARN it is reported by, the version the review is pinned
+    /// at beside the version the lens is at, and the members that name the resource holding
+    /// the review — the others left off rather than filled with a value of the wrong kind.
+    fn lens_upgrade_summary(
+        self,
+        lens: &str,
+        lens_arn: String,
+        current_lens_version: String,
+        latest_lens_version: String,
+    ) -> LensUpgradeSummary {
+        let (workload_id, workload_name, resource_arn, resource_name) = match self {
+            Self::Workload {
+                workload_id,
+                workload_name,
+            } => (
+                Some(workload_id.to_string()),
+                Some(workload_name.to_string()),
+                None,
+                None,
+            ),
+            Self::ReviewTemplate {
+                template_arn,
+                template_name,
+            } => (
+                None,
+                None,
+                Some(template_arn.to_string()),
+                Some(template_name.to_string()),
+            ),
+        };
+        LensUpgradeSummary {
+            workload_id,
+            workload_name,
+            // "Each lens is identified by its `LensSummary$LensAlias`" (`WorkloadLenses`
+            // doc): the name the apply recorded the lens under — for a custom lens its ARN,
+            // which is the only `LensAlias` such a lens has.
+            lens_alias: Some(lens.to_string()),
+            lens_arn: Some(lens_arn),
+            current_lens_version: Some(current_lens_version),
+            latest_lens_version: Some(latest_lens_version),
+            resource_arn,
+            resource_name,
+        }
+    }
+}
+
+/// The lens reviews of one resource paired with the version each one PINS, read through the
+/// resource's own `lens_review_version` — the same resolution a read of that review reports
+/// its version from, so a notification cannot disagree with it.
+fn pinned_reviews<'a>(
+    reviews: ::std::collections::BTreeMap<&'a str, &'a str>,
+    pinned: impl Fn(&'a str) -> Option<&'a str>,
+) -> Vec<(&'a str, &'a str, Option<&'a str>)> {
+    reviews
+        .into_iter()
+        .map(|(alias, lens)| (alias, lens, pinned(lens)))
+        .collect()
 }
