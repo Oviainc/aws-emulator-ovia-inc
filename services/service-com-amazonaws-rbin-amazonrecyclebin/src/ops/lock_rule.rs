@@ -179,11 +179,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        // A retention rule exists only in the Region it was created in, so the rule an
+        // identifier addresses is resolved in the Region this request is signed for.
+        let region = crate::state::request_region(ctx.parts());
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        let Some(rule) = store.rules.get_mut(&input.identifier) else {
+        let Some(rule) = store.rule_mut(&region, &input.identifier) else {
             return Err(LockRuleErrorModeled::ResourceNotFoundException(
                 crate::state::rule_not_found(&input.identifier),
             )

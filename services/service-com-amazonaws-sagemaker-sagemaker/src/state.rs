@@ -3274,6 +3274,14 @@ pub fn does_not_exist(entity: &str, arn: &str) -> String {
 /// The entity label [`does_not_exist`] names a lineage action by.
 pub const ACTION_ENTITY: &str = "Action";
 
+/// The entity label [`does_not_exist`] names ONE END of a lineage association by.
+///
+/// An `AssociationEntityArn` may name any of five entity kinds (experiment,
+/// experiment-trial-component, artifact, action, context), and the operations that resolve
+/// one do not care which: the refusal names the end generically rather than guessing the
+/// kind out of the ARN it could not resolve.
+pub const ASSOCIATION_END_ENTITY: &str = "Resource";
+
 /// The entity label [`does_not_exist`] names a lineage group by.
 pub const LINEAGE_GROUP_ENTITY: &str = "Lineage group";
 
@@ -6275,13 +6283,57 @@ pub const ASSOCIATION_QUOTA: usize = 10_000;
 /// because `AssociationType` is an optional member: an association created without one
 /// carries none, which is distinguishable on the wire from any of the modelled edge
 /// types. `creation_time` is the instant the association was FIRST added, so a repeated
-/// add does not pretend the edge is new.
+/// add does not pretend the edge is new, and `created_by` is stored beside it by the call
+/// that first added the edge — as every other record here stores the identity that
+/// created it — so a later read reports the identity that really created this one.
 #[derive(Debug, Clone)]
 pub struct Association {
     pub source_arn: String,
     pub destination_arn: String,
     pub association_type: Option<String>,
+    pub created_by: UserContext,
     pub creation_time: SystemTime,
+}
+
+impl Association {
+    /// This association's store key as ONE string, for the page token a listing mints.
+    ///
+    /// The identity is the `(source, destination)` pair, so the token has to name both; a
+    /// space joins them because no ARN this service mints contains one (the resource
+    /// segment is a lineage name or a minted id), so the pair is recoverable and two
+    /// different pairs can never spell the same key. The same precedent as
+    /// [`ModelPackage::key`], which spells a two-part identity as one key too.
+    pub fn key(&self) -> String {
+        format!("{} {}", self.source_arn, self.destination_arn)
+    }
+
+    /// Whether this edge belongs to `region`, i.e. both of its ends are ARNs this service
+    /// mints there.
+    ///
+    /// The association store is account-wide, while every lineage entity is REGIONAL — its
+    /// ARN names the Region it was created in — so a listing reports the edges of the
+    /// Region the request signed for and never one between entities of another.
+    pub fn in_region(&self, region: &str) -> bool {
+        arn_resource(&self.source_arn, region).is_some()
+            && arn_resource(&self.destination_arn, region).is_some()
+    }
+}
+
+/// What a reader reports about ONE END of an association: the lineage entity's own name
+/// and type, read out of the record the matching `Create*` stored.
+///
+/// `name` is an `Option` because an artifact need not have one (`ArtifactName` is
+/// optional), and `entity_type` because only three of the five entity kinds an
+/// `AssociationEntityArn` admits carry a type of their own — an artifact's `ArtifactType`,
+/// an action's `ActionType`, a context's `ContextType`. An experiment and a trial
+/// component take theirs from the `Source` of the job that emitted them, which
+/// `CreateExperiment` and `CreateTrialComponent` do not accept, so one created directly
+/// has no type to report and the member stays absent rather than being filled with an
+/// invented value.
+#[derive(Debug, Clone, Default)]
+pub struct LineageEntityEnd {
+    pub name: Option<String>,
+    pub entity_type: Option<String>,
 }
 
 impl ComAmazonawsSagemakerSagemakerState {
@@ -6301,39 +6353,70 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// create, so each is decided by whether its own store holds the ARN rather than by
     /// the kind being unreachable.
     pub fn lineage_entity_exists(&self, region: &str, arn: &str) -> bool {
+        self.lineage_entity_end(region, arn).is_some()
+    }
+
+    /// The name and type of the lineage entity `arn` names, or `None` when it names none
+    /// this service holds.
+    ///
+    /// The resolution side of [`Self::lineage_entity_exists`], which is this returning
+    /// `Some`: one walk over the five entity kinds, so "is this an end an association may
+    /// have" and "what does a reader report about that end" can never disagree.
+    pub fn lineage_entity_end(&self, region: &str, arn: &str) -> Option<LineageEntityEnd> {
         // Every `AssociationEntityArn` IS an ARN (its pattern starts `^arn:`), so the
         // bare-name branch of `entity_name_from_name_or_arn` is unreachable from an
         // association request; guarded rather than assumed, so a bare name can never
         // resolve to an entity through this helper.
         if !arn.starts_with("arn:") {
-            return false;
+            return None;
         }
         if entity_name_from_name_or_arn(arn, region, ARTIFACT_KIND).is_some() {
             // Both lineage stores are keyed by the WHOLE ARN the create minted, which
             // already carries this request's Region and the emulator's account.
-            return self.artifacts.contains_key(arn);
+            return self.artifacts.get(arn).map(|artifact| LineageEntityEnd {
+                name: artifact.name.clone(),
+                entity_type: Some(artifact.artifact_type.clone()),
+            });
         }
         if entity_name_from_name_or_arn(arn, region, ACTION_KIND).is_some() {
-            return self.actions.contains_key(arn);
+            return self.actions.get(arn).map(|action| LineageEntityEnd {
+                name: Some(action.name.clone()),
+                entity_type: Some(action.action_type.clone()),
+            });
         }
         if entity_name_from_name_or_arn(arn, region, CONTEXT_KIND).is_some() {
             // The context store is keyed by the whole ARN too (see [`context_key`]), so a
             // context `CreateContext` really stored is an end an association may point at.
-            return self.contexts.contains_key(arn);
+            return self.contexts.get(arn).map(|context| LineageEntityEnd {
+                name: Some(context.name.clone()),
+                entity_type: Some(context.context_type.clone()),
+            });
         }
         if let Some(name) = entity_name_from_name_or_arn(arn, region, TRIAL_COMPONENT_KIND) {
             // The trial-component store is keyed by the case-folded NAME (the name "is
             // not case-sensitive" per its model doc), so the lookup goes through the same
             // key `CreateTrialComponent` stored the record under.
-            return self.trial_components.contains_key(&entity_key(name));
+            return self
+                .trial_components
+                .get(&entity_key(name))
+                .map(|component| LineageEntityEnd {
+                    name: Some(component.name.clone()),
+                    entity_type: None,
+                });
         }
         if let Some(name) = entity_name_from_name_or_arn(arn, region, EXPERIMENT_KIND) {
             // Same keying as the trial-component store, and for the same reason: an
             // `ExperimentEntityName` is unique per account and not case-sensitive, so
             // `CreateExperiment` filed the record under [`entity_key`] of the name.
-            return self.experiments.contains_key(&entity_key(name));
+            return self
+                .experiments
+                .get(&entity_key(name))
+                .map(|experiment| LineageEntityEnd {
+                    name: Some(experiment.name.clone()),
+                    entity_type: None,
+                });
         }
-        false
+        None
     }
 }
 

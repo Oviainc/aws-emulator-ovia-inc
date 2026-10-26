@@ -5,7 +5,9 @@
 //! answers from the record it just stored. A name that already exists is refused with
 //! `ConflictException` (409); a `Tags` entry breaking a published tag rule is refused with
 //! the `BadRequestException` (400) the tagging layer answers a broken tag rule with, so a
-//! pipe cannot be created carrying a tag `TagResource` would refuse. This is the ONLY file
+//! pipe cannot be created carrying a tag `TagResource` would refuse. A pipe the caller
+//! asked to RUN also gets its data-plane poller ([`crate::state::data_plane`]), which is
+//! what makes the pipe move records with no further client action. This is the ONLY file
 //! to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -320,7 +322,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_time: Some(crate::state::timestamp(record.creation_time)),
             last_modified_time: Some(crate::state::timestamp(record.last_modified_time)),
         };
-        state.pipes.insert(record.name.clone(), record);
+        let name = record.name.clone();
+        let runnable = record.desired_state == crate::state::requested_state::RUNNING;
+        state.pipes.insert(name.clone(), record);
+        // The data plane of a pipe the caller asked to RUN: the lock is released first,
+        // and the poller waits out the `CREATING` span before it consumes anything, so
+        // nothing a caller is told by this response depends on it.
+        drop(state);
+        if runnable {
+            crate::state::data_plane::drive_pipe(ctx, &self.engine, &name);
+        }
         Ok(output)
     }
 }

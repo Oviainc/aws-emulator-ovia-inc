@@ -248,14 +248,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // A request that names a `PolicyRevisionId` is conditional on it being the
-        // policy's current one. The check happens before anything is written, so a
-        // refused put leaves the stored policy exactly as it was.
-        if let Some(mismatch) = store
-            .app_monitors
-            .get(&input.name)
-            .and_then(|record| record.policy_revision_refusal(input.policy_revision_id.as_deref()))
-        {
+        // The put must PROVIDE the correct current `PolicyRevisionId`: a request that
+        // names one is conditional on it being the policy's current one, and once a
+        // revision id has been assigned a request that names none is refused too, rather
+        // than overwriting the policy unconditionally. The check happens before anything
+        // is written, so a refused put leaves the stored policy exactly as it was.
+        if let Some(mismatch) = store.app_monitors.get(&input.name).and_then(|record| {
+            record.policy_revision_refusal_on_current(input.policy_revision_id.as_deref())
+        }) {
             return Err(
                 PutResourcePolicyErrorModeled::InvalidPolicyRevisionIdException(mismatch).into(),
             );
@@ -274,7 +274,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // two revisions a client holds can be ordered. The document is stored as its
         // CONTENT: the layout the caller's printer chose is not part of the policy
         // (`crate::state::canonical_policy_document`).
-        let stored = record.store_resource_policy(&input.policy_document);
+        let stored = record
+            .store_resource_policy(&input.policy_document, input.policy_revision_id.as_deref());
 
         // Reported off the record this call just wrote, under the lock it still holds, so
         // what a following `GetResourcePolicy` reads is what is answered here.

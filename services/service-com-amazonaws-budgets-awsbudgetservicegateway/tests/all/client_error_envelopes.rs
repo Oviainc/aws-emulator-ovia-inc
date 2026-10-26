@@ -203,30 +203,13 @@ async fn a_scaffolded_operation_still_answers_501() {
     // Every one of these is still a stub under its own issue, and each request
     // satisfies every modelled constraint on its input so that it reaches the stub
     // rather than the validation layer in front of it.
-    for (operation, request) in [
-        (
-            // `DescribeBudgetActionsForBudget` is implemented now (it lists the actions
-            // `CreateBudgetAction` writes onto a budget), so the account-wide list is
-            // one stub row here, still under its own issue.
-            "DescribeBudgetActionsForAccount",
-            json!({"AccountId": &account_id}),
-        ),
-        (
-            // `CreateSubscriber` / `UpdateSubscriber` are implemented now, so the
-            // subscriber delete is the other stub row, still under its own issue.
-            "DeleteSubscriber",
-            json!({
-                "AccountId": &account_id,
-                "BudgetName": "stub",
-                "Notification": {
-                    "NotificationType": "ACTUAL",
-                    "ComparisonOperator": "GREATER_THAN",
-                    "Threshold": 80.0
-                },
-                "Subscriber": {"SubscriptionType": "EMAIL", "Address": "ops@example.com"}
-            }),
-        ),
-    ] {
+    for (operation, request) in [(
+        // `DescribeBudgetActionsForBudget` is implemented now (it lists the actions
+        // `CreateBudgetAction` writes onto a budget), so the account-wide list is
+        // the one stub row left here, still under its own issue.
+        "DescribeBudgetActionsForAccount",
+        json!({"AccountId": &account_id}),
+    )] {
         let (status, body) = call(&router, operation, &request).await;
         assert_eq!(
             status, 501,

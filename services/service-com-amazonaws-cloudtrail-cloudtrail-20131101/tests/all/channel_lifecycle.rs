@@ -339,10 +339,14 @@ async fn create_channel_refuses_every_destination_that_is_not_a_usable_event_dat
             "EventDataStoreARNInvalidException",
         ),
         (
-            "bare-uuid-is-not-an-arn",
+            // A BARE id is the member's other form, so it is read as an id and
+            // addressed in the calling Region: this one names no store, which is an
+            // absent store rather than a malformed ARN. The whole classification is
+            // the table in `channel_destination_identifier.rs`.
+            "bare-uuid-no-store-carries",
             destination(EVENT_DATA_STORE, UNKNOWN_UUID),
             400,
-            "EventDataStoreARNInvalidException",
+            "EventDataStoreNotFoundException",
         ),
         (
             "well-formed-but-no-such-store",

@@ -29,6 +29,8 @@ mod graph_deletion;
 mod graph_lifecycle;
 #[path = "all/graph_record_encryption.rs"]
 mod graph_record_encryption;
+#[path = "all/graph_reset.rs"]
+mod graph_reset;
 #[path = "all/graph_restore_from_snapshot.rs"]
 mod graph_restore_from_snapshot;
 #[path = "all/graph_run_state.rs"]

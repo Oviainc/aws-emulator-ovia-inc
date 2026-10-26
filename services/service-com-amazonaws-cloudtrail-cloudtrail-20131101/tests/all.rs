@@ -154,3 +154,8 @@ mod dashboard_protection_and_policy_readiness;
 // `insight_selectors` suite that seeds the store registry directly.
 #[path = "all/insight_selectors_api_state.rs"]
 mod insight_selectors_api_state;
+// `channel_destination_identifier` pins how a `Destination$Location` is read and how
+// each way of failing to read it is refused, over both operations that take a
+// `Destinations` list.
+#[path = "all/channel_destination_identifier.rs"]
+mod channel_destination_identifier;
