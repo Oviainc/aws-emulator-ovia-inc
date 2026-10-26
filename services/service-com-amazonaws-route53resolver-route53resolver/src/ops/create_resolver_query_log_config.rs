@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateResolverQueryLogConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateResolverQueryLogConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateResolverQueryLogConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +172,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateResolverQueryLogConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateResolverQueryLogConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateResolverQueryLogConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateResolverQueryLogConfigErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `Name`'s pattern (`^(?!^[0-9]+$)([a-zA-Z0-9\-_' ']+)$`) excludes a name
+        // made of digits alone through a negative lookahead the boundary
+        // validator's regex engine does not accept, so that part of the rule is
+        // enforced here — with the `InvalidParameterException` this operation
+        // models, which names the rejected member — before the store is locked,
+        // so nothing is written.
+        if !crate::state::name_satisfies_pattern(&input.name) {
+            return Err(
+                CreateResolverQueryLogConfigErrorModeled::InvalidParameterException(
+                    crate::state::invalid_query_log_config_name(&input.name),
+                )
+                .into(),
+            );
+        }
+
+        // `DestinationArn` is "the ARN of the resource that you want Resolver to
+        // send query logs", and the resources Resolver delivers to are an S3
+        // bucket, a CloudWatch Logs log group and a Kinesis Data Firehose
+        // delivery stream; the model bounds that member's length only, so a
+        // string naming no such destination is refused here rather than stored.
+        if !crate::state::query_log_destination_is_wellformed(&input.destination_arn) {
+            return Err(
+                CreateResolverQueryLogConfigErrorModeled::InvalidParameterException(
+                    crate::state::invalid_query_log_destination(&input.destination_arn),
+                )
+                .into(),
+            );
+        }
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        // `CreatorRequestId` is "a unique string that identifies the request and
+        // that allows failed requests to be retried without the risk of running
+        // the operation twice": a repeat of a request id that already created a
+        // configuration resolves to THAT configuration and creates nothing.
+        if let Some(existing_id) = store
+            .query_log_config_creator_request_ids
+            .get(&input.creator_request_id)
+        {
+            if let Some(record) = store.resolver_query_log_configs.get(existing_id) {
+                return Ok(CreateResolverQueryLogConfigOutput {
+                    resolver_query_log_config: Some(record.to_query_log_config(now)),
+                });
+            }
+        }
+
+        // The store is bounded: a new configuration past the cap is refused with
+        // the `LimitExceededException` this operation models, BEFORE anything is
+        // written. The retry path above is unaffected — it allocates no record.
+        if !store.can_store_another_query_log_config() {
+            return Err(
+                CreateResolverQueryLogConfigErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "This emulator stores at most {} Resolver query logging configurations; delete one before creating another",
+                            crate::state::MAX_STORED_QUERY_LOG_CONFIGS
+                        )),
+                        resource_type: Some(
+                            crate::state::RESOURCE_TYPE_RESOLVER_QUERY_LOG_CONFIG.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let seq = store.next_seq();
+        let id = crate::state::mint_query_log_config_id(seq);
+        let arn = ::engine::emulator_arn(
+            crate::state::ARN_NAMESPACE,
+            &region,
+            &format!("resolver-query-log-config/{id}"),
+        );
+
+        let record = crate::state::ResolverQueryLogConfigRecord {
+            seq,
+            id: id.clone(),
+            arn,
+            name: input.name.clone(),
+            owner_id: ::engine::emulator_account_id().to_string(),
+            destination_arn: crate::state::canonical_query_log_destination(&input.destination_arn),
+            creator_request_id: input.creator_request_id.clone(),
+            // The emulator serves one account, so a configuration it creates is
+            // shared with nobody until it is shared through Resource Access
+            // Manager.
+            share_status: crate::state::SHARE_STATUS_NOT_SHARED.to_string(),
+            // "To specify which VPCs you want to log queries for, you use
+            // AssociateResolverQueryLogConfig": a configuration is created with
+            // no VPC, so it reports an `AssociationCount` of zero.
+            associated_vpc_ids: Vec::new(),
+            status: crate::state::QUERY_LOG_CONFIG_STATUS_CREATING.to_string(),
+            tags: input.tags.clone().unwrap_or_default(),
+            creation_time: crate::state::now_rfc3339(),
+            // This call answers while Resolver is still creating the
+            // configuration, so the move to `CREATED` is the one the clock owes.
+            settled_at: Some(now + crate::state::PROVISIONING_DELAY),
+        };
+
+        let created = record.to_query_log_config(now);
+        store
+            .query_log_config_creator_request_ids
+            .insert(input.creator_request_id.clone(), id.clone());
+        store.resolver_query_log_configs.insert(id, record);
+
+        Ok(CreateResolverQueryLogConfigOutput {
+            resolver_query_log_config: Some(created),
+        })
     }
 }

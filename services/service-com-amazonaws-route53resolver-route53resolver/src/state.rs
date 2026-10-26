@@ -19,7 +19,8 @@ use crate::ops::types::{
     FirewallConfig, FirewallDomainList, FirewallDomainListMetadata, InvalidParameterException,
     InvalidPolicyDocument, InvalidRequestException, IpAddressResponse, IpAddressUpdate,
     LimitExceededException, OutpostResolver, ResolverConfig, ResolverDnssecConfig, ResolverEndpoint,
-    ResolverRule, ResolverRuleAssociation, ResourceExistsException, ResourceInUseException,
+    ResolverQueryLogConfig, ResolverRule, ResolverRuleAssociation, ResourceExistsException,
+    ResourceInUseException,
     ResourceNotFoundException, Tag, TargetAddress, UnknownResourceException, ValidationException,
 };
 
@@ -309,10 +310,11 @@ pub const RULE_ASSOCIATION_STATUS_CREATING: &str = "CREATING";
 pub const RULE_ASSOCIATION_STATUS_COMPLETE: &str = "COMPLETE";
 pub const RULE_ASSOCIATION_STATUS_DELETING: &str = "DELETING";
 
-/// `ResolverRule$ShareStatus` for a rule this account owns and has not shared:
-/// a member of the model's `ShareStatus` enum
+/// `ShareStatus` for a resource this account owns and has not shared: a member
+/// of the model's `ShareStatus` enum
 /// (`smithy_query(query="shape",shape="ShareStatus")`). The emulator has one
-/// account, so no rule it mints is shared with another.
+/// account, so no Resolver rule and no query logging configuration it mints is
+/// shared with another.
 pub const SHARE_STATUS_NOT_SHARED: &str = "NOT_SHARED";
 
 /// The most Resolver rules, and rule associations, this store holds.
@@ -2211,6 +2213,226 @@ impl ResolverConfigRecord {
     }
 }
 
+/// `ResolverQueryLogConfigStatus` values this slice reports, out of the model's
+/// enum (`smithy_query(query="shape",shape="ResolverQueryLogConfigStatus")`:
+/// `CREATING | CREATED | DELETING | FAILED`).
+///
+/// `CREATING` is "Resolver is creating the query logging configuration", which
+/// is what a create answers with, and `CREATED` is "the query logging
+/// configuration was successfully created": the move between them is the one the
+/// clock owes, [`PROVISIONING_DELAY`] after the call that started it. `DELETING`
+/// describes a configuration a delete has been accepted for and `FAILED` one
+/// whose destination Resolver cannot deliver to, neither of which a create
+/// produces.
+pub const QUERY_LOG_CONFIG_STATUS_CREATING: &str = "CREATING";
+
+/// See [`QUERY_LOG_CONFIG_STATUS_CREATING`].
+pub const QUERY_LOG_CONFIG_STATUS_CREATED: &str = "CREATED";
+
+/// `ResourceNotFoundException$ResourceType` for a query logging configuration:
+/// the modelled shape name of the resource, as for
+/// [`RESOURCE_TYPE_RESOLVER_ENDPOINT`].
+pub const RESOURCE_TYPE_RESOLVER_QUERY_LOG_CONFIG: &str = "ResolverQueryLogConfig";
+
+/// The most query logging configurations this store holds, for the same reason
+/// as [`MAX_STORED_ENDPOINTS`]: `CreateResolverQueryLogConfig` admits any unseen
+/// `CreatorRequestId`, so without a bound a caller looping creates would grow
+/// one emulator process without limit. A create past this count is REFUSED by
+/// [`ComAmazonawsRoute53resolverRoute53resolverState::can_store_another_query_log_config`]
+/// with the `LimitExceededException` the operation models; a retry of a
+/// `CreatorRequestId` already stored stays allowed, because it allocates no new
+/// record.
+pub const MAX_STORED_QUERY_LOG_CONFIGS: usize = 1_000;
+
+/// The destinations Resolver delivers query logs to, as
+/// `CreateResolverQueryLogConfig$DestinationArn` documents them — "an S3 bucket,
+/// a CloudWatch Logs log group, or a Kinesis Data Firehose delivery stream" —
+/// each as the `service` field its ARN carries together with the prefix that
+/// field's resource part must start with, from the examples the same doc gives
+/// (`arn:aws:s3:::amzn-s3-demo-bucket`,
+/// `arn:aws:logs:us-west-1:123456789012:log-group:/mystack-testgroup-12ABC1AB12A1:*`,
+/// `arn:aws:kinesis:us-east-2:0123456789:stream/my_stream_name`). A Firehose
+/// delivery stream also carries its own `firehose` service with a
+/// `deliverystream/` resource.
+const QUERY_LOG_DESTINATIONS: [(&str, &str); 4] = [
+    ("s3", ""),
+    ("logs", "log-group:"),
+    ("kinesis", "stream/"),
+    ("firehose", "deliverystream/"),
+];
+
+/// Whether `destination_arn` names one of the destinations Resolver can send
+/// query logs to, i.e. is an ARN
+/// (`arn:<partition>:<service>:<region>:<account>:<resource>`) whose service and
+/// resource are one of [`QUERY_LOG_DESTINATIONS`].
+///
+/// The model constrains `DestinationArn` only to length 1..600, so a string that
+/// names no such destination reaches the handler, which refuses it with the
+/// client error the operation models rather than storing a configuration whose
+/// logs could never be delivered.
+pub fn query_log_destination_is_wellformed(destination_arn: &str) -> bool {
+    let fields: Vec<&str> = destination_arn.splitn(6, ':').collect();
+    let [prefix, partition, service, _region, _account, resource] = fields.as_slice() else {
+        return false;
+    };
+    if *prefix != "arn" || partition.is_empty() || resource.is_empty() {
+        return false;
+    }
+    QUERY_LOG_DESTINATIONS
+        .iter()
+        .any(|(name, resource_prefix)| *name == *service && resource.starts_with(resource_prefix))
+}
+
+/// The form a query logging destination is STORED in.
+///
+/// A CloudWatch Logs log group is addressed by an ARN that may carry the `:*`
+/// log-stream wildcard
+/// (`arn:<partition>:logs:<region>:<account>:log-group:<name>:*`, the form
+/// `CreateResolverQueryLogConfig$DestinationArn`'s own example uses). That
+/// wildcard names every stream in the group rather than part of the group's
+/// identity, and the destination is the GROUP, so it is dropped and every read
+/// of the configuration reports the canonical log-group ARN. Every other
+/// destination is stored exactly as the request wrote it.
+pub fn canonical_query_log_destination(destination_arn: &str) -> String {
+    let fields: Vec<&str> = destination_arn.splitn(6, ':').collect();
+    if let [_, _, service, _, _, resource] = fields.as_slice() {
+        if *service == "logs" && resource.starts_with("log-group:") {
+            if let Some(group) = destination_arn.strip_suffix(":*") {
+                return group.to_string();
+            }
+        }
+    }
+    destination_arn.to_string()
+}
+
+/// The `InvalidParameterException` a query-logging write answers for a
+/// `DestinationArn` that names none of the destinations Resolver delivers to.
+///
+/// `InvalidParameterException` is "one or more parameters in this request are not
+/// valid" and the model gives it a `FieldName`, "the parameter that is not
+/// valid", so the refusal names the member that was rejected.
+pub fn invalid_query_log_destination(destination_arn: &str) -> InvalidParameterException {
+    InvalidParameterException {
+        message: format!(
+            "Invalid destination ARN \"{destination_arn}\": query logs can be sent only to an \
+             S3 bucket, a CloudWatch Logs log group or a Kinesis Data Firehose delivery stream."
+        ),
+        field_name: Some("DestinationArn".to_string()),
+    }
+}
+
+/// The `InvalidParameterException` a query-logging write answers for a `Name`
+/// the modelled pattern excludes but the boundary validator cannot refuse; see
+/// [`name_satisfies_pattern`] on why it reaches a handler at all.
+pub fn invalid_query_log_config_name(name: &str) -> InvalidParameterException {
+    InvalidParameterException {
+        message: format!(
+            "Invalid name \"{name}\": a query logging configuration name must carry at least one \
+             letter, digit, hyphen, underscore, apostrophe or space, and cannot consist of only \
+             digits."
+        ),
+        field_name: Some("Name".to_string()),
+    }
+}
+
+/// The `ResourceNotFoundException` the query-logging operations answer for an id
+/// they hold no configuration under, built here so every operation that resolves
+/// a `ResolverQueryLogConfigId` reports the same body. See
+/// [`outpost_resolver_not_found`] on the absent `RSLVR-nnnnn` service error code.
+pub fn resolver_query_log_config_not_found(
+    resolver_query_log_config_id: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            r#"Resolver query log config with ID "{resolver_query_log_config_id}" does not exist."#
+        )),
+        resource_type: Some(RESOURCE_TYPE_RESOLVER_QUERY_LOG_CONFIG.to_string()),
+    }
+}
+
+/// A Resolver query logging configuration, as stored.
+///
+/// `AssociationCount` is DERIVED from [`Self::associated_vpc_ids`] and never held
+/// separately — the same way [`FirewallDomainListRecord::domain_count`] derives
+/// from its domains — so the count and the associations cannot disagree.
+#[derive(Debug, Clone, Default)]
+pub struct ResolverQueryLogConfigRecord {
+    /// Position in the store's creation order, from
+    /// [`ComAmazonawsRoute53resolverRoute53resolverState::id_seq`]. It is the
+    /// list order and the source of the minted id.
+    pub seq: u64,
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    pub owner_id: String,
+    pub destination_arn: String,
+    pub creator_request_id: String,
+    /// The `ShareStatus` this configuration reports; the emulator has one
+    /// account, so it is [`SHARE_STATUS_NOT_SHARED`].
+    pub share_status: String,
+    /// The VPCs this configuration logs queries for, in association order —
+    /// what `AssociateResolverQueryLogConfig` adds to and
+    /// `DisassociateResolverQueryLogConfig` takes out of. A configuration is
+    /// created with none: "to specify which VPCs you want to log queries for,
+    /// you use AssociateResolverQueryLogConfig".
+    pub associated_vpc_ids: Vec<String>,
+    /// The `ResolverQueryLogConfigStatus` this configuration reports, as of
+    /// [`Self::settled_at`].
+    pub status: String,
+    /// `CreateResolverQueryLogConfig$Tags`, kept with the record so they are not
+    /// silently discarded. `ResolverQueryLogConfig` models no `Tags` member, so
+    /// no response reports them: `ListTagsForResource` is a separate operation.
+    pub tags: Vec<Tag>,
+    pub creation_time: String,
+    /// The instant at which the move from the transient [`Self::status`] to
+    /// [`QUERY_LOG_CONFIG_STATUS_CREATED`] is owed, or `None` for a
+    /// configuration with no transition in flight.
+    pub settled_at: Option<Instant>,
+}
+
+impl ResolverQueryLogConfigRecord {
+    /// `AssociationCount`: "The number of VPCs that are associated with the
+    /// query logging configuration."
+    pub fn association_count(&self) -> i32 {
+        i32::try_from(self.associated_vpc_ids.len()).unwrap_or(i32::MAX)
+    }
+
+    /// This configuration's `ResolverQueryLogConfigStatus` as of `now`: the
+    /// transient status until the transition the clock owes falls due,
+    /// [`QUERY_LOG_CONFIG_STATUS_CREATED`] after it, and the stored status
+    /// itself when no transition is owed — the same shape as
+    /// [`FirewallDomainListRecord::status_at`].
+    pub fn status_at(&self, now: Instant) -> &str {
+        match self.settled_at {
+            Some(due) if now < due => &self.status,
+            Some(_) => QUERY_LOG_CONFIG_STATUS_CREATED,
+            None => &self.status,
+        }
+    }
+
+    /// Project the record onto the modelled `ResolverQueryLogConfig`.
+    pub fn to_query_log_config(&self, now: Instant) -> ResolverQueryLogConfig {
+        ResolverQueryLogConfig {
+            id: Some(self.id.clone()),
+            owner_id: Some(self.owner_id.clone()),
+            status: Some(self.status_at(now).to_string()),
+            share_status: Some(self.share_status.clone()),
+            association_count: self.association_count(),
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            destination_arn: Some(self.destination_arn.clone()),
+            creator_request_id: Some(self.creator_request_id.clone()),
+            creation_time: Some(self.creation_time.clone()),
+        }
+    }
+}
+
+/// Mint the `Id` of a query logging configuration from the id sequence. AWS names
+/// one `rqlc-<hex>`. Every result fits `ResourceId` (length 1..64).
+pub fn mint_query_log_config_id(seq: u64) -> String {
+    format!("rqlc-{:016x}", scramble(seq))
+}
+
 /// The most tags one resource carries.
 ///
 /// The model's `TagList` is length 0..200 — it is both the list `TagResource`
@@ -2225,13 +2447,18 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 ///
 /// The segments are the ones the create operations mint an ARN out of
 /// (`resolver-endpoint/<id>`, `resolver-rule/<id>`, `outpost-resolver/<id>`,
-/// `firewall-domain-list/<id>`); the shape names are what every other refusal
-/// of this service reports in `ResourceNotFoundException$ResourceType`.
-const TAGGABLE_ARN_SEGMENTS: [(&str, &str); 4] = [
+/// `firewall-domain-list/<id>`, `resolver-query-log-config/<id>`); the shape
+/// names are what every other refusal of this service reports in
+/// `ResourceNotFoundException$ResourceType`.
+const TAGGABLE_ARN_SEGMENTS: [(&str, &str); 5] = [
     ("resolver-endpoint", RESOURCE_TYPE_RESOLVER_ENDPOINT),
     ("resolver-rule", RESOURCE_TYPE_RESOLVER_RULE),
     ("outpost-resolver", RESOURCE_TYPE_OUTPOST_RESOLVER),
     ("firewall-domain-list", RESOURCE_TYPE_FIREWALL_DOMAIN_LIST),
+    (
+        "resolver-query-log-config",
+        RESOURCE_TYPE_RESOLVER_QUERY_LOG_CONFIG,
+    ),
 ];
 
 /// The resource type an ARN states, when the ARN names one of this service's
@@ -2261,6 +2488,7 @@ pub enum TaggedResource {
     ResolverRule(String),
     OutpostResolver(String),
     FirewallDomainList(String),
+    ResolverQueryLogConfig(String),
 }
 
 /// The id an ARN names the resource by: everything after the last `/`, the
@@ -2399,6 +2627,13 @@ pub struct ComAmazonawsRoute53resolverRoute53resolverState {
     /// `CreatorRequestId` identifies a request to ONE operation, so this map is
     /// kept apart from theirs.
     pub firewall_domain_list_creator_request_ids: HashMap<String, String>,
+    /// Every stored Resolver query logging configuration, keyed by its `Id`.
+    pub resolver_query_log_configs: HashMap<String, ResolverQueryLogConfigRecord>,
+    /// `CreatorRequestId` -> query logging configuration id, the same retry
+    /// index as [`Self::creator_request_id_index`] for the other resources: a
+    /// `CreatorRequestId` identifies a request to ONE operation, so this map is
+    /// kept apart from theirs.
+    pub query_log_config_creator_request_ids: HashMap<String, String>,
     /// The configuration for DNSSEC validation of every VPC whose validation
     /// setting was moved off its default, keyed by that VPC's id
     /// (`ResolverDnssecConfig$ResourceId`).
@@ -2548,6 +2783,13 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
     /// refuses answers `LimitExceededException` and writes nothing.
     pub fn can_store_another_firewall_domain_list(&self) -> bool {
         self.firewall_domain_lists.len() < MAX_STORED_FIREWALL_DOMAIN_LISTS
+    }
+
+    /// Whether one more query logging configuration may be stored, i.e. the
+    /// store is still below [`MAX_STORED_QUERY_LOG_CONFIGS`]. A create that this
+    /// refuses answers `LimitExceededException` and writes nothing.
+    pub fn can_store_another_query_log_config(&self) -> bool {
+        self.resolver_query_log_configs.len() < MAX_STORED_QUERY_LOG_CONFIGS
     }
 
     /// Every stored Resolver on an Outpost in creation order — the order
@@ -2768,6 +3010,13 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
         {
             return Some(TaggedResource::FirewallDomainList(record.id.clone()));
         }
+        if let Some(record) = self
+            .resolver_query_log_configs
+            .values()
+            .find(|record| record.arn == resource_arn)
+        {
+            return Some(TaggedResource::ResolverQueryLogConfig(record.id.clone()));
+        }
         None
     }
 
@@ -2789,6 +3038,10 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
                 .map(|record| record.tags.as_slice()),
             TaggedResource::FirewallDomainList(id) => self
                 .firewall_domain_lists
+                .get(&id)
+                .map(|record| record.tags.as_slice()),
+            TaggedResource::ResolverQueryLogConfig(id) => self
+                .resolver_query_log_configs
                 .get(&id)
                 .map(|record| record.tags.as_slice()),
         }
@@ -2813,6 +3066,10 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
                 .map(|record| &mut record.tags),
             TaggedResource::FirewallDomainList(id) => self
                 .firewall_domain_lists
+                .get_mut(&id)
+                .map(|record| &mut record.tags),
+            TaggedResource::ResolverQueryLogConfig(id) => self
+                .resolver_query_log_configs
                 .get_mut(&id)
                 .map(|record| &mut record.tags),
         }

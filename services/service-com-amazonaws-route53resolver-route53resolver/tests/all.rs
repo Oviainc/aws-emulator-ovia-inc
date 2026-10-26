@@ -41,6 +41,8 @@ mod resolver_dnssec_configs;
 mod resolver_endpoint_ip_address_association;
 #[path = "all/resolver_endpoints.rs"]
 mod resolver_endpoints;
+#[path = "all/resolver_query_log_configs.rs"]
+mod resolver_query_log_configs;
 #[path = "all/resolver_rule_association_listing.rs"]
 mod resolver_rule_association_listing;
 #[path = "all/resolver_rule_deletion.rs"]
