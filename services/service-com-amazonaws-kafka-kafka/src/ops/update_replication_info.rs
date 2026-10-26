@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateReplicationInfo
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateReplicationInfo`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateReplicationInfo::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +76,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The message Amazon MSK refuses an update whose source/target pair addresses no
+/// configured replication with. A replication is addressed by the aliases of its
+/// two Kafka clusters, so a pair that names none of this replicator's
+/// replications identifies nothing to update — one fixed sentence, with no part
+/// taken from the request.
+const REPLICATION_INFO_ABSENT_MESSAGE: &str =
+    "The replication info specified with the kafka cluster aliases does not exist.";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,18 +158,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateReplicationInfo` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateReplicationInfoErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateReplicationInfo"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateReplicationInfoErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some("the kafka service state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+        if !crate::state::is_replicator_arn(&input.replicator_arn) {
+            return Err(
+                UpdateReplicationInfoErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some(crate::state::REPLICATOR_ARN_MEMBER.to_string()),
+                    message: Some(format!(
+                        "{} is not a valid Amazon MSK replicator ARN.",
+                        input.replicator_arn
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The ends of the replication this call addresses, as the ALIASES every
+        // reader of a replicator reports them under: a cluster is named by its
+        // Amazon MSK ARN or by its Apache Kafka cluster id, and both resolve to
+        // one alias through the service's single rule.
+        let addressed = crate::state::flow_cluster_alias(
+            input.source_kafka_cluster_arn.as_deref(),
+            input.source_kafka_cluster_id.as_deref(),
+        )
+        .zip(crate::state::flow_cluster_alias(
+            input.target_kafka_cluster_arn.as_deref(),
+            input.target_kafka_cluster_id.as_deref(),
+        ));
+
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+        // Resolved through the settling lookup, as the reader does: the version
+        // checked below and the state reported back are the replicator's own, so
+        // this call must see the transition the clock already owed it.
+        let Some(replicator) =
+            state.settled_replicator_in(&region, &input.replicator_arn, now)
+        else {
+            return Err(
+                UpdateReplicationInfoErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: Some(crate::state::REPLICATOR_ARN_MEMBER.to_string()),
+                    // The refusal names the input member that resolved to nothing
+                    // and says nothing about this endpoint's own state.
+                    message: Some(crate::state::parameter_not_found_message(
+                        crate::state::REPLICATOR_ARN_MEMBER,
+                    )),
+                })
+                .into(),
+            );
+        };
+        // WHICH replication the call changes is settled before the version it
+        // quotes: a request whose pair of cluster aliases addresses no configured
+        // replication asks to change something the replicator does not have,
+        // whatever version it quotes.
+        let addressed = addressed
+            .and_then(|(source, target)| replicator.replication_index_of(&source, &target));
+        let stored_version = replicator.current_version.clone();
+
+        let Some(index) = addressed else {
+            return Err(
+                UpdateReplicationInfoErrorModeled::BadRequestException(BadRequestException {
+                    // The pair as a whole addresses nothing; no single member of
+                    // it is at fault.
+                    invalid_parameter: None,
+                    message: Some(REPLICATION_INFO_ABSENT_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        };
+
+        // A quoted version must be the one the replicator is actually at; a stale
+        // one means the caller is changing a configuration it has not seen the
+        // latest of.
+        if input.current_version != stored_version {
+            return Err(
+                UpdateReplicationInfoErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("currentVersion".to_string()),
+                    message: Some(format!(
+                        "The replicator's current version is {stored_version}, not {}.",
+                        input.current_version
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The write counterpart of the lookup above, scoped to the same region,
+        // so the record changed here is the one just resolved.
+        let Some(replicator) = state.replicator_mut_in(&region, &input.replicator_arn) else {
+            // Unreachable: the lookup above resolved this replicator under the
+            // same lock. Reported as a server fault rather than silently
+            // answering as though the update had been applied.
+            return Err(
+                UpdateReplicationInfoErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some("the replicator could not be updated".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        replicator.apply_replication_update(
+            index,
+            now,
+            input.topic_replication,
+            input.consumer_group_replication,
+            input.log_delivery,
+        );
+        Ok(UpdateReplicationInfoOutput {
+            replicator_arn: Some(replicator.arn.clone()),
+            // Read off the record the update just changed, so the state this
+            // reports is the one `DescribeReplicator` reports a moment later.
+            replicator_state: Some(replicator.state.clone()),
+        })
     }
 }

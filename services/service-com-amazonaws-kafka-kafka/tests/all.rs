@@ -53,6 +53,8 @@ mod list_clusters_v2;
 mod node_listing;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
+#[path = "all/replication_info_update.rs"]
+mod replication_info_update;
 #[path = "all/replicator_lifecycle.rs"]
 mod replicator_lifecycle;
 #[path = "all/replicator_listing.rs"]

@@ -228,6 +228,7 @@ fn replicator(region: &str, name: &str, ordinal: u32) -> Replicator {
         creation_time: now,
         running_due: now + REPLICATOR_ACTIVATION_DELAY,
         state: REPLICATOR_STATE_CREATING.to_string(),
+        revision: 1,
         is_replicator_reference: false,
         kafka_clusters: Vec::new(),
         replication_info: Vec::new(),

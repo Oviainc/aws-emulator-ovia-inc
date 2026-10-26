@@ -95,7 +95,8 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     BrokerEBSVolumeInfo, BrokerNodeGroupInfo, BrokerNodeInfo, BrokerSoftwareInfo,
     ChannelLoggingInfo, ClientAuthentication, ClusterInfo, ClusterOperationInfo, Configuration,
-    ConfigurationInfo, ConfigurationRevision, ConnectivityInfo, CreateChannelInput,
+    ConfigurationInfo, ConfigurationRevision, ConnectivityInfo, ConsumerGroupReplicationUpdate,
+    CreateChannelInput,
     CreateClusterInput, CreateConfigurationInput, CreateReplicatorInput, CreateVpcConnectionInput,
     DescribeChannelOutput, EBSStorageInfo, EncryptionAtRest, EncryptionConfiguration,
     EncryptionInTransit, EncryptionInfo, IcebergDestinationConfiguration, JmxExporter,
@@ -105,7 +106,7 @@ use crate::ops::types::{
     ProvisionedThroughput, Rebalancing, ReplicationInfo, ReplicationInfoDescription,
     ReplicationInfoSummary, ReplicatorSummary, S3DestinationConfiguration, Serverless,
     ServerlessClientAuthentication, ServerlessConnectivityInfo, ServerlessRequest, StorageInfo,
-    TopicConfiguration, TopicInfo, VpcConfig, ZookeeperAccess,
+    TopicConfiguration, TopicInfo, TopicReplicationUpdate, VpcConfig, ZookeeperAccess,
 };
 
 /// How long after a cluster create a new cluster becomes `ACTIVE`.
@@ -1353,6 +1354,10 @@ pub const REPLICATOR_STATE_RUNNING: &str = "RUNNING";
 /// The `ReplicatorState` value a deleted replicator is reported in — the state
 /// `DeleteReplicator` answers with, another member of the same model enum.
 pub const REPLICATOR_STATE_DELETING: &str = "DELETING";
+/// The `ReplicatorState` value a replicator holds while a configuration change
+/// it accepted is being rolled out, until the clock owes it
+/// [`REPLICATOR_STATE_RUNNING`] again — another member of the same model enum.
+pub const REPLICATOR_STATE_UPDATING: &str = "UPDATING";
 
 /// One Kafka cluster a replicator replicates between, under the alias the
 /// replicator knows it by.
@@ -1433,14 +1438,19 @@ pub struct Replicator {
     /// also half of its registry key.
     pub region: String,
     pub current_version: String,
+    /// Which revision of its configuration the replicator is at.
+    /// [`Replicator::current_version`] is this number's token, so the version
+    /// changes exactly when an accepted update changes the replicator.
+    pub revision: u64,
     /// `ReplicatorDescription` — the summary description the request carried, if
     /// any.
     pub description: Option<String>,
     /// The IAM role the replicator uses to reach the source and target clusters.
     pub service_execution_role_arn: String,
     pub creation_time: SystemTime,
-    /// The instant the clock owes this replicator its `CREATING` -> `RUNNING`
-    /// transition. Stored, never slept on.
+    /// The instant the clock owes this replicator its transition into
+    /// `RUNNING`: from `CREATING` after the create, and from `UPDATING` after an
+    /// accepted configuration change. Stored, never slept on.
     pub running_due: SystemTime,
     /// A `ReplicatorState` value.
     pub state: String,
@@ -1502,6 +1512,7 @@ impl Replicator {
             .collect();
         Self {
             current_version: current_version_token(&arn, 1),
+            revision: 1,
             resource_arn: arn.clone(),
             arn,
             name: input.replicator_name,
@@ -1539,13 +1550,96 @@ impl Replicator {
         }
     }
 
-    /// Apply the `CREATING` -> `RUNNING` transition once `now` has reached
-    /// [`Self::running_due`]. Idempotent, and a no-op for every other state: only
-    /// a transition the clock already owed is materialised here.
+    /// Apply the transition into `RUNNING` once `now` has reached
+    /// [`Self::running_due`] — out of `CREATING` after the create and out of
+    /// `UPDATING` after an accepted change, the two non-terminal states a
+    /// replicator of this registry is reported in. Idempotent, and a no-op for
+    /// every other state: only a transition the clock already owed is
+    /// materialised here.
     pub fn settle(&mut self, now: SystemTime) {
-        if self.state == REPLICATOR_STATE_CREATING && now >= self.running_due {
+        let settling = self.state == REPLICATOR_STATE_CREATING
+            || self.state == REPLICATOR_STATE_UPDATING;
+        if settling && now >= self.running_due {
             self.state = REPLICATOR_STATE_RUNNING.to_string();
         }
+    }
+
+    /// The position in [`Self::replication_info`] of the replication running
+    /// between the clusters the aliases `source` and `target` name, or `None`
+    /// when this replicator configures no replication for that ordered pair.
+    ///
+    /// A replication is addressed by the ALIASES of its two ends — the same way
+    /// every reader reports it — so an end given as an Amazon MSK cluster ARN and
+    /// the same end given as an Apache Kafka cluster id resolve through one rule,
+    /// [`flow_cluster_alias`]. The pair is ORDERED: the aliases of a configured
+    /// replication named the other way round address no replication.
+    pub fn replication_index_of(&self, source: &str, target: &str) -> Option<usize> {
+        self.replication_info.iter().position(|info| {
+            let configured_source = flow_cluster_alias(
+                info.source_kafka_cluster_arn.as_deref(),
+                info.source_kafka_cluster_id.as_deref(),
+            );
+            let configured_target = flow_cluster_alias(
+                info.target_kafka_cluster_arn.as_deref(),
+                info.target_kafka_cluster_id.as_deref(),
+            );
+            configured_source.is_some_and(|alias| alias == source)
+                && configured_target.is_some_and(|alias| alias == target)
+        })
+    }
+
+    /// Fold an accepted replication-info update into the stored record: replace
+    /// the members the update shapes carry on the replication at `index`, take
+    /// the submitted log delivery when the request carried one, bump the
+    /// replicator's revision — and so its `CurrentVersion` token — and move it to
+    /// `UPDATING` with the instant the clock owes it `RUNNING` again.
+    ///
+    /// `TopicReplicationUpdate` and `ConsumerGroupReplicationUpdate` model every
+    /// member they carry as required, so each one SETS that member of the stored
+    /// configuration; the members those shapes do not model (a topic
+    /// replication's starting position and topic-name configuration, a consumer
+    /// group replication's offset sync mode) are not part of the update and keep
+    /// the values the record already holds.
+    ///
+    /// A no-op for an `index` the record does not hold, so a caller of this
+    /// module cannot change a replicator's version without changing its
+    /// configuration.
+    pub fn apply_replication_update(
+        &mut self,
+        index: usize,
+        now: SystemTime,
+        topic_replication: Option<TopicReplicationUpdate>,
+        consumer_group_replication: Option<ConsumerGroupReplicationUpdate>,
+        log_delivery: Option<LogDelivery>,
+    ) {
+        let Some(info) = self.replication_info.get_mut(index) else {
+            return;
+        };
+        if let Some(update) = topic_replication {
+            let stored = &mut info.topic_replication;
+            stored.copy_access_control_lists_for_topics =
+                Some(update.copy_access_control_lists_for_topics);
+            stored.copy_topic_configurations = Some(update.copy_topic_configurations);
+            stored.detect_and_copy_new_topics = Some(update.detect_and_copy_new_topics);
+            stored.topics_to_exclude = Some(update.topics_to_exclude);
+            stored.topics_to_replicate = update.topics_to_replicate;
+        }
+        if let Some(update) = consumer_group_replication {
+            let stored = &mut info.consumer_group_replication;
+            stored.consumer_groups_to_exclude = Some(update.consumer_groups_to_exclude);
+            stored.consumer_groups_to_replicate = update.consumer_groups_to_replicate;
+            stored.detect_and_copy_new_consumer_groups =
+                Some(update.detect_and_copy_new_consumer_groups);
+            stored.synchronise_consumer_group_offsets =
+                Some(update.synchronise_consumer_group_offsets);
+        }
+        if log_delivery.is_some() {
+            self.log_delivery = log_delivery;
+        }
+        self.revision += 1;
+        self.current_version = current_version_token(&self.arn, self.revision);
+        self.state = REPLICATOR_STATE_UPDATING.to_string();
+        self.running_due = now + REPLICATOR_ACTIVATION_DELAY;
     }
 
     /// The alias of the stored cluster an endpoint of a `ReplicationInfo` names,
