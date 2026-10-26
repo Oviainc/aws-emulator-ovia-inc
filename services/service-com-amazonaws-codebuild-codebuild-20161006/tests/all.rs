@@ -31,6 +31,8 @@ mod list_sandboxes_for_project;
 mod list_sandboxes_for_project_paging;
 #[path = "all/list_shared_projects.rs"]
 mod list_shared_projects;
+#[path = "all/list_shared_report_groups.rs"]
+mod list_shared_report_groups;
 #[path = "all/project_build_batch_lifecycle.rs"]
 mod project_build_batch_lifecycle;
 #[path = "all/project_build_lifecycle.rs"]

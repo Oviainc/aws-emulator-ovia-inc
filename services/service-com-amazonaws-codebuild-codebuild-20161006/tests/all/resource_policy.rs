@@ -13,7 +13,11 @@
 //! resource of this account is refused with `ResourceNotFoundException`, and a value
 //! that is not the ARN of a resource a policy attaches to, or a policy that is not a
 //! JSON document, with `InvalidInputException`; and the policy lives and dies with the
-//! resource it is attached to.
+//! resource it is attached to. Sharing a resource is READ-ONLY sharing, so a document
+//! containing any action outside the read-only consumer set of the kind of resource the
+//! ARN names is refused with `InvalidInputException` and stores nothing.
+//! `DeleteResourcePolicy` removes the attachment, which unshares the resource, and
+//! models no not-found error, so removing an attachment that is not there is accepted.
 //!
 //! The harness (`call`, `create_project`, `emulator`, `emulator_on`, `error_type`,
 //! `REGION`) is the one `project_build_lifecycle` already drives this service with, and
@@ -128,6 +132,19 @@ async fn refusal(
     answer["message"].as_str().unwrap_or_default().to_string()
 }
 
+/// One read-only consumer action a policy on `arn` may grant, picked for the KIND of
+/// resource the ARN names — the sets differ per kind, so a project's grant is not a
+/// report group's. Sources: the CodeBuild user guide's "Sharing a project" and "Sharing
+/// a report group" permission pages, as
+/// `state::PolicyTarget::shareable_actions` records them.
+fn shareable_action(arn: &str) -> &'static str {
+    if arn.contains(":report-group/") {
+        "codebuild:BatchGetReportGroups"
+    } else {
+        "codebuild:BatchGetProjects"
+    }
+}
+
 /// A sharing policy document whose `Sid` is `label` — one of the grants the CodeBuild
 /// user guide's "Sharing a Project" describes. Built with `serde_json`, so the rows that
 /// vary the LABEL vary only the document's content, not its shape.
@@ -138,7 +155,7 @@ fn sharing_policy(arn: &str, label: &str) -> String {
             "Sid": label,
             "Effect": "Allow",
             "Principal": {"AWS": "arn:aws:iam::222222222222:root"},
-            "Action": ["codebuild:BatchGetProjects"],
+            "Action": [shareable_action(arn)],
             "Resource": arn,
         }],
     })
@@ -168,11 +185,12 @@ fn documents(arn: &str) -> Vec<(String, String)> {
         .collect();
     // Formatting a re-serializer would normalise away: newlines, tabs and padding
     // between the members, and the members in an order no canonical form keeps.
+    let action = shareable_action(arn);
     rows.push((
         "pretty printed with tabs".to_string(),
         format!(
             "{{\n\t\"Statement\" : [\n\t\t{{\n\t\t\t\"Resource\":   \"{arn}\",\n\t\t\t\
-             \"Action\": \"codebuild:*\",\n\t\t\t\"Effect\" : \"Allow\",\n\t\t\t\
+             \"Action\": \"{action}\",\n\t\t\t\"Effect\" : \"Allow\",\n\t\t\t\
              \"Principal\": {{\"AWS\": \"*\"}}\n\t\t}}\n\t],\n\t\
              \"Version\":\"2012-10-17\"\n}}"
         ),
@@ -245,7 +263,7 @@ async fn a_stored_policy_round_trips_byte_for_byte_for_either_resource_kind() {
             )
             .await;
             assert_eq!(
-                message, "Resource policy does not exist",
+                message, "Resource ARN resource policy does not exist",
                 "case {case:?}: a sibling resource carries no policy, got {message:?}"
             );
         }
@@ -266,6 +284,24 @@ async fn a_stored_policy_round_trips_byte_for_byte_for_either_resource_kind() {
             Some(&expected),
             "{kind:?}: the shared listing must report exactly the projects carrying a \
              policy, got {listed}"
+        );
+
+        // The mirror for the other resource kind: a report group carrying a policy is
+        // what the account shares, and a project's policy lists no report group.
+        let (status, groups) = call(&router, "ListSharedReportGroups", json!({})).await;
+        assert_eq!(
+            status, 200,
+            "{kind:?}: ListSharedReportGroups must succeed, got {status} with {groups}"
+        );
+        let expected: Vec<Value> = match kind {
+            Kind::Project => vec![],
+            Kind::ReportGroup => vec![json!(arn)],
+        };
+        assert_eq!(
+            groups["reportGroups"].as_array(),
+            Some(&expected),
+            "{kind:?}: the shared listing must report exactly the report groups carrying \
+             a policy, got {groups}"
         );
     }
 }
@@ -388,7 +424,7 @@ async fn an_arn_this_account_holds_no_resource_for_is_refused_as_not_found() {
         )
         .await;
         assert_eq!(
-            message, "Resource policy does not exist",
+            message, "Resource ARN resource policy does not exist",
             "case {case:?}: a refused write must store nothing, got {message:?}"
         );
     }
@@ -446,7 +482,7 @@ async fn a_malformed_request_is_refused_as_invalid_input() {
             let case = format!("{operation}, {case}");
             let message = refusal(&router, &case, operation, body, "InvalidInputException").await;
             assert_eq!(
-                message, "Invalid resource ARN",
+                message, "Resource ARN is invalid",
                 "case {case:?}: expected CodeBuild's invalid-ARN sentence, got {message:?}"
             );
             assert!(
@@ -480,7 +516,7 @@ async fn a_malformed_request_is_refused_as_invalid_input() {
         )
         .await;
         assert_eq!(
-            message, "Invalid policy document",
+            message, "Problem parsing given policy",
             "case {case:?}: expected CodeBuild's invalid-document sentence, got {message:?}"
         );
         assert!(
@@ -497,7 +533,7 @@ async fn a_malformed_request_is_refused_as_invalid_input() {
         )
         .await;
         assert_eq!(
-            message, "Resource policy does not exist",
+            message, "Resource ARN resource policy does not exist",
             "case {case:?}: a refused write must store nothing, got {message:?}"
         );
     }
@@ -554,7 +590,7 @@ async fn deleting_the_resource_drops_the_policy_attached_to_it() {
         )
         .await;
         assert_eq!(
-            message, "Resource policy does not exist",
+            message, "Resource ARN resource policy does not exist",
             "{operation}: the deleted resource's policy must be gone, got {message:?}"
         );
 
@@ -574,8 +610,436 @@ async fn deleting_the_resource_drops_the_policy_attached_to_it() {
         )
         .await;
         assert_eq!(
-            message, "Resource policy does not exist",
+            message, "Resource ARN resource policy does not exist",
             "{operation}: a recreated resource carries no earlier grant, got {message:?}"
         );
     }
+}
+
+/// The IAM principal every statement below grants to — a fixed account root, so no row
+/// varies in anything but the ACTIONS it names.
+const PRINCIPAL: &str = "arn:aws:iam::222222222222:root";
+
+/// Per resource kind: the resource-type token CodeBuild names the kind by when it
+/// refuses a policy for it, the read-only consumer actions a policy on that kind may
+/// grant, and actions it may not.
+///
+/// The allowed sets are hand-written from the CodeBuild user guide's sharing-permission
+/// pages ("Sharing a report group" lists the four report-group actions, "Sharing a
+/// project" the three project ones); the model types `policy` only as a
+/// `NonEmptyString`, so neither set is modelled. The disallowed rows span a delete, an
+/// update and a start on the kind itself, plus the OTHER kind's read action — which is
+/// how the two sets are shown to be per-kind rather than one shared list.
+fn policy_actions(kind: Kind) -> (&'static str, &'static [&'static str], &'static [&'static str]) {
+    match kind {
+        Kind::Project => (
+            "codebuild:Project",
+            &[
+                "codebuild:BatchGetProjects",
+                "codebuild:BatchGetBuilds",
+                "codebuild:ListBuildsForProject",
+            ],
+            &[
+                "codebuild:DeleteProject",
+                "codebuild:UpdateProject",
+                "codebuild:StartBuild",
+                "codebuild:BatchGetReportGroups",
+            ],
+        ),
+        Kind::ReportGroup => (
+            "codebuild:ReportGroup",
+            &[
+                "codebuild:BatchGetReportGroups",
+                "codebuild:BatchGetReports",
+                "codebuild:ListReportsForReportGroup",
+                "codebuild:DescribeTestCases",
+            ],
+            &[
+                "codebuild:DeleteReportGroup",
+                "codebuild:UpdateReportGroup",
+                "codebuild:CreateReportGroup",
+                "codebuild:BatchGetProjects",
+            ],
+        ),
+    }
+}
+
+/// One statement granting `action` — a single action or a list of them — on `arn`.
+fn statement(action: Value, arn: &str) -> Value {
+    json!({
+        "Sid": "Shared",
+        "Effect": "Allow",
+        "Principal": {"AWS": PRINCIPAL},
+        "Action": action,
+        "Resource": arn,
+    })
+}
+
+/// A document whose `Statement` is `statements` — itself either one statement or a list.
+fn policy_of(statements: Value) -> String {
+    json!({"Version": "2012-10-17", "Statement": statements}).to_string()
+}
+
+/// The documents a policy write on `kind` must REFUSE: every form in which a document
+/// can contain an action outside the kind's read-only set.
+fn documents_containing_a_disallowed_action(kind: Kind, arn: &str) -> Vec<(String, String)> {
+    let (_, allowed, disallowed) = policy_actions(kind);
+    let mut rows: Vec<(String, String)> = disallowed
+        .iter()
+        .map(|action| {
+            (
+                format!("grants {action}"),
+                policy_of(json!([statement(json!(action), arn)])),
+            )
+        })
+        .collect();
+    rows.extend([
+        (
+            "a list mixing an allowed and a disallowed action".to_string(),
+            policy_of(json!([statement(
+                json!([allowed[0], disallowed[0]]),
+                arn
+            )])),
+        ),
+        (
+            "a wildcard over the service".to_string(),
+            policy_of(json!([statement(json!("codebuild:*"), arn)])),
+        ),
+        (
+            "a wildcard over everything".to_string(),
+            policy_of(json!([statement(json!("*"), arn)])),
+        ),
+        (
+            "another service's action".to_string(),
+            policy_of(json!([statement(json!("s3:GetObject"), arn)])),
+        ),
+        (
+            "an action that is not a string".to_string(),
+            policy_of(json!([statement(json!(42), arn)])),
+        ),
+        (
+            "one statement rather than a list of them".to_string(),
+            policy_of(statement(json!(disallowed[0]), arn)),
+        ),
+        (
+            "a disallowed statement after an allowed one".to_string(),
+            policy_of(json!([
+                statement(json!(allowed[0]), arn),
+                statement(json!(disallowed[0]), arn),
+            ])),
+        ),
+        (
+            // A document names an action whatever case its member names are written in,
+            // so casing cannot carry a grant past the check.
+            "member names in another case".to_string(),
+            json!({
+                "version": "2012-10-17",
+                "statement": [{
+                    "effect": "Allow",
+                    "principal": {"AWS": PRINCIPAL},
+                    "action": disallowed[0],
+                    "resource": arn,
+                }],
+            })
+            .to_string(),
+        ),
+        (
+            // The refusal is about what the document CONTAINS, so the effect a
+            // disallowed action is named under does not matter.
+            "a disallowed action under Deny".to_string(),
+            policy_of(json!([{
+                "Effect": "Deny",
+                "Principal": {"AWS": PRINCIPAL},
+                "Action": disallowed[0],
+                "Resource": arn,
+            }])),
+        ),
+    ]);
+    rows
+}
+
+/// The documents a policy write on `kind` must ACCEPT: every read-only action of the
+/// kind's own set, the whole set at once, that set written in another case (an action
+/// names the same operation however it is cased), and documents that name no action at
+/// all.
+fn documents_containing_only_shareable_actions(kind: Kind, arn: &str) -> Vec<(String, String)> {
+    let (_, allowed, _) = policy_actions(kind);
+    let mut rows: Vec<(String, String)> = allowed
+        .iter()
+        .map(|action| {
+            (
+                format!("grants only {action}"),
+                policy_of(json!([statement(json!(action), arn)])),
+            )
+        })
+        .collect();
+    rows.extend([
+        (
+            "grants the whole read-only set".to_string(),
+            policy_of(json!([statement(json!(allowed), arn)])),
+        ),
+        (
+            "grants a read-only action in another case".to_string(),
+            policy_of(json!([statement(
+                json!(allowed[0].to_lowercase()),
+                arn
+            )])),
+        ),
+        (
+            "a statement naming no action".to_string(),
+            policy_of(json!([{
+                "Effect": "Allow",
+                "Principal": {"AWS": PRINCIPAL},
+                "Resource": arn,
+            }])),
+        ),
+        ("a document with no statement".to_string(), "{}".to_string()),
+    ]);
+    rows
+}
+
+/// RULE: sharing a CodeBuild resource gives a consumer READ access to it, so a policy
+/// may contain only the read-only consumer actions of the kind of resource its ARN
+/// names; a document containing any other action is refused with
+/// `InvalidInputException`, naming that kind, and nothing is stored or replaced.
+#[tokio::test]
+async fn a_policy_containing_an_action_outside_the_kinds_read_only_set_is_refused() {
+    for kind in KINDS {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let router = emulator_on(Arc::clone(&engine));
+        let arn = create_target(&router, kind, "action-checked").await;
+        let (resource_type, _, _) = policy_actions(kind);
+        let expected = format!(
+            "Proposed policy was not valid: InvalidPolicy: Input policy containing action \
+             that is not allowed for resource type {resource_type}"
+        );
+
+        // Nothing has been stored yet, so each refusal must leave the ARN carrying no
+        // policy at all.
+        for (case, document) in documents_containing_a_disallowed_action(kind, &arn) {
+            let case = format!("{kind:?}, {case}");
+            let message = refusal(
+                &router,
+                &case,
+                "PutResourcePolicy",
+                json!({"resourceArn": arn, "policy": document}),
+                "InvalidInputException",
+            )
+            .await;
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected CodeBuild's disallowed-action sentence, got {message:?}"
+            );
+            assert!(
+                !message.contains(document.as_str()),
+                "case {case:?}: the sentence must not echo the document, got {message:?}"
+            );
+            let absent = refusal(
+                &router,
+                &case,
+                "GetResourcePolicy",
+                json!({"resourceArn": arn}),
+                "ResourceNotFoundException",
+            )
+            .await;
+            assert_eq!(
+                absent, "Resource ARN resource policy does not exist",
+                "case {case:?}: a refused write must store nothing, got {absent:?}"
+            );
+        }
+
+        // The positive controls: the same resource takes a document whose actions are
+        // all read-only ones, and hands it back verbatim.
+        for (case, document) in documents_containing_only_shareable_actions(kind, &arn) {
+            let case = format!("{kind:?}, {case}");
+            put(&router, &case, &arn, &document).await;
+            let read = get(&router, &case, &arn).await;
+            assert_eq!(
+                read, document,
+                "case {case:?}: a read-only grant must round-trip verbatim, got {read:?}"
+            );
+        }
+
+        // A refused write leaves the document already in force untouched — it neither
+        // stores nor clobbers.
+        let in_force = sharing_policy(&arn, "in-force");
+        put(&router, "the grant in force", &arn, &in_force).await;
+        for (case, document) in documents_containing_a_disallowed_action(kind, &arn) {
+            let case = format!("{kind:?}, {case}, over a stored grant");
+            let message = refusal(
+                &router,
+                &case,
+                "PutResourcePolicy",
+                json!({"resourceArn": arn, "policy": document}),
+                "InvalidInputException",
+            )
+            .await;
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected CodeBuild's disallowed-action sentence, got {message:?}"
+            );
+            let read = get(&router, &case, &arn).await;
+            assert_eq!(
+                read, in_force,
+                "case {case:?}: a refused write must leave the stored grant in force, got {read:?}"
+            );
+        }
+
+        assert_eq!(
+            engine
+                .state::<CodeBuildState>()
+                .lock()
+                .resource_policies
+                .len(),
+            1,
+            "{kind:?}: only the one accepted grant may be held"
+        );
+    }
+}
+
+/// Delete the policy attached to `arn`, asserting the call succeeded and answered a body
+/// with no members (`DeleteResourcePolicyOutput` declares none).
+async fn delete(router: &MultiServiceRouter, case: &str, arn: &str) {
+    let (status, body) = call(router, "DeleteResourcePolicy", json!({"resourceArn": arn})).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: DeleteResourcePolicy must succeed, got {status} with {body}"
+    );
+    let empty = match &body {
+        Value::Null => true,
+        Value::Object(members) => members.is_empty(),
+        _ => false,
+    };
+    assert!(
+        empty,
+        "case {case:?}: the answer carries no members, got {body}"
+    );
+}
+
+/// RULE: deleting the attachment unshares the resource — the document leaves the store
+/// and a read reports the absent policy — and the operation models no not-found error, so
+/// deleting an attachment that is not there is accepted and changes nothing.
+#[tokio::test]
+async fn deleting_the_policy_unshares_the_resource_and_is_idempotent() {
+    for kind in KINDS {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let router = emulator_on(Arc::clone(&engine));
+        let arn = create_target(&router, kind, "unshared").await;
+        // A sibling of the same kind, shared and left alone: the attachment is keyed by
+        // ARN, so one resource's delete must never reach another's grant.
+        let sibling = create_target(&router, kind, "unshared-sibling").await;
+        let sibling_document = sharing_policy(&sibling, "sibling-grant");
+        put(&router, "the sibling's grant", &sibling, &sibling_document).await;
+
+        // Rows: a delete that removes a stored grant, two that find nothing left to
+        // remove (so the call is idempotent), and a delete of a grant stored again after
+        // one was removed.
+        let rows = [
+            ("a stored grant", true),
+            ("nothing left to remove", false),
+            ("still nothing left to remove", false),
+            ("a grant stored again", true),
+        ];
+        for (case, stored_first) in rows {
+            let case = format!("{kind:?}, {case}");
+            if stored_first {
+                let document = sharing_policy(&arn, "grant");
+                put(&router, &case, &arn, &document).await;
+                assert_eq!(
+                    get(&router, &case, &arn).await,
+                    document,
+                    "case {case:?}: the grant is in force before the delete"
+                );
+            }
+            delete(&router, &case, &arn).await;
+            let message = refusal(
+                &router,
+                &case,
+                "GetResourcePolicy",
+                json!({"resourceArn": arn}),
+                "ResourceNotFoundException",
+            )
+            .await;
+            assert_eq!(
+                message, "Resource ARN resource policy does not exist",
+                "case {case:?}: the unshared resource carries no policy, got {message:?}"
+            );
+            assert_eq!(
+                get(&router, &case, &sibling).await,
+                sibling_document,
+                "case {case:?}: the sibling's grant must survive another ARN's delete"
+            );
+        }
+
+        // The resource itself survives being unshared: only the attachment was removed,
+        // so the same ARN takes a policy again.
+        let again = sharing_policy(&arn, "shared-again");
+        put(&router, "shared again", &arn, &again).await;
+        assert_eq!(
+            get(&router, "shared again", &arn).await,
+            again,
+            "{kind:?}: an unshared resource can be shared again"
+        );
+        let held: Vec<String> = engine
+            .state::<CodeBuildState>()
+            .lock()
+            .resource_policies
+            .keys()
+            .cloned()
+            .collect();
+        let mut expected = vec![arn.clone(), sibling.clone()];
+        expected.sort();
+        assert_eq!(
+            held, expected,
+            "{kind:?}: exactly the two shared resources may be held"
+        );
+    }
+}
+
+/// RULE: a value that is not the ARN of a resource a policy attaches to is a malformed
+/// input on the DELETE path too, refused with `InvalidInputException` and CodeBuild's
+/// invalid-ARN sentence, and nothing stored is touched.
+#[tokio::test]
+async fn deleting_a_policy_from_a_value_that_is_not_a_policy_target_is_refused() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(Arc::clone(&engine));
+    let arn = create_target(&router, Kind::Project, "delete-validated").await;
+    let document = sharing_policy(&arn, "grant");
+    put(&router, "the grant in force", &arn, &document).await;
+
+    // The same class of values the write and the read path refuse: ARNs of CodeBuild
+    // resources a policy does not attach to, another service's ARN, and values that are
+    // not ARNs at all.
+    let not_a_target = [
+        ("a build ARN", state::build_arn(REGION, "delete-validated:1111")),
+        ("a report ARN", state::report_arn(REGION, "group", "2222")),
+        ("another service's ARN", "arn:aws:s3:::bucket/key".to_string()),
+        ("a bare project name", "delete-validated".to_string()),
+        ("text that is not an ARN", "not-an-arn".to_string()),
+    ];
+    for (case, value) in not_a_target {
+        let message = refusal(
+            &router,
+            case,
+            "DeleteResourcePolicy",
+            json!({"resourceArn": value}),
+            "InvalidInputException",
+        )
+        .await;
+        assert_eq!(
+            message, "Resource ARN is invalid",
+            "case {case:?}: expected CodeBuild's invalid-ARN sentence, got {message:?}"
+        );
+        assert!(
+            !message.contains(&value),
+            "case {case:?}: the sentence must not echo the value, got {message:?}"
+        );
+    }
+
+    // A refused delete removed nothing.
+    assert_eq!(
+        get(&router, "the grant in force", &arn).await,
+        document,
+        "a refused delete must leave the stored grant in force"
+    );
 }
