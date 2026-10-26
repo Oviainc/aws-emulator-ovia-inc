@@ -53,6 +53,8 @@ mod report_group_reads;
 mod resource_policy;
 #[path = "all/retry_build.rs"]
 mod retry_build;
+#[path = "all/sandbox_connection.rs"]
+mod sandbox_connection;
 #[path = "all/sandbox_lifecycle.rs"]
 mod sandbox_lifecycle;
 #[path = "all/sandbox_sessions.rs"]

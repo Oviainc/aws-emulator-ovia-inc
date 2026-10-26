@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartSandboxConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartSandboxConnection`'s real behaviour. Implement it here — this is
+//! Starts a Session Manager connection into a stored sandbox and persists it: this is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartSandboxConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A connection is a session INTO the sandbox's live session, so it needs one to act
+//! on: a sandbox that is still queued, or that has stopped or timed out, is refused,
+//! and an id no sandbox answers to is refused as not found. Each call starts its OWN
+//! session — a fresh session id, its own token and its own data-channel URL — and that
+//! session is persisted ([`crate::state::StoredSandboxConnection`]) for as long as it
+//! can be used, which is as long as the sandbox session it connects to lives.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +137,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartSandboxConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartSandboxConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartSandboxConnection"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "StartSandboxConnection (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_millis();
+
+        // `sandboxId` is documented as "A sandboxId or sandboxArn", so either form names
+        // the same record — the rewrite every sandbox-addressing operation shares.
+        let store_id = crate::state::sandbox_store_id(&input.sandbox_id);
+
+        // READ PASS: hold the shared lock only long enough to resolve the sandbox and
+        // read what the connection's life is bounded by, then release it so minting the
+        // token below does not run inside the critical section every other CodeBuild
+        // request shares. The WRITE PASS re-asserts both.
+        let (sandbox_id, expires_millis) = {
+            let mut guard = state.lock();
+            let Some(stored) = guard.settled_sandbox(store_id, now) else {
+                return Err(sandbox_not_found());
+            };
+            if !stored.is_running() {
+                return Err(invalid_build_phase(stored));
+            }
+            // Addressed by its own id from here on, so an ARN in the request mints a
+            // connection to the sandbox it names.
+            (
+                stored
+                    .sandbox
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| store_id.to_string()),
+                stored.timeout_due_millis(),
+            )
+        };
+
+        // The token is a secret handed to the caller and is minted by the emulator's
+        // credential store, never built here. A store that minted nothing leaves the
+        // operation to refuse rather than report a token it made up — and the request
+        // itself was never the problem, so it is not refused as invalid input.
+        let Some(token_value) = crate::state::mint_ssm_session_token(ctx.credential_store()) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "StartSandboxConnection (no session token could be minted)",
+            ));
+        };
+
+        // WRITE PASS: one critical section that re-asserts what the read pass saw and
+        // then allocates the sequence number and persists the session together, so a
+        // sandbox stopped while this request was resolving cannot end up with a
+        // connection started after it.
+        let mut guard = state.lock();
+        let Some(stored) = guard.settled_sandbox(store_id, now) else {
+            return Err(sandbox_not_found());
+        };
+        if !stored.is_running() {
+            return Err(invalid_build_phase(stored));
+        }
+        let connection_number = guard.allocate_sandbox_connection_number(&sandbox_id);
+        let session_id = crate::state::ssm_session_id(&sandbox_id, connection_number, now);
+        let ssm_session = SSMSession {
+            session_id: Some(session_id.clone()),
+            token_value: Some(token_value),
+            stream_url: Some(crate::state::ssm_stream_url(&region, &session_id)),
+        };
+        guard.record_sandbox_connection(
+            session_id,
+            crate::state::StoredSandboxConnection {
+                ssm_session: ssm_session.clone(),
+                sandbox_id,
+                started_millis: now,
+                expires_millis,
+            },
+            now,
+        );
+
+        Ok(StartSandboxConnectionOutput {
+            ssm_session: Some(ssm_session),
+        })
     }
 }
+
+/// The modelled refusal for a `sandboxId` no sandbox of this account answers to.
+///
+/// Worded by the one sentence CodeBuild answers an unresolvable sandbox with
+/// ([`crate::state::SANDBOX_NOT_FOUND_MESSAGE`]), which names no identifier — so nothing
+/// about the request, and no ARN for a sandbox that does not exist, reaches the wire.
+fn sandbox_not_found() -> StartSandboxConnectionError {
+    StartSandboxConnectionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::SANDBOX_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// The modelled refusal for a sandbox the request resolved to whose session is not live:
+/// a connection is a session INTO the sandbox's live session, so there is nothing to
+/// connect to from any other phase — one still in the queue has no container yet, and one
+/// that stopped or timed out has completed.
+///
+/// CodeBuild states that refusal as one clause whose only variable part is the phase the
+/// sandbox's own session is sitting in, so the phase comes off the record rather than out
+/// of the request. A record carrying no session at all reports the status it reached
+/// instead, which is the only phase-like value it has.
+fn invalid_build_phase(stored: &crate::state::StoredSandbox) -> StartSandboxConnectionError {
+    let phase = stored
+        .sandbox
+        .current_session
+        .as_ref()
+        .and_then(|session| session.current_phase.clone())
+        .or_else(|| stored.sandbox.status.clone())
+        .unwrap_or_default();
+    StartSandboxConnectionErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(format!(
+            "Sandbox found with invalid build phase to start connection: {phase}"
+        )),
+    })
+    .into()
+}
+

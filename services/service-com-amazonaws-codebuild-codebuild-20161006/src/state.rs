@@ -10,6 +10,7 @@
 //! [`StoredBuild`], `StartBuildBatch` writes a [`StoredBuildBatch`],
 //! `StartSandbox` writes a [`StoredSandbox`] and `StopSandbox` ends one,
 //! `StartCommandExecution` writes a [`StoredCommandExecution`],
+//! `StartSandboxConnection` writes a [`StoredSandboxConnection`],
 //! `CreateReportGroup` writes a [`StoredReportGroup`] and `DeleteReportGroup`
 //! removes one,
 //! `ImportSourceCredentials` writes a [`StoredSourceCredentials`],
@@ -34,7 +35,7 @@ use std::collections::BTreeMap;
 use crate::ops::types::{
     Build, BuildArtifacts, BuildBatch, BuildBatchPhase, BuildPhase, CommandExecution,
     EnvironmentVariable, Fleet, FleetStatus, PhaseContext, Project, ProjectArtifacts, ProjectCache,
-    ProjectEnvironment, ProjectSource, Report, ReportGroup, Sandbox, SandboxSession,
+    ProjectEnvironment, ProjectSource, Report, ReportGroup, SSMSession, Sandbox, SandboxSession,
     SandboxSessionPhase, SourceCredentialsInfo,
 };
 
@@ -395,6 +396,16 @@ pub const MAX_SANDBOX_IDEMPOTENCY_TOKENS: usize = MAX_IDEMPOTENCY_TOKENS;
 /// NOT AWS'S — it is the one [`MAX_SANDBOXES`] puts on the resource these belong to.
 pub const MAX_COMMAND_EXECUTIONS: usize = MAX_SANDBOXES;
 
+/// Session Manager connections this emulator retains, across every sandbox.
+///
+/// A connection is minted by each `StartSandboxConnection` rather than being a
+/// resource the caller deletes, so the store needs a ceiling at that growth site:
+/// past this,
+/// [`ComAmazonawsCodebuildCodebuild20161006State::record_sandbox_connection`] retires
+/// the oldest one. THIS NUMBER IS THE EMULATOR'S, NOT AWS'S — it is the one
+/// [`MAX_SANDBOXES`] puts on the resource these belong to.
+pub const MAX_SANDBOX_CONNECTIONS: usize = MAX_SANDBOXES;
+
 /// Why an emulated build never reaches `SUCCEEDED`.
 ///
 /// Nothing in this emulator executes a CodeBuild build container, so a build
@@ -674,6 +685,19 @@ pub struct ComAmazonawsCodebuildCodebuild20161006State {
     /// modelled member: it is what makes an execution's derived id unique when two
     /// commands of one sandbox are submitted in the same millisecond.
     pub next_command_execution_numbers: BTreeMap<String, i64>,
+    /// Session Manager connections, keyed by the `ssmSession` session id they report.
+    ///
+    /// Keyed by session id because that is what identifies one connection on the wire
+    /// (`SSMSession$sessionId`, and the session id the connection's `streamUrl` carries),
+    /// and the id is derived under the sandbox it was started for, so two sandboxes
+    /// cannot mint the same one. Entries whose token has stopped being in force are
+    /// dropped by [`Self::record_sandbox_connection`]: past that instant a connection
+    /// can never be used again.
+    pub sandbox_connections: BTreeMap<String, StoredSandboxConnection>,
+    /// The next per-sandbox connection sequence number to hand out. It is not a
+    /// modelled member: it is what makes a connection's derived session id unique when
+    /// two connections to one sandbox are started in the same millisecond.
+    pub next_sandbox_connection_numbers: BTreeMap<String, i64>,
     /// `RetryBuild` idempotency tokens, keyed by (project name, token).
     ///
     /// Kept apart from `start_build_tokens` for the reason
@@ -1012,6 +1036,32 @@ pub struct StoredCommandExecution {
     pub settle_due_millis: i64,
 }
 
+/// A persisted Session Manager connection to one sandbox: the modelled [`SSMSession`]
+/// one `StartSandboxConnection` minted, plus the instants that bound its life.
+///
+/// The session is a record rather than a value fabricated per call: its id is unique
+/// across the account, re-reading the store reports the session that was handed out,
+/// and the token is in force only while the sandbox session it connects to is.
+#[derive(Debug, Clone)]
+pub struct StoredSandboxConnection {
+    /// The session every caller of this connection was handed back.
+    pub ssm_session: SSMSession,
+    /// The sandbox this connection connects to.
+    pub sandbox_id: String,
+    /// Epoch millis the connection was started at.
+    pub started_millis: i64,
+    /// Epoch millis the connection's token stops being in force at.
+    ///
+    /// A connection is a session INTO the sandbox's live session, so it cannot outlive
+    /// it: the instant is the sandbox's own
+    /// [`StoredSandbox::timeout_due_millis`] — the end of the wait
+    /// `Sandbox$timeoutInMinutes` documents, "How long, in minutes, from 5 to 2160 (36
+    /// hours), for CodeBuild to wait before timing out this sandbox if it does not get
+    /// marked as completed". Past it the sandbox has timed out, so there is nothing
+    /// left for the token to authenticate a connection to.
+    pub expires_millis: i64,
+}
+
 /// What one in-force `StartSandbox` idempotency token resolved to. The sibling of
 /// [`StartBuildToken`], keyed and retired by the same rules.
 ///
@@ -1077,6 +1127,12 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
     /// counter. Like a `buildNumber`, a number is never reused for a project.
     pub fn allocate_sandbox_number(&mut self, project_name: &str) -> i64 {
         allocate_number(&mut self.next_sandbox_numbers, project_name)
+    }
+
+    /// Hand out `sandbox_id`'s next connection sequence number and advance the counter.
+    /// Like a `buildNumber`, a number is never reused for a sandbox.
+    pub fn allocate_sandbox_connection_number(&mut self, sandbox_id: &str) -> i64 {
+        allocate_number(&mut self.next_sandbox_connection_numbers, sandbox_id)
     }
 
     /// Persist `stored` under `id` and record it as the newest build of its
@@ -1750,6 +1806,57 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
         }
         stored.settle(now_millis);
         Some(stored)
+    }
+
+    /// Persist the connection `stored` under the session id `id`, first dropping the
+    /// connections whose token has stopped being in force, then retiring anything still
+    /// over [`MAX_SANDBOX_CONNECTIONS`] oldest-first.
+    ///
+    /// Dropping an expired entry is the clock's own work, owed at its `expires_millis`
+    /// whether or not anybody called, and a connection whose sandbox is gone from the
+    /// store goes with it: neither can ever be used again.
+    pub fn record_sandbox_connection(
+        &mut self,
+        id: String,
+        stored: StoredSandboxConnection,
+        now_millis: i64,
+    ) {
+        let sandboxes = &self.sandboxes;
+        self.sandbox_connections.retain(|_, held| {
+            now_millis < held.expires_millis
+                && sandboxes
+                    .get(&held.sandbox_id)
+                    .is_some_and(|sandbox| !sandbox.is_terminal())
+        });
+        self.sandbox_connections.insert(id, stored);
+        while self.sandbox_connections.len() > MAX_SANDBOX_CONNECTIONS {
+            let oldest = self
+                .sandbox_connections
+                .iter()
+                .min_by_key(|(_, held)| held.started_millis)
+                .map(|(id, _)| id.clone());
+            let Some(oldest) = oldest else { break };
+            self.sandbox_connections.remove(&oldest);
+        }
+        let mut counters = ::std::mem::take(&mut self.next_sandbox_connection_numbers);
+        counters.retain(|sandbox_id, _| self.sandboxes.contains_key(sandbox_id));
+        self.next_sandbox_connection_numbers = counters;
+    }
+
+    /// Every connection of `sandbox_id` whose token is still in force at `now_millis`,
+    /// newest first — the connections a caller may still open a data channel with.
+    pub fn live_sandbox_connections(
+        &self,
+        sandbox_id: &str,
+        now_millis: i64,
+    ) -> Vec<&StoredSandboxConnection> {
+        let mut live: Vec<&StoredSandboxConnection> = self
+            .sandbox_connections
+            .values()
+            .filter(|held| held.sandbox_id == sandbox_id && now_millis < held.expires_millis)
+            .collect();
+        live.sort_by_key(|held| ::std::cmp::Reverse(held.started_millis));
+        live
     }
 }
 
@@ -2623,6 +2730,63 @@ pub fn source_credential_arn(region: &str, server_type: &str) -> String {
 /// `arn:aws:codebuild:<region>:<account>:sandbox/<id>`.
 pub fn sandbox_arn(region: &str, id: &str) -> String {
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("sandbox/{id}"))
+}
+
+/// The `sessionId` one Session Manager connection to a sandbox reports.
+///
+/// Opaque and DERIVED, not drawn from a generator: [`derived_uuid`] in its own
+/// namespace, over the sandbox the connection is into, the per-sandbox connection
+/// sequence number allocated for it under the state lock and the instant it was
+/// started — so two connections never share a session id, and nothing about the
+/// request is read back out of it. The `codebuild-sandbox` prefix is what the session
+/// is a session of, the way a Session Manager session id names its target.
+pub fn ssm_session_id(sandbox_id: &str, connection_number: i64, started_millis: i64) -> String {
+    format!(
+        "codebuild-sandbox-{}",
+        derived_uuid(
+            "sandbox-connection",
+            sandbox_id,
+            connection_number,
+            started_millis
+        )
+    )
+}
+
+/// The `streamUrl` one Session Manager connection reports: "A URL back to SSM Agent on
+/// the managed node that the Session Manager client uses to send commands and receive
+/// output from the node".
+///
+/// The form is the one Systems Manager hands a Session Manager client for a session's
+/// data channel — the regional `ssmmessages` websocket endpoint, the session's own id,
+/// and the publish-subscribe role the client opens the channel with.
+pub fn ssm_stream_url(region: &str, session_id: &str) -> String {
+    format!(
+        "wss://ssmmessages.{region}.amazonaws.com/v1/data-channel/{session_id}\
+         ?role=publish_subscribe"
+    )
+}
+
+/// The `tokenValue` one Session Manager connection reports: "An encrypted token value
+/// containing session and caller information".
+///
+/// The value is a secret handed to a caller — a Session Manager client authenticates
+/// the connection's data channel with it — but it is NOT a credential of this emulator
+/// and must never be accepted as one, so it is minted and retired exactly the way
+/// [`mint_webhook_secret`] mints a webhook's secret: nothing in a service may construct
+/// a secret itself, so the value comes from the one component that generates secrets,
+/// the emulator's credential store, which is then removed from that store again.
+///
+/// `None` when the store minted nothing, which leaves the operation to refuse rather
+/// than report a token it made up.
+pub fn mint_ssm_session_token(store: &::emulator_server::CredentialStore) -> Option<String> {
+    let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
+    let token = minted
+        .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
+        .unwrap_or_default()
+        .to_string();
+    // The session token is not a credential of this emulator; see above.
+    let _ = store.delete(&minted.id);
+    (!token.is_empty()).then_some(token)
 }
 
 /// The session a just-requested sandbox carries: it was submitted and is waiting in
