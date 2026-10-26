@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteStorageLensConfigurationTagging
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteStorageLensConfigurationTagging`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteStorageLensConfigurationTagging::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the tag set of an EXISTING S3 Storage Lens configuration, as the
+//! operation's documentation states: the whole tag set of the configuration the
+//! URI names goes away, so the tagging read that follows it reports no tag at
+//! all.
+//!
+//! It touches only the tag set — the configuration document is left exactly as
+//! `PutStorageLensConfiguration` stored it, and the configuration itself stays
+//! (dropping the configuration is `DeleteStorageLensConfiguration`'s business).
+//! A configuration the account does not own is refused rather than reported as
+//! deleted, the same refusal every other read and write of a configuration that
+//! is not there answers with.
 //!
 //! ## Shape of an operation
 //!
@@ -133,18 +136,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteStorageLensConfigurationTagging` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteStorageLensConfigurationTaggingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteStorageLensConfigurationTagging"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+
+        let key = (input.account_id, input.config_id);
+        let mut store = state.lock();
+        let Some(record) = store.storage_lens_configurations.get_mut(&key) else {
+            return Err(crate::state::no_such_storage_lens_configuration(&key.1));
+        };
+
+        // "Deletes the … configuration tags": the whole tag set goes and nothing
+        // else about the configuration changes. A configuration carrying no tag
+        // already is left the same way, since the end state the call asks for is
+        // the state it leaves.
+        record.tags.clear();
+        Ok(DeleteStorageLensConfigurationTaggingOutput {})
     }
 }

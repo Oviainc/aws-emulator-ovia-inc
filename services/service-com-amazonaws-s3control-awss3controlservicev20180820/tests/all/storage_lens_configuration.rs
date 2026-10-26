@@ -57,7 +57,7 @@ pub(crate) fn leaf(path: &str, value: &str) -> Leaf {
 }
 
 /// One tag, spelled for a table row.
-fn tag(key: &str, value: &str) -> (String, String) {
+pub(crate) fn tag(key: &str, value: &str) -> (String, String) {
     (key.to_string(), value.to_string())
 }
 
@@ -270,8 +270,12 @@ pub(crate) fn reported_tags(body: &str) -> Vec<(String, String)> {
 // ---------------------------------------------------------------------------
 
 /// One Storage Lens configuration document, described as its leaves.
-struct Document {
-    case: &'static str,
+///
+/// `pub(crate)` with the callers below because the tagging-delete suite drives
+/// the same documents through the same front door rather than writing a second
+/// table and a second set of request builders.
+pub(crate) struct Document {
+    pub(crate) case: &'static str,
     /// The leaves below the document root, WITHOUT `Id`: the id is the one the
     /// URI names, so one row can be put under any id.
     leaves: Vec<Leaf>,
@@ -288,7 +292,7 @@ impl Document {
     /// What a read of `config_id` must report: the submitted document, with
     /// `StorageLensArn` the one the service assigns — the member is documented
     /// read-only, so a submitted value is replaced rather than stored.
-    fn expected(&self, config_id: &str, region: &str) -> Vec<Leaf> {
+    pub(crate) fn expected(&self, config_id: &str, region: &str) -> Vec<Leaf> {
         let mut leaves: Vec<Leaf> = self
             .submitted(config_id)
             .into_iter()
@@ -328,7 +332,7 @@ fn expected_arn(config_id: &str, region: &str) -> String {
 /// `SelectionCriteria$MaxDepth` ranges 1..10 — exercised at both published
 /// bounds. A value past a modelled bound is refused before any handler runs, so
 /// it is the framework's business, not this rule's.
-fn documents() -> Vec<Document> {
+pub(crate) fn documents() -> Vec<Document> {
     vec![
         Document {
             case: "the smallest document the model allows: a required, empty bucket level",
@@ -531,7 +535,7 @@ fn config_ids() -> Vec<String> {
 // Calling the Storage Lens configuration surface
 // ---------------------------------------------------------------------------
 
-async fn put_configuration(
+pub(crate) async fn put_configuration(
     emulator: &Emulator,
     account_id: &str,
     config_id: &str,
@@ -548,7 +552,11 @@ async fn put_configuration(
         .await
 }
 
-async fn get_configuration(emulator: &Emulator, account_id: &str, config_id: &str) -> Reply {
+pub(crate) async fn get_configuration(
+    emulator: &Emulator,
+    account_id: &str,
+    config_id: &str,
+) -> Reply {
     emulator
         .call(
             "GET",
@@ -559,7 +567,7 @@ async fn get_configuration(emulator: &Emulator, account_id: &str, config_id: &st
         .await
 }
 
-async fn put_tagging(
+pub(crate) async fn put_tagging(
     emulator: &Emulator,
     account_id: &str,
     config_id: &str,
@@ -580,7 +588,7 @@ async fn put_tagging(
         .await
 }
 
-async fn get_tagging(emulator: &Emulator, account_id: &str, config_id: &str) -> Reply {
+pub(crate) async fn get_tagging(emulator: &Emulator, account_id: &str, config_id: &str) -> Reply {
     emulator
         .call(
             "GET",
@@ -845,7 +853,7 @@ async fn configurations_are_scoped_to_the_account_that_put_them() {
 /// documented maximum), which characters the keys and values use, how long they
 /// are (`TagKeyString` is 1..128, `TagValueString` 0..256 — both exercised at
 /// their maximum), and the order the tags are submitted in.
-fn tag_sets() -> Vec<(&'static str, Vec<(String, String)>)> {
+pub(crate) fn tag_sets() -> Vec<(&'static str, Vec<(String, String)>)> {
     let maximum = ::service_com_amazonaws_s3control_awss3controlservicev20180820::state::MAX_STORAGE_LENS_TAGS;
     vec![
         ("no tags at all", Vec::new()),
