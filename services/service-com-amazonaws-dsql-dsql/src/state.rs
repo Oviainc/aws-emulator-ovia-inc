@@ -73,6 +73,12 @@ pub const STATUS_PENDING_DELETE: &str = "PENDING_DELETE";
 pub const STREAM_STATUS_CREATING: &str = "CREATING";
 /// See [`STREAM_STATUS_CREATING`].
 pub const STREAM_STATUS_ACTIVE: &str = "ACTIVE";
+/// See [`STREAM_STATUS_CREATING`]: the status of a stream whose deletion has
+/// started and which the clock has yet to remove.
+pub const STREAM_STATUS_DELETING: &str = "DELETING";
+/// See [`STREAM_STATUS_CREATING`]: the status a deleted stream reaches, at which
+/// point it is no longer held by its cluster ([`ComAmazonawsDsqlDsqlState::settle`]).
+pub const STREAM_STATUS_DELETED: &str = "DELETED";
 
 /// `EncryptionType` values (`smithy_query(query="shape", shape="EncryptionType")`).
 pub const ENCRYPTION_AWS_OWNED: &str = "AWS_OWNED_KMS_KEY";
@@ -166,6 +172,41 @@ pub struct Stream {
     pub tags: BTreeMap<String, String>,
     /// The status change the clock owes this stream, if any.
     pub pending: Option<PendingTransition>,
+}
+
+impl Stream {
+    /// Whether the stream is in a status that accepts a mutation. A stream the
+    /// clock still owes a transition ([`STREAM_STATUS_CREATING`]) or one already
+    /// on its way out ([`STREAM_STATUS_DELETING`], [`STREAM_STATUS_DELETED`]) is
+    /// not; every other `StreamStatus` names a stream that exists and is not
+    /// changing by itself.
+    pub fn accepts_mutation(&self) -> bool {
+        !matches!(
+            self.status.as_str(),
+            STREAM_STATUS_CREATING | STREAM_STATUS_DELETING | STREAM_STATUS_DELETED
+        )
+    }
+
+    /// The modelled refusal a request that MUTATES this stream answers with while
+    /// its status does not accept a mutation, or `None` when it does.
+    ///
+    /// The stream-side counterpart of [`Cluster::mutation_conflict`], and worded
+    /// the same way, so neither resource states the condition differently.
+    /// `attempted` completes the sentence after the stream's identifier ("be
+    /// deleted").
+    pub fn mutation_conflict(&self, attempted: &str) -> Option<ConflictException> {
+        if self.accepts_mutation() {
+            return None;
+        }
+        Some(ConflictException {
+            message: format!(
+                "stream {} cannot {attempted} while its status is {}",
+                self.stream_identifier, self.status
+            ),
+            resource_id: Some(self.stream_identifier.clone()),
+            resource_type: Some(RESOURCE_TYPE_STREAM.to_string()),
+        })
+    }
 }
 
 /// One persisted Aurora DSQL cluster.
@@ -365,6 +406,8 @@ pub enum TokenScope {
     DeleteCluster,
     /// `CreateStream.clientToken`.
     CreateStream,
+    /// `DeleteStream.clientToken`.
+    DeleteStream,
     /// `PutClusterPolicy.clientToken`.
     PutClusterPolicy,
     /// `DeleteClusterPolicy.clientToken`.
@@ -374,11 +417,12 @@ pub enum TokenScope {
 impl TokenScope {
     /// Every scope, in ledger order. The array the state holds is indexed by
     /// this order, so the two cannot drift.
-    pub const ALL: [TokenScope; 6] = [
+    pub const ALL: [TokenScope; 7] = [
         TokenScope::CreateCluster,
         TokenScope::UpdateCluster,
         TokenScope::DeleteCluster,
         TokenScope::CreateStream,
+        TokenScope::DeleteStream,
         TokenScope::PutClusterPolicy,
         TokenScope::DeleteClusterPolicy,
     ];
@@ -390,8 +434,9 @@ impl TokenScope {
             TokenScope::UpdateCluster => 1,
             TokenScope::DeleteCluster => 2,
             TokenScope::CreateStream => 3,
-            TokenScope::PutClusterPolicy => 4,
-            TokenScope::DeleteClusterPolicy => 5,
+            TokenScope::DeleteStream => 4,
+            TokenScope::PutClusterPolicy => 5,
+            TokenScope::DeleteClusterPolicy => 6,
         }
     }
 
@@ -399,12 +444,12 @@ impl TokenScope {
     /// names is gone.
     ///
     /// Every other scope records a call ON a live resource, so the token goes
-    /// when the resource goes; the scope of the call that REMOVES the resource
+    /// when the resource goes; the scope of a call that REMOVES a resource
     /// records the removal itself, and a retry of it arrives precisely when the
     /// resource no longer exists, so its record has to outlive it. Such a
     /// ledger is still bounded by [`MAX_CLIENT_TOKENS`].
     fn outlives_its_resource(self) -> bool {
-        matches!(self, TokenScope::DeleteCluster)
+        matches!(self, TokenScope::DeleteCluster | TokenScope::DeleteStream)
     }
 }
 
@@ -696,20 +741,43 @@ impl ComAmazonawsDsqlDsqlState {
         let identifiers: Vec<String> = self.clusters.keys().cloned().collect();
 
         for identifier in identifiers {
+            // The streams whose deletion came due: a settled deletion REMOVES the
+            // stream, so `GetStream` answers `ResourceNotFoundException` and
+            // `ListStreams` stops listing it, exactly as a settled cluster
+            // deletion retires the cluster below.
+            let mut removed_streams: Vec<String> = Vec::new();
+            {
+                let Some(cluster) = self.clusters.get_mut(&identifier) else {
+                    continue;
+                };
+                for stream in cluster.streams.values_mut() {
+                    let settled = stream
+                        .pending
+                        .as_ref()
+                        .filter(|pending| pending.due_at <= now)
+                        .map(|pending| pending.next_status);
+                    if let Some(next_status) = settled {
+                        stream.status = next_status.to_string();
+                        stream.pending = None;
+                        if next_status == STREAM_STATUS_DELETED {
+                            removed_streams.push(stream.stream_identifier.clone());
+                        }
+                    }
+                }
+                for stream_identifier in &removed_streams {
+                    cluster.streams.remove(stream_identifier);
+                }
+            }
+            for stream_identifier in &removed_streams {
+                // A record keyed by a stream that is gone goes with it, bar the
+                // ledger of the call that removed it
+                // ([`TokenScope::outlives_its_resource`]).
+                self.forget_tokens_for(stream_identifier);
+            }
+
             let Some(cluster) = self.clusters.get_mut(&identifier) else {
                 continue;
             };
-            for stream in cluster.streams.values_mut() {
-                let settled = stream
-                    .pending
-                    .as_ref()
-                    .filter(|pending| pending.due_at <= now)
-                    .map(|pending| pending.next_status);
-                if let Some(next_status) = settled {
-                    stream.status = next_status.to_string();
-                    stream.pending = None;
-                }
-            }
             if !is_due(&cluster.pending) {
                 continue;
             }

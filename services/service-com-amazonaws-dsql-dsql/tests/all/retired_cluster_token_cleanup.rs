@@ -6,8 +6,8 @@
 //! RULE: a `clientToken` record is keyed by the resource its call acted on, and it
 //! is dropped when that resource ceases to exist — including when it ceases to
 //! exist because the cluster holding it was removed — so the token stands for no
-//! earlier request afterwards and serves a fresh one; only the ledger of the
-//! operation that REMOVES the cluster keeps its record, which is what a retry
+//! earlier request afterwards and serves a fresh one; only the ledger of an
+//! operation that REMOVES a resource keeps its record, which is what a retry
 //! arriving after the removal is answered from.
 //!
 //! The first table walks every ledger against both kinds of resource a record is
@@ -67,12 +67,12 @@ fn token_for(scope: TokenScope, resource: &str) -> String {
 
 /// RULE (at the ledger): retiring a cluster drops every record keyed by a resource
 /// that retirement removes — the cluster itself and each stream stored on its
-/// record — in every ledger but the one belonging to the call that removes the
-/// cluster, and leaves the records of a cluster that is still there alone.
+/// record — in every ledger but those belonging to a call that removes a resource,
+/// and leaves the records of a cluster that is still there alone.
 ///
-/// Driven against the state directly: a ledger is per-operation, so covering all
-/// six over the wire would need one suite per operation — the wire-level class is
-/// the test below.
+/// Driven against the state directly: a ledger is per-operation, so covering
+/// every one over the wire would need one suite per operation — the wire-level
+/// class is the test below.
 #[test]
 fn retiring_a_cluster_drops_every_token_keyed_by_what_it_removes() {
     let already_due = SystemTime::now() - Duration::from_secs(1);
@@ -134,9 +134,10 @@ fn retiring_a_cluster_drops_every_token_keyed_by_what_it_removes() {
     );
 
     for scope in TokenScope::ALL {
-        // The one exemption: the record of the call that REMOVES the cluster has
-        // to outlive it, because that is when a retry of it arrives.
-        let outlives = scope == TokenScope::DeleteCluster;
+        // The exemption: the record of a call that REMOVES a resource has to
+        // outlive it, because that is when a retry of it arrives — the delete of
+        // the cluster, and the delete of a stream the cluster carried.
+        let outlives = matches!(scope, TokenScope::DeleteCluster | TokenScope::DeleteStream);
         for resource in &removed {
             let token = token_for(scope, resource);
             let verdict = state.tokens_of(scope).verdict(&token, &token);

@@ -206,6 +206,22 @@ impl Dsql {
         .await
     }
 
+    /// `DeleteStream`: `DELETE /stream/{clusterIdentifier}/{streamIdentifier}`,
+    /// with whatever `@httpQuery` string the case needs (`?client-token=..`).
+    pub async fn delete_stream(
+        &self,
+        cluster_identifier: &str,
+        stream_identifier: &str,
+        query: &str,
+    ) -> Answer {
+        self.call(
+            "DELETE",
+            &format!("/stream/{cluster_identifier}/{stream_identifier}{query}"),
+            None,
+        )
+        .await
+    }
+
     /// `ListStreams`: `GET /stream/{clusterIdentifier}`, with whatever
     /// `@httpQuery` string the case needs (`?max-results=..&next-token=..`).
     pub async fn list_streams(&self, cluster_identifier: &str, query: &str) -> Answer {

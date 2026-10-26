@@ -53,6 +53,8 @@ mod retired_cluster_token_cleanup;
 mod shared_page_walk;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stream_deletion.rs"]
+mod stream_deletion;
 #[path = "all/stream_lifecycle.rs"]
 mod stream_lifecycle;
 #[path = "all/stream_listing.rs"]

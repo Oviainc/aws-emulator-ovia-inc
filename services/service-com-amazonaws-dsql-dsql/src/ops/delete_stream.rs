@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the persisted stream the two `@httpLabel`s name: the stream reports
+//! `DELETING` and the clock removes it from its cluster, so a later `GetStream`
+//! answers `ResourceNotFoundException` and `ListStreams` stops listing it. An
+//! unknown cluster or an unknown stream is `ResourceNotFoundException` (404); a
+//! stream whose status does not accept a mutation — and a cluster whose status
+//! does not, since a stream lives ON the cluster's record — is
+//! `ConflictException` (409), bar the delete of a stream that is already
+//! deleting, which answers with the delete in flight. `@idempotent`: a retry
+//! carrying the same `client-token` answers the result the first call gave, from
+//! the `clientToken` ledger, so it still answers once the clock has removed the
+//! stream; that token carried by a DIFFERENT delete is a `ConflictException`
+//! (409).
 //!
 //! ## Shape of an operation
 //!
@@ -97,11 +101,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dsql-dsql.json");
 // here — hence the `DeleteStreamError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.dsql#DeleteStream")]
+// The service-common `InternalServerException` is widened in with `extra_errors`:
+// the service declares it for every operation (its `common_errors` are
+// AccessDenied / InternalServer / Throttling / Validation), but the per-operation
+// list the macro checks against does not repeat it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.dsql#DeleteStream",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DeleteStreamErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -155,18 +167,180 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteStreamErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the dsql cluster store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle(now);
+
+        // `@idempotencyToken`: a repeat of the SAME delete answers with the result
+        // of the original call and has no additional effect; the same token with
+        // DIFFERENT parameters is a different request wearing a used token, which
+        // is a conflict rather than a retry.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteStream"))
+        // The ledger is consulted BEFORE the stream is looked up — as
+        // `DeleteCluster`'s is, and unlike the operations that act on a live
+        // resource — because the result this operation records is the resource's
+        // REMOVAL: the retry of a delete that already succeeded arrives exactly
+        // when the stream is gone, so the recorded answer, not the store, is what
+        // serves it.
+        let fingerprint = crate::state::request_fingerprint(&[
+            input.cluster_identifier.clone(),
+            input.stream_identifier.clone(),
+        ]);
+        if let Some(token) = input.client_token.as_deref() {
+            match state
+                .tokens_of(crate::state::TokenScope::DeleteStream)
+                .verdict(token, &fingerprint)
+            {
+                crate::state::TokenVerdict::Replay(recorded) => {
+                    return recorded_delete_output(&input.cluster_identifier, &recorded)
+                        .ok_or_else(|| {
+                            // A recorded delete always keeps every member it
+                            // answered, so there is nothing to serve here — and
+                            // nothing this request may delete in its place.
+                            DeleteStreamErrorModeled::InternalServerException(
+                                InternalServerException {
+                                    message: "the recorded result of this request is unavailable"
+                                        .to_string(),
+                                    retry_after_seconds: None,
+                                },
+                            )
+                            .into()
+                        });
+                }
+                crate::state::TokenVerdict::Mismatch => {
+                    return Err(DeleteStreamErrorModeled::ConflictException(ConflictException {
+                        message: crate::state::CLIENT_TOKEN_MISMATCH_MESSAGE.to_string(),
+                        resource_id: Some(input.stream_identifier.clone()),
+                        resource_type: Some(crate::state::RESOURCE_TYPE_STREAM.to_string()),
+                    })
+                    .into());
+                }
+                crate::state::TokenVerdict::Unused => {}
+            }
+        }
+
+        let Some(cluster) = state.clusters.get_mut(&input.cluster_identifier) else {
+            return Err(DeleteStreamErrorModeled::ResourceNotFoundException(
+                crate::state::cluster_not_found(&region, &input.cluster_identifier),
+            )
+            .into());
+        };
+        // A stream is stored ON its cluster's record, so removing one WRITES that
+        // record: the cluster answers the same status gate here as it does to
+        // every other write of it. Read before the stream is borrowed, and
+        // reported only once the stream this call names has been found, so an
+        // unknown stream is still a 404 rather than a conflict.
+        let cluster_conflict = cluster.mutation_conflict("have a stream deleted");
+        let Some(stream) = cluster.streams.get_mut(&input.stream_identifier) else {
+            return Err(DeleteStreamErrorModeled::ResourceNotFoundException(
+                crate::state::stream_not_found(
+                    &region,
+                    &input.cluster_identifier,
+                    &input.stream_identifier,
+                ),
+            )
+            .into());
+        };
+
+        // A stream that is already deleting answers with the delete in flight; one
+        // in any other status that does not accept a mutation refuses the
+        // deletion.
+        if stream.status != crate::state::STREAM_STATUS_DELETING {
+            if let Some(conflict) = stream.mutation_conflict("be deleted") {
+                return Err(DeleteStreamErrorModeled::ConflictException(conflict).into());
+            }
+            if let Some(conflict) = cluster_conflict {
+                return Err(DeleteStreamErrorModeled::ConflictException(conflict).into());
+            }
+            stream.status = crate::state::STREAM_STATUS_DELETING.to_string();
+            // The clock, not a later caller, finishes the deletion: at that point
+            // the stream leaves its cluster's record.
+            stream.pending = Some(crate::state::PendingTransition {
+                due_at: now + crate::state::SETTLE_AFTER,
+                next_status: crate::state::STREAM_STATUS_DELETED,
+            });
+        }
+
+        let creation_time = stream.creation_time;
+        let deleted = delete_stream_output(&input.cluster_identifier, stream);
+        // The record of a call that CHANGED stored state: what was deleted and
+        // what the caller was told. Nothing the caller sent is logged — not the
+        // client token, which keys the ledger below.
+        ::tracing::info!(
+            operation = Self::NAME,
+            cluster = %deleted.cluster_identifier,
+            stream = %deleted.stream_identifier,
+            status = %deleted.status,
+            "deleted a stream of a cluster"
+        );
+        if let Some(token) = input.client_token {
+            // Recorded whichever branch answered: a delete of a stream already on
+            // its way out succeeded just as much as the one that started the
+            // deletion, so its retry has the same recorded result to answer from.
+            // Every member of the answer is kept, because the stream this record
+            // describes is on its way out of the store.
+            state.tokens(crate::state::TokenScope::DeleteStream).record(
+                token,
+                fingerprint,
+                crate::state::RecordedCall::new(&deleted.stream_identifier)
+                    .answering(crate::state::STATUS_MEMBER, &deleted.status)
+                    .answering(crate::state::ARN_MEMBER, &deleted.arn)
+                    .answering(
+                        crate::state::CREATION_TIME_MEMBER,
+                        &crate::state::encode_instant(creation_time),
+                    ),
+            );
+        }
+        Ok(deleted)
     }
+}
+
+/// `DeleteStreamOutput` read off the stored stream the call deleted: every member
+/// of the output is a field of that record (or the cluster it is stored on), so
+/// the answer is rendered from state rather than from the request.
+fn delete_stream_output(
+    cluster_identifier: &str,
+    stream: &crate::state::Stream,
+) -> DeleteStreamOutput {
+    DeleteStreamOutput {
+        cluster_identifier: cluster_identifier.to_string(),
+        stream_identifier: stream.stream_identifier.clone(),
+        arn: stream.arn.clone(),
+        status: stream.status.clone(),
+        creation_time: ::aws_smithy_types::DateTime::from(stream.creation_time),
+    }
+}
+
+/// The answer a recorded `DeleteStream` call gave, rendered for its retry.
+///
+/// The stream's own members come from the record rather than from the store: the
+/// stream the recorded call deleted is, by the time a retry arrives, either on
+/// its way out or gone, and neither its current status nor its absence is what
+/// that request answered. The cluster is the one the retry addresses, which the
+/// fingerprint binds to the recorded call's own. `None` is a record missing a
+/// member it should hold — never an answer to serve.
+fn recorded_delete_output(
+    cluster_identifier: &str,
+    recorded: &crate::state::RecordedCall,
+) -> Option<DeleteStreamOutput> {
+    Some(DeleteStreamOutput {
+        cluster_identifier: cluster_identifier.to_string(),
+        stream_identifier: recorded.resource.clone(),
+        arn: recorded.answered(crate::state::ARN_MEMBER)?.to_string(),
+        status: recorded.answered(crate::state::STATUS_MEMBER)?.to_string(),
+        creation_time: ::aws_smithy_types::DateTime::from(crate::state::decode_instant(
+            recorded.answered(crate::state::CREATION_TIME_MEMBER)?,
+        )?),
+    })
 }
