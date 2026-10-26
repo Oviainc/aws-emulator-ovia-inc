@@ -284,6 +284,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The KIND of policy this update addresses is the one it was created
+        // as: `PolicyDetails$PolicyLanguage` is the member that says which kind a
+        // configuration describes, and a configuration naming the other kind asks
+        // for the one change `UpdateLifecyclePolicyRequest$PolicyDetails` rules
+        // out ("You cannot update the policy type or the resource type"). Judged
+        // before the first write, so a refused update leaves the stored policy
+        // exactly as it was.
+        if let Some(refusal) =
+            crate::state::policy_language_violation(policy, input.policy_details.as_ref())
+        {
+            return Err(
+                UpdateLifecyclePolicyErrorModeled::InvalidRequestException(refusal).into(),
+            );
+        }
+
         // The one member of that configuration an update may not CHANGE:
         // `UpdateLifecyclePolicyRequest$PolicyDetails` is "the configuration of
         // the lifecycle policy. You cannot update the policy type or the resource
@@ -366,7 +381,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // change. A policy that is not a default policy holds none of those
             // members and may state none (refused above), so for one of those
             // this moves nothing and replaces nothing.
-            let mut details = crate::state::materialized_policy_details(policy_details);
+            //
+            // WHICH members the materialization stamps follows the kind of
+            // policy this record IS, which this update cannot change (refused
+            // above): a replacement configuration for a default policy is
+            // stored as a default policy's and one for a custom policy as a
+            // custom policy's, whether or not the structure restated its
+            // language.
+            let default_policy = policy.default_policy;
+            let mut details =
+                crate::state::materialized_policy_details(policy_details, default_policy);
             let configuration =
                 crate::state::DefaultPolicyConfiguration::taken_from_policy_details(&mut details);
             policy.replace_default_policy_configuration(configuration);

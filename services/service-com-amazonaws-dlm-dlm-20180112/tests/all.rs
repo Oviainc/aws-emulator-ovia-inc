@@ -31,6 +31,8 @@ mod invalid_request_parameter_lists;
 mod lifecycle_policy_crud;
 #[path = "all/policy_configuration_validation.rs"]
 mod policy_configuration_validation;
+#[path = "all/policy_language_immutability.rs"]
+mod policy_language_immutability;
 #[path = "all/policy_read_projection.rs"]
 mod policy_read_projection;
 #[path = "all/policy_type.rs"]

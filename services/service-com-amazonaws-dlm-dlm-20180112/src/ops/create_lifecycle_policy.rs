@@ -364,10 +364,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The configuration is stored with every member the service
         // materializes already stamped onto it, so a read reports the stored
-        // record rather than synthesizing a default per call.
+        // record rather than synthesizing a default per call. WHICH members
+        // those are follows the kind of policy this request creates, decided
+        // above, so no stored configuration's language contradicts the kind of
+        // policy holding it.
+        //
+        // A create has no stored kind to contradict, so the kind the request
+        // asks for is the one it gets: `DefaultPolicy` is the member documented
+        // as creating one ("Specify the type of default policy to create"), so a
+        // request naming it creates a default policy whichever language the
+        // structure beside it states, and the configuration stored for it is a
+        // default policy's. Whether a request naming the two ways round each
+        // other should instead be refused as a pair that cannot be provided
+        // together belongs to the request-body/structure alternatives rule
+        // ([`crate::state::configuration_stated_twice`]), which this path leaves
+        // as it stands; what is fixed here is that no record is left holding a
+        // configuration whose language contradicts its kind.
         let mut policy_details = input
             .policy_details
-            .map(crate::state::materialized_policy_details);
+            .map(|details| crate::state::materialized_policy_details(details, is_default));
         // A default policy's `[Default policies only]` configuration is stored in
         // ONE place — the record's own fields — whichever of the two alternative
         // places this request stated it in: the members stated inside the

@@ -296,10 +296,24 @@ pub fn configures_event_based_policy(details: &PolicyDetails) -> bool {
 /// So the stamping happens here, where a create or an update writes the record,
 /// and never in a read projection.
 ///
+/// WHICH members are materialized follows the KIND of policy the record is —
+/// `default_policy`, a DEFAULT policy against a custom one — and never what the
+/// submitted structure's own `PolicyLanguage` happens to say. The kind is the
+/// caller's to decide, because only the write path knows it: a create derives it
+/// from the request, and an update from the policy it addresses, whose kind it
+/// cannot change ([`policy_language_violation`]). A DEFAULT policy's
+/// configuration carries none of the custom members below; its `[Default
+/// policies only]` defaults are the documented ones, which
+/// [`LifecyclePolicyRecord::effective_policy_details`] reports from the record's
+/// own fields.
+///
 /// What is stamped, and why:
 ///
-/// * `PolicyLanguage` — `STANDARD`, which `PolicyDetails$PolicyLanguage`
-///   documents as the language of a custom policy.
+/// * `PolicyLanguage` — the language the policy's kind names, which
+///   `PolicyDetails$PolicyLanguage` documents: `SIMPLIFIED` "To create a default
+///   policy" and `STANDARD` "To create a custom policy". Stamping it is what
+///   leaves no stored configuration whose language contradicts the kind of policy
+///   holding it.
 /// * `PolicyType` — the documented default `EBS_SNAPSHOT_MANAGEMENT` for a
 ///   configuration that names no type ("The default is
 ///   `EBS_SNAPSHOT_MANAGEMENT`"), whatever the policy targets.
@@ -318,17 +332,17 @@ pub fn configures_event_based_policy(details: &PolicyDetails) -> bool {
 /// interval unit, a nested deprecate/archive/fast-restore rule's members. They
 /// keep exactly what the request stated, because inventing one would be
 /// fabrication.
-pub fn materialized_policy_details(mut details: PolicyDetails) -> PolicyDetails {
-    if details.policy_language.as_deref() == Some(SIMPLIFIED_POLICY_LANGUAGE) {
-        // A DEFAULT policy's configuration. Its `[Default policies only]`
-        // defaults are the documented ones, which
-        // [`LifecyclePolicyRecord::effective_policy_details`] reports from the
-        // record's own body parameters.
+pub fn materialized_policy_details(
+    mut details: PolicyDetails,
+    default_policy: bool,
+) -> PolicyDetails {
+    if default_policy {
+        // A DEFAULT policy's configuration, which carries none of the custom
+        // members stamped below.
+        details.policy_language = Some(SIMPLIFIED_POLICY_LANGUAGE.to_string());
         return details;
     }
-    details
-        .policy_language
-        .get_or_insert_with(|| STANDARD_POLICY_LANGUAGE.to_string());
+    details.policy_language = Some(STANDARD_POLICY_LANGUAGE.to_string());
 
     // Which kind of configuration this is, read BEFORE the type is stamped, so
     // the stamped default cannot turn an event-based configuration into
@@ -524,7 +538,7 @@ impl LifecyclePolicyRecord {
             return self.policy_details.clone();
         }
         let mut details = self.policy_details.clone().unwrap_or_default();
-        details.policy_language = Some(SIMPLIFIED_POLICY_LANGUAGE.to_string());
+        details.policy_language = Some(self.policy_language().to_string());
         details.policy_type = Some(self.policy_type());
         details.resource_type = self.default_policy_type.clone();
         details.create_interval = Some(self.create_interval.unwrap_or(DEFAULT_CREATE_INTERVAL));
@@ -570,6 +584,23 @@ impl LifecyclePolicyRecord {
         self.extend_deletion = configuration.extend_deletion;
         self.cross_region_copy_targets = configuration.cross_region_copy_targets.unwrap_or_default();
         self.exclusions = configuration.exclusions;
+    }
+
+    /// The `PolicyLanguage` this policy's KIND names:
+    /// `PolicyDetails$PolicyLanguage` documents `SIMPLIFIED` as "To create a
+    /// default policy" and `STANDARD` as "To create a custom policy", so the
+    /// language is the wire name of the one flag the record keeps for it rather
+    /// than a second, independently stored value that could contradict it.
+    ///
+    /// The kind is decided when the policy is created and an update cannot change
+    /// it ([`policy_language_violation`]), so this is also the only language a
+    /// request addressing this policy may state.
+    pub fn policy_language(&self) -> &'static str {
+        if self.default_policy {
+            SIMPLIFIED_POLICY_LANGUAGE
+        } else {
+            STANDARD_POLICY_LANGUAGE
+        }
     }
 
     /// This policy's `PolicyTypeValues`.
@@ -1071,20 +1102,64 @@ pub const RESOURCE_TYPE_MEMBER: &str = "ResourceType";
 /// both states the resource type twice.
 pub const DEFAULT_POLICY_MEMBER: &str = "DefaultPolicy";
 
+/// The wire name of the `PolicyDetails` member that states which KIND of policy
+/// a configuration describes.
+pub const POLICY_LANGUAGE_MEMBER: &str = "PolicyLanguage";
+
 /// The `InvalidRequestException` for an update whose configuration states a
-/// resource type other than the one the policy holds.
+/// value for a member of the policy's identity other than the one the policy
+/// holds.
 ///
 /// `UpdateLifecyclePolicyRequest$PolicyDetails` is "the configuration of the
 /// lifecycle policy. You cannot update the policy type or the resource type": the
 /// request states a configuration the service cannot apply to this policy, which
 /// is the "invalid parameters" the operation models `InvalidRequestException`
-/// for. The message names the member refused, the type the policy holds and the
-/// one the request asked for.
-pub fn resource_type_cannot_be_updated(stated: &str, stored: &str) -> InvalidRequestException {
+/// for. The message names the member refused, the value the policy holds for it
+/// and the one the request asked for — `described` being how that member's
+/// documentation names what it states.
+pub fn configuration_member_cannot_be_updated(
+    member: &str,
+    described: &str,
+    stated: &str,
+    stored: &str,
+) -> InvalidRequestException {
     invalid_request(format!(
-        "The parameter {POLICY_DETAILS_PREFIX}{RESOURCE_TYPE_MEMBER} cannot be updated. The \
-         policy's resource type is {stored} and {stated} was requested."
+        "The parameter {POLICY_DETAILS_PREFIX}{member} cannot be updated. The policy's \
+         {described} is {stored} and {stated} was requested."
     ))
+}
+
+/// The refusal of an update that states a resource type other than the one the
+/// policy holds, by that rule.
+pub fn resource_type_cannot_be_updated(stated: &str, stored: &str) -> InvalidRequestException {
+    configuration_member_cannot_be_updated(RESOURCE_TYPE_MEMBER, "resource type", stated, stored)
+}
+
+/// The refusal of an update whose configuration names a KIND of policy other
+/// than the one the policy addressed IS, or `None` when it names that kind or
+/// names none.
+///
+/// `PolicyDetails$PolicyLanguage` is the member that says which kind a
+/// configuration describes — `SIMPLIFIED` "To create a default policy",
+/// `STANDARD` "To create a custom policy" — so a configuration stating the other
+/// kind's language asks for the one change
+/// `UpdateLifecyclePolicyRequest$PolicyDetails` rules out: "You cannot update the
+/// policy type or the resource type". It is refused by the same rule, and for the
+/// same reason, as a configuration naming another resource type.
+pub fn policy_language_violation(
+    policy: &LifecyclePolicyRecord,
+    details: Option<&PolicyDetails>,
+) -> Option<InvalidRequestException> {
+    let stated = details?.policy_language.as_deref()?;
+    let stored = policy.policy_language();
+    (stated != stored).then(|| {
+        configuration_member_cannot_be_updated(
+            POLICY_LANGUAGE_MEMBER,
+            "policy language",
+            stated,
+            stored,
+        )
+    })
 }
 
 /// The `InvalidRequestException` for `[Default policies only]` parameters stated
