@@ -23,8 +23,9 @@
 //! Every call goes through `MultiServiceRouter::dispatch`, so the modelled constraints and
 //! the `X-Amz-Target` routing are exercised rather than bypassed; the harness is the one
 //! `ssoadmin_permission_sets.rs` owns. Additional Regions are seeded through the service's
-//! own `state::Instance::add_region`, because the operation that adds one (`AddRegion`) is
-//! still a scaffold stub with an issue of its own; and where a test has to be on the far
+//! own `state::Instance::add_region`, so a removal row starts from Regions that are
+//! already `ACTIVE` rather than from an extension workflow in flight (`AddRegion` over the
+//! wire is `instance_region_addition.rs`); and where a test has to be on the far
 //! side of a due instant it moves the STORED instant rather than sleeping — the transition
 //! itself is still applied by the service's own `materialize_due`, exactly as in
 //! production.
@@ -71,9 +72,9 @@ async fn instance_arn_in(router: &MultiServiceRouter, region: &str) -> String {
 /// `additional`, and that instance's ARN.
 ///
 /// The additional Regions are seeded through `state::Instance::add_region` — the one
-/// place the service's own records append a Region — because `AddRegion`, the operation
-/// that enables one over the wire, is still a scaffold stub tracked by its own issue.
-/// Everything asserted afterwards goes over the wire.
+/// place the service's own records append a Region — so each starts out `ACTIVE`, which is
+/// the state a removal row needs; the add over the wire has its own suite
+/// (`instance_region_addition.rs`). Everything asserted afterwards goes over the wire.
 async fn instance_enabled_in(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,

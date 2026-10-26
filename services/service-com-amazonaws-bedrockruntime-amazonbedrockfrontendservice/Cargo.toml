@@ -33,6 +33,12 @@ sha2 = { workspace = true }
 # Encodes the opaque `ListAsyncInvokes` page token.
 hex = { workspace = true }
 
+# The CloudWatch metric store an inference publishes its token volume into
+# (`state::invocation_metrics`): the datapoints go into the store `PutMetricData` writes
+# and `GetMetricStatistics` / `ListMetrics` read, which is reached through the shared
+# engine and needs the owning service's state TYPE.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 

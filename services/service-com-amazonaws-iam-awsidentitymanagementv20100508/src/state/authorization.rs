@@ -58,6 +58,9 @@ pub const LIST_USERS: &str = "iam:ListUsers";
 /// `iam:ListPolicies`.
 pub const LIST_POLICIES: &str = "iam:ListPolicies";
 
+/// `iam:ListInstanceProfiles`.
+pub const LIST_INSTANCE_PROFILES: &str = "iam:ListInstanceProfiles";
+
 /// `iam:CreateGroup`.
 pub const CREATE_GROUP: &str = "iam:CreateGroup";
 

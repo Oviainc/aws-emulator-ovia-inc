@@ -33,3 +33,33 @@ Actual: all four reported timestamps for the two gates fall inside a 4-microseco
 Boot the emulator and replay `cloudformation__sns__sqs.cfn-independent-branches-provision-concurrently-and-tear-down-in-reverse` from suite simparity-behavioral-ga-prod-v1.
 
 By hand: `CreateStack` with a diamond template — two independent `AWS::CloudFormation::WaitCondition` gates (GateA, GateB), an `AWS::SQS::Queue` under each via `DependsOn`, two SNS subscriptions, and a join resource that `DependsOn` both subtrees — hold ~20s before `SignalResource` on each gate, then read `DescribeStackEvents` and compare each resource's `CREATE_IN_PROGRESS` vs `CREATE_COMPLETE` `Timestamp`. All of them are the same instant. Repeat for `DeleteStack` and compare the `DELETE_*` timestamps.
+
+## Resolution
+
+A stack operation's per-resource events are no longer written at the instant the operation
+happened to take the store lock. The walk a stack operation makes over the template's
+dependency relation is now a planned TIMELINE
+(`services/service-com-amazonaws-cloudformation-cloudformation/src/state/timeline.rs`): each
+resource's `*_IN_PROGRESS` event falls due when the walk SCHEDULED it — once everything it
+depends on has finished — and its terminal event when it FINISHED, and the stack's `settle`
+records each of them at that instant. So the event log shows independent resources in flight
+together, a `DependsOn`/`Ref` child only after its parent completed, a join only after the
+last of its predecessors, and a deletion walking the same relation backwards. A wait
+condition finishes when the signal that satisfies its `Count` arrives, so a gate held open
+has an interval as long as the wait and nothing behind it is scheduled — or reported — until
+then. The walk is laid out inside the span the stack's own clock already owed, so no
+operation takes longer than it did. `ops/describe_stack_events.rs` reports the log unchanged.
+
+Held to by `tests/all/stack_event_timeline.rs`.
+
+A deployment an owning service REFUSES ends when it is refused, which is sooner than the
+span a walk is laid out across, so the walk the refusal cut short is scaled into the span
+the operation really took (`Timeline::compress_into`): it is reported in the order it
+happened, inside the operation's own events, and never past the failure that ended it.
+
+Still open, and NOT resolved by this change: the recorded check goes on past its overlap
+assertion and then waits for a message published to one of the stack's SNS topics to arrive
+in a subscribed SQS queue. `AWS::SNS::Subscription` and `AWS::SQS::QueuePolicy` are resource
+types this emulator provisions nowhere, so the stack records them from the template alone and
+no subscription exists to deliver through — a provisioning-coverage gap in
+`src/state/provisioner.rs`, not a timeline one.

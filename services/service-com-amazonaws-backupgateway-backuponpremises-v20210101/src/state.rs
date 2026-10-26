@@ -84,6 +84,15 @@
 //! none associated the request is refused ([`GATEWAY_OUT_OF_DATE`]) and nothing is
 //! written.
 //!
+//! The gateway's APPLIANCE SOFTWARE UPDATE ([`StoredGateway::software_update`]) is
+//! written by `UpdateGatewaySoftwareNow` and by nothing else
+//! ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::update_gateway_software_now`]):
+//! the trigger is immediate but the install is not, so the record keeps the version the
+//! update installs beside the instant the install falls due, and the version a read
+//! reports is derived from that instant and the clock
+//! ([`StoredGateway::software_version_as_of`]) the way a hypervisor's state is — so a read
+//! never installs anything and every reader agrees on which version the appliance runs.
+//!
 //! A hypervisor also carries the METADATA SYNC last started on it
 //! ([`StoredHypervisor::metadata_sync_started`]):
 //! `StartVirtualMachinesMetadataSync` persists the instant it was requested at, and the
@@ -308,6 +317,27 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// hyphens.
 pub const GATEWAY_SOFTWARE_VERSION: &str = "2-0-0";
 
+/// The version an appliance runs once `UpdateGatewaySoftwareNow` has installed the update
+/// it triggers — the newest release of the emulated appliance software.
+///
+/// CHOSEN, like [`GATEWAY_SOFTWARE_VERSION`], and rendered the same way, because AWS
+/// publishes no version list for the appliance; what matters is that it DIFFERS from the
+/// version a gateway is activated with, so an install is observable, and that it is the
+/// newest one — an appliance already running it has nothing left to install.
+pub const GATEWAY_UPDATED_SOFTWARE_VERSION: &str = "2-0-1";
+
+/// How long the appliance software update `UpdateGatewaySoftwareNow` triggers takes to
+/// install.
+///
+/// A CHOSEN span, not a documented one: AWS states only that the request triggers the
+/// update immediately, answers 200 at once, and that "it might take some time for the
+/// update to complete" (`smithy_query(query="operation",operation="UpdateGatewaySoftwareNow")`).
+/// It is non-zero so a caller that reads straight after the trigger still sees the version
+/// the appliance was running, and short enough that a caller which waits sees the new one.
+/// Nothing sleeps for it — the due instant is stored and every read compares the clock
+/// against it ([`StoredGateway::software_version_as_of`]).
+pub const GATEWAY_SOFTWARE_UPDATE_INSTALLS_AFTER: Duration = Duration::from_millis(500);
+
 /// The only `GatewayType` the model declares (`GATEWAY_TYPE_VALUES`).
 pub const BACKUP_VM: &str = "BACKUP_VM";
 
@@ -468,8 +498,14 @@ pub struct StoredGateway {
     pub last_seen_time: SystemTime,
     /// When this record was created.
     pub created_time: SystemTime,
-    /// `SoftwareVersion` of the appliance.
+    /// `SoftwareVersion` of the appliance: the version it is running now, moved only by
+    /// an appliance software update whose install has fallen due
+    /// ([`Self::software_version_as_of`]).
     pub software_version: String,
+    /// The appliance software update `UpdateGatewaySoftwareNow` last triggered, absent
+    /// until one is triggered and again once its install has been folded onto
+    /// [`Self::software_version`]. `None` means "no update is installing".
+    pub software_update: Option<GatewaySoftwareUpdate>,
     /// `VpcEndpoint`, set only for a gateway activated through a VPC endpoint.
     pub vpc_endpoint: Option<String>,
     /// `MaintenanceStartTime`, absent until `PutMaintenanceStartTime` sets one.
@@ -482,12 +518,64 @@ pub struct StoredGateway {
     pub tags: BTreeMap<String, String>,
 }
 
+/// An appliance software update of one gateway, as `UpdateGatewaySoftwareNow` triggered
+/// it.
+///
+/// Kept ON the gateway record rather than in a map beside it: the update is a fact about
+/// that appliance, so every reader of the record agrees on which version it is installing
+/// and when that install falls due.
+#[derive(Debug, Clone)]
+pub struct GatewaySoftwareUpdate {
+    /// The version the appliance runs once this install is done.
+    pub to_version: String,
+    /// When the install falls due. Until then the appliance is still running the version
+    /// it was running when the update was triggered.
+    pub installed_at: SystemTime,
+}
+
 impl StoredGateway {
-    /// This record as the `GatewayDetails` shape `GetGateway` returns.
+    /// The version the appliance is running at `now`: the version an update whose install
+    /// has fallen due left there, and otherwise the one on the record.
     ///
-    /// `NextUpdateAvailabilityTime` and `DeprecationDate` stay absent: no appliance
-    /// update is scheduled and no deprecation date is set for an emulated gateway.
-    pub fn details(&self) -> GatewayDetails {
+    /// Derived, never written: a read of a gateway reports the version the clock says the
+    /// appliance runs without moving an install along, so every reader of one record
+    /// agrees and reading twice reports the same thing.
+    pub fn software_version_as_of(&self, now: SystemTime) -> String {
+        match &self.software_update {
+            Some(update) if now >= update.installed_at => update.to_version.clone(),
+            _ => self.software_version.clone(),
+        }
+    }
+
+    /// Fold an install the clock has ALREADY made due onto [`Self::software_version`], so
+    /// the version on the record is the one the appliance runs and the update still held
+    /// beside it is one still to come.
+    ///
+    /// Reached only from a MUTATING operation
+    /// ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::update_gateway_software_now`]);
+    /// a read derives the version instead ([`Self::software_version_as_of`]) and writes
+    /// nothing.
+    fn settle_software_update(&mut self, now: SystemTime) {
+        if self
+            .software_update
+            .as_ref()
+            .is_some_and(|update| now >= update.installed_at)
+        {
+            self.software_version = self.software_version_as_of(now);
+            self.software_update = None;
+        }
+    }
+
+    /// This record as the `GatewayDetails` shape `GetGateway` returns, as of `now`.
+    ///
+    /// `now` is what decides the `SoftwareVersion` reported: an install the clock has made
+    /// due is in effect for every reader at the same instant
+    /// ([`Self::software_version_as_of`]).
+    ///
+    /// `NextUpdateAvailabilityTime` and `DeprecationDate` stay absent: this service
+    /// schedules no appliance update of its own — an update happens when a caller asks for
+    /// one — and no deprecation date is set for an emulated gateway.
+    pub fn details_as_of(&self, now: SystemTime) -> GatewayDetails {
         GatewayDetails {
             gateway_arn: Some(self.arn.clone()),
             gateway_display_name: Some(self.display_name.clone()),
@@ -498,7 +586,7 @@ impl StoredGateway {
             next_update_availability_time: None,
             vpc_endpoint: self.vpc_endpoint.clone(),
             deprecation_date: None,
-            software_version: Some(self.software_version.clone()),
+            software_version: Some(self.software_version_as_of(now)),
         }
     }
 
@@ -1017,6 +1105,7 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
             last_seen_time: now,
             created_time: now,
             software_version: GATEWAY_SOFTWARE_VERSION.to_string(),
+            software_update: None,
             vpc_endpoint: None,
             maintenance_start_time: None,
             bandwidth_rate_limit_intervals: Vec::new(),
@@ -1080,6 +1169,42 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         intervals: Vec<BandwidthRateLimitInterval>,
     ) -> Option<StoredGateway> {
         self.gateways.get_mut(arn)?.bandwidth_rate_limit_intervals = intervals;
+        self.gateways.get(arn).cloned()
+    }
+
+    /// Trigger the appliance software update of the gateway stored under `arn`, and hand
+    /// back the record as it is now STORED — read out of the map after the write, so the
+    /// ARN a caller gets is the key the store holds.
+    ///
+    /// `None` — nothing written — when this store holds no gateway under `arn`.
+    ///
+    /// The update is triggered at once and INSTALLS when
+    /// [`GATEWAY_SOFTWARE_UPDATE_INSTALLS_AFTER`] has passed, which is when a read starts
+    /// reporting [`GATEWAY_UPDATED_SOFTWARE_VERSION`]; nothing sleeps for that instant, it
+    /// is stored on the record. An install the clock has already made due is folded onto
+    /// the record first, so the version an appliance runs only ever moves forward.
+    ///
+    /// An appliance already running the newest version has nothing to install, and one
+    /// already installing it is installing it: in both cases the trigger leaves the record
+    /// exactly as the call before it left it, so the same request twice is one update and
+    /// a second call neither restarts nor delays the install the first one started.
+    /// Nothing else on the record is touched — an update is not an association, a window,
+    /// a schedule or a tagging call.
+    pub fn update_gateway_software_now(
+        &mut self,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<StoredGateway> {
+        let gateway = self.gateways.get_mut(arn)?;
+        gateway.settle_software_update(now);
+        if gateway.software_update.is_none()
+            && gateway.software_version != GATEWAY_UPDATED_SOFTWARE_VERSION
+        {
+            gateway.software_update = Some(GatewaySoftwareUpdate {
+                to_version: GATEWAY_UPDATED_SOFTWARE_VERSION.to_string(),
+                installed_at: now + GATEWAY_SOFTWARE_UPDATE_INSTALLS_AFTER,
+            });
+        }
         self.gateways.get(arn).cloned()
     }
 

@@ -46,6 +46,8 @@
 //! [`MAX_DELETED_STACKS_RETAINED`] completed deletions (the oldest deletion is reclaimed
 //! past that, which is this emulator's stand-in for CloudFormation's 90-day retention of
 //! deleted-stack summaries), [`MAX_EVENTS_PER_STACK`] events per stack (oldest-first),
+//! one [`timeline`] step per resource transition the operation in flight recorded, which
+//! is retired with that operation,
 //! [`MAX_SIGNALS_PER_STACK`] recorded resource signals per stack (oldest-first),
 //! [`TEMPLATE_BODY_MAX_BYTES`] per stored template body (the documented `TemplateBody`
 //! maximum, which the model carries no `@length` for), [`MAX_CHANGE_SETS_PER_STACK`]
@@ -109,6 +111,15 @@
 //! clock: a failed create resolves no outputs and reports no identifier for what was never
 //! created, and a failed update leaves the template in force alone.
 //!
+//! The operation's WALK over those resources rides the same clock, one step at a time: a
+//! stack operation acts on the template's resources in dependency order, and each
+//! resource's `*_IN_PROGRESS` event falls due when the walk SCHEDULED it and its terminal
+//! event when it FINISHED ([`timeline`]). `settle` is what records each of them at that
+//! instant, so `DescribeStackEvents` reports a deployment as far as it has got — resources
+//! with no dependency between them in flight together, a dependent only after its
+//! dependency, and a wait condition for as long as it waits — rather than the whole
+//! resource set at the single instant the operation settles.
+//!
 //! CREATING those resources in the services that own them is [`provisioning`], which the
 //! deploying operation drives with no lock held — and which leaves the stack
 //! `CREATE_FAILED` with the owning service's own refusal as the reason rather than
@@ -116,9 +127,11 @@
 //!
 //! A stack operation therefore owes more than its own two events. As each resource
 //! transitions in the service that owns it, `provisioning` records that transition
-//! ([`provisioning::ResourceTransition`]) and the operation appends it to the stack's event
-//! log ([`StoredStack::record_resource_events`]) — the resource's logical id, its type, the
-//! properties it was deployed with and the owning service's own refusal where it failed —
+//! ([`provisioning::ResourceTransition`]) and the operation plans it onto the stack's walk
+//! ([`StoredStack::schedule_resource_events`]), from which [`StoredStack::settle`] appends
+//! it to the event log at the instant the walk reached it — the resource's logical id, its
+//! type, the properties it was deployed with and the owning service's own refusal where it
+//! failed —
 //! so each of those events sits between the stack's opening and terminal ones, and all of
 //! them carry one token ("All events triggered by a given stack operation are assigned the
 //! same client request token"). A resource the operation does not act on reports nothing,
@@ -183,7 +196,7 @@
 //! cap on CONCURRENT generations transient: it counts the records still in a pending or
 //! in-progress status, so it lifts as those conclude.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 /// Creating the resources a stack's template declares in the services that own them, and
@@ -255,6 +268,11 @@ pub mod wait_conditions;
 /// The stack sets this account and Region holds, and the stack instances each one carries,
 /// which `ListStackInstances` reports summaries of.
 pub mod stack_sets;
+
+/// The TIMELINE of one stack operation's walk over a stack's resources: when each resource
+/// was scheduled and when it finished, which is what the per-resource `StackEvent`s of that
+/// operation are stamped with.
+pub mod timeline;
 
 /// How long after the call that starts it a stack's terminal status becomes due.
 ///
@@ -968,6 +986,9 @@ pub struct PendingStatus {
     /// [`StoredStack::fail_transition`] for a failure discovered while the operation is in
     /// flight): a failure has to say what failed, and a success states no reason.
     pub status_reason: Option<String>,
+    /// The instant the call that opened this operation was served — what the operation's
+    /// own walk over the stack's resources is measured from ([`timeline`]).
+    pub started_at: SystemTime,
     pub due_at: SystemTime,
     pub operation_id: Option<String>,
     pub client_request_token: Option<String>,
@@ -989,6 +1010,12 @@ pub struct PendingDeployment {
     /// [`StoredStack::begin_transition`] is what opens a barrier for each one the
     /// operation has to wait at.
     pub wait_conditions: Vec<wait_conditions::DeclaredWaitCondition>,
+    /// The direct dependency relation of the template being deployed
+    /// ([`template::direct_dependencies`]): what each resource it declares waits for.
+    /// Read where the template is READ, outside the store lock, and installed as the
+    /// stack's own when the deployment completes — it is what orders the deployment's
+    /// walk over the resources in time ([`timeline`]).
+    pub dependencies: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// One stack, as this emulator persists it.
@@ -1068,6 +1095,18 @@ pub struct StoredStack {
     /// What the create or update currently in flight will leave the two fields above
     /// with when it completes.
     pub pending_deployment: Option<PendingDeployment>,
+    /// The direct dependency relation of the template IN FORCE on the stack, keyed by
+    /// logical id ([`template::direct_dependencies`]): what each of the stack's resources
+    /// waits for. Installed by the operation that deploys the template, so the stack's own
+    /// deletion still knows the order to walk its resources in.
+    pub resource_dependencies: BTreeMap<String, BTreeSet<String>>,
+    /// The walk the operation in flight made over the stack's resources, with the
+    /// per-resource events it still owes ([`timeline`]): a resource's `*_IN_PROGRESS` event
+    /// is recorded when that resource was SCHEDULED and its terminal one when it FINISHED,
+    /// so the event log of one operation is the timeline of its walk. [`Self::settle`] is
+    /// what records the events whose instant the clock has reached; `None` for a stack with
+    /// no walk still owing events.
+    pub resource_timeline: Option<timeline::Timeline>,
     /// The wait conditions the operation in flight is waiting at, each with the signals
     /// that have arrived ([`wait_conditions`]).
     ///
@@ -1167,6 +1206,8 @@ impl StoredStack {
             resources: Vec::new(),
             outputs: Vec::new(),
             pending_deployment: None,
+            resource_dependencies: BTreeMap::new(),
+            resource_timeline: None,
             wait_conditions: Vec::new(),
             last_operation: None,
             creation_time: now,
@@ -1421,10 +1462,15 @@ impl StoredStack {
         // is not locked, and charged to the SAME budget as every other evaluation of this
         // deployment, so what one request can ask for stays bounded in total.
         let wait_conditions = wait_conditions::declared(&declared, &resources, &mut budget);
+        // What each declared resource WAITS FOR, read here for the same reason: the
+        // deployment's walk over these resources is ordered by it ([`timeline`]), and a
+        // read must not re-parse a caller-sized body under the store lock.
+        let dependencies = template::direct_dependencies(&declared);
         self.pending_deployment = Some(PendingDeployment {
             resources,
             outputs,
             wait_conditions,
+            dependencies,
         });
         Ok(())
     }
@@ -1654,8 +1700,8 @@ impl StoredStack {
         self.events.push_back(event);
     }
 
-    /// Append the event each RESOURCE transition of a stack operation owes, through
-    /// [`Self::record_resource_event`].
+    /// Plan the event each RESOURCE transition of a stack operation owes, as the walk that
+    /// operation made over the stack's resources ([`timeline`]).
     ///
     /// "Returns all stack related events for a specified stack": an event is not only the
     /// stack's own status changes but one record per transition of each resource the
@@ -1663,29 +1709,174 @@ impl StoredStack {
     /// resource a failed deployment failed on and, through
     /// `StackEvent$ResourceStatusReason`, why the service that owns it refused.
     ///
+    /// A stack operation is a WALK over the dependency graph, though, and
+    /// `StackEvent$Timestamp` is "Time the status was updated" — so these records are not
+    /// written here at one instant. Each one falls due when the walk reached it: a resource
+    /// is scheduled once everything it depends on has finished, and a wait condition the
+    /// operation waits at finishes when its signals arrive. [`Self::settle`] is what
+    /// records each event at that instant, so the log a client reads is the timeline of the
+    /// deployment rather than a set of simultaneous records.
+    ///
     /// Every event of one stack operation carries that operation's id and the token the
     /// call supplied ("All events triggered by a given stack operation are assigned the
     /// same client request token"), which is what the stack is reporting as its last
-    /// operation while these are recorded.
-    pub fn record_resource_events(&mut self, transitions: &[provisioning::ResourceTransition]) {
-        let operation_id = self
-            .last_operation
+    /// operation while these are planned.
+    pub fn schedule_resource_events(
+        &mut self,
+        transitions: &[provisioning::ResourceTransition],
+    ) {
+        // The walk belongs to the operation in flight, so its timeline is measured from
+        // the instant that operation started.
+        let started_at = self
+            .pending
             .as_ref()
-            .map(|operation| operation.operation_id.clone());
-        let client_request_token = self.client_request_token.clone();
-        for transition in transitions {
+            .map_or_else(SystemTime::now, |pending| pending.started_at);
+        // Whatever an earlier walk of this stack still owed happened before this one: it is
+        // recorded rather than dropped, and never after what follows it.
+        self.flush_resource_timeline(started_at);
+        let gated: BTreeSet<String> = self
+            .wait_conditions
+            .iter()
+            .map(|barrier| barrier.logical_id().to_string())
+            .collect();
+        let planned = {
+            // The relation of the template being DEPLOYED where there is one, else the one
+            // in force — which is what a deletion walks.
+            let dependencies = match &self.pending_deployment {
+                Some(deployment) => &deployment.dependencies,
+                None => &self.resource_dependencies,
+            };
+            timeline::plan(
+                started_at,
+                STATUS_TRANSITION_DELAY,
+                transitions,
+                dependencies,
+                &gated,
+                self.last_operation
+                    .as_ref()
+                    .map(|operation| operation.operation_id.clone()),
+                self.client_request_token.clone(),
+            )
+        };
+        self.resource_timeline = planned;
+    }
+
+    /// Record the per-resource events the walk in flight has made due at `now`, leaving the
+    /// ones it has not reached for a later call.
+    ///
+    /// Only ever records an event whose instant has passed, so it reports what the walk had
+    /// got to at `now` even if nobody had called, and never stamps one in the future.
+    fn record_due_resource_events(&mut self, now: SystemTime) {
+        self.drain_resource_timeline(now, false);
+    }
+
+    /// Record every per-resource event the walk still owes, none of them later than `at`,
+    /// and have done with it.
+    ///
+    /// Called where the operation that made the walk CONCLUDES — it completed, or it
+    /// failed: everything it did happened at or before that instant, so nothing it recorded
+    /// is left unreported and nothing is stamped after the conclusion it belongs to.
+    fn flush_resource_timeline(&mut self, at: SystemTime) {
+        self.drain_resource_timeline(at, true);
+    }
+
+    /// Record the per-resource events of the walk in flight, oldest first.
+    ///
+    /// `flush` is what separates the two callers above: with it the walk is compressed into
+    /// the span the operation really took ([`timeline::Timeline::compress_into`]) and every
+    /// event it still owes is recorded, at its own instant or at `now` where the walk had
+    /// not reached it; without it only the events the walk has reached are recorded and the
+    /// rest are left for the clock.
+    fn drain_resource_timeline(&mut self, now: SystemTime, flush: bool) {
+        let Some(mut walk) = self.resource_timeline.take() else {
+            return;
+        };
+        let released = self.gate_releases();
+        if flush {
+            walk.compress_into(now, &released);
+        }
+        let times = walk.times(&released);
+        // (instant, step, the event's place in that step), so the log is appended in the
+        // order the walk did these things.
+        let mut owed: Vec<(SystemTime, usize, usize)> = Vec::new();
+        for (index, step) in walk.steps.iter().enumerate() {
+            let at = times.get(index).copied().unwrap_or_default();
+            let count = step.events.len();
+            for (place, event) in step.events.iter().enumerate() {
+                if event.recorded {
+                    continue;
+                }
+                if let Some(when) = due_instant(at.event_at(place, count), now, flush) {
+                    owed.push((when, index, place));
+                }
+            }
+        }
+        owed.sort();
+        for (at, index, place) in owed {
+            let Some(step) = walk.steps.get_mut(index) else {
+                continue;
+            };
+            let logical_id = step.logical_id.clone();
+            let resource_type = step.resource_type.clone();
+            let Some(event) = step.events.get_mut(place) else {
+                continue;
+            };
+            event.recorded = true;
+            let physical_resource_id = event.physical_resource_id.clone();
+            let status = event.status.clone();
+            let reason = event.reason.clone();
+            let resource_properties = event.resource_properties.clone();
             self.record_resource_event(
-                transition.at,
-                &transition.logical_id,
-                transition.physical_resource_id.clone(),
-                &transition.resource_type,
-                &transition.status,
-                transition.reason.clone(),
-                transition.resource_properties.clone(),
-                operation_id.clone(),
-                client_request_token.clone(),
+                at,
+                &logical_id,
+                physical_resource_id,
+                &resource_type,
+                &status,
+                reason,
+                resource_properties,
+                walk.operation_id.clone(),
+                walk.client_request_token.clone(),
             );
         }
+        if !flush {
+            // Kept until the operation it belongs to concludes, not until its last event is
+            // recorded: what it computed is also the instant each resource's own status was
+            // updated, which the conclusion installs.
+            self.resource_timeline = Some(walk);
+        }
+    }
+
+    /// The instant each wait condition the operation is waiting at got the signals it waits
+    /// for, by logical id — which is when that resource's own creation FINISHED, and when
+    /// the resources behind it were scheduled.
+    ///
+    /// Read off the stack's signal log, which is the one record of what has arrived: the
+    /// arrival of the signal that brought the count up to the `Count` it waits for. A
+    /// barrier still short of that is absent, because nothing has finished it.
+    fn gate_releases(&self) -> BTreeMap<String, SystemTime> {
+        self.wait_conditions
+            .iter()
+            .filter_map(|barrier| {
+                self.satisfied_at(barrier)
+                    .map(|at| (barrier.logical_id().to_string(), at))
+            })
+            .collect()
+    }
+
+    /// The instant `barrier` was satisfied: when the signal that brought it up to its
+    /// `Count` arrived, or `None` while it is short of it.
+    ///
+    /// Over the same signals [`Self::successful_signals`] counts, in arrival order: the
+    /// `Count`-th of them is the one that satisfied the wait condition.
+    fn satisfied_at(
+        &self,
+        barrier: &wait_conditions::WaitConditionBarrier,
+    ) -> Option<SystemTime> {
+        let mut arrivals: Vec<SystemTime> = self
+            .successful_signal_arrivals(barrier.logical_id())
+            .collect();
+        arrivals.sort_unstable();
+        arrivals.get(barrier.count().saturating_sub(1)).copied()
     }
 
     /// Record a signal `SignalResource` sent one of this stack's resources, and answer
@@ -1730,7 +1921,8 @@ impl StoredStack {
         });
     }
 
-    /// Materialise the status transition the clock has already made due, if any.
+    /// Materialise the status transition the clock has already made due, if any, and record
+    /// the per-resource events the operation's walk has reached.
     ///
     /// Only ever applies a transition whose due instant has passed, so it reports what
     /// was owed at `now` even if nobody had called — it never advances a stack because
@@ -1740,15 +1932,40 @@ impl StoredStack {
     /// signals arrive, so the barriers are consulted FIRST: one whose `Timeout` has run
     /// out fails the operation (which the clock does owe at that instant), and one still
     /// waiting holds the pending transition back however long ago it was opened.
+    ///
+    /// The WALK the operation made over the stack's resources is on the same clock and is
+    /// reported as it proceeds ([`timeline`]): a client polling `DescribeStackEvents` reads
+    /// the resources the walk has scheduled and finished so far, and the walk is laid out
+    /// inside the span the operation's own clock owes, so no resource of it is reported as
+    /// finishing after the operation that acted on it.
     pub fn settle(&mut self, now: SystemTime) {
         self.settle_wait_conditions(now);
+        // What the operation's walk over the resources owes at `now`, whether or not the
+        // operation as a whole is due: a deployment in flight is reported as far as it has
+        // got.
+        self.record_due_resource_events(now);
         if self.waiting_for_signals() {
             // The operation is still waiting for its signals: nothing is due.
             return;
         }
-        if self.pending.as_ref().is_none_or(|p| p.due_at > now) {
+        let Some(due_at) = self.pending.as_ref().map(|pending| pending.due_at) else {
+            // No operation is in flight, so a walk left over belongs to nothing: whatever
+            // it still owed is recorded rather than held.
+            self.flush_resource_timeline(now);
+            return;
+        };
+        if due_at > now {
             return;
         }
+        // When each resource the walk acted on finished, which is the instant its own
+        // status was updated — read before the walk is drained, since draining it is what
+        // retires it.
+        let finished_at = self.resource_finished_instants();
+        // Everything the operation did happened before it concluded, so whatever its walk
+        // still owed is recorded now — ahead of the stack's own terminal event, and never
+        // later than the last instant the walk itself computed.
+        let walk_ends_at = self.resource_walk_ends_at().unwrap_or(due_at);
+        self.flush_resource_timeline(due_at.max(walk_ends_at));
         // The operation is completing, so its barriers belong to nothing from here on.
         // They are kept until exactly this point, so what the operation had created stays
         // reported for the whole of it rather than disappearing between the releasing
@@ -1757,17 +1974,16 @@ impl StoredStack {
         let pending = self.pending.take().expect("checked just above");
         let completing_deletion = pending.status == status::DELETE_COMPLETE;
         let deployed = self.pending_deployment.take();
-        // The per-RESOURCE events of this operation were recorded by the operation itself,
-        // as each resource transitioned in the service that owns it
-        // ([`Self::record_resource_events`]) — so by now the only event still owed is the
-        // stack's own terminal one, which closes the operation after them.
-        let at = pending.due_at;
+        // The per-RESOURCE events of this operation were recorded as its walk reached each
+        // resource ([`Self::drain_resource_timeline`], flushed just above) — so by now the
+        // only event still owed is the stack's own terminal one, which closes the operation
+        // after them.
         self.status = pending.status;
         // The reason the terminal status carries: the one the operation failed with, and
         // nothing for one that completed.
         self.status_reason = pending.status_reason.clone();
         if completing_deletion {
-            self.deletion_time = Some(pending.due_at);
+            self.deletion_time = Some(due_at);
             // The deletion completed, so every resource of the stack was deleted as of
             // that instant — reported, not dropped: "For deleted stacks,
             // DescribeStackResources returns resource information for up to 90 days after
@@ -1775,7 +1991,10 @@ impl StoredStack {
             // evaluated against resources that no longer exist.
             for deployed in &mut self.resources {
                 deployed.status = resource_status::DELETE_COMPLETE.to_string();
-                deployed.status_timestamp = pending.due_at;
+                deployed.status_timestamp = finished_at
+                    .get(&deployed.resource.logical_id)
+                    .copied()
+                    .unwrap_or(due_at);
             }
             self.outputs.clear();
         } else if self.status == status::ROLLBACK_COMPLETE {
@@ -1788,19 +2007,48 @@ impl StoredStack {
         } else if let Some(deployment) = deployed {
             // The create or update completed: the template it deployed is what the stack
             // reports resources and outputs for from here on.
-            self.resources =
-                installed_resources(&self.resources, deployment.resources, pending.due_at);
+            self.resources = installed_resources(
+                &self.resources,
+                deployment.resources,
+                due_at,
+                &finished_at,
+            );
             self.outputs = deployment.outputs;
+            // The relation the template that finished deploying describes is the stack's
+            // from here on, which is what its deletion walks.
+            self.resource_dependencies = deployment.dependencies;
         }
         let status = self.status.clone();
         let reason = pending.status_reason;
         self.record_event(
-            at,
+            due_at,
             &status,
             reason,
             pending.operation_id,
             pending.client_request_token,
         );
+    }
+
+    /// The instant the LAST resource the walk in flight acted on finished, if it has one.
+    ///
+    /// The walk is laid out inside the span the operation's own clock owes, so this is
+    /// normally before the operation's due instant; it is what the events the operation's
+    /// conclusion still owes are held to, so none of them is stamped after the walk really
+    /// got there.
+    fn resource_walk_ends_at(&self) -> Option<SystemTime> {
+        self.resource_timeline
+            .as_ref()?
+            .ends_at(&self.gate_releases())
+    }
+
+    /// The instant each resource the walk in flight acted on finished, by logical id —
+    /// what `StackResource$Timestamp` ("Time the status was updated") reports for a
+    /// resource the operation leaves in a new status.
+    fn resource_finished_instants(&self) -> BTreeMap<String, SystemTime> {
+        match &self.resource_timeline {
+            Some(walk) => walk.finished_instants(&self.gate_releases()),
+            None => BTreeMap::new(),
+        }
     }
 
     /// Start a stack operation: move the stack to its `*_IN_PROGRESS` status, record the
@@ -1818,6 +2066,9 @@ impl StoredStack {
         operation_id: Option<String>,
         client_request_token: Option<String>,
     ) {
+        // An operation starts only once the one before it is over: whatever its walk over
+        // the resources still owed happened before this call.
+        self.flush_resource_timeline(now);
         self.status = in_progress.to_string();
         self.status_reason = Some(USER_INITIATED.to_string());
         // `Stack$LastOperations`: "Information about the most recent operations performed
@@ -1843,6 +2094,7 @@ impl StoredStack {
             // A completion carries no reason, and nothing has failed yet:
             // `Self::fail_transition` is what records a failure of this operation.
             status_reason: None,
+            started_at: now,
             due_at: now + STATUS_TRANSITION_DELAY,
             operation_id,
             client_request_token,
@@ -1906,21 +2158,32 @@ impl StoredStack {
         }
     }
 
-    /// How many DISTINCT success signals this stack has received for `logical_id`.
+    /// When each DISTINCT success signal this stack has received for `logical_id` arrived.
     ///
-    /// Counted off the stack's signal log, which `SignalResource` keys by the signalled
+    /// Read off the stack's signal log, which `SignalResource` keys by the signalled
     /// resource and the signal's `UniqueId` ([`Self::record_signal`]): "if you send
     /// multiple signals to a single resource (such as signaling a wait condition), each
-    /// signal requires a different unique ID", so two signals under one id are one signal
-    /// and this is the count a wait condition's `Count` is compared against.
-    pub fn successful_signals(&self, logical_id: &str) -> usize {
+    /// signal requires a different unique ID", so two signals under one id are one signal.
+    /// This is the one place that says which of a stack's signals COUNT for a resource:
+    /// [`Self::successful_signals`] counts them and [`Self::satisfied_at`] reads when the
+    /// one that satisfied a wait condition arrived.
+    fn successful_signal_arrivals<'stack>(
+        &'stack self,
+        logical_id: &'stack str,
+    ) -> impl Iterator<Item = SystemTime> + 'stack {
         self.signals
             .iter()
-            .filter(|signal| {
+            .filter(move |signal| {
                 signal.logical_resource_id == logical_id
                     && signal.status == resource_signal_status::SUCCESS
             })
-            .count()
+            .map(|signal| signal.received_at)
+    }
+
+    /// How many DISTINCT success signals this stack has received for `logical_id` — the
+    /// count a wait condition's `Count` is compared against.
+    pub fn successful_signals(&self, logical_id: &str) -> usize {
+        self.successful_signal_arrivals(logical_id).count()
     }
 
     /// Whether this barrier has the signals it waits for, so the operation may proceed.
@@ -2037,7 +2300,8 @@ impl StoredStack {
             })
             .cloned()
             .collect();
-        let mut reported = installed_resources(&self.resources, started, opened_at);
+        let mut reported =
+            installed_resources(&self.resources, started, opened_at, &self.resource_finished_instants());
         for deployed in &mut reported {
             if let Some(barrier) = unsatisfied
                 .iter()
@@ -2153,7 +2417,14 @@ impl StoredStack {
     /// This is how CloudFormation reports a stack whose resources an owning service
     /// refused to create or delete (`CREATE_FAILED` / `DELETE_FAILED`) — the operation
     /// does not stay pending and no terminal status it never reached is reported.
+    ///
+    /// The operation CONCLUDED at `now`, which for a failure an owning service answered is
+    /// sooner than the span the walk over the resources was laid out across: the walk is
+    /// therefore compressed into the span the operation really took, so what it had done is
+    /// recorded in the order it did it, at its own instants, ahead of the failure that ends
+    /// it ([`timeline::Timeline::compress_into`]).
     pub fn fail_transition(&mut self, now: SystemTime, failed_status: &str, reason: String) {
+        self.flush_resource_timeline(now);
         let pending = self.pending.take();
         // An operation that failed waits for nothing: whatever it was waiting at, it is
         // not going to proceed on a signal.
@@ -2206,6 +2477,7 @@ impl StoredStack {
             // nothing else to go on.
             status: status::ROLLBACK_COMPLETE.to_string(),
             status_reason: Some(reason),
+            started_at: now,
             due_at: now + STATUS_TRANSITION_DELAY,
             operation_id,
             client_request_token,
@@ -2277,14 +2549,23 @@ fn initiated_reason(in_progress_status: &str) -> &'static str {
 /// changed reports that completion as an update, and one it left exactly as it found it
 /// keeps the status and the instant it already carried: nothing about that resource's
 /// status was updated, so its timestamp must not move.
+///
+/// The instant a resource's status was updated is that RESOURCE's own: `finished_at` is
+/// when the operation's walk finished each one ([`timeline`]), and `at` is the fallback for
+/// a resource the walk recorded nothing for.
 fn installed_resources(
     previous: &[DeployedResource],
     deployed: Vec<StoredResource>,
     at: SystemTime,
+    finished_at: &BTreeMap<String, SystemTime>,
 ) -> Vec<DeployedResource> {
     deployed
         .into_iter()
         .map(|resource| {
+            let updated_at = finished_at
+                .get(&resource.logical_id)
+                .copied()
+                .unwrap_or(at);
             match previous
                 .iter()
                 .find(|before| before.resource.logical_id == resource.logical_id)
@@ -2293,12 +2574,33 @@ fn installed_resources(
                 Some(before) if before.resource == resource => before.clone(),
                 // Deployed before under this logical id and now different: the operation
                 // updated it.
-                Some(_) => DeployedResource::new(resource, resource_status::UPDATE_COMPLETE, at),
+                Some(_) => DeployedResource::new(
+                    resource,
+                    resource_status::UPDATE_COMPLETE,
+                    updated_at,
+                ),
                 // Not deployed before: the operation created it.
-                None => DeployedResource::new(resource, resource_status::CREATE_COMPLETE, at),
+                None => DeployedResource::new(
+                    resource,
+                    resource_status::CREATE_COMPLETE,
+                    updated_at,
+                ),
             }
         })
         .collect()
+}
+
+/// The instant a per-resource event the walk owes falls due, or `None` while the walk has
+/// not reached it.
+///
+/// `flush` is the operation CONCLUDING: an event the walk had not reached by then is
+/// recorded at that instant rather than dropped or stamped after it.
+fn due_instant(computed: Option<SystemTime>, now: SystemTime, flush: bool) -> Option<SystemTime> {
+    match computed {
+        Some(at) if at <= now => Some(at),
+        _ if flush => Some(now),
+        _ => None,
+    }
 }
 
 /// The change set as this store carries it: the resource-level change list and the

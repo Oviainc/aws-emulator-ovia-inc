@@ -141,6 +141,19 @@ pub const INSTANCE_ACTIVATION_SPAN: Duration = Duration::from_millis(500);
 /// nothing sleeps for it.
 pub const REGION_REMOVAL_SPAN: Duration = Duration::from_millis(500);
 
+/// How long after `AddRegion` the Region it names finishes its extension workflow — the
+/// end of the `ADDING` the add put it into ("This operation initiates an asynchronous
+/// workflow to replicate the IAM Identity Center instance to the target Region. The Region
+/// status is set to ADDING at first and changes to ACTIVE when the workflow completes").
+///
+/// AWS publishes no duration for that workflow, so this span is the emulator's own CHOSEN
+/// one, on the same footing as [`REGION_REMOVAL_SPAN`]: it is never zero, so a caller that
+/// reads the Region straight after the add still observes the `ADDING` status the model
+/// declares, and it is short enough to be waited out inside one test. It is held as the
+/// instant the activation falls due and applied by [`Region::materialize_due`] — nothing
+/// sleeps for it.
+pub const REGION_ACTIVATION_SPAN: Duration = Duration::from_millis(500);
+
 /// Which KIND of IAM Identity Center instance a record is.
 ///
 /// The distinction is AWS's: `CreateInstance` is documented as creating "an instance of
@@ -1042,6 +1055,15 @@ pub struct Region {
     /// a due INSTANT and applied by [`Instance::materialize_due`], which drops the record;
     /// nothing sleeps for it.
     pub removed_due: Option<SystemTime>,
+    /// When the clock owes this Region its move out of `ADDING` — the end of the extension
+    /// workflow an `AddRegion` started ([`REGION_ACTIVATION_SPAN`]) — or `None` for a
+    /// Region whose own enablement is not in flight. Stored as a due INSTANT and applied
+    /// by [`Region::materialize_due`]; nothing sleeps for it.
+    ///
+    /// A Region of an instance whose WHOLE creation is still in flight carries none: its
+    /// enablement finishes with the instance's own activation
+    /// ([`Instance::materialize_due`]), not on a span of its own.
+    pub active_due: Option<SystemTime>,
 }
 
 impl Region {
@@ -1065,6 +1087,23 @@ impl Region {
             added_date,
             is_primary_region: false,
             removed_due: None,
+            active_due: None,
+        }
+    }
+
+    /// An ADDITIONAL Region whose extension workflow has just STARTED at `now`: the record
+    /// `AddRegion` appends, `ADDING` until its activation falls due
+    /// ([`REGION_ACTIVATION_SPAN`]) and `ACTIVE` from then on — "The Region status is set to
+    /// ADDING at first and changes to ACTIVE when the workflow completes."
+    ///
+    /// `AddedDate` is the instant the Region was added to the instance, which is this one:
+    /// `DescribeRegion$AddedDate` is "The timestamp when the Region was added to the IAM
+    /// Identity Center instance", not the instant its workflow finished.
+    pub fn adding(region_name: &str, now: SystemTime) -> Self {
+        Self {
+            status: STATUS_ADDING.to_string(),
+            active_due: Some(now + REGION_ACTIVATION_SPAN),
+            ..Self::active(region_name, DateTime::from(now))
         }
     }
 
@@ -1098,8 +1137,34 @@ impl Region {
         if self.removed_due.is_some() {
             return;
         }
+        // The Region is on its way OUT, so no activation is owed it any more.
+        self.active_due = None;
         self.status = STATUS_REMOVING.to_string();
         self.removed_due = Some(now + REGION_REMOVAL_SPAN);
+    }
+
+    /// Whether this Region's own ENABLEMENT is still in flight: an `AddRegion` started its
+    /// extension workflow and the clock has not made its completion due yet.
+    pub fn addition_in_flight(&self, now: SystemTime) -> bool {
+        self.active_due.is_some_and(|due| due > now)
+    }
+
+    /// Apply what the CLOCK already owes this Region: a Region whose extension workflow has
+    /// run out is `ACTIVE` — "The Region status is set to ADDING at first and changes to
+    /// ACTIVE when the workflow completes" — whether or not anybody called. Idempotent, and
+    /// it changes nothing before that instant falls due.
+    ///
+    /// A Region a `RemoveRegion` has since started removing keeps its `REMOVING`: the
+    /// record is on its way out, and [`Self::start_removal`] has already dropped the
+    /// activation it was owed.
+    pub fn materialize_due(&mut self, now: SystemTime) {
+        if self.removed_due.is_some() {
+            return;
+        }
+        if self.active_due.is_some_and(|due| due <= now) {
+            self.active_due = None;
+            self.status = STATUS_ACTIVE.to_string();
+        }
     }
 
     /// Whether the clock already owes this Region record its DELETION.
@@ -1306,6 +1371,12 @@ impl Instance {
         // anybody called: `RemoveRegion` is documented as deleting the Region record "when
         // the workflow completes".
         self.regions.retain(|region| !region.removal_due(now));
+        // And a Region whose own EXTENSION workflow has run out is `ACTIVE`, on the span
+        // the `AddRegion` that started it fixed — independently of the instance's own
+        // lifecycle, which that add did not touch.
+        for region in &mut self.regions {
+            region.materialize_due(now);
+        }
         if self.deleted_due.is_some() {
             return;
         }
@@ -1316,6 +1387,7 @@ impl Instance {
                 // A Region on its way OUT keeps its `REMOVING`: the instance's activation
                 // says nothing about a removal workflow another call started.
                 if region.removed_due.is_none() {
+                    region.active_due = None;
                     region.status = STATUS_ACTIVE.to_string();
                 }
             }

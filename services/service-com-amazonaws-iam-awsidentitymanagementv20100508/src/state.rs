@@ -372,6 +372,12 @@ pub const MARKER_SCOPE_ROLES: &str = "roles";
 /// issued while paging groups is not read as a position among the users or roles.
 pub const MARKER_SCOPE_GROUPS: &str = "groups";
 
+/// The marker scope of the account's instance profile collection, which
+/// `ListInstanceProfiles` pages over. It is its OWN scope, exactly as the user and
+/// role collections are, so a marker issued while paging another collection is not
+/// read as a position among the instance profiles.
+pub const MARKER_SCOPE_INSTANCE_PROFILES: &str = "instance-profiles";
+
 /// The marker scope of the managed policies an account can read — the ones it holds
 /// itself and the ones AWS owns ([`AWS_MANAGED_POLICIES`]) — which `ListPolicies`
 /// pages over. It is its OWN scope, like the user and role collections, and ONE
@@ -2593,6 +2599,22 @@ pub fn listed_policy(policy: &Policy) -> Policy {
         description: None,
         tags: None,
         ..policy.clone()
+    }
+}
+
+/// One stored instance profile as a resource-LISTING operation reports it, for the
+/// same reason [`listed_role`] exists.
+///
+/// `ListInstanceProfiles`' documentation: "IAM resource-listing operations return a
+/// subset of the available attributes for the resource. For example, this operation
+/// does not return tags, even though they are an attribute of the returned object. To
+/// view all of the information for an instance profile, see GetInstanceProfile." Every
+/// other member — including `Roles`, which the resolution fills from the roles the
+/// account holds — is reported as it stands.
+pub fn listed_instance_profile(instance_profile: InstanceProfile) -> InstanceProfile {
+    InstanceProfile {
+        tags: None,
+        ..instance_profile
     }
 }
 

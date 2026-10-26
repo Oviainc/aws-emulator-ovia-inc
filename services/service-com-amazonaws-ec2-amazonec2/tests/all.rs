@@ -429,3 +429,9 @@ mod route_server_associations;
 // the Traffic Mirror session store, and what it refuses.
 #[path = "all/traffic_mirror_sessions.rs"]
 mod traffic_mirror_sessions;
+// Declared LAST for the reason the header gives: the sorted region of this file is where
+// every new ec2 suite inserts its lines. What `DescribeClientVpnEndpoints` reports out of the
+// Client VPN endpoint store, and how the ids, the documented filters and the page size narrow
+// it.
+#[path = "all/client_vpn_endpoints.rs"]
+mod client_vpn_endpoints;

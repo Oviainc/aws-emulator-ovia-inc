@@ -19,7 +19,8 @@
 //! each is scoped to its own list.
 //!
 //! Being addressed BY a contact ARN, it is gated on the account's Incident Manager replication
-//! set the way `ListContactChannels` is: without an active set the ARN resolves to nothing. A
+//! set the way `ListContactChannels` is: without an active set the account has no entry in
+//! Incident Manager's registry and the call is refused about the ACCOUNT. A
 //! `ContactId` the store does not hold is the modelled `ResourceNotFoundException` (HTTP 404).
 //!
 //! ## Shape of an operation
@@ -190,10 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The account gate comes FIRST — before the `NextToken` is read and before `ContactId`
         // is resolved — so a non-onboarded account is refused identically whatever else the
-        // request carries, and the refusal names the ARN the request supplied, which is what
-        // cannot be resolved without a replication set.
+        // request carries, and about its own missing registry entry rather than about
+        // anything the request named.
         state
-            .require_active_replication_set_for(&input.contact_id)
+            .require_active_replication_set()
             .map_err(account_precondition_failed)?;
 
         // The resume point: the send sequence the previous page of results ended on. Read

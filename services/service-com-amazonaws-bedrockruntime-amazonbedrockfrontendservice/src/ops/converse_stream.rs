@@ -165,15 +165,18 @@ impl<Eng: Send + Sync + 'static> ConverseStream<Eng> {
                 .and_then(|config| config.max_tokens),
         );
 
-        state
-            .lock()
-            .log_invocation(crate::state::InvocationLogEntry {
-                model_id: model.model_id.clone(),
-                kind: crate::state::InvokeKind::ConverseStream,
-                input_tokens: turn.input_tokens,
-                output_tokens: turn.output_tokens,
-                at_millis: crate::state::now_millis(),
-            });
+        let logged = crate::state::InvocationLogEntry {
+            model_id: model.model_id.clone(),
+            kind: crate::state::InvokeKind::ConverseStream,
+            input_tokens: turn.input_tokens,
+            output_tokens: turn.output_tokens,
+            at_millis: crate::state::now_millis(),
+        };
+        state.lock().log_invocation(logged.clone());
+        // The token volume this call reports in its metadata event is also its
+        // contribution to the `AWS/Bedrock` series dimensioned on the invoked
+        // model, published with no state guard of this service held.
+        crate::state::invocation_metrics::publish_token_usage(&*self.engine, &logged);
 
         // The assistant message this turn is, as one text content block — the same
         // message `Converse` answers with, so the two surfaces cannot drift.
