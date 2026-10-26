@@ -2308,6 +2308,19 @@ pub fn status_conflict_message(id: &str, status: &str, action: &str) -> String {
     format!("benefit application {id} is {status}, so it cannot be {action}")
 }
 
+/// The message an optimistic-concurrency refusal carries: the application, the revision
+/// it is actually at, and the revision the request named — e.g. ``benefit application
+/// benappl-… is at revision 3, not 1``.
+///
+/// One construction for every revision refusal this service makes
+/// (`UpdateBenefitApplication`, `AmendBenefitApplication`), for the same reason
+/// [`status_conflict_message`] is written once: a client reading a `ConflictException`
+/// learns the current revision from any of them in the same words, and in the same
+/// order — the stored revision first, the requested one second.
+pub fn revision_conflict_message(id: &str, current: &str, requested: &str) -> String {
+    format!("benefit application {id} is at revision {current}, not {requested}")
+}
+
 /// The entitlement gate: `Some(..)` when the calling account holds no active AWS partner
 /// benefit, and the request must be refused with the modelled `AccessDeniedException`
 /// (served with [`ACCESS_DENIED_STATUS`]) instead of being served.

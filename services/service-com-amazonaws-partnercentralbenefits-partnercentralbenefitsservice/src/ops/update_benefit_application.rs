@@ -313,11 +313,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if application.revision_text() != input.revision {
             return Err(UpdateBenefitApplicationErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "benefit application {} is at revision {}, not {}",
-                        application.id,
-                        application.revision_text(),
-                        input.revision
+                    message: crate::state::revision_conflict_message(
+                        &application.id,
+                        &application.revision_text(),
+                        &input.revision,
                     ),
                 },
             )
