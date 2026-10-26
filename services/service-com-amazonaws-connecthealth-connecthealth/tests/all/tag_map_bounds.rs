@@ -64,14 +64,20 @@ use crate::resource_tagging::{domain_tags, entries, tags_path};
 type EntriesCase<'t> = (&'t str, Vec<(&'t String, &'t String)>, bool);
 
 /// A `tags` map of exactly one entry, built from a key and a value this suite computes.
-fn one_tag(key: &str, value: &str) -> Value {
+///
+/// `pub(crate)` so the sibling suite that sweeps the UNIT the bound is measured in
+/// (`tests/all/tag_bound_unit.rs`) builds its maps the same way rather than growing a
+/// second copy.
+pub(crate) fn one_tag(key: &str, value: &str) -> Value {
     json!({ key.to_string(): value })
 }
 
 /// `character` repeated until the string is `length` CHARACTERS long — the unit
 /// `@length` on a string counts, which is why a multi-byte row is not the same test as
 /// an ASCII one.
-fn of_length(character: char, length: usize) -> String {
+///
+/// `pub(crate)` for the same reason as [`one_tag`].
+pub(crate) fn of_length(character: char, length: usize) -> String {
     character.to_string().repeat(length)
 }
 
@@ -101,7 +107,10 @@ fn detail(case: &str, body: &Value) -> String {
 /// naming the length constraint that was violated. The text itself is not the
 /// requirement — the status, the code and the fact that the sentence states the violated
 /// constraint are.
-fn assert_refused(case: &str, status: u16, body: &Value) -> String {
+///
+/// `pub(crate)` for the same reason as [`one_tag`], so the two suites cannot disagree
+/// about what a refused entry looks like on the wire.
+pub(crate) fn assert_refused(case: &str, status: u16, body: &Value) -> String {
     assert_eq!(
         status, 400,
         "case {case:?}: expected HTTP 400, got {status} with {body}"
