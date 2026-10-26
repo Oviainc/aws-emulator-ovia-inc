@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePullRequestApprovalState
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePullRequestApprovalState`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePullRequestApprovalState::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: records the CALLING identity's approval state on the stored pull
+//! request in `crate::state`, so the approvals its approval rules are counted
+//! against are the ones reviewers gave, and appends the change to the pull
+//! request's event log (`DescribePullRequestEvents`).
 //!
 //! ## Shape of an operation
 //!
@@ -201,18 +196,178 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePullRequestApprovalState` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePullRequestApprovalStateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePullRequestApprovalState"))
+        // Which ids address a pull request is `crate::state`'s rule, so every
+        // operation taking a `pullRequestId` agrees about it; this only maps each
+        // outcome onto the error THIS operation models for it.
+        let pull_request_id = crate::state::normalize_pull_request_id(&input.pull_request_id)
+            .map_err(|problem| match problem {
+                crate::state::PullRequestIdProblem::Missing => {
+                    UpdatePullRequestApprovalStateErrorModeled::PullRequestIdRequiredException(
+                        PullRequestIdRequiredException {
+                            message: Some(
+                                crate::state::PULL_REQUEST_ID_REQUIRED_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+                crate::state::PullRequestIdProblem::Invalid => {
+                    UpdatePullRequestApprovalStateErrorModeled::InvalidPullRequestIdException(
+                        InvalidPullRequestIdException {
+                            message: Some(
+                                crate::state::INVALID_PULL_REQUEST_ID_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+            })?;
+
+        // Which values can name a revision of a pull request is likewise
+        // `crate::state`'s rule.
+        let revision_id = crate::state::normalize_revision_id(&input.revision_id).map_err(
+            |problem| match problem {
+                crate::state::RevisionIdProblem::Missing => {
+                    UpdatePullRequestApprovalStateErrorModeled::RevisionIdRequiredException(
+                        RevisionIdRequiredException {
+                            message: Some(crate::state::REVISION_ID_REQUIRED_MESSAGE.to_string()),
+                        },
+                    )
+                }
+                crate::state::RevisionIdProblem::Invalid => {
+                    UpdatePullRequestApprovalStateErrorModeled::InvalidRevisionIdException(
+                        InvalidRevisionIdException {
+                            message: Some(crate::state::INVALID_REVISION_ID_MESSAGE.to_string()),
+                        },
+                    )
+                }
+            },
+        )?;
+
+        // `approvalState` is a modelled enum, so a value outside it is already
+        // refused at the boundary (`crate::service` words that code); classifying it
+        // here as well is what keeps the handler total without a 501.
+        let requested = match input.approval_state.as_str() {
+            state @ (crate::state::APPROVAL_STATE_APPROVE
+            | crate::state::APPROVAL_STATE_REVOKE) => state,
+            _ => {
+                return Err(
+                    UpdatePullRequestApprovalStateErrorModeled::InvalidApprovalStateException(
+                        InvalidApprovalStateException {
+                            message: Some(crate::state::INVALID_APPROVAL_STATE_MESSAGE.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // "The user is derived from the signed-in account when the request is made":
+        // the approval this call records belongs to the identity that MADE it, never
+        // to anything the request names.
+        let reviewer = crate::state::caller_identity_arn(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+        let pull_request = store.pull_request_mut(pull_request_id).ok_or_else(|| {
+            UpdatePullRequestApprovalStateErrorModeled::PullRequestDoesNotExistException(
+                PullRequestDoesNotExistException {
+                    message: Some(crate::state::pull_request_does_not_exist_message(
+                        &pull_request_id.to_string(),
+                    )),
+                },
+            )
+        })?;
+
+        // An approval state is recorded only while the pull request is open: one
+        // that is no longer open takes no further review.
+        if pull_request.status != crate::state::PULL_REQUEST_STATUS_OPEN {
+            return Err(
+                UpdatePullRequestApprovalStateErrorModeled::PullRequestAlreadyClosedException(
+                    PullRequestAlreadyClosedException {
+                        message: Some(
+                            crate::state::PULL_REQUEST_ALREADY_CLOSED_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // An approval is given on the revision it was read against, so a request
+        // naming a revision the pull request has moved past records nothing.
+        if !pull_request.is_current_revision(&revision_id) {
+            return Err(
+                UpdatePullRequestApprovalStateErrorModeled::RevisionNotCurrentException(
+                    RevisionNotCurrentException {
+                        message: Some(crate::state::REVISION_NOT_CURRENT_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "You cannot approve a pull request that you created": the author's own
+        // approval would be its own review, so it is refused rather than recorded.
+        // Revoking is not approving, and an author holds no approval to revoke, so
+        // it is only an approval that is refused here.
+        if requested == crate::state::APPROVAL_STATE_APPROVE && pull_request.author_arn == reviewer
+        {
+            return Err(
+                UpdatePullRequestApprovalStateErrorModeled::PullRequestCannotBeApprovedByAuthorException(
+                    PullRequestCannotBeApprovedByAuthorException {
+                        message: Some(
+                            crate::state::PULL_REQUEST_CANNOT_BE_APPROVED_BY_AUTHOR_MESSAGE
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The state the reviewer already holds is the state this call asks for, so
+        // the request is accepted and changes NOTHING — no event, because the log
+        // records only changes that happened, and so no move of "the day and time of
+        // the last user or system activity on the pull request" either.
+        if pull_request.approval_state_of(&reviewer) != requested {
+            // A state for a reviewer the pull request holds none for yet is what
+            // grows what it stores, so it is refused past the bound this emulator
+            // holds; one it already holds a state for is changed in place.
+            if !pull_request.approvals.contains_key(&reviewer)
+                && pull_request.approvals.len() >= crate::state::MAX_APPROVALS_PER_PULL_REQUEST
+            {
+                return Err(
+                    UpdatePullRequestApprovalStateErrorModeled::MaximumNumberOfApprovalsExceededException(
+                        MaximumNumberOfApprovalsExceededException {
+                            message: Some(
+                                crate::state::maximum_number_of_approvals_exceeded_message(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            pull_request
+                .approvals
+                .insert(reviewer.clone(), requested.to_string());
+            // The reviewer's state moved, so the pull request's event log records it
+            // through the one place an entry is appended — which also moves
+            // `lastActivityDate` onto this call. The approvals the pull request now
+            // holds are what its approval rules are counted against, so a rule this
+            // approval meets is met for every later reader of the pull request.
+            pull_request.record_event(
+                ::std::time::SystemTime::now(),
+                Some(reviewer),
+                crate::state::PullRequestEventDetail::ApprovalStateChanged {
+                    revision_id,
+                    approval_status: requested.to_string(),
+                },
+            );
+        }
+
+        Ok(UpdatePullRequestApprovalStateOutput)
     }
 }

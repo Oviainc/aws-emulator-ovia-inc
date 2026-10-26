@@ -522,6 +522,30 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
             "InvalidPullRequestIdException",
             crate::state::INVALID_PULL_REQUEST_ID_MESSAGE,
         ),
+        // `revisionId` names a revision of a pull request for every operation that
+        // takes one, and each of them models the same pair of codes for it: a
+        // revision that was not provided, and one that is not a revision id.
+        ("revisionId", _) if missing => (
+            "RevisionIdRequiredException",
+            crate::state::REVISION_ID_REQUIRED_MESSAGE,
+        ),
+        ("revisionId", _) => (
+            "InvalidRevisionIdException",
+            crate::state::INVALID_REVISION_ID_MESSAGE,
+        ),
+        // `approvalState` is a modelled enum, so a value outside it is refused at
+        // the boundary rather than by the handler that records the approval; the
+        // code and sentence are the ones `UpdatePullRequestApprovalState` models for
+        // that member, which requires it, so one that was not provided at all is
+        // reported as missing rather than as invalid.
+        ("approvalState", _) if missing => (
+            "ApprovalStateRequiredException",
+            crate::state::APPROVAL_STATE_REQUIRED_MESSAGE,
+        ),
+        ("approvalState", _) => (
+            "InvalidApprovalStateException",
+            crate::state::INVALID_APPROVAL_STATE_MESSAGE,
+        ),
         ("tags", _) if missing => (
             "TagsMapRequiredException",
             "A map of tags is required.",

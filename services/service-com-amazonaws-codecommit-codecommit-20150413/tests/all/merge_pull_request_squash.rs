@@ -1042,10 +1042,13 @@ fn statement(approvals_needed: u32, pool: &[String]) -> Statement {
 }
 
 /// Record the approval states and the override this row names on the STORED pull
-/// request. No implemented operation records an approval or an override yet
-/// (`UpdatePullRequestApprovalState` and `OverridePullRequestApprovalRules` are
-/// still scaffolds), so the state a merge reads is seeded here, exactly as the
-/// sibling approval-rule suite seeds a closed pull request.
+/// request. A row's approvers include identities no caller of this emulator can sign
+/// as (an assumed-role session, a user nobody holds), and no implemented operation
+/// records an override yet (`OverridePullRequestApprovalRules` is still a scaffold),
+/// so the state a merge reads is seeded here, exactly as the sibling approval-rule
+/// suite seeds a closed pull request. The sibling
+/// `pull_request_approval_state` suite drives the approvals an API caller can
+/// record through `UpdatePullRequestApprovalState` instead.
 fn record_approvals(engine: &Arc<engine::InMemoryEngine>, pull_request_id: &str, row: &ApprovalRow) {
     let state = engine.state::<CodeCommitState>();
     let mut store = state.lock();

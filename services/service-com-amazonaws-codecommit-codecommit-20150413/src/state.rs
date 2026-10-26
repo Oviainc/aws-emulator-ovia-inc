@@ -2605,6 +2605,27 @@ impl PullRequestRecord {
             .collect()
     }
 
+    /// The approval state this pull request holds for one reviewer.
+    ///
+    /// An approval the pull request does not hold IS a non-approval, so a reviewer
+    /// it has recorded nothing for is in [`APPROVAL_STATE_REVOKE`]: that is what
+    /// makes setting a reviewer's state to it a request that asks for the state
+    /// already held rather than a change.
+    pub fn approval_state_of(&self, reviewer: &str) -> &str {
+        self.approvals
+            .get(reviewer)
+            .map_or(APPROVAL_STATE_REVOKE, String::as_str)
+    }
+
+    /// Does `revision_id` name the CURRENT revision of this pull request?
+    ///
+    /// The question every operation asks of a request made against a revision —
+    /// an older revision is one the pull request has moved past, which is what
+    /// `RevisionNotCurrentException` reports.
+    pub fn is_current_revision(&self, revision_id: &str) -> bool {
+        self.revision_id() == revision_id
+    }
+
     /// The names of the approval rules applied to this pull request whose
     /// conditions its approvals do not meet, in the order the rules were applied.
     ///
@@ -3120,11 +3141,104 @@ pub const PULL_REQUEST_APPROVAL_RULES_NOT_SATISFIED_MESSAGE: &str =
 pub const APPROVAL_STATE_APPROVE: &str = "APPROVE";
 pub const APPROVAL_STATE_REVOKE: &str = "REVOKE";
 
+/// How many reviewers' approval states one pull request holds before
+/// `UpdatePullRequestApprovalState` refuses to record another.
+///
+/// The emulator's OWN bound, not an AWS limit: an approval state is keyed by the
+/// identity that recorded it and a caller signs as whatever identity it likes, so
+/// this is what keeps one pull request's stored size bounded. A reviewer the pull
+/// request already holds a state for changes it whatever the bound, and every
+/// record it holds is released by `DeleteRepository`.
+pub const MAX_APPROVALS_PER_PULL_REQUEST: usize = 100;
+
+/// `MaximumNumberOfApprovalsExceededException`'s message: the sentence the model
+/// documents for the shape, then the bound this emulator enforces — worded the way
+/// [`number_of_rules_exceeded_message`] states the bound on approval rules.
+pub fn maximum_number_of_approvals_exceeded_message() -> String {
+    format!(
+        "The number of approvals required for the approval rule exceeds the maximum number \
+         allowed. The maximum number of approvals for a pull request is {MAX_APPROVALS_PER_PULL_REQUEST}."
+    )
+}
+
 /// `overrideStatus` values the model's `OverrideStatus` declares
 /// (`smithy_query(query="shape",shape="OverrideStatus")`): whether the approval
 /// rules of a pull request are set aside or held again.
 pub const OVERRIDE_STATUS_OVERRIDE: &str = "OVERRIDE";
 pub const OVERRIDE_STATUS_REVOKE: &str = "REVOKE";
+
+/// `ApprovalStateRequiredException`'s message: a FIXED sentence, the one the model
+/// documents for the shape, worded here once for every operation that takes an
+/// `approvalState`.
+pub const APPROVAL_STATE_REQUIRED_MESSAGE: &str =
+    "An approval state is required, but was not specified.";
+
+/// `InvalidApprovalStateException`'s message: the sentence pair the model documents
+/// for the shape — the failure, then the values that are accepted — echoing nothing
+/// from the request.
+pub const INVALID_APPROVAL_STATE_MESSAGE: &str =
+    "The state for the approval is not valid. Valid values include APPROVE and REVOKE.";
+
+/// `PullRequestCannotBeApprovedByAuthorException`'s message: the sentence pair the
+/// model documents for the shape, echoing nothing from the request.
+pub const PULL_REQUEST_CANNOT_BE_APPROVED_BY_AUTHOR_MESSAGE: &str =
+    "The approval cannot be applied because the user approving the pull request matches the user \
+     who created the pull request. You cannot approve a pull request that you created.";
+
+/// `RevisionIdRequiredException`'s message: a FIXED sentence, worded here once for
+/// every operation that takes a `revisionId`.
+pub const REVISION_ID_REQUIRED_MESSAGE: &str = "A revision ID is required, but was not provided.";
+
+/// `InvalidRevisionIdException`'s message: the sentence pair the model documents for
+/// the shape — the failure, then where the value is read from.
+pub const INVALID_REVISION_ID_MESSAGE: &str =
+    "The revision ID is not valid. Use GetPullRequest to determine the value.";
+
+/// `RevisionNotCurrentException`'s message: the sentence pair the model documents
+/// for the shape, echoing nothing from the request. Worded here once for every
+/// operation that refuses a request made against a revision the pull request has
+/// moved past.
+pub const REVISION_NOT_CURRENT_MESSAGE: &str =
+    "The revision ID provided in the request does not match the current revision ID. Use \
+     GetPullRequest to retrieve the current revision ID.";
+
+/// Why a `revisionId` cannot name a revision of a pull request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevisionIdProblem {
+    /// The id is absent or blank: the operations model
+    /// `RevisionIdRequiredException` for this.
+    Missing,
+    /// The id is not the form a revision id takes:
+    /// `InvalidRevisionIdException`.
+    Invalid,
+}
+
+/// The revision a `revisionId` names, in the form a stored revision id is reported
+/// in, or why it names none.
+///
+/// A revision id is the digest this crate mints for a pull request's current
+/// revision ([`PullRequestRecord::revision_id`]), so a value that is not a digest of
+/// that form names no revision of any pull request in any account and is refused as
+/// invalid rather than reported as not current. Hex is case insensitive, so an id
+/// handed back in either case names the same revision. Every operation that takes a
+/// `revisionId` classifies it here, so they cannot disagree about which ids are
+/// addressable.
+pub fn normalize_revision_id(raw: &str) -> Result<String, RevisionIdProblem> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(RevisionIdProblem::Missing);
+    }
+    if trimmed.len() != REVISION_ID_CHARACTERS
+        || !trimmed.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(RevisionIdProblem::Invalid);
+    }
+    Ok(trimmed.to_ascii_lowercase())
+}
+
+/// How many characters a revision id holds: the hex SHA-256
+/// [`PullRequestRecord::revision_id`] mints.
+const REVISION_ID_CHARACTERS: usize = 64;
 
 /// Is this approval rule document's set of conditions met by `approvers`?
 ///
