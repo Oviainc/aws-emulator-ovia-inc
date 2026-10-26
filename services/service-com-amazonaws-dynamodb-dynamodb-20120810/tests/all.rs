@@ -49,6 +49,8 @@ mod item_write_expressions;
 mod item_write_vocabularies;
 #[path = "all/key_schema_element_refusals.rs"]
 mod key_schema_element_refusals;
+#[path = "all/kinesis_streaming_destinations.rs"]
+mod kinesis_streaming_destinations;
 #[path = "all/list_imports.rs"]
 mod list_imports;
 #[path = "all/number_canonicalization.rs"]

@@ -465,6 +465,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // contributor insights member, so `UpdateContributorInsights` is the only
             // way to turn them on.
             contributor_insights: crate::state::ContributorInsights::default(),
+            // A new table replicates to no Kinesis data stream: `CreateTable` carries no
+            // Kinesis destination member, so the enable command is the only way to
+            // register one.
+            kinesis_destinations: Vec::new(),
             // This table was created, not restored, so it has no `RestoreSummary` to
             // report: only `RestoreTableFromBackup` writes one.
             restore: None,

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableKinesisStreamingDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableKinesisStreamingDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableKinesisStreamingDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The command that STARTS a table's replication to a Kinesis data stream: it resolves
+//! the table, registers a destination record for the stream its `StreamArn` names under
+//! the configuration the request carries, and reports the replication as `ENABLING`
+//! until the clock settles it — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +164,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableKinesisStreamingDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableKinesisStreamingDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableKinesisStreamingDestination"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+        // A destination IS a Kinesis data stream, so a value that names no stream names
+        // no destination this command could register.
+        let stream = crate::state::check_stream_arn(&input.stream_arn).map_err(lift)?;
+        let precision = input
+            .enable_kinesis_streaming_configuration
+            .as_ref()
+            .and_then(|configuration| {
+                configuration
+                    .approximate_creation_date_time_precision
+                    .as_deref()
+            });
+        // The precision is a modelled enum, so the request validator has already refused
+        // every value outside its set; this refusal is what keeps that true of what
+        // reaches the store, and it is worded the way that validator words a value
+        // outside an enumerated member's set.
+        if let Some(precision) = precision {
+            if !APPROXIMATE_CREATION_DATE_TIME_PRECISION_VALUES.contains(&precision) {
+                return Err(lift(crate::state::invalid_member(
+                    "enableKinesisStreamingConfiguration.approximateCreationDateTimePrecision",
+                    Some(precision),
+                    &crate::state::enum_value_requirement(
+                        APPROXIMATE_CREATION_DATE_TIME_PRECISION_VALUES,
+                    ),
+                )));
+            }
+        }
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+        let table = store.table_mut(&region, &name).map_err(lift)?;
+        // The refusals below are stated over the table's STORED name, so reading it
+        // cannot overlap the borrow of the record they are about.
+        let table_name = table.name.clone();
+        if table
+            .replicating_kinesis_destination_mut(&input.stream_arn, now)
+            .is_some()
+        {
+            return Err(lift(crate::state::kinesis_destination_already_enabled(
+                &table_name,
+                &input.stream_arn,
+            )));
+        }
+        // A table keeps a bounded replication history, so a caller naming new streams
+        // without end is answered the control plane's quota error rather than growing
+        // this table's record list for ever.
+        if table.kinesis_destination_slots_exhausted(&input.stream_arn) {
+            return Err(EnableKinesisStreamingDestinationErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Subscriber limit exceeded: this table already holds the maximum of {} \
+                         Kinesis streaming destinations",
+                        crate::state::MAX_KINESIS_DESTINATIONS_PER_TABLE
+                    )),
+                },
+            )
+            .into());
+        }
+        let registered = table.register_kinesis_destination(&input.stream_arn, precision, now);
+        let stream_arn = registered.stream_arn.clone();
+        let status = registered.status(now).to_string();
+        let in_force = registered.precision();
+
+        // The audit record for a state-changing call: who asked, what was changed and
+        // that it succeeded. Never a credential — only the access key id the caller
+        // presented.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            table_name = %table_name,
+            stream = %stream,
+            destination_status = %status,
+            outcome = "enabled",
+            "kinesis streaming destination enabled"
+        );
+
+        Ok(EnableKinesisStreamingDestinationOutput {
+            table_name: Some(table_name),
+            stream_arn: Some(stream_arn),
+            destination_status: Some(status),
+            // The configuration this destination replicates under, read back from the
+            // record: a command that named no precision registers none, and the member
+            // stays absent until one does.
+            enable_kinesis_streaming_configuration: in_force.map(|precision| {
+                EnableKinesisStreamingConfiguration {
+                    approximate_creation_date_time_precision: Some(precision),
+                }
+            }),
+        })
+    }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> EnableKinesisStreamingDestinationError {
+    EnableKinesisStreamingDestinationErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel: a table that is not there
+/// is the `ResourceNotFoundException` this operation models, and a request the service
+/// itself refuses — a member it cannot read, or replication that is already on — is the
+/// 400 `ValidationException`.
+fn lift(error: crate::state::RequestError) -> EnableKinesisStreamingDestinationError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            EnableKinesisStreamingDestinationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
     }
 }

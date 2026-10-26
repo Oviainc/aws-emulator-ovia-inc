@@ -406,6 +406,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A new table has consumed none of the capacity it is provisioned for.
             write_budget: crate::state::CapacityBudget::new(now),
             contributor_insights: crate::state::ContributorInsights::default(),
+            // A restore reproduces the source table's data, not its Kinesis streaming
+            // destinations: the restored table replicates to no stream until the enable
+            // command registers one on it.
+            kinesis_destinations: Vec::new(),
             restore: Some(crate::state::TableRestore {
                 // A restore to a point in time came from no backup, so the summary
                 // reports only the table it was taken of.

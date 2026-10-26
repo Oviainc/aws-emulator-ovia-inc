@@ -24,7 +24,8 @@ use crate::ops::types::{
     GlobalSecondaryIndexDescription, GlobalSecondaryIndexInfo,
     GlobalSecondaryIndexWarmThroughputDescription,
     ImportSummary,
-    ItemCollectionMetrics, KeySchemaElement, LocalSecondaryIndexDescription,
+    ItemCollectionMetrics, KeySchemaElement, KinesisDataStreamDestination,
+    LocalSecondaryIndexDescription,
     LocalSecondaryIndexInfo,
     PointInTimeRecoveryDescription, Projection,
     ProvisionedThroughput, ProvisionedThroughputDescription, RestoreSummary, S3BucketSource,
@@ -2050,6 +2051,204 @@ impl ContributorInsights {
 }
 
 // =============================================================================
+// KINESIS DATA STREAM DESTINATIONS
+//
+// A table replicates its item changes to a Kinesis data stream through a
+// DESTINATION record it carries: the enable command registers one, the update
+// command changes the timestamp precision of a registered one, the disable
+// command stops it, and the describing operation reports every one the table
+// holds. Each record below is what those operations read and report; no value
+// they answer with is canned.
+// =============================================================================
+
+/// The `DestinationStatus` values a destination record moves between
+/// ([`crate::ops::types::DESTINATION_STATUS_VALUES`]), named one per meaning.
+///
+/// Registering, updating and stopping replication are all asynchronous, so a
+/// destination is reported in a transient status (`ENABLING`, `UPDATING`,
+/// `DISABLING`) for a span and in the settled one (`ACTIVE`, `DISABLED`) after it —
+/// the same clock-owed move every other status in this store makes
+/// ([`STATUS_TRANSITION`]).
+pub const DESTINATION_STATUS_ENABLING: &str = "ENABLING";
+pub const DESTINATION_STATUS_ACTIVE: &str = "ACTIVE";
+pub const DESTINATION_STATUS_UPDATING: &str = "UPDATING";
+pub const DESTINATION_STATUS_DISABLING: &str = "DISABLING";
+pub const DESTINATION_STATUS_DISABLED: &str = "DISABLED";
+
+/// How DynamoDB opens its refusal of a command against a table's Kinesis streaming
+/// destination that the table's state cannot serve; the reason follows the colon.
+const KINESIS_DESTINATION_INVALID_STATE: &str =
+    "Table is not in a valid state to enable Kinesis Streaming Destination";
+
+/// How a command that addresses ONE of a table's Kinesis streaming destinations is
+/// refused when the table replicates to no such stream: the stream ARN the request
+/// named and the table it named it against, under the invalid-state sentence above.
+///
+/// A destination record is addressed by its `StreamArn`, so a table that has never
+/// replicated to that stream and one whose replication to it has stopped are the same
+/// miss: neither carries a destination the command could act on.
+pub fn kinesis_destination_not_found(table: &str, stream_arn: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "{KINESIS_DESTINATION_INVALID_STATE}: No streaming destination with streamArn: \
+         {stream_arn} found for table with tableName: {table}"
+    ))
+}
+
+/// How the command that STARTS replication is refused when the table already replicates
+/// to that stream: the same invalid-state sentence, over the stream and table the
+/// request named. Replication that is already on cannot be started again.
+pub fn kinesis_destination_already_enabled(table: &str, stream_arn: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "{KINESIS_DESTINATION_INVALID_STATE}: Streaming destination with streamArn: \
+         {stream_arn} is already enabled for table with tableName: {table}"
+    ))
+}
+
+/// How many Kinesis data stream destination records ONE table keeps.
+///
+/// The list grows by one per DISTINCT stream a command registers — a stream the table
+/// already holds a record for is re-registered in place — and the stopped records are
+/// the replication history the describing operation reports. AWS publishes no figure for
+/// that history, so this store CHOOSES 64: room for a table's replication history to be
+/// reported in full, and a bound, so no sequence of commands grows one table's record
+/// list without end.
+pub const MAX_KINESIS_DESTINATIONS_PER_TABLE: usize = 64;
+
+/// The form a Kinesis data stream's ARN takes
+/// (`arn:<partition>:kinesis:<region>:<account>:stream/<name>`), answering the stream it
+/// names.
+///
+/// The `StreamArn` member is modelled as a length-bounded string only, so this is the
+/// check the service itself makes: a value that names no Kinesis data stream addresses
+/// no destination at all, which is an INPUT failure rather than a lookup miss, worded
+/// the way this service words an ARN member it cannot read ([`check_table_arn`]).
+pub fn check_stream_arn(stream_arn: &str) -> Result<String, RequestError> {
+    let invalid = || {
+        RequestError::Validation(format!(
+            "Invalid StreamArn: Invalid StreamArn provided as input {stream_arn}"
+        ))
+    };
+    // `arn`, partition, service, region, account, resource — the resource field is the
+    // last one and may itself carry `/`, so the split stops at six.
+    let fields: Vec<&str> = stream_arn.splitn(6, ':').collect();
+    let (partition, service, region, resource) = match fields.as_slice() {
+        ["arn", partition, service, region, _account, resource] => {
+            (*partition, *service, *region, *resource)
+        }
+        _ => return Err(invalid()),
+    };
+    if partition.is_empty() || service != "kinesis" || region.is_empty() {
+        return Err(invalid());
+    }
+    let name = resource.strip_prefix("stream/").ok_or_else(invalid)?;
+    if name.is_empty() || name.contains('/') {
+        return Err(invalid());
+    }
+    Ok(name.to_string())
+}
+
+/// One Kinesis data stream destination of a table: the stream it replicates to, where
+/// that replication is in its lifecycle, and the timestamp precision in force.
+///
+/// Only the last accepted command is stored; the status is derived at every read from
+/// the clock, exactly as [`ContributorInsights`] derives its own.
+#[derive(Debug, Clone)]
+pub struct KinesisDestination {
+    /// "The ARN for a specific Kinesis data stream"
+    /// (`KinesisDataStreamDestination$StreamArn`) — the identity a command addresses
+    /// this record by.
+    pub stream_arn: String,
+    /// The status this record settles on once the span has elapsed.
+    settled_status: &'static str,
+    /// The status it reports until then.
+    transient_status: &'static str,
+    /// When the clock owes the move from the transient status to the settled one.
+    settles_at: SystemTime,
+    /// "The precision of the Kinesis data stream timestamp"
+    /// (`KinesisDataStreamDestination$ApproximateCreationDateTimePrecision`), or `None`
+    /// while no command has named one: the member is absent until one does.
+    precision: Option<String>,
+}
+
+impl KinesisDestination {
+    /// Register one destination, as the command that starts replication leaves it:
+    /// `ENABLING` for the span, then `ACTIVE`.
+    pub fn enabling(stream_arn: &str, precision: Option<&str>, now: SystemTime) -> Self {
+        Self {
+            stream_arn: stream_arn.to_string(),
+            settled_status: DESTINATION_STATUS_ACTIVE,
+            transient_status: DESTINATION_STATUS_ENABLING,
+            settles_at: now + STATUS_TRANSITION,
+            precision: precision.map(str::to_string),
+        }
+    }
+
+    /// The status at `now`: the transient one until the clock has made the move due,
+    /// then the settled one.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now < self.settles_at {
+            self.transient_status
+        } else {
+            self.settled_status
+        }
+    }
+
+    /// Whether this record still REPLICATES — the destination a command that addresses
+    /// a table's live replication to this stream acts on. A record whose replication has
+    /// stopped, or is stopping, is history: it is still reported, and no longer
+    /// addressable.
+    pub fn replicating(&self, now: SystemTime) -> bool {
+        let status = self.status(now);
+        status != DESTINATION_STATUS_DISABLED && status != DESTINATION_STATUS_DISABLING
+    }
+
+    /// Apply one update of this destination's configuration: the record is `UPDATING`
+    /// for the span and `ACTIVE` after it, carrying the precision the command named.
+    ///
+    /// A command that names no precision changes none — it asks for no configuration
+    /// change — and still restarts the span, because the service accepted the command.
+    pub fn apply_update(&mut self, precision: Option<&str>, now: SystemTime) {
+        if let Some(precision) = precision {
+            self.precision = Some(precision.to_string());
+        }
+        self.settled_status = DESTINATION_STATUS_ACTIVE;
+        self.transient_status = DESTINATION_STATUS_UPDATING;
+        self.settles_at = now + STATUS_TRANSITION;
+    }
+
+    /// The timestamp precision in force, which a destination no command has named one
+    /// for carries none of.
+    pub fn precision(&self) -> Option<String> {
+        self.precision.clone()
+    }
+
+    /// Apply the command that STOPS replication: the record is `DISABLING` for the span
+    /// and `DISABLED` after it, keeping the stream it replicated to and the precision it
+    /// replicated under — a stopped destination is still reported, as this table's
+    /// replication history.
+    pub fn apply_disable(&mut self, now: SystemTime) {
+        self.settled_status = DESTINATION_STATUS_DISABLED;
+        self.transient_status = DESTINATION_STATUS_DISABLING;
+        self.settles_at = now + STATUS_TRANSITION;
+    }
+
+    /// Project this record into the `KinesisDataStreamDestination` the describing
+    /// operation reports.
+    ///
+    /// `DestinationStatusDescription` is "the human-readable string that corresponds to
+    /// the replica status" — a description of a FAILURE, which a record that replicates
+    /// has none of, so the member stays absent.
+    pub fn describe(&self, now: SystemTime) -> KinesisDataStreamDestination {
+        KinesisDataStreamDestination {
+            stream_arn: Some(self.stream_arn.clone()),
+            destination_status: Some(self.status(now).to_string()),
+            destination_status_description: None,
+            approximate_creation_date_time_precision: self.precision(),
+        }
+    }
+}
+
+// =============================================================================
 // ON-DEMAND BACKUPS
 //
 // A backup is a resource of its own: `CreateBackup` catalogues one from a table,
@@ -2703,6 +2902,13 @@ pub struct Table {
     /// operations wrote and report it ([`ContributorInsights`]). Its indexes carry
     /// their own.
     pub contributor_insights: ContributorInsights,
+    /// The Kinesis data stream destinations this table replicates its item changes to,
+    /// in the order they were registered ([`KinesisDestination`]).
+    ///
+    /// A destination whose replication has stopped stays here, so the describing
+    /// operation keeps reporting the table's replication history and a later command
+    /// can tell a stream the table once replicated to from one it never did.
+    pub kinesis_destinations: Vec<KinesisDestination>,
     /// What this table was RESTORED from, for a table a restore created, or `None` for a
     /// table `CreateTable` created: "Contains details for the restore"
     /// (`TableDescription$RestoreSummary`), which is what every description of a restored
@@ -3249,6 +3455,75 @@ impl Table {
                     .ok_or_else(|| index_not_found(&table, name))
             }
         }
+    }
+
+    /// The destination the command addressed, mutably: this table's LIVE replication to
+    /// the stream that `stream_arn` names, or `None` when the table replicates to no
+    /// such stream — a stream it has never replicated to, and one it has stopped
+    /// replicating to, alike ([`KinesisDestination::replicating`]).
+    pub fn replicating_kinesis_destination_mut(
+        &mut self,
+        stream_arn: &str,
+        now: SystemTime,
+    ) -> Option<&mut KinesisDestination> {
+        self.kinesis_destinations
+            .iter_mut()
+            .find(|destination| destination.stream_arn == stream_arn && destination.replicating(now))
+    }
+
+    /// Whether this table already holds as many destination records as it keeps and
+    /// `stream_arn` is not one of them — the registration that would grow the list past
+    /// [`MAX_KINESIS_DESTINATIONS_PER_TABLE`].
+    pub fn kinesis_destination_slots_exhausted(&self, stream_arn: &str) -> bool {
+        self.kinesis_destinations.len() >= MAX_KINESIS_DESTINATIONS_PER_TABLE
+            && !self
+                .kinesis_destinations
+                .iter()
+                .any(|destination| destination.stream_arn == stream_arn)
+    }
+
+    /// Register replication to `stream_arn`, as the command that starts it leaves the
+    /// record: `ENABLING` for the span and `ACTIVE` after it, under the precision the
+    /// command named and under none where it named none.
+    ///
+    /// A stream this table once replicated to is re-registered IN PLACE, so one stream
+    /// has one record whatever number of times replication to it is started and stopped,
+    /// and it keeps its place in the order the describing operation reports.
+    pub fn register_kinesis_destination(
+        &mut self,
+        stream_arn: &str,
+        precision: Option<&str>,
+        now: SystemTime,
+    ) -> &KinesisDestination {
+        let registered = KinesisDestination::enabling(stream_arn, precision, now);
+        let index = match self
+            .kinesis_destinations
+            .iter()
+            .position(|destination| destination.stream_arn == stream_arn)
+        {
+            Some(index) => {
+                self.kinesis_destinations[index] = registered;
+                index
+            }
+            None => {
+                self.kinesis_destinations.push(registered);
+                self.kinesis_destinations.len() - 1
+            }
+        };
+        &self.kinesis_destinations[index]
+    }
+
+    /// Every Kinesis data stream destination this table carries, in registration order,
+    /// as the describing operation reports them — the stopped ones included, which is
+    /// what makes that report the table's replication history.
+    pub fn describe_kinesis_destinations(
+        &self,
+        now: SystemTime,
+    ) -> Vec<KinesisDataStreamDestination> {
+        self.kinesis_destinations
+            .iter()
+            .map(|destination| destination.describe(now))
+            .collect()
     }
 
     /// Every contributor insights summary this table reports: its own first, then one
