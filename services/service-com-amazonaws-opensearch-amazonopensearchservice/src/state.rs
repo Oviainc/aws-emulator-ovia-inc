@@ -2433,6 +2433,11 @@ pub fn scheduled_action_under_way(action_id: &str, status: &str) -> ConflictExce
 /// a scheduled action.
 pub const AUTO_TUNE_TYPE_SCHEDULED_ACTION: &str = "SCHEDULED_ACTION";
 
+/// `InsightFieldType`'s `text` value — "possible values are `text` and `metric`" —
+/// the type of a field that carries a text description rather than metric data. One
+/// of [`crate::ops::types::INSIGHT_FIELD_TYPE_VALUES`].
+pub const INSIGHT_FIELD_TYPE_TEXT: &str = "text";
+
 /// One field of an insight's DETAILED view, as this emulator persists it.
 ///
 /// A detail read "returns detailed fields associated with the specified insight, such
@@ -5245,24 +5250,27 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
         }
     }
 
-    /// The one insight the entity a request names holds under `insight_id`.
+    /// The one insight the entity a request names holds under `insight_id`, or
+    /// `None` where that entity holds none under it.
     ///
     /// An insight is addressed by its entity and its id together, so this resolves
     /// the entity exactly as [`Self::insights_of_entity`] does — the same ONE
-    /// decision — and then refuses an id that entity holds no insight under rather
-    /// than reporting an insight some other entity holds, or an empty view of one
-    /// that does not exist.
+    /// decision, and the only one that can refuse — and then looks the id up among
+    /// the insights THAT entity holds, so an insight another entity holds is never
+    /// reported here. An id the entity holds no insight under is not a refusal: it
+    /// names no insight of this entity, which the caller reports as it reports any
+    /// other id it resolves nothing for.
     ///
     /// Reads ONLY.
     pub fn insight_of_entity(
         &self,
         entity: &InsightEntity,
         insight_id: &str,
-    ) -> Result<&InsightRecord, InsightEntityRefusal> {
-        self.insights_of_entity(entity)?
+    ) -> Result<Option<&InsightRecord>, InsightEntityRefusal> {
+        Ok(self
+            .insights_of_entity(entity)?
             .into_iter()
-            .find(|record| record.insight_id == insight_id)
-            .ok_or_else(|| InsightEntityRefusal::NotFound(insight_not_found(entity, insight_id)))
+            .find(|record| record.insight_id == insight_id))
     }
 
     /// The tag set of the resource `arn` names, for a caller about to READ it.
@@ -6008,24 +6016,76 @@ pub fn unknown_insight_entity(entity_type: &str) -> ValidationException {
     }
 }
 
-/// The `ResourceNotFoundException` payload for an id that names no insight of the
-/// entity a request named.
-///
-/// It names the id that could not be resolved and the entity it was looked up in,
-/// both as the request gave them, so a caller tells an id this service never minted
-/// from one naming an insight another entity holds.
-pub fn insight_not_found(entity: &InsightEntity, insight_id: &str) -> ResourceNotFoundException {
-    let held_by = if entity.r#type == INSIGHT_ENTITY_DOMAIN_NAME {
+/// The entity a request named, as a detail field names it: the domain an entity of
+/// that type names, or the account an `Account` entity stands for — the one this
+/// request was made for where it named no id.
+fn insight_entity_label(entity: &InsightEntity) -> String {
+    if entity.r#type == INSIGHT_ENTITY_DOMAIN_NAME {
         format!("domain {}", insight_entity_value(entity).unwrap_or_default())
     } else {
         format!(
             "account {}",
             insight_entity_value(entity).unwrap_or(::engine::emulator_account_id())
         )
-    };
-    ResourceNotFoundException {
-        message: Some(format!("Insight {insight_id} not found for {held_by}")),
     }
+}
+
+/// Where the insights of the entity a request named are reviewed: this service's
+/// console home in `region`, at the entity's own place in it.
+///
+/// CHOSEN, not documented by AWS: no AWS document gives the console location of an
+/// entity's insights a form, so this emulator serves one deterministic form of its
+/// own, built from the entity the request named and the Region it was signed for.
+fn insights_console_uri(entity: &InsightEntity, region: &str) -> String {
+    let home = format!("https://{region}.console.aws.amazon.com/aos/home?region={region}");
+    match insight_entity_value(entity) {
+        Some(name) if entity.r#type == INSIGHT_ENTITY_DOMAIN_NAME => {
+            format!("{home}#opensearch/domains/{name}")
+        }
+        _ => format!("{home}#opensearch/insights"),
+    }
+}
+
+/// The detail fields a read of an insight id the entity holds no insight under is
+/// answered with: informational fields, naming the id that resolved to no insight of
+/// that entity and where the entity's insights are reviewed.
+///
+/// A detail read is not keyed on an insight existing under the requested id — any id
+/// of the modelled `GUID` form is answered rather than refused — and `Fields` is
+/// `@required`, so the view carries the service's informational fields where it holds
+/// no insight to detail. Each field is built from the request's id and entity and the
+/// Region it was signed for, so the same request is always answered the same way and
+/// no stored insight is involved.
+pub fn informational_insight_details(
+    entity: &InsightEntity,
+    insight_id: &str,
+    region: &str,
+) -> Vec<InsightDetailField> {
+    let held_by = insight_entity_label(entity);
+    let console = insights_console_uri(entity, region);
+    vec![
+        InsightDetailField {
+            name: "Description".to_string(),
+            field_type: INSIGHT_FIELD_TYPE_TEXT.to_string(),
+            value: format!(
+                "No insight details are available for insight {insight_id} of {held_by}. \
+                 Review the insights of {held_by} in the Amazon OpenSearch Service console."
+            ),
+            html_value: Some(format!(
+                "<p>No insight details are available for insight {insight_id} of {held_by}. \
+                 Review the insights of {held_by} in the Amazon OpenSearch Service \
+                 console.</p>"
+            )),
+        },
+        InsightDetailField {
+            name: "Console".to_string(),
+            field_type: INSIGHT_FIELD_TYPE_TEXT.to_string(),
+            value: console,
+            // The console location is reported as the URI itself in either rendering:
+            // it is a value a caller follows, not content the service marks up.
+            html_value: None,
+        },
+    ]
 }
 
 /// The `ValidationException` payload for an upgrade whose `TargetVersion` is not a

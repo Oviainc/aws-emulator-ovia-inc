@@ -6,9 +6,11 @@
 //! request addresses ([`crate::state::InsightDetailField`]), in the order they are
 //! stored, each rendered with its markup or as plain content according to the
 //! request's `ShowHtmlContent`. The entity is resolved exactly as a listing resolves
-//! it, and an id that entity holds no insight under names no insight to detail, so it
-//! is refused rather than answered with an empty view. It only REPORTS: an insight and
-//! its fields are raised by the service observing a domain, never by a read of them.
+//! it — the only decision of this read that can refuse it — while the id is not: an
+//! id that entity holds no insight under is answered with the service's informational
+//! fields ([`crate::state::informational_insight_details`]) rather than refused. It
+//! only REPORTS: an insight and its fields are raised by the service observing a
+//! domain, never by a read of them.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +170,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The Region the request was signed for — what the informational view names
+        // the console location of this entity's insights in.
+        let region = crate::state::request_region(ctx.parts());
         let state =
             crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
         let store = state.lock();
 
         // An insight is addressed by the entity that holds it and its own id
         // together, and resolving that pair is the store's one decision
-        // ([`crate::state::ComAmazonawsOpensearchAmazonopensearchserviceState::insight_of_entity`]),
-        // so an entity this account does not hold, and an id that entity holds no
-        // insight under, are refused here exactly as they are for a listing: this
-        // operation describes "an existing insight", and the model declares
-        // `ResourceNotFoundException` for one that does not exist.
+        // ([`crate::state::ComAmazonawsOpensearchAmazonopensearchserviceState::insight_of_entity`]).
+        // Only the ENTITY can refuse the read — it is resolved exactly as it is for a
+        // listing, so an entity this account does not hold and one outside
+        // `InsightEntityType` are refused here identically — while an id that entity
+        // holds no insight under resolves to no insight of it rather than to a
+        // refusal.
         let insight = store
             .insight_of_entity(&input.entity, &input.insight_id)
             .map_err(|refusal| match refusal {
@@ -198,17 +203,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .show_html_content
             .unwrap_or(SHOW_HTML_CONTENT_DEFAULT);
 
-        Ok(DescribeInsightDetailsOutput {
-            // "The list of fields that contain detailed information about the
-            // insight", in the order the insight holds them. The member is required, so
-            // an insight the service has raised no detail field for is reported with an
-            // EMPTY list rather than without the member — an insight that exists and
-            // details nothing, which is not the same answer as one that does not exist.
-            fields: insight
+        // "The list of fields that contain detailed information about the insight", in
+        // the order they are held. An insight this entity holds details with its own
+        // stored fields — an EMPTY list where the service has raised none for it, an
+        // insight that exists and details nothing — and an id it holds no insight
+        // under details with the informational fields, which is the whole of what
+        // there is to report about an id this entity resolves no insight for.
+        let fields = match insight {
+            Some(insight) => insight
                 .details
                 .iter()
                 .map(|field| field.to_insight_field(show_html))
                 .collect(),
-        })
+            None => {
+                crate::state::informational_insight_details(
+                    &input.entity,
+                    &input.insight_id,
+                    &region,
+                )
+                .iter()
+                .map(|field| field.to_insight_field(show_html))
+                .collect()
+            }
+        };
+
+        Ok(DescribeInsightDetailsOutput { fields })
     }
 }

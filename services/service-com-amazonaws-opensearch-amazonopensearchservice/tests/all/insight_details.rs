@@ -12,16 +12,18 @@
 //! insight the entity the request names holds under the requested id — each field as
 //! its stored name, type and value, in the order the insight holds them — rendering
 //! each value with the markup the field carries when the request asks for HTML content
-//! and as plain content otherwise; the entity is resolved exactly as a listing resolves
-//! it, an id that entity holds no insight under names no insight to detail and is
-//! refused, and nothing is written.
+//! and as plain content otherwise; the read is keyed on the ENTITY alone, which is
+//! resolved exactly as a listing resolves it, so an id that entity holds no insight
+//! under is answered with the service's informational fields rather than refused; and
+//! nothing is written.
 //!
 //! So the assertions span a SET of inputs rather than one call: a table of fields
 //! covering both values of `InsightFieldType`, a field with a marked-up rendering and
 //! fields without one, an empty value and a long one; then the three ways a request can
 //! answer `ShowHtmlContent`, every entity type the model admits with the account named
-//! both ways, four ids no entity holds an insight under, five entities this account
-//! holds nothing for, and an insight carrying no detail field at all.
+//! both ways, five ids no entity holds an insight under against four entities that do
+//! resolve, five entities this account holds nothing for, and an insight carrying no
+//! detail field at all.
 //!
 //! The insights themselves are written into the store directly (through
 //! [`super::domain_lifecycle::Emulator::store`]): the service RAISES an insight and its
@@ -251,6 +253,81 @@ fn reported_value(reported: &[Value], name: &str, case: &str) -> String {
         .unwrap_or_else(|| panic!("case {case}: expected the field {name:?} to be reported"))
 }
 
+/// An informational detail view, asserted as the rule states it: a NON-EMPTY list
+/// whose every field carries a name, a modelled type and a value, naming the id the
+/// request asked about, the entity it was looked up in and where that entity's
+/// insights are reviewed — marked up only for a request that asked for HTML content.
+///
+/// `names_entity` is the entity as a caller names it: the domain name of a
+/// `DomainName` entity, and the account id an `Account` entity stands for.
+fn informational(
+    answer: &Answer,
+    case: &str,
+    insight_id: &str,
+    names_entity: &str,
+    show_html: bool,
+) -> Vec<Value> {
+    let reported = fields(answer, case);
+    assert!(
+        !reported.is_empty(),
+        "case {case}: expected a non-empty informational view, got {:?}",
+        answer.body
+    );
+    for field in &reported {
+        let field_type = field["Type"].as_str().unwrap_or_default();
+        // The type catalog is the model's own enum, as generated into `ops::types`.
+        assert!(
+            INSIGHT_FIELD_TYPE_VALUES.contains(&field_type),
+            "case {case}: expected a modelled field type, got {field_type:?}"
+        );
+        assert!(
+            !field["Name"].as_str().unwrap_or_default().is_empty(),
+            "case {case}: expected every field to carry a Name, got {field:?}"
+        );
+        assert!(
+            !field["Value"].as_str().unwrap_or_default().is_empty(),
+            "case {case}: expected every field to carry a Value, got {field:?}"
+        );
+    }
+
+    let reported_values = reported
+        .iter()
+        .map(|field| field["Value"].as_str().unwrap_or_default())
+        .collect::<Vec<&str>>()
+        .join("\n");
+    assert!(
+        reported_values.contains(insight_id),
+        "case {case}: expected the view to name the requested id, got {reported_values:?}"
+    );
+    assert!(
+        reported_values.contains(names_entity),
+        "case {case}: expected the view to name the entity, got {reported_values:?}"
+    );
+    assert!(
+        reported_values.contains("console.aws.amazon.com"),
+        "case {case}: expected the view to direct the caller to the console, got \
+         {reported_values:?}"
+    );
+    // `ShowHtmlContent` picks the rendering here exactly as it does for a stored
+    // field: the marked-up one only where the request asked for HTML content.
+    assert_eq!(
+        reported_values.contains("<p>"),
+        show_html,
+        "case {case}: expected markup only where HTML content was asked for, got \
+         {reported_values:?}"
+    );
+    // It is the informational view, not some other insight's: none of the stored
+    // insight's fields is reported.
+    for held in field_names() {
+        assert!(
+            !names(&reported).contains(&held),
+            "case {case}: expected no stored field of another insight, got {:?}",
+            names(&reported)
+        );
+    }
+    reported
+}
+
 /// `POST /2021-01-01/opensearch/insights` for `entity` — the listing the detail read
 /// must leave exactly as it was.
 async fn list(emulator: &Emulator, entity: Value) -> Answer {
@@ -434,63 +511,116 @@ async fn an_insight_is_addressed_through_the_entity_that_holds_it() {
 
     // A sibling domain of the same account does not hold this insight, and no
     // `DomainName` entity holds the account's own one: an insight is reported by the
-    // entity that holds it, so another entity of the same account names no insight to
-    // detail and is refused rather than answered.
-    for (entity, insight_id) in [
-        (domain_entity("insight-detail-other"), id.clone()),
+    // entity that holds it, so another entity of the same account resolves no insight
+    // under that id and is answered with the informational view rather than with the
+    // insight — the id itself never widens the entity a read is scoped to.
+    for (entity, insight_id, names_entity) in [
+        (
+            domain_entity("insight-detail-other"),
+            id.clone(),
+            "insight-detail-other",
+        ),
         (
             domain_entity("insight-detail-entity"),
             account_wide_id.clone(),
+            "insight-detail-entity",
         ),
     ] {
+        let case = format!("DescribeInsightDetails({entity:?}, {insight_id:?})");
         let answer = describe_insight(&emulator, entity.clone(), &insight_id, json!({})).await;
-        refused(
-            &answer,
-            &format!("DescribeInsightDetails({entity:?}, {insight_id:?})"),
-            409,
-            "ResourceNotFoundException",
-        );
+        informational(&answer, &case, &insight_id, names_entity, false);
     }
 }
 
 #[tokio::test]
-async fn an_id_the_entity_holds_no_insight_under_is_refused() {
+async fn an_id_the_entity_holds_no_insight_under_is_answered_with_the_informational_view() {
     let emulator = Emulator::new();
     let id = seeded(&emulator, "insight-detail-missing").await;
-    let entity = domain_entity("insight-detail-missing");
+    create_baseline(&emulator, "insight-detail-nothing").await;
 
-    // Rows differ along the shape of the id: one never raised, one all zeroes, one all
-    // `f`s, and the stored id with its hex digits in the other case — `GUID`'s pattern
-    // admits either case, and an id is the exact value the service handed out, so one
-    // differing in case names no insight.
-    for not_an_insight in [
+    // Id rows differ along the shape of the id: one never raised, one all zeroes, one
+    // all `f`s, one with its hex digits in both cases, and the stored id uppercased —
+    // `GUID`'s pattern admits either case, and an id is the exact value the service
+    // handed out, so one differing in case names no insight.
+    let unheld_ids = [
         guid("000000000099"),
         "00000000-0000-0000-0000-000000000000".to_string(),
         "ffffffff-ffff-ffff-ffff-ffffffffffff".to_string(),
+        "A1b2C3d4-E5f6-7a8b-9C0d-1e2F3a4B5c6D".to_string(),
         id.to_uppercase(),
-    ] {
-        assert_ne!(
-            not_an_insight, id,
-            "case DescribeInsightDetails({not_an_insight:?}): the row must name another id"
-        );
-        let case = format!("DescribeInsightDetails({not_an_insight:?})");
-        let answer = describe_insight(&emulator, entity.clone(), &not_an_insight, json!({})).await;
-        refused(&answer, &case, 409, "ResourceNotFoundException");
-        // The refusal names the id that could not be resolved and the entity it was
-        // looked up in, both as the request gave them.
-        let message = answer.body["message"]
-            .as_str()
-            .or_else(|| answer.body["Message"].as_str())
-            .unwrap_or_else(|| panic!("case {case}: expected a message, got {:?}", answer.body));
-        assert!(
-            message.contains(&not_an_insight) && message.contains("insight-detail-missing"),
-            "case {case}: expected the message to name the id and the entity, got {message:?}"
+    ];
+    // Entity rows: the domain holding an insight, a sibling domain holding none, and
+    // the account named both ways — every entity type the model admits, each one this
+    // account does hold, so the read resolves and only the id does not.
+    let entities = [
+        (
+            domain_entity("insight-detail-missing"),
+            "insight-detail-missing".to_string(),
+        ),
+        (
+            domain_entity("insight-detail-nothing"),
+            "insight-detail-nothing".to_string(),
+        ),
+        (
+            json!({"Type": "Account"}),
+            engine::emulator_account_id().to_string(),
+        ),
+        (
+            json!({"Type": "Account", "Value": engine::emulator_account_id()}),
+            engine::emulator_account_id().to_string(),
+        ),
+    ];
+
+    for (entity, names_entity) in &entities {
+        let before = list(&emulator, entity.clone()).await;
+        for unheld in &unheld_ids {
+            assert_ne!(
+                unheld, &id,
+                "case DescribeInsightDetails({unheld:?}): the row must name another id"
+            );
+            // The three ways a request can answer `ShowHtmlContent`, so the rendering
+            // rule holds over the informational view too.
+            for (show_html, extra) in [
+                (false, json!({})),
+                (false, json!({"ShowHtmlContent": false})),
+                (true, json!({"ShowHtmlContent": true})),
+            ] {
+                let case = format!("DescribeInsightDetails({entity:?}, {unheld:?}, {extra:?})");
+                let answer =
+                    describe_insight(&emulator, entity.clone(), unheld, extra.clone()).await;
+                let reported = informational(&answer, &case, unheld, names_entity, show_html);
+
+                // A report: a second identical read answers exactly the same.
+                let again =
+                    describe_insight(&emulator, entity.clone(), unheld, extra.clone()).await;
+                assert_eq!(
+                    names(&fields(&again, &case)),
+                    names(&reported),
+                    "case {case}(twice): expected the same informational view, got {:?}",
+                    again.body
+                );
+            }
+        }
+        // Reading ids this entity holds no insight under raised no insight: its
+        // listing is exactly what it was.
+        let after = list(&emulator, entity.clone()).await;
+        assert_eq!(
+            after.body, before.body,
+            "case DescribeInsightDetails({entity:?})(listing): a detail read must leave the \
+             listing as it was, got {:?}",
+            after.body
         );
     }
 
-    // The insight the entity DOES hold is still reported in full, so an unresolvable id
-    // leaves the set it was looked up in as it was.
-    let answer = describe_insight(&emulator, entity, &id, json!({})).await;
+    // The insight the entity DOES hold is still reported in full, so an id it holds
+    // none under leaves the set it was looked up in as it was.
+    let answer = describe_insight(
+        &emulator,
+        domain_entity("insight-detail-missing"),
+        &id,
+        json!({}),
+    )
+    .await;
     assert_eq!(
         names(&fields(&answer, "the insight that is held")),
         field_names(),
