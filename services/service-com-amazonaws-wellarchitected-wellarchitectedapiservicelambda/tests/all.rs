@@ -158,6 +158,9 @@ mod resource_tagging;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 
+#[path = "all/review_template_answer_reads.rs"]
+mod review_template_answer_reads;
+
 #[path = "all/review_template_answer_updates.rs"]
 mod review_template_answer_updates;
 
