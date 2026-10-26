@@ -70,6 +70,14 @@ fn generated(n: usize) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The same `n` keys as [`generated`] with values carrying `mark`, so a row that repeats a
+/// key in one request can tell WHICH of the two writes the stored value came from.
+fn generated_marked(n: usize, mark: &str) -> Vec<(String, String)> {
+    (0..n)
+        .map(|index| (format!("k{index}"), format!("v{index}-{mark}")))
+        .collect()
+}
+
 /// `CreateDomain`, optionally carrying create-time tags. Answers the created domain's ARN.
 async fn create_tagged_domain(router: &MultiServiceRouter, domain: &str, tags: &[(String, String)]) -> String {
     let created = call(
@@ -738,6 +746,266 @@ async fn a_tag_quota_refusal_states_the_rule_identically_at_every_write_site() {
             expected,
             "case {case:?}: expected {expected:?}, got {:?}",
             answer.message()
+        );
+    }
+}
+
+/// One row of the resultant-set table: the tags the resource is created holding, the batch
+/// written over them, whether the write is accepted, and the tag set the resource must hold
+/// once the call has been answered.
+struct ResultantSetCase {
+    label: String,
+    seed: Vec<(String, String)>,
+    batch: Vec<(String, String)>,
+    accepted: bool,
+    expected: Vec<(String, String)>,
+}
+
+/// RULE 3's SUBJECT: the quota bounds the tag set a write would leave the resource
+/// HOLDING — the set keyed by tag key, which is what the refusal's sentence calls the
+/// resultant tag set — never the number of entries the request listed, nor the sum of that
+/// list and the set already held.
+///
+/// Rows differ along what the rule generalises over: how many entries one request lists
+/// (the bound, one past it, twice it, the bound plus a few), how many DISTINCT keys those
+/// entries name, how many tags the resource already holds (none, a full set) and whether
+/// the batch's keys overlap the held ones — each row driven on all three kinds this service
+/// tags and through every site that writes a tag set.
+#[tokio::test]
+async fn the_tag_quota_bounds_the_resultant_set_and_not_the_request_length() {
+    let router = emulator();
+    // The sentence the quota refusal carries, written out rather than re-derived from the
+    // implementation, so what is pinned is the service's WORDING; its one variable part is
+    // the published per-resource bound.
+    let quota_message = "The resultant tag set must not have more than 50 user tags.";
+    assert_eq!(
+        MAX_TAGS_PER_RESOURCE, 50,
+        "the sentence above names the published bound, got {MAX_TAGS_PER_RESOURCE}"
+    );
+    let full = generated(MAX_TAGS_PER_RESOURCE);
+    let mut rows: Vec<ResultantSetCase> = Vec::new();
+
+    // One entry past the bound, with one key repeated: the resultant set is AT the bound,
+    // and the repeated key carries the request's last value for it.
+    let mut batch = full.clone();
+    batch.push(("k0".to_string(), "v0-again".to_string()));
+    let mut expected = full.clone();
+    expected[0].1 = "v0-again".to_string();
+    rows.push(ResultantSetCase {
+        label: format!(
+            "{} entries whose repeated key keys down to the bound",
+            batch.len()
+        ),
+        seed: Vec::new(),
+        batch,
+        accepted: true,
+        expected,
+    });
+
+    // Twice the bound in one batch, every key named twice: still the bound.
+    let mut batch = full.clone();
+    batch.extend(generated_marked(MAX_TAGS_PER_RESOURCE, "second"));
+    rows.push(ResultantSetCase {
+        label: format!("{} entries naming each key twice", batch.len()),
+        seed: Vec::new(),
+        batch,
+        accepted: true,
+        expected: generated_marked(MAX_TAGS_PER_RESOURCE, "second"),
+    });
+
+    // One DISTINCT key past the bound, however often the keys repeat: refused, and the
+    // resource is left holding the set it had.
+    let mut batch = generated(MAX_TAGS_PER_RESOURCE + 1);
+    batch.extend(generated_marked(5, "second"));
+    rows.push(ResultantSetCase {
+        label: format!(
+            "{} entries naming {} distinct keys",
+            batch.len(),
+            MAX_TAGS_PER_RESOURCE + 1
+        ),
+        seed: Vec::new(),
+        batch,
+        accepted: false,
+        expected: Vec::new(),
+    });
+
+    // A full set re-edited key for key: the list and the held set sum to twice the bound,
+    // and the resultant set is the bound, so it is accepted.
+    rows.push(ResultantSetCase {
+        label: format!(
+            "a full set re-edited by {} entries that name only held keys",
+            MAX_TAGS_PER_RESOURCE
+        ),
+        seed: full.clone(),
+        batch: generated_marked(MAX_TAGS_PER_RESOURCE, "edited"),
+        accepted: true,
+        expected: generated_marked(MAX_TAGS_PER_RESOURCE, "edited"),
+    });
+
+    // The same batch with ONE key the resource does not hold: the resultant set is one past
+    // the bound, so it is refused and nothing is written.
+    let mut batch = generated_marked(MAX_TAGS_PER_RESOURCE, "edited");
+    batch.push(("fresh".to_string(), "x".to_string()));
+    rows.push(ResultantSetCase {
+        label: "a full set re-edited with one unheld key among the batch".to_string(),
+        seed: full.clone(),
+        batch,
+        accepted: false,
+        expected: full.clone(),
+    });
+
+    for (index, case) in rows.iter().enumerate() {
+        let domain = format!("resultant-{index}");
+        let domain_arn = create_tagged_domain(&router, &domain, &case.seed).await;
+        let repository_arn = create_tagged_repository(&router, &domain, "repo", &case.seed).await;
+        let group_arn =
+            create_tagged_package_group(&router, &domain, "/npm/scope/*", &case.seed).await;
+
+        for (kind, arn) in [
+            ("domain", &domain_arn),
+            ("repository", &repository_arn),
+            ("package group", &group_arn),
+        ] {
+            let label = format!("TagResource on a {kind}: {}", case.label);
+            let answer = tag(&router, arn, &case.batch).await;
+            if case.accepted {
+                assert_eq!(
+                    (answer.status, answer.code()),
+                    (200, String::new()),
+                    "case {label:?}: a resultant set within the bound must be accepted, got {answer:?}"
+                );
+            } else {
+                assert_eq!(
+                    (answer.status, answer.code()),
+                    (402, "ServiceQuotaExceededException".to_string()),
+                    "case {label:?}: a resultant set past the bound must be refused, got {answer:?}"
+                );
+                assert_eq!(
+                    answer.message().as_str(),
+                    quota_message,
+                    "case {label:?}: expected {quota_message:?}, got {:?}",
+                    answer.message()
+                );
+            }
+            let got = held_tags(&router, arn, &label).await;
+            assert_eq!(
+                got,
+                expected_map(&case.expected),
+                "case {label:?}: expected {} tags, got {got:?}",
+                case.expected.len()
+            );
+        }
+    }
+
+    // The create sites bound the resultant set the same way: a `tags` list longer than the
+    // bound that keys down to it is accepted, and stores the keyed set.
+    let mut long = full.clone();
+    long.extend(generated_marked(6, "last"));
+    let mut expected_from_long = full.clone();
+    for (slot, marked) in expected_from_long
+        .iter_mut()
+        .zip(generated_marked(6, "last"))
+    {
+        slot.1 = marked.1;
+    }
+    let created_domain = create_tagged_domain(&router, "resultant-create", &long).await;
+    let created_repository =
+        create_tagged_repository(&router, "resultant-create", "repo", &long).await;
+    let created_group =
+        create_tagged_package_group(&router, "resultant-create", "/npm/long/*", &long).await;
+    for (kind, arn) in [
+        ("domain", &created_domain),
+        ("repository", &created_repository),
+        ("package group", &created_group),
+    ] {
+        let label = format!(
+            "a {kind} created with {} entries keying down to the bound",
+            long.len()
+        );
+        let got = held_tags(&router, arn, &label).await;
+        assert_eq!(
+            got,
+            expected_map(&expected_from_long),
+            "case {label:?}: expected the keyed set of {} entries, got {got:?}",
+            long.len()
+        );
+    }
+
+    // ...and a list whose DISTINCT keys pass the bound is refused at each create site, with
+    // the same sentence and with nothing created.
+    let mut over = generated(MAX_TAGS_PER_RESOURCE + 1);
+    over.extend(generated_marked(3, "last"));
+    let refusals = [
+        (
+            "CreateDomain",
+            call(
+                &router,
+                "POST",
+                "/v1/domain?domain=resultant-create-over",
+                Some(json!({ "tags": tag_list(&over) })),
+            )
+            .await,
+            call(&router, "GET", "/v1/domain?domain=resultant-create-over", None).await,
+        ),
+        (
+            "CreateRepository",
+            call(
+                &router,
+                "POST",
+                "/v1/repository?domain=resultant-create&repository=over",
+                Some(json!({ "tags": tag_list(&over) })),
+            )
+            .await,
+            call(
+                &router,
+                "GET",
+                "/v1/repository?domain=resultant-create&repository=over",
+                None,
+            )
+            .await,
+        ),
+        (
+            "CreatePackageGroup",
+            call(
+                &router,
+                "POST",
+                "/v1/package-group?domain=resultant-create",
+                Some(json!({ "packageGroup": "/npm/over/*", "tags": tag_list(&over) })),
+            )
+            .await,
+            call(
+                &router,
+                "GET",
+                &format!(
+                    "/v1/package-group?domain=resultant-create&package-group={}",
+                    encode_query("/npm/over/*")
+                ),
+                None,
+            )
+            .await,
+        ),
+    ];
+    for (operation, refused, read_back) in &refusals {
+        let label = format!(
+            "{operation} carrying {} entries naming {} distinct keys",
+            over.len(),
+            MAX_TAGS_PER_RESOURCE + 1
+        );
+        assert_eq!(
+            (refused.status, refused.code()),
+            (402, "ServiceQuotaExceededException".to_string()),
+            "case {label:?}: a resultant set past the bound must be refused, got {refused:?}"
+        );
+        assert_eq!(
+            refused.message().as_str(),
+            quota_message,
+            "case {label:?}: expected {quota_message:?}, got {:?}",
+            refused.message()
+        );
+        assert_eq!(
+            (read_back.status, read_back.code()),
+            (404, "ResourceNotFoundException".to_string()),
+            "case {label:?}: a refused create must leave no resource behind, got {read_back:?}"
         );
     }
 }
