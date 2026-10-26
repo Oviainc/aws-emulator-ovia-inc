@@ -225,18 +225,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = crate::state::page_size(input.max_results);
 
         // A token names the job the previous page stopped after, so this page starts
-        // strictly beyond it: no job is returned twice and none is skipped.
+        // strictly beyond it: no job is returned twice and none is skipped. A token this
+        // service did not issue does not decode, and is the one refusal every paged list
+        // here shares, built by the shared helper so no list words it its own way.
         let resume_after = match input.next_token.as_deref() {
             None => None,
             Some(token) => match crate::state::page_resume_after(token) {
                 Some(after) => Some(after),
                 None => {
                     return Err(ListHarvestJobsErrorModeled::ValidationException(
-                        crate::state::validation_failed(
-                            "nextToken",
-                            crate::state::INVALID_PAGINATION_TOKEN_DETAIL,
-                            crate::state::VALIDATION_INVALID_PAGINATION_TOKEN,
-                        ),
+                        crate::state::invalid_pagination_token(),
                     )
                     .into());
                 }

@@ -259,11 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(after) => Some(after),
                 None => {
                     return Err(ListOriginEndpointsErrorModeled::ValidationException(
-                        crate::state::validation_failed(
-                            "nextToken",
-                            crate::state::INVALID_PAGINATION_TOKEN_DETAIL,
-                            "INVALID_PAGINATION_TOKEN",
-                        ),
+                        crate::state::invalid_pagination_token(),
                     )
                     .into());
                 }

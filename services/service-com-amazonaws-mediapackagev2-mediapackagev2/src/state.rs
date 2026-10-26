@@ -2755,6 +2755,24 @@ pub fn multiview_source_violation(
 pub const INVALID_PAGINATION_TOKEN_DETAIL: &str = "You've provided an invalid pagination \
      token in your request. Check your token and then try again";
 
+/// The member a paged list carries its continuation token in, as the wire names it
+/// (`httpQuery("nextToken")` on every list's `NextToken`) and therefore as a validation
+/// message paths it.
+const NEXT_TOKEN_MEMBER: &str = "nextToken";
+
+/// The modeled 400 a paged list refuses a token this service did not issue with.
+///
+/// Every paged list answers this one class, so the member path, the detail and the
+/// discriminator are assembled here once rather than per list: four lists refusing one
+/// class cannot then word it four ways.
+pub fn invalid_pagination_token() -> ValidationException {
+    validation_failed(
+        NEXT_TOKEN_MEMBER,
+        INVALID_PAGINATION_TOKEN_DETAIL,
+        VALIDATION_INVALID_PAGINATION_TOKEN,
+    )
+}
+
 // =============================================================================
 // Validation: which manifests an origin endpoint's container type can serve
 // =============================================================================
