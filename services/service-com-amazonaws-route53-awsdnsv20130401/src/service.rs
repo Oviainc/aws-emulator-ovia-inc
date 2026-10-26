@@ -77,6 +77,67 @@ const INVALID_CHANGE_BATCH: &str = "InvalidChangeBatch";
 /// collection): `changeBatch.changes.<n>.member.resourceRecordSet.region`.
 const RECORD_SET_REGION_PATH: &str = "resourceRecordSet.region";
 
+/// The order this service states one enum's value set in, one row per enum.
+///
+/// The value SET is the model's and the CHECK is the framework's; only the ORDER
+/// the sentence lists the set in is chosen here, because no model records it:
+/// Route 53 states a value set in neither the model's declaration order nor
+/// ascending order, so the row below is READ OFF an answer the service gave for a
+/// value outside that set rather than computed from the model.
+///
+/// A row is matched by its value SET rather than by the member the clause names
+/// (see [`stated_value_order`]), because the order is a property of the enum
+/// SHAPE: every member targeting that enum, in any operation, is stated alike. An
+/// enum with no row — every other enum this model declares — keeps the order the
+/// value set arrived in, the model's declaration order, which is the only order
+/// there is evidence for.
+const STATED_VALUE_ORDERS: &[&[&str]] = &[
+    // com.amazonaws.route53#RRType, the DNS record type a record set, a query and
+    // a traffic policy are all typed by.
+    &[
+        "AAAA", "A", "SVCB", "CAA", "NS", "SOA", "TLSA", "SPF", "HTTPS", "MX", "PTR", "CNAME",
+        "DS", "TXT", "SSHFP", "SRV", "NAPTR",
+    ],
+];
+
+/// `allowed` in the order this service states that enum's value set in, or in the
+/// order it arrived in when there is no stated order for it.
+fn stated_value_order(allowed: &[String]) -> Vec<String> {
+    match STATED_VALUE_ORDERS
+        .iter()
+        .find(|stated| is_same_set(stated, allowed))
+    {
+        Some(stated) => stated.iter().map(|value| (*value).to_string()).collect(),
+        None => allowed.to_vec(),
+    }
+}
+
+/// Whether two value sets hold the same values. An enum's values are unique by
+/// definition, so equal lengths plus containment is set equality.
+fn is_same_set(stated: &[&str], allowed: &[String]) -> bool {
+    stated.len() == allowed.len()
+        && stated
+            .iter()
+            .all(|value| allowed.iter().any(|candidate| candidate == value))
+}
+
+/// Every violation as this service states it: the framework's clause, with an
+/// enum's value set listed in the order this service publishes it
+/// ([`stated_value_order`]).
+fn as_stated(violations: &[Violation]) -> Vec<Violation> {
+    violations
+        .iter()
+        .map(|violation| match &violation.kind {
+            ViolationKind::EnumValue(allowed) => Violation {
+                path: violation.path.clone(),
+                kind: ViolationKind::EnumValue(stated_value_order(allowed)),
+                value: violation.value.clone(),
+            },
+            _ => violation.clone(),
+        })
+        .collect()
+}
+
 /// The regions a change batch was refused over, when THAT is what it was
 /// refused over, in the order the batch named them.
 ///
@@ -178,9 +239,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The MESSAGE is the one the framework already renders and the one the
         // service answers: the per-member envelope `N validation error(s)
         // detected: Value '<value>' at '<member path>' failed to satisfy
-        // constraint: <requirement>`, built from the request. Only the code a
-        // client branches on is this service's to choose, so the envelope is
-        // taken from the framework rather than restated here.
+        // constraint: <requirement>`, built from the request. ONE rendering
+        // inside it is this service's rather than the framework's, because no
+        // model records it — the order an enum's value set is listed in
+        // ([`STATED_VALUE_ORDERS`]); everything else about the envelope is taken
+        // from the framework rather than restated here.
         //
         // The ONE exception is a value this service RESOLVES rather than one the
         // request has to have — see [`unresolvable_regions`].
@@ -205,8 +268,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                     code: INVALID_INPUT.to_string(),
                     // `None` when there are no violations to state, which keeps
                     // the framework's own wording rather than answering an empty
-                    // message.
-                    message: aws_smithy_schema_server::envelope(violations)?,
+                    // message. The clauses are the framework's; the ORDER an
+                    // enum's value set is listed in is this service's
+                    // ([`as_stated`]).
+                    message: aws_smithy_schema_server::envelope(&as_stated(violations))?,
                 })
             }
             // An unauthenticated caller is not an input problem at all: keep the

@@ -19,10 +19,14 @@ mod checker_ip_ranges;
 mod dns_answers;
 #[path = "all/dnssec_status.rs"]
 mod dnssec_status;
+#[path = "all/enum_value_set_order.rs"]
+mod enum_value_set_order;
 #[path = "all/error_classification.rs"]
 mod error_classification;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/geolocation_routing.rs"]
+mod geolocation_routing;
 #[path = "all/health_check_creation.rs"]
 mod health_check_creation;
 // Declared beside the other health-check suites: this one is the `ChildHealthChecks`

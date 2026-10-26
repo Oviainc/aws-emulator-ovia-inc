@@ -33,6 +33,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// publishes that assessment as.
 pub mod health_check_status;
 
+/// Where a simulated DNS query appears to come from, which is what a geolocation
+/// record set is selected by.
+pub mod client_location;
+
 use crate::ops::types::create_reusable_delegation_set_types::HostedZoneNotFound;
 use crate::ops::types::delete_vpc_association_authorization_types::VPCAssociationAuthorizationNotFound;
 use crate::ops::types::get_change_types::NoSuchChange;

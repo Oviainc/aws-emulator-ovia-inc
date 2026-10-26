@@ -107,6 +107,7 @@ use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::state::client_location::{self, ClientLocation};
 use crate::state::{
     canonical_dns_name, name_is_in_zone, no_such_hosted_zone, normalize_zone_id,
     ComAmazonawsRoute53Awsdnsv20130401State, StoredZone,
@@ -241,6 +242,131 @@ fn client_subnet_problem(input: &TestDNSAnswerInput) -> Option<String> {
     }
 }
 
+/// What the request says about where the query it simulates comes FROM.
+///
+/// Three of the operation's inputs are about the ORIGIN of the simulated query
+/// rather than about what it asks for: `ResolverIP` ("if you want to simulate a
+/// request from a specific DNS resolver, specify the IP address for that
+/// resolver") and the pair `EDNS0ClientSubnetIP`/`EDNS0ClientSubnetMask` ("the
+/// IPv4 or IPv6 address of a client in the applicable location" and "the number
+/// of bits of the IP address that you want the checking tool to include in the
+/// DNS query"). Every routing policy that routes by WHERE a query came from
+/// reads them through this one description, so the policies cannot disagree
+/// about the origin of the same query.
+#[derive(Debug, Clone, Copy, Default)]
+struct QueryOrigin {
+    /// The Amazon EC2 Region of the resolver the query is simulated from, when
+    /// it is one this service knows ([`DEFAULT_RESOLVER_REGION`]).
+    resolver_region: Option<&'static str>,
+    /// The geographic location the query appears to come from: the client subnet
+    /// the request names, or the resolver's own address when it names no client
+    /// subnet, placed by [`client_location`]. `None` for an address no public
+    /// delegation record places, which `GeoLocation`'s documentation calls a
+    /// query "from [an IP address] that [isn't] mapped to a location".
+    location: Option<ClientLocation>,
+}
+
+/// Where the request says this query comes from.
+///
+/// The client subnet is what the apparent location comes from when the request
+/// names one — it is the member whose documentation is about "a client in the
+/// applicable location" — and the resolver's own address is what is left to place
+/// the query by when it does not. A request that names neither carries nothing
+/// to place: the resolver the checking tool then simulates is named by its Region
+/// alone ("If you omit this value, TestDnsAnswer uses the IP address of a DNS
+/// resolver in the … us-east-1 … Region"), which is what a latency group routes
+/// by and is not an address a geolocation group can be resolved against.
+fn query_origin(input: &TestDNSAnswerInput) -> QueryOrigin {
+    let resolver_ip = input.resolver_ip.as_deref().filter(|ip| !ip.is_empty());
+    let client_subnet_ip = input
+        .edns0_client_subnet_ip
+        .as_deref()
+        .filter(|ip| !ip.is_empty());
+    let client_subnet_mask = input
+        .edns0_client_subnet_mask
+        .as_deref()
+        .filter(|mask| !mask.is_empty());
+    QueryOrigin {
+        // A resolver the request DOES name sits wherever its address does, which
+        // is not a Region this emulator can read off an address.
+        resolver_region: resolver_ip.is_none().then_some(DEFAULT_RESOLVER_REGION),
+        location: match client_subnet_ip {
+            Some(address) => client_location::locate_client_subnet(address, client_subnet_mask),
+            None => resolver_ip.and_then(client_location::locate_address),
+        },
+    }
+}
+
+/// How specifically one geolocation record set's location covers the origin of
+/// this query, or `None` when it does not cover it at all.
+///
+/// `GeoLocation` names a location at one of three granularities — a subdivision
+/// of a country, a country, a continent — or with the `*` `CountryCode` that
+/// stands for every location the group holds no record set for
+/// ([`UNPLACEABLE_COUNTRY_CODE`]). A more specific cover wins: a query from a
+/// country the group holds a record set for is answered from THAT record set even
+/// when a continent sibling covers the same country, and the `*` member answers
+/// only a query no sibling's location covers.
+fn location_specificity(location: &GeoLocation, origin: Option<ClientLocation>) -> Option<u8> {
+    let named = |code: &Option<String>| {
+        code.as_deref()
+            .filter(|code| !code.is_empty())
+            .map(str::to_string)
+    };
+    let country = named(&location.country_code);
+    if country.as_deref() == Some(UNPLACEABLE_COUNTRY_CODE) {
+        // The default member covers every origin — including a query whose
+        // address places nowhere — and is the least specific cover there is.
+        return Some(0);
+    }
+    let origin = origin?;
+    if let Some(country) = country {
+        if !country.eq_ignore_ascii_case(origin.country_code) {
+            return None;
+        }
+        return match named(&location.subdivision_code) {
+            // A record set that routes by a subdivision covers only a query
+            // placed in that subdivision of that country.
+            Some(subdivision) => origin
+                .subdivision_code
+                .is_some_and(|placed| subdivision.eq_ignore_ascii_case(placed))
+                .then_some(3),
+            None => Some(2),
+        };
+    }
+    let continent = named(&location.continent_code)?;
+    continent
+        .eq_ignore_ascii_case(origin.continent_code)
+        .then_some(1)
+}
+
+/// The member of a geolocation group this query is answered from: the one whose
+/// location covers the query's origin most specifically, and none at all when
+/// the group holds neither a covering location nor a `*` default — the "no
+/// answer" response `GeoLocation`'s documentation describes.
+fn geolocated_member<'a>(
+    group: &[&'a ResourceRecordSet],
+    origin: Option<ClientLocation>,
+) -> Option<&'a ResourceRecordSet> {
+    let mut answering: Option<(u8, &'a ResourceRecordSet)> = None;
+    for record in group.iter().copied() {
+        let Some(specificity) = record
+            .geo_location
+            .as_ref()
+            .and_then(|location| location_specificity(location, origin))
+        else {
+            continue;
+        };
+        // Strictly MORE specific wins, so two siblings that cover the origin
+        // equally are answered by the first of them in `SetIdentifier` order —
+        // the order the zone holds the group in.
+        if answering.is_none_or(|(covered, _)| specificity > covered) {
+            answering = Some((specificity, record));
+        }
+    }
+    answering.map(|(_, record)| record)
+}
+
 /// A uniform draw below `bound`, which is what makes a weighted group's answer
 /// fall to one member "based on the ratio of a resource's weight to the total"
 /// (`Weight`'s own documentation) rather than always to the same one.
@@ -323,11 +449,13 @@ fn weighted_member<'a>(group: &[&'a ResourceRecordSet]) -> Option<&'a ResourceRe
 ///   record to be healthy");
 /// * multivalue answer — up to eight members, all of them when the group is
 ///   that small ([`MAX_MULTIVALUE_ANSWERS`]);
-/// * geolocation — the member whose location covers the query's origin. Mapping
-///   an address to a location is something this emulator cannot do, so every
-///   query is one "from [an IP address] that [isn't] mapped to a location",
-///   which `GeoLocation`'s documentation routes to the `*` member, and to a "no
-///   answer" response when the group has none ([`UNPLACEABLE_COUNTRY_CODE`]);
+/// * geolocation — the member whose location covers the query's origin most
+///   specifically ([`geolocated_member`]), where the origin is the client subnet
+///   or resolver address the request names ([`query_origin`]). A query whose
+///   address places nowhere is one "from [an IP address] that [isn't] mapped to a
+///   location", which `GeoLocation`'s documentation routes to the `*` member, and
+///   to a "no answer" response when the group holds none
+///   ([`UNPLACEABLE_COUNTRY_CODE`]);
 /// * latency — the member in the resolver's own Region, which is `us-east-1` for
 ///   the resolver the checking tool simulates by default
 ///   ([`DEFAULT_RESOLVER_REGION`]). Latency to the other Regions is not
@@ -340,7 +468,7 @@ fn weighted_member<'a>(group: &[&'a ResourceRecordSet]) -> Option<&'a ResourceRe
 ///   nothing to choose between its members by.
 fn answering_members<'a>(
     group: &[&'a ResourceRecordSet],
-    resolver_region: Option<&str>,
+    origin: QueryOrigin,
 ) -> Vec<&'a ResourceRecordSet> {
     let one = |record: Option<&'a ResourceRecordSet>| record.into_iter().collect();
     if group.iter().any(|record| record.weight.is_some()) {
@@ -361,16 +489,10 @@ fn answering_members<'a>(
             .collect();
     }
     if group.iter().any(|record| record.geo_location.is_some()) {
-        return one(group.iter().copied().find(|record| {
-            record
-                .geo_location
-                .as_ref()
-                .and_then(|location| location.country_code.as_deref())
-                == Some(UNPLACEABLE_COUNTRY_CODE)
-        }));
+        return one(geolocated_member(group, origin.location));
     }
     if group.iter().any(|record| record.region.is_some()) {
-        let in_region = resolver_region.and_then(|region| {
+        let in_region = origin.resolver_region.and_then(|region| {
             group
                 .iter()
                 .copied()
@@ -414,7 +536,7 @@ fn answering_members<'a>(
 fn record_data<'a>(
     store: &'a ComAmazonawsRoute53Awsdnsv20130401State,
     record: &'a ResourceRecordSet,
-    resolver_region: Option<&str>,
+    origin: QueryOrigin,
 ) -> Vec<String> {
     let mut current = record;
     // At most one entry per hop, so the walk's own bookkeeping is bounded by
@@ -440,10 +562,7 @@ fn record_data<'a>(
             return Vec::new();
         }
         let group = target_zone.records_at(&hop.1, hop.2);
-        let Some(next) = answering_members(&group, resolver_region)
-            .into_iter()
-            .next()
-        else {
+        let Some(next) = answering_members(&group, origin).into_iter().next() else {
             return Vec::new();
         };
         resolved.push(hop);
@@ -472,7 +591,7 @@ fn answer(
     zone: &StoredZone,
     name: &str,
     rr_type: &str,
-    resolver_region: Option<&str>,
+    origin: QueryOrigin,
 ) -> (&'static str, Vec<String>) {
     if !name_is_in_zone(name, &zone.name) {
         return (RESPONSE_CODE_NXDOMAIN, Vec::new());
@@ -486,9 +605,9 @@ fn answer(
         };
         return (code, Vec::new());
     }
-    let values = answering_members(&group, resolver_region)
+    let values = answering_members(&group, origin)
         .into_iter()
-        .flat_map(|record| record_data(store, record, resolver_region))
+        .flat_map(|record| record_data(store, record, origin))
         .take(MAX_RECORD_DATA_ENTRIES)
         .collect();
     (RESPONSE_CODE_NOERROR, values)
@@ -579,16 +698,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // "If you omit this value, TestDnsAnswer uses the IP address of a DNS
-        // resolver in the … us-east-1 … Region." A resolver the request DOES
-        // name sits wherever its address does, which is not something this
-        // emulator can place, so its Region is unknown.
-        let resolver_region = input
-            .resolver_ip
-            .as_deref()
-            .filter(|ip| !ip.is_empty())
-            .is_none()
-            .then_some(DEFAULT_RESOLVER_REGION);
+        // Where this query appears to come from: the Region of the resolver it
+        // is simulated from, and the location its client subnet (or the
+        // resolver's own address) places it in. Read off the request before any
+        // zone is, since it is a property of the query and not of the zone.
+        let origin = query_origin(&input);
 
         let store = state.lock();
         let zone = store
@@ -614,13 +728,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let record_name = canonical_dns_name(&input.record_name);
-        let (response_code, record_data) = answer(
-            &store,
-            zone,
-            &record_name,
-            &input.record_type,
-            resolver_region,
-        );
+        let (response_code, record_data) =
+            answer(&store, zone, &record_name, &input.record_type, origin);
 
         Ok(TestDNSAnswerOutput {
             // A query reaches ONE of the zone's four authoritative name servers,
