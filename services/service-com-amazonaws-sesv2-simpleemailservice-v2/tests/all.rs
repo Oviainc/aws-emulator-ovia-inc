@@ -31,6 +31,8 @@ mod email_identity_configuration_set_association;
 mod email_identity_feedback_attributes;
 #[path = "all/email_identity_lifecycle.rs"]
 mod email_identity_lifecycle;
+#[path = "all/email_identity_policies.rs"]
+mod email_identity_policies;
 #[path = "all/multi_region_endpoints.rs"]
 mod multi_region_endpoints;
 #[path = "all/state_roundtrip.rs"]

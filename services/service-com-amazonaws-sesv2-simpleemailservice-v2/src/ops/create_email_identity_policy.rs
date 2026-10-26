@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEmailIdentityPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEmailIdentityPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEmailIdentityPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes one NEW sending-authorization policy onto the email identity this account
+//! holds, after reading the document through the shared IAM resource-policy grammar;
+//! `GetEmailIdentity` reports back what it stored. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -116,6 +111,56 @@ impl From<CreateEmailIdentityPolicyErrorModeled> for CreateEmailIdentityPolicyEr
     }
 }
 
+/// What SES answers for a document that is not a sending authorization policy.
+///
+/// The service reports ONE opaque phrase for that whole class — it does not name
+/// the clause of the policy grammar the document broke — so a document that is not
+/// JSON and one that is JSON but carries no statement are refused in the same
+/// words.
+const NOT_A_POLICY: &str = "Unable to parse policy.";
+
+/// The bytes one sending-authorization policy document may carry.
+///
+/// `CreateEmailIdentityPolicyRequest$Policy` states the ceiling: "The text of the
+/// policy in JSON format. The policy cannot exceed 4 KB." The model carries only
+/// the member's lower bound (`length 1..`), so the documented ceiling is this
+/// handler's to enforce — and it is also what bounds one entry of the identity's
+/// policy map.
+pub const MAX_POLICY_BYTES: usize = 4 * 1024;
+
+/// The sending-authorization policies ONE identity may hold at once, and so the
+/// ceiling this operation keeps on an identity's policy map.
+///
+/// A CHOSEN bound, informed by what `GetEmailIdentityPolicies` documents — it
+/// returns the identity's policies and "you can retrieve a maximum of 20 policies
+/// at a time", so 20 is the whole set a caller can read back in one call — rather
+/// than a quota AWS states for the collection itself. A create past it is refused
+/// with the `LimitExceededException` the model binds, so caller input cannot grow
+/// the store without end.
+pub const MAX_IDENTITY_POLICIES: usize = 20;
+
+/// Refuse the request with this operation's input error: `BadRequestException` is
+/// documented as "the input you provided is invalid", which is what a document or a
+/// policy name that breaks a documented rule is.
+fn bad_request(message: impl Into<String>) -> CreateEmailIdentityPolicyError {
+    CreateEmailIdentityPolicyErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The characters `PolicyName` admits, from its own documentation: "The name of the
+/// policy. The policy name cannot exceed 64 characters and can only include
+/// alphanumeric characters, dashes, and underscores." The length is modeled
+/// (`length 1..64`) and so already refused at the boundary; the character set is
+/// not, so this handler reads it.
+fn is_policy_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
 /// The `CreateEmailIdentityPolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -152,18 +197,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEmailIdentityPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEmailIdentityPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEmailIdentityPolicy"))
+        // Request metadata is not needed: the identity is keyed by name within the
+        // one emulated account.
+        let _ = ctx;
+
+        if !is_policy_name(&input.policy_name) {
+            return Err(bad_request(format!(
+                "The policy name {} can only include alphanumeric characters, dashes, \
+                 and underscores.",
+                input.policy_name
+            )));
+        }
+
+        // The document's ceiling: "The policy cannot exceed 4 KB." The model bounds
+        // `Policy` only below, so a longer document reaches this handler. Its own
+        // message, because the size rule is not the parse rule.
+        if input.policy.len() > MAX_POLICY_BYTES {
+            return Err(bad_request(format!(
+                "Policy exceeds the maximum size of {MAX_POLICY_BYTES} bytes."
+            )));
+        }
+
+        // A sending authorization policy IS an IAM resource-based policy document —
+        // each statement names the `Principal` it authorizes to send through the
+        // identity — so whether the text is a policy at all is read through the ONE
+        // shared grammar rather than by asking `serde_json` whether it parses, which
+        // would accept `5`, `"hello"` and `{}` as policies and store them.
+        if ::service_common::iam_policy::resource_policy_defect(&input.policy).is_some() {
+            return Err(bad_request(NOT_A_POLICY));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to write to. That is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateEmailIdentityPolicy without the shared emulator state",
+            ));
+        };
+
+        let mut store = state.lock();
+        // A read of the table reports settled statuses; do the same here so this
+        // write lands on the same record a read would have reported.
+        store.settle(::std::time::SystemTime::now());
+
+        // "This API is for the identity owner only. If you have not verified the
+        // identity, this API will return an error": the policy hangs off an identity
+        // this account holds, so a name it holds none for is the modelled 404 rather
+        // than a new record. Holding it is what the rule turns on, not the status of
+        // the verification it started: that transition is one the clock owes within a
+        // sub-second span and nothing a caller can complete here, so the window
+        // before it falls due is a transient of this emulator rather than a state the
+        // service refuses a policy write in — the same reading the SES v1 sibling's
+        // `PutIdentityPolicy` takes of its identity table.
+        let Some(record) = store
+            .identities
+            .get_mut(&crate::state::identity_key(&input.email_identity))
+        else {
+            return Err(CreateEmailIdentityPolicyErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Email identity {} does not exist.",
+                        input.email_identity
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "CREATES the specified sending authorization policy": this call only ever
+        // adds a policy the identity does not carry yet, which is why the model binds
+        // `AlreadyExistsException` here and not to the update. Replacing the document
+        // of a name the identity already holds is `UpdateEmailIdentityPolicy`'s job.
+        if record.policies.contains_key(&input.policy_name) {
+            return Err(CreateEmailIdentityPolicyErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(format!(
+                        "Policy {} already exists for email identity {}.",
+                        input.policy_name, input.email_identity
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // One identity holds a bounded set of policies, so a create past that set is
+        // "too many instances of the specified resource type" rather than a write.
+        if record.policies.len() >= MAX_IDENTITY_POLICIES {
+            return Err(CreateEmailIdentityPolicyErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Email identity {} already holds the maximum of \
+                         {MAX_IDENTITY_POLICIES} sending authorization policies.",
+                        input.email_identity
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Stored VERBATIM under the name the request spelled, so a read reports back
+        // the document that was submitted — whitespace and member order included —
+        // rather than a re-rendering of it.
+        record.policies.insert(input.policy_name, input.policy);
+
+        // `CreateEmailIdentityPolicyResponse` has no members: what the call produced
+        // is the state it wrote, which the identity's reads report.
+        Ok(CreateEmailIdentityPolicyOutput {})
     }
 }
