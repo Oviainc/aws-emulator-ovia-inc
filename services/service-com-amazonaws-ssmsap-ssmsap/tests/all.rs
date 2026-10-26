@@ -57,6 +57,8 @@ mod pattern_violation_messages;
 mod register_application_conditional_requirements;
 #[path = "all/registered_database_arn.rs"]
 mod registered_database_arn;
+#[path = "all/region_partition_reclamation.rs"]
+mod region_partition_reclamation;
 #[path = "all/region_scoping.rs"]
 mod region_scoping;
 #[path = "all/registration_derived_state.rs"]
