@@ -168,8 +168,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The record is reported AS OF NOW: a disable the clock already owes this
+        // ingestion (a destination association it lost while enabled) is part of
+        // the state a read reports, without this reporting call writing anything.
         Ok(GetIngestionOutput {
-            ingestion: ingestion.to_ingestion(),
+            ingestion: ingestion.to_ingestion(::std::time::SystemTime::now()),
         })
     }
 }

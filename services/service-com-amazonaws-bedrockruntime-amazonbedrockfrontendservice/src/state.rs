@@ -30,13 +30,14 @@
 //! Everything around that — resolution, validation, status, timestamps, ARNs,
 //! paging and the invocation log — is real and computed from persisted state.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use crate::ops::types::{
     AsyncInvokeOutputDataConfig, CitationGeneratedContent, CitationSourceContent, ContentBlock,
     DocumentBlock, DocumentContentBlock, DocumentSource, GuardrailConverseContentBlock, Message,
     ReasoningContentBlock, SearchResultBlock, SystemContentBlock, Tag, TokenUsage, Tool,
     ToolChoice, ToolConfiguration, ToolInputSchema, ToolReference, ToolResultContentBlock,
+    ToolUseBlock,
 };
 
 /// The `AWS/Bedrock` metric data a served inference publishes, beside the
@@ -85,7 +86,8 @@ pub struct ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState {
     /// The inference log: one entry per served inference call, as a ring buffer
     /// of the most recent [`MAX_INVOCATION_LOG_ENTRIES`].
     pub invocations: VecDeque<InvocationLogEntry>,
-    /// Monotonic counter mixed into every minted async-invoke id.
+    /// Monotonic counter mixed into every id this service mints (an async
+    /// invocation's, a tool request's).
     pub next_id: u64,
 }
 
@@ -185,6 +187,84 @@ impl ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState {
         let seed = format!("{}:{}:{}", self.next_id, model_id, submit_millis);
         let digest = Sha256::digest(seed.as_bytes());
         hex::encode(digest)[..12].to_string()
+    }
+
+    /// The id a tool request is issued under: the `tooluse_` prefix every
+    /// Bedrock tool request carries, plus 22 hex characters, which satisfies the
+    /// modelled `ToolUseId` (`@length` 1..64, `@pattern`
+    /// `^[a-zA-Z0-9_.:-]+$`).
+    ///
+    /// Derived from the state counter plus the request's own values, as
+    /// [`Self::mint_invocation_id`] is, so two requests never collide and the id
+    /// is not a guessable sequence. The id is MINTED here, which is what lets a
+    /// later turn be checked against the ids this service actually issued.
+    pub fn mint_tool_use_id(&mut self, tool_name: &str, at_millis: i64) -> String {
+        use sha2::{Digest, Sha256};
+        self.next_id += 1;
+        let seed = format!("{}:{}:{}", self.next_id, tool_name, at_millis);
+        let digest = Sha256::digest(seed.as_bytes());
+        format!("tooluse_{}", &hex::encode(digest)[..22])
+    }
+
+    /// The tool request a mandatory `toolChoice` obliges this turn to make, or
+    /// `None` when the request leaves the choice to the model (`auto`, or no
+    /// `toolChoice` at all).
+    ///
+    /// `Err` carries the refusal sentence for a choice the request's own tools
+    /// cannot satisfy; the caller answers it with the operation's modelled
+    /// `ValidationException` (400).
+    pub fn forced_tool_use(
+        &mut self,
+        tool_config: Option<&ToolConfiguration>,
+        at_millis: i64,
+    ) -> Result<Option<ToolUseBlock>, String> {
+        let Some(config) = tool_config else {
+            return Ok(None);
+        };
+        let requestable = requestable_tool_names(config);
+        let name = match &config.tool_choice {
+            // `auto` leaves it to the model, and a model that generates text is
+            // what this emulator serves.
+            Some(ToolChoice::Auto(_)) | None => return Ok(None),
+            // "The model must request at least one tool": the first tool the
+            // request offers is the one requested, so the choice is answered
+            // from the request rather than from a guess.
+            Some(ToolChoice::Any(_)) => match requestable.first() {
+                Some(name) => (*name).to_string(),
+                None => {
+                    return Err("The toolConfig must offer at least one tool for a toolChoice \
+                         that requires the model to request one. Try again with a toolConfig \
+                         whose tools include a tool the model can request."
+                        .to_string())
+                }
+            },
+            // "The Model must request the specified tool", which has to be one
+            // of the tools the request passed.
+            Some(ToolChoice::Tool(choice)) => {
+                if !requestable.contains(&choice.name.as_str()) {
+                    return Err(format!(
+                        "The tool {} named by toolChoice is not one of the tools in \
+                         toolConfig. Try again with a toolChoice that names a tool you \
+                         passed in toolConfig.",
+                        choice.name
+                    ));
+                }
+                choice.name.clone()
+            }
+        };
+        let tool_use_id = self.mint_tool_use_id(&name, at_millis);
+        Ok(Some(ToolUseBlock {
+            tool_use_id,
+            name,
+            // No language model runs in this emulator, so nothing composes the
+            // arguments a model would have inferred from the conversation: the
+            // tool is requested with an empty input object rather than with
+            // invented values. The envelope — the minted id, the tool requested
+            // and the input member — is computed from the request that was
+            // served.
+            input: ::aws_smithy_types::Document::Object(::std::collections::HashMap::new()),
+            r#type: None,
+        }))
     }
 
     /// Materialise every async-invoke transition the clock has already made due
@@ -1689,6 +1769,86 @@ pub fn converse_input_tokens(
         })
 }
 
+/// The names of the tools a `toolConfig` offers the model, in request order.
+///
+/// A tool is requestable when it HAS a name: `toolSpec` and `systemTool` name
+/// one, while `cachePoint` is a marker in the tool list and names none.
+pub fn requestable_tool_names(config: &ToolConfiguration) -> Vec<&str> {
+    config
+        .tools
+        .iter()
+        .filter_map(|tool| match tool {
+            Tool::toolSpec(spec) => Some(spec.name.as_str()),
+            Tool::systemTool(tool) => Some(tool.name.as_str()),
+            Tool::cachePoint(_) => None,
+        })
+        .collect()
+}
+
+/// The tool-result addressing rule both Converse APIs state: a `toolResult`
+/// answers a tool request the conversation carries, addressed by the
+/// `toolUseId` that request was issued under, so a `toolUseId` no `toolUse`
+/// block of the conversation was issued with addresses nothing.
+///
+/// `Err` carries the refusal sentence, which names the member path of the
+/// offending block, the id it supplied and the id (or ids) the tool requests it
+/// could answer were issued under; the caller answers it with the operation's
+/// modelled `ValidationException` (400). `Converse` and `ConverseStream` share
+/// this, so the same conversation is accepted or refused identically by both.
+pub fn validate_tool_results(messages: &[Message]) -> Result<(), String> {
+    // The ids issued so far, in the order the conversation issued them, plus
+    // those of the most recent tool request, which is the one a tool result is
+    // normally answering.
+    let mut issued: HashSet<&str> = HashSet::new();
+    let mut latest: Vec<&str> = Vec::new();
+    for (turn, message) in messages.iter().enumerate() {
+        let mut issued_here: Vec<&str> = Vec::new();
+        for (index, block) in message.content.iter().enumerate() {
+            match block {
+                ContentBlock::toolUse(tool_use) => {
+                    issued.insert(tool_use.tool_use_id.as_str());
+                    issued_here.push(tool_use.tool_use_id.as_str());
+                }
+                ContentBlock::toolResult(result) => {
+                    if issued.contains(result.tool_use_id.as_str()) {
+                        continue;
+                    }
+                    let addressed = if latest.is_empty() {
+                        "the conversation carries no tool request for it to answer".to_string()
+                    } else {
+                        format!(
+                            "the tool request it can answer was issued with toolUseId {}",
+                            latest.join(", ")
+                        )
+                    };
+                    return Err(format!(
+                        "The toolResult block at messages.{turn}.content.{index} has \
+                         toolUseId {}, but {addressed}. Try again with a toolResult whose \
+                         toolUseId is the one of the toolUse block it answers.",
+                        result.tool_use_id
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if !issued_here.is_empty() {
+            latest = issued_here;
+        }
+    }
+    Ok(())
+}
+
+/// The tokens ONE content block is, by the same text rule
+/// [`converse_prompt_pieces`] applies to a whole request — so a block costs the
+/// same whether this emulator generates it or a later turn submits it back.
+pub fn content_block_tokens(block: &ContentBlock) -> u32 {
+    let mut pieces = Vec::new();
+    push_content_text(block, &mut pieces);
+    pieces.iter().fold(0u32, |total, piece| {
+        total.saturating_add(count_text_tokens(piece))
+    })
+}
+
 /// The message-sequence rule both Converse APIs state: a conversation is a
 /// non-empty sequence of turns that starts with the user and alternates between
 /// the user and the assistant.
@@ -1726,14 +1886,18 @@ pub fn validate_conversation(messages: Option<&Vec<Message>>) -> Result<&Vec<Mes
     Ok(messages)
 }
 
-/// One served Converse-API turn: the assistant text this emulator answers with,
-/// the token accounting computed for it, and whether the generation cap cut it
-/// short.
+/// One served Converse-API turn: the assistant content this emulator answers
+/// with, the token accounting computed for it, and whether the generation cap
+/// cut it short.
 #[derive(Debug, Clone)]
 pub struct ConverseTurn {
     /// The assistant's text. No model runs here, so it is
     /// [`emulated_completion`] — never the request's own text echoed back.
+    /// EMPTY for a turn that requests a tool, which generates no text.
     pub text: String,
+    /// The tool this turn requests, when the request obliged it to request one
+    /// ([`ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState::forced_tool_use`]).
+    pub tool_use: Option<ToolUseBlock>,
     pub input_tokens: u32,
     pub output_tokens: u32,
     /// Whether the generation cap cut the text short, which is what makes the
@@ -1744,10 +1908,22 @@ pub struct ConverseTurn {
 impl ConverseTurn {
     /// The modelled `StopReason` this turn ended on.
     pub fn stop_reason(&self) -> &'static str {
-        if self.truncated {
+        if self.tool_use.is_some() {
+            "tool_use"
+        } else if self.truncated {
             "max_tokens"
         } else {
             "end_turn"
+        }
+    }
+
+    /// The assistant message's content, as the modelled `ContentBlock`s: the
+    /// tool request alone for a turn that requests a tool, and otherwise the
+    /// generated text.
+    pub fn content(&self) -> Vec<ContentBlock> {
+        match &self.tool_use {
+            Some(tool_use) => vec![ContentBlock::toolUse(tool_use.clone())],
+            None => vec![ContentBlock::Text(self.text.clone())],
         }
     }
 
@@ -1767,9 +1943,16 @@ impl ConverseTurn {
 
 /// Serve one Converse-API turn from the request that was actually supplied.
 ///
-/// `Converse` and `ConverseStream` both call this, so the text, the stop reason
-/// and the token counts the two report for identical input agree by construction;
-/// the only difference between them is how the turn is framed on the wire.
+/// `Converse` and `ConverseStream` both call this, so the content, the stop
+/// reason and the token counts the two report for identical input agree by
+/// construction; the only difference between them is how the turn is framed on
+/// the wire.
+///
+/// `tool_use` is the tool request the turn is obliged to make, from
+/// [`ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState::forced_tool_use`]:
+/// a turn that requests a tool generates no text, so the whole of what it
+/// answers is that one content block and the tokens it reports for its output
+/// are that block's.
 ///
 /// `requested_max_tokens` is `inferenceConfig.maxTokens`; the model's own ceiling
 /// caps it, and the completion is composed to FIT that budget
@@ -1781,8 +1964,19 @@ pub fn converse_turn(
     messages: Option<&Vec<Message>>,
     tool_config: Option<&ToolConfiguration>,
     requested_max_tokens: Option<i32>,
+    tool_use: Option<ToolUseBlock>,
 ) -> ConverseTurn {
     let input_tokens = converse_input_tokens(system, messages, tool_config);
+    if let Some(tool_use) = tool_use {
+        let output_tokens = content_block_tokens(&ContentBlock::toolUse(tool_use.clone()));
+        return ConverseTurn {
+            text: String::new(),
+            tool_use: Some(tool_use),
+            input_tokens,
+            output_tokens,
+            truncated: false,
+        };
+    }
     let max_output_tokens = requested_max_tokens
         .and_then(|max| u32::try_from(max).ok())
         .unwrap_or(model.max_output_tokens)
@@ -1797,6 +1991,7 @@ pub fn converse_turn(
     let output_tokens = count_text_tokens(&completion.text);
     ConverseTurn {
         text: completion.text,
+        tool_use: None,
         input_tokens,
         output_tokens,
         truncated: completion.truncated,

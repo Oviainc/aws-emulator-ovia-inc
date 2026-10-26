@@ -167,13 +167,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !sources.is_empty() && (!names.is_empty() || input.scaling_plan_version.is_some()) {
             return Err(validation(APPLICATION_SOURCES_CONFLICT));
         }
-        // "The names of the scaling plans (up to 10)."
-        if names.len() > MAX_PLAN_NAMES {
-            return Err(validation(format!(
-                "1 validation error detected: Value at 'scalingPlanNames' failed to satisfy \
-                 constraint: Member must have length less than or equal to {MAX_PLAN_NAMES}"
-            )));
-        }
+        // Each selector list is documented with its own maximum entry count, and
+        // neither carries a modelled `@length`, so both bounds are applied here —
+        // before the request is served — rather than only the one.
+        check_entry_count("scalingPlanNames", names.len(), MAX_PLAN_NAMES)?;
+        check_entry_count("applicationSources", sources.len(), MAX_APPLICATION_SOURCES)?;
         // "If you specify a scaling plan version, you must also specify a scaling plan name."
         if input.scaling_plan_version.is_some() && names.is_empty() {
             return Err(validation(
@@ -244,7 +242,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// `ScalingPlanNames` is documented as "The names of the scaling plans (up to 10)".
-const MAX_PLAN_NAMES: usize = 10;
+pub const MAX_PLAN_NAMES: usize = 10;
+
+/// `ApplicationSources` is documented as "The sources for the applications (up to 10)" —
+/// the same bound as its sibling selector carries, stated for its own member.
+pub const MAX_APPLICATION_SOURCES: usize = 10;
+
+/// Refuse a request list member that holds more entries than its documented maximum.
+///
+/// `member` is the member's wire name, as AWS's validation refusal names it, and `max`
+/// the count its own documentation states; a list within its bound is accepted.
+fn check_entry_count(
+    member: &str,
+    entries: usize,
+    max: usize,
+) -> Result<(), DescribeScalingPlansError> {
+    if entries > max {
+        return Err(validation(format!(
+            "1 validation error detected: Value at '{member}' failed to satisfy constraint: \
+             Member must have length less than or equal to {max}"
+        )));
+    }
+    Ok(())
+}
 
 /// AWS's fixed refusal for a request that selects by application source AND by the
 /// name-based selector (`ScalingPlanNames` and/or `ScalingPlanVersion`) at once.

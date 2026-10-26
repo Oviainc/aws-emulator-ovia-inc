@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ConnectCustomKeyStore
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ConnectCustomKeyStore`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ConnectCustomKeyStore::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -119,6 +110,17 @@
 //!   cannot find a custom key store with the specified key store name or ID.
 //! * `KMSInternalException` (HTTP 500) — The request was rejected because an internal
 //!   exception occurred. The request can be retried.
+//!
+//! ## What the backing key store contributes here
+//!
+//! The two preconditions that belong to the BACKING store rather than to the custom
+//! key store record — the associated CloudHSM cluster's configuration
+//! (`CloudHsmClusterInvalidConfigurationException`) and whether it is active
+//! (`CloudHsmClusterNotActiveException`) — are deliberately unreachable from this
+//! handler: this emulator holds no CloudHSM cluster and no external key manager, so
+//! there is no state to judge either against and nothing for it to report as a
+//! connection error code. Every precondition the custom key store record itself
+//! carries IS judged here.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -195,18 +197,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ConnectCustomKeyStore` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ConnectCustomKeyStoreErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ConnectCustomKeyStore"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ConnectCustomKeyStoreErrorModeled::KMSInternalException(
+                KMSInternalException {
+                    message: Some("the KMS state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        // A connection change an earlier call started may already have fallen due.
+        // Materialising it first is what makes this request judge the key store by
+        // the connection state the clock owes, rather than the transient one that
+        // call left behind.
+        state.settle_custom_key_stores();
+
+        // "The request was rejected because KMS cannot find a custom key store with
+        // the specified key store name or ID" (`CustomKeyStoreNotFoundException`): an
+        // id this account and Region holds no key store under names no key store at
+        // all.
+        let Some(store) = state.custom_key_store_mut(&region, &input.custom_key_store_id) else {
+            return Err(not_found());
+        };
+
+        // "You requested the ConnectCustomKeyStore operation on a custom key store
+        // with a ConnectionState of DISCONNECTING or FAILED. This operation is valid
+        // for all other ConnectionState values"
+        // (`smithy_query(query="doc",shape="CustomKeyStoreInvalidStateException")`).
+        if store.connection_state == crate::state::CONNECTION_STATE_DISCONNECTING
+            || store.connection_state == crate::state::CONNECTION_STATE_FAILED
+        {
+            return Err(invalid_state());
+        }
+
+        // "This operation starts the connection process, but it does not wait for it
+        // to complete. When it succeeds, this operation quickly returns an HTTP 200
+        // response and a JSON object with no properties. However, this response does
+        // not indicate that the custom key store is connected. To get the connection
+        // state of the custom key store, use the DescribeCustomKeyStores operation"
+        // (`smithy_query(query="doc",shape="ConnectCustomKeyStore")`) — so the key
+        // store is left connecting here and reaches the connected state a span later,
+        // with no request waiting for it.
+        store.start_connecting();
+        Ok(ConnectCustomKeyStoreOutput {})
     }
 }
+
+/// How a request naming no custom key store of this account and Region is refused:
+/// "KMS cannot find a custom key store with the specified key store name or ID"
+/// (`CustomKeyStoreNotFoundException`).
+///
+/// The refusal carries NO message member, as the custom key store family's
+/// missing-key-store refusals do (see
+/// `crate::ops::describe_custom_key_stores`), so no message is invented for it.
+fn not_found() -> ConnectCustomKeyStoreError {
+    ConnectCustomKeyStoreErrorModeled::CustomKeyStoreNotFoundException(
+        CustomKeyStoreNotFoundException { message: None },
+    )
+    .into()
+}
+
+/// How a request against a key store whose connection state does not admit this
+/// operation is refused: "The request was rejected because of the ConnectionState of
+/// the custom key store" (`CustomKeyStoreInvalidStateException`). Like this family's
+/// other refusals it carries the error code alone.
+fn invalid_state() -> ConnectCustomKeyStoreError {
+    ConnectCustomKeyStoreErrorModeled::CustomKeyStoreInvalidStateException(
+        CustomKeyStoreInvalidStateException { message: None },
+    )
+    .into()
+}
+

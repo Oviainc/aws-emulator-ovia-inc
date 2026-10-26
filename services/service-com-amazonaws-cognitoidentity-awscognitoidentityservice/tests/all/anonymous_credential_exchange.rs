@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_cognitoidentity_awscognitoidentityservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::identity_pool_flow::error_code;
+use crate::identity_pool_flow::{cognito_trust_policy, error_code, seed_role, seeded_role_arn};
 
 /// This service's SigV4 signing name, the 4th field of a credential scope.
 const SIGNING_NAME: &str = "cognito-identity";
@@ -450,6 +450,26 @@ async fn credentials_for_an_identity_validate_the_logins_they_are_presented_with
     }
     let [configured_identity, bare_identity] = <[String; 2]>::try_from(identities)
         .expect("one identity was minted per pool");
+
+    // A vend is a session of the pool's role, so each pool is given one that trusts its
+    // own users: what the session stands for is `super::vended_role_session`'s own rule,
+    // and what is asserted here is which LOGINS a vend accepts.
+    for (pool_name, pool_id) in [("configured", &configured_pool), ("bare", &bare_pool)] {
+        let role_arn = seed_role(
+            &engine,
+            &seeded_role_arn(pool_name, "vend"),
+            cognito_trust_policy(pool_id),
+        );
+        ok(
+            &emulator,
+            "SetIdentityPoolRoles",
+            &json!({
+                "IdentityPoolId": pool_id,
+                "Roles": {"authenticated": &role_arn, "unauthenticated": &role_arn},
+            }),
+        )
+        .await;
+    }
 
     // (case, identity, logins, authorized)
     let rows: Vec<(&str, &String, Option<String>, bool)> = vec![

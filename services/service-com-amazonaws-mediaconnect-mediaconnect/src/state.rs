@@ -2032,6 +2032,243 @@ pub fn materialise_vpc_interface(request: &VpcInterfaceRequest, suffix: u64) -> 
     }
 }
 
+/// The member path a nested request member is named by in a refusal detail: `member`
+/// qualified by `prefix` when the request nests it (one `Outputs` entry of an add, say),
+/// and `member` alone when `prefix` is empty because the member belongs to the request
+/// itself (an update, which addresses its output or source by ARN).
+fn qualified_member(prefix: &str, member: &str) -> String {
+    if prefix.is_empty() {
+        member.to_string()
+    } else {
+        format!("{prefix}.{member}")
+    }
+}
+
+/// Why `name` names no media stream of a flow whose media streams are named `held`, as the
+/// detail the refusal carries, or `None` when one of them carries that name. `member` is
+/// the request member that named it.
+///
+/// A media stream association references its media stream BY NAME within the one flow:
+/// `MediaStreamOutputConfigurationRequest$MediaStreamName` is "the name of the media
+/// stream that is associated with the output" and
+/// `MediaStreamSourceConfigurationRequest$MediaStreamName` is its source counterpart. A
+/// media stream exists on a flow only once CreateFlow's `MediaStreams` or
+/// AddFlowMediaStreams ("adds media streams to an existing flow") created it, so a name
+/// none of the flow's media streams carries references nothing — storing it would leave
+/// the flow holding an association the flow's own media streams cannot satisfy, and which
+/// [`StoredFlow::media_stream_association`] would then resolve for a media stream that
+/// does not exist.
+pub fn unknown_media_stream_rejection(
+    member: &str,
+    name: &str,
+    held: &BTreeSet<String>,
+) -> Option<String> {
+    if held.contains(name) {
+        return None;
+    }
+    Some(format!(
+        "{member} {name:?} does not name a media stream this flow holds."
+    ))
+}
+
+/// Why `name` names no VPC interface of a flow whose VPC interfaces are named `held`, as
+/// the detail the refusal carries, or `None` when one of them carries that name. `member`
+/// is the request member that named it.
+///
+/// A VPC interface reference is a name within the one flow too —
+/// `VpcInterfaceAttachment$VpcInterfaceName` is "the name of the VPC interface to use for
+/// this resource" and `SetSourceRequest$VpcInterfaceName` "the name of the VPC interface
+/// to use for this source" — and a VPC interface exists on a flow only once CreateFlow's
+/// `VpcInterfaces` or AddFlowVpcInterfaces created it, its name "unique against other
+/// VpcInterfaces in this Flow" (`VpcInterface$Name`). So a name none of the flow's VPC
+/// interfaces carries references nothing, for the same reason a media stream name outside
+/// the flow does ([`unknown_media_stream_rejection`]).
+pub fn unknown_vpc_interface_rejection(
+    member: &str,
+    name: &str,
+    held: &BTreeSet<String>,
+) -> Option<String> {
+    if held.contains(name) {
+        return None;
+    }
+    Some(format!(
+        "{member} {name:?} does not name a VPC interface this flow holds."
+    ))
+}
+
+/// Why the media stream associations `requests` would give an OUTPUT cannot be stored on a
+/// flow whose media streams are named `media_streams` and whose VPC interfaces are named
+/// `vpc_interfaces`, or `None` when every name they reference resolves. `prefix` is the
+/// request member that nests the list, if any (see [`qualified_member`]).
+///
+/// An entry references the flow by name twice: the media stream it associates, and —
+/// through each destination configuration's `Interface` — the VPC interface the media
+/// stream leaves on (`InterfaceRequest$Name` is "the name of the VPC interface", on "the
+/// VPC interface that you want to use for the media stream associated with the output").
+/// The list travels on `AddOutputRequest$MediaStreamOutputConfigurations` (CreateFlow's
+/// `Outputs` and AddFlowOutputs) and on `UpdateFlowOutputRequest`'s member of the same
+/// name, so the one resolution is stated once here and every entry point reads it.
+pub fn media_stream_output_configuration_rejection(
+    prefix: &str,
+    requests: &[MediaStreamOutputConfigurationRequest],
+    media_streams: &BTreeSet<String>,
+    vpc_interfaces: &BTreeSet<String>,
+) -> Option<String> {
+    requests.iter().enumerate().find_map(|(index, request)| {
+        let entry = qualified_member(prefix, &format!("MediaStreamOutputConfigurations[{index}]"));
+        unknown_media_stream_rejection(
+            &format!("{entry}.MediaStreamName"),
+            &request.media_stream_name,
+            media_streams,
+        )
+        .or_else(|| {
+            request
+                .destination_configurations
+                .iter()
+                .flatten()
+                .enumerate()
+                .find_map(|(position, configuration)| {
+                    unknown_vpc_interface_rejection(
+                        &format!("{entry}.DestinationConfigurations[{position}].Interface.Name"),
+                        &configuration.interface.name,
+                        vpc_interfaces,
+                    )
+                })
+        })
+    })
+}
+
+/// Why the media stream associations `requests` would give a SOURCE cannot be stored on a
+/// flow whose media streams are named `media_streams` and whose VPC interfaces are named
+/// `vpc_interfaces`, or `None` when every name they reference resolves — the source-side
+/// counterpart of [`media_stream_output_configuration_rejection`], whose input
+/// configurations name the VPC interface an incoming media stream arrives on, reached from
+/// `SetSourceRequest$MediaStreamSourceConfigurations` (CreateFlow's `Source` / `Sources`
+/// and AddFlowSources) and from `UpdateFlowSourceRequest`'s member of the same name.
+pub fn media_stream_source_configuration_rejection(
+    prefix: &str,
+    requests: &[MediaStreamSourceConfigurationRequest],
+    media_streams: &BTreeSet<String>,
+    vpc_interfaces: &BTreeSet<String>,
+) -> Option<String> {
+    requests.iter().enumerate().find_map(|(index, request)| {
+        let entry = qualified_member(prefix, &format!("MediaStreamSourceConfigurations[{index}]"));
+        unknown_media_stream_rejection(
+            &format!("{entry}.MediaStreamName"),
+            &request.media_stream_name,
+            media_streams,
+        )
+        .or_else(|| {
+            request
+                .input_configurations
+                .iter()
+                .flatten()
+                .enumerate()
+                .find_map(|(position, configuration)| {
+                    unknown_vpc_interface_rejection(
+                        &format!("{entry}.InputConfigurations[{position}].Interface.Name"),
+                        &configuration.interface.name,
+                        vpc_interfaces,
+                    )
+                })
+        })
+    })
+}
+
+/// Why the VPC interface `attachment` names cannot be attached on a flow whose VPC
+/// interfaces are named `held`, or `None` when it resolves — including when there is no
+/// attachment, or an attachment that names no interface, because neither references
+/// anything. `member` is the request member that carries the attachment.
+pub fn vpc_interface_attachment_rejection(
+    member: &str,
+    attachment: Option<&VpcInterfaceAttachment>,
+    held: &BTreeSet<String>,
+) -> Option<String> {
+    let name = attachment?.vpc_interface_name.as_deref()?;
+    unknown_vpc_interface_rejection(&format!("{member}.VpcInterfaceName"), name, held)
+}
+
+/// Why the output `request` cannot be stored on a flow whose media streams are named
+/// `media_streams` and whose VPC interfaces are named `vpc_interfaces`, or `None` when
+/// every name the request references resolves. `prefix` is the request member that nests
+/// the output (`Outputs[0]`, say).
+///
+/// An output references the flow's own sub-resources by name in its media stream
+/// associations and in its VPC interface attachment, and CreateFlow's `Outputs` and
+/// AddFlowOutputs both store exactly this shape through
+/// [`StoredOutput::from_add_request`], so both resolve those references here and refuse
+/// the same requests.
+pub fn output_request_reference_rejection(
+    prefix: &str,
+    request: &AddOutputRequest,
+    media_streams: &BTreeSet<String>,
+    vpc_interfaces: &BTreeSet<String>,
+) -> Option<String> {
+    if let Some(rejection) = media_stream_output_configuration_rejection(
+        prefix,
+        request
+            .media_stream_output_configurations
+            .as_deref()
+            .unwrap_or_default(),
+        media_streams,
+        vpc_interfaces,
+    ) {
+        return Some(rejection);
+    }
+    vpc_interface_attachment_rejection(
+        &qualified_member(prefix, "VpcInterfaceAttachment"),
+        request.vpc_interface_attachment.as_ref(),
+        vpc_interfaces,
+    )
+}
+
+/// Why the source `request` cannot be stored on a flow whose media streams are named
+/// `media_streams` and whose VPC interfaces are named `vpc_interfaces`, or `None` when
+/// every name the request references resolves — the source-side counterpart of
+/// [`output_request_reference_rejection`], reached from CreateFlow's `Source` / `Sources`
+/// and AddFlowSources, which both store this shape through
+/// [`StoredSource::from_set_request`].
+///
+/// A source references the flow's VPC interfaces through `VpcInterfaceName` and, for a
+/// source fed by a gateway bridge, through its `GatewayBridgeSource`'s attachment — the
+/// same two references [`StoredFlow::vpc_interface_reference`] resolves when
+/// RemoveFlowVpcInterface asks what still holds an interface.
+pub fn source_request_reference_rejection(
+    prefix: &str,
+    request: &SetSourceRequest,
+    media_streams: &BTreeSet<String>,
+    vpc_interfaces: &BTreeSet<String>,
+) -> Option<String> {
+    if let Some(rejection) = media_stream_source_configuration_rejection(
+        prefix,
+        request
+            .media_stream_source_configurations
+            .as_deref()
+            .unwrap_or_default(),
+        media_streams,
+        vpc_interfaces,
+    ) {
+        return Some(rejection);
+    }
+    if let Some(rejection) = request.vpc_interface_name.as_deref().and_then(|name| {
+        unknown_vpc_interface_rejection(
+            &qualified_member(prefix, "VpcInterfaceName"),
+            name,
+            vpc_interfaces,
+        )
+    }) {
+        return Some(rejection);
+    }
+    vpc_interface_attachment_rejection(
+        &qualified_member(prefix, "GatewayBridgeSource.VpcInterfaceAttachment"),
+        request
+            .gateway_bridge_source
+            .as_ref()
+            .and_then(|bridge_source| bridge_source.vpc_interface_attachment.as_ref()),
+        vpc_interfaces,
+    )
+}
+
 /// A flow, as the service holds it between calls. Every flow operation's response is
 /// computed from this record.
 #[derive(Debug, Clone)]
@@ -2118,6 +2355,28 @@ impl StoredFlow {
         self.entitlements
             .iter()
             .map(|entitlement| entitlement.entitlement.name.clone())
+            .collect()
+    }
+
+    /// The names of the media streams the flow holds — the set every by-name media stream
+    /// reference a request carries is resolved against (see
+    /// [`unknown_media_stream_rejection`]), because a media stream is addressed by name
+    /// within its flow.
+    pub fn media_stream_names(&self) -> BTreeSet<String> {
+        self.media_streams
+            .iter()
+            .map(|media_stream| media_stream.stream.media_stream_name.clone())
+            .collect()
+    }
+
+    /// The names of the VPC interfaces the flow holds — the set every by-name VPC
+    /// interface reference a request carries is resolved against (see
+    /// [`unknown_vpc_interface_rejection`]), because a VPC interface is addressed by name
+    /// within its flow.
+    pub fn vpc_interface_names(&self) -> BTreeSet<String> {
+        self.vpc_interfaces
+            .iter()
+            .map(|vpc_interface| vpc_interface.name.clone())
             .collect()
     }
 

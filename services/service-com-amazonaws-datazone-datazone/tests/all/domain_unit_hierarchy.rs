@@ -138,13 +138,15 @@ async fn created_domain_units_are_persisted_and_reported_by_get() {
 
     let mut minted: Vec<(&'static str, String)> = Vec::new();
 
-    for case in unit_cases() {
+    for (row, case) in unit_cases().into_iter().enumerate() {
         // Build the chain this case hangs under: `depth_under_root` intermediate units,
-        // each the child of the one before.
+        // each the child of the one before. The row number is part of every
+        // intermediate name, because a name is unique among ONE parent's children and
+        // the first step of every chain hangs under the same root unit.
         let mut chain: Vec<String> = vec![root.clone()];
         for step in 0..case.depth_under_root {
             let parent = chain.last().expect("the chain always holds the root").clone();
-            let name = format!("ancestor {step}");
+            let name = format!("ancestor {row} {step}");
             chain.push(create_unit(&dz, &domain, &parent, &name, case.label).await);
         }
         let parent = chain.last().expect("the chain always holds the root").clone();
@@ -417,12 +419,14 @@ async fn a_repeated_client_token_returns_the_first_domain_unit() {
         );
     }
 
+    // A fresh token creates a second unit — under its own name, since the name of the
+    // first one is taken among the root unit's children.
     let other = dz
         .call(
             "POST",
             &format!("/v2/domains/{domain}/domain-units"),
             Some(json!({
-                "name": "tokened",
+                "name": "tokened twice",
                 "parentDomainUnitIdentifier": root,
                 "clientToken": "token-two",
             })),

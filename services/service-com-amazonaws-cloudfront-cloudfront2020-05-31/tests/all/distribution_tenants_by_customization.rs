@@ -48,7 +48,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::distribution_lifecycle::{call, emulator, Answer, Node, API_VERSION};
 use crate::distribution_tenant_lifecycle::{
-    create_distribution_tenant, domains_of, escape, multi_tenant_distribution,
+    create_distribution_tenant, domains_of, escape, managed_certificate_request,
+    multi_tenant_distribution,
 };
 use crate::response_headers_policy_lifecycle::{assert_absent, text};
 use crate::tenant_web_acl_association::{associate, disassociate};
@@ -220,12 +221,13 @@ impl Tenant {
              <DistributionId>{}</DistributionId><Name>{}</Name>\
              <Domains><member><Domain>{}.example.com</Domain></member></Domains>\
              <Parameters><member><Name>tenantName</Name><Value>{}</Value></member></Parameters>\
-             {}</CreateDistributionTenantRequest>",
+             {}{}</CreateDistributionTenantRequest>",
             escape(distribution_id),
             self.slug,
             self.slug,
             self.slug,
-            self.customizations_xml()
+            self.customizations_xml(),
+            managed_certificate_request()
         )
     }
 

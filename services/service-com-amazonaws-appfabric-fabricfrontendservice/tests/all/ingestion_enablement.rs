@@ -38,7 +38,7 @@ use crate::app_bundle_ingestion_lifecycle::{
 };
 
 /// `POST /appbundles/{appBundleIdentifier}/ingestions/{ingestionIdentifier}/start`.
-async fn start_ingestion(emulator: &Emulator, bundle: &str, ingestion: &str) -> Answer {
+pub(crate) async fn start_ingestion(emulator: &Emulator, bundle: &str, ingestion: &str) -> Answer {
     emulator
         .call(
             "POST",
@@ -64,7 +64,7 @@ fn as_identifier(arn: &str, by_arn: bool) -> String {
 
 /// The `state` `ListIngestions` reports for one stored ingestion, read out of the
 /// summary whose `arn` matches — the OTHER reader of the same record.
-async fn listed_state(emulator: &Emulator, bundle: &str, ingestion_arn: &str) -> String {
+pub(crate) async fn listed_state(emulator: &Emulator, bundle: &str, ingestion_arn: &str) -> String {
     let listed = emulator.list_ingestions(bundle, "").await;
     listed
         .body

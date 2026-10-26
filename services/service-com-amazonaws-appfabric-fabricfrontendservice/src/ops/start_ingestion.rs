@@ -181,18 +181,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Only a `disabled` ingestion has a start to make. Anything else is the
-        // modelled conflict, and nothing is written.
-        if ingestion.state != crate::state::INGESTION_STATE_DISABLED {
+        // modelled conflict, and nothing is written. The state this call decides
+        // from is the one a read reports AS OF NOW
+        // (`crate::state::IngestionRecord::state_at`), so a disable the clock has
+        // already made due is a start this call makes rather than refuses.
+        let now = ::std::time::SystemTime::now();
+        if ingestion.state_at(now) != crate::state::INGESTION_STATE_DISABLED {
             let conflict = crate::state::ingestion_state_conflict(
                 &ingestion.arn,
-                &ingestion.state,
+                ingestion.state_at(now),
                 crate::state::INGESTION_STATE_DISABLED,
             );
             return Err(StartIngestionErrorModeled::ConflictException(conflict).into());
         }
 
-        ingestion.state = crate::state::INGESTION_STATE_ENABLED.to_string();
-        ingestion.updated_at = ::std::time::SystemTime::now();
+        ingestion.set_state(crate::state::INGESTION_STATE_ENABLED, now);
         let id = ingestion.id.clone();
         crate::state::audit_resource_change(ctx.parts(), Self::NAME, "Ingestion", &id, "enabled");
         Ok(StartIngestionOutput {})

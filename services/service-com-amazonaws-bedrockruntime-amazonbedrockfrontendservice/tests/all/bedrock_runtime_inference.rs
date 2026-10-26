@@ -550,13 +550,26 @@ fn prompt_piece_rows() -> Vec<PromptPieceRow> {
             ],
         },
         PromptPieceRow {
+            // The tool request this result answers is carried too: a tool result
+            // addresses the id of a tool request the conversation holds.
             case: "a tool result carrying JSON",
-            extra_content: serde_json::json!([{"toolResult": {
-                "toolUseId": "tooluse-2",
-                "content": [{"json": {"celsius": 23}}],
-            }}]),
+            extra_content: serde_json::json!([
+                {"toolUse": {
+                    "toolUseId": "tooluse-2",
+                    "name": "get_celsius",
+                    "input": {"city": "Lisbon"},
+                }},
+                {"toolResult": {
+                    "toolUseId": "tooluse-2",
+                    "content": [{"json": {"celsius": 23}}],
+                }},
+            ]),
             tool_config: serde_json::Value::Null,
-            pieces: &[r#"{"celsius":23}"#],
+            pieces: &[
+                "get_celsius",
+                r#"{"city":"Lisbon"}"#,
+                r#"{"celsius":23}"#,
+            ],
         },
         PromptPieceRow {
             case: "guarded content",

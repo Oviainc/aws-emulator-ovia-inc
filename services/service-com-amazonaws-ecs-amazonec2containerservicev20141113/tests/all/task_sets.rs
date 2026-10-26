@@ -45,7 +45,11 @@ const NO_INSTANCES_REASON: &str = "Reason: No Container Instances were found in 
 
 /// Register one Fargate-capable revision of `family` (`awsvpc` plus task-level cpu and
 /// memory), so a case may place it under either launch type.
-async fn register_fargate_definition(router: &MultiServiceRouter, family: &str, case: &str) {
+pub(crate) async fn register_fargate_definition(
+    router: &MultiServiceRouter,
+    family: &str,
+    case: &str,
+) {
     ok(
         router,
         "RegisterTaskDefinition",
@@ -66,7 +70,7 @@ async fn register_fargate_definition(router: &MultiServiceRouter, family: &str, 
 /// Create a service whose tasks come from a TASK SET: the `EXTERNAL` deployment
 /// controller, which the `CreateTaskSet` doc names ("This is used when a service uses the
 /// EXTERNAL deployment controller type").
-async fn create_external_service(
+pub(crate) async fn create_external_service(
     router: &MultiServiceRouter,
     cluster: &str,
     name: &str,
@@ -89,7 +93,7 @@ async fn create_external_service(
 }
 
 /// `DescribeTaskSets` for one service, optionally narrowed to `references`.
-async fn describe_task_sets(
+pub(crate) async fn describe_task_sets(
     router: &MultiServiceRouter,
     cluster: &str,
     service_name: &str,

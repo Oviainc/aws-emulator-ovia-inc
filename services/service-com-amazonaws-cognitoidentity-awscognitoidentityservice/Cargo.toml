@@ -27,11 +27,14 @@ hex = { workspace = true }
 # Mixes the material a minted GUID is built from.
 sha2 = { workspace = true }
 # `iam_authorization`: the shared evaluation of IAM policy documents against
-# (action, resource), which this service's authorization gate runs.
+# (action, resource), which this service's authorization gate runs and which the resolved
+# role's trust policy is read with; also the account's management-event log a vend and the
+# assume behind it are recorded in.
 service-common = { path = "../common" }
-# The IAM store holds the identity-based policies of the principal a request speaks for,
-# and the STS store resolves which principal that is: this service reads both services'
-# OWN state accessors rather than keeping a second copy of either fact.
+# The IAM store holds the identity-based policies of the principal a request speaks for and
+# the roles a vend assumes, and the STS store resolves which principal a request is and
+# holds the sessions a vend mints: this service reads both services' OWN state accessors
+# rather than keeping a second copy of either fact.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
@@ -42,7 +45,8 @@ emulator-core-build-support = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # The authorization suite makes the principals it calls as through IAM's and STS's own
-# operations, so the policies it asserts on are the ones those services wrote.
+# operations, so the policies it asserts on are the ones those services wrote; the vend
+# suites seed the roles a vend assumes as `iam:CreateRole` writes them.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 

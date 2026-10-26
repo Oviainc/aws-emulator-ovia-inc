@@ -24,7 +24,10 @@ use crate::flow_outputs::{create_flow_with_outputs, described_outputs, unknown_f
 
 /// `PUT /v1/flows/{FlowArn}/outputs/{OutputArn}` — the UpdateFlowOutput binding
 /// (`smithy_query(query="operation",operation="UpdateFlowOutput")`).
-async fn update_flow_output(
+///
+/// `pub(crate)` because `tests/all/flow_name_references.rs` moves an output's references
+/// through the same binding.
+pub(crate) async fn update_flow_output(
     emulator: &Emulator,
     flow_arn: &str,
     output_arn: &str,

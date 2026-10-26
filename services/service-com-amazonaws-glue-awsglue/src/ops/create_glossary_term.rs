@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGlossaryTerm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGlossaryTerm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGlossaryTerm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers one business concept within a stored business glossary: the glossary the term
+//! belongs to, its name and its two descriptions come from the request, the catalog mints
+//! the `GlossaryTermId` that addresses the record, and the create answers with the five
+//! members it stored. The record lands in this account's glossary term namespace
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::glossary_terms`]), which `GetGlossaryTerm`
+//! reads back by id.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +161,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGlossaryTerm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGlossaryTermErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGlossaryTerm"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(CreateGlossaryTermErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue glossary store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // "A unique, case-sensitive identifier that you provide to ensure the idempotency
+        // of the request" (`ClientToken`): a retry of the very same create — same token,
+        // same glossary, same name — is answered with the term that create already stored,
+        // so the retry neither mints a second record nor is refused as a duplicate name.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(stored) = store
+                .glossary_terms
+                .values()
+                .find(|term| {
+                    term.client_token.as_deref() == Some(token)
+                        && term.glossary_id == input.glossary_identifier
+                        && term.name == input.name
+                })
+                .cloned()
+            {
+                return Ok(CreateGlossaryTermOutput {
+                    id: Some(stored.id),
+                    glossary_id: Some(stored.glossary_id),
+                    name: Some(stored.name),
+                    short_description: stored.short_description,
+                    long_description: stored.long_description,
+                });
+            }
+        }
+
+        // A term is created WITHIN a glossary, so the glossary the request names must be
+        // one this account holds: there is no container to put the term in otherwise.
+        if store.glossary(&input.glossary_identifier).is_none() {
+            return Err(CreateGlossaryTermErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    // Wording for this slice is pinned by no recording or doc, so the
+                    // refusal is derived from the request: it names the member that
+                    // resolved to nothing, exactly as `GetGlossary`'s does. What is
+                    // pinned is the behaviour — 400 with `EntityNotFoundException`.
+                    message: Some(format!("Glossary {} not found", input.glossary_identifier)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        // A term's name identifies it within its glossary, so one glossary holds one term
+        // per name: a create under a name that glossary already holds is refused rather
+        // than minting a second term the caller could not tell apart. The same name in
+        // ANOTHER glossary is a different term, and is free.
+        if store
+            .glossary_term_by_name(&input.glossary_identifier, &input.name)
+            .is_some()
+        {
+            return Err(CreateGlossaryTermErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    // Wording for this slice is pinned by no recording or doc, so the
+                    // refusal states the resource kind and withholds the requested name,
+                    // as this service's other already-exists refusals do.
+                    message: Some("Glossary term already exists.".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The store is resident memory and this create is reachable by any caller, so the
+        // number of records one process will hold is bounded. Past the ceiling the request
+        // is refused with the closest client error this operation models.
+        if !store.can_store_glossary_term() {
+            return Err(CreateGlossaryTermErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "This account already holds the maximum of {} glossary terms",
+                        crate::state::MAX_GLOSSARY_TERMS
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        let entry = crate::state::GlossaryTermEntry::from_create_input(&input);
+        let stored = entry.clone();
+        store.glossary_terms.insert(entry.id.clone(), entry);
+        ::tracing::info!(
+            operation = "CreateGlossaryTerm",
+            glossary = %stored.glossary_id,
+            term = %stored.id,
+            "created a Glue glossary term"
+        );
+
+        // Every member comes from the record just stored, so the create reports exactly
+        // what a later `GetGlossaryTerm` of this id will.
+        Ok(CreateGlossaryTermOutput {
+            id: Some(stored.id),
+            glossary_id: Some(stored.glossary_id),
+            name: Some(stored.name),
+            short_description: stored.short_description,
+            long_description: stored.long_description,
+        })
     }
 }

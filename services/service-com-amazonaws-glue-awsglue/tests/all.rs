@@ -57,6 +57,8 @@ mod form_types;
 mod get_table_entity_not_found;
 #[path = "all/glossaries.rs"]
 mod glossaries;
+#[path = "all/glossary_terms.rs"]
+mod glossary_terms;
 #[path = "all/job_listing.rs"]
 mod job_listing;
 #[path = "all/job_regions.rs"]

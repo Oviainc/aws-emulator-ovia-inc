@@ -72,6 +72,38 @@ pub struct MessageStartEvent {
     pub role: String,
 }
 
+#[smithy_macros::smithy(shape = "com.amazonaws.bedrockruntime#ContentBlockStartEvent")]
+#[derive(Debug, Clone)]
+pub struct ContentBlockStartEvent {
+    pub start: ContentBlockStart,
+    pub content_block_index: i32,
+}
+
+/// `ContentBlockStart`. Only the `toolUse` member is declared: the others start a
+/// tool result or a streamed image block, neither of which this emulator produces.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.bedrockruntime#ContentBlockStart",
+    unsupported = ["toolResult", "image"]
+)]
+#[derive(Debug, Clone)]
+pub enum ContentBlockStart {
+    toolUse(ToolUseBlockStart),
+}
+
+#[smithy_macros::smithy(shape = "com.amazonaws.bedrockruntime#ToolUseBlockStart")]
+#[derive(Debug, Clone, Default)]
+pub struct ToolUseBlockStart {
+    pub tool_use_id: String,
+    pub name: String,
+    pub r#type: Option<String>,
+}
+
+#[smithy_macros::smithy(shape = "com.amazonaws.bedrockruntime#ToolUseBlockDelta")]
+#[derive(Debug, Clone, Default)]
+pub struct ToolUseBlockDelta {
+    pub input: String,
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrockruntime#ContentBlockDeltaEvent")]
 #[derive(Debug, Clone)]
 pub struct ContentBlockDeltaEvent {
@@ -79,18 +111,20 @@ pub struct ContentBlockDeltaEvent {
     pub content_block_index: i32,
 }
 
-/// `ContentBlockDelta`. Only the `text` member is declared: the others carry a tool
-/// use, a tool result, reasoning content, a citation or an image delta, none of which
-/// this emulator produces (no model runs in it), and a union member that is never
-/// constructed would be dead weight on every frame. Whoever teaches this service to
-/// stream one of them declares it then, beside the code that fills it.
+/// `ContentBlockDelta`. Only the `text` and `toolUse` members are declared: the
+/// others carry a tool result, reasoning content, a citation or an image delta,
+/// none of which this emulator produces (no model runs in it), and a union member
+/// that is never constructed would be dead weight on every frame. Whoever teaches
+/// this service to stream one of them declares it then, beside the code that fills
+/// it.
 #[smithy_macros::smithy(
     shape = "com.amazonaws.bedrockruntime#ContentBlockDelta",
-    unsupported = ["toolUse", "toolResult", "reasoningContent", "citation", "image"]
+    unsupported = ["toolResult", "reasoningContent", "citation", "image"]
 )]
 #[derive(Debug, Clone)]
 pub enum ContentBlockDelta {
     Text(String),
+    toolUse(ToolUseBlockDelta),
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrockruntime#ContentBlockStopEvent")]

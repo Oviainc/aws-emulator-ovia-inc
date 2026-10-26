@@ -1125,6 +1125,7 @@ async fn describe_scaling_plans_honours_its_documented_filter_rules() {
 
     // The documented combination rules, each refused with ValidationException.
     let eleven: Vec<String> = (0..11).map(|n| format!("name-{n}")).collect();
+    let eleven_sources: Vec<Value> = (0..11).map(stack_source).collect();
     for (label, request) in [
         (
             "names and sources together",
@@ -1136,6 +1137,13 @@ async fn describe_scaling_plans_honours_its_documented_filter_rules() {
             json!({ "ApplicationSources": [tagged.clone()], "ScalingPlanVersion": 1 }),
         ),
         ("more than ten names", json!({ "ScalingPlanNames": eleven })),
+        // Both selector lists are documented "(up to 10)", so the source list is bounded
+        // exactly as the name list is (the whole rule lives in
+        // `crate::describe_scaling_plans_selector_bounds`).
+        (
+            "more than ten sources",
+            json!({ "ApplicationSources": eleven_sources }),
+        ),
         // An ApplicationSources entry that identifies no application must be refused,
         // never dropped: dropping it would widen the filter to "every plan" and
         // answer a narrow question with an unfiltered 200.
