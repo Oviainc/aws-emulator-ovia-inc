@@ -53,11 +53,15 @@ const REGION: &str = "us-east-1";
 /// Recorded behaviour: the Smithy model declares the `ec2Query` protocol but not the media
 /// type's `charset` parameter, and AWS sends the parameter on a success and on a refusal
 /// alike, where the protocol's own default is the bare `text/xml`.
-const RESPONSE_CONTENT_TYPE: &str = "text/xml;charset=UTF-8";
+///
+/// `pub(crate)` so a suite that brings further operations or a further RESPONSE LAYER under
+/// this same rule names the media type from here rather than spelling it a second time.
+pub(crate) const RESPONSE_CONTENT_TYPE: &str = "text/xml;charset=UTF-8";
 
 /// A well-formed VPC id in the long (17 hexadecimal digit) form that the account holds no
-/// VPC for — the row that makes the service answer a modelled refusal.
-const UNKNOWN_VPC_ID: &str = "vpc-0ffffffffffffffff";
+/// VPC for — the row that makes the service answer a modelled refusal. `pub(crate)` for the
+/// reason [`RESPONSE_CONTENT_TYPE`] is.
+pub(crate) const UNKNOWN_VPC_ID: &str = "vpc-0ffffffffffffffff";
 
 /// A well-formed Capacity Reservation id the account holds no reservation for.
 const UNKNOWN_CAPACITY_RESERVATION_ID: &str = "cr-00000000000000000";

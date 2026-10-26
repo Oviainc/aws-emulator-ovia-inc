@@ -316,6 +316,11 @@ mod queued_reserved_instances;
 mod transit_gateway_multicast_domains;
 #[path = "all/regions.rs"]
 mod regions;
+// Declared in the MIDDLE of this list rather than at either end, for the reason the header
+// note gives: the media type every ec2Query response declares, across the operations, the
+// statuses and the layers that render one.
+#[path = "all/response_media_type.rs"]
+mod response_media_type;
 #[path = "all/resource_specific_error_codes.rs"]
 mod resource_specific_error_codes;
 #[path = "all/revoke_security_group_ingress.rs"]

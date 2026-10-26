@@ -29,9 +29,12 @@
 //!   request's resolved route key against this service's signing name. Edit it
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
-//! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//! - `override_operation` — which operation serves a request. This service serves
+//!   every modelled operation through [`FinishedEnvelope`], which runs that same
+//!   generated operation and then finishes whatever it answered with the envelope
+//!   above — the one response of the dispatch sequence `override_protocol` cannot
+//!   reach being its framework-level refusal tail (a value outside a declared
+//!   constraint), which the sequence renders itself.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -71,6 +74,12 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// [`Service::override_protocol`]. See [`Ec2QueryEnvelope`] for what it adds
     /// to the generated one.
     protocol: Ec2QueryEnvelope,
+    /// The decorator every modelled operation is served through
+    /// ([`Service::override_operation`]), so the one response the protocol above
+    /// cannot reach carries the same envelope as every other. Carries no state of
+    /// its own: it resolves the operation it runs from the service the framework
+    /// hands it.
+    envelope: FinishedEnvelope,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -82,6 +91,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             entry: crate::ServiceDefinition::new(engine),
             // Built once, per `override_protocol`'s contract: never per request.
             protocol: Ec2QueryEnvelope::new(),
+            envelope: FinishedEnvelope,
         }
     }
 }
@@ -108,12 +118,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Every modelled operation is served through [`FinishedEnvelope`], which runs
+        // the generated operation the routing table names and then finishes its
+        // response with this service's envelope. Claimed only for a routing key that
+        // table actually serves, so a request naming no operation of this service
+        // still reaches `override_routing_error` rather than an operation that would
+        // have nothing to run.
+        modeled_operation(self, req)?;
+        Some(&self.envelope)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -162,7 +174,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // default rendering, code and message and all, and stamps the envelope on
         // it ([`stamp_error_envelope`]) rather than wording the failure again.
         let mut response = self.entry.routing_error_response(req);
-        stamp_error_envelope(&mut response);
+        stamp_envelope(&mut response);
         Some(response)
     }
 
@@ -180,7 +192,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // the framework's own rendering rather than reporting the failure as a
         // different kind.
         let mut response = self.entry.framework_error_response(restated(error)?);
-        stamp_error_envelope(&mut response);
+        stamp_envelope(&mut response);
         Some(response)
     }
 
@@ -222,18 +234,19 @@ const XML_NAMESPACE: &str = "http://ec2.amazonaws.com/doc/2016-11-15";
 /// [`Ec2QueryEnvelope`] is the one place a serializer's media type is chosen, so
 /// it reaches every response this SERVICE renders: each success and each modelled
 /// error, including the scaffold's 501 — the same reach the envelope's
-/// `<RequestID>` has. What `override_protocol` does NOT reach is the responses the
-/// FRAMEWORK renders in front of the service; of those, the two the router offers
-/// this service — a routing failure and a transport failure — are taken back
-/// through `override_routing_error` / `override_framework_error` and stamped with
-/// the same envelope ([`stamp_error_envelope`]), so they too announce this media
-/// type and state a request id.
+/// `<RequestID>` has. What a protocol does NOT render is the dispatch sequence's
+/// framework-level refusal tail — a value outside a constraint the model declares,
+/// an absent `@required` member — which the sequence renders itself from the
+/// model-derived pre-dispatch declaration; those responses are finished with this
+/// same envelope by [`FinishedEnvelope`], the decorator every modelled operation is
+/// served through. The two the router renders in front of the service — a routing
+/// failure and a transport failure — are taken back through
+/// `override_routing_error` / `override_framework_error` and finished the same way
+/// ([`stamp_envelope`]).
 ///
-/// Two framework responses remain outside every seam, because the router renders
-/// them without consulting the service: the refusal tail of a matched operation (a
-/// value outside a constraint the model declares, which the service can only
-/// RE-WORD, through `override_refusal`) and an authentication refusal. Both still
-/// answer the model-derived envelope.
+/// One framework response remains outside every seam, because the router renders it
+/// without consulting the service for anything but its code and message: an
+/// authentication refusal, which answers the model-derived envelope.
 const RESPONSE_CONTENT_TYPE: &str = "text/xml;charset=UTF-8";
 
 /// The element an ec2Query ERROR envelope names its request id with.
@@ -289,10 +302,15 @@ fn new_error_request_id() -> String {
 /// refusals are distinguishable.
 ///
 /// A body that does not end with the envelope's closing element is left alone rather than
-/// guessed at, so this can only ever add the element the envelope documents.
+/// guessed at, so this can only ever add the element the envelope documents — and so is
+/// one that already names the request it answers, the envelope carrying exactly one id
+/// however many times a response passes through here.
 fn with_error_request_id(body: &[u8]) -> Option<Vec<u8>> {
     let text = std::str::from_utf8(body).ok()?;
     let head = text.strip_suffix(ERROR_ENVELOPE_CLOSE)?;
+    if head.contains(&format!("<{ERROR_REQUEST_ID_ELEMENT}>")) {
+        return None;
+    }
     let request_id = new_error_request_id();
     Some(
         format!(
@@ -303,16 +321,19 @@ fn with_error_request_id(body: &[u8]) -> Option<Vec<u8>> {
     )
 }
 
-/// Stamp EC2's error envelope on `response`: the media type it declares
-/// ([`RESPONSE_CONTENT_TYPE`]) and the `<RequestID>` it closes with
+/// Finish `response` with EC2's envelope: the media type it declares
+/// ([`RESPONSE_CONTENT_TYPE`]) and, when the body is an error envelope that does not
+/// name the request yet, the `<RequestID>` it closes with
 /// ([`with_error_request_id`]).
 ///
-/// The one place an EC2 error response is finished, so every error this service
-/// answers — a modelled error from a handler, the scaffold's 501, a routing failure,
-/// a transport failure — carries the same envelope. The body the renderer built is
+/// The one place a response of this service is finished, so every response it
+/// answers — a success, a modelled error from a handler, the scaffold's 501, a
+/// refusal the request walk gave before a handler ran, a routing failure, a
+/// transport failure — carries the same envelope. The body the renderer built is
 /// in memory, so it can be read back and rewritten here; a body that is not an
-/// envelope this can close is left exactly as it was.
-fn stamp_error_envelope(response: &mut RtResponse) {
+/// envelope this can close is left exactly as it was, and so is one already closed,
+/// which is what lets this be applied wherever a response is finished.
+fn stamp_envelope(response: &mut RtResponse) {
     response
         .headers_mut()
         .insert("content-type", RESPONSE_CONTENT_TYPE);
@@ -502,9 +523,77 @@ impl ServerProtocol for Ec2QueryEnvelope {
             .inner
             .serialize_error(error, error_schema, error_code, http_status)?;
         // The media type and the envelope's own request id, neither of which the
-        // framework's ec2Query error body carries; see [`stamp_error_envelope`].
-        stamp_error_envelope(&mut response);
+        // framework's ec2Query error body carries; see [`stamp_envelope`].
+        stamp_envelope(&mut response);
         Ok(response)
+    }
+}
+
+/// The generated operation the model's routing key names for `req`, or `None` when the
+/// key names no operation of this service.
+///
+/// The SAME lookup the router's own table does, through the model-derived protocol, so
+/// the operation claimed here and the operation the router would have resolved are one.
+///
+/// Called twice per request on purpose — once by `override_operation`, to decide whether
+/// this service claims the request at all, and once by [`FinishedEnvelope::run`], which
+/// borrows the service for exactly as long as the future it returns and so cannot be
+/// handed the first result. The lookup is the protocol's own routing-key resolution over a
+/// body already in memory, which is what the router itself does a third time to read the
+/// operation's auth schemes.
+fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dyn ErasedOperation> {
+    let key = svc.definition().protocol().routing_key(req).ok()?;
+    svc.definition().routing_table().get(key)
+}
+
+/// One modelled operation, run as itself and then answered in EC2's response envelope.
+///
+/// [`Ec2QueryEnvelope`] reaches the responses the dispatch sequence's CODEC renders — a
+/// success and a modelled error. It does not reach the sequence's refusal tail: a value
+/// outside a `@range` or `@length` the model declares, or an absent `@required` member, is
+/// refused before any handler runs and rendered by the sequence itself from the
+/// model-derived pre-dispatch declaration — the bare media type the Smithy protocol
+/// definition prescribes, and no request id. Those refusals are EC2 responses like any
+/// other (one of them carries this service's own `InvalidMaxResults`), so this decorator
+/// runs the operation and finishes WHATEVER it answered with the same envelope
+/// ([`stamp_envelope`]), which is idempotent for a response already finished.
+///
+/// Stateless: the operation to run is resolved from the service the framework hands
+/// `run`, so one value serves every operation and nothing is built per request.
+#[derive(Debug)]
+struct FinishedEnvelope;
+
+impl ErasedOperation for FinishedEnvelope {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r smithy_server_runtime::OperationContext<'r>,
+    ) -> smithy_server_runtime::BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            let mut response = match modeled_operation(svc, req) {
+                Some(operation) => operation.run(svc, req, ctx).await,
+                // `override_operation` claims a request only for a routing key the table
+                // serves, so this is unreachable; a request that somehow arrives here
+                // named no operation of this service and is answered the way one that
+                // names none is, rather than with an invented envelope.
+                None => svc.definition().routing_error_response(req),
+            };
+            stamp_envelope(&mut response);
+            response
+        })
+    }
+
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        // `None` defers to the modelled operation the request's routing key names — the
+        // operation this decorator runs — so serving a request through here cannot change
+        // which auth schemes the model requires of it. The router resolves those schemes
+        // from the modelled operation FIRST and consults the operation it is about to run
+        // only when the model names none: `authenticate` in
+        // `vendor/smithy-server-runtime/src/multi_service_router.rs`, which reads them
+        // through its own `modeled_operation` lookup rather than from the value
+        // `override_operation` answered.
+        None
     }
 }
 
