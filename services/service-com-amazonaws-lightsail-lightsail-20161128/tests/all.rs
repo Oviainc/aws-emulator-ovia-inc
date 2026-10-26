@@ -177,6 +177,8 @@ mod load_balancer_provisioning;
 mod load_balancer_tls_certificate_create;
 #[path = "all/load_balancer_tls_certificate_delete.rs"]
 mod load_balancer_tls_certificate_delete;
+#[path = "all/load_balancer_tls_policies.rs"]
+mod load_balancer_tls_policies;
 #[path = "all/operations_for_resource.rs"]
 mod operations_for_resource;
 #[path = "all/paging.rs"]

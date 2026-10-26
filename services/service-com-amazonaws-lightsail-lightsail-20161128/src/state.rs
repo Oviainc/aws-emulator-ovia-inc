@@ -10525,6 +10525,303 @@ pub const INSTANCE_HEALTH_REASON_DEREGISTRATION_IN_PROGRESS: &str =
     "Instance.DeregistrationInProgress";
 
 // ---------------------------------------------------------------------------
+// Load balancer TLS security policies
+// ---------------------------------------------------------------------------
+
+use crate::ops::types::LoadBalancerTlsPolicy;
+
+/// How many TLS security policies one `GetLoadBalancerTlsPolicies` page carries.
+///
+/// CHOSEN: Lightsail publishes no page size for this operation, only that "a next
+/// page token is not returned if there are no more results to display". Matches
+/// [`LOAD_BALANCER_PAGE_SIZE`], so every listing of this slice pages the same
+/// way, and it is below the number of policies this service publishes, so the
+/// catalog really does page.
+pub const LOAD_BALANCER_TLS_POLICY_PAGE_SIZE: usize = 5;
+
+/// The protocol versions a published policy may negotiate, oldest first.
+///
+/// SOURCE: the spellings the load-balancing service reports for an SSL policy's
+/// protocol versions (`TLSv1`, `TLSv1.1`, `TLSv1.2`), which is what
+/// `LoadBalancerTlsPolicy$protocols` — "The protocols used in a given TLS
+/// security policy" — carries.
+const TLS_PROTOCOL_1_0: &str = "TLSv1";
+/// See [`TLS_PROTOCOL_1_0`].
+const TLS_PROTOCOL_1_1: &str = "TLSv1.1";
+/// See [`TLS_PROTOCOL_1_0`].
+const TLS_PROTOCOL_1_2: &str = "TLSv1.2";
+
+/// Every protocol version a policy that still accepts TLS 1.0 negotiates.
+const TLS_PROTOCOLS_1_0_AND_LATER: &[&str] =
+    &[TLS_PROTOCOL_1_0, TLS_PROTOCOL_1_1, TLS_PROTOCOL_1_2];
+/// The protocol versions a policy whose floor is TLS 1.1 negotiates.
+const TLS_PROTOCOLS_1_1_AND_LATER: &[&str] = &[TLS_PROTOCOL_1_1, TLS_PROTOCOL_1_2];
+/// The only protocol version a TLS 1.2 policy negotiates.
+const TLS_PROTOCOLS_1_2_ONLY: &[&str] = &[TLS_PROTOCOL_1_2];
+
+/// The cipher suites the DEFAULT policy offers, in order of preference — the
+/// suites of the load-balancing service's own 2016-08 security policy, which the
+/// `TLS-2016-08` Lightsail policy is.
+///
+/// "The ciphers are listed in order of preference"
+/// (`LoadBalancerTlsPolicy$ciphers`), so this order is part of the published
+/// data: the ephemeral-key (`ECDHE`) suites come first, 128-bit before 256-bit
+/// within each key exchange, and the static-RSA suites last.
+const TLS_DEFAULT_CIPHERS: &[&str] = &[
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES128-SHA256",
+    "ECDHE-RSA-AES128-SHA256",
+    "ECDHE-ECDSA-AES128-SHA",
+    "ECDHE-RSA-AES128-SHA",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA",
+    "ECDHE-ECDSA-AES256-SHA",
+    "AES128-GCM-SHA256",
+    "AES128-SHA256",
+    "AES128-SHA",
+    "AES256-GCM-SHA384",
+    "AES256-SHA256",
+    "AES256-SHA",
+];
+
+/// The cipher suites a forward-secrecy policy offers: the ephemeral-key
+/// (`ECDHE`) suites of [`TLS_DEFAULT_CIPHERS`], in the same order of preference,
+/// and none of its static-RSA ones — a session key those cannot leak with the
+/// server's private key is what forward secrecy means.
+const TLS_FORWARD_SECRECY_CIPHERS: &[&str] = &[
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES128-SHA256",
+    "ECDHE-RSA-AES128-SHA256",
+    "ECDHE-ECDSA-AES128-SHA",
+    "ECDHE-RSA-AES128-SHA",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA384",
+    "ECDHE-ECDSA-AES256-SHA",
+    "ECDHE-RSA-AES256-SHA",
+];
+
+/// The cipher suites a RESTRICTED forward-secrecy policy offers: the
+/// [`TLS_FORWARD_SECRECY_CIPHERS`] whose handshake and record MAC use SHA-256 or
+/// SHA-384, so the SHA-1 suites are left out.
+const TLS_FORWARD_SECRECY_RESTRICTED_CIPHERS: &[&str] = &[
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES128-SHA256",
+    "ECDHE-RSA-AES128-SHA256",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA384",
+];
+
+/// The cipher suites the NEWEST restricted forward-secrecy policy offers: the
+/// [`TLS_FORWARD_SECRECY_RESTRICTED_CIPHERS`] that are authenticated-encryption
+/// (`GCM`) suites, so the CBC ones are left out too.
+const TLS_FORWARD_SECRECY_GCM_CIPHERS: &[&str] = &[
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+];
+
+/// One TLS security policy a load balancer of this service can be given: the
+/// protocol versions it negotiates and the cipher suites it offers, in order of
+/// preference.
+///
+/// This is PUBLISHED data, not per-account state: every account sees the same
+/// policies and no operation in this service creates, changes or withdraws one.
+/// So it is a `const` table beside this service's other published catalogs
+/// (instance bundles, blueprints, Regions), `GetLoadBalancerTlsPolicies` reports
+/// it without reading or writing a stored resource, and
+/// `CreateLoadBalancer$tlsPolicyName` names an entry of it — "Use the
+/// GetLoadBalancerTlsPolicies action to get a list of TLS policy names that you
+/// can specify".
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LoadBalancerTlsPolicySpec {
+    /// `LoadBalancerTlsPolicy$name` — "The name of the TLS security policy", and
+    /// the value a load balancer's `tlsPolicyName` carries.
+    pub name: &'static str,
+    /// `LoadBalancerTlsPolicy$isDefault` — "A Boolean value that indicates
+    /// whether the TLS security policy is the default", so exactly one entry of
+    /// the catalog carries it.
+    pub is_default: bool,
+    /// `LoadBalancerTlsPolicy$protocols` — "The protocols used in a given TLS
+    /// security policy", oldest first.
+    pub protocols: &'static [&'static str],
+    /// `LoadBalancerTlsPolicy$ciphers` — "The ciphers used by the TLS security
+    /// policy", which "are listed in order of preference".
+    pub ciphers: &'static [&'static str],
+}
+
+/// Every TLS security policy this service publishes, the default first and then
+/// the forward-secrecy policies from the most permissive protocol floor to the
+/// most restrictive.
+///
+/// SOURCE: the Lightsail TLS security policies of the Developer Guide's
+/// "Configuring TLS security policies on your Amazon Lightsail load balancers" —
+/// the default `TLS-2016-08` policy and the forward-secrecy (`FS`) policies,
+/// whose names carry the protocol floor (`1-1`, `1-2`), the restricted cipher
+/// set (`Res`) and the date of the policy. Each one is the load-balancing
+/// service's own security policy of that name, so its protocol versions and its
+/// ordered cipher suites are that policy's.
+pub const LOAD_BALANCER_TLS_POLICY_SPECS: &[LoadBalancerTlsPolicySpec] = &[
+    LoadBalancerTlsPolicySpec {
+        name: "TLS-2016-08",
+        is_default: true,
+        protocols: TLS_PROTOCOLS_1_0_AND_LATER,
+        ciphers: TLS_DEFAULT_CIPHERS,
+    },
+    LoadBalancerTlsPolicySpec {
+        name: "TLS-FS-2018-06",
+        is_default: false,
+        protocols: TLS_PROTOCOLS_1_0_AND_LATER,
+        ciphers: TLS_FORWARD_SECRECY_CIPHERS,
+    },
+    LoadBalancerTlsPolicySpec {
+        name: "TLS-FS-1-1-2019-08",
+        is_default: false,
+        protocols: TLS_PROTOCOLS_1_1_AND_LATER,
+        ciphers: TLS_FORWARD_SECRECY_CIPHERS,
+    },
+    LoadBalancerTlsPolicySpec {
+        name: "TLS-FS-1-2-2019-08",
+        is_default: false,
+        protocols: TLS_PROTOCOLS_1_2_ONLY,
+        ciphers: TLS_FORWARD_SECRECY_CIPHERS,
+    },
+    LoadBalancerTlsPolicySpec {
+        name: "TLS-FS-1-2-Res-2019-08",
+        is_default: false,
+        protocols: TLS_PROTOCOLS_1_2_ONLY,
+        ciphers: TLS_FORWARD_SECRECY_RESTRICTED_CIPHERS,
+    },
+    LoadBalancerTlsPolicySpec {
+        name: "TLS-FS-1-2-Res-2020-10",
+        is_default: false,
+        protocols: TLS_PROTOCOLS_1_2_ONLY,
+        ciphers: TLS_FORWARD_SECRECY_GCM_CIPHERS,
+    },
+];
+
+/// The protocol versions of a policy, as one English list.
+fn protocol_list(protocols: &[&str]) -> String {
+    match protocols {
+        [] => String::new(),
+        [only] => (*only).to_string(),
+        [leading @ .., last] => format!("{} and {last}", leading.join(", ")),
+    }
+}
+
+/// The description a policy reports.
+///
+/// DERIVED from the policy's own protocol versions and cipher suites rather than
+/// carried per entry, so a policy added to [`LOAD_BALANCER_TLS_POLICY_SPECS`] is
+/// described the same way: the sentence states the protocol versions the policy
+/// negotiates, how many suites it offers, and whether EVERY one of them uses an
+/// ephemeral key exchange — which is what makes a policy a forward-secrecy one.
+///
+/// The wording is this emulator's: the model documents the member only as "The
+/// description of the TLS security policy", so what it has to carry is the
+/// policy's own published properties and nothing from the request.
+pub fn load_balancer_tls_policy_description(protocols: &[&str], ciphers: &[&str]) -> String {
+    let negotiated = if protocols.is_empty() {
+        "no TLS protocol version".to_string()
+    } else {
+        protocol_list(protocols)
+    };
+    let forward_secrecy = !ciphers.is_empty()
+        && ciphers
+            .iter()
+            .all(|cipher| cipher.starts_with("ECDHE-") || cipher.starts_with("DHE-"));
+    format!(
+        "Negotiates {negotiated} with {} cipher suite{}{}",
+        ciphers.len(),
+        if ciphers.len() == 1 { "" } else { "s" },
+        if forward_secrecy {
+            ", every one of which provides forward secrecy"
+        } else {
+            ""
+        }
+    )
+}
+
+impl LoadBalancerTlsPolicySpec {
+    /// This policy as the modelled `LoadBalancerTlsPolicy`.
+    ///
+    /// `description` is DERIVED by [`load_balancer_tls_policy_description`] from
+    /// this entry's protocols and ciphers rather than carried a second time.
+    pub fn view(&self) -> LoadBalancerTlsPolicy {
+        LoadBalancerTlsPolicy {
+            name: Some(self.name.to_string()),
+            is_default: Some(self.is_default),
+            description: Some(load_balancer_tls_policy_description(
+                self.protocols,
+                self.ciphers,
+            )),
+            protocols: Some(self.protocols.iter().map(|p| (*p).to_string()).collect()),
+            ciphers: Some(self.ciphers.iter().map(|c| (*c).to_string()).collect()),
+        }
+    }
+}
+
+/// The policies a `GetLoadBalancerTlsPolicies` call reports out of `specs`, in
+/// `specs`' own order, so two reads answer identically.
+///
+/// Taking the catalog as an argument is what lets the reporting rule be
+/// exercised against catalogs the published one is only one of.
+pub fn load_balancer_tls_policies_from(
+    specs: &[LoadBalancerTlsPolicySpec],
+) -> Vec<LoadBalancerTlsPolicy> {
+    specs.iter().map(LoadBalancerTlsPolicySpec::view).collect()
+}
+
+/// The policies a `GetLoadBalancerTlsPolicies` call reports:
+/// [`load_balancer_tls_policies_from`] over this service's published catalog,
+/// [`LOAD_BALANCER_TLS_POLICY_SPECS`].
+pub fn load_balancer_tls_policies() -> Vec<LoadBalancerTlsPolicy> {
+    load_balancer_tls_policies_from(LOAD_BALANCER_TLS_POLICY_SPECS)
+}
+
+/// One page of `reported`, by the same token walk every published catalog of this
+/// service uses ([`catalog_page`]): a page token is the policy name a previous
+/// page reported as `nextPageToken`.
+pub fn load_balancer_tls_policy_page(
+    reported: &[LoadBalancerTlsPolicy],
+    page_size: usize,
+    page_token: Option<&str>,
+) -> Option<(Vec<LoadBalancerTlsPolicy>, Option<String>)> {
+    catalog_page(reported, page_size, page_token, |policy| {
+        policy.name.as_deref().map(std::borrow::Cow::Borrowed)
+    })
+}
+
+/// The policy names `reported` holds, for a refusal that has to tell the caller
+/// what a page token may name.
+pub fn reported_load_balancer_tls_policy_names(reported: &[LoadBalancerTlsPolicy]) -> String {
+    reported
+        .iter()
+        .filter_map(|policy| policy.name.clone())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The published TLS security policy `name` names, or `None` when this service
+/// publishes no such policy.
+pub fn load_balancer_tls_policy_spec(name: &str) -> Option<LoadBalancerTlsPolicySpec> {
+    LOAD_BALANCER_TLS_POLICY_SPECS
+        .iter()
+        .find(|spec| spec.name == name)
+        .copied()
+}
+
+// ---------------------------------------------------------------------------
 // SSL/TLS certificates and CDN distributions
 // ---------------------------------------------------------------------------
 
