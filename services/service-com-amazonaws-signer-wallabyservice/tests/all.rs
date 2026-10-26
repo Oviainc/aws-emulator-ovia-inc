@@ -26,6 +26,9 @@ mod profile_permissions;
 #[path = "all/profile_revocation_and_identity.rs"]
 mod profile_revocation_and_identity;
 
+#[path = "all/put_profile_platform_validation.rs"]
+mod put_profile_platform_validation;
+
 #[path = "all/region_scoping.rs"]
 mod region_scoping;
 

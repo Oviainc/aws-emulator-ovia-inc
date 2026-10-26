@@ -301,8 +301,9 @@ async fn untag_in(router: &Router, region: &str, arn: &str, keys: &[&str]) -> (u
 
 /// The tags the resource's own read reports.
 ///
-/// A read that reports no `tags` member at all reports an empty map: `TagMap` is
-/// `len 1..200`, so a resource carrying nothing has no map to report.
+/// Every read of this service reports the `tags` member, empty when the resource
+/// carries none, so this asserts the member is there rather than normalising its
+/// absence away.
 pub(crate) async fn tags_of(
     router: &Router,
     region: &str,
@@ -314,10 +315,13 @@ pub(crate) async fn tags_of(
         status, 200,
         "case {case:?}: expected the read to answer 200, got {status} {body:?}"
     );
-    body.get("tags")
-        .filter(|tags| !tags.is_null())
-        .cloned()
-        .unwrap_or_else(|| json!({}))
+    let tags = body.get("tags").cloned().unwrap_or(Value::Null);
+    assert!(
+        tags.is_object(),
+        "case {case:?}: every read reports a tag map, empty when nothing tagged the \
+         resource, got {tags:?}"
+    );
+    tags
 }
 
 // ---------------------------------------------------------------------------

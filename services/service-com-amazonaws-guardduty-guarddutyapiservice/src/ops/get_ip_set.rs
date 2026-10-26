@@ -178,16 +178,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             format: ip_set.format.clone(),
             location: ip_set.location.clone(),
             status: ip_set.status.clone(),
-            // An IPSet always reports a tag map, EMPTY when nothing tagged it, so a
-            // client iterates it without a null guard — the same way `GetDetector`
-            // reports the detector's tags.
-            tags: Some(
-                ip_set
-                    .tags
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect(),
-            ),
+            // Projected through the ONE tag-map rule every read of this service
+            // shares ([`crate::state::reported_tags`]): the member is always
+            // reported, empty when nothing tagged the IPSet.
+            tags: crate::state::reported_tags(&ip_set.tags),
             // "This field appears in the response only if it was provided during
             // IPSet creation or update" (`smithy_query(operation="GetIPSet")`).
             expected_bucket_owner: ip_set.expected_bucket_owner.clone(),

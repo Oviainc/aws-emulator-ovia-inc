@@ -199,14 +199,13 @@ fn profile_cases() -> Vec<ProfileCase> {
                 "tags": { "owner": "iot", "tier": "gold" },
             }),
         },
-        // A platform the documented catalog does not name, with a YEARS period.
-        // Such a platform's profile holds the certificate its signatures are
-        // issued under, so the request names one (see
-        // `crate::state::platform_requires_signing_material`).
+        // The container-image platform, with a YEARS period. That platform's
+        // profile holds the certificate its signatures are issued under, so the
+        // request names one (its published `requires_signing_material`).
         ProfileCase {
-            name: "Private_Platform_Profile",
+            name: "Container_Profile",
             request: json!({
-                "platformId": "PrivatePlatform-SHA256-ECDSA",
+                "platformId": "Notation-OCI-SHA384-ECDSA",
                 "signingMaterial": {
                     "certificateArn": "arn:aws:acm:eu-west-1:000000000000:certificate/abc",
                 },

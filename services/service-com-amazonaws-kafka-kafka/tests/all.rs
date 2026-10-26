@@ -57,6 +57,8 @@ mod resource_tags;
 mod state_roundtrip;
 #[path = "all/storage_updates.rs"]
 mod storage_updates;
+#[path = "all/topic_apis_serverless_gate.rs"]
+mod topic_apis_serverless_gate;
 #[path = "all/topic_lifecycle.rs"]
 mod topic_lifecycle;
 #[path = "all/vpc_connection_lifecycle.rs"]

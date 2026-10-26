@@ -180,17 +180,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetCustomDetectionRuleAssociationOutput {
             rule_association: crate::state::detection_rule_association_view(record),
-            // `Tags` is OPTIONAL on this read and `TagMap` is `len 1..200`
-            // (`smithy_query(operation="GetCustomDetectionRuleAssociation")`), so
-            // an association nothing tagged reports no tag map at all rather than
-            // an empty one the model cannot carry.
-            tags: (!record.tags.is_empty()).then(|| {
-                record
-                    .tags
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect()
-            }),
+            // Projected through the ONE tag-map rule every read of this service
+            // shares ([`crate::state::reported_tags`]): the member is always
+            // reported, empty when nothing tagged the association.
+            tags: crate::state::reported_tags(&record.tags),
         })
     }
 }

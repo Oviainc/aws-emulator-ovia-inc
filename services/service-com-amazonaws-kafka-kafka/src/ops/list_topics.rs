@@ -4,7 +4,10 @@
 //!
 //! Pages the stored topics of one cluster in name order: the cluster is resolved
 //! first (a `ClusterArn` that is not an MSK cluster ARN is a bad request, a
-//! well-formed one no live cluster holds is a 404), then `TopicNameFilter` keeps
+//! well-formed one no live cluster holds is a 404, and a cluster whose
+//! `ClusterType` is serverless is refused with
+//! [`crate::state::serverless_topic_apis_unsupported`] — the Topic Management
+//! surface is not offered for that cluster kind), then `TopicNameFilter` keeps
 //! the matching prefixes and `MaxResults` / `NextToken` page what is left.
 //!
 //! ## Shape of an operation
@@ -242,7 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Topics are listed FROM a cluster, so an endpoint that holds no cluster
         // for this ARN has no list to serve — which is a missing resource, not an
         // empty page.
-        if state.cluster_in(&region, &input.cluster_arn).is_none() {
+        let Some(cluster) = state.cluster_in(&region, &input.cluster_arn) else {
             return Err(
                 ListTopicsErrorModeled::NotFoundException(NotFoundException {
                     invalid_parameter: None,
@@ -250,6 +253,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into(),
             );
+        };
+
+        // The Topic Management surface applies to a cluster whose brokers this
+        // service manages for the caller, so a serverless one is refused on its
+        // KIND -- an empty page would say the cluster holds no topics, which is a
+        // different claim from "this API does not serve this kind of cluster".
+        if cluster.is_serverless() {
+            return Err(crate::state::serverless_topic_apis_unsupported());
         }
 
         // Absent `MaxResults` pages at the largest size the model allows, and no

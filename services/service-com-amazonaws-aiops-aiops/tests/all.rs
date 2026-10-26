@@ -29,6 +29,8 @@ mod regional_identifier_resolution;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_write_last_modified_stamp.rs"]
+mod tag_write_last_modified_stamp;
 #[path = "all/tagging_frontend_errors.rs"]
 mod tagging_frontend_errors;
 #[path = "all/update_investigation_group_identifier.rs"]

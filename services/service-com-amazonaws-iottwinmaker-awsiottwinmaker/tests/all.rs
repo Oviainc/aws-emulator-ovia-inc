@@ -139,3 +139,6 @@ mod workspace_listing;
 
 #[path = "all/workspace_update.rs"]
 mod workspace_update;
+
+#[path = "all/workspace_update_scope.rs"]
+mod workspace_update_scope;
