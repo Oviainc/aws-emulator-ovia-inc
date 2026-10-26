@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPricingPlans
-//! Reports the pricing plans this service holds, one page at a time: the read that
-//! `CreatePricingPlan`, `UpdatePricingPlan`, `DeletePricingPlan` and the pricing-rule
-//! association operations are all observable through at once.
+//! Reports the pricing plans this service holds AS THEY STOOD in the billing period the
+//! read is scoped to, one page at a time: the read that `CreatePricingPlan`,
+//! `UpdatePricingPlan`, `DeletePricingPlan` and the pricing-rule association operations
+//! are all observable through at once.
 //!
 //! ## Shape of an operation
 //!
@@ -113,19 +114,28 @@ impl From<ListPricingPlansErrorModeled> for ListPricingPlansError {
     }
 }
 
-/// The modelled view of a stored plan. `Size` is passed in because it is DERIVED from
-/// the plan's pricing-rule associations rather than held on the record: "the pricing
-/// rules count that's currently associated with this pricing plan list element". A plan
-/// associated with no rule counts 0, which is what it holds, rather than the model's
-/// unenforced `@range(min: 1)` floor; that is the same answer `UpdatePricingPlan` gives.
-fn element(plan: &crate::state::PricingPlanRecord, size: i64) -> PricingPlanListElement {
+/// The modelled view of a stored plan AS IT STOOD in the billing period the read is
+/// scoped to: `version` is the generation of the plan in force in that period
+/// ([`crate::state::PricingPlanRecord::effective_in`]), and the members no write can
+/// change (`Arn` and `CreationTime` — neither carried by `UpdatePricingPlanInput`) come
+/// from the record itself. `Size` is passed in because it is DERIVED from the plan's
+/// pricing-rule associations in that same period rather than held on the record: "the
+/// pricing rules count that's currently associated with this pricing plan list element".
+/// A plan associated with no rule counts 0, which is what it holds, rather than the
+/// model's unenforced `@range(min: 1)` floor; that is the same answer `UpdatePricingPlan`
+/// gives.
+fn element(
+    plan: &crate::state::PricingPlanRecord,
+    version: &crate::state::PricingPlanVersion,
+    size: i64,
+) -> PricingPlanListElement {
     PricingPlanListElement {
-        name: Some(plan.name.clone()),
+        name: Some(version.name.clone()),
         arn: Some(plan.arn.clone()),
-        description: plan.description.clone(),
+        description: version.description.clone(),
         size,
         creation_time: plan.creation_time_millis,
-        last_modified_time: plan.last_modified_time_millis,
+        last_modified_time: version.last_modified_time_millis,
     }
 }
 
@@ -189,10 +199,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         );
 
-        // `Size` is a count of the plan's rule ASSOCIATIONS, and an association is in
-        // force only from the billing period it was made in onward, so the count is
-        // taken for the period the read is scoped to. A request that names no period
-        // asks about the current one.
+        // `BillingPeriod` selects the month the listing is READ FOR — "the billing
+        // period for which the described pricing plans are applicable" — and a request
+        // that names no period asks about the current one. So a plan is reported only for
+        // the periods it existed in, with the values that held in the period asked about:
+        // the generation in force then
+        // ([`crate::state::PricingPlanRecord::effective_in`]) and the rule associations in
+        // force then, which is what `Size` counts.
         let billing_period = input
             .billing_period
             .clone()
@@ -201,22 +214,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `pricing_plans` is ordered by ARN, and an ARN carries the monotonic id this
         // service mints, so the sequence is creation order and a `NextToken` names the
         // same cut point on the next call. The AWS-managed plans belong to no account
-        // and are not stored, so they are not this account's plans to report.
-        let selected: Vec<(String, PricingPlanListElement)> = state
+        // and are not stored, so they are not this account's plans to report. The page is
+        // cut FIRST, so the generation each reported plan stood at is projected for at
+        // most one page of plans.
+        let selected: Vec<(String, &crate::state::PricingPlanRecord)> = state
             .pricing_plans
             .iter()
-            .filter(|(arn, _)| wanted.as_ref().is_none_or(|wanted| wanted.contains(arn)))
-            .map(|(arn, plan)| {
-                let size = state
-                    .associated_pricing_rule_arns(arn, &billing_period)
-                    .map(|arns| i64::try_from(arns.len()).unwrap_or(i64::MAX))
-                    .unwrap_or_default();
-                (arn.clone(), element(plan, size))
+            .filter(|(arn, plan)| {
+                wanted.as_ref().is_none_or(|wanted| wanted.contains(*arn))
+                    && plan.exists_in(&billing_period)
             })
+            .map(|(arn, plan)| (arn.clone(), plan))
             .collect();
 
-        let (pricing_plans, next_token) =
+        let (page, next_token) =
             crate::state::paginate(selected, input.next_token.as_deref(), input.max_results);
+        let pricing_plans: Vec<PricingPlanListElement> = page
+            .iter()
+            .filter_map(|plan| {
+                let version = plan.effective_in(&billing_period)?;
+                let size = state
+                    .associated_pricing_rule_arns(&plan.arn, &billing_period)
+                    .map(|arns| i64::try_from(arns.len()).unwrap_or(i64::MAX))
+                    .unwrap_or_default();
+                Some(element(plan, &version, size))
+            })
+            .collect();
 
         Ok(ListPricingPlansOutput {
             // "The billing period for which the described pricing plans are applicable."

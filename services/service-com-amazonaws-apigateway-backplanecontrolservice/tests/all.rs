@@ -23,6 +23,8 @@ mod documentation_part_creation;
 
 #[path = "all/account_settings.rs"]
 mod account_settings;
+#[path = "all/api_key_collection.rs"]
+mod api_key_collection;
 #[path = "all/api_key_collection_members.rs"]
 mod api_key_collection_members;
 #[path = "all/api_key_import.rs"]

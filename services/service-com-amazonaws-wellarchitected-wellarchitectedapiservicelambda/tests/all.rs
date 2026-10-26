@@ -267,6 +267,11 @@ mod global_settings;
 mod agent_context_updates;
 
 // Declared last for the same reason as the declarations above: the sorted position for a
+// profile suite falls in a crowded run of this list.
+#[path = "all/profile_revisions.rs"]
+mod profile_revisions;
+
+// Declared last for the same reason as the declarations above: the sorted position for a
 // workload suite falls in a crowded run of this list.
 #[path = "all/workload_lens_review_upgrade.rs"]
 mod workload_lens_review_upgrade;

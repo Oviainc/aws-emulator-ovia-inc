@@ -37,6 +37,8 @@ mod primary_email_read;
 mod primary_email_update;
 #[path = "all/primary_email_update_acceptance.rs"]
 mod primary_email_update_acceptance;
+#[path = "all/primary_email_update_address_in_use.rs"]
+mod primary_email_update_address_in_use;
 #[path = "all/primary_email_update_in_flight.rs"]
 mod primary_email_update_in_flight;
 #[path = "all/primary_email_update_self_reaffirmation.rs"]

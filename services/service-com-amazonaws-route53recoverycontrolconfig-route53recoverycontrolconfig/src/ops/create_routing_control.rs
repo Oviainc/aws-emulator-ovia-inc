@@ -210,7 +210,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(cluster) = guard.clusters.get(&input.cluster_arn) else {
             return Err(CreateRoutingControlErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("no cluster is stored under {}", input.cluster_arn),
+                    message: crate::state::not_found_message(
+                        crate::state::CLUSTER_NOUN,
+                        &input.cluster_arn,
+                    ),
                 },
             )
             .into());
@@ -225,7 +228,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(panel) = guard.control_panels.get(&panel_arn) else {
             return Err(CreateRoutingControlErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("no control panel is stored under {panel_arn}"),
+                    message: crate::state::not_found_message(
+                        crate::state::CONTROL_PANEL_NOUN,
+                        &panel_arn,
+                    ),
                 },
             )
             .into());

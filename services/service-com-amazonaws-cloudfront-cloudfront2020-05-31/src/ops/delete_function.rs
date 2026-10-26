@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFunction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFunction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFunction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: a delete REMOVES the whole function record the create persisted — both of
+//! its stages, its code, its configuration, its version tokens and its tags — once the
+//! version the caller read is still current and no stored cache behaviour attaches it, so
+//! every later read of that name reports a function that does not exist and the name is
+//! free for a later create. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +71,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::IfMatch;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -170,20 +168,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFunction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFunctionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFunction"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes the rest of the store before this
+        // call reads it: whether a cache behaviour attaches this function is decided
+        // against the distributions as they stand at this instant.
+        store.settle(::std::time::SystemTime::now());
+
+        // "To delete a function, you must provide the function's name and version (ETag
+        // value). To get these values, you can use ListFunctions and DescribeFunction":
+        // a delete names NO stage, and the version a stage-less function call is checked
+        // against is the `DEVELOPMENT` stage's — the stage a function lives its editable
+        // life in and the one a describe that names no stage reports. A name no function
+        // holds is "The function does not exist", answered before the precondition, which
+        // can only be checked against a stored version.
+        let Some(stored) = store.function(&input.name) else {
+            return Err(DeleteFunctionErrorModeled::NoSuchFunctionExists(
+                crate::state::no_such_function_exists(),
+            )
+            .into());
+        };
+        let current_etag = stored.development.etag.clone();
+        // Both stages of one function report the SAME ARN, and a cache behaviour attaches a
+        // function BY that ARN, so the attachment question is asked of the stored ARN rather
+        // than of an identifier re-derived from the request.
+        let arn = stored.arn.clone();
+
+        // The precondition is checked first, the way HTTP evaluates one: a caller holding a
+        // version that is no longer current is told that before anything about what the
+        // function is attached to. A token that is not a version token at all is "missing or
+        // not valid"; a well-formed token that is not the current one is a failed
+        // precondition.
+        match crate::state::check_if_match(&current_etag, Some(input.if_match.as_str())) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(DeleteFunctionErrorModeled::InvalidIfMatchVersion(
+                    crate::state::invalid_if_match_version(),
+                )
+                .into());
+            }
+            IfMatch::Stale => {
+                return Err(DeleteFunctionErrorModeled::PreconditionFailed(
+                    crate::state::precondition_failed(),
+                )
+                .into());
+            }
+        }
+
+        // "You cannot delete a function if it's associated with a cache behavior. First,
+        // update your distributions to remove the function association from all cache
+        // behaviors, then delete the function." So a function any stored cache behaviour
+        // still attaches is refused here and stays readable — the same attachment check the
+        // publish path computes a published stage's status from.
+        if store.function_is_associated(&arn) {
+            return Err(
+                DeleteFunctionErrorModeled::FunctionInUse(crate::state::function_in_use()).into(),
+            );
+        }
+
+        // Gone means gone: the ONE record every read of this function answered from is
+        // removed, so both of its stages report a function that does not exist, its ARN
+        // names no function for a tag read, and the name is free for a later create to
+        // claim.
+        store.functions.remove(&input.name);
+
+        Ok(DeleteFunctionOutput)
     }
 }

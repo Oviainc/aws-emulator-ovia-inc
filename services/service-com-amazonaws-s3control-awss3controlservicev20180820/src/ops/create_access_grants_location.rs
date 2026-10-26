@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAccessGrantsLocation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAccessGrantsLocation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAccessGrantsLocation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers one S3 data location in the account's S3 Access Grants instance in
+//! the Region the request was signed for, and records it for
+//! `GetAccessGrantsLocation` to report and for `CreateAccessGrant` to narrow.
+//! The id is `default` for the default location `s3://` and service-assigned
+//! for any other, as `AccessGrantsLocationId` documents. Refuses when the
+//! account has no instance in that Region — "you must have an S3 Access Grants
+//! instance in the same Region as the S3 data" — and when that instance already
+//! has a location registered for the same scope.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +171,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAccessGrantsLocation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAccessGrantsLocationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAccessGrantsLocation"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+
+        // A location is registered IN an Access Grants instance, which is
+        // (account, Region) — so the Region the request was signed for is part
+        // of this resource's identity, exactly as it is for the instance.
+        let region = crate::state::signing_region(ctx.parts());
+        let mut store = state.lock();
+        if !store
+            .access_grants_instances
+            .contains_key(&(input.account_id.clone(), region.clone()))
+        {
+            return Err(crate::state::no_such_access_grants_instance(
+                &input.account_id,
+                &region,
+            ));
+        }
+
+        // One registration per S3 path: a second one over the same scope would
+        // be two locations, with two ids and two roles, over one set of data.
+        if store
+            .access_grants_location_by_scope(&input.account_id, &region, &input.location_scope)
+            .is_some()
+        {
+            return Err(crate::state::access_grants_location_already_exists(
+                &input.location_scope,
+            ));
+        }
+        // The store is bounded: past its quota a registration is refused rather
+        // than adding another record, so a caller cannot grow this process's
+        // state without end by varying the location scope.
+        if store.access_grants_locations.len() >= crate::state::ACCESS_GRANTS_LOCATION_QUOTA {
+            return Err(crate::state::access_grants_location_store_full());
+        }
+
+        // "S3 Access Grants assigns the ID default to the default location
+        // s3:// and assigns an auto-generated ID to other locations that you
+        // register" (`AccessGrantsLocationId`).
+        let id = if input.location_scope == crate::state::DEFAULT_LOCATION_SCOPE {
+            crate::state::ACCESS_GRANTS_LOCATION_DEFAULT_ID.to_string()
+        } else {
+            store.new_access_grants_location_id()
+        };
+        let record = crate::state::AccessGrantsLocationRecord {
+            account_id: input.account_id.clone(),
+            region: region.clone(),
+            arn: crate::state::access_grants_location_arn(&region, &id),
+            id,
+            location_scope: input.location_scope.clone(),
+            iam_role_arn: input.iam_role_arn.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()),
+            tags: input.tags.clone().unwrap_or_default(),
+        };
+
+        let output = CreateAccessGrantsLocationOutput {
+            created_at: Some(record.created_at),
+            access_grants_location_id: Some(record.id.clone()),
+            access_grants_location_arn: Some(record.arn.clone()),
+            location_scope: Some(record.location_scope.clone()),
+            iam_role_arn: Some(record.iam_role_arn.clone()),
+        };
+        let key = (record.account_id.clone(), region, record.id.clone());
+        store.access_grants_locations.insert(key, record);
+        Ok(output)
     }
 }

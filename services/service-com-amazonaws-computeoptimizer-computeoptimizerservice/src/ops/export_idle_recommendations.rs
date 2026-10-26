@@ -258,6 +258,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .to_string(),
             ));
         };
+        // And the bucket must already exist: the export is written INTO it, so a name no
+        // bucket of this emulator's object store answers to is refused rather than queued
+        // into a job whose export file could never appear.
+        if let Some(reason) =
+            crate::state::export::destination_bucket_rejection(&*self.engine, bucket)
+        {
+            return Err(invalid_parameter(reason));
+        }
 
         // Compute Optimizer is regional: the export job belongs to the Region whose
         // endpoint created it, and so does the one-job-in-progress limit below.
@@ -314,20 +322,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::RESOURCE_TYPE_IDLE,
             &job_id,
         );
-        let job = crate::state::ExportJob {
+        let plan = crate::state::export::ExportPlan {
             job_id: job_id.clone(),
             region,
             resource_type: crate::state::RESOURCE_TYPE_IDLE.to_string(),
             bucket: bucket.to_string(),
             key,
             metadata_key,
-            created_at: now,
+            // "The recommendations data to include in the export file", or every field the
+            // model declares for this resource type when the request selects none.
+            columns: crate::state::export::export_columns(
+                input.fields_to_export.as_deref(),
+                EXPORTABLE_IDLE_FIELD_VALUES,
+            ),
+            file_format: input
+                .file_format
+                .unwrap_or_else(|| crate::state::export::FILE_FORMAT_CSV.to_string()),
+            account_ids,
+            include_member_accounts: input.include_member_accounts,
+            // The filters export "a more specific set of" recommendations, so they select
+            // which recommendations the export file holds.
+            filters: crate::state::export::filter_pairs(&filters),
         };
         // The destination this call answers is the job's own, so it names exactly the
-        // objects `DescribeRecommendationExportJobs` reports for the job.
-        let s3_destination = job.s3_destination();
-        guard.export_jobs.insert(job);
+        // objects `DescribeRecommendationExportJobs` reports for the job and exactly the
+        // objects the completed job writes.
+        let s3_destination = guard.record_export_job(&plan, now).s3_destination();
         drop(guard);
+
+        // An export this call did not create may have come due meanwhile, and this one comes
+        // due two lifecycle steps from now — the task is what makes the objects appear for a
+        // client that makes no further call to this service.
+        crate::state::export::deliver_and_schedule(&self.engine, now);
 
         Ok(ExportIdleRecommendationsOutput {
             job_id: Some(job_id),

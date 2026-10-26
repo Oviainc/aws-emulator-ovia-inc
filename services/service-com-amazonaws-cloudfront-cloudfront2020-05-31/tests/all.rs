@@ -65,6 +65,8 @@ mod distributions_by_response_headers_policy_id;
 mod error_envelope;
 #[path = "all/field_level_encryption_profile_lifecycle.rs"]
 mod field_level_encryption_profile_lifecycle;
+#[path = "all/function_delete.rs"]
+mod function_delete;
 #[path = "all/function_lifecycle.rs"]
 mod function_lifecycle;
 #[path = "all/function_list.rs"]

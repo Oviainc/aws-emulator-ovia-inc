@@ -25,6 +25,8 @@ mod catalog_mutations;
 mod catalog_projections;
 #[path = "all/column_statistics_task_runs.rs"]
 mod column_statistics_task_runs;
+#[path = "all/connection_listing.rs"]
+mod connection_listing;
 #[path = "all/connection_updates.rs"]
 mod connection_updates;
 #[path = "all/crawler_event_queue.rs"]
