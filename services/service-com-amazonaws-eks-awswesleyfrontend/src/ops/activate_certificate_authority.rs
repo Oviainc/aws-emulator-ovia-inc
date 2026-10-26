@@ -227,6 +227,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The second `@httpLabel` names a resource too, so a CA this cluster does not
         // hold is a 404 before anything about the cluster's or the CA's state is
         // judged.
+        //
+        // What the refusal STATES is trust-bundle membership: this operation promotes
+        // a certificate authority that is already "present on the cluster", i.e. in
+        // the cluster's trust bundle, so an id the bundle does not hold — one never
+        // appended, or one a deletion has since taken out of it — is reported as not
+        // being in that cluster's TRUSTED LIST, which is the fact a rotation client
+        // acts on (its staged successor is gone, rather than a record merely not
+        // being found). The sentence is built from the request's own two
+        // `@httpLabel`s, and ends in no full stop.
         let Some(authority) = cluster.certificate_authority(&authority_id) else {
             return Err(
                 ActivateCertificateAuthorityErrorModeled::ResourceNotFoundException(
@@ -234,8 +243,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // the payload names no cluster: see
                     // [`crate::state::child_resource_not_found`].
                     crate::state::child_resource_not_found(format!(
-                        "No certificate authority found with id: {authority_id} for cluster: \
-                         {cluster_name}."
+                        "Certificate authority {authority_id} is not in the trusted list for \
+                         cluster {cluster_name}"
                     )),
                 )
                 .into(),

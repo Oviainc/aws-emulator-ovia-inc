@@ -41,7 +41,7 @@ use crate::wire::{call, emulator, encode_label, error_code, Answer};
 /// `DELETE /clusters/{clusterName}/certificate-authorities/{certificateAuthorityId}`,
 /// whose `clientRequestToken` is an `@httpQuery` parameter rather than a body
 /// member.
-async fn delete_authority(
+pub(crate) async fn delete_authority(
     router: &MultiServiceRouter,
     region: &str,
     cluster: &str,

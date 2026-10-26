@@ -35,7 +35,7 @@ use crate::wire::{call, emulator, encode_label, Answer};
 
 /// Every resource-identity member `ResourceNotFoundException` declares beside
 /// `message` (`smithy_query query="shape" shape="ResourceNotFoundException"`).
-const IDENTITY_MEMBERS: &[&str] = &[
+pub(crate) const IDENTITY_MEMBERS: &[&str] = &[
     "clusterName",
     "nodegroupName",
     "fargateProfileName",
