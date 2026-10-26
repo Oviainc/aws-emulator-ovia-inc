@@ -480,6 +480,65 @@ pub async fn reconcile(
         // identifier its service knows the dependency by — and so the comparison below
         // reads an UNCHANGED declaration as unchanged.
         repoint_references(&mut resource.properties, &minted);
+        // Every `{{resolve:...}}` DYNAMIC REFERENCE the declaration carries is resolved
+        // against the store it names, before anything is asked of the owning service: that
+        // service is asked for the resource the reference's VALUE describes, and a
+        // reference the named store cannot satisfy fails THIS resource — the deployment
+        // stops here, exactly as it does on a refusal, so a create rolls the stack back
+        // rather than creating a resource configured with the reference's own text.
+        let resolved = match super::dynamic_references::resolve(
+            ctx,
+            region,
+            &resource.resource_type,
+            &resource.properties,
+        )
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(reason) => {
+                let updating = previous
+                    .iter()
+                    .any(|existing| existing.materialised && is_same_resource(existing, &resource));
+                // CloudFormation itself failed the resource here — no owning service was
+                // asked anything — so the reason is this service's own words rather than
+                // a provider refusal ([`handler_failure_reason`]).
+                if updating {
+                    outcome.failure = Some(format!(
+                        "The following resource(s) failed to update: [{}]. {reason}",
+                        resource.logical_id
+                    ));
+                    outcome.transitions.push(ResourceTransition::starting(
+                        &resource,
+                        super::resource_status::UPDATE_IN_PROGRESS,
+                    ));
+                    outcome.transitions.push(ResourceTransition::finished(
+                        &resource,
+                        super::resource_status::UPDATE_FAILED,
+                        Some(reason),
+                    ));
+                } else {
+                    outcome.failure = Some(format!(
+                        "The following resource(s) failed to create: [{}]. {reason}",
+                        resource.logical_id
+                    ));
+                    outcome
+                        .transitions
+                        .push(ResourceTransition::creating(&resource));
+                    outcome.transitions.push(ResourceTransition::failed(
+                        &resource,
+                        super::resource_status::CREATE_FAILED,
+                        reason,
+                    ));
+                }
+                outcome.resources.push(resource);
+                break;
+            }
+        };
+        // The resource's record carries the document the stack RECORDS — a secure
+        // reference's value is never one of them — while the owning service is asked for
+        // the resource with the resolved one.
+        resource.properties = resolved.recorded;
+        let deployed_properties = resolved.deployed;
         if let Some(existing) = previous
             .iter()
             .find(|existing| existing.materialised && is_same_resource(existing, &resource))
@@ -507,7 +566,7 @@ pub async fn reconcile(
                 let applied = match provisioner_for(&resource.resource_type) {
                     Some(provisioner) => {
                         provisioner
-                            .update(ctx, region, &resource, &declared_properties)
+                            .update(ctx, region, &resource, &deployed_properties)
                             .await
                     }
                     None => Ok(None),
@@ -571,7 +630,7 @@ pub async fn reconcile(
                 Some(provisioner) => {
                     let tags = stack.tags_for(&resource.logical_id);
                     provisioner
-                        .retag(ctx, region, &resource, &declared_properties, &tags)
+                        .retag(ctx, region, &resource, &deployed_properties, &tags)
                         .await
                 }
                 None => Ok(()),
@@ -624,7 +683,14 @@ pub async fn reconcile(
             // own, plus the three that name the stack and this resource's place in it.
             Some(provisioner) => {
                 let tags = stack.tags_for(&resource.logical_id);
-                provisioner.create(ctx, region, &resource, &tags).await
+                // Asked for with the DEPLOYED document: the record keeps the one the stack
+                // reports, so the create carries a resolved dynamic reference's value
+                // while nothing the stack reports does.
+                let asked = StoredResource {
+                    properties: deployed_properties,
+                    ..resource.clone()
+                };
+                provisioner.create(ctx, region, &asked, &tags).await
             }
             // No provisioner for this type: nothing is asked of any service, and the
             // resource stays DECLARED-ONLY — which the stack still records as a resource it

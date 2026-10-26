@@ -7518,7 +7518,11 @@ fn parameter_text(value: &Value) -> Value {
 }
 
 /// Call one AWS Systems Manager operation on the awsJson1_1 wire its model declares.
-async fn call_ssm(
+///
+/// Reached from [`super::dynamic_references`] too, which resolves a `{{resolve:ssm...}}`
+/// dynamic reference through this one spelling of that service's wire rather than a second
+/// copy of it.
+pub(super) async fn call_ssm(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     operation: &str,
