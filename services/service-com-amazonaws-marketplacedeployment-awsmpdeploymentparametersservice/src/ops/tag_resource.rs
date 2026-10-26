@@ -21,8 +21,14 @@
 //! can address, so it is refused as a bad request (HTTP 400, error code
 //! `BadRequestException` — `crate::scaffolded::BAD_REQUEST_CODE`, the tagging
 //! front-end's own identity rather than the modelled `ValidationException` shape
-//! name), raised before the store is consulted at all. An ARN that IS one of this
-//! service's and names no stored record is a 404 carrying this service's own
+//! name), raised before the store is consulted at all. The `tags` it carries are
+//! judged as an input in the same way and just as early
+//! (`crate::state::validate_tags_member`), so every refusal a request earns on its
+//! own content — a reserved key, a key or value outside its length bound — is the
+//! modelled `ValidationException` (HTTP 400) whatever the store holds; only the
+//! per-resource cap, a property of the resulting stored set, is judged at the merge.
+//! An ARN that IS one of this service's and names no stored record is a 404 carrying
+//! this service's own
 //! `NotFoundException` code (`crate::state::parameter_not_found`), which is the code
 //! its recorded responses use rather than the modelled `ResourceNotFoundException`
 //! shape name. A record whose `expirationDate` has passed is "scheduled for
@@ -168,14 +174,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Input before lookup: a value that is not a resource ARN this API addresses is
         // a bad request, not a missing resource.
         crate::state::validate_resource_arn(&input.resource_arn)?;
-        // A tag key in the namespace AWS reserves for its own generated tags is a bad
-        // request too, judged on the input before the resource is resolved: a caller
-        // may not create or change one, so the refusal does not depend on the target
-        // existing, and nothing is stored.
+        // The TAGS next, still before any state is touched: the whole part of the tag
+        // judgement that reads only the request is made here, so the answer to a bad
+        // tag set does not depend on whether the store holds the ARN. A key in the
+        // namespace AWS reserves for its own generated tags, a key outside the length
+        // bound a tag key may hold, and a value longer than a tag value may be are
+        // each bad requests — the modelled `ValidationException` (HTTP 400) —
+        // whether the target exists or not, and nothing is stored either way. Only
+        // the per-resource cap, which is a property of the RESULTING stored set
+        // rather than of the request, is left to the merge below.
+        //
+        // `TagConstraints::Unconstrained` because this operation's `tags` member
+        // targets the map the model leaves unconstrained; the character class the
+        // model states belongs to the constrained map another member targets.
         if let Some(tags) = input.tags.as_ref() {
-            if let Err(why) =
-                crate::state::validate_tag_keys_unreserved(tags.keys().map(String::as_str), "tags")
-            {
+            if let Err(why) = crate::state::validate_tags_member(
+                tags,
+                crate::state::TagConstraints::Unconstrained,
+            ) {
                 return Err(TagResourceErrorModeled::ValidationException(why).into());
             }
         }
