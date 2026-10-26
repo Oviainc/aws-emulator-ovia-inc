@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeStackSetOperation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeStackSetOperation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeStackSetOperation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports one StackSet operation as this store holds it — its action, the
+//! status its clock has reached, the instants it was initiated and ended at, the
+//! preferences the request that started it supplied and, for a `DETECT_DRIFT` operation,
+//! the drift details that detection computed.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +74,59 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::stack_sets::{
+    drift_detection_details, drift_detection_status, operation_action, preferences_view,
+    StoredStackSet, StoredStackSetOperation,
+};
+
+/// One stored operation as the modelled `StackSetOperation`.
+///
+/// Every member is read off the operation record and the stack set that holds it, so this
+/// read and `ListStackSetOperations` cannot disagree about an operation's action, status,
+/// instants or preferences. A member the record does not carry — the end instant of an
+/// operation that has not ended, a status with no reason, the preferences of one whose
+/// request named none — is absent rather than reported empty.
+fn stack_set_operation(
+    stack_set: &StoredStackSet,
+    stored: &StoredStackSetOperation,
+) -> StackSetOperation {
+    StackSetOperation {
+        operation_id: Some(stored.operation_id.clone()),
+        stack_set_id: Some(stack_set.stack_set_id.clone()),
+        action: Some(stored.action.clone()),
+        status: Some(stored.status.clone()),
+        operation_preferences: stored.preferences.as_ref().map(preferences_view),
+        retain_stacks: stored.retain_stacks,
+        administration_role_arn: stored.administration_role_arn.clone(),
+        execution_role_name: stored.execution_role_name.clone(),
+        creation_timestamp: Some(crate::state::timestamp(stored.creation)),
+        end_timestamp: stored.end.map(crate::state::timestamp),
+        // "Valid only if the StackSet uses service-managed permissions": this store holds
+        // the accounts an operation targeted on the instances it wrote, so nothing invents
+        // an Organizations target for a self-managed StackSet.
+        deployment_targets: None,
+        // "This information will only be present for StackSet operations whose Action type
+        // is DETECT_DRIFT", and for one of those it is the stack set's own detection
+        // details — counted off the instances the detection covered — with the status of
+        // THIS operation's detection: still IN_PROGRESS while the operation is running.
+        stack_set_drift_detection_details: (stored.action == operation_action::DETECT_DRIFT)
+            .then(|| crate::ops::types::StackSetDriftDetectionDetails {
+                drift_detection_status: Some(
+                    stored
+                        .drift_detection_status
+                        .clone()
+                        .unwrap_or_else(|| drift_detection_status::IN_PROGRESS.to_string()),
+                ),
+                ..drift_detection_details(stack_set)
+            }),
+        status_reason: stored.status_reason.clone(),
+        status_details: stored.failed_stack_instances_count.map(|failed| {
+            StackSetOperationStatusDetails {
+                failed_stack_instances_count: Some(failed),
+            }
+        }),
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -149,18 +197,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeStackSetOperation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeStackSetOperationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeStackSetOperation"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no StackSet store to read the
+            // operation from, so this answers 501 rather than a status nothing stands
+            // behind.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DescribeStackSetOperation",
+            ));
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising the status transition the
+        // clock had already made due — which is what moves an operation this read is
+        // monitoring from RUNNING to its terminal status, and was owed at this instant even
+        // if nobody had called.
+        store.settle(::std::time::SystemTime::now());
+
+        let stack_set = store
+            .resolve_stack_set(&region, &input.stack_set_name)
+            .ok_or_else(|| {
+                DescribeStackSetOperationErrorModeled::StackSetNotFoundException(
+                    StackSetNotFoundException {
+                        message: Some(crate::state::stack_set_does_not_exist(
+                            &input.stack_set_name,
+                        )),
+                    },
+                )
+            })?;
+        // "The specified ID refers to an operation that doesn't exist": an operation id
+        // this stack set holds no record for is the modelled `OperationNotFoundException`,
+        // never another operation's status.
+        let operation = stack_set.operation(&input.operation_id).ok_or_else(|| {
+            DescribeStackSetOperationErrorModeled::OperationNotFoundException(
+                OperationNotFoundException {
+                    message: Some(crate::state::stack_set_operation_does_not_exist(
+                        &input.operation_id,
+                    )),
+                },
+            )
+        })?;
+
+        Ok(DescribeStackSetOperationOutput {
+            stack_set_operation: Some(stack_set_operation(stack_set, operation)),
+        })
     }
 }

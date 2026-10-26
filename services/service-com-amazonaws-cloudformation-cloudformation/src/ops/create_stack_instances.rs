@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStackInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStackInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStackInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: deploys one stack per target account and Region pair from the stack set's
+//! template — the stack instance a `ListStackInstances` / `DescribeStackInstance` read
+//! reports — and records the StackSet operation whose `OperationId` it answers, which
+//! `DescribeStackSetOperation` monitors.
 //!
 //! ## Shape of an operation
 //!
@@ -121,6 +116,71 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::stack_sets::{
+    detailed_status, instance_status, new_instance_stack_name, operation_action,
+    operation_status, StoredStackInstance,
+};
+use crate::state::{status, StoredStack};
+
+/// The target accounts a request names, by the member that names them.
+///
+/// "[Self-managed permissions] The account IDs of one or more Amazon Web Services accounts
+/// that you want to create stack instances in" / "[Service-managed permissions] The
+/// Organizations accounts in which to create stack instances": "You can specify Accounts
+/// or DeploymentTargets, but not both", and "you must specify at least one value for
+/// either".
+fn target_accounts(input: &CreateStackInstancesInput) -> Result<Vec<String>, String> {
+    let accounts = input.accounts.clone().unwrap_or_default();
+    let targets = input
+        .deployment_targets
+        .as_ref()
+        .map(|targets| targets.accounts.clone().unwrap_or_default())
+        .unwrap_or_default();
+    if !accounts.is_empty() && input.deployment_targets.is_some() {
+        return Err("You cannot specify both Accounts and DeploymentTargets".to_string());
+    }
+    // "The location of the accounts" an `AccountsUrl` names is an Amazon S3 object, which
+    // would have to be fetched over the network — this emulator makes no outbound
+    // connections, so a request naming one is refused rather than served with the accounts
+    // nobody read.
+    if input
+        .deployment_targets
+        .as_ref()
+        .is_some_and(|targets| targets.accounts_url.is_some())
+    {
+        return Err(
+            "DeploymentTargets.AccountsUrl names an Amazon S3 object this emulator does not \
+             read"
+                .to_string(),
+        );
+    }
+    let selected = if accounts.is_empty() { targets } else { accounts };
+    if selected.is_empty() {
+        return Err(
+            "You must specify at least one value for either Accounts or DeploymentTargets"
+                .to_string(),
+        );
+    }
+    Ok(selected)
+}
+
+/// One instance's stack, as the write block hands it to the provisioning walk that creates
+/// its resources in the services that own them.
+struct Deployment {
+    /// The stack the instance deploys, by id.
+    stack_id: String,
+    /// The target account the instance belongs to.
+    account: String,
+    /// The target Region the instance's stack lives in.
+    region: String,
+    /// The resources that stack's template declares, which the walk creates.
+    declared: Vec<crate::state::StoredResource>,
+    /// Why this service could not deploy the template at all, for an instance whose create
+    /// failed before any owning service was asked for a resource.
+    cannot_deploy: Option<String>,
+    /// The stack identity and tags CloudFormation gives each created resource.
+    provenance: crate::state::provisioning::StackProvenance,
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -195,18 +255,456 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStackInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStackInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no StackSet store to deploy from,
+            // so nothing was written and 501 is the only honest answer.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateStackInstances",
+            ));
+        };
+        let accounts =
+            target_accounts(&input).map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // "You must specify at least one value for Regions."
+        if input.regions.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "You must specify at least one value for Regions",
+            ));
+        }
+        // "Creates stack instances for the specified accounts, within the specified Amazon
+        // Web Services Regions": one instance per account and Region pair, so the PRODUCT of
+        // the two lists is what this request asks the store to hold — and both lists are the
+        // caller's. A product past the ceiling one StackSet's instances are bounded by is
+        // refused HERE, before the store is read at all, so no oversized request drives work
+        // under the store lock.
+        let requested = accounts.len().saturating_mul(input.regions.len());
+        if requested > crate::state::stack_sets::MAX_INSTANCES_PER_STACK_SET {
+            return Err(CreateStackInstancesErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Limit for stack instances exceeded: no more than {} stack \
+                         instances can exist in one StackSet",
+                        crate::state::stack_sets::MAX_INSTANCES_PER_STACK_SET
+                    )),
+                },
+            )
+            .into());
+        }
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        // "The operation ID also functions as an idempotency token": the caller's when it
+        // named one, otherwise the one CloudFormation assigns the operation.
+        let operation_id = input
+            .operation_id
+            .clone()
+            .unwrap_or_else(crate::state::new_operation_id);
+
+        // What the stack set says every instance deploys, read under a short lock so the
+        // caller-sized template is processed below it rather than while every other
+        // CloudFormation request waits.
+        let (stack_set_id, stack_set_name, template_body, parameters, capabilities, tags) = {
+            let mut store = state.lock();
+            store.settle(now);
+            let stack_set = store
+                .resolve_stack_set(&region, &input.stack_set_name)
+                .ok_or_else(|| {
+                    CreateStackInstancesErrorModeled::StackSetNotFoundException(
+                        StackSetNotFoundException {
+                            message: Some(crate::state::stack_set_does_not_exist(
+                                &input.stack_set_name,
+                            )),
+                        },
+                    )
+                })?;
+            // "Only one operation can be performed for a stack set at a given time."
+            if stack_set.operation_in_progress() {
+                return Err(
+                    CreateStackInstancesErrorModeled::OperationInProgressException(
+                        OperationInProgressException {
+                            message: Some(
+                                "Another operation is currently in progress for this StackSet. \
+                                 Only one operation can be performed for a stack set at a given \
+                                 time."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // "The specified operation ID already exists": the same id names the operation
+            // that already ran, so this request is not performed a second time.
+            if stack_set.operation(&operation_id).is_some() {
+                return Err(
+                    CreateStackInstancesErrorModeled::OperationIdAlreadyExistsException(
+                        OperationIdAlreadyExistsException {
+                            message: Some(format!(
+                                "Operation id {operation_id} already exists"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // "Creates stack instances for the specified accounts, within the specified
+            // Amazon Web Services Regions": the store holds at most
+            // `MAX_INSTANCES_PER_STACK_SET` instances per StackSet, so the write past that
+            // ceiling is refused on the modelled channel rather than reclaiming an instance
+            // underneath it. The request's own product was bounded before the lock, so
+            // everything below it is bounded too.
+            let already = stack_set.instances.len();
+            if already.saturating_add(requested)
+                > crate::state::stack_sets::MAX_INSTANCES_PER_STACK_SET
+            {
+                return Err(CreateStackInstancesErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "Limit for stack instances exceeded: no more than {} stack \
+                             instances can exist in one StackSet",
+                            crate::state::stack_sets::MAX_INSTANCES_PER_STACK_SET
+                        )),
+                    },
+                )
+                .into());
+            }
+            // "A stack instance refers to a stack in a specific account and Region", and an
+            // account and Region pair carries at most ONE instance of a StackSet: a pair the
+            // StackSet already holds an instance for is not a second instance to deploy, so
+            // the request is refused on the modelled channel rather than leaving the stack
+            // the first instance deployed behind with nothing pointing at it. The pairs the
+            // StackSet holds are indexed in ONE pass, so this costs one lookup per requested
+            // pair rather than a scan per pair.
+            let held: ::std::collections::BTreeSet<(&str, &str)> = stack_set
+                .instances
+                .iter()
+                .map(|instance| (instance.account.as_str(), instance.region.as_str()))
+                .collect();
+            for account in &accounts {
+                for target_region in &input.regions {
+                    if held.contains(&(account.as_str(), target_region.as_str())) {
+                        return Err(
+                            CreateStackInstancesErrorModeled::InvalidOperationException(
+                                InvalidOperationException {
+                                    message: Some(format!(
+                                        "Stack instance in account {account} and Region \
+                                         {target_region} already exists"
+                                    )),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                }
+            }
+            // "The specified operation isn't valid": a stack set with no template declares
+            // nothing for an instance to deploy, so there is no stack to create.
+            let Some(template_body) = stack_set.template_body.clone() else {
+                return Err(CreateStackInstancesErrorModeled::InvalidOperationException(
+                    InvalidOperationException {
+                        message: Some(format!(
+                            "StackSet {} has no template to deploy",
+                            stack_set.stack_set_name
+                        )),
+                    },
+                )
+                .into());
+            };
+            // Each instance is a STACK of this store too, so the same ceiling a
+            // `CreateStack` is held to bounds a deployment's stacks: the product of the
+            // accounts and the Regions is the caller's to choose, and the write past the
+            // ceiling across every Region is refused on the modelled channel rather than
+            // reclaiming a caller's stack underneath it.
+            if store.live_stack_count().saturating_add(requested)
+                > crate::state::MAX_LIVE_STACKS
+            {
+                return Err(CreateStackInstancesErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "Limit for stacks exceeded: no more than {} stacks can exist in \
+                             this account",
+                            crate::state::MAX_LIVE_STACKS
+                        )),
+                    },
+                )
+                .into());
+            }
+            for target_region in &input.regions {
+                if store
+                    .live_stacks(target_region)
+                    .count()
+                    .saturating_add(accounts.len())
+                    > crate::state::MAX_STACKS
+                {
+                    return Err(CreateStackInstancesErrorModeled::LimitExceededException(
+                        LimitExceededException {
+                            message: Some(format!(
+                                "Limit for stacks exceeded: no more than {} stacks can exist \
+                                 in this account and Region",
+                                crate::state::MAX_STACKS
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            }
+            (
+                stack_set.stack_set_id.clone(),
+                stack_set.stack_set_name.clone(),
+                template_body,
+                stack_set.parameters.clone(),
+                stack_set.capabilities.clone(),
+                stack_set.tags.clone(),
+            )
+        };
+
+        // "To override the current value for a parameter, include the parameter and specify
+        // its value": the instance deploys the stack set's parameters with the request's
+        // overrides applied, and reports as its `ParameterOverrides` exactly the parameters
+        // the request named — "a list of parameters from the StackSet template whose values
+        // have been overridden in this stack instance".
+        let merged =
+            crate::state::merged_parameters(&parameters, input.parameter_overrides.as_deref())
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        let named: Vec<String> = input
+            .parameter_overrides
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|supplied| supplied.parameter_key.clone())
+            .collect();
+        let declared_overrides: Vec<crate::state::StoredParameter> = merged
+            .iter()
+            .filter(|parameter| named.contains(&parameter.key))
+            .cloned()
+            .collect();
+        let overrides = crate::state::parameters_in_force(&template_body, merged);
+        // Applying the template's transforms is caller-sized work, so it happens HERE,
+        // between the two locks, and once for every instance this request deploys.
+        let processed_template = crate::state::template::process(&template_body);
+
+        // What a `Fn::ImportValue` in the stack set's template resolves against, per TARGET
+        // Region: a stack instance's template resolves its imports against the Region the
+        // instance is deployed IN, the way any other stack of that Region does. Read under
+        // ONE short lock, before any template is evaluated, so the evaluations below happen
+        // with the store UNLOCKED.
+        let exports_by_region: ::std::collections::BTreeMap<
+            String,
+            ::std::collections::BTreeMap<String, String>,
+        > = {
+            let mut store = state.lock();
+            store.settle(now);
+            input
+                .regions
+                .iter()
+                .map(|target_region| {
+                    (target_region.clone(), store.exported_values(target_region))
+                })
+                .collect()
+        };
+
+        // Each instance's stack: created in the TARGET Region, from the stack set's
+        // template, and answered while its create is still in progress — exactly as
+        // `CreateStack` answers one. Built and EVALUATED off the store lock, for the same
+        // reason `CreateStack` evaluates its template off it: reading a caller-sized body is
+        // work the request paid for, and no other CloudFormation request should wait on it.
+        let no_exports = ::std::collections::BTreeMap::new();
+        let mut prepared: Vec<(StoredStack, String, String, Option<String>)> = Vec::new();
+        for account in &accounts {
+            for target_region in &input.regions {
+                let stack_name = new_instance_stack_name(&stack_set_name);
+                let mut stack = StoredStack::new_processed(
+                    crate::state::new_stack_id(target_region, &stack_name),
+                    stack_name,
+                    Some(template_body.clone()),
+                    processed_template.clone(),
+                    now,
+                );
+                stack.region = target_region.clone();
+                stack.parameters = overrides.clone();
+                stack.capabilities = capabilities.clone();
+                stack.tags = tags.clone();
+                let exports = exports_by_region.get(target_region).unwrap_or(&no_exports);
+                let cannot_deploy = stack.deploy_template(exports).err();
+                stack.begin_transition(
+                    now,
+                    status::CREATE_IN_PROGRESS,
+                    status::CREATE_COMPLETE,
+                    Some(operation_id.clone()),
+                    Some(operation_id.clone()),
+                );
+                if let Some(reason) = cannot_deploy.clone() {
+                    stack.fail_pending_transition(status::CREATE_FAILED, reason);
+                }
+                prepared.push((stack, account.clone(), target_region.clone(), cannot_deploy));
+            }
+        }
+        // What these instances would bring into the account, counted off the deployments
+        // themselves: the resources of one instance's template, once per instance.
+        let declared_resources: usize = prepared
+            .iter()
+            .map(|(stack, _, _, _)| stack.current_resource_count())
+            .sum();
+
+        let mut deployments: Vec<Deployment> = Vec::new();
+        {
+            let mut store = state.lock();
+            // Re-asserted under the WRITING lock rather than trusted from the read above:
+            // between the two another request may have taken the stack set away, and an
+            // instance of a stack set the store no longer holds would be a stack nothing
+            // points at.
+            if store.resolve_stack_set(&region, &stack_set_id).is_none() {
+                return Err(CreateStackInstancesErrorModeled::StackSetNotFoundException(
+                    StackSetNotFoundException {
+                        message: Some(crate::state::stack_set_does_not_exist(
+                            &input.stack_set_name,
+                        )),
+                    },
+                )
+                .into());
+            }
+            // The same ceiling `CreateStack` holds a create to, counted in RESOURCES rather
+            // than stacks: CloudFormation meters concurrent resources per account, and this
+            // deployment is what would bring every instance's resources into it. Checked in
+            // the SAME lock block as the writes below, so a refused request writes nothing
+            // and two concurrent requests cannot both pass it.
+            if store.current_resource_count().saturating_add(declared_resources)
+                > crate::state::MAX_CONCURRENT_RESOURCES
+            {
+                return Err(CreateStackInstancesErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "Limit for concurrent resources exceeded: no more than {} \
+                             resources can exist across the stacks of this account",
+                            crate::state::MAX_CONCURRENT_RESOURCES
+                        )),
+                    },
+                )
+                .into());
+            }
+            for (stack, account, target_region, cannot_deploy) in prepared {
+                let stack_id = stack.stack_id.clone();
+                let declared = stack.current_resources().to_vec();
+                let provenance = stack.provenance();
+                store.stacks.push(stack);
+
+                let mut instance = StoredStackInstance::new(
+                    account.clone(),
+                    target_region.clone(),
+                    operation_id.clone(),
+                );
+                instance.stack_id = Some(stack_id.clone());
+                // "RUNNING: The operation in the specified account and Region is
+                // currently in progress" — the instance is answered mid-deployment and
+                // reaches `CURRENT`/`SUCCEEDED` when the operation concludes.
+                instance.detailed_status = detailed_status::RUNNING.to_string();
+                instance.parameter_overrides = declared_overrides.clone();
+                if let Some(stack_set) = store.resolve_stack_set_mut(&region, &stack_set_id) {
+                    stack_set.record_instance(instance);
+                }
+                deployments.push(Deployment {
+                    stack_id,
+                    account,
+                    region: target_region,
+                    declared,
+                    cannot_deploy,
+                    provenance,
+                });
+            }
+            // The operation this call started, which `DescribeStackSetOperation` monitors:
+            // RUNNING now, SUCCEEDED once the clock makes its conclusion due.
+            if let Some(stack_set) = store.resolve_stack_set_mut(&region, &stack_set_id) {
+                let mut operation = crate::state::stack_sets::StoredStackSetOperation::running(
+                    operation_id.clone(),
+                    operation_action::CREATE,
+                    now,
+                );
+                operation.preferences = input
+                    .operation_preferences
+                    .as_ref()
+                    .map(crate::state::stack_sets::stored_preferences);
+                operation.administration_role_arn = stack_set.administration_role_arn.clone();
+                operation.execution_role_name = stack_set.execution_role_name.clone();
+                stack_set.record_operation(operation);
+            }
+        }
+
+        // Each instance's resources are created in the services that own them, in the
+        // instance's own Region, with the store unlocked — every one of those calls reaches
+        // another service's handler, which takes that service's lock.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStackInstances"))
+        // An instance whose stack could not be deployed is recorded as the FAILURE it is:
+        // "FAILED: The operation in the specified account and Region failed", and the
+        // instance is not up to date with its StackSet. The operation's own conclusion
+        // follows from them below, so nothing reports a success for work that did not
+        // complete.
+        let mut failed_instances: Vec<(String, String, String)> = Vec::new();
+        for deployment in deployments {
+            let materialised = crate::state::provisioning::reconcile(
+                ctx,
+                &deployment.region,
+                &deployment.provenance,
+                deployment.declared,
+                &[],
+            )
+            .await;
+            let mut store = state.lock();
+            // A template this service could not deploy at all failed the create before any
+            // service was asked for a resource, and that reason is the instance's.
+            let mut failure_reason = deployment.cannot_deploy;
+            if let Some(stack) = store.resolve_mut(&deployment.region, &deployment.stack_id) {
+                stack.schedule_resource_events(&materialised.transitions);
+                stack.record_materialised_resources(materialised.resources);
+                if let Some(failure) = materialised.failure {
+                    stack.fail_transition(
+                        ::std::time::SystemTime::now(),
+                        status::CREATE_FAILED,
+                        failure.clone(),
+                    );
+                    failure_reason = Some(failure);
+                }
+            }
+            if let Some(reason) = failure_reason {
+                failed_instances.push((deployment.account, deployment.region, reason));
+            }
+        }
+
+        if !failed_instances.is_empty() {
+            let mut store = state.lock();
+            if let Some(stack_set) = store.resolve_stack_set_mut(&region, &stack_set_id) {
+                for (account, target_region, reason) in &failed_instances {
+                    if let Some(instance) = stack_set
+                        .instances
+                        .iter_mut()
+                        .find(|held| held.is_in(account, target_region))
+                    {
+                        // "OUTDATED: The stack isn't currently up to date with the StackSet
+                        // because the associated stack failed during a CreateStackSet or
+                        // UpdateStackSet operation."
+                        instance.status = instance_status::OUTDATED.to_string();
+                        instance.detailed_status = detailed_status::FAILED.to_string();
+                        instance.status_reason = Some(reason.clone());
+                    }
+                }
+                let failed = i32::try_from(failed_instances.len()).unwrap_or(i32::MAX);
+                if let Some(operation) = stack_set
+                    .operations
+                    .iter_mut()
+                    .find(|held| held.operation_id == operation_id)
+                {
+                    // "FAILED: The operation exceeded the specified failure tolerance",
+                    // which for an operation with no tolerance stated is any failure at all.
+                    if let Some(pending) = operation.pending.as_mut() {
+                        pending.status = operation_status::FAILED.to_string();
+                        pending.failed_stack_instances_count = Some(failed);
+                        pending.status_reason = failed_instances
+                            .first()
+                            .map(|(_, _, reason)| reason.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(CreateStackInstancesOutput {
+            operation_id: Some(operation_id),
+        })
     }
 }

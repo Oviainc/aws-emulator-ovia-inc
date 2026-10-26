@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListStackInstanceResourceDrifts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListStackInstanceResourceDrifts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListStackInstanceResourceDrifts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the per-resource drift rows ONE drift-detection operation
+//! recorded for ONE stack instance of a StackSet — read back by the account, the Region
+//! and the `OperationId` of the detection that produced them, so no other detection's
+//! findings are ever served for an id.
 //!
 //! ## Shape of an operation
 //!
@@ -107,6 +102,43 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::stack_sets::{StoredInstanceDrift, StoredResourceDrift};
+
+/// One recorded resource drift as the modelled `StackInstanceResourceDriftsSummary`.
+///
+/// Every member is read off the row the detection wrote and the instance it covered.
+/// `PropertyDifferences` is reported only where there are any: they "will be present only
+/// for resources whose `StackInstanceResourceDriftStatus` is `MODIFIED`".
+fn resource_drift_summary(
+    instance: &StoredInstanceDrift,
+    stored: &StoredResourceDrift,
+) -> StackInstanceResourceDriftsSummary {
+    StackInstanceResourceDriftsSummary {
+        stack_id: instance.stack_id.clone(),
+        logical_resource_id: stored.logical_resource_id.clone(),
+        physical_resource_id: stored.physical_resource_id.clone(),
+        // "Context key-value pairs in cases where a resource's logical and physical IDs
+        // aren't enough to uniquely identify that resource": this service identifies every
+        // resource it records by those two, so there is no further context to report.
+        physical_resource_id_context: None,
+        resource_type: stored.resource_type.clone(),
+        property_differences: crate::state::non_empty(
+            stored
+                .differences
+                .iter()
+                .map(|difference| PropertyDifference {
+                    property_path: difference.property_path.clone(),
+                    expected_value: difference.expected_value.clone(),
+                    actual_value: difference.actual_value.clone(),
+                    difference_type: difference.difference_type.clone(),
+                })
+                .collect(),
+        ),
+        stack_resource_drift_status: stored.drift_status.clone(),
+        // "Time at which the stack instance drift detection operation was initiated."
+        timestamp: crate::state::timestamp(instance.checked_at),
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -178,18 +210,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListStackInstanceResourceDrifts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStackInstanceResourceDriftsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListStackInstanceResourceDrifts"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no StackSet store to read a
+            // detection's findings from, so this answers 501 rather than an empty,
+            // truthful-looking list.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListStackInstanceResourceDrifts",
+            ));
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a status transition the
+        // clock had already made due, which was owed whether or not anyone called.
+        store.settle(::std::time::SystemTime::now());
+
+        let stack_set = store
+            .resolve_stack_set(&region, &input.stack_set_name)
+            .ok_or_else(|| {
+                ListStackInstanceResourceDriftsErrorModeled::StackSetNotFoundException(
+                    StackSetNotFoundException {
+                        message: Some(crate::state::stack_set_does_not_exist(
+                            &input.stack_set_name,
+                        )),
+                    },
+                )
+            })?;
+        // "The specified ID refers to an operation that doesn't exist": `OperationId` here
+        // is "the unique ID of the drift operation", so an id this stack set holds no
+        // operation for — and one that names an operation of another action — is the
+        // modelled `OperationNotFoundException`, never the previous operation's summaries.
+        let operation = stack_set
+            .operation(&input.operation_id)
+            .filter(|operation| {
+                operation.action == crate::state::stack_sets::operation_action::DETECT_DRIFT
+            })
+            .ok_or_else(|| {
+                ListStackInstanceResourceDriftsErrorModeled::OperationNotFoundException(
+                    OperationNotFoundException {
+                        message: Some(
+                            crate::state::drift_operation_does_not_exist().to_string(),
+                        ),
+                    },
+                )
+            })?;
+        // "The specified stack instance doesn't exist": the account and Region pair is what
+        // identifies one instance of a stack set, so a pair this stack set holds none for is
+        // the modelled refusal.
+        if stack_set
+            .instance(&input.stack_instance_account, &input.stack_instance_region)
+            .is_none()
+        {
+            return Err(
+                ListStackInstanceResourceDriftsErrorModeled::StackInstanceNotFoundException(
+                    StackInstanceNotFoundException {
+                        message: Some(crate::state::stack_instance_does_not_exist(
+                            &input.stack_instance_account,
+                            &input.stack_instance_region,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "Returns drift information for resources in a stack instance": the rows THIS
+        // operation recorded for THAT instance. An operation that recorded none for it —
+        // one that is still running, or one of another action entirely — has no row to
+        // report, which is the empty list.
+        let summaries: Vec<StackInstanceResourceDriftsSummary> = operation
+            .instance_drifts
+            .iter()
+            .filter(|instance| {
+                instance.account == input.stack_instance_account
+                    && instance.region == input.stack_instance_region
+            })
+            .flat_map(|instance| {
+                instance
+                    .resources
+                    .iter()
+                    // "The resource drift status of the stack instance": a request that
+                    // names statuses reports only the rows carrying one of them, and one
+                    // that names none reports every row.
+                    .filter(|resource| {
+                        input
+                            .stack_instance_resource_drift_statuses
+                            .as_deref()
+                            .is_none_or(|wanted| wanted.contains(&resource.drift_status))
+                    })
+                    .map(|resource| resource_drift_summary(instance, resource))
+            })
+            .collect();
+
+        // `@paginated(inputToken: NextToken, outputToken: NextToken, items: Summaries,
+        // pageSize: MaxResults)`: one response carries at most the `MaxResults` the request
+        // asks for, and the token resumes just past that page.
+        let max_results = input.max_results.and_then(|max| usize::try_from(max).ok());
+        let (summaries, next_token) = crate::state::paginate_at_most(
+            crate::state::PageOf::StackInstanceResourceDrifts,
+            summaries,
+            input.next_token.as_deref(),
+            max_results,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        Ok(ListStackInstanceResourceDriftsOutput {
+            // Always present, as an empty element where the detection recorded no row the
+            // request selects: a client reading the list sees the same shape either way.
+            summaries: Some(summaries),
+            next_token,
+        })
     }
 }

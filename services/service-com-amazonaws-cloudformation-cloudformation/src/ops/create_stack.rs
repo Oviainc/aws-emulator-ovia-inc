@@ -528,6 +528,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // outputs, which `DescribeStacks` reports once the create completes. A template
         // this service cannot deploy at all answers the reason here, and the create below
         // ends in the modelled CREATE_FAILED with it.
+        //
+        // What a `Fn::ImportValue` resolves against is read first, under its own short
+        // lock: the exported output values in force in this Region. Evaluating the
+        // caller-sized template then happens off that lock, as everything above it does.
+        let exports = {
+            let mut store = state.lock();
+            store.settle(now);
+            store.exported_values(&region)
+        };
         let cannot_deploy = if transform_failure.is_some() {
             // Processing the template failed, so the create never reached the stage that
             // provisions anything: the stack declares no resource and no output, and the
@@ -535,7 +544,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stack.deploy_nothing();
             None
         } else {
-            stack.deploy_template().err()
+            stack.deploy_template(&exports).err()
         };
 
         // The store lock is taken for the write and RELEASED at the end of this block:

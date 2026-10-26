@@ -91,6 +91,7 @@ fn provisioned(template_body: &str, parameters: &[(&str, &str)]) -> BTreeMap<Str
     let resources = BTreeMap::new();
     let mappings = Value::Null;
     let conditions = Value::Null;
+    let imports = BTreeMap::new();
     let scope = Scope {
         stack: StackScope {
             region: REGION,
@@ -102,6 +103,7 @@ fn provisioned(template_body: &str, parameters: &[(&str, &str)]) -> BTreeMap<Str
         resources: &resources,
         mappings: &mappings,
         conditions: &conditions,
+        imports: &imports,
     };
     let mut budget = Budget::new();
     template::provision(&parsed.0, &scope, &mut budget)

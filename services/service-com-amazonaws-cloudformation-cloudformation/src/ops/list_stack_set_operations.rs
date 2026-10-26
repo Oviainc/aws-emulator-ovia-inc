@@ -84,7 +84,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::stack_sets::{StoredOperationPreferences, StoredStackSetOperation};
+use crate::state::stack_sets::{preferences_view, StoredStackSetOperation};
 
 /// One stored operation as the modelled `StackSetOperationSummary`.
 ///
@@ -107,20 +107,6 @@ fn stack_set_operation_summary(stored: &StoredStackSetOperation) -> StackSetOper
             }
         }),
         operation_preferences: stored.preferences.as_ref().map(preferences_view),
-    }
-}
-
-/// The stored preferences as the modelled `StackSetOperationPreferences`: the members the
-/// request that started the operation named, and nothing else.
-fn preferences_view(stored: &StoredOperationPreferences) -> StackSetOperationPreferences {
-    StackSetOperationPreferences {
-        region_concurrency_type: stored.region_concurrency_type.clone(),
-        region_order: crate::state::non_empty(stored.region_order.clone()),
-        failure_tolerance_count: stored.failure_tolerance_count,
-        failure_tolerance_percentage: stored.failure_tolerance_percentage,
-        max_concurrent_count: stored.max_concurrent_count,
-        max_concurrent_percentage: stored.max_concurrent_percentage,
-        concurrency_mode: stored.concurrency_mode.clone(),
     }
 }
 

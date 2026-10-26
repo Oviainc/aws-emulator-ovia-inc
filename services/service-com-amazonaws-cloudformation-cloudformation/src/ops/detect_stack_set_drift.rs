@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetectStackSetDrift
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetectStackSetDrift`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetectStackSetDrift::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: starts one drift detection over every stack instance of a StackSet —
+//! asking the service that owns each of an instance's resources what that resource IS now
+//! — and answers the `OperationId` `DescribeStackSetOperation` monitors and
+//! `ListStackInstanceResourceDrifts` reads the per-resource findings back by.
 //!
 //! ## Shape of an operation
 //!
@@ -102,6 +97,20 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::stack_sets::{
+    drift_detection_status, operation_action, operation_status, StoredInstanceDrift,
+    StoredResourceDrift, StoredStackSetOperation,
+};
+use crate::state::{drift, StoredResource};
+
+/// One stack instance as this detection has to read it: where its stack lives, and the
+/// resources that stack deployed.
+struct Target {
+    account: String,
+    region: String,
+    stack_id: String,
+    resources: Vec<StoredResource>,
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -173,18 +182,223 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetectStackSetDrift` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetectStackSetDriftErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no StackSet to detect drift on, so
+            // this answers 501 rather than an operation id nothing stands behind.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DetectStackSetDrift",
+            ));
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        // "If you don't specify an operation ID, the SDK generates one automatically": the
+        // caller's token when it named one, otherwise the one CloudFormation assigns.
+        let operation_id = input
+            .operation_id
+            .clone()
+            .unwrap_or_else(crate::state::new_operation_id);
+
+        // The store lock is taken for the write and RELEASED at the end of this block: the
+        // reads that ask each owning service what an instance's resource IS now run after
+        // it, and each of those reaches another service's own handler.
+        let (stack_set_id, targets) = {
+            let mut store = state.lock();
+            store.settle(now);
+
+            let stack_set = store
+                .resolve_stack_set(&region, &input.stack_set_name)
+                .ok_or_else(|| {
+                    DetectStackSetDriftErrorModeled::StackSetNotFoundException(
+                        StackSetNotFoundException {
+                            message: Some(crate::state::stack_set_does_not_exist(
+                                &input.stack_set_name,
+                            )),
+                        },
+                    )
+                })?;
+            // "Only one operation can be performed for a stack set at a given time."
+            if stack_set.operation_in_progress() {
+                return Err(
+                    DetectStackSetDriftErrorModeled::OperationInProgressException(
+                        OperationInProgressException {
+                            message: Some(
+                                "Another operation is currently in progress for this StackSet. \
+                                 Only one operation can be performed for a stack set at a given \
+                                 time."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // "Detect drift on a StackSet. When CloudFormation performs drift detection on
+            // a StackSet, it performs drift detection on the stack associated with each
+            // stack instance in the StackSet": a StackSet with no instance has no stack to
+            // detect drift on, which is the modelled `InvalidOperationException` rather
+            // than an operation that checked nothing.
+            if stack_set.instances.is_empty() {
+                return Err(DetectStackSetDriftErrorModeled::InvalidOperationException(
+                    InvalidOperationException {
+                        message: Some(format!(
+                            "StackSet {} has no stack instances to detect drift on",
+                            stack_set.stack_set_name
+                        )),
+                    },
+                )
+                .into());
+            }
+            let stack_set_id = stack_set.stack_set_id.clone();
+            // Every instance that HAS a stack: an instance a deployment never produced a
+            // stack for has no actual configuration to compare, so there is nothing to read
+            // for it.
+            let instances: Vec<(String, String, String)> = stack_set
+                .instances
+                .iter()
+                .filter_map(|instance| {
+                    let stack_id = instance.stack_id.clone()?;
+                    Some((instance.account.clone(), instance.region.clone(), stack_id))
+                })
+                .collect();
+            let targets: Vec<Target> = instances
+                .into_iter()
+                .map(|(account, instance_region, stack_id)| {
+                    let resources = store
+                        .resolve(&instance_region, &stack_id)
+                        .map(|stack| {
+                            stack
+                                .resources
+                                .iter()
+                                .map(|deployed| deployed.resource.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Target {
+                        account,
+                        region: instance_region,
+                        stack_id,
+                        resources,
+                    }
+                })
+                .collect();
+
+            // The operation is answered while it is still RUNNING, and
+            // `DescribeStackSetOperation` is what a caller monitors it with: "Use this
+            // operation id with DescribeStackSetOperation to monitor the progress of the
+            // drift detection operation."
+            if let Some(stack_set) = store.resolve_stack_set_mut(&region, &stack_set_id) {
+                let mut operation = StoredStackSetOperation::running(
+                    operation_id.clone(),
+                    operation_action::DETECT_DRIFT,
+                    now,
+                );
+                operation.preferences = input
+                    .operation_preferences
+                    .as_ref()
+                    .map(crate::state::stack_sets::stored_preferences);
+                operation.administration_role_arn = stack_set.administration_role_arn.clone();
+                operation.execution_role_name = stack_set.execution_role_name.clone();
+                stack_set.record_operation(operation);
+            }
+            (stack_set_id, targets)
+        };
+
+        // The comparison itself: one read per covered resource, from the service that owns
+        // it, in the Region the INSTANCE's stack lives in — where its resources are.
+        let mut instance_drifts: Vec<StoredInstanceDrift> = Vec::with_capacity(targets.len());
+        let mut failures = 0_usize;
+        for target in &targets {
+            let detected = drift::detect(ctx, &target.region, &target.resources).await;
+            if detected.failure.is_some() {
+                failures += 1;
+            }
+            let resources = target
+                .resources
+                .iter()
+                .zip(&detected.results)
+                .map(|(resource, result)| StoredResourceDrift {
+                    logical_resource_id: result.logical_id.clone(),
+                    physical_resource_id: Some(resource.physical_resource_id.clone())
+                        .filter(|id| !id.is_empty()),
+                    resource_type: resource.resource_type.clone(),
+                    drift_status: result.status.clone(),
+                    differences: result
+                        .detail
+                        .as_ref()
+                        .map(|detail| detail.differences.clone())
+                        .unwrap_or_default(),
+                })
+                .collect();
+            instance_drifts.push(StoredInstanceDrift {
+                account: target.account.clone(),
+                region: target.region.clone(),
+                stack_id: target.stack_id.clone(),
+                drift_status: detected.stack_drift_status().to_string(),
+                checked_at: now,
+                resources,
+            });
+            // The detection really read each of that instance's resources, so what it found
+            // is the instance's STACK's drift result as well: the same check, recorded where
+            // every read of that stack reports it.
+            let mut store = state.lock();
+            store.apply_drift_result(
+                &target.stack_id,
+                now,
+                detected.stack_drift_status(),
+                &detected.results,
+            );
+        }
+
+        // How the detection as a whole CONCLUDED, which is what
+        // `DescribeStackSetOperation` reports as its `DriftDetectionStatus`. What it FOUND
+        // is on the instances it covered, where every read of the stack set counts it from.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetectStackSetDrift"))
+        // "COMPLETED: The drift detection operation completed without failing on any stack
+        // instances"; "PARTIAL_SUCCESS: The drift detection operation completed without
+        // exceeding the failure tolerance for the operation"; "FAILED: The drift detection
+        // operation exceeded the specified failure tolerance."
+        let detection_status = if failures == 0 {
+            drift_detection_status::COMPLETED
+        } else if failures < instance_drifts.len() {
+            drift_detection_status::PARTIAL_SUCCESS
+        } else {
+            drift_detection_status::FAILED
+        };
+
+        let mut store = state.lock();
+        if let Some(stack_set) = store.resolve_stack_set_mut(&region, &stack_set_id) {
+            if let Some(operation) = stack_set
+                .operations
+                .iter_mut()
+                .find(|held| held.operation_id == operation_id)
+            {
+                operation.drift_detection_status = Some(detection_status.to_string());
+                operation.instance_drifts = instance_drifts;
+                // The operation's conclusion is what makes the detection the stack set's,
+                // and it is still a moment away: a caller monitoring it straight after this
+                // call sees it RUNNING. "FAILED: The operation exceeded the specified
+                // failure tolerance" — a detection that could not be carried out for ANY
+                // instance it covered concludes the operation as failed rather than
+                // reporting a success beside a failed detection.
+                if let Some(pending) = operation.pending.as_mut() {
+                    if detection_status == drift_detection_status::FAILED {
+                        pending.status = operation_status::FAILED.to_string();
+                    }
+                    pending.failed_stack_instances_count = Some(count_of(failures));
+                    pending.due_at =
+                        ::std::time::SystemTime::now() + crate::state::DRIFT_DETECTION_DELAY;
+                }
+            }
+        }
+
+        Ok(DetectStackSetDriftOutput {
+            operation_id: Some(operation_id),
+        })
     }
+}
+
+/// A count as the modelled `*StackInstancesCount` integers report it, saturating rather
+/// than wrapping: every one of them is `@range(min: 0)`.
+fn count_of(count: usize) -> i32 {
+    i32::try_from(count).unwrap_or(i32::MAX)
 }

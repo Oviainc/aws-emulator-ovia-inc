@@ -164,6 +164,12 @@ pub struct StackRevision<'a> {
     pub template: &'a template::Template,
     pub parameters: &'a [StoredParameter],
     pub deployed: &'a [DeployedResource],
+    /// The exported output values the stack's `Fn::ImportValue` references resolved to
+    /// when its template was deployed. Both sides of the comparison resolve imports
+    /// against the SAME map, for the reason both resolve references against the same
+    /// deployed resources: what an import would change is not something this comparison
+    /// claims to know.
+    pub imports: &'a BTreeMap<String, String>,
 }
 
 /// The resource-level changes that applying `submitted` with `submitted_parameters` to the
@@ -216,6 +222,7 @@ pub fn computed_changes(
         resources: &deployed,
         mappings: &current.template.mappings,
         conditions: &current.template.conditions,
+        imports: current.imports,
     };
     let after_parameters = parameter_values(submitted, submitted_parameters);
     let after_types = submitted.parameter_types();
@@ -226,6 +233,7 @@ pub fn computed_changes(
         resources: &deployed,
         mappings: &submitted.mappings,
         conditions: &submitted.conditions,
+        imports: current.imports,
     };
     let declared_resources: BTreeSet<&str> = submitted
         .resources

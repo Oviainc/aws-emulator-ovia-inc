@@ -48,6 +48,7 @@ fn deployed(body: &str, parameters: &[(&str, &str)]) -> Vec<StoredResource> {
     let mut budget = Budget::new();
     let parameter_types = declared.parameter_types();
     let no_resources: BTreeMap<String, StoredResource> = BTreeMap::new();
+    let no_imports: BTreeMap<String, String> = BTreeMap::new();
     // The deployment's scope before any resource is resolved, exactly as
     // `StoredStack::deploy_template` builds it.
     let declaring = Scope {
@@ -57,6 +58,7 @@ fn deployed(body: &str, parameters: &[(&str, &str)]) -> Vec<StoredResource> {
         resources: &no_resources,
         mappings: &declared.mappings,
         conditions: &declared.conditions,
+        imports: &no_imports,
     };
     let mut resources = template::provision(&declared, &declaring, &mut budget);
     let by_logical_id: BTreeMap<String, StoredResource> = resources

@@ -36,15 +36,18 @@
 //! created with — its template, parameters, capabilities, tags, roles, permission model and
 //! deployment settings — so `DescribeStackSet` reports exactly what that call stated rather
 //! than anything recomputed from a request. Its instances and the operations performed on it
-//! are written by `CreateStackInstances`, `UpdateStackSet` and `DeleteStackInstances`, each
-//! of which is still a scaffold answering 501 with its own stub issue. The ONE way a record
-//! enters this
+//! are written by `CreateStackInstances` and by `DetectStackSetDrift`, which records the
+//! operation a drift detection runs as and what that detection found; the remaining writers
+//! (`UpdateStackSet`, `DeleteStackInstances`) are still scaffolds answering 501, each with
+//! its own stub issue. The ONE way a record enters this
 //! store is
 //! [`crate::state::ComAmazonawsCloudformationCloudformationState::record_stack_set`], so
 //! those writers — and the suites that cover the reads over records no wire call can create
 //! yet — go through it rather than reaching into the vector.
 
 use std::time::SystemTime;
+
+use super::StoredParameter;
 
 /// How many stack sets this store holds, oldest reclaimed first.
 ///
@@ -102,7 +105,7 @@ pub const DEFAULT_EXECUTION_ROLE_NAME: &str = "AWSCloudFormationStackSetExecutio
 /// "COMPLETED: The drift detection operation completed without failing on any stack
 /// instances" (`smithy_query(query="shape", shape="StackSetDriftDetectionDetails",
 /// member="DriftDetectionStatus")`).
-pub const DRIFT_DETECTION_COMPLETED: &str = "COMPLETED";
+pub const DRIFT_DETECTION_COMPLETED: &str = drift_detection_status::COMPLETED;
 
 /// The model's `StackInstanceStatus`: the instance's status "in terms of its synchronization
 /// with its associated stack set" (`smithy_query(query="shape",
@@ -186,6 +189,30 @@ pub mod filter_name {
     pub const DRIFT_STATUS: &str = "DRIFT_STATUS";
 }
 
+/// The model's `StackSetStatus`: "the status of the StackSet"
+/// (`smithy_query(query="shape", shape="StackSetStatus")`).
+///
+/// An alias of [`status`], kept so a caller reading a StackSet's own status spells which
+/// status it means.
+pub use status as stack_set_status;
+
+/// The model's `StackSetDriftDetectionStatus`: "the status of the StackSet drift detection
+/// operation" (`smithy_query(query="shape", shape="StackSetDriftDetectionStatus")`).
+pub mod drift_detection_status {
+    /// "COMPLETED: The drift detection operation completed without failing on any stack
+    /// instances."
+    pub const COMPLETED: &str = "COMPLETED";
+    /// "FAILED: The drift detection operation exceeded the specified failure tolerance."
+    pub const FAILED: &str = "FAILED";
+    /// "PARTIAL_SUCCESS: The drift detection operation completed without exceeding the
+    /// failure tolerance for the operation."
+    pub const PARTIAL_SUCCESS: &str = "PARTIAL_SUCCESS";
+    /// "IN_PROGRESS: The drift detection operation is currently being performed."
+    pub const IN_PROGRESS: &str = "IN_PROGRESS";
+    /// "STOPPED: The user has canceled the drift detection operation."
+    pub const STOPPED: &str = "STOPPED";
+}
+
 /// Mint a stack set's id: `<name>:<uuid>`, the form CloudFormation gives a stack set, with
 /// the same 8-4-4-4-12 identifier every other id this service mints carries.
 pub fn new_stack_set_id(stack_set_name: &str) -> String {
@@ -201,6 +228,95 @@ pub fn new_stack_set_arn(region: &str, stack_set_id: &str) -> String {
         region,
         &format!("stackset/{stack_set_id}"),
     )
+}
+
+/// The stack NAME CloudFormation gives the stack ONE instance of a stack set deploys:
+/// `StackSet-<StackSetName>-<uuid>`, the form a stack instance's stack carries.
+///
+/// Minted per instance, like every other identifier this service hands out, so two
+/// instances of one stack set never address the same stack.
+pub fn new_instance_stack_name(stack_set_name: &str) -> String {
+    format!(
+        "StackSet-{stack_set_name}-{}",
+        super::new_identifier(stack_set_name)
+    )
+}
+
+/// The `StackSetOperationPreferences` a request supplied, as stored.
+///
+/// The ONE projection of the wire shape onto the record, so every operation that starts a
+/// stack-set operation stores the same thing — and [`preferences_view`] is its inverse, so
+/// a read reports exactly the members the request named.
+pub fn stored_preferences(
+    supplied: &crate::ops::types::StackSetOperationPreferences,
+) -> StoredOperationPreferences {
+    StoredOperationPreferences {
+        region_concurrency_type: supplied.region_concurrency_type.clone(),
+        region_order: supplied.region_order.clone().unwrap_or_default(),
+        failure_tolerance_count: supplied.failure_tolerance_count,
+        failure_tolerance_percentage: supplied.failure_tolerance_percentage,
+        max_concurrent_count: supplied.max_concurrent_count,
+        max_concurrent_percentage: supplied.max_concurrent_percentage,
+        concurrency_mode: supplied.concurrency_mode.clone(),
+    }
+}
+
+/// The stored preferences as the modelled `StackSetOperationPreferences`: the members the
+/// request that started the operation named, and nothing else.
+pub fn preferences_view(
+    stored: &StoredOperationPreferences,
+) -> crate::ops::types::StackSetOperationPreferences {
+    crate::ops::types::StackSetOperationPreferences {
+        region_concurrency_type: stored.region_concurrency_type.clone(),
+        region_order: crate::state::non_empty(stored.region_order.clone()),
+        failure_tolerance_count: stored.failure_tolerance_count,
+        failure_tolerance_percentage: stored.failure_tolerance_percentage,
+        max_concurrent_count: stored.max_concurrent_count,
+        max_concurrent_percentage: stored.max_concurrent_percentage,
+        concurrency_mode: stored.concurrency_mode.clone(),
+    }
+}
+
+/// One resource of one stack instance, as the drift detection that covered it found it —
+/// every member `StackInstanceResourceDriftsSummary` reports.
+#[derive(Debug, Clone)]
+pub struct StoredResourceDrift {
+    /// `LogicalResourceId`: "the logical name of the resource specified in the template".
+    pub logical_resource_id: String,
+    /// `PhysicalResourceId`: "the name or unique identifier that corresponds to a physical
+    /// instance ID of a resource supported by CloudFormation".
+    pub physical_resource_id: Option<String>,
+    /// `ResourceType`: the resource's type as the template declares it.
+    pub resource_type: String,
+    /// `StackResourceDriftStatus`: "the drift status of the resource in a stack instance"
+    /// ([`crate::state::resource_drift_status`]).
+    pub drift_status: String,
+    /// `PropertyDifferences`: "status of the actual configuration of the resource compared
+    /// to its expected configuration", present "only for resources whose
+    /// `StackInstanceResourceDriftStatus` is `MODIFIED`".
+    pub differences: Vec<super::drift::PropertyDiff>,
+}
+
+/// What one drift detection found for ONE stack instance of a stack set.
+///
+/// `ListStackInstanceResourceDrifts` reads these back by the account, the Region and the
+/// `OperationId` of the detection that produced them, so the per-resource rows of one
+/// detection are never served for another detection's id.
+#[derive(Debug, Clone)]
+pub struct StoredInstanceDrift {
+    /// The target account the instance is deployed in.
+    pub account: String,
+    /// The target Region the instance is deployed in.
+    pub region: String,
+    /// `StackId`: "the ID of the stack instance" the detection read.
+    pub stack_id: String,
+    /// The instance's own `DriftStatus`, which is what the per-resource rows add up to.
+    pub drift_status: String,
+    /// `Timestamp`: "time at which the stack instance drift detection operation was
+    /// initiated".
+    pub checked_at: SystemTime,
+    /// One row per resource the detection covered, in the order it checked them.
+    pub resources: Vec<StoredResourceDrift>,
 }
 
 /// `AutoDeployment` as the call that set it supplied: "whether StackSets automatically
@@ -312,6 +428,31 @@ impl StoredStackSet {
         }
     }
 
+    /// The operation this stack set holds under `operation_id`, if it holds one.
+    pub fn operation(&self, operation_id: &str) -> Option<&StoredStackSetOperation> {
+        self.operations
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+    }
+
+    /// Whether an operation on this stack set is still RUNNING — the state
+    /// `OperationInProgressException` reports ("another operation is currently in progress
+    /// for this StackSet").
+    pub fn operation_in_progress(&self) -> bool {
+        self.operations.iter().any(|operation| {
+            operation.status == operation_status::RUNNING
+                || operation.status == operation_status::QUEUED
+                || operation.status == operation_status::STOPPING
+        })
+    }
+
+    /// The instance deployed in `account` and `region`, if this stack set holds one.
+    pub fn instance(&self, account: &str, region: &str) -> Option<&StoredStackInstance> {
+        self.instances
+            .iter()
+            .find(|instance| instance.is_in(account, region))
+    }
+
     /// Whether `name_or_id` addresses this stack set in `region`: `StackSetName` is "the
     /// name or unique ID of the StackSet", and nothing outside that Region is addressable.
     pub fn is_addressed_by(&self, region: &str, name_or_id: &str) -> bool {
@@ -402,10 +543,46 @@ impl StoredStackSet {
     }
 
     /// Materialise every status transition the clock has made due on this stack set's
-    /// operations.
+    /// operations, and the per-instance state each operation that CONCLUDES owes.
+    ///
+    /// An operation's conclusion is what makes its outcome the stack set's: the instances a
+    /// deployment created are up to date with the stack set once it finishes, and a drift
+    /// detection's findings become the instances' own drift results — which is what
+    /// [`drift_detection_details`] counts the stack set's `StackSetDriftDetectionDetails`
+    /// off, so "information about drift operations in-progress isn't included" holds without
+    /// a second copy of the aggregate.
     pub fn settle(&mut self, now: SystemTime) {
-        for operation in &mut self.operations {
-            operation.settle(now);
+        for index in 0..self.operations.len() {
+            if !self.operations[index].settle(now) {
+                continue;
+            }
+            let concluded = self.operations[index].clone();
+            if concluded.status != operation_status::SUCCEEDED {
+                continue;
+            }
+            for drift in &concluded.instance_drifts {
+                if let Some(instance) = self
+                    .instances
+                    .iter_mut()
+                    .find(|held| held.is_in(&drift.account, &drift.region))
+                {
+                    instance.drift_status = drift.drift_status.clone();
+                    instance.last_drift_check = Some(drift.checked_at);
+                }
+            }
+            // A deployment that completed leaves the instances it acted on up to date with
+            // the stack set: "CURRENT: The stack is currently up to date with the StackSet."
+            if concluded.action == operation_action::CREATE
+                || concluded.action == operation_action::UPDATE
+            {
+                for instance in &mut self.instances {
+                    if instance.last_operation_id != concluded.operation_id {
+                        continue;
+                    }
+                    instance.status = instance_status::CURRENT.to_string();
+                    instance.detailed_status = detailed_status::SUCCEEDED.to_string();
+                }
+            }
         }
     }
 }
@@ -483,6 +660,25 @@ pub struct StoredStackSetOperation {
     /// `OperationPreferences`: what the request that started the operation asked for, absent
     /// for one that asked for nothing.
     pub preferences: Option<StoredOperationPreferences>,
+    /// `AdministrationRoleARN`: "the Amazon Resource Name (ARN) of the IAM role used to
+    /// perform this StackSet operation", as the stack set carried it when the operation
+    /// started.
+    pub administration_role_arn: Option<String>,
+    /// `ExecutionRoleName`: "the name of the IAM execution role used to create or update
+    /// the StackSet", likewise.
+    pub execution_role_name: Option<String>,
+    /// `RetainStacks`: "for StackSet operations of action type DELETE, specifies whether to
+    /// remove the stack instances from the specified StackSet, but doesn't delete the
+    /// stacks".
+    pub retain_stacks: Option<bool>,
+    /// `StackSetDriftDetectionDetails$DriftDetectionStatus` as this operation's own
+    /// detection concluded — [`drift_detection_status`]. "This information will only be
+    /// present for StackSet operations whose Action type is DETECT_DRIFT", so it is `None`
+    /// for every other action and for a detection that has not concluded.
+    pub drift_detection_status: Option<String>,
+    /// What a `DETECT_DRIFT` operation found, one entry per stack instance it covered —
+    /// which is what `ListStackInstanceResourceDrifts` reads back by this operation's id.
+    pub instance_drifts: Vec<StoredInstanceDrift>,
     /// The terminal status the clock owes this operation, until [`Self::settle`]
     /// materialises it.
     pub pending: Option<PendingOperationOutcome>,
@@ -506,6 +702,11 @@ impl StoredStackSetOperation {
             status_reason: None,
             failed_stack_instances_count: None,
             preferences: None,
+            administration_role_arn: None,
+            execution_role_name: None,
+            retain_stacks: None,
+            drift_detection_status: None,
+            instance_drifts: Vec::new(),
             pending: Some(PendingOperationOutcome {
                 status: operation_status::SUCCEEDED.to_string(),
                 status_reason: None,
@@ -515,20 +716,24 @@ impl StoredStackSetOperation {
         }
     }
 
-    /// Materialise the status transition the clock has already made due, if any.
+    /// Materialise the status transition the clock has already made due, if any, and answer
+    /// whether this call is the one that applied it.
     ///
     /// Only ever applies a transition whose due instant has passed, so it reports what was
     /// owed at `now` even if nobody had called. The operation ENDING is what stamps
-    /// `EndTimestamp`, so that instant is the one that was due rather than now.
-    pub fn settle(&mut self, now: SystemTime) {
+    /// `EndTimestamp`, so that instant is the one that was due rather than now. The answer
+    /// is what lets the stack set apply, exactly once, what the operation's CONCLUSION owes
+    /// the instances and the stack set itself.
+    pub fn settle(&mut self, now: SystemTime) -> bool {
         if self.pending.as_ref().is_none_or(|owed| owed.due_at > now) {
-            return;
+            return false;
         }
         let owed = self.pending.take().expect("checked just above");
         self.status = owed.status;
         self.status_reason = owed.status_reason;
         self.failed_stack_instances_count = owed.failed_stack_instances_count;
         self.end = Some(owed.due_at);
+        true
     }
 }
 
@@ -629,6 +834,10 @@ pub struct StoredStackInstance {
     /// organizational unit (OU) IDs" the instance was deployed to, absent for a stack set
     /// with self-managed permissions.
     pub organizational_unit_id: Option<String>,
+    /// `ParameterOverrides`: "a list of parameters from the StackSet template whose values
+    /// have been overridden in this stack instance" — what the deployment that created it
+    /// supplied, which is also what the instance's own stack was deployed with.
+    pub parameter_overrides: Vec<StoredParameter>,
 }
 
 impl StoredStackInstance {
@@ -651,6 +860,7 @@ impl StoredStackInstance {
             last_drift_check: None,
             last_operation_id: last_operation_id.into(),
             organizational_unit_id: None,
+            parameter_overrides: Vec::new(),
         }
     }
 

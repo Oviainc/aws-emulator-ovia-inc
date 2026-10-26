@@ -504,6 +504,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )),
                 ),
             };
+        // What a `Fn::ImportValue` in the stack's template resolved to: the plan's two
+        // sides resolve imports against it, the way they resolve references against the
+        // resources the stack has deployed.
+        let previous_imports = target_stack_id
+            .as_deref()
+            .and_then(|stack_id| store.resolve(&region, stack_id))
+            .map(|stack| stack.imports.clone())
+            .unwrap_or_default();
         // "Whether to reuse the template that's associated with the stack to create the
         // change set." Either way the body and its processed stage travel together, which
         // `zip` is what expresses: a submitted body ALWAYS has the stage computed for it
@@ -618,6 +626,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         template: &current,
                         parameters: &previous_parameters,
                         deployed: &deployed,
+                        imports: &previous_imports,
                     }
                 }),
                 &submitted,

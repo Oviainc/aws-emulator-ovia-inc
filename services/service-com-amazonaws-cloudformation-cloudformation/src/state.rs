@@ -34,6 +34,18 @@
 //! stack, which
 //! [`ComAmazonawsCloudformationCloudformationState::settle`] enforces.
 //!
+//! ## Cross-stack references
+//!
+//! A stack's outputs that declare an `Export` name are what `ListExports` reports, and the
+//! other half of that relation lives on the stack too: [`StoredStack::imports`] is the
+//! exported output values the stack's deployed template resolved a `Fn::ImportValue`
+//! against, so [`ComAmazonawsCloudformationCloudformationState::importing_stacks`] is what
+//! `ListImports` answers from and
+//! [`ComAmazonawsCloudformationCloudformationState::export_in_use`] is what keeps an export
+//! another stack still imports from being removed. Both halves are derived from the stacks
+//! themselves rather than from an index of their own, so an export and its importers appear
+//! when a deployment completes and go when the stack goes.
+//!
 //! ## Bounds
 //!
 //! Every growth site in this store is bounded, because a caller chooses both how many
@@ -678,6 +690,17 @@ pub mod status {
     /// The terminal status of a rollback that could not remove what the failed create had
     /// already made.
     pub const ROLLBACK_FAILED: &str = "ROLLBACK_FAILED";
+    /// The status a stack takes while the changes of an UPDATE that failed are being put
+    /// back: "if the stack update fails, CloudFormation rolls back the stack to the previous
+    /// stack configuration".
+    pub const UPDATE_ROLLBACK_IN_PROGRESS: &str = "UPDATE_ROLLBACK_IN_PROGRESS";
+    /// The terminal status of an update that was rolled back.
+    pub const UPDATE_ROLLBACK_COMPLETE: &str = "UPDATE_ROLLBACK_COMPLETE";
+    /// The terminal status of an update rollback that could not put a resource back: "a
+    /// stack goes into the UPDATE_ROLLBACK_FAILED state when CloudFormation can't roll back
+    /// all changes after a failed stack update" (`ContinueUpdateRollback`), which is the one
+    /// status that operation resumes from.
+    pub const UPDATE_ROLLBACK_FAILED: &str = "UPDATE_ROLLBACK_FAILED";
     /// The status of a stack a `CREATE` change set brought into existence and nothing has
     /// executed yet (`CreateChangeSetInput$ChangeSetType`: "If you create a change set for
     /// a new stack, CloudFormation creates a stack with a unique stack ID, but no template
@@ -1067,6 +1090,12 @@ pub struct PendingStatus {
 pub struct PendingDeployment {
     pub resources: Vec<StoredResource>,
     pub outputs: Vec<StoredOutput>,
+    /// The exported output values this deployment resolved its template's
+    /// `Fn::ImportValue` references against, keyed by export name
+    /// ([`template::imported_export_names`]). This is the stack's entry in the cross-stack
+    /// reference index `ListImports` reports, so it takes effect when the deployment
+    /// completes, exactly as the resources and outputs beside it do.
+    pub imports: BTreeMap<String, String>,
     /// The wait conditions the template being deployed declares
     /// ([`wait_conditions::declared`]), each with the resources whose creation waits on
     /// it. Computed where the template is READ, outside the store lock;
@@ -1236,6 +1265,11 @@ pub struct StoredStack {
     /// a resource whose declaration waits on resource signals
     /// ([`template::waits_for_resource_signals`]) has an operation that acts on one.
     pub signals: ::std::collections::VecDeque<StoredResourceSignal>,
+    /// The exported output values this stack's deployed template IMPORTS, keyed by export
+    /// name: "the value of an output exported by another stack", resolved once where the
+    /// template was deployed. A stack that imports an export is what `ListImports` reports
+    /// for that export name, and what makes the exporting stack's export in use.
+    pub imports: BTreeMap<String, String>,
     /// `Stack$DriftInformation`'s `StackDriftStatus`: the stack-level result the last
     /// drift detection that COMPLETED against this stack left ([`drift`]).
     /// [`DRIFT_STATUS_NOT_CHECKED`] until one has, since "NOT_CHECKED: CloudFormation
@@ -1318,6 +1352,7 @@ impl StoredStack {
             events: ::std::collections::VecDeque::new(),
             retained_event_properties_bytes: 0,
             signals: ::std::collections::VecDeque::new(),
+            imports: BTreeMap::new(),
             drift_status: DRIFT_STATUS_NOT_CHECKED.to_string(),
             drift_last_check: None,
         }
@@ -1404,7 +1439,14 @@ impl StoredStack {
     /// reason — never in a completion reporting work nothing performed. A stack with no
     /// template at all is not such a case: there is nothing to deploy, which is what a
     /// stack a `CREATE` change set created is for.
-    pub fn deploy_template(&mut self) -> Result<(), String> {
+    /// `exports` is the exported output values in force in the account and Region this
+    /// deployment runs in, keyed by export name: what its template's `Fn::ImportValue`
+    /// references resolve against. The deployment keeps the ones it really imported, which
+    /// is the stack's entry in the index `ListImports` reports.
+    pub fn deploy_template(
+        &mut self,
+        exports: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
         if self.template_body.is_none() {
             // No template to deploy: the stack a CREATE change set created, which carries
             // no resources until that change set is executed.
@@ -1453,6 +1495,7 @@ impl StoredStack {
             resources: &no_resources,
             mappings: &declared.mappings,
             conditions: &declared.conditions,
+            imports: exports,
         };
         let mut resources = template::provision(&declared, &scope, &mut budget);
         let by_logical_id: BTreeMap<String, StoredResource> = resources
@@ -1567,9 +1610,21 @@ impl StoredStack {
         // deployment's walk over these resources is ordered by it ([`timeline`]), and a
         // read must not re-parse a caller-sized body under the store lock.
         let dependencies = template::direct_dependencies(&declared);
+        // Which exports this template really IMPORTS, resolved against the same scope its
+        // resources and outputs were: only those names belong on the stack, and they are
+        // what makes each exporting stack's export in use.
+        let imported = template::imported_export_names(&declared, &scope, &mut budget);
+        let imports: BTreeMap<String, String> = imported
+            .into_iter()
+            .filter_map(|name| {
+                let value = exports.get(&name)?.clone();
+                Some((name, value))
+            })
+            .collect();
         self.pending_deployment = Some(PendingDeployment {
             resources,
             outputs,
+            imports,
             wait_conditions,
             // Nothing has been acted on yet: this deployment has not started.
             attempted: BTreeSet::new(),
@@ -1661,6 +1716,12 @@ impl StoredStack {
         let resources = self.current_resources();
         let parameter_types = declared.parameter_types();
         let no_resources = BTreeMap::new();
+        // The imports of the deployment in flight where there is one, else the stack's own:
+        // an output reading an imported value reports the value THAT deployment resolved.
+        let imports = match &self.pending_deployment {
+            Some(deployment) => deployment.imports.clone(),
+            None => self.imports.clone(),
+        };
         let mut budget = template::Budget::new();
         let outputs = self.evaluated_outputs(
             &declared,
@@ -1675,6 +1736,7 @@ impl StoredStack {
                 resources: &no_resources,
                 mappings: &declared.mappings,
                 conditions: &declared.conditions,
+                imports: &imports,
             },
             &resources,
             &mut budget,
@@ -2153,6 +2215,9 @@ impl StoredStack {
             self.resources =
                 disposed_resources(&self.resources, deployed, due_at, &finished_at);
             self.outputs.clear();
+            // A stack that holds no resources any more consumes nobody's export: it drops
+            // out of the cross-stack reference index `ListImports` reports.
+            self.imports.clear();
         } else if let Some(deployment) = deployed {
             // The create or update completed: the template it deployed is what the stack
             // reports resources and outputs for from here on.
@@ -2163,6 +2228,9 @@ impl StoredStack {
                 &finished_at,
             );
             self.outputs = deployment.outputs;
+            // The imports the template that finished deploying resolved are the stack's
+            // from here on: that is what makes it an importer of those exports.
+            self.imports = deployment.imports;
             // The relation the template that finished deploying describes is the stack's
             // from here on, which is what its deletion walks.
             self.resource_dependencies = deployment.dependencies;
@@ -2648,6 +2716,119 @@ impl StoredStack {
             started_at: now,
             due_at: now + STATUS_TRANSITION_DELAY,
             operation_id,
+            client_request_token,
+        });
+    }
+
+    /// Open the ROLLBACK a failed UPDATE owes: the stack moves to
+    /// `UPDATE_ROLLBACK_IN_PROGRESS` carrying the reason the update failed, and
+    /// `UPDATE_ROLLBACK_COMPLETE` becomes due one [`STATUS_TRANSITION_DELAY`] later.
+    ///
+    /// CloudFormation "rolls back the stack to the previous stack configuration" when an
+    /// update fails: the update's own deployment is ABANDONED here — a failed update
+    /// installs nothing, so the stack keeps the resources, outputs and template stage its
+    /// last completed operation left — and putting back in the owning services what the
+    /// update had already changed there is the caller's to drive
+    /// ([`provisioning::reconcile`], against the resources in force) before the terminal
+    /// status falls due. A revert an owning service refuses leaves the stack
+    /// `UPDATE_ROLLBACK_FAILED` ([`Self::fail_transition`]), which is the state
+    /// `ContinueUpdateRollback` resumes from.
+    ///
+    /// Called AFTER [`Self::fail_transition`] recorded the update's own failure, so the
+    /// event log carries the failure and then the rollback, in that order.
+    pub fn begin_update_rollback(&mut self, now: SystemTime, reason: String) {
+        // A failed update deploys nothing: its pending deployment is what the stack would
+        // have reported had it completed, and the rollback is the decision not to.
+        self.pending_deployment = None;
+        self.status = status::UPDATE_ROLLBACK_IN_PROGRESS.to_string();
+        self.status_reason = Some(reason.clone());
+        let operation_id = self
+            .last_operation
+            .as_ref()
+            .map(|operation| operation.operation_id.clone());
+        let client_request_token = self.client_request_token.clone();
+        self.record_event(
+            now,
+            status::UPDATE_ROLLBACK_IN_PROGRESS,
+            Some(reason.clone()),
+            operation_id.clone(),
+            client_request_token.clone(),
+        );
+        self.pending = Some(PendingStatus {
+            status: status::UPDATE_ROLLBACK_COMPLETE.to_string(),
+            // The rolled-back stack keeps the reason its update failed for: that is what
+            // the stack is in this status for.
+            status_reason: Some(reason),
+            started_at: now,
+            due_at: now + STATUS_TRANSITION_DELAY,
+            operation_id,
+            client_request_token,
+        });
+    }
+
+    /// Resume the rollback of a failed update, leaving the resources `skipped` names
+    /// exactly as the failed update made them.
+    ///
+    /// `ContinueUpdateRollback` "continues rolling back a stack from
+    /// UPDATE_ROLLBACK_FAILED to UPDATE_ROLLBACK_COMPLETE state", and of the resources the
+    /// request names: "CloudFormation sets the status of the specified resources to
+    /// UPDATE_COMPLETE and continues to roll back the stack" — so each skipped resource
+    /// keeps the configuration it has and takes that status, with the event that says so,
+    /// while the stack moves to `UPDATE_ROLLBACK_IN_PROGRESS` and reaches
+    /// `UPDATE_ROLLBACK_COMPLETE` one [`STATUS_TRANSITION_DELAY`] later.
+    pub fn continue_update_rollback(
+        &mut self,
+        now: SystemTime,
+        skipped: &[String],
+        client_request_token: Option<String>,
+    ) {
+        let operation_id = new_operation_id();
+        self.last_operation = Some(StoredOperation {
+            operation_id: operation_id.clone(),
+            operation_type: operation_type::UPDATE_STACK.to_string(),
+        });
+        self.client_request_token = client_request_token.clone();
+        self.status = status::UPDATE_ROLLBACK_IN_PROGRESS.to_string();
+        self.status_reason = None;
+        self.record_event(
+            now,
+            status::UPDATE_ROLLBACK_IN_PROGRESS,
+            None,
+            Some(operation_id.clone()),
+            client_request_token.clone(),
+        );
+        for logical_id in skipped {
+            let Some(deployed) = self
+                .resources
+                .iter_mut()
+                .find(|deployed| &deployed.resource.logical_id == logical_id)
+            else {
+                continue;
+            };
+            deployed.status = resource_status::UPDATE_COMPLETE.to_string();
+            deployed.status_timestamp = now;
+            deployed.status_reason = None;
+            let logical_resource_id = deployed.resource.logical_id.clone();
+            let physical_resource_id = deployed.resource.physical_resource_id.clone();
+            let resource_type = deployed.resource.resource_type.clone();
+            self.record_resource_event(
+                now,
+                &logical_resource_id,
+                Some(physical_resource_id),
+                &resource_type,
+                resource_status::UPDATE_COMPLETE,
+                None,
+                None,
+                Some(operation_id.clone()),
+                client_request_token.clone(),
+            );
+        }
+        self.pending = Some(PendingStatus {
+            status: status::UPDATE_ROLLBACK_COMPLETE.to_string(),
+            status_reason: None,
+            started_at: now,
+            due_at: now + STATUS_TRANSITION_DELAY,
+            operation_id: Some(operation_id),
             client_request_token,
         });
     }
@@ -3595,6 +3776,79 @@ impl ComAmazonawsCloudformationCloudformationState {
         self.stack_sets.push(stack_set);
     }
 
+    /// [`Self::resolve_stack_set`], for a caller that mutates the stack set it resolved.
+    pub fn resolve_stack_set_mut(
+        &mut self,
+        region: &str,
+        name_or_id: &str,
+    ) -> Option<&mut stack_sets::StoredStackSet> {
+        self.stack_sets
+            .iter_mut()
+            .find(|stack_set| stack_set.is_addressed_by(region, name_or_id))
+    }
+
+    /// The exported output values in force in one Region, keyed by export name.
+    ///
+    /// "Lists all exported output values in the account and Region in which you call this
+    /// action" — the same set `ListExports` reports, which is what a deployment's
+    /// `Fn::ImportValue` resolves against: every output of a LIVE stack of that Region that
+    /// declares an `Export` name and whose value this service evaluated. An export name two
+    /// stacks publish cannot happen on AWS ("export names must be unique within a Region"),
+    /// and the first stack that entered the store wins here.
+    pub fn exported_values(&self, region: &str) -> BTreeMap<String, String> {
+        let mut exports = BTreeMap::new();
+        for stack in self.live_stacks(region) {
+            for output in &stack.outputs {
+                let (Some(name), Some(value)) = (&output.export_name, &output.value) else {
+                    continue;
+                };
+                exports
+                    .entry(name.clone())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+        exports
+    }
+
+    /// The names of the live stacks of one Region that IMPORT `export_name`, in creation
+    /// order.
+    ///
+    /// `ListImports` "lists all stacks that are importing an exported output value": a
+    /// stack imports one when the template it deployed resolved a `Fn::ImportValue` for
+    /// that name ([`StoredStack::imports`]), so it enters the index when its deployment
+    /// completes and leaves it when the stack is deleted.
+    pub fn importing_stacks(&self, region: &str, export_name: &str) -> Vec<String> {
+        self.live_stacks(region)
+            .filter(|stack| stack.imports.contains_key(export_name))
+            .map(|stack| stack.stack_name.clone())
+            .collect()
+    }
+
+    /// The first export of `stack` another live stack of the same Region still imports, as
+    /// the pair (export name, importing stack name).
+    ///
+    /// An exported output value that is in use cannot be removed: deleting the stack that
+    /// publishes it would break every stack that imported it, which CloudFormation refuses.
+    /// `None` when nothing the stack exports is imported, which is when its deletion is
+    /// free to proceed.
+    pub fn export_in_use(&self, stack: &StoredStack) -> Option<(String, String)> {
+        for output in &stack.outputs {
+            let Some(export_name) = &output.export_name else {
+                continue;
+            };
+            let importer = self
+                .live_stacks(&stack.region)
+                .find(|other| {
+                    other.stack_id != stack.stack_id && other.imports.contains_key(export_name)
+                })
+                .map(|other| other.stack_name.clone());
+            if let Some(importer) = importer {
+                return Some((export_name.clone(), importer));
+            }
+        }
+        None
+    }
+
     /// The drift detection with this `StackDriftDetectionId`, if this store still holds it.
     pub fn drift_detection(&self, detection_id: &str) -> Option<&StoredDriftDetection> {
         self.drift_detections
@@ -4442,6 +4696,17 @@ pub fn stack_cannot_be_updated(stack_id: &str, status: &str) -> String {
     format!("Stack:{stack_id} is in {status} state and can not be updated.")
 }
 
+/// The message CloudFormation answers when `ContinueUpdateRollback` names a stack whose
+/// current status is not one a rollback can be continued from.
+///
+/// "A stack goes into the UPDATE_ROLLBACK_FAILED state when CloudFormation can't roll back
+/// all changes after a failed stack update": that is the one state the rollback can be
+/// continued from, and the refusal names the stack and the state it really is in — the same
+/// form [`stack_cannot_be_updated`] words the analogous refusal in.
+pub fn stack_cannot_be_continued(stack_id: &str, status: &str) -> String {
+    format!("Stack:{stack_id} is in {status} state and can not be continued.")
+}
+
 /// `Err(message)` for a request that names a change set by NAME without the stack it
 /// belongs to.
 ///
@@ -4511,6 +4776,42 @@ pub fn stack_set_template_does_not_exist(name_or_id: &str) -> String {
 /// modelled `ErrorMessage` length (1..255) for any `StackSetName` a caller can send.
 pub fn stack_set_does_not_exist(name_or_id: &str) -> String {
     format!("StackSet {name_or_id} not found")
+}
+
+/// The message CloudFormation answers when a stack set holds no operation under the
+/// `OperationId` a request named.
+///
+/// Built from what the request named, the way [`stack_set_does_not_exist`] is.
+pub fn stack_set_operation_does_not_exist(operation_id: &str) -> String {
+    format!("StackSet operation {operation_id} not found")
+}
+
+/// The message CloudFormation answers when a request for a stack instance's RESOURCE
+/// DRIFTS names an operation that is not a drift detection of that stack set.
+///
+/// `ListStackInstanceResourceDriftsInput$OperationId` is "the unique ID of the drift
+/// operation", so what does not exist is a DRIFT operation under that id — an id the stack
+/// set holds no operation for, and an id that names an operation of another action. The
+/// text carries no variable part.
+pub fn drift_operation_does_not_exist() -> &'static str {
+    "Detect Drift Operation not found"
+}
+
+/// The message CloudFormation answers when a stack set holds no instance in the account
+/// and Region a request named — the pair that identifies one instance of a stack set.
+pub fn stack_instance_does_not_exist(account: &str, region: &str) -> String {
+    format!("Stack instance in account {account} and Region {region} not found")
+}
+
+/// The refusal a request to remove an exported output value that is still IMPORTED is
+/// answered with: the export, and the stack that is still consuming it.
+///
+/// An export in use cannot be removed — deleting the stack that publishes it would break
+/// the reference every importing stack resolved — so the refusal names both halves of the
+/// reference, taken from the request's own stack and from this store's index, never from
+/// any one recorded run.
+pub fn export_in_use_message(export_name: &str, importing_stack_name: &str) -> String {
+    format!("Export {export_name} cannot be deleted as it is in use by {importing_stack_name}")
 }
 
 /// The message answered when a request names a `LogicalResourceId` the stack it selected
@@ -4597,6 +4898,10 @@ pub enum PageOf {
     StackSetOperationSummaries,
     /// `ListGeneratedTemplates`'s `Summaries`.
     TemplateSummaries,
+    /// `ListImports`'s `Imports`.
+    Imports,
+    /// `ListStackInstanceResourceDrifts`'s `Summaries`.
+    StackInstanceResourceDrifts,
 }
 
 impl PageOf {
@@ -4619,6 +4924,8 @@ impl PageOf {
             Self::StackInstanceSummaries => "stack-instance-summaries",
             Self::StackSetOperationSummaries => "stack-set-operation-summaries",
             Self::TemplateSummaries => "template-summaries",
+            Self::Imports => "imports",
+            Self::StackInstanceResourceDrifts => "stack-instance-resource-drifts",
         }
     }
 }

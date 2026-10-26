@@ -33,6 +33,8 @@ mod client_request_tokens;
 mod cognito_resource_types;
 #[path = "all/content_delivery_stack_outputs.rs"]
 mod content_delivery_stack_outputs;
+#[path = "all/cross_stack_imports.rs"]
+mod cross_stack_imports;
 #[path = "all/drift_and_resource_reads.rs"]
 mod drift_and_resource_reads;
 #[path = "all/dynamic_references.rs"]
@@ -149,6 +151,8 @@ mod stack_resource_provisioning;
 mod stack_resources;
 #[path = "all/stack_role_trust.rs"]
 mod stack_role_trust;
+#[path = "all/stack_set_drift_lifecycle.rs"]
+mod stack_set_drift_lifecycle;
 #[path = "all/stack_set_lifecycle.rs"]
 mod stack_set_lifecycle;
 #[path = "all/stack_tag_propagation.rs"]
@@ -169,6 +173,8 @@ mod type_testing;
 mod unprovisioned_resources;
 #[path = "all/unrecognized_resource_types.rs"]
 mod unrecognized_resource_types;
+#[path = "all/update_rollback_recovery.rs"]
+mod update_rollback_recovery;
 #[path = "all/validate_template.rs"]
 mod validate_template;
 #[path = "all/waf_regional_ip_set_resources.rs"]

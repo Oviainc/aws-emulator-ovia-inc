@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeStackInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeStackInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeStackInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports ONE stack instance of a StackSet — the one in the account and
+//! Region the request names, which is the pair that identifies an instance — read off the
+//! record `CreateStackInstances` wrote, so this read and `ListStackInstances` cannot
+//! disagree about it.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +148,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeStackInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeStackInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeStackInstance"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no StackSet store to read the
+            // instance from, so this answers 501 rather than a description nothing stands
+            // behind.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DescribeStackInstance",
+            ));
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a status transition the
+        // clock had already made due — which is what moves an instance a deployment is
+        // still carrying out to `CURRENT`, and was owed whether or not anyone called.
+        store.settle(::std::time::SystemTime::now());
+
+        let stack_set = store
+            .resolve_stack_set(&region, &input.stack_set_name)
+            .ok_or_else(|| {
+                DescribeStackInstanceErrorModeled::StackSetNotFoundException(
+                    StackSetNotFoundException {
+                        message: Some(crate::state::stack_set_does_not_exist(
+                            &input.stack_set_name,
+                        )),
+                    },
+                )
+            })?;
+        let stored = stack_set
+            .instance(&input.stack_instance_account, &input.stack_instance_region)
+            .ok_or_else(|| {
+                DescribeStackInstanceErrorModeled::StackInstanceNotFoundException(
+                    StackInstanceNotFoundException {
+                        message: Some(crate::state::stack_instance_does_not_exist(
+                            &input.stack_instance_account,
+                            &input.stack_instance_region,
+                        )),
+                    },
+                )
+            })?;
+
+        Ok(DescribeStackInstanceOutput {
+            stack_instance: Some(StackInstance {
+                stack_set_id: Some(stack_set.stack_set_id.clone()),
+                region: Some(stored.region.clone()),
+                account: Some(stored.account.clone()),
+                stack_id: stored.stack_id.clone(),
+                parameter_overrides: crate::state::parameter_views(&stored.parameter_overrides),
+                status: Some(stored.status.clone()),
+                stack_instance_status: Some(StackInstanceComprehensiveStatus {
+                    detailed_status: Some(stored.detailed_status.clone()),
+                }),
+                status_reason: stored.status_reason.clone(),
+                organizational_unit_id: stored.organizational_unit_id.clone(),
+                drift_status: Some(stored.drift_status.clone()),
+                last_drift_check_timestamp: stored.last_drift_check.map(crate::state::timestamp),
+                last_operation_id: Some(stored.last_operation_id.clone()),
+            }),
+        })
     }
 }

@@ -217,6 +217,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (stack_id, region, declared, previous_resources, provenance) = {
             let mut store = state.lock();
             store.settle(now);
+            // What a `Fn::ImportValue` in the change set's template resolves against: the
+            // exported output values in force in the Region this request is signed for.
+            let exports = store.exported_values(&request_region);
 
             let change_set = store
                 .resolve_change_set(
@@ -372,7 +375,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // resources and outputs are computed from that body and the parameters in
             // force, and are reported once this operation completes — exactly as they are
             // for `CreateStack` and `UpdateStack`.
-            let cannot_deploy = stack.deploy_template().err();
+            let cannot_deploy = stack.deploy_template(&exports).err();
             // "After the call successfully completes, CloudFormation starts updating the
             // stack": a CREATE change set creates the stack it had left in
             // REVIEW_IN_PROGRESS, an UPDATE change set updates one that already exists —

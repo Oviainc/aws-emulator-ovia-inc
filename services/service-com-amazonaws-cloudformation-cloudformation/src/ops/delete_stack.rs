@@ -223,6 +223,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     input.stack_name
                 )));
             }
+            // An exported output value that another stack still IMPORTS cannot be removed:
+            // deleting the stack that publishes it would break the cross-stack reference
+            // the importing stack resolved, so CloudFormation refuses the call and the
+            // stack remains unchanged. The refusal names the export and the stack that is
+            // still consuming it — both read off this store's own index
+            // (`ListImports` reports the same relation), so the call succeeds again as
+            // soon as the last importer is gone.
+            if let Some((export_name, importing_stack_name)) = store.export_in_use(previous) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::export_in_use_message(&export_name, &importing_stack_name),
+                ));
+            }
             // "For stacks in the DELETE_FAILED state, a list of resource logical IDs that
             // are associated with the resources you want to retain." A stack in any other
             // state is refused, as CloudFormation refuses it; retaining a resource of a

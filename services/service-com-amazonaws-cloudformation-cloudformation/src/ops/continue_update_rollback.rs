@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ContinueUpdateRollback
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ContinueUpdateRollback`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ContinueUpdateRollback::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: resumes the rollback of a stack whose failed update could not be rolled
+//! back — re-declaring the resources in force in the services that own them, except the
+//! ones `ResourcesToSkip` names, which are left exactly as the failed update made them —
+//! so the stack reaches `UPDATE_ROLLBACK_COMPLETE`. A stack in any other status is
+//! refused rather than moved.
 //!
 //! ## Shape of an operation
 //!
@@ -111,6 +107,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{resource_status, status};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -180,18 +177,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ContinueUpdateRollback` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ContinueUpdateRollbackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ContinueUpdateRollback"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no stack to continue rolling back,
+            // and nothing was written.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ContinueUpdateRollback",
+            ));
+        };
+        // "ForceRollback and ResourcesToSkip are mutually exclusive. Specifying both in the
+        // same request returns a validation error."
+        let force_rollback = input.force_rollback.unwrap_or(false);
+        let named_to_skip = input
+            .resources_to_skip
+            .as_deref()
+            .is_some_and(|resources| !resources.is_empty());
+        if force_rollback && named_to_skip {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "You cannot specify both ForceRollback and ResourcesToSkip",
+            ));
+        }
+        // The rollback runs as the `RoleARN` it names, so a role CloudFormation cannot
+        // assume is refused before the stack is touched — the same check `UpdateStack`
+        // makes.
+        crate::state::refuse_unassumable_role(&*self.engine, input.role_arn.as_deref())?;
+        let now = ::std::time::SystemTime::now();
+        let request_region = crate::state::request_region(ctx.parts());
+
+        // The store lock is taken for the write and RELEASED at the end of this block: the
+        // calls that put the resources back run after it, and each of those reaches another
+        // service's own handler.
+        let (stack_id, region, declared, provenance) = {
+            let mut store = state.lock();
+            store.settle(now);
+
+            let Some(previous) = store
+                .resolve(&request_region, &input.stack_name)
+                .filter(|stack| stack.is_live())
+            else {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::stack_does_not_exist(&input.stack_name),
+                ));
+            };
+            // "A stack goes into the UPDATE_ROLLBACK_FAILED state when CloudFormation can't
+            // roll back all changes after a failed stack update": that is the one state a
+            // rollback can be continued from, so a stack in any other one is refused and
+            // left exactly where it is.
+            if previous.status != status::UPDATE_ROLLBACK_FAILED {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::stack_cannot_be_continued(
+                        &previous.stack_id,
+                        &previous.status,
+                    ),
+                ));
+            }
+            // "A client request token already exists": the token identifies ONE request, so
+            // one this stack has already run an operation under is the modelled refusal
+            // rather than a second rollback.
+            if let Some(token) = &input.client_request_token {
+                if previous
+                    .events
+                    .iter()
+                    .any(|event| event.client_request_token.as_deref() == Some(token.as_str()))
+                {
+                    return Err(
+                        ContinueUpdateRollbackErrorModeled::TokenAlreadyExistsException(
+                            TokenAlreadyExistsException {
+                                message: Some(format!(
+                                    "Token {token} already exists for stack {}",
+                                    previous.stack_id
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+            // "You can specify only resources that are in the UPDATE_FAILED state because a
+            // rollback failed", and `ForceRollback` is "this instead of listing each
+            // resource individually in ResourcesToSkip. Only resources that entered the
+            // UPDATE_FAILED state because a rollback failed are skipped" — so both spellings
+            // select from the SAME set, and a logical id outside it is refused rather than
+            // silently skipped.
+            let failed: Vec<String> = previous
+                .resources
+                .iter()
+                .filter(|deployed| deployed.status == resource_status::UPDATE_FAILED)
+                .map(|deployed| deployed.resource.logical_id.clone())
+                .collect();
+            let skipped: Vec<String> = if force_rollback {
+                failed.clone()
+            } else {
+                input.resources_to_skip.clone().unwrap_or_default()
+            };
+            if let Some(unexpected) = skipped
+                .iter()
+                .find(|logical_id| !failed.contains(logical_id))
+            {
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                    "ResourcesToSkip can only name resources in the {} state; [{unexpected}] \
+                     is not one of them",
+                    resource_status::UPDATE_FAILED
+                )));
+            }
+
+            let Some(stack) = store.resolve_mut(&request_region, &input.stack_name) else {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::stack_does_not_exist(&input.stack_name),
+                ));
+            };
+            if let Some(role_arn) = &input.role_arn {
+                // "CloudFormation always uses this role for all future operations on the
+                // stack."
+                stack.role_arn = Some(role_arn.clone());
+            }
+            stack.continue_update_rollback(
+                now,
+                &skipped,
+                input.client_request_token.clone(),
+            );
+            // What the rollback still has to put back in the owning services: the resources
+            // in force, minus the ones this request skipped — those are "left as the failed
+            // update made them rather than reverted".
+            let declared: Vec<crate::state::StoredResource> = stack
+                .resources
+                .iter()
+                .map(|deployed| deployed.resource.clone())
+                .filter(|resource| !skipped.contains(&resource.logical_id))
+                .collect();
+            (
+                stack.stack_id.clone(),
+                stack.region.clone(),
+                declared,
+                stack.provenance(),
+            )
+        };
+
+        // The rollback is re-attempted over the resources it did not skip, in the Region the
+        // stack lives in: each is declared again in the service that owns it, against the
+        // same set, so nothing the rollback is not resuming is created or deleted.
+        let reverted = crate::state::provisioning::reconcile(
+            ctx,
+            &region,
+            &provenance,
+            declared.clone(),
+            &declared,
+        )
+        .await;
+
+        let mut store = state.lock();
+        if let Some(stack) = store.resolve_mut(&request_region, &stack_id) {
+            stack.schedule_resource_events(&reverted.transitions);
+            stack.record_materialised_resources(reverted.resources);
+            if let Some(failure) = reverted.failure {
+                // The rollback could not be carried out even now: the stack stays in
+                // UPDATE_ROLLBACK_FAILED with the owning service's own refusal as the
+                // reason, rather than reporting a rollback that did not happen.
+                stack.fail_transition(
+                    ::std::time::SystemTime::now(),
+                    status::UPDATE_ROLLBACK_FAILED,
+                    failure,
+                );
+            }
+        }
+
+        Ok(ContinueUpdateRollbackOutput {})
     }
 }

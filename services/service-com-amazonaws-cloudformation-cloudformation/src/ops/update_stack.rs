@@ -202,8 +202,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    status, StoredDeploymentConfig, StoredParameter, StoredRollbackConfiguration, StoredStack,
-    StoredTag,
+    resource_status, status, StoredDeploymentConfig, StoredParameter,
+    StoredRollbackConfiguration, StoredStack, StoredTag,
 };
 
 /// The stored values this update is resolved against: every member the merge below reads
@@ -588,6 +588,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the stack or started an operation on it, and only one update may be in flight.
         let (stack_id, region, declared, previous_resources, provenance) = {
             let mut store = state.lock();
+            // What a `Fn::ImportValue` in the submitted template resolves against: the
+            // exported output values in force in the Region this request is signed for,
+            // read before the stack is resolved so the two cannot disagree about them.
+            let exports = store.exported_values(&request_region);
             let stack = store
                 .resolve_mut(&request_region, &input.stack_name)
                 .filter(|stack| stack.is_live())
@@ -682,7 +686,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // carries: its resources and its outputs are re-evaluated from the new body
             // and the merged parameters, each resource the deployment acts on reports its
             // own events, and all of it is reported once the update completes.
-            let cannot_deploy = stack.deploy_template().err();
+            let cannot_deploy = stack.deploy_template(&exports).err();
             // The update starts now and settles to UPDATE_COMPLETE once the clock makes
             // that due; the stack id never changes.
             stack.begin_transition(
@@ -720,26 +724,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .await;
 
-        let mut store = state.lock();
-        if let Some(stack) = store.resolve_mut(&request_region, &stack_id) {
+        let output = UpdateStackOutput {
+            stack_id: Some(stack_id.clone()),
+            operation_id: Some(operation_id),
+        };
+        // What the failure (if any) owes the stack beyond the UPDATE_FAILED it records: the
+        // configuration to put back in the services that own the resources the update had
+        // already changed there.
+        //
+        // "If the stack update fails, CloudFormation rolls back the stack to the previous
+        // stack configuration" — and a rollback is owed only where there is something to put
+        // back. An update whose first resource the owning service REFUSED changed nothing in
+        // any service, so the previous configuration is already the one in force: the stack
+        // stops at UPDATE_FAILED with that service's refusal, which is what a caller reading
+        // it has to act on. This is what the transitions say: a resource the update really
+        // carried its work out on reported a COMPLETED transition.
+        let applied_a_change = materialised.transitions.iter().any(|transition| {
+            transition.status == resource_status::UPDATE_COMPLETE
+                || transition.status == resource_status::CREATE_COMPLETE
+                || transition.status == resource_status::DELETE_COMPLETE
+        });
+        let rollback = {
+            let mut store = state.lock();
+            let Some(stack) = store.resolve_mut(&request_region, &stack_id) else {
+                return Ok(output);
+            };
             // The resources' own transitions come BEFORE the stack's terminal event: the
             // event stream is what the update did, in the order it did it.
             stack.schedule_resource_events(&materialised.transitions);
-            stack.record_materialised_resources(materialised.resources);
-            if let Some(failure) = materialised.failure {
-                // A resource an owning service refused: the update does not reach
-                // UPDATE_COMPLETE, and the reason reported is the one that service gave.
-                stack.fail_transition(
-                    ::std::time::SystemTime::now(),
-                    status::UPDATE_FAILED,
-                    failure,
-                );
+            stack.record_materialised_resources(materialised.resources.clone());
+            match materialised.failure {
+                None => None,
+                Some(failure) => {
+                    // A resource an owning service refused: the update does not reach
+                    // UPDATE_COMPLETE, and the reason reported is the one that service gave.
+                    let failed_at = ::std::time::SystemTime::now();
+                    stack.fail_transition(failed_at, status::UPDATE_FAILED, failure.clone());
+                    // Nothing to put back, or a caller that asked for the failed state to be
+                    // kept (`DisableRollback`), which says what it wants left behind.
+                    if !applied_a_change || stack.disable_rollback {
+                        None
+                    } else {
+                        stack.begin_update_rollback(failed_at, failure);
+                        Some(stack.provenance())
+                    }
+                }
+            }
+        };
+
+        // Putting the previous configuration back is the rollback's own work in the
+        // services that own the resources: the set the stack had BEFORE this update is
+        // declared again, against what the failed update left there.
+        if let Some(provenance) = rollback {
+            let reverted = crate::state::provisioning::reconcile(
+                ctx,
+                &region,
+                &provenance,
+                previous_resources,
+                &materialised.resources,
+            )
+            .await;
+            let mut store = state.lock();
+            if let Some(stack) = store.resolve_mut(&request_region, &stack_id) {
+                stack.schedule_resource_events(&reverted.transitions);
+                stack.record_materialised_resources(reverted.resources);
+                if let Some(failure) = reverted.failure {
+                    // "A stack goes into the UPDATE_ROLLBACK_FAILED state when
+                    // CloudFormation can't roll back all changes after a failed stack
+                    // update": a resource the owning service would not put back leaves the
+                    // stack there, which is the state `ContinueUpdateRollback` resumes from.
+                    stack.fail_transition(
+                        ::std::time::SystemTime::now(),
+                        status::UPDATE_ROLLBACK_FAILED,
+                        failure,
+                    );
+                }
             }
         }
 
-        Ok(UpdateStackOutput {
-            stack_id: Some(stack_id),
-            operation_id: Some(operation_id),
-        })
+        Ok(output)
     }
 }

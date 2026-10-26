@@ -52,8 +52,8 @@
 //! the output is reported with its key and description and without an `OutputValue`,
 //! because `Output$OutputValue` is optional and a made-up ARN is worse than an absent
 //! one. What is left unevaluated is an expression whose INPUT this emulator does not
-//! hold — a `Ref` to a name the template never declares, a `Fn::ImportValue` (nothing
-//! here resolves an import against the exports `ListExports` reports), a
+//! hold — a `Ref` to a name the template never declares, a `Fn::ImportValue` naming an
+//! export no stack of this account and Region publishes, a
 //! `Fn::Transform` naming a macro this emulator runs nothing for (the `AWS::Include`
 //! snippets it DOES read are spliced in before this module sees the template —
 //! [`super::include`]), or a
@@ -4858,6 +4858,11 @@ pub struct Scope<'a> {
     pub mappings: &'a Value,
     /// The template's `Conditions` section.
     pub conditions: &'a Value,
+    /// The exported output values a `Fn::ImportValue` resolves against, keyed by export
+    /// name: "the value of an output exported by another stack". An export name this map
+    /// does not carry is not exported in the account and Region the deployment runs in, so
+    /// the import resolves to nothing.
+    pub imports: &'a BTreeMap<String, String>,
 }
 
 /// Evaluate every output a template declares, in `OutputKey` order (the protocol fixes no
@@ -4895,6 +4900,66 @@ pub fn evaluate_outputs(
         });
     }
     outputs
+}
+
+/// Every export name a template IMPORTS: the resolved argument of each `Fn::ImportValue`
+/// its resources and its outputs name.
+///
+/// This is the stack's half of the cross-stack reference index `ListImports` reports —
+/// "the stacks that are importing an exported output value" — so it is computed where the
+/// template is deployed, from the document that really deploys, and charged to that
+/// deployment's own budget like every other pass over a caller-sized body. An argument
+/// that is itself an expression is evaluated, so an import whose name a `Fn::Sub` or a
+/// parameter decides is the export name it really resolved to.
+pub fn imported_export_names(
+    template: &Template,
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    for resource in &template.resources {
+        collect_imports(&resource.declaration, scope, 0, budget, &mut found);
+    }
+    for output in &template.outputs {
+        collect_imports(&output.value, scope, 0, budget, &mut found);
+        if let Some(export_name) = &output.export_name {
+            collect_imports(export_name, scope, 0, budget, &mut found);
+        }
+    }
+    found
+}
+
+/// Collect every `Fn::ImportValue` argument inside one declaration, bounded by the
+/// deployment's depth limit and its shared budget: ONE pass over the node, whatever the
+/// document carries.
+fn collect_imports(
+    value: &Value,
+    scope: &Scope<'_>,
+    depth: usize,
+    budget: &mut Budget,
+    found: &mut BTreeSet<String>,
+) {
+    if depth > MAX_INTRINSIC_DEPTH || budget.spend(1).is_none() {
+        return;
+    }
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_imports(item, scope, depth + 1, budget, found);
+            }
+        }
+        Value::Object(members) => {
+            for (name, argument) in members {
+                if name == FN_IMPORT_VALUE {
+                    if let Some(export_name) = text(argument, scope, depth + 1, budget) {
+                        found.insert(export_name);
+                    }
+                }
+                collect_imports(argument, scope, depth + 1, budget, found);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// An evaluated expression: CloudFormation's intrinsic functions produce either a string
@@ -4978,9 +5043,8 @@ fn bounded(resolved: Resolved, budget: &mut Budget) -> Option<Resolved> {
 /// Evaluate one intrinsic function.
 ///
 /// The functions this module does not implement yield no value, so an output that uses
-/// one is reported without an `OutputValue`: `Fn::ImportValue` (nothing here resolves an
-/// import against the exported output values `ListExports` reports)
-/// and `Fn::Transform` (a macro this emulator runs nothing for). The CONDITION functions
+/// one is reported without an `OutputValue`:
+/// `Fn::Transform` (a macro this emulator runs nothing for). The CONDITION functions
 /// (`Fn::Equals`, `Fn::And`, `Fn::Or`, `Fn::Not`, `Condition`) are not values either:
 /// they are evaluated where CloudFormation allows them — the `Conditions` section and
 /// `Fn::If` — by [`boolean`].
@@ -5008,6 +5072,15 @@ fn intrinsic(
         // "Fn::Sub substitutes variables in an input string with values that you
         // specify": a string, or [string, {variables}].
         "Fn::Sub" => substitute(argument, scope, depth, budget).map(Resolved::Text),
+        // "The intrinsic function Fn::ImportValue returns the value of an output exported
+        // by another stack": the argument is the EXPORT NAME, and the value is the one that
+        // export carries in the account and Region this deployment runs in. An export name
+        // nothing publishes there resolves to no value, the same as any other unresolvable
+        // expression.
+        FN_IMPORT_VALUE => {
+            let name = text(argument, scope, depth + 1, budget)?;
+            scope.imports.get(&name).cloned().map(Resolved::Text)
+        }
         // "Fn::Join appends a set of values into a single value, separated by the
         // specified delimiter": [delimiter, [values]].
         "Fn::Join" => {
@@ -5599,6 +5672,8 @@ const FN_LENGTH: &str = "Fn::Length";
 const FN_TO_JSON_STRING: &str = "Fn::ToJsonString";
 /// `Fn::Sub`, whose template string is where a loop identifier is read inside a value.
 const FN_SUB: &str = "Fn::Sub";
+/// `Fn::ImportValue`, whose argument names the EXPORT a template imports.
+const FN_IMPORT_VALUE: &str = "Fn::ImportValue";
 /// `Ref`, the other way a loop's output map reads the loop identifier.
 const REF_FUNCTION: &str = "Ref";
 
@@ -6214,6 +6289,7 @@ mod tests {
         let resources = BTreeMap::new();
         let mappings = Value::Null;
         let conditions = Value::Null;
+        let imports = BTreeMap::new();
         let scope = Scope {
             stack,
             parameters: &parameters,
@@ -6221,6 +6297,7 @@ mod tests {
             resources: &resources,
             mappings: &mappings,
             conditions: &conditions,
+            imports: &imports,
         };
         let mut budget = Budget::new();
         let declared = DeclaredResource {
