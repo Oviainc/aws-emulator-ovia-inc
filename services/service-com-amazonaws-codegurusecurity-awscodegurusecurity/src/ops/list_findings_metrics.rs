@@ -321,10 +321,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // answer reports one `AccountFindingsMetric` per day from the first through the
         // last, INCLUSIVE.
         //
-        // Neither bound is window-checked: unlike the sibling metrics operation, whose
-        // `date` the model documents as having to fall within a bounded span back from
-        // today, these members carry no documented window, so a day that precedes every
-        // finding the account has simply reports zeros.
+        // Neither bound is recency-checked, and nor is the sibling metrics operation's
+        // `date`: a recency hint that lives only in a member's documentation is not a
+        // constraint trait, so a day that precedes every finding the account has simply
+        // reports zeros.
         let start_millis = crate::state::from_timestamp(&input.start_date);
         let end_millis = crate::state::from_timestamp(&input.end_date);
 

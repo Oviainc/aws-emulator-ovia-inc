@@ -7,21 +7,20 @@
 //! the harness of `crate::scan_lifecycle`, so the restJson1 wire shape and the shared
 //! engine store are exercised exactly as a client would exercise them.
 //!
-//! The rule under test: a `date` inside the window the model documents for it is
-//! answered with the summary of the UTC day that instant falls in — the account's OPEN
+//! The rule under test: ANY parseable `date` — the member carries no constraint trait —
+//! is answered with the summary of the UTC day that instant falls in: the account's OPEN
 //! findings as of the END of that day, counted per severity, per finding category (the
 //! detector that found it) and per scan, with the top 5 categories and the top 3 scans by
-//! count — while a `date` outside that window fails a documented input constraint and is
-//! refused with the modelled `ValidationException` (HTTP 400). Each case varies what the
-//! rule generalises over: where in (or outside) the window the requested instant falls,
-//! how many categories and scans the store holds, the severity and status of each
-//! finding, and when each finding was created.
+//! count. Each case varies what the rule generalises over: how old or how far ahead the
+//! requested day is (from the epoch to years into the future), where inside one day the
+//! instant falls, how many categories and scans the store holds, the severity and status
+//! of each finding, and when each finding was created.
 
 use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
 use serde_json::Value;
 use service_com_amazonaws_codegurusecurity_awscodegurusecurity::ops::get_metrics_summary::{
-    CATEGORIES_WITH_MOST_FINDINGS, METRICS_SUMMARY_WINDOW_DAYS, SCANS_WITH_MOST_OPEN_FINDINGS,
+    CATEGORIES_WITH_MOST_FINDINGS, SCANS_WITH_MOST_OPEN_FINDINGS,
 };
 use service_com_amazonaws_codegurusecurity_awscodegurusecurity::ops::types::Finding;
 use service_com_amazonaws_codegurusecurity_awscodegurusecurity::state::{
@@ -35,10 +34,9 @@ use crate::scan_lifecycle::{call, harness, store_of, Answer};
 /// One day in seconds.
 const DAY: i64 = 24 * 60 * 60;
 
-/// The start of today's UTC day, in epoch seconds: the latest day
-/// `GetMetricsSummaryRequest$date` may name. Every fixture day below is expressed
-/// relative to it, so the suite keeps asking about days inside the window the handler
-/// accepts however long after it was written it runs.
+/// The start of today's UTC day, in epoch seconds. Every fixture day below is expressed
+/// relative to it, so the suite keeps asking about the same ages however long after it
+/// was written it runs.
 fn today_secs() -> i64 {
     start_of_utc_day_millis(now_millis()) / 1_000
 }
@@ -56,12 +54,12 @@ fn day_b() -> i64 {
 }
 
 /// How close to a UTC midnight [`off_a_day_boundary`] refuses to run a case: the test
-/// reads the clock to build its bounds and the handler reads it again, so a day that
-/// rolls over between the two reads would move the window under an exact-bound case.
+/// reads the clock to build its fixture days and the handler reads it again, so a day
+/// that rolls over between the two reads would move every day a case asks about.
 const DAY_ROLLOVER_MARGIN_MILLIS: i64 = 5_000;
 
 /// Wait out a UTC midnight that is about to happen, so every case of this test computes
-/// its bounds from the same day the handler will read. Waits at most
+/// its fixture days from the same day the handler will read. Waits at most
 /// [`DAY_ROLLOVER_MARGIN_MILLIS`] and usually not at all.
 async fn off_a_day_boundary() {
     let until_midnight = MILLIS_PER_DAY - now_millis().rem_euclid(MILLIS_PER_DAY);
@@ -397,11 +395,11 @@ async fn metrics_summary_counts_the_stored_findings_as_of_the_requested_day() {
             scans: &[("alpha", 4), ("beta", 3), ("gamma", 2)],
             critical_scans: &[("alpha", 2), ("beta", 1)],
         },
-        // The latest day the window reaches, long after every finding was created,
-        // reports the same summary: the cutoff is a lower bound on what has been
-        // created, not a second window.
+        // Today, long after every finding was created, reports the same summary: the day
+        // asked about is an upper bound on what had been created, so a later day adds
+        // nothing.
         Case {
-            label: "today, the latest day the window reaches",
+            label: "today",
             at_secs: today_secs() + DAY / 3,
             open: (2.0, 2.0, 2.0, 2.0, 3.0),
             categories: &[
@@ -494,30 +492,56 @@ fn seed_one_open_finding(engine: &std::sync::Arc<engine::InMemoryEngine>) {
     );
 }
 
-/// The earliest day `GetMetricsSummaryRequest$date` may name, in epoch seconds: the
-/// published lower bound of the window the model documents ("The date must be within the
-/// past two years", `METRICS_SUMMARY_WINDOW_DAYS` days back from today).
-fn earliest_day_secs() -> i64 {
-    today_secs() - METRICS_SUMMARY_WINDOW_DAYS * DAY
-}
+/// The age the member's own documentation mentions ("The date you want to retrieve
+/// summary metrics from, rounded to the nearest day. The date must be within the past two
+/// years", `GetMetricsSummaryRequest$date`), in days. Prose, not a constraint trait: the
+/// table below asks about days either side of it and expects the same answer from each,
+/// so this is only where the rows that straddle that age come from. Two years as 730
+/// days, because every day on the millisecond scale this service keeps its instants on is
+/// exactly `MILLIS_PER_DAY` long.
+const DOCUMENTED_AGE_DAYS: i64 = 2 * 365;
 
 #[tokio::test]
-async fn metrics_summary_answers_any_day_inside_the_documented_window() {
+async fn metrics_summary_answers_a_date_of_any_age() {
     off_a_day_boundary().await;
     let (engine, router) = harness();
     seed_one_open_finding(&engine);
 
-    // Rows: where inside the window the requested instant falls — both published bounds
-    // (the earliest day the window reaches and today), a day just inside each, and three
-    // instants inside ONE day (its first second, the middle, its last second) which must
-    // all report that same day.
+    // Rows: how old, or how far ahead, the requested day is. `GetMetricsSummaryRequest$date`
+    // is a required Timestamp carrying NO constraint trait, so every row is answered with a
+    // summary — the epoch (what a client that sent an unset timestamp names), days far older
+    // than the age the member's prose mentions, the days either side of that age, days a
+    // finding exists on, and days that have not happened yet. Three rows name three instants
+    // of ONE day (its first second, the middle, its last second), which must all report that
+    // same day.
     let cases: &[(&str, i64, f64)] = &[
-        ("the earliest day of the window", earliest_day_secs(), 0.0),
+        ("the epoch", 0, 0.0),
         (
-            "one day inside the earliest bound",
-            earliest_day_secs() + DAY,
+            "twenty years before today",
+            today_secs() - 20 * 365 * DAY,
             0.0,
         ),
+        (
+            "three years before today",
+            today_secs() - 3 * 365 * DAY,
+            0.0,
+        ),
+        (
+            "one day older than the documented age",
+            today_secs() - (DOCUMENTED_AGE_DAYS + 1) * DAY,
+            0.0,
+        ),
+        (
+            "the documented age itself",
+            today_secs() - DOCUMENTED_AGE_DAYS * DAY,
+            0.0,
+        ),
+        (
+            "one day younger than the documented age",
+            today_secs() - (DOCUMENTED_AGE_DAYS - 1) * DAY,
+            0.0,
+        ),
+        ("one year before today", today_secs() - 365 * DAY, 0.0),
         ("the day before the findings", day_a() - DAY, 0.0),
         ("the first second of the day", day_a(), 1.0),
         ("the middle of the day", day_a() + DAY / 2, 1.0),
@@ -526,6 +550,9 @@ async fn metrics_summary_answers_any_day_inside_the_documented_window() {
         ("yesterday", today_secs() - DAY, 1.0),
         ("the first second of today", today_secs(), 1.0),
         ("the last second of today", today_secs() + DAY - 1, 1.0),
+        ("tomorrow", today_secs() + DAY, 1.0),
+        ("two hundred days ahead", today_secs() + 200 * DAY, 1.0),
+        ("five years ahead", today_secs() + 5 * 365 * DAY, 1.0),
     ];
 
     for (label, at_secs, expected_high) in cases {
@@ -534,8 +561,27 @@ async fn metrics_summary_answers_any_day_inside_the_documented_window() {
         assert_eq!(
             instant_secs(label, &summary["date"]),
             at_secs - at_secs.rem_euclid(DAY),
-            "case {label:?}: a date inside the window is answered for the UTC day it falls in, got {summary}"
+            "case {label:?}: the date is answered for the UTC day it falls in, got {summary}"
         );
+
+        // The response shape does not depend on the day's age: each ranking member is
+        // present as a list, carrying the one seeded finding's scan and category once that
+        // finding existed and nothing before then.
+        let ranked_rows = usize::from(*expected_high > 0.0);
+        for (member, name_key, expected_rows) in [
+            ("categoriesWithMostFindings", "categoryName", ranked_rows),
+            ("scansWithMostOpenFindings", "scanName", ranked_rows),
+            // The seeded finding is `High`, so there is never a critical one to rank —
+            // the member is still present, as an empty list.
+            ("scansWithMostOpenCriticalFindings", "scanName", 0),
+        ] {
+            assert_eq!(
+                ranking(label, summary, member, name_key).len(),
+                expected_rows,
+                "case {label:?}: {member} ranks what was open as of that day, got {summary}"
+            );
+        }
+
         let high = open_findings(label, summary)
             .into_iter()
             .find(|(severity, _)| *severity == SEVERITY_HIGH)
@@ -549,55 +595,32 @@ async fn metrics_summary_answers_any_day_inside_the_documented_window() {
 }
 
 #[tokio::test]
-async fn metrics_summary_refuses_a_date_outside_the_documented_window() {
-    off_a_day_boundary().await;
+async fn metrics_summary_refuses_only_a_date_the_model_makes_invalid() {
     let (engine, router) = harness();
     seed_one_open_finding(&engine);
 
-    // Rows: how the requested date leaves the window — one day past each published
-    // bound, then far outside it on either side, including the epoch itself (what a
-    // client that sent an unset or a seconds-vs-milliseconds timestamp names).
-    let cases: &[(&str, i64)] = &[
-        ("one day before the earliest bound", earliest_day_secs() - DAY),
+    // Rows: the ways a `date` can be invalid once the member carries no constraint trait —
+    // it is not a timestamp at all, or it is empty. Both are decided by the modelled input
+    // before any summary is produced.
+    let cases: &[(&str, &str)] = &[
         (
-            "the last second before the earliest bound",
-            earliest_day_secs() - 1,
+            "a date that is not a timestamp",
+            "/metrics/summary?date=yesterday",
         ),
-        ("tomorrow", today_secs() + DAY),
-        (
-            "the last second of tomorrow",
-            today_secs() + 2 * DAY - 1,
-        ),
-        ("five years in the future", today_secs() + 5 * 365 * DAY),
-        ("the epoch", 0),
-        ("twenty years ago", today_secs() - 20 * 365 * DAY),
+        ("an empty date", "/metrics/summary?date="),
     ];
 
-    for (label, at_secs) in cases {
-        let answer = get_metrics_summary(&router, *at_secs).await;
+    for (label, uri) in cases {
+        let answer = call(&router, "GET", uri, None).await;
         assert_eq!(
             answer.status, 400,
-            "case {label:?}: a date outside the documented window is refused, got {} {}",
+            "case {label:?}: a date the model makes invalid is refused, got {} {}",
             answer.status, answer.json
         );
         assert!(
             answer.error_type.contains("ValidationException"),
             "case {label:?}: the refusal is the modelled ValidationException, got {:?}",
             answer.error_type
-        );
-        assert_eq!(
-            answer.json["reason"].as_str(),
-            Some("fieldValidationFailed"),
-            "case {label:?}: an input constraint failed, got {}",
-            answer.json
-        );
-        let fields = answer.json["fieldList"].as_array().cloned().unwrap_or_default();
-        assert!(
-            fields
-                .iter()
-                .any(|field| field["name"].as_str() == Some("date")),
-            "case {label:?}: the refusal names the member that failed, got {}",
-            answer.json
         );
         assert!(
             answer.json["metricsSummary"].is_null(),
