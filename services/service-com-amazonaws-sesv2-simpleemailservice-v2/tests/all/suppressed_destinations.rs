@@ -25,15 +25,22 @@
 //! `InvalidNextTokenException`. Those tables span the selections, each reason subset,
 //! each side of the window and its bounds, every page size from one to past the end,
 //! and the ways a token can fail to be a position in this listing.
+//!
+//! One further rule, under both of those: an entry's storage key names exactly one
+//! (list, address) pair and carries its own list's prefix and no other's — whatever
+//! either part of the pair holds — which is what keeps one list's entries, and one
+//! listing's page tokens, out of another's.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sesv2_simpleemailservice_v2::ops::types::SUPPRESSION_LIST_REASON_VALUES;
 use service_com_amazonaws_sesv2_simpleemailservice_v2::state::{
-    encode_tagged_page_token, suppression_key, ComAmazonawsSesv2SimpleemailserviceV2State,
-    SuppressedDestinationRecord, CONTACTS_PAGE_TOKEN_TAG, MAX_TENANT_NAME_CHARS,
+    encode_tagged_page_token, suppression_key, suppression_list_prefix,
+    ComAmazonawsSesv2SimpleemailserviceV2State, SuppressedDestinationRecord,
+    CONTACTS_PAGE_TOKEN_TAG, MAX_TENANT_NAME_CHARS,
 };
 use service_com_amazonaws_sesv2_simpleemailservice_v2::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -1351,4 +1358,67 @@ async fn listing_the_suppression_list_changes_nothing_a_later_caller_sees() {
         "repeat listing",
         ses.stored()
     );
+}
+
+/// The suppression lists a storage key can belong to: the account-level list (`None`)
+/// and tenant lists whose names differ along what the key must stay one-to-one over —
+/// length, a shared leading character, the documented form, and names carrying the
+/// separator the key joins its parts with, which a name outside the documented
+/// `TenantName` form could otherwise use to reach another list's key space.
+const KEYED_LISTS: &[(&str, Option<&str>)] = &[
+    ("the account-level list", None),
+    ("a one-character name", Some("a")),
+    ("a name sharing its first character", Some("ab")),
+    ("the documented form", Some("tenant-one_1")),
+    ("a name carrying the key separator", Some("a\u{1f}x")),
+    ("a name ending in the key separator", Some("a\u{1f}")),
+    ("a name that is only the separator", Some("\u{1f}")),
+];
+
+/// Addresses that stay distinct after the key normalises them (the domain is matched
+/// without regard to case, the local part exactly), including one carrying the
+/// separator.
+const KEYED_ADDRESSES: &[&str] = &[
+    "reader@example.com",
+    "other@example.com",
+    "\u{1f}reader@example.com",
+    "reader@example.com\u{1f}",
+];
+
+#[test]
+fn a_suppression_key_names_one_list_and_one_address() {
+    // One key per (list, address) pair: no two pairs may share a key, whatever either
+    // part holds, or one list's entry would answer another list's read.
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    for (case, tenant) in KEYED_LISTS {
+        for address in KEYED_ADDRESSES {
+            let pair = format!("{case} / {address:?}");
+            let key = suppression_key(*tenant, address);
+            let previous = seen.insert(key.clone(), pair.clone());
+            assert!(
+                previous.is_none(),
+                "case {pair:?}: a key must name one (list, address) pair, but this one \
+                 collides with {previous:?}"
+            );
+        }
+    }
+
+    // And a key carries a list's prefix only if it belongs to that very list, which is
+    // what lets a listing tell a position in its own list from one in another's.
+    for (case, tenant) in KEYED_LISTS {
+        let prefix = suppression_list_prefix(*tenant);
+        for (other_case, other) in KEYED_LISTS {
+            for address in KEYED_ADDRESSES {
+                let key = suppression_key(*other, address);
+                let same_list = other == tenant;
+                assert_eq!(
+                    key.starts_with(&prefix),
+                    same_list,
+                    "case {case:?} vs {other_case:?} / {address:?}: expected the key \
+                     {key:?} to carry the prefix {prefix:?} only for its own list, got {}",
+                    key.starts_with(&prefix)
+                );
+            }
+        }
+    }
 }

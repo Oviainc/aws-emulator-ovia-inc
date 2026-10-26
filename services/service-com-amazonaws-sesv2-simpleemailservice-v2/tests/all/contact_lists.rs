@@ -14,6 +14,18 @@
 //! rule generalises over: the number of stored items (none, one, several), the page size
 //! (absent, one, a size that divides the count, a size larger than it), both listings
 //! (`ListContactLists` and `ListContacts`), and the refusal legs.
+//!
+//! The second rule these cases pin: an update that replaces a resource's metadata stores
+//! EXACTLY the members the request supplies — a member it omits is cleared, not kept —
+//! while leaving everything the request does not bind alone, so the next read reports the
+//! supplied metadata and nothing of the metadata it replaced. The replacement table below
+//! spans what that rule generalises over: a member removed from a list of them, every
+//! member removed (by omitting the list and by supplying an empty one), the same members
+//! in another order, one added, the whole set replaced, and each scalar supplied and
+//! omitted. Each row also pins the rule's consequence for a sub-resource that refers to
+//! the replaced members: a contact's stated topic preference names a topic OF its list, so
+//! it is reported, and resolves to a status, only while the list still publishes that
+//! topic.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -130,6 +142,15 @@ impl Ses {
     async fn delete_list(&self, name: &str) -> Reply {
         self.call("DELETE", &format!("/v2/email/contact-lists/{name}"), None)
             .await
+    }
+
+    async fn update_list(&self, name: &str, body: Value) -> Reply {
+        self.call(
+            "PUT",
+            &format!("/v2/email/contact-lists/{name}"),
+            Some(body),
+        )
+        .await
     }
 
     async fn list_lists(&self, query: &str) -> Reply {
@@ -874,5 +895,566 @@ async fn a_next_token_this_service_did_not_hand_out_is_refused() {
         "case {:?}: the resumed page must start strictly after the first page, got {:?}",
         "the service's own token",
         resumed.body
+    );
+}
+
+/// The display name a topic carries when the UPDATE supplies it, which differs from the
+/// one the create supplied so a read-back proves each topic's own members were replaced
+/// too, not only the set of topic names.
+fn updated_display_name(topic: &str) -> String {
+    format!("{topic} display, as updated")
+}
+
+/// One `Topic` as a request body spells it. `Topic` requires `TopicName`, `DisplayName`
+/// and `DefaultSubscriptionStatus`; `SubscriptionStatus` is `OPT_IN` or `OPT_OUT`.
+fn updated_topic(name: &str, default_status: &str) -> Value {
+    json!({
+        "TopicName": name,
+        "DisplayName": updated_display_name(name),
+        "DefaultSubscriptionStatus": default_status
+    })
+}
+
+/// The topics a `GetContactList` reply reports, in order, as
+/// (`TopicName`, `DisplayName`, `DefaultSubscriptionStatus`).
+fn read_topics(reply: &Reply) -> Vec<(String, String, String)> {
+    reply
+        .body
+        .get("Topics")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    let member = |name: &str| {
+                        row.get(name)
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    (
+                        member("TopicName"),
+                        member("DisplayName"),
+                        member("DefaultSubscriptionStatus"),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The topic names a reply's `member` list of topic preferences names, in order.
+fn preference_topics(reply: &Reply, member: &str) -> Vec<String> {
+    reply
+        .body
+        .get(member)
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    row.get("TopicName")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A timestamp member as epoch seconds, for an ordering assertion.
+fn timestamp_seconds(reply: &Reply, member: &str) -> f64 {
+    reply
+        .body
+        .get(member)
+        .and_then(Value::as_f64)
+        .unwrap_or_default()
+}
+
+/// One row of the metadata-replacement table: the update's body. The expectation IS the
+/// body — a complete replacement stores exactly what the request supplied — so each row
+/// is read as both.
+struct ReplacementCase {
+    case: &'static str,
+    /// The `Topics` the update supplies as (name, default status), or `None` when the
+    /// update omits the member entirely.
+    topics: Option<&'static [(&'static str, &'static str)]>,
+    /// The `Description` the update supplies, or `None` when it omits the member.
+    description: Option<&'static str>,
+}
+
+/// Every row runs against the same starting list — topics `weekly`, `offers` and `alerts`
+/// and a description — so each row's own difference is what the assertions attribute the
+/// result to.
+const REPLACEMENT_CASES: &[ReplacementCase] = &[
+    ReplacementCase {
+        case: "one of three topics removed",
+        topics: Some(&[("weekly", "OPT_IN"), ("alerts", "OPT_OUT")]),
+        description: Some("still publishing"),
+    },
+    ReplacementCase {
+        case: "every topic removed by omitting Topics",
+        topics: None,
+        description: Some("no topics any more"),
+    },
+    ReplacementCase {
+        case: "every topic removed by supplying an empty Topics list",
+        topics: Some(&[]),
+        description: Some("an empty topic list"),
+    },
+    ReplacementCase {
+        case: "the same three topics in another order",
+        topics: Some(&[
+            ("alerts", "OPT_IN"),
+            ("offers", "OPT_IN"),
+            ("weekly", "OPT_OUT"),
+        ]),
+        description: Some("reordered"),
+    },
+    ReplacementCase {
+        case: "a fourth topic added to the three",
+        topics: Some(&[
+            ("weekly", "OPT_OUT"),
+            ("offers", "OPT_IN"),
+            ("alerts", "OPT_IN"),
+            ("monthly", "OPT_OUT"),
+        ]),
+        description: Some("one more topic"),
+    },
+    ReplacementCase {
+        case: "the whole set replaced by a topic the list never published",
+        topics: Some(&[("monthly", "OPT_IN")]),
+        description: Some("replaced wholesale"),
+    },
+    ReplacementCase {
+        case: "the description omitted while the topics are kept",
+        topics: Some(&[
+            ("weekly", "OPT_IN"),
+            ("offers", "OPT_OUT"),
+            ("alerts", "OPT_IN"),
+        ]),
+        description: None,
+    },
+    ReplacementCase {
+        case: "both members omitted",
+        topics: None,
+        description: None,
+    },
+];
+
+#[tokio::test]
+async fn updating_a_contact_list_replaces_its_metadata_completely() {
+    for case in REPLACEMENT_CASES {
+        let ses = Ses::new();
+        let list = "newsletter";
+        let created = ses
+            .create_list(json!({
+                "ContactListName": list,
+                "Description": "Everything we publish",
+                "Topics": [
+                    {
+                        "TopicName": "weekly",
+                        "DisplayName": "Weekly digest, as created",
+                        "DefaultSubscriptionStatus": "OPT_IN"
+                    },
+                    {
+                        "TopicName": "offers",
+                        "DisplayName": "Special offers, as created",
+                        "DefaultSubscriptionStatus": "OPT_OUT"
+                    },
+                    {
+                        "TopicName": "alerts",
+                        "DisplayName": "Service alerts, as created",
+                        "DefaultSubscriptionStatus": "OPT_IN"
+                    }
+                ],
+                "Tags": [{"Key": "team", "Value": "growth"}]
+            }))
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {:?}: expected HTTP 200 from CreateContactList, got {} {:?}",
+            case.case, created.status, created.body
+        );
+        let contact = ses
+            .create_contact(
+                list,
+                json!({
+                    "EmailAddress": "reader@example.com",
+                    "TopicPreferences": [{"TopicName": "offers", "SubscriptionStatus": "OPT_IN"}]
+                }),
+            )
+            .await;
+        assert_eq!(
+            contact.status, 200,
+            "case {:?}: expected HTTP 200 from CreateContact, got {} {:?}",
+            case.case, contact.status, contact.body
+        );
+        let before = ses.get_list(list).await;
+        let created_timestamp = before.body.get("CreatedTimestamp").cloned();
+
+        let mut body = serde_json::Map::new();
+        if let Some(topics) = case.topics {
+            body.insert(
+                "Topics".to_string(),
+                Value::Array(
+                    topics
+                        .iter()
+                        .map(|(name, status)| updated_topic(name, status))
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(description) = case.description {
+            body.insert("Description".to_string(), json!(description));
+        }
+        let updated = ses.update_list(list, Value::Object(body)).await;
+        assert_eq!(
+            updated.status, 200,
+            "case {:?}: expected HTTP 200 from UpdateContactList, got {} {:?}",
+            case.case, updated.status, updated.body
+        );
+
+        let read = ses.get_list(list).await;
+        assert_eq!(
+            read.status, 200,
+            "case {:?}: expected HTTP 200 reading the updated list, got {} {:?}",
+            case.case, read.status, read.body
+        );
+        assert_eq!(
+            read.text("ContactListName"),
+            list,
+            "case {:?}: the update must not rename the list, got {:?}",
+            case.case,
+            read.body
+        );
+        let expected_topics: Vec<(String, String, String)> = case
+            .topics
+            .unwrap_or(&[])
+            .iter()
+            .map(|(name, status)| {
+                (
+                    (*name).to_string(),
+                    updated_display_name(name),
+                    (*status).to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            read_topics(&read),
+            expected_topics,
+            "case {:?}: the read must report exactly the supplied topics, in order, got {:?}",
+            case.case,
+            read.body
+        );
+        assert_eq!(
+            read.body.get("Description").and_then(Value::as_str),
+            case.description,
+            "case {:?}: the read must report exactly the supplied description, got {:?}",
+            case.case,
+            read.body
+        );
+        // What the update's input does not bind is untouched: the tags and the creation
+        // time, and the contacts on the list are still on it.
+        assert_eq!(
+            read.body
+                .get("Tags")
+                .and_then(Value::as_array)
+                .and_then(|tags| tags.first())
+                .and_then(|tag| tag.get("Value"))
+                .and_then(Value::as_str),
+            Some("growth"),
+            "case {:?}: the update must keep the list's tags, got {:?}",
+            case.case,
+            read.body
+        );
+        assert_eq!(
+            read.body.get("CreatedTimestamp").cloned(),
+            created_timestamp,
+            "case {:?}: the update must not move the creation time, got {:?}",
+            case.case,
+            read.body
+        );
+        assert!(
+            timestamp_seconds(&read, "LastUpdatedTimestamp")
+                >= timestamp_seconds(&read, "CreatedTimestamp"),
+            "case {:?}: the last-updated time may not precede the creation time, got {:?}",
+            case.case,
+            read.body
+        );
+        let read_contact = ses.get_contact(list, "reader@example.com").await;
+        assert_eq!(
+            read_contact.status, 200,
+            "case {:?}: the contact must survive the metadata replacement, got {} {:?}",
+            case.case, read_contact.status, read_contact.body
+        );
+        // `TopicDefaultPreferences` is computed from the list's topics, so the
+        // replacement shows through on the contact as well.
+        assert_eq!(
+            preference_topics(&read_contact, "TopicDefaultPreferences"),
+            expected_topics
+                .iter()
+                .map(|(name, _, _)| name.clone())
+                .collect::<Vec<String>>(),
+            "case {:?}: a contact's defaults must follow the list's topics, got {:?}",
+            case.case,
+            read_contact.body
+        );
+        // The contact stated one preference, for `offers`. A stated preference names a
+        // topic OF the list, so it is reported only while the list still publishes that
+        // topic: once the replacement drops the topic, the preference names nothing.
+        let offers_published = case
+            .topics
+            .unwrap_or(&[])
+            .iter()
+            .any(|(name, _)| *name == "offers");
+        let expected_preferences: Vec<String> = if offers_published {
+            vec!["offers".to_string()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            preference_topics(&read_contact, "TopicPreferences"),
+            expected_preferences,
+            "case {:?}: GetContact must report a stated preference only while the list \
+             publishes its topic, got {:?}",
+            case.case,
+            read_contact.body
+        );
+        let listed = ses.list_contacts(list, json!({})).await;
+        assert_eq!(
+            listed.status, 200,
+            "case {:?}: expected HTTP 200 from ListContacts, got {} {:?}",
+            case.case, listed.status, listed.body
+        );
+        let listed_row = listed
+            .body
+            .get("Contacts")
+            .and_then(Value::as_array)
+            .and_then(|rows| rows.first())
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert_eq!(
+            listed_row
+                .get("TopicPreferences")
+                .and_then(Value::as_array)
+                .map(|rows| rows
+                    .iter()
+                    .filter_map(|row| row.get("TopicName").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect::<Vec<String>>())
+                .unwrap_or_default(),
+            expected_preferences,
+            "case {:?}: ListContacts must report the same stated preferences as the \
+             contact's own read, got {listed_row:?}",
+            case.case
+        );
+        // And a filter on that topic selects the contact only while the topic is there:
+        // nothing is subscribed to a topic the list does not publish.
+        let filtered = ses
+            .list_contacts(
+                list,
+                json!({
+                    "Filter": {
+                        "FilteredStatus": "OPT_IN",
+                        "TopicFilter": {"TopicName": "offers"}
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(
+            filtered.status, 200,
+            "case {:?}: expected HTTP 200 from a filtered ListContacts, got {} {:?}",
+            case.case, filtered.status, filtered.body
+        );
+        assert_eq!(
+            listed_contacts(&filtered),
+            if offers_published {
+                vec!["reader@example.com".to_string()]
+            } else {
+                Vec::new()
+            },
+            "case {:?}: a topic filter may select a contact only while the list publishes \
+             the topic, got {:?}",
+            case.case,
+            filtered.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_preference_dropped_with_its_topic_does_not_come_back_with_the_topic() {
+    let ses = Ses::new();
+    let list = "newsletter";
+    // (case, the topic set the update supplies)
+    let weekly = updated_topic("weekly", "OPT_IN");
+    let offers = updated_topic("offers", "OPT_OUT");
+    ses.create_list(json!({
+        "ContactListName": list,
+        "Topics": [weekly.clone(), offers.clone()]
+    }))
+    .await;
+    let created = ses
+        .create_contact(
+            list,
+            json!({
+                "EmailAddress": "reader@example.com",
+                "TopicPreferences": [
+                    {"TopicName": "weekly", "SubscriptionStatus": "OPT_OUT"},
+                    {"TopicName": "offers", "SubscriptionStatus": "OPT_IN"}
+                ]
+            }),
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "case {:?}: expected HTTP 200 from CreateContact, got {} {:?}",
+        "both topics stated", created.status, created.body
+    );
+
+    // Remove `weekly`: the preference stated for it goes with the topic.
+    let removed = ses
+        .update_list(list, json!({"Topics": [offers.clone()]}))
+        .await;
+    assert_eq!(
+        removed.status, 200,
+        "case {:?}: expected HTTP 200 from UpdateContactList, got {} {:?}",
+        "weekly removed", removed.status, removed.body
+    );
+    let after_removal = ses.get_contact(list, "reader@example.com").await;
+    assert_eq!(
+        preference_topics(&after_removal, "TopicPreferences"),
+        vec!["offers".to_string()],
+        "case {:?}: the preference for the removed topic must be gone, got {:?}",
+        "weekly removed",
+        after_removal.body
+    );
+
+    // Declare `weekly` again: nothing kept the dropped preference, so it does not come
+    // back — the contact now has only the list's default for that topic.
+    let readded = ses
+        .update_list(list, json!({"Topics": [offers, weekly]}))
+        .await;
+    assert_eq!(
+        readded.status, 200,
+        "case {:?}: expected HTTP 200 from UpdateContactList, got {} {:?}",
+        "weekly re-added", readded.status, readded.body
+    );
+    let after_readd = ses.get_contact(list, "reader@example.com").await;
+    assert_eq!(
+        preference_topics(&after_readd, "TopicPreferences"),
+        vec!["offers".to_string()],
+        "case {:?}: a dropped preference may not return with its topic, got {:?}",
+        "weekly re-added",
+        after_readd.body
+    );
+    assert_eq!(
+        preference_topics(&after_readd, "TopicDefaultPreferences"),
+        vec!["offers".to_string(), "weekly".to_string()],
+        "case {:?}: the re-added topic must contribute its default, got {:?}",
+        "weekly re-added",
+        after_readd.body
+    );
+}
+
+#[tokio::test]
+async fn a_topic_filter_naming_a_topic_the_list_does_not_publish_selects_nothing() {
+    let ses = Ses::new();
+    let list = "newsletter";
+    ses.create_list(json!({
+        "ContactListName": list,
+        "Topics": [updated_topic("offers", "OPT_OUT")]
+    }))
+    .await;
+    // A contact unsubscribed from everything resolves OPT_OUT for every topic the list
+    // publishes — and for no topic it does not.
+    ses.create_contact(
+        list,
+        json!({"EmailAddress": "reader@example.com", "UnsubscribeAll": true}),
+    )
+    .await;
+
+    // (case, the topic the filter names, whether the list publishes it)
+    for (case, topic_name, published) in [
+        ("a topic the list publishes", "offers", true),
+        ("a topic the list never published", "monthly", false),
+        ("a topic the list's own name is not", "newsletter", false),
+    ] {
+        let filtered = ses
+            .list_contacts(
+                list,
+                json!({
+                    "Filter": {
+                        "FilteredStatus": "OPT_OUT",
+                        "TopicFilter": {"TopicName": topic_name}
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(
+            filtered.status, 200,
+            "case {case:?}: expected HTTP 200 from a filtered ListContacts, got {} {:?}",
+            filtered.status, filtered.body
+        );
+        assert_eq!(
+            listed_contacts(&filtered),
+            if published {
+                vec!["reader@example.com".to_string()]
+            } else {
+                Vec::new()
+            },
+            "case {case:?}: a filter may select a contact only for a topic the list \
+             publishes, got {:?}",
+            filtered.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn updating_a_contact_list_nothing_was_stored_under_is_refused() {
+    let ses = Ses::new();
+    let list = "newsletter";
+    ses.create_list(json!({
+        "ContactListName": list,
+        "Description": "Everything we publish"
+    }))
+    .await;
+
+    // A name nothing was stored under — including the stored name spelled differently,
+    // since the name is compared exactly — is a terminal 404 naming it.
+    for unknown in ["missing", "Newsletter", "news-letter"] {
+        let reply = ses
+            .update_list(unknown, json!({"Description": "written by a refused call"}))
+            .await;
+        assert_eq!(
+            (reply.status, reply.error_code().as_str()),
+            (404, "NotFoundException"),
+            "case {unknown:?}: expected 404 NotFoundException updating a list nothing \
+             stored, got {} {:?}",
+            reply.status,
+            reply.body
+        );
+        assert_eq!(
+            reply.message(),
+            format!("List with name: {unknown} doesn't exist."),
+            "case {unknown:?}: unexpected refusal wording, got {:?}",
+            reply.body
+        );
+    }
+
+    // A refused update stores nothing: no list is created for the name it named, and the
+    // stored list still reads back as it was created.
+    assert_eq!(
+        listed_lists(&ses.list_lists("").await),
+        vec![list.to_string()],
+        "case {:?}: a refused update may not create a list",
+        "after the refusals"
+    );
+    let read = ses.get_list(list).await;
+    assert_eq!(
+        read.text("Description"),
+        "Everything we publish",
+        "case {:?}: a refused update may not touch another list, got {:?}",
+        "after the refusals",
+        read.body
     );
 }

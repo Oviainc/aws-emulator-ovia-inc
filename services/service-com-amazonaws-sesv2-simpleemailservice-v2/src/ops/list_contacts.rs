@@ -291,13 +291,17 @@ fn matches_filter(
 
 /// The subscription status in force for `contact` on `topic_name`: its own stated
 /// preference, or — when it has stated none and the filter asks for the default — the
-/// topic's `DefaultSubscriptionStatus`. `None` when neither applies.
+/// topic's `DefaultSubscriptionStatus`. `None` when neither applies, which includes a
+/// topic the list does not publish: nothing is subscribed to a topic that is not there.
 fn resolved_status<'list>(
     list: &'list ContactListRecord,
     contact: &'list ContactRecord,
     topic_name: &str,
     use_default: bool,
 ) -> Option<&'list str> {
+    if !list.publishes_topic(topic_name) {
+        return None;
+    }
     // "A boolean value status noting if the contact is unsubscribed from all contact list
     // topics": that answer overrides every per-topic preference.
     if contact.unsubscribe_all {

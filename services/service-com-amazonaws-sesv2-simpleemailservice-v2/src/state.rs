@@ -9,7 +9,7 @@
 //! attributes. Nothing here is per-request scratch — the whole struct lives in the one
 //! shared engine (see [`service_state`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::{Duration, SystemTime};
@@ -1188,6 +1188,42 @@ impl ContactListRecord {
         self.topics.iter().any(|topic| topic.topic_name == topic_name)
     }
 
+    /// Replace this list's metadata with what `UpdateContactList` supplied — "updates
+    /// contact list metadata. This operation does a complete replacement" — and apply
+    /// what that replacement means for the contacts on the list.
+    ///
+    /// `topics` and `description` become exactly what the request supplied, so a member
+    /// the request omitted is CLEARED rather than kept, and the topics keep the order
+    /// supplied. A contact's stated preference names a topic OF this list (`CreateContact`
+    /// refuses one that names anything else), so a preference whose topic the replacement
+    /// drops ceases to exist along with the topic: it is removed from every contact on the
+    /// list, and declaring that topic again later does not bring it back, because nothing
+    /// kept it.
+    pub fn replace_metadata(
+        &mut self,
+        topics: Vec<crate::ops::types::Topic>,
+        description: Option<String>,
+        now: SystemTime,
+    ) {
+        self.topics = topics;
+        self.description = description;
+        self.last_updated_at = now;
+
+        let published: BTreeSet<&str> = self
+            .topics
+            .iter()
+            .map(|topic| topic.topic_name.as_str())
+            .collect();
+        for contact in self.contacts.values_mut() {
+            contact
+                .topic_preferences
+                .retain(|preference| published.contains(preference.topic_name.as_str()));
+            // The contact's own `last_updated_at` stays where its own last write left it:
+            // what changed is this list, not the contact, and the dropped preference is
+            // the topic's removal showing through rather than a write to the contact.
+        }
+    }
+
     /// The default preference the list's own topics give a contact that has stated
     /// none: one `TopicPreference` per topic, carrying that topic's
     /// `DefaultSubscriptionStatus`.
@@ -2108,10 +2144,14 @@ impl SuppressedDestinationRecord {
 /// it.
 ///
 /// The address part is its [`identity_key`], so a lookup matches the domain without
-/// regard to case while keeping the local part exactly as supplied. The two parts
-/// are joined by a character neither a `TenantName` ("alphanumeric characters,
-/// including letters, numbers, hyphens (-) and underscores (_) only") nor an
-/// addr-spec can contain, so one list's entries can never collide with another's.
+/// regard to case while keeping the local part exactly as supplied.
+///
+/// The list part is LENGTH-PREFIXED: the number of bytes in the list's name, the
+/// separator, then the name itself. Where the split between the two parts falls is
+/// therefore decided by a count this function writes, not by a character the name is
+/// assumed not to contain, so the key is one-to-one with the (list, address) pair
+/// whatever either part holds — no name can collide with another list's keys or forge
+/// another list's prefix.
 pub fn suppression_key(tenant_name: Option<&str>, email_address: &str) -> String {
     format!(
         "{}{}",
@@ -2120,15 +2160,22 @@ pub fn suppression_key(tenant_name: Option<&str>, email_address: &str) -> String
     )
 }
 
-/// The key prefix every entry of ONE suppression list shares: the tenant whose list
-/// it is (the empty name for the account-level list) and the separator from
-/// [`suppression_key`].
+/// The key prefix every entry of ONE suppression list shares: the length and the name
+/// of the tenant whose list it is (the empty name for the account-level list), joined
+/// by the separator from [`suppression_key`].
 ///
-/// A position in one list therefore starts with that list's prefix and no other's,
-/// which is what lets a listing tell its own page token from one minted for a
+/// A key carries this prefix only if it belongs to this very list — a different name
+/// either differs in the length that opens the prefix or, at equal length, in the name
+/// itself — which is what lets a listing tell its own page token from one minted for a
 /// different list.
+///
+/// Every entry of one list shares the prefix, so within a list the keys are ordered by
+/// address, which is the order a page walks. Across lists they group by name length
+/// rather than alphabetically; no listing depends on that, since each enumerates the
+/// one list its request selects.
 pub fn suppression_list_prefix(tenant_name: Option<&str>) -> String {
-    format!("{}\u{1f}", tenant_name.unwrap_or_default())
+    let name = tenant_name.unwrap_or_default();
+    format!("{}\u{1f}{name}", name.len())
 }
 
 /// How this service words `NotFoundException` for an address that is not on the
