@@ -9,10 +9,16 @@
 //! it is refused with the modelled `InvalidRequestException`.
 //!
 //! A server that DOES delegate authentication names a customer-run provider (an API
-//! Gateway endpoint, a Lambda function, a directory). Testing it means CALLING it,
-//! which this emulator cannot do, and `StatusCode`/`Response` are the provider's own
-//! answer — so that branch answers the scaffold's 501 rather than reporting a status
-//! for a call nothing made.
+//! Gateway endpoint, a Lambda function, a directory), and this operation's answer is
+//! the OUTCOME of an authentication request against it: the provider's endpoint, the
+//! HTTP status it answered, its response body and a message saying whether the test
+//! succeeded. This emulator opens no outbound connection and runs no customer identity
+//! provider, so no such request is made: the answer reports the endpoint the server is
+//! configured with, `StatusCode`'s modelled default — the value for an answer that
+//! carries no HTTP status (`crate::state::IDENTITY_PROVIDER_NO_RESPONSE_STATUS`) — no
+//! `Response`, as the operation documents for a test that got none, and the message
+//! `crate::state::identity_provider_test_message` decides from the stored
+//! configuration. Nothing here claims an outcome for a request nothing sent.
 //!
 //! ## Shape of an operation
 //!
@@ -220,11 +226,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Past the gate the server delegates authentication to a customer-run provider,
-        // and this operation's whole answer — `Url`, `StatusCode`, `Response`,
-        // `Message` — is that provider's response to an authentication attempt. The
-        // emulator makes no outbound connection and runs no customer identity provider,
-        // so there is no such response to report: answering the 501 says exactly that,
-        // where a synthesised `StatusCode` would report a call nothing made.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TestIdentityProvider"))
+        // and what this operation reports is the outcome of an authentication request
+        // against it. None is made here, so the answer carries the endpoint the server
+        // names, the modelled default status for an answer with no HTTP status in it,
+        // and the message that says why — decided from the STORED configuration alone.
+        Ok(TestIdentityProviderOutput {
+            url: st::identity_provider_endpoint(server),
+            status_code: st::IDENTITY_PROVIDER_NO_RESPONSE_STATUS,
+            // "If you provide any incorrect values for any parameters, the `Response`
+            // field is empty": no provider answered, so there is no response body to
+            // report and none may be invented.
+            response: None,
+            message: Some(st::identity_provider_test_message(server).to_string()),
+        })
     }
 }

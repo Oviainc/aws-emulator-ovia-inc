@@ -170,8 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A page is addressed UNDER its product
         // (`/v2/portalproducts/{PortalProductId}/productrestendpointpages/{Id}`), so an
         // unknown product and an unknown page under a known one both name no page: 404
-        // `NotFoundException` ("The resource specified in the request was not found"), the
-        // wording `GetProductRestEndpointPage` refuses an unknown page with.
+        // `NotFoundException`, with the sentence `GetProductRestEndpointPage` refuses an
+        // unknown page with (see
+        // [`crate::state::PRODUCT_REST_ENDPOINT_PAGE_NOT_FOUND_MESSAGE`]).
         let stored = store
             .portal_products
             .get_mut(&input.portal_product_id)
@@ -183,12 +184,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(page) = stored else {
             return Err(UpdateProductRestEndpointPageErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!(
-                        "Invalid ProductRestEndpointPage identifier specified {}:{}:{}",
-                        ::engine::emulator_account_id(),
-                        input.portal_product_id,
-                        input.product_rest_endpoint_page_id
-                    )),
+                    message: Some(
+                        crate::state::PRODUCT_REST_ENDPOINT_PAGE_NOT_FOUND_MESSAGE.to_string(),
+                    ),
                     resource_type: ::std::option::Option::None,
                 },
             )

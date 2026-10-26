@@ -290,10 +290,11 @@ async fn test_identity_provider_refuses_every_service_managed_server() {
 }
 
 /// RULE 1 (`TestIdentityProvider`, past the gate): a server that DOES delegate
-/// authentication to a customer-run provider is not refused as misconfigured. Testing
-/// such a provider means calling it, which this emulator cannot do — so the gate is
-/// what this asserts: the answer is NOT the `InvalidRequestException` of the rule
-/// above, and not a fabricated `StatusCode` either.
+/// authentication to a customer-run provider is not refused as misconfigured — it is
+/// answered with the outcome of an authentication request against that provider. What
+/// that answer REPORTS is [`crate::identity_provider_tests`]' subject; the gate is what
+/// this asserts: the answer is not the `InvalidRequestException` of the rule above, and
+/// it carries no status for a response nothing received.
 #[tokio::test]
 async fn test_identity_provider_passes_the_gate_for_an_external_identity_provider() {
     let emulator = Emulator::new();
@@ -312,11 +313,21 @@ async fn test_identity_provider_passes_the_gate_for_an_external_identity_provide
                 answer.body
             );
             assert_eq!(
-                (answer.status, answer.error_code().as_str()),
-                (501, "NotImplemented"),
-                "case {case:?}: calling a customer identity provider is not emulated, so the \
-                 answer must say so rather than report a status for a call nothing made; got {} {}",
-                answer.status,
+                answer.status, 200,
+                "case {case:?}: expected the test of an external identity provider to be \
+                 answered, got {} {}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                member_of(&answer.body, "StatusCode").as_i64(),
+                Some(0),
+                "case {case:?}: no provider answered, so the modelled default status is the \
+                 one that may be reported; got {}",
+                answer.body
+            );
+            assert!(
+                member_of(&answer.body, "Response").is_null(),
+                "case {case:?}: no provider answered, so no Response may be reported; got {}",
                 answer.body
             );
         }
@@ -647,11 +658,10 @@ async fn start_file_transfer_on_an_absent_connector_is_not_found() {
     }
 }
 
-/// RULE 3 and the declined transfer (`StartFileTransfer`): once the connector resolves,
-/// a request naming no file is refused 400 `InvalidRequestException`; a request that
-/// does name files cannot be served, because the transfer runs against the partner's
-/// remote endpoint, so it must say so rather than mint a `TransferId` for a transfer
-/// nothing runs.
+/// RULE 3 (`StartFileTransfer`): once the connector resolves, a request naming no file is
+/// refused 400 `InvalidRequestException`; a request that does name files is ACCEPTED, and
+/// the identifier it answers with addresses the record whose per-file results
+/// `ListFileTransferResults` reports (`crate::connector_transfers` is that rule's suite).
 #[tokio::test]
 async fn start_file_transfer_on_a_created_connector_refuses_a_request_naming_no_file() {
     let emulator = Emulator::new();
@@ -676,24 +686,50 @@ async fn start_file_transfer_on_a_created_connector_refuses_a_request_naming_no_
             json!({"ConnectorId": &connector_id, "SendFilePaths": ["bucket/one.txt"]}),
         ),
         (
-            "inbound",
+            "outbound, several files with a remote directory",
             json!({
                 "ConnectorId": &connector_id,
-                "RetrieveFilePaths": ["/outbox/one.txt"],
-                "LocalDirectoryPath": "/bucket/landing",
+                "SendFilePaths": ["bucket/one.txt", "bucket/two.txt"],
+                "RemoteDirectoryPath": "/inbox",
             }),
         ),
     ] {
         let answer = emulator.call("StartFileTransfer", request).await;
         assert_eq!(
-            (answer.status, answer.error_code().as_str()),
-            (501, "NotImplemented"),
-            "case {case:?}: a transfer against a remote partner endpoint is not emulated, so \
-             no TransferId may be minted for it; got {} {}",
-            answer.status,
+            answer.status, 200,
+            "case {case:?}: expected the resolved transfer to be accepted, got {} {}",
+            answer.status, answer.body
+        );
+        assert!(
+            answer
+                .get("TransferId")
+                .as_str()
+                .is_some_and(|transfer_id| !transfer_id.is_empty()),
+            "case {case:?}: expected the accepted transfer to answer a TransferId, got {}",
             answer.body
         );
     }
+
+    // This connector is an AS2 one, and "for an AS2 connector, you specify the
+    // ConnectorId and one or more SendFilePaths" — so a RETRIEVE is a direction it
+    // cannot be asked for, which is a malformed request rather than a transfer.
+    let message = assert_invalid_request(
+        "an inbound transfer asked of an AS2 connector",
+        &emulator
+            .call(
+                "StartFileTransfer",
+                json!({
+                    "ConnectorId": &connector_id,
+                    "RetrieveFilePaths": ["/outbox/one.txt"],
+                    "LocalDirectoryPath": "/bucket/landing",
+                }),
+            )
+            .await,
+    );
+    assert!(
+        message.contains("RetrieveFilePaths"),
+        "expected the refusal to name RetrieveFilePaths, got {message:?}"
+    );
 }
 
 /// The `IdentityProviderType` the STORED server resolved to — what the

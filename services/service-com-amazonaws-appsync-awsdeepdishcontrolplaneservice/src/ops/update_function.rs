@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFunction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFunction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFunction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +164,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFunction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFunctionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFunction"))
+        // The new settings come from the deserialized input; the function's identity
+        // (its id and its ARN) is kept from the stored record, so no request metadata
+        // takes part and `ctx` is unused.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateFunctionErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // An `apiId` that is not an API id at all is a malformed request, not a
+        // missing resource (see `crate::state::is_api_id`).
+        if !crate::state::is_api_id(&input.api_id) {
+            return Err(UpdateFunctionErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        let mut guard = state.lock();
+
+        // The resource this call addresses is resolved first: `apiId` and `functionId`
+        // are the URI's own labels, so an update aimed at a function that is not there
+        // — never created, or already deleted — is a missing resource whatever the
+        // body carries.
+        let Some(api) = guard.graphql_apis.get_mut(&input.api_id) else {
+            return Err(UpdateFunctionErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        };
+        let Some(stored) = api.functions.get(&input.function_id) else {
+            return Err(UpdateFunctionErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::function_not_found_message(&input.function_id)),
+            })
+            .into());
+        };
+
+        // `dataSourceName` is "The Function DataSource name" — the data source the
+        // function resolves against — so an update may only point the function at one
+        // its own API holds: a name no data source of this API carries names no
+        // resource, including one held by a DIFFERENT API.
+        if !api.data_sources.contains_key(&input.data_source_name) {
+            return Err(UpdateFunctionErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::data_source_not_found_message(
+                    &input.data_source_name,
+                )),
+            })
+            .into());
+        }
+
+        // Every settable member of the request is the function's new value, so the
+        // update REPLACES what was stored rather than merging into it: a member the
+        // request omits is gone from the function. The creation order, the id and the
+        // ARN identify the record and are not settable, so the candidate keeps the
+        // stored ones — and `description` takes the same projection as on the create,
+        // where an empty description describes nothing.
+        let updated = crate::state::FunctionRecord {
+            seq: stored.seq,
+            function_id: stored.function_id.clone(),
+            arn: stored.arn.clone(),
+            name: input.name,
+            description: crate::state::data_source_description(input.description),
+            data_source_name: input.data_source_name,
+            request_mapping_template: input.request_mapping_template,
+            response_mapping_template: input.response_mapping_template,
+            function_version: input.function_version,
+            sync_config: input.sync_config,
+            max_batch_size: input.max_batch_size,
+            runtime: input.runtime,
+            code: input.code,
+        };
+
+        // The candidate has to describe a function AppSync could run, exactly as the
+        // create's does: a definition whose members do not pair up is refused before
+        // the stored record is replaced, so a refused update leaves the function as it
+        // was.
+        if let Some(message) = crate::state::function_definition_refusal(
+            updated.code.as_deref(),
+            updated.runtime.as_ref(),
+            updated.function_version.as_deref(),
+        ) {
+            return Err(UpdateFunctionErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // Answer from the record this update STORES, so this body is the one
+        // `GetFunction` answers with next. The projection is taken from the record
+        // itself, before the map takes ownership of it.
+        let function_configuration = updated.to_function_configuration();
+        api.functions.insert(updated.function_id.clone(), updated);
+
+        Ok(UpdateFunctionOutput {
+            function_configuration: Some(function_configuration),
+        })
     }
 }

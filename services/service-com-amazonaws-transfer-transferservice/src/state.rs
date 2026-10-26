@@ -58,8 +58,9 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    AccessDeniedException, As2ConnectorConfig, ConnectorEgressConfig,
-    ConnectorVpcLatticeEgressConfig, CustomDirectoriesType, DescribedWebAppEndpointDetails,
+    AccessDeniedException, As2ConnectorConfig, ConflictException, ConnectorEgressConfig,
+    ConnectorFileTransferResult, ConnectorVpcLatticeEgressConfig, CustomDirectoriesType,
+    DescribedWebAppEndpointDetails,
     DescribedWebAppIdentityProviderDetails, EndpointDetails, HomeDirectoryMapEntry,
     IdentityProviderDetails, InvalidNextTokenException, InvalidRequestException, PosixProfile,
     ProtocolDetails, ProxyConfig,
@@ -721,6 +722,73 @@ pub fn not_configured_for_external_auth(server_id: &str) -> InvalidRequestExcept
     InvalidRequestException {
         message: format!("{server_id} not configured for external auth"),
     }
+}
+
+/// `TestIdentityProvider`'s `StatusCode` for a test that got no HTTP response back.
+///
+/// `StatusCode` is "the HTTP status code that is the response from your API Gateway or
+/// your Lambda function", and the model gives the member `@default(0)`: the value an
+/// answer carries when there is no such status to report. This emulator opens no
+/// outbound connection and runs no customer identity provider, so no authentication
+/// request is sent and no status comes back — the test reports that default, with
+/// [`identity_provider_test_message`] saying why, and no `Response`, which is what the
+/// operation documents for a test that did not get one ("If you provide any incorrect
+/// values for any parameters, the `Response` field is empty").
+pub const IDENTITY_PROVIDER_NO_RESPONSE_STATUS: i32 = 0;
+
+/// `Message` for a test of a server whose `IdentityProviderDetails` names no endpoint
+/// for the provider type it delegates authentication to.
+///
+/// Each of the three external types is configured through ONE member of
+/// `IdentityProviderDetails` — `Url` for `API_GATEWAY`, `Function` for `AWS_LAMBDA`,
+/// `DirectoryId` for `AWS_DIRECTORY_SERVICE` — so without it the server names nothing
+/// to authenticate against, whatever else the request carries.
+const IDENTITY_PROVIDER_NAMES_NO_ENDPOINT: &str = "The server's IdentityProviderDetails \
+     names no endpoint for its IdentityProviderType, so there is no identity provider \
+     for this test to authenticate against.";
+
+/// `Message` for a test of a server whose identity provider IS named: the test got as
+/// far as the authentication request itself, which is what this emulator does not make.
+const IDENTITY_PROVIDER_NOT_INVOKED: &str = "The stored identity provider \
+     configuration is complete, but the authentication request could not be made: this \
+     emulator opens no outbound connection and runs no customer identity provider, so \
+     the provider returned no response.";
+
+/// The endpoint of the service `server` authenticates its users against, as
+/// `TestIdentityProvider`'s required `Url` reports it ("the endpoint of the service used
+/// to authenticate a user").
+///
+/// Read off the ONE `IdentityProviderDetails` member the server's own
+/// `IdentityProviderType` is configured through. The EMPTY string — which `Url`'s
+/// `len 0..255` admits — for a server that names none, because there is then no endpoint
+/// to report and none may be invented.
+pub fn identity_provider_endpoint(server: &Server) -> String {
+    let Some(details) = server.identity_provider_details.as_ref() else {
+        return String::new();
+    };
+    let named = match server.identity_provider_type.as_str() {
+        IDENTITY_PROVIDER_API_GATEWAY => details.url.as_deref(),
+        IDENTITY_PROVIDER_AWS_LAMBDA => details.function.as_deref(),
+        IDENTITY_PROVIDER_AWS_DIRECTORY_SERVICE => details.directory_id.as_deref(),
+        _ => None,
+    };
+    named
+        .map(|endpoint| endpoint.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// The `Message` a test of `server`'s identity provider reports: "a message that
+/// indicates whether the test was successful or not".
+///
+/// Decided from the server's STORED configuration alone, like the verdict
+/// [`sftp_connection_status_message`] gives a connector: each text is fixed for the
+/// condition it states and carries no request data, and none of them claims an outcome
+/// for an authentication request nothing made.
+pub fn identity_provider_test_message(server: &Server) -> &'static str {
+    if identity_provider_endpoint(server).is_empty() {
+        return IDENTITY_PROVIDER_NAMES_NO_ENDPOINT;
+    }
+    IDENTITY_PROVIDER_NOT_INVOKED
 }
 
 /// What an access operation DOES to the grant it addresses, as that operation's
@@ -1891,6 +1959,179 @@ pub fn merge_connector_egress_config(
     ))
 }
 
+// -----------------------------------------------------------------------------
+// Connector operations: the transfers, moves and deletes a connector is asked to
+// perform against the partner's REMOTE endpoint
+// -----------------------------------------------------------------------------
+//
+// `StartFileTransfer` and `StartRemoteMove` are ASYNCHRONOUS: each one accepts the
+// request and answers an identifier for it, and the work itself then happens against
+// the partner's remote AS2 or SFTP endpoint — an outbound connection this emulator
+// never makes. So each accepted request is RECORDED here, under the identifier it was
+// answered with, and `ListFileTransferResults` reports the per-file status of the
+// record: `QUEUED`, the `TransferTableStatus` for a file whose transfer has not run.
+// Nothing here ever reports a file as transferred, because nothing transferred it.
+
+/// `TransferTableStatus`' value for a file whose transfer has been accepted and has
+/// not run (the enum is `[QUEUED, IN_PROGRESS, COMPLETED, FAILED]`).
+///
+/// The only status this emulator reports for a queued file: `IN_PROGRESS`, `COMPLETED`
+/// and `FAILED` are each a claim about a transfer that was attempted against the
+/// partner's remote endpoint, and no attempt is made here, so none of them could be
+/// true of a file this service holds.
+pub const TRANSFER_STATUS_QUEUED: &str = "QUEUED";
+
+/// `ResourceType` for one accepted connector operation, addressed by its
+/// `TransferId`. Same convention as [`RESOURCE_TYPE_SERVER`].
+pub const RESOURCE_TYPE_TRANSFER: &str = "Transfer";
+
+/// A `TransferId` the resolved connector has no accepted operation under. Its own
+/// entry in the not-found table, like every other kind.
+pub const NOT_FOUND_TRANSFER: NotFoundResource = NotFoundResource {
+    resource_type: RESOURCE_TYPE_TRANSFER,
+    message: "Unknown transfer",
+};
+
+/// The not-found payload for a `TransferId` the named connector has no record of.
+pub fn unknown_transfer(transfer_id: &str) -> ResourceNotFoundException {
+    resource_not_found(&NOT_FOUND_TRANSFER, transfer_id)
+}
+
+/// How many accepted operations ONE connector holds before a `Start*` call refuses
+/// with the modelled `ServiceUnavailableException` instead of growing.
+///
+/// The emulator's OWN bound on the store, chosen on the same basis as
+/// [`MAX_STORED_SERVERS`] — not a claim about any account's quota. Each record is
+/// itself bounded by the modelled lengths of what a caller may send (`SendFilePaths`
+/// and `RetrieveFilePaths` `len 1..10` of `FilePath` `len 1..1024`), which the
+/// framework's boundary validator enforces before a handler runs, so this bounds a
+/// connector's records in bytes as well as in count. `DeleteConnector` releases all of
+/// a connector's.
+pub const MAX_TRANSFERS_PER_CONNECTOR: usize = 100;
+
+/// One accepted connector operation, keyed by `(ConnectorId, TransferId)`.
+///
+/// The paths are held in the caller's OWN order — the order the request named the files
+/// in is the order their results are reported in, which is the only order the request
+/// states — so this is a `Vec`, not a set.
+#[derive(Debug, Clone)]
+pub struct ConnectorTransfer {
+    /// The minted identifier this operation was answered with (`TransferId`/`MoveId`
+    /// are both `len 1..512`, pattern `^[0-9a-zA-Z./-]+$`).
+    pub transfer_id: String,
+    /// The files the request named, in the order it named them.
+    pub file_paths: Vec<String>,
+    /// When the request was accepted.
+    pub requested_at: SystemTime,
+}
+
+impl ConnectorTransfer {
+    /// The per-file results of this operation, in submission order: one result per file
+    /// the request named, each `QUEUED`.
+    ///
+    /// `FailureCode` and `FailureMessage` are "for transfers that fail": nothing here
+    /// failed — nothing ran — so neither is reported.
+    pub fn results(&self) -> Vec<ConnectorFileTransferResult> {
+        self.file_paths
+            .iter()
+            .map(|file_path| ConnectorFileTransferResult {
+                file_path: file_path.clone(),
+                status_code: TRANSFER_STATUS_QUEUED.to_string(),
+                failure_code: None,
+                failure_message: None,
+            })
+            .collect()
+    }
+}
+
+/// The refusal for a `Start*` call that names no file for the connector to act on.
+///
+/// `StartFileTransfer` takes the files from whichever direction the request names
+/// ("you specify one or more `RetrieveFilePaths` to identify the files you want to
+/// transfer" inbound, "one or more `SendFilePaths`" outbound), so a request that names
+/// neither identifies nothing to transfer.
+pub fn transfer_names_no_file() -> InvalidRequestException {
+    InvalidRequestException {
+        message: required_member("SendFilePaths or RetrieveFilePaths"),
+    }
+}
+
+/// The refusal for an INBOUND transfer asked of an AS2 connector.
+///
+/// The operation documents the directions per connector kind: "For an AS2 connector,
+/// you specify the `ConnectorId` and one or more `SendFilePaths`" — outbound only —
+/// while "for an SFTP connector, the file transfer can be either outbound or inbound".
+/// So retrieving files is something only an SFTP connector can be asked to do.
+pub fn retrieval_requires_sftp_connector() -> InvalidRequestException {
+    InvalidRequestException {
+        message: settable_only_when("RetrieveFilePaths", "the connector configures SftpConfig"),
+    }
+}
+
+/// The refusal for a remote path that is not absolute.
+///
+/// `StartRemoteMove` "moves or renames a file or directory on the remote SFTP server",
+/// and a path on that server is resolved from its root: a relative path names no file
+/// there, so it is refused as the malformed request it is rather than acted on against
+/// some assumed directory. `member` is the modelled member name (`SourcePath` or
+/// `TargetPath`), and nothing the caller sent reaches the text.
+pub fn remote_path_must_be_absolute(member: &str) -> InvalidRequestException {
+    InvalidRequestException {
+        message: format!("{member} must be an absolute path on the remote server"),
+    }
+}
+
+/// Whether `path` is an absolute path on the remote server, i.e. is resolved from its
+/// root rather than from an assumed working directory.
+pub fn is_absolute_remote_path(path: &str) -> bool {
+    path.starts_with('/')
+}
+
+impl ComAmazonawsTransferTransferserviceState {
+    /// The operations accepted for `connector_id`, in `TransferId` order.
+    ///
+    /// A RANGE scan over that connector's contiguous run of the map, on the same rule
+    /// as [`Self::users_of`].
+    pub fn transfers_of<'a>(
+        &'a self,
+        connector_id: &'a str,
+    ) -> impl Iterator<Item = &'a ConnectorTransfer> + 'a {
+        use ::std::ops::Bound;
+        let lower = (connector_id.to_string(), String::new());
+        self.connector_transfers
+            .range((Bound::Included(lower), Bound::Unbounded))
+            .take_while(move |((cid, _), _)| cid == connector_id)
+            .map(|(_, transfer)| transfer)
+    }
+
+    /// Whether `connector_id` can take another accepted operation, i.e. is below
+    /// [`MAX_TRANSFERS_PER_CONNECTOR`].
+    pub fn connector_has_transfer_capacity(&self, connector_id: &str) -> bool {
+        self.transfers_of(connector_id).count() < MAX_TRANSFERS_PER_CONNECTOR
+    }
+
+    /// Record one accepted operation against `connector_id` and answer the identifier
+    /// it is held under — the `TransferId`/`MoveId` the call answers with.
+    ///
+    /// Minted and stored under the SAME lock, so the answer never names an operation
+    /// the store does not hold.
+    pub fn accept_connector_transfer(
+        &mut self,
+        connector_id: &str,
+        file_paths: Vec<String>,
+    ) -> String {
+        let transfer_id = self.mint_transfer_id();
+        let transfer = ConnectorTransfer {
+            file_paths,
+            requested_at: SystemTime::now(),
+            transfer_id: transfer_id.clone(),
+        };
+        self.connector_transfers
+            .insert((connector_id.to_string(), transfer_id.clone()), transfer);
+        transfer_id
+    }
+}
+
 /// What a state-changing server call does, given the server's current `State`.
 ///
 /// `StartServer` and `StopServer` share ONE rule, so the two handlers cannot drift:
@@ -2063,51 +2304,90 @@ pub fn merge_s3_storage_options(
     }))
 }
 
+/// The first line of the OpenSSH private-key container (`ssh-keygen`'s own armour).
+const OPENSSH_PRIVATE_KEY_BEGIN: &str = "-----BEGIN OPENSSH PRIVATE KEY-----";
+
+/// The last line of that container.
+const OPENSSH_PRIVATE_KEY_END: &str = "-----END OPENSSH PRIVATE KEY-----";
+
+/// How many Base64 columns [`normalised_openssh_private_key`] wraps the payload at.
+///
+/// The width OpenSSH itself writes, and the ONE width [`ssh_key`]'s container decoder
+/// accepts: it reads the payload through a line-wrapped Base64 reader fixed at this
+/// width, so an armour wrapped at any other column count is rejected by it even though
+/// the key inside is the same key.
+const OPENSSH_ARMOUR_COLUMNS: usize = 70;
+
+/// The OpenSSH private-key container around `material`'s payload, re-emitted in the
+/// one armour [`ssh_key`]'s decoder reads — or `None` when `material` carries no such
+/// container at all.
+///
+/// The container's LAYOUT is not part of the key: what identifies the key is the Base64
+/// payload between the two boundary lines, so the line width that payload is wrapped at
+/// (OpenSSH writes 70 columns, other tools 64 or none at all), the line ending it uses
+/// and any surrounding blank space all name the SAME key and must be read identically.
+/// This strips the boundary lines and every whitespace character of the payload and
+/// re-wraps what is left at [`OPENSSH_ARMOUR_COLUMNS`]; every other character is kept
+/// exactly as supplied, so material whose payload is not a key still fails to parse
+/// rather than being silently repaired.
+fn normalised_openssh_private_key(material: &str) -> Option<String> {
+    let inner = material
+        .trim()
+        .strip_prefix(OPENSSH_PRIVATE_KEY_BEGIN)?
+        .trim_end()
+        .strip_suffix(OPENSSH_PRIVATE_KEY_END)?;
+    let payload: Vec<char> = inner.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut normalised = String::with_capacity(material.len() + OPENSSH_ARMOUR_COLUMNS);
+    normalised.push_str(OPENSSH_PRIVATE_KEY_BEGIN);
+    normalised.push('\n');
+    for line in payload.chunks(OPENSSH_ARMOUR_COLUMNS) {
+        normalised.extend(line.iter());
+        normalised.push('\n');
+    }
+    normalised.push_str(OPENSSH_PRIVATE_KEY_END);
+    normalised.push('\n');
+    Some(normalised)
+}
+
 /// The genuine fingerprint and SSH algorithm name of private key MATERIAL a caller
 /// supplied, when the material is a key the emulator can read.
+///
+/// The material is read through [`normalised_openssh_private_key`], so whichever way
+/// the tool that wrote it wrapped the container's armour, the same key reads the same
+/// way.
 ///
 /// `None` for material in a format the emulator cannot read: it implements no
 /// private-key format other than OpenSSH's (what `ssh-keygen` writes) and serves no
 /// SSH transport, so there is nothing to compute a fingerprint or an algorithm name
 /// from — and neither may be invented for material nothing parsed.
 pub fn read_host_key(material: &str) -> Option<(String, String)> {
-    let key = ::ssh_key::PrivateKey::from_openssh(material).ok()?;
+    let normalised = normalised_openssh_private_key(material)?;
+    let key = ::ssh_key::PrivateKey::from_openssh(&normalised).ok()?;
     Some((
         key.fingerprint(::ssh_key::HashAlg::Sha256).to_string(),
         key.algorithm().as_str().to_string(),
     ))
 }
 
-/// Mint a host key for a new server and return its Base64 SHA256 fingerprint.
+/// Mint a host key for a new server: its Base64 SHA256 fingerprint and its SSH
+/// algorithm name, the two properties this service reports about a host key.
 ///
 /// AWS generates a host key for a server whose host key it manages, and reports that
 /// key's fingerprint — "equivalent to the output of the `ssh-keygen -l -f` command",
 /// i.e. OpenSSH's `SHA256:<base64 of the SHA256 of the public key blob>`. So this
 /// GENERATES a real Ed25519 SSH host key and asks `ssh-key` — the crate that
-/// implements the OpenSSH key formats — for that key's fingerprint; the value is
-/// computed from real key material rather than invented. The key itself is
-/// per-server and per-run, like the real service's, and is not kept: the emulator
-/// serves no SSH transport, so nothing can use the private half, and nothing may
-/// return it.
-pub fn mint_host_key_fingerprint() -> String {
+/// implements the OpenSSH key formats — for that key's fingerprint and algorithm; both
+/// values are computed from real key material rather than invented. The key itself is
+/// per-server and per-run, like the real service's, and its private half is not kept:
+/// the emulator serves no SSH transport, so nothing can use it, and nothing may return
+/// it.
+pub fn mint_host_key() -> (String, String) {
     let keypair = ::ssh_key::private::Ed25519Keypair::random(&mut ::ssh_key::rand_core::OsRng);
-    ::ssh_key::PrivateKey::from(keypair)
-        .fingerprint(::ssh_key::HashAlg::Sha256)
-        .to_string()
-}
-
-/// The Base64 SHA256 fingerprint of host key MATERIAL a caller supplied, when the
-/// material is a key the emulator can read.
-///
-/// `CreateServer`/`UpdateServer` accept a `HostKey`; when it is an OpenSSH private key
-/// — what `ssh-keygen` writes — that key IS the server's host key, so the fingerprint
-/// reported for the server is parsed straight out of it and matches what
-/// `ssh-keygen -l` prints for the same file. `None` for material in a format the
-/// emulator cannot read (it implements no other private-key format and serves no SSH
-/// transport): the server then keeps the host key it already has, whose genuine
-/// fingerprint it reports, rather than one invented for material nothing read.
-pub fn supplied_host_key_fingerprint(material: &str) -> Option<String> {
-    read_host_key(material).map(|(fingerprint, _algorithm)| fingerprint)
+    let key = ::ssh_key::PrivateKey::from(keypair);
+    (
+        key.fingerprint(::ssh_key::HashAlg::Sha256).to_string(),
+        key.algorithm().as_str().to_string(),
+    )
 }
 
 // =============================================================================
@@ -2578,6 +2858,66 @@ pub struct WebApp {
     /// i.e. [`Self::arn`]. A web app no customization was assigned to carries the
     /// default (every member unset), which no `CreateWebApp` member can set.
     pub customization: WebAppCustomization,
+    /// When the update this web app is CURRENTLY applying completes, or `None` when it
+    /// is applying none — see [`WEB_APP_UPDATE_SPAN`].
+    pub update_due: Option<Instant>,
+}
+
+/// How long a web app is applying an `UpdateWebApp` before the next update may begin.
+///
+/// Changing a web app's identity provider, access endpoint, units or endpoint is a
+/// configuration roll-out, not a map write: the service applies ONE at a time, so a
+/// second update that arrives while the first is still being applied is refused with
+/// the modelled `ConflictException` rather than racing it — which is what makes two
+/// concurrent writers have exactly one winner. AWS documents no span for the roll-out,
+/// so this one is CHOSEN on the same basis as [`SERVER_START_SPAN`]: long enough that a
+/// caller writing straight after a write still meets the window, short enough not to
+/// stall a test. The due instant is stored and read on the next call; nothing sleeps
+/// for it.
+pub const WEB_APP_UPDATE_SPAN: Duration = Duration::from_millis(500);
+
+impl WebApp {
+    /// Whether an update of this web app is still being applied at `now`.
+    pub fn update_in_flight(&self, now: Instant) -> bool {
+        self.update_due.is_some_and(|due| now < due)
+    }
+
+    /// Record that this web app has begun applying an update, which completes
+    /// [`WEB_APP_UPDATE_SPAN`] later.
+    pub fn begin_update(&mut self, now: Instant) {
+        self.update_due = Some(now + WEB_APP_UPDATE_SPAN);
+    }
+}
+
+/// `ConflictException`'s `Message` for a web-app update that arrived while the web app
+/// was still applying another one.
+///
+/// Fixed for the condition and carrying no request data, like every other refusal text
+/// in this module: the web app a caller addressed is the one it named.
+pub const WEB_APP_UPDATE_IN_PROGRESS: &str =
+    "An update is already in progress for this web app; wait for it to complete and \
+     try again.";
+
+/// The conflict payload for an update of a web app that is still applying another.
+pub fn web_app_update_conflict() -> ConflictException {
+    ConflictException {
+        message: WEB_APP_UPDATE_IN_PROGRESS.to_string(),
+    }
+}
+
+/// The refusal for a VPC-endpoint update of a web app that has no VPC endpoint.
+///
+/// `EndpointType` is "`PUBLIC` for publicly accessible endpoints and `VPC` for
+/// VPC-hosted endpoints", and it is selected by the endpoint configuration the create
+/// carried — so a publicly accessible web app has no VPC endpoint whose subnets an
+/// update could change, which makes the request a malformed one.
+pub fn web_app_has_no_vpc_endpoint() -> InvalidRequestException {
+    InvalidRequestException {
+        message: settable_only_when(
+            "EndpointDetails.Vpc",
+            &format!("EndpointType is {WEB_APP_ENDPOINT_TYPE_VPC}"),
+        ),
+    }
 }
 
 /// One web app's customization: the page title, logo and icon a caller assigned to it.
@@ -2897,6 +3237,11 @@ pub struct ComAmazonawsTransferTransferserviceState {
     /// Workflows by `WorkflowId` (`"w-" + 17 hex`). `BTreeMap` so `ListWorkflows` pages
     /// in a stable, resumable order.
     pub workflows: BTreeMap<String, Workflow>,
+    /// The operations a connector has ACCEPTED, by `(ConnectorId, TransferId)`, so one
+    /// connector's are a contiguous, ordered range — exactly as [`Self::users`] is
+    /// keyed. BOUNDED per connector by [`MAX_TRANSFERS_PER_CONNECTOR`], which
+    /// [`Self::connector_has_transfer_capacity`] is the predicate for.
+    pub connector_transfers: BTreeMap<(String, String), ConnectorTransfer>,
     /// Monotonic counter behind every minted id, so ids are unique and reproducible.
     pub next_id_seq: u64,
 }
@@ -2923,6 +3268,17 @@ impl ComAmazonawsTransferTransferserviceState {
     fn mint_hex_id(&mut self, prefix: &str, digits: usize) -> String {
         self.next_id_seq += 1;
         format!("{prefix}-{:0width$x}", self.next_id_seq, width = digits)
+    }
+
+    /// Mint the identifier of one accepted connector operation.
+    ///
+    /// `TransferId` and `MoveId` are `len 1..512`, pattern `^[0-9a-zA-Z./-]+$`, and
+    /// carry no documented prefix — unlike every resource id this service mints — so
+    /// this is the bare counter in 32 lowercase hex digits, which that pattern admits
+    /// and which no resource identifier can be mistaken for.
+    pub fn mint_transfer_id(&mut self) -> String {
+        self.next_id_seq += 1;
+        format!("{:032x}", self.next_id_seq)
     }
 
     /// The users stored for `server_id`, in `ListUsers` paging order.
@@ -2973,6 +3329,61 @@ impl ComAmazonawsTransferTransferserviceState {
     /// [`MAX_HOST_KEYS_PER_SERVER`].
     pub fn server_has_host_key_capacity(&self, server_id: &str) -> bool {
         self.host_keys_of(server_id).count() < MAX_HOST_KEYS_PER_SERVER
+    }
+
+    /// Materialise a server's ACTIVE host key as one of that server's host-key
+    /// resources, and answer the `HostKeyId` it is held under.
+    ///
+    /// The key whose fingerprint a server reports as its own is one of its host keys:
+    /// the service manages it, so `ListHostKeys` enumerates it and `DescribeHostKey`
+    /// reports it, exactly as it does a key a caller imported — which is what lets a
+    /// client that audits or rotates a server's keys find the one the server is
+    /// actually serving with. Every write that SETS a server's host key calls this with
+    /// the fingerprint and algorithm read out of that key's material
+    /// ([`read_host_key`]) or minted with it ([`mint_host_key`]), so no server can
+    /// report a fingerprint none of its host keys has.
+    ///
+    /// A server that already holds a key with this fingerprint keeps it — the material
+    /// IS the key's identity within a server, the rule `ImportHostKey` refuses a
+    /// re-import on — so setting the same key twice stores one record, not two.
+    ///
+    /// The per-server BOUND ([`MAX_HOST_KEYS_PER_SERVER`],
+    /// [`Self::server_has_host_key_capacity`]) belongs to the caller: `CreateServer`
+    /// materialises the first key of a server that holds none, and `UpdateServer`
+    /// refuses a rotation the server has no room for before it writes anything. So this
+    /// adds at most one record per write that sets a server's host key, and never past
+    /// what its caller admitted.
+    pub fn materialise_host_key(
+        &mut self,
+        region: &str,
+        server_id: &str,
+        fingerprint: &str,
+        key_type: &str,
+    ) -> String {
+        let held = self
+            .host_keys_of(server_id)
+            .find(|host_key| host_key.fingerprint == fingerprint)
+            .map(|host_key| host_key.host_key_id.clone());
+        if let Some(host_key_id) = held {
+            return host_key_id;
+        }
+        let host_key_id = self.mint_id("hostkey");
+        let host_key = HostKey {
+            arn: host_key_arn(region, server_id, &host_key_id),
+            fingerprint: fingerprint.to_string(),
+            key_type: key_type.to_string(),
+            // The service generated or adopted this key for the server itself: no
+            // caller described it and no caller tagged it, so neither member is
+            // invented for it.
+            description: None,
+            date_imported: SystemTime::now(),
+            storage_type: DEFAULT_HOST_KEY_STORAGE_TYPE.to_string(),
+            tags: Vec::new(),
+            host_key_id: host_key_id.clone(),
+        };
+        self.host_keys
+            .insert((server_id.to_string(), host_key_id.clone()), host_key);
+        host_key_id
     }
 
     /// `UserCount`: the live number of users assigned to `server_id`.
@@ -3256,6 +3667,38 @@ pub fn page_bounds(
         None
     };
     (start..end, next)
+}
+
+/// The index range of one page of a list whose order is the order its items were
+/// SUBMITTED in, and the next page's token key.
+///
+/// [`page_bounds`] resumes by KEY, which needs the list sorted; a listing that reports
+/// its items in submission order is not sorted, so its token carries the POSITION the
+/// next page starts at instead. `None` for a token this codec did not issue — one that
+/// is not a position, or one past the end of the list — so a caller is refused rather
+/// than silently given a restarted listing.
+pub fn page_bounds_by_position(
+    count: usize,
+    after: Option<&str>,
+    limit: usize,
+) -> Option<(::std::ops::Range<usize>, Option<String>)> {
+    let start = match after {
+        Some(position) => {
+            let start = position.parse::<usize>().ok()?;
+            if start > count {
+                return None;
+            }
+            start
+        }
+        None => 0,
+    };
+    let end = start.saturating_add(limit).min(count);
+    let next = if end < count {
+        Some(end.to_string())
+    } else {
+        None
+    };
+    Some((start..end, next))
 }
 
 /// Turn a caller's `MaxResults` into a page bound.

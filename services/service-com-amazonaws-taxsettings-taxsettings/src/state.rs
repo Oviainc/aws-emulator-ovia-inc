@@ -642,6 +642,10 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
     /// is a real discriminator (an id naming another account fails it), unlike
     /// comparing the CALLER against it — see [`MANAGEMENT_ACCOUNT_ONLY`] for why
     /// the latter would admit every call.
+    ///
+    /// A read that names such an account reports it on its own per-account
+    /// channel — the batch read's `failedAccounts` — so the accounts named
+    /// beside it are still reported.
     pub fn reports_exemptions_for(&self, account_id: &str) -> bool {
         account_id == ::engine::emulator_account_id()
             || self.registrations.contains_key(account_id)
@@ -2492,24 +2496,6 @@ pub fn check_registration_deletable(
 pub fn no_tax_registration() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: "No tax registration found".to_string(),
-    }
-}
-
-/// This service's modelled `ResourceNotFoundException` (HTTP 404) for an
-/// exemption read that names an account this service holds no tax-settings
-/// resource for — one outside the caller's consolidated billing family (see
-/// [`ComAmazonawsTaxsettingsTaxsettingsState::reports_exemptions_for`]).
-///
-/// It carries its `message` only, for the reason [`no_tax_registration`] gives.
-/// The 404 and the `ResourceNotFoundException` shape are the contract; the
-/// wording is this emulator's own, built from the request so the caller is told
-/// WHICH of the accounts it named is the one with nothing behind it.
-pub fn no_exemptions_for_account(account_id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: format!(
-            "Account {account_id} is not in your consolidated billing family, so it has no tax \
-             exemptions to report."
-        ),
     }
 }
 

@@ -103,14 +103,6 @@ enum Expected {
     },
 }
 
-/// Whether `value` is an AWS Transfer Family `ServerId`: `s-` and 17 LOWERCASE
-/// hexadecimal characters (Transfer's model: `^s-([0-9a-f]{17})$`, `length 19..19`).
-fn is_transfer_server_id(value: &str) -> bool {
-    value
-        .strip_prefix("s-")
-        .is_some_and(|id| id.len() == 17 && id.chars().all(is_lower_hex))
-}
-
 /// Whether `value` is an AWS Transfer Family `WorkflowId`: `w-` and 17 characters of
 /// `[a-z0-9]` (Transfer's model: `^w-([a-z0-9]{17})$`, `length 19..19`).
 fn is_transfer_workflow_id(value: &str) -> bool {
@@ -533,57 +525,50 @@ fn output_cases() -> Vec<OutputCase> {
             ]),
         },
         OutputCase {
-            // The issue's own CloudFormation case, in the YAML spelling it was recorded
-            // in: the template hands the caller the server id the owning SERVICE assigns,
-            // which is the only way a CFN-driven integration can learn it.
-            case: "a transfer server: !GetAtt of the id its service assigns, and its arn",
-            stack_name: "transfer-server",
+            // The issue's own CloudFormation case now lives in the router's own suite
+            // (see the note on the workflow case below), so what this row carries is the
+            // Lambda pair above and the workflow below.
+            case: "a transfer workflow: a second declared-only service-assigned id",
+            stack_name: "transfer-second-workflow",
             template: concat!(
                 "Resources:\n",
-                "  Server:\n",
-                "    Type: AWS::Transfer::Server\n",
-                "    Properties:\n",
-                "      Protocols:\n",
-                "        - SFTP\n",
+                "  Flow:\n",
+                "    Type: AWS::Transfer::Workflow\n",
                 "Outputs:\n",
-                "  ServerId:\n",
-                "    Value: !GetAtt Server.ServerId\n",
-                "  ServerArn:\n",
-                "    Value:\n",
-                "      Fn::GetAtt: [Server, Arn]\n",
-                "  ServerRef:\n",
-                "    Value: !Ref Server\n",
+                "  WorkflowId:\n",
+                "    Value: !GetAtt Flow.WorkflowId\n",
+                "  WorkflowRef:\n",
+                "    Value: !Ref Flow\n",
             )
             .to_string(),
             parameters: vec![],
             expected: vec![
                 (
-                    "ServerId",
+                    "WorkflowId",
                     Expected::Form {
-                        described: "a ServerId of the form s- + 17 hexadecimal characters",
-                        check: is_transfer_server_id,
+                        described: "a WorkflowId of the form w- + 17 of [a-z0-9]",
+                        check: is_transfer_workflow_id,
                     },
                 ),
                 (
-                    "ServerArn",
+                    // "Ref returns the Amazon Resource Name (ARN)" for this type too.
+                    "WorkflowRef",
                     Expected::Form {
-                        described: "a transfer server ARN",
-                        check: |value| is_transfer_arn(value, "server", is_transfer_server_id),
-                    },
-                ),
-                (
-                    // "Ref returns the Amazon Resource Name (ARN) of the server".
-                    "ServerRef",
-                    Expected::Form {
-                        described: "a transfer server ARN",
-                        check: |value| is_transfer_arn(value, "server", is_transfer_server_id),
+                        described: "a transfer workflow ARN",
+                        check: |value| is_transfer_arn(value, "workflow", is_transfer_workflow_id),
                     },
                 ),
             ],
         },
         OutputCase {
-            // The same rule one type along, on a type the issue never cited: a workflow id
-            // is `w-` + 17 of `[a-z0-9]`, so the FORM differs while the rule does not.
+            // The same rule on a type whose owning service this router does not mount:
+            // a workflow id is `w-` + 17 of `[a-z0-9]`, so the FORM differs while the
+            // rule does not. The `AWS::Transfer::Server` case this suite used to carry
+            // moved to `core/router/tests/all/cloudformation_provisions_transfer_servers.rs`
+            // when that type gained a provisioner: a stack that declares it now CALLS
+            // AWS Transfer Family, which only a router with both services mounted can
+            // serve — and that suite asserts the published id against the server the
+            // service really created, which is stronger than a form check.
             case: "a transfer workflow: its own service-assigned id form",
             stack_name: "transfer-workflow",
             template: r#"{"Resources":{"Flow":{"Type":"AWS::Transfer::Workflow",
@@ -1915,13 +1900,19 @@ async fn a_substitution_chain_cannot_multiply_the_work_of_its_parts() {
 #[tokio::test]
 async fn a_service_assigned_resource_id_is_unique_per_resource_and_stable() {
     let router = router();
+    // Every type here is one this router leaves DECLARED-ONLY: a type whose owning
+    // service this router does not mount is created nowhere, and the id CloudFormation
+    // publishes for it is what this rule is about. `AWS::Transfer::Server` was one of
+    // them until it gained a provisioner — a stack that declares it now calls AWS
+    // Transfer Family — so its place here is taken by a second `AWS::Transfer::Workflow`,
+    // whose id has the same service-assigned shape, and the provisioned type is asserted
+    // against the service that creates it in
+    // `core/router/tests/all/cloudformation_provisions_transfer_servers.rs`.
     let template = concat!(
         "Resources:\n",
         "  First:\n",
-        "    Type: AWS::Transfer::Server\n",
+        "    Type: AWS::Transfer::Workflow\n",
         "  Second:\n",
-        "    Type: AWS::Transfer::Server\n",
-        "  Flow:\n",
         "    Type: AWS::Transfer::Workflow\n",
         "  Monitor:\n",
         "    Type: AWS::RUM::AppMonitor\n",
@@ -1933,11 +1924,9 @@ async fn a_service_assigned_resource_id_is_unique_per_resource_and_stable() {
         "      Name: assigned-ids-two\n",
         "Outputs:\n",
         "  FirstId:\n",
-        "    Value: !GetAtt First.ServerId\n",
+        "    Value: !GetAtt First.WorkflowId\n",
         "  SecondId:\n",
-        "    Value: !GetAtt Second.ServerId\n",
-        "  FlowId:\n",
-        "    Value: !GetAtt Flow.WorkflowId\n",
+        "    Value: !GetAtt Second.WorkflowId\n",
         "  MonitorId:\n",
         "    Value: !GetAtt Monitor.Id\n",
         "  OtherMonitorId:\n",
@@ -1961,22 +1950,16 @@ async fn a_service_assigned_resource_id_is_unique_per_resource_and_stable() {
         described: &'static str,
         check: fn(&str) -> bool,
     }
-    let rows: [IdRow; 5] = [
-        IdRow {
-            case: "a transfer server",
-            key: "FirstId",
-            described: "s- + 17 hexadecimal characters",
-            check: is_transfer_server_id,
-        },
-        IdRow {
-            case: "a second transfer server in the same stack",
-            key: "SecondId",
-            described: "s- + 17 hexadecimal characters",
-            check: is_transfer_server_id,
-        },
+    let rows: [IdRow; 4] = [
         IdRow {
             case: "a transfer workflow",
-            key: "FlowId",
+            key: "FirstId",
+            described: "w- + 17 of [a-z0-9]",
+            check: is_transfer_workflow_id,
+        },
+        IdRow {
+            case: "a second transfer workflow in the same stack",
+            key: "SecondId",
             described: "w- + 17 of [a-z0-9]",
             check: is_transfer_workflow_id,
         },
@@ -2019,13 +2002,7 @@ async fn a_service_assigned_resource_id_is_unique_per_resource_and_stable() {
 
     let (_, body) = describe_stack(&router, "assigned-ids").await;
     let second = wire_outputs(&body);
-    for key in [
-        "FirstId",
-        "SecondId",
-        "FlowId",
-        "MonitorId",
-        "OtherMonitorId",
-    ] {
+    for key in ["FirstId", "SecondId", "MonitorId", "OtherMonitorId"] {
         assert_eq!(
             read(key, &second),
             read(key, &first),

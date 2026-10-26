@@ -3994,6 +3994,20 @@ pub fn too_many_tags_message(resource: &str) -> String {
     format!("Tag limit exceeded for {resource}.")
 }
 
+/// The message `ApprovalAlreadyCompletedException` carries, for an approval that has
+/// already been answered.
+///
+/// Unlike the refusals above, this one is INVARIANT text: the service words this class
+/// of failure as one sentence pair whatever approval was answered, so nothing from the
+/// request or from state is interpolated into it. The second sentence is the
+/// remediation — a token presented again may have been published against an earlier
+/// pipeline revision rather than merely reused — and keeping the string constant is what
+/// lets a caller that classifies approval failures by their text, or compares error
+/// payloads against a golden file, read the same bytes in every account and region.
+pub const APPROVAL_ALREADY_COMPLETED_MESSAGE: &str =
+    "The approval request that you responded to is already complete or has expired. \
+     Review the latest revisions in the pipeline, and then try again.";
+
 /// How a tagging refusal names a custom action type: the three request members that
 /// identify it (`CreateCustomActionType$category`, `$provider` and `$version` — the
 /// action type's identity, since `owner` is always `Custom` for one this account

@@ -9,8 +9,9 @@
 //!   it — every stored record, member for member — and an account it holds none
 //!   for simply has no entry in the reported map;
 //! * an exemption READ naming an account this service holds no tax settings for
-//!   and that is not the caller's own refuses the CALL with
-//!   `ResourceNotFoundException` (404) rather than reporting on it;
+//!   and that is not the caller's own reports that account on the batch read's
+//!   own per-account failure channel (`failedAccounts`) on a 200, and still
+//!   reports every account named beside it;
 //! * a submission, by contrast, screens no account: it records the exemption for
 //!   every account id it names, whatever this service already holds for that
 //!   account, and answers one support case id;
@@ -210,13 +211,17 @@ struct Visibility {
     error_code: &'static str,
     /// The accounts the reported map must carry, sorted.
     reported: Vec<&'static str>,
+    /// The accounts `failedAccounts` must carry, in the order the request named
+    /// them for the first time.
+    failed: Vec<&'static str>,
 }
 
 /// RULE: the call reports the exemptions this service holds for each account it
-/// names, and refuses the whole call with `ResourceNotFoundException` (404) when
-/// one of them names an account this service holds no tax settings for and that
-/// is not the caller's own — an account outside the caller's consolidated
-/// billing family.
+/// names, and an account it holds no tax settings for and that is not the
+/// caller's own — an account outside the caller's consolidated billing family —
+/// is reported on the response's own per-account failure channel
+/// (`failedAccounts`) on a 200, the accounts named beside it still being
+/// reported in the map.
 #[tokio::test]
 async fn only_accounts_this_service_holds_tax_settings_for_are_reported() {
     let (router, engine) = emulator_with_engine();
@@ -251,6 +256,7 @@ async fn only_accounts_this_service_holds_tax_settings_for_are_reported() {
             status: 200,
             error_code: "",
             reported: vec![],
+            failed: vec![],
         },
         Visibility {
             case: "an account with a stored TRN and no exemption",
@@ -258,6 +264,7 @@ async fn only_accounts_this_service_holds_tax_settings_for_are_reported() {
             status: 200,
             error_code: "",
             reported: vec![],
+            failed: vec![],
         },
         Visibility {
             case: "an account with a recorded exemption",
@@ -265,6 +272,7 @@ async fn only_accounts_this_service_holds_tax_settings_for_are_reported() {
             status: 200,
             error_code: "",
             reported: vec![with_exemption],
+            failed: vec![],
         },
         Visibility {
             case: "an account whose exemption record list is empty",
@@ -272,6 +280,7 @@ async fn only_accounts_this_service_holds_tax_settings_for_are_reported() {
             status: 200,
             error_code: "",
             reported: vec![],
+            failed: vec![],
         },
         Visibility {
             case: "several accounts, only one of which holds an exemption",
@@ -279,6 +288,7 @@ async fn only_accounts_this_service_holds_tax_settings_for_are_reported() {
             status: 200,
             error_code: "",
             reported: vec![with_exemption],
+            failed: vec![],
         },
         Visibility {
             // `accountIds` is @length 1..=5: five ids is the published bound,
@@ -294,27 +304,31 @@ async fn only_accounts_this_service_holds_tax_settings_for_are_reported() {
             status: 200,
             error_code: "",
             reported: vec![with_exemption],
+            failed: vec![],
         },
         Visibility {
             case: "an account outside the caller's billing family",
             accounts: vec![foreign],
-            status: 404,
-            error_code: "ResourceNotFoundException",
+            status: 200,
+            error_code: "",
             reported: vec![],
+            failed: vec![foreign],
         },
         Visibility {
-            case: "a foreign account named beside accounts that would report",
+            case: "a foreign account named beside accounts that report",
             accounts: vec![with_exemption, foreign],
-            status: 404,
-            error_code: "ResourceNotFoundException",
-            reported: vec![],
+            status: 200,
+            error_code: "",
+            reported: vec![with_exemption],
+            failed: vec![foreign],
         },
         Visibility {
             case: "a foreign account named first",
             accounts: vec![foreign, with_exemption],
-            status: 404,
-            error_code: "ResourceNotFoundException",
-            reported: vec![],
+            status: 200,
+            error_code: "",
+            reported: vec![with_exemption],
+            failed: vec![foreign],
         },
         Visibility {
             // One past the published `@length` bound: the boundary validator
@@ -331,6 +345,7 @@ async fn only_accounts_this_service_holds_tax_settings_for_are_reported() {
             status: 400,
             error_code: "ValidationException",
             reported: vec![],
+            failed: vec![],
         },
     ];
 
@@ -361,12 +376,14 @@ async fn only_accounts_this_service_holds_tax_settings_for_are_reported() {
         );
 
         if row.status == 200 {
-            // Nothing can fail on its own: the accounts a reporting call names
-            // are all read from one store under one lock.
+            // The per-account failure channel carries exactly the accounts this
+            // service could not report on, and is present-and-empty when there
+            // are none.
             assert_eq!(
                 answer.get("failedAccounts"),
-                &json!([]),
-                "case {case:?}: expected no failed account, got {:?}",
+                &json!(row.failed),
+                "case {case:?}: expected the failed accounts {:?}, got {:?}",
+                row.failed,
                 answer.body
             );
         } else {

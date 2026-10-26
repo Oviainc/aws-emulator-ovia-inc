@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAccountAssignmentDeletionStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAccountAssignmentDeletionStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: enumerates the assignment-deletion statuses this service's state
+//! (`crate::state`) holds for one instance, newest last, one page at a time. This is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAccountAssignmentDeletionStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read over the SAME records
+//! [`crate::ops::describe_account_assignment_deletion_status`] reports one of, projected
+//! onto the model's `AccountAssignmentOperationStatusMetadata` (status, request id,
+//! created date), so the list and the describe cannot disagree. An instance under which
+//! nothing has been deleted is an empty list, not an error.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +162,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAccountAssignmentDeletionStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAccountAssignmentDeletionStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAccountAssignmentDeletionStatus"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAccountAssignmentDeletionStatusErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // The `StatusValues` the request filters by, as one of the values the model's enum
+        // declares (`STATUS_VALUES_VALUES`, the one source for their spelling). Reaching
+        // this handler means the modelled constraints already hold, so anything else
+        // cannot arrive here; it is still refused rather than answered with an empty page,
+        // which would read as "no deletion is in that state".
+        let filter = match input
+            .filter
+            .as_ref()
+            .and_then(|filter| filter.status.as_deref())
+        {
+            None => None,
+            Some(status) if STATUS_VALUES_VALUES.contains(&status) => Some(status),
+            Some(status) => {
+                return Err(
+                    ListAccountAssignmentDeletionStatusErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(crate::state::operation_status_unknown_message(status)),
+                            // The model's `ValidationExceptionReason` enum carries only KMS
+                            // key states, none of which this refusal is.
+                            reason: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // The cursor is scoped to THIS enumeration: the operation and the whole filter
+        // that selected the rows, since the page key only distinguishes rows within it.
+        let scope =
+            crate::state::cursor_account_assignment_deletion_status(&input.instance_arn, filter);
+        let after = crate::state::cursor_after(&scope, input.next_token.as_deref()).map_err(
+            |message| {
+                ListAccountAssignmentDeletionStatusErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message.to_string()),
+                        reason: None,
+                    },
+                )
+            },
+        )?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let ordered: Vec<(String, AccountAssignmentOperationStatusMetadata)> = {
+            let mut store = state.lock();
+            // A READ, except for what the CLOCK already owes the instances themselves, and
+            // the account's ambient instance if nothing has enabled one yet (`on_request`):
+            // enumerating tracked operations advances none of them, and each status is
+            // derived from the due instant the delete that started it stored.
+            store.on_request(&region, now);
+            // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: account
+            // assignments are a feature of an organization instance, so on an account
+            // instance no assignment deletion can ever have run and the enumeration is
+            // refused rather than answered empty. An ARN this account holds no instance
+            // for is NOT this refusal — it falls through to the 404 below.
+            if store.permission_set_surface_withdrawn(&input.instance_arn) {
+                return Err(
+                    ListAccountAssignmentDeletionStatusErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
+                            ),
+                            reason: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            if store.instance(&input.instance_arn).is_none() {
+                return Err(
+                    ListAccountAssignmentDeletionStatusErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "No instance found with the ARN {}",
+                                input.instance_arn
+                            )),
+                            reason: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // The stored deletion history of THIS instance, in the chronological order its
+            // page key imposes, keeping only the rows whose status as of `now` is the one
+            // the filter asked for.
+            let mut rows: Vec<(String, AccountAssignmentOperationStatusMetadata)> = store
+                .assignment_deletions
+                .iter()
+                .filter(|record| record.instance_arn == input.instance_arn)
+                .filter(|record| filter.is_none_or(|status| record.status(now) == status))
+                .map(|record| (record.page_key(), record.to_metadata_shape(now)))
+                .collect();
+            rows.sort_by(|(left, _), (right, _)| left.cmp(right));
+            rows
+        };
+
+        let (account_assignments_deletion_status, next_token) =
+            crate::state::page(&scope, ordered, after.as_deref(), input.max_results);
+        Ok(ListAccountAssignmentDeletionStatusOutput {
+            account_assignments_deletion_status: Some(account_assignments_deletion_status),
+            next_token,
+        })
     }
 }
