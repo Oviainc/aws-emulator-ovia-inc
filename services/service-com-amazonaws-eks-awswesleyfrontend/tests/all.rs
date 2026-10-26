@@ -87,5 +87,7 @@ mod pod_identity_associations;
 mod state_roundtrip;
 #[path = "all/untag_resource.rs"]
 mod untag_resource;
+#[path = "all/update_listing.rs"]
+mod update_listing;
 #[path = "all/wire.rs"]
 mod wire;

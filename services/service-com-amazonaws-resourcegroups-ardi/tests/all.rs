@@ -43,6 +43,8 @@ mod list_groups_filters;
 mod list_tag_sync_tasks;
 #[path = "all/page_size_rule.rs"]
 mod page_size_rule;
+#[path = "all/put_group_configuration.rs"]
+mod put_group_configuration;
 #[path = "all/region_isolation.rs"]
 mod region_isolation;
 #[path = "all/resource_group_lifecycle.rs"]

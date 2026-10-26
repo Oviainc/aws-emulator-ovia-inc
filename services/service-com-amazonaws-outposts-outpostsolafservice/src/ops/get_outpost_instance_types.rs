@@ -172,13 +172,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // region's inventory and of no other's, so that is where the identifier is
         // resolved — and with it the configuration this store records for it.
         let region = crate::state::request_region(ctx.parts());
-        // `OutpostId` accepts the bare id or the full Outpost ARN; both name the same
-        // stored Outpost.
-        let outpost_id = crate::state::resolve_outpost_id(&input.outpost_id).ok_or_else(|| {
-            GetOutpostInstanceTypesErrorModeled::ValidationException(ValidationException {
-                message: Some(crate::state::outpost_id_pattern_report()),
+        // `OutpostId` accepts the bare id or the full Outpost ARN. A bare id names an
+        // Outpost of the inventory this endpoint serves; an ARN carries a partition, a
+        // Region and an account of its own, and one that is not this endpoint's names
+        // no Outpost it holds.
+        let not_found = || {
+            GetOutpostInstanceTypesErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::identifier_not_found(
+                    crate::state::OUTPOST_ID_MEMBER,
+                    &input.outpost_id,
+                )),
             })
-        })?;
+        };
+        let outpost_id = crate::state::resolve_outpost_id(&input.outpost_id, &region)
+            .ok_or_else(|| {
+                GetOutpostInstanceTypesErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::outpost_id_pattern_report()),
+                })
+            })?
+            .here()
+            .ok_or_else(not_found)?
+            .to_string();
+
         // The resume point the caller's token names. A token this service did not
         // issue for THIS report is a bad request, not an empty page — the same rule
         // every other paged answer in this service applies to its own token.
@@ -213,14 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let outpost = store
             .outpost(&region, &outpost_id)
             .map(|record| record.outpost.clone())
-            .ok_or_else(|| {
-                GetOutpostInstanceTypesErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(crate::state::identifier_not_found(
-                        crate::state::OUTPOST_ID_MEMBER,
-                        &input.outpost_id,
-                    )),
-                })
-            })?;
+            .ok_or_else(not_found)?;
         // The boundary a page of this report stops at is an entry's POSITION in the
         // configuration's own stable order: a configured instance type carries no
         // creation sequence of its own, and that order is the one the whole report is
