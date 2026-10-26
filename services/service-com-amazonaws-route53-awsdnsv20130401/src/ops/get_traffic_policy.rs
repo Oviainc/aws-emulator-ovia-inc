@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 GetTrafficPolicyErrorModeled::NoSuchTrafficPolicy(no_such_traffic_policy(
                     &input.id,
-                    input.version,
+                    Some(input.version),
                 ))
             })?;
 

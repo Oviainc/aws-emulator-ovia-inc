@@ -17,8 +17,9 @@
 //! rather than one recorded call: the rows differ along which rule the request names
 //! (one with a remediation configuration, one without, one that does not exist at all),
 //! along the resource type and id each key carries (including the account-level type,
-//! which the published `ResourceType` value set does not list), and along how many keys
-//! one request carries.
+//! which the published `ResourceType` value set does not list, and a key that names no
+//! resource at all), and along how many keys one request carries — both published bounds
+//! of `ResourceKeys` and one past each of them.
 
 use std::time::Duration;
 
@@ -329,6 +330,205 @@ async fn an_execution_moves_from_queued_through_running_to_succeeded() {
         !step["StartTime"].is_null() && !step["StopTime"].is_null(),
         "a finished step reports when it ran, got {step}"
     );
+}
+
+/// One row of the key-count table: how many resource keys the request carries, and the
+/// error code expected (`None` where the request is served).
+struct CountCase {
+    case: &'static str,
+    keys: usize,
+    expected: Option<&'static str>,
+}
+
+#[tokio::test]
+async fn one_execution_is_invoked_per_resource_key_up_to_the_published_maximum() {
+    // The counts come from `StartRemediationExecutionRequest$ResourceKeys`
+    // (`smithy_query(query="shape", shape="ResourceKeys")`: list of ResourceKey, length
+    // 1..100), which the operation's own documentation states as "You can specify up to
+    // 100 resource keys per request": both published bounds are exercised, and so is one
+    // past each of them.
+    let cases: [CountCase; 6] = [
+        CountCase {
+            case: "no key at all, one below the published minimum",
+            keys: 0,
+            expected: Some("ValidationException"),
+        },
+        CountCase {
+            case: "the published minimum",
+            keys: 1,
+            expected: None,
+        },
+        CountCase {
+            case: "a handful",
+            keys: 7,
+            expected: None,
+        },
+        CountCase {
+            case: "half the published maximum",
+            keys: 50,
+            expected: None,
+        },
+        CountCase {
+            case: "the published maximum",
+            keys: 100,
+            expected: None,
+        },
+        CountCase {
+            case: "one key past the published maximum",
+            keys: 101,
+            expected: Some("ValidationException"),
+        },
+    ];
+
+    for CountCase {
+        case,
+        keys,
+        expected,
+    } in cases
+    {
+        let name = "counted-rule";
+        let emulator = emulator_with_rule(name, true).await;
+        // Each key names a DISTINCT resource, so one request carries `keys` of them and
+        // the report must hold one execution per key rather than one per request.
+        let ids: Vec<String> = (0..keys).map(|index| format!("bucket-{index:04}")).collect();
+        let request = json!({
+            "ConfigRuleName": name,
+            "ResourceKeys": ids
+                .iter()
+                .map(|resource_id| json!({
+                    "resourceType": S3_BUCKET,
+                    "resourceId": resource_id,
+                }))
+                .collect::<Vec<Value>>(),
+        });
+
+        match expected {
+            Some(expected) => {
+                let (status, code) = emulator
+                    .refused("StartRemediationExecution", &request)
+                    .await;
+                assert_eq!(
+                    (status, code.as_str()),
+                    (400, expected),
+                    "case {case:?}: expected HTTP 400 {expected} for {keys} key(s), got \
+                     {status} {code}"
+                );
+                let states = reported(case, &emulator, name).await;
+                assert!(
+                    states.is_empty(),
+                    "case {case:?}: a refused request starts nothing, got {states:?}"
+                );
+            }
+            None => {
+                emulator.ok("StartRemediationExecution", &request).await;
+                let states = reported(case, &emulator, name).await;
+                assert_eq!(
+                    states.len(),
+                    keys,
+                    "case {case:?}: expected {keys} execution(s), got {} ({states:?})",
+                    states.len()
+                );
+                let unexpected: Vec<&(String, String, String)> = states
+                    .iter()
+                    .filter(|(resource_type, resource_id, state)| {
+                        resource_type != S3_BUCKET
+                            || !ids.contains(resource_id)
+                            || state != REMEDIATION_EXECUTION_STATE_QUEUED
+                    })
+                    .collect();
+                assert!(
+                    unexpected.is_empty(),
+                    "case {case:?}: every execution is queued for a key the request \
+                     named, got {unexpected:?}"
+                );
+            }
+        }
+    }
+}
+
+/// One row of the incomplete-key table: the `(resourceType, resourceId)` a key carries,
+/// and the error code expected (`None` where the request is served).
+struct KeyCase {
+    case: &'static str,
+    key: (&'static str, &'static str),
+    expected: Option<&'static str>,
+}
+
+#[tokio::test]
+async fn a_key_that_names_no_resource_is_refused_as_an_invalid_parameter() {
+    // `ResourceKey` requires both `resourceType` and `resourceId`
+    // (`smithy_query(query="shape", shape="ResourceKey")`: both members required,
+    // `resourceId` length 1..768), so a key carrying only whitespace for either names no
+    // resource to remediate and the request it belongs to is refused rather than
+    // partially started.
+    let cases: [KeyCase; 5] = [
+        KeyCase {
+            case: "an empty resource type",
+            key: ("", "config-bucket"),
+            expected: Some("InvalidParameterValueException"),
+        },
+        KeyCase {
+            case: "a blank resource type",
+            key: ("   ", "config-bucket"),
+            expected: Some("InvalidParameterValueException"),
+        },
+        KeyCase {
+            case: "a blank resource id",
+            key: (S3_BUCKET, " "),
+            expected: Some("InvalidParameterValueException"),
+        },
+        KeyCase {
+            case: "an empty resource id, below its published length minimum",
+            key: (S3_BUCKET, ""),
+            expected: Some("ValidationException"),
+        },
+        KeyCase {
+            case: "a key naming both, which is served",
+            key: (EC2_VOLUME, "vol-0002"),
+            expected: None,
+        },
+    ];
+
+    for KeyCase {
+        case,
+        key,
+        expected,
+    } in cases
+    {
+        let name = "keyed-rule";
+        let emulator = emulator_with_rule(name, true).await;
+        // The incomplete key travels BESIDE a well-formed one, so what is pinned is the
+        // judgement of the request rather than of a single-key request.
+        let request = start(name, &[(S3_BUCKET, "config-bucket-ok"), key]);
+
+        match expected {
+            Some(expected) => {
+                let (status, code) = emulator
+                    .refused("StartRemediationExecution", &request)
+                    .await;
+                assert_eq!(
+                    (status, code.as_str()),
+                    (400, expected),
+                    "case {case:?}: expected HTTP 400 {expected}, got {status} {code}"
+                );
+                let states = reported(case, &emulator, name).await;
+                assert!(
+                    states.is_empty(),
+                    "case {case:?}: a refused request starts nothing, not even for the \
+                     well-formed key beside it, got {states:?}"
+                );
+            }
+            None => {
+                emulator.ok("StartRemediationExecution", &request).await;
+                let states = reported(case, &emulator, name).await;
+                assert_eq!(
+                    states.len(),
+                    2,
+                    "case {case:?}: expected one execution per named key, got {states:?}"
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]

@@ -22,6 +22,12 @@
 //! request naming one of those is refused with `ValidationException` before any
 //! member is written.
 //!
+//! Switching a probe off or back on also moves the CONTAINING monitor, because
+//! a monitor aggregates what its probes measure
+//! ([`crate::state::Monitor::follow_probe_states`]): a monitor whose every
+//! probe is deactivated has nothing aggregating and is reported `INACTIVE`,
+//! and one that gains a probe in service is owed `PENDING` -> `ACTIVE` again.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -349,6 +355,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // Answered from the STORED probe, so what the caller is told is what a
         // later `GetProbe` and `GetMonitor` read back.
-        Ok(output_for(probe))
+        let output = output_for(probe);
+        // A monitor aggregates what its probes measure, so switching a probe
+        // off or back on changes what the CONTAINING monitor is reporting too:
+        // the monitor follows the probes it now holds
+        // ([`crate::state::Monitor::follow_probe_states`]) — back to `INACTIVE`
+        // once it has nothing in service, and owed `PENDING` -> `ACTIVE` again
+        // the moment it has.
+        monitor.follow_probe_states(now);
+        Ok(output)
     }
 }

@@ -3812,6 +3812,26 @@ pub struct Bucket {
     ///
     /// Private, like `tags`, so the accessor pair below is the only way in or out.
     cors: Option<Vec<BucketCorsRule>>,
+    /// Where the bucket's server access logs are delivered, as the last
+    /// `PutBucketLogging` set it, or `None` while server access logging is not enabled on
+    /// the bucket.
+    ///
+    /// `None` is the state a bucket is created in, and the state an empty
+    /// `BucketLoggingStatus` puts it back into: "To enable logging, you use
+    /// `LoggingEnabled` and its children request elements. To disable logging, you use an
+    /// empty `BucketLoggingStatus` request element" (`PutBucketLogging`'s own
+    /// documentation). It is what makes `GetBucketLogging` report a status container with
+    /// no `LoggingEnabled` in it — a 200 rather than a not-found, since every bucket HAS a
+    /// logging status and "not enabled" is one of the states it can be in.
+    ///
+    /// The MODELLED container is stored whole, the way [`Self::replication`] is: it is
+    /// exactly what the put carries inside its payload and what `GetBucketLogging` reports
+    /// back, so a read answers the configuration the bucket actually carries — every
+    /// member the request named, its target grants and its key format included — rather
+    /// than a re-derived copy of it.
+    ///
+    /// Private, like `tags`, so the accessor pair below is the only way in or out.
+    logging: Option<crate::ops::types::LoggingEnabled>,
     /// Every VERSION the bucket holds of every key, NEWEST FIRST within each key.
     ///
     /// Entry 0 of a key's chain is its CURRENT version — what a reader that names no
@@ -4545,6 +4565,25 @@ impl Bucket {
     /// — the way [`Bucket::set_website`] replaces the website configuration.
     pub fn set_cors(&mut self, rules: Vec<BucketCorsRule>) {
         self.cors = Some(rules);
+    }
+
+    /// Where the bucket's server access logs are delivered, or `None` while logging is not
+    /// enabled on it. See [`Self::logging`].
+    pub fn logging(&self) -> Option<&crate::ops::types::LoggingEnabled> {
+        self.logging.as_ref()
+    }
+
+    /// Set the bucket's logging status to `logging`: `Some` to enable server access
+    /// logging with that configuration, `None` to disable it.
+    ///
+    /// A replacement of the whole subresource, the way [`Bucket::set_cors`] replaces the
+    /// cors configuration: `BucketLoggingStatus` is the complete "container for logging
+    /// status information" a `PutBucketLogging` carries as its payload, so what the bucket
+    /// carries afterwards is exactly what that container named — and a container naming no
+    /// `LoggingEnabled` is how logging is turned off again ("To disable logging, you use an
+    /// empty `BucketLoggingStatus` request element", that operation's own documentation).
+    pub fn set_logging(&mut self, logging: Option<crate::ops::types::LoggingEnabled>) {
+        self.logging = logging;
     }
 
     /// The object stored at `key`, or `None` when the bucket holds no current object
@@ -7311,6 +7350,37 @@ pub const REPLICATION_CONFIGURATION_NOT_FOUND_MESSAGE: &str =
 /// The HTTP status [`REPLICATION_CONFIGURATION_NOT_FOUND_CODE`] is rendered with: 404,
 /// from the same list.
 pub const REPLICATION_CONFIGURATION_NOT_FOUND_STATUS: u16 = 404;
+
+/// The code S3 answers a `PutBucketLogging` whose `LoggingEnabled$TargetBucket` is not a
+/// bucket log files can be delivered to with: "InvalidTargetBucketForLogging - The target
+/// bucket for logging does not exist, is not owned by you, or does not have the appropriate
+/// grants for the log-delivery group." (Amazon S3 "Error responses", list of error codes),
+/// with HTTP 400.
+pub const INVALID_TARGET_BUCKET_FOR_LOGGING_CODE: &str = "InvalidTargetBucketForLogging";
+/// See [`INVALID_TARGET_BUCKET_FOR_LOGGING_CODE`] — the fixed text S3 publishes for that
+/// code, nothing of which comes from the request.
+pub const INVALID_TARGET_BUCKET_FOR_LOGGING_MESSAGE: &str =
+    "The target bucket for logging does not exist, is not owned by you, or does not have \
+     the appropriate grants for the log-delivery group.";
+/// The HTTP status [`INVALID_TARGET_BUCKET_FOR_LOGGING_CODE`] is rendered with: 400, from
+/// the same list.
+pub const INVALID_TARGET_BUCKET_FOR_LOGGING_STATUS: u16 = 400;
+
+/// The code S3 answers a `PutBucketLogging` whose target bucket is in another Region than
+/// the bucket being logged with: "CrossLocationLoggingProhibited - Cross-location logging
+/// not allowed. Buckets in one geographic location cannot log information to a bucket in
+/// another location." (Amazon S3 "Error responses", list of error codes), with HTTP 403 —
+/// the refusal behind "All logs are saved to buckets in the same Amazon Web Services Region
+/// as the source bucket" (`PutBucketLogging`'s own documentation).
+pub const CROSS_LOCATION_LOGGING_PROHIBITED_CODE: &str = "CrossLocationLoggingProhibited";
+/// See [`CROSS_LOCATION_LOGGING_PROHIBITED_CODE`] — the fixed text S3 publishes for that
+/// code.
+pub const CROSS_LOCATION_LOGGING_PROHIBITED_MESSAGE: &str =
+    "Cross-location logging not allowed. Buckets in one geographic location cannot log \
+     information to a bucket in another location.";
+/// The HTTP status [`CROSS_LOCATION_LOGGING_PROHIBITED_CODE`] is rendered with: 403, from
+/// the same list.
+pub const CROSS_LOCATION_LOGGING_PROHIBITED_STATUS: u16 = 403;
 
 /// How many metrics configurations one bucket may hold, and so how many entries one
 /// bucket's metrics record can ever carry.

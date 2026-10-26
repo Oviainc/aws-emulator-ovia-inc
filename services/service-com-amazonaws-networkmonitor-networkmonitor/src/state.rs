@@ -58,13 +58,15 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 pub const MONITOR_STATE_PENDING: &str = "PENDING";
 /// `MonitorState` of a monitor whose probes are live.
 pub const MONITOR_STATE_ACTIVE: &str = "ACTIVE";
-/// `MonitorState` of a monitor that holds no probe.
+/// `MonitorState` of a monitor that has no probe in service.
 ///
-/// A monitor aggregates what its probes measure, so one with no probe has
-/// nothing to activate: it is reported `INACTIVE` straight away and stays there
-/// — nothing is due — until a probe is added. This is the state a monitor
-/// created with an empty (or absent) `probes` list is in, and the one a monitor
-/// returns to when its last probe is deleted.
+/// A monitor aggregates what its probes measure, so one with nothing measuring
+/// has nothing to activate: it is reported `INACTIVE` straight away and stays
+/// there — nothing is due — until a probe of its own is in service again. This
+/// is the state a monitor created with an empty (or absent) `probes` list is in,
+/// the one a monitor returns to when its last probe is deleted, and the one it
+/// returns to when every probe it holds has been deactivated
+/// ([`Monitor::follow_probe_states`]).
 pub const MONITOR_STATE_INACTIVE: &str = "INACTIVE";
 
 /// `ProbeState` of a probe that is not sending packets yet (model enum
@@ -843,6 +845,18 @@ impl Probe {
         })
     }
 
+    /// Whether a caller has switched this probe off.
+    ///
+    /// A deactivated probe keeps its configuration but sends no packets, so it
+    /// measures nothing its monitor could aggregate
+    /// ([`Monitor::follow_probe_states`]). Every other state a probe is
+    /// reported in counts as being in service, a probe draining through its
+    /// teardown included: the monitor holds it, and keeps aggregating it, until
+    /// the record is gone.
+    pub fn is_deactivated(&self) -> bool {
+        self.state == PROBE_STATE_INACTIVE
+    }
+
     /// Materialise the lifecycle transition the clock has already made due for
     /// THIS probe: `PENDING` -> `ACTIVE` once its activation instant has passed,
     /// and `DELETING` -> `DELETED` once its teardown instant has. A probe being
@@ -882,15 +896,18 @@ pub struct Monitor {
 }
 
 impl Monitor {
-    /// Record that this monitor now holds at least one probe, so the clock owes
+    /// Record that this monitor now has a probe in service, so the clock owes
     /// it the `PENDING` -> `ACTIVE` transition [`ACTIVATION_AFTER`] from `now`.
     ///
-    /// Called only by the mutating operations that add a probe. A monitor that
-    /// already has an activation due keeps the earlier instant: adding a second
-    /// probe does not postpone the first one's activation.
+    /// Called by the mutating operations that put a probe in service and by
+    /// [`Self::follow_probe_states`], which is the one place that decides this
+    /// from the probe records. A monitor that already has an activation due
+    /// keeps the earlier instant: a second probe going into service does not
+    /// postpone the first one's activation.
     ///
     /// A monitor that was `INACTIVE` — nothing to aggregate — is provisioning
-    /// the new probe, so it moves to `PENDING` and the clock owes it `ACTIVE`.
+    /// what it just gained, so it moves to `PENDING` and the clock owes it
+    /// `ACTIVE`.
     pub fn schedule_activation(&mut self, now: SystemTime) {
         if self.activates_at.is_none() {
             self.activates_at = now.checked_add(ACTIVATION_AFTER);
@@ -900,11 +917,48 @@ impl Monitor {
         }
     }
 
-    /// Give up the activation the clock owed: a monitor with no probes has
-    /// nothing to aggregate, so it goes back to `INACTIVE` with nothing due.
+    /// Give up the activation the clock owed: a monitor with nothing in service
+    /// has nothing to aggregate, so it goes back to `INACTIVE` with nothing due.
     pub fn clear_activation(&mut self) {
         self.activates_at = None;
         self.state = MONITOR_STATE_INACTIVE.to_string();
+    }
+
+    /// Whether any probe this monitor holds is in service, i.e. is something
+    /// the monitor can aggregate ([`Probe::is_deactivated`]).
+    pub fn has_probe_in_service(&self) -> bool {
+        self.probes.values().any(|probe| !probe.is_deactivated())
+    }
+
+    /// Make this monitor's `state` follow the probes it holds, which is the one
+    /// rule that decides it: a monitor aggregates what its probes measure.
+    ///
+    /// A monitor with nothing in service — no probe at all, or every probe it
+    /// holds deactivated — has nothing to aggregate, so it goes back to
+    /// `INACTIVE` with nothing due. One that has a probe in service is owed the
+    /// `PENDING` -> `ACTIVE` transition ([`Self::schedule_activation`]) and
+    /// reaches `ACTIVE` once that instant has passed.
+    ///
+    /// Called by every operation that can change which probes are in service,
+    /// and by the settle walk every read performs, so one monitor-level rule is
+    /// applied however a probe got into or out of service. Both halves are
+    /// decided by the probe records themselves, so applying it twice changes
+    /// nothing: the activation a monitor is already owed keeps its instant.
+    pub fn follow_probe_states(&mut self, now: SystemTime) {
+        if !self.has_probe_in_service() {
+            if self.state != MONITOR_STATE_INACTIVE || self.activates_at.is_some() {
+                self.clear_activation();
+            }
+            return;
+        }
+        self.schedule_activation(now);
+        if self.state == MONITOR_STATE_PENDING
+            && self
+                .activates_at
+                .is_some_and(|activates_at| now >= activates_at)
+        {
+            self.state = MONITOR_STATE_ACTIVE.to_string();
+        }
     }
 }
 
@@ -1127,22 +1181,13 @@ impl ComAmazonawsNetworkmonitorNetworkmonitorState {
         for probe in monitor.probes.values_mut() {
             probe.settle(now);
         }
-        // A monitor left holding no probe has nothing to aggregate, so the
-        // teardown of its last probe takes its activation away with it — the
-        // same state a monitor created without probes is in.
-        if monitor.probes.is_empty() {
-            if monitor.state != MONITOR_STATE_INACTIVE || monitor.activates_at.is_some() {
-                monitor.clear_activation();
-            }
-            return;
-        }
-        if monitor.state == MONITOR_STATE_PENDING
-            && monitor
-                .activates_at
-                .is_some_and(|activates_at| now >= activates_at)
-        {
-            monitor.state = MONITOR_STATE_ACTIVE.to_string();
-        }
+        // The monitor-level half of the same rule: a monitor left with nothing
+        // in service — the teardown of its last probe has run its course, or
+        // every probe it holds has been deactivated — has nothing to aggregate,
+        // which is the state a monitor created without probes is in. Both halves
+        // are read off the probe records, so this reports the state the monitor
+        // was already in at `now` whether or not anybody called.
+        monitor.follow_probe_states(now);
     }
 
     /// The same, for every monitor of ONE region: what `ListMonitors` reports is
