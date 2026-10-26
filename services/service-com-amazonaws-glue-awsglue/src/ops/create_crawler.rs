@@ -213,9 +213,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !crate::state::is_cron_expression(schedule) {
                 return Err(CreateCrawlerErrorModeled::InvalidInputException(
                     InvalidInputException {
-                        message: Some(format!(
-                            "Schedule {schedule} is not a cron expression of the form \
-                             cron(<minutes> <hours> <day-of-month> <month> <day-of-week> <year>)"
+                        message: Some(crate::state::messages::schedule_not_a_cron_expression(
+                            schedule,
                         )),
                         from_federation_source: None,
                     },

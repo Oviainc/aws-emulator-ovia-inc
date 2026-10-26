@@ -1,18 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Client VPN endpoints and the target networks associated with them.
+//! Client VPN endpoints, the target networks associated with them, and the routes of their
+//! route tables.
 //!
-//! A submodule of [`crate::state`] rather than more lines in `state.rs`: the two stores,
-//! their id forms, their refusals and the clock-owed `associating` -> `associated` move are
-//! one subject, and keeping them in their own file leaves `state.rs` readable — and leaves
-//! this fix out of the end of that file, which is where every concurrently landing EC2 fix
-//! inserts. Everything here is re-exported by `crate::state`, so a handler reaches it as
+//! A submodule of [`crate::state`] rather than more lines in `state.rs`: the stores, their
+//! id forms, their refusals and the clock-owed `associating` -> `associated` and
+//! `creating` -> `active` moves are one subject, and keeping them in their own file leaves
+//! `state.rs` readable — and leaves this fix out of the end of that file, which is where
+//! every concurrently landing EC2 fix inserts. Everything here is re-exported by
+//! `crate::state`, so a handler reaches it as
 //! `crate::state::require_known_client_vpn_endpoint` exactly as it reaches the helpers that
 //! live in the parent module.
 //!
 //! The stores themselves are fields of [`ComAmazonawsEc2Amazonec2State`]
-//! (`client_vpn_endpoints`, `client_vpn_target_networks`), because the state struct is one
-//! struct; it is only the code that reads and writes them that lives here.
+//! (`client_vpn_endpoints`, `client_vpn_target_networks`, `client_vpn_routes`), because the
+//! state struct is one struct; it is only the code that reads and writes them that lives
+//! here.
 
 use super::*;
 
@@ -69,12 +72,38 @@ pub fn invalid_client_vpn_endpoint_id_not_found<E>(id: &str) -> Scaffolded<E> {
     )
 }
 
+/// The Client VPN endpoint `id` names, or the one refusal this surface answers for a value it
+/// holds no endpoint for: HTTP 400 [`INVALID_CLIENT_VPN_ENDPOINT_ID_NOT_FOUND`].
+///
+/// Resolution by LOOKUP alone, with no id-form arm in front of it: the model puts no pattern
+/// on the member (`smithy_query(query="shape",shape="ClientVpnEndpointId")` is a plain
+/// `String`), so no id form is a declared constraint of it, and AWS's EC2 error catalogue
+/// documents `InvalidClientVpnEndpointId.NotFound` for an endpoint it cannot resolve and no
+/// `.Malformed` counterpart to tell "not an id of this kind" from "no such endpoint" with.
+/// So a value of any form that this account holds no endpoint for is answered `Endpoint <id>
+/// does not exist`.
+///
+/// That is what the operations that MUTATE an endpoint resolve their scalar
+/// `ClientVpnEndpointId` through. [`require_known_client_vpn_endpoint`] is the reading the
+/// describes keep, where EC2 refuses an id of the wrong form in an id parameter before it
+/// looks anything up; the two are named apart here rather than one silently covering both.
+pub fn require_client_vpn_endpoint<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    id: &str,
+) -> Result<&'store crate::ops::types::ClientVpnEndpoint, Scaffolded<E>> {
+    store
+        .client_vpn_endpoints
+        .get(id)
+        .ok_or_else(|| invalid_client_vpn_endpoint_id_not_found(id))
+}
+
 /// Refuse a `ClientVpnEndpointId` this service cannot resolve: a malformed one before an
 /// unknown one, the order [`require_well_formed_id`] documents.
 ///
-/// The ONE place a Client VPN endpoint id is resolved, so every operation that takes one
-/// refuses the same id the same way; the contract [`require_known_instance`] writes out for
-/// instances.
+/// What the operations that REPORT endpoints resolve an id through, so each of them refuses
+/// the same id the same way; the contract [`require_known_instance`] writes out for
+/// instances. An operation that mutates one endpoint resolves it through
+/// [`require_client_vpn_endpoint`] instead, which records why.
 pub fn require_known_client_vpn_endpoint<E>(
     store: &ComAmazonawsEc2Amazonec2State,
     id: &str,
@@ -290,6 +319,316 @@ impl ComAmazonawsEc2Amazonec2State {
                 .map(str::to_string);
             if let Some(code) = due {
                 record.view.status = Some(crate::ops::types::AssociationStatus {
+                    code: Some(code),
+                    message: None,
+                });
+                record.pending = None;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The routes of a Client VPN endpoint's route table
+// ---------------------------------------------------------------------------
+
+/// "creating" — the state a route starts in (`ClientVpnRouteStatusCode`), which
+/// `CreateClientVpnRoute` answers with.
+pub const CLIENT_VPN_ROUTE_STATUS_CREATING: &str = "creating";
+
+/// "active" — the state the clock owes a `creating` route ([`TRANSITION_DELAY`] later,
+/// through [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]).
+pub const CLIENT_VPN_ROUTE_STATUS_ACTIVE: &str = "active";
+
+/// "add-route" — the `Origin` of a route a caller added: "`add-route` indicates that the
+/// route was manually added using the CreateClientVpnRoute action"
+/// (`ClientVpnRoute$Origin`).
+pub const CLIENT_VPN_ROUTE_ORIGIN_ADD_ROUTE: &str = "add-route";
+
+/// "associate" — the other `Origin` that member takes: "`associate` indicates that the route
+/// was automatically added when the target network was associated with the Client VPN
+/// endpoint" (`ClientVpnRoute$Origin`), which is the operation that associates a target
+/// network's to write, not this one's.
+pub const CLIENT_VPN_ROUTE_ORIGIN_ASSOCIATE: &str = "associate";
+
+/// "Nat" — the `Type` ("The route type", `ClientVpnRoute$Type`) EC2 reports for every route
+/// of a Client VPN endpoint, as the AWS CLI reference's own `describe-client-vpn-routes`
+/// example output reports both the route added with a target network and the route added by
+/// `CreateClientVpnRoute`.
+pub const CLIENT_VPN_ROUTE_TYPE_NAT: &str = "Nat";
+
+/// The `TargetVpcSubnetId` that names the endpoint's own client network rather than a
+/// subnet: "if you're adding a route for the local network, specify `local`"
+/// (`CreateClientVpnRouteRequest$TargetVpcSubnetId`). It is not a subnet id, so it is not
+/// resolved against the endpoint's target networks.
+pub const CLIENT_VPN_ROUTE_TARGET_LOCAL: &str = "local";
+
+/// `InvalidClientVpnDuplicateRoute` (HTTP 400): the endpoint's route table already holds a
+/// route for that destination through that target, so adding this one would make two.
+pub const INVALID_CLIENT_VPN_DUPLICATE_ROUTE: &str = "InvalidClientVpnDuplicateRoute";
+
+/// `InvalidClientVpnActiveAssociationNotFound` (HTTP 400): the subnet a route would send
+/// traffic through is not a target network of the endpoint, so there is no path for the
+/// route to be programmed into.
+pub const INVALID_CLIENT_VPN_ACTIVE_ASSOCIATION_NOT_FOUND: &str =
+    "InvalidClientVpnActiveAssociationNotFound";
+
+/// What separates a route's destination from its target in the position a page token names
+/// ([`ClientVpnRouteKey::cursor`]): a character that orders BELOW every character a CIDR
+/// block or a subnet id carries, so comparing two cursors as strings orders the pairs they
+/// name rather than running the two halves together.
+pub const CLIENT_VPN_ROUTE_CURSOR_SEPARATOR: char = ' ';
+
+/// Refuse a route an endpoint's route table already holds: HTTP 400
+/// [`INVALID_CLIENT_VPN_DUPLICATE_ROUTE`], naming the destination and the endpoint the
+/// request sent.
+pub fn client_vpn_duplicate_route<E>(destination_cidr: &str, endpoint_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_CLIENT_VPN_DUPLICATE_ROUTE,
+        400,
+        format!("Route {destination_cidr} already exists in Client VPN endpoint {endpoint_id}"),
+    )
+}
+
+/// The id prefix EC2 mints a subnet with — `subnet-`, the prefix
+/// [`ComAmazonawsEc2Amazonec2State::insert_subnet`] mints a subnet id under. A
+/// `TargetVpcSubnetId` is read against it, because a value that is not a subnet id at all is
+/// refused before anything is looked up.
+pub const SUBNET_ID_PREFIX: &str = "subnet";
+
+/// `InvalidSubnetID.Malformed` (HTTP 400): the value given for a subnet is not a subnet id.
+///
+/// The same `Invalid<Kind>.Malformed` question [`require_well_formed_id`] asks of every
+/// resource id of this crate, in the wording the Client VPN surface answers it with — `The
+/// subnet ID '<id>' is malformed`, naming the member's own resource kind rather than the
+/// generic `Invalid id: '<id>'`.
+pub const INVALID_SUBNET_ID_MALFORMED: &str = "InvalidSubnetID.Malformed";
+
+/// Refuse a value for a subnet that is not a subnet id: HTTP 400
+/// [`INVALID_SUBNET_ID_MALFORMED`], naming the value the request sent.
+pub fn invalid_subnet_id_malformed<E>(subnet_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_SUBNET_ID_MALFORMED,
+        400,
+        format!("The subnet ID '{subnet_id}' is malformed"),
+    )
+}
+
+/// Refuse a route through a subnet that is not a target network of the endpoint: HTTP 400
+/// [`INVALID_CLIENT_VPN_ACTIVE_ASSOCIATION_NOT_FOUND`], naming the subnet and the endpoint.
+pub fn client_vpn_active_association_not_found<E>(
+    subnet_id: &str,
+    endpoint_id: &str,
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_CLIENT_VPN_ACTIVE_ASSOCIATION_NOT_FOUND,
+        400,
+        format!(
+            "There is no active association for subnet {subnet_id} in Client VPN endpoint \
+             {endpoint_id}"
+        ),
+    )
+}
+
+/// What names ONE route of a Client VPN endpoint's route table: the endpoint it belongs to,
+/// the destination it routes, and the target that traffic leaves through.
+///
+/// Those three are exactly what `DeleteClientVpnRoute` names a route by
+/// (`ClientVpnEndpointId` + `DestinationCidrBlock` + `TargetVpcSubnetId`), and
+/// `ClientVpnRoute` carries no id member of its own, so the store is keyed by them rather
+/// than by a minted id. `target` is the empty string for a route of a Transit Gateway-based
+/// endpoint, where "this parameter is not required"
+/// (`CreateClientVpnRouteRequest$TargetVpcSubnetId`) because traffic leaves through the
+/// endpoint's attachment instead.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ClientVpnRouteKey {
+    /// "The ID of the Client VPN endpoint with which the route is associated"
+    /// (`ClientVpnRoute$ClientVpnEndpointId`).
+    pub client_vpn_endpoint_id: String,
+    /// "The IPv4 address range, in CIDR notation, of the route destination"
+    /// (`ClientVpnRoute$DestinationCidr`), in the canonical form this service stores every
+    /// CIDR member in.
+    pub destination_cidr: String,
+    /// "The ID of the subnet through which traffic is routed"
+    /// (`ClientVpnRoute$TargetSubnet`), [`CLIENT_VPN_ROUTE_TARGET_LOCAL`] for a route of the
+    /// local network, or empty for a route that leaves through a Transit Gateway attachment.
+    pub target: String,
+}
+
+impl ClientVpnRouteKey {
+    /// This route's position in the order its endpoint's routes are reported and paged in:
+    /// the destination, then the target.
+    ///
+    /// A single string so a page token can name a position with one cursor
+    /// ([`CLIENT_VPN_ROUTE_CURSOR_SEPARATOR`] says why the halves cannot run together), and
+    /// the reporting path both SORTS and RESUMES by it, so the paging order and the cursor
+    /// are the same order by construction.
+    pub fn cursor(&self) -> String {
+        format!(
+            "{destination}{CLIENT_VPN_ROUTE_CURSOR_SEPARATOR}{target}",
+            destination = self.destination_cidr,
+            target = self.target,
+        )
+    }
+}
+
+/// One route of a Client VPN endpoint's route table: the modelled
+/// [`crate::ops::types::ClientVpnRoute`] every operation that reports one answers with, plus
+/// the move the clock owes it.
+///
+/// The modelled shape itself rather than a parallel record, for the reason every other store
+/// of this module holds one: a member a writer sets round-trips through
+/// `DescribeClientVpnRoutes` without a field-by-field copy that can silently drop one.
+#[derive(Debug, Clone)]
+pub struct ClientVpnRouteRecord {
+    /// The route as the model shapes it, carrying the status reached so far.
+    pub view: crate::ops::types::ClientVpnRoute,
+    /// The `ClientVpnRouteStatusCode` the clock owes this route while it is still transient
+    /// (`creating` -> `active`); `None` once it has been applied.
+    pub pending: Option<PendingStateMove>,
+}
+
+/// What one route is written with: the endpoint whose route table it joins, the destination
+/// it routes, what traffic for that destination leaves through, and the description the
+/// request gave it.
+///
+/// Every member the service itself owns — the route's type, its origin and the status it
+/// starts in — is derived by
+/// [`ComAmazonawsEc2Amazonec2State::insert_client_vpn_route`] rather than taken from a
+/// caller, so two writers cannot report one route differently.
+#[derive(Debug, Clone)]
+pub struct ClientVpnRouteSpec {
+    /// The endpoint whose route table takes the route.
+    pub client_vpn_endpoint_id: String,
+    /// The destination range, in the canonical form this service stores a CIDR member in.
+    pub destination_cidr: String,
+    /// The subnet traffic is routed through, or [`CLIENT_VPN_ROUTE_TARGET_LOCAL`]; `None`
+    /// for a Transit Gateway-based endpoint, whose routes leave through its attachment.
+    pub target_subnet: Option<String>,
+    /// "The ID of the Transit Gateway attachment, if the route targets a Transit Gateway"
+    /// (`ClientVpnRoute$TransitGatewayAttachmentId`) — read off the endpoint's own stored
+    /// configuration, never from the request.
+    pub transit_gateway_attachment_id: Option<String>,
+    /// "A brief description of the route" (`CreateClientVpnRouteRequest$Description`).
+    pub description: Option<String>,
+}
+
+/// The caller-chosen bytes one stored route holds: the ids of the resources it joins, the
+/// destination range and the description, on top of the fixed
+/// [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs.
+///
+/// The ONE definition of that charge, the way
+/// [`client_vpn_target_network_payload_bytes`] is for the store beside it: the insert charges
+/// exactly it, and a removal path must give back the same number.
+pub fn client_vpn_route_payload_bytes(view: &crate::ops::types::ClientVpnRoute) -> usize {
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(view.client_vpn_endpoint_id.as_deref().map_or(0, str::len))
+        .saturating_add(view.destination_cidr.as_deref().map_or(0, str::len))
+        .saturating_add(view.target_subnet.as_deref().map_or(0, str::len))
+        .saturating_add(view.description.as_deref().map_or(0, str::len))
+        .saturating_add(
+            view.transit_gateway_attachment_id
+                .as_deref()
+                .map_or(0, str::len),
+        )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another route fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of [`Self::has_vpc_capacity`]: a
+    /// writer asks this BEFORE inserting, because nothing here reclaims a stored route.
+    pub fn has_client_vpn_route_capacity(&self) -> bool {
+        self.client_vpn_routes.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// The route `key` names, or `None` when that endpoint's route table holds none.
+    pub fn client_vpn_route(&self, key: &ClientVpnRouteKey) -> Option<&ClientVpnRouteRecord> {
+        self.client_vpn_routes.get(key)
+    }
+
+    /// Is `subnet_id` a target network of `endpoint_id`?
+    ///
+    /// The question `CreateClientVpnRoute` asks of its target subnet — "The specified subnet
+    /// must be an existing target network of the Client VPN endpoint"
+    /// (`CreateClientVpnRouteRequest$TargetVpcSubnetId`) — answered against the association
+    /// store, so the route path and `DescribeClientVpnTargetNetworks` read one set of
+    /// associations.
+    pub fn client_vpn_endpoint_has_target_network(
+        &self,
+        endpoint_id: &str,
+        subnet_id: &str,
+    ) -> bool {
+        self.client_vpn_target_networks.values().any(|record| {
+            record.view.client_vpn_endpoint_id.as_deref() == Some(endpoint_id)
+                && record.view.target_network_id.as_deref() == Some(subnet_id)
+        })
+    }
+
+    /// Add one route to a Client VPN endpoint's route table and answer the key it is held
+    /// under beside the route as its writer reports it — or `None` when one of the store's
+    /// bounds would be crossed and NOTHING was stored.
+    ///
+    /// The seam `CreateClientVpnRoute` calls. Every member the service owns is derived here:
+    /// the route `Type` EC2 reports for a Client VPN route, the `add-route` `Origin` that
+    /// says a caller added it rather than a target network association, and the `creating`
+    /// status it starts in — which the clock owes `active` one [`TRANSITION_DELAY`] later
+    /// through [`Self::materialize_due_transitions`]. The span is never zero, so a caller
+    /// describing the route straight after the call that made it still sees `creating`.
+    pub fn insert_client_vpn_route(
+        &mut self,
+        spec: ClientVpnRouteSpec,
+    ) -> Option<(ClientVpnRouteKey, crate::ops::types::ClientVpnRoute)> {
+        let key = ClientVpnRouteKey {
+            client_vpn_endpoint_id: spec.client_vpn_endpoint_id.clone(),
+            destination_cidr: spec.destination_cidr.clone(),
+            target: spec.target_subnet.clone().unwrap_or_default(),
+        };
+        let view = crate::ops::types::ClientVpnRoute {
+            client_vpn_endpoint_id: Some(spec.client_vpn_endpoint_id),
+            destination_cidr: Some(spec.destination_cidr),
+            target_subnet: spec.target_subnet,
+            r#type: Some(CLIENT_VPN_ROUTE_TYPE_NAT.to_string()),
+            origin: Some(CLIENT_VPN_ROUTE_ORIGIN_ADD_ROUTE.to_string()),
+            status: Some(crate::ops::types::ClientVpnRouteStatus {
+                code: Some(CLIENT_VPN_ROUTE_STATUS_CREATING.to_string()),
+                message: None,
+            }),
+            description: spec.description,
+            transit_gateway_attachment_id: spec.transit_gateway_attachment_id,
+        };
+        let charge = client_vpn_route_payload_bytes(&view);
+        if !self.has_client_vpn_route_capacity() || self.would_exceed_stored_bytes(charge) {
+            return None;
+        }
+        self.add_stored_bytes(charge);
+        let stored = view.clone();
+        self.client_vpn_routes.insert(
+            key.clone(),
+            ClientVpnRouteRecord {
+                view,
+                pending: Some(PendingStateMove::starting_now(
+                    CLIENT_VPN_ROUTE_STATUS_ACTIVE,
+                )),
+            },
+        );
+        Some((key, stored))
+    }
+
+    /// Apply the `creating` -> `active` move every route that has reached its due instant by
+    /// `now` owes.
+    ///
+    /// Called by [`Self::materialize_due_transitions`], which is what a reporting operation
+    /// calls: the move was owed at its instant whether or not anybody asked, so applying it
+    /// on a read changes nothing a later caller would not have seen anyway.
+    pub(crate) fn materialize_due_client_vpn_routes(&mut self, now: Instant) {
+        for record in self.client_vpn_routes.values_mut() {
+            let due = record
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.due_by(now))
+                .map(str::to_string);
+            if let Some(code) = due {
+                record.view.status = Some(crate::ops::types::ClientVpnRouteStatus {
                     code: Some(code),
                     message: None,
                 });

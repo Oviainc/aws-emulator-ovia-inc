@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Accepts the removal of the stream the request names in `crate::state`'s store: the
+//! stored record is marked `DELETING` and the instant its removal falls due is recorded, so
+//! a caller that reads the stream straight after the call still sees it in `DELETING` and
+//! every operation answers `ResourceNotFoundException` for it from then on — the name, its
+//! shard logs and its tags all go with it. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -122,7 +120,14 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteStreamOutput {
 // here — hence the `DeleteStreamError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#DeleteStream")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#DeleteStream",
+    // `InternalFailureException` is widened in with `extra_errors`: this SERVICE models
+    // it ("The processing of the request failed because of an unknown error, exception, or
+    // failure"), the operation shape does not list it, and it is the only honest answer
+    // for a service mounted on an engine that holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum DeleteStreamErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -130,6 +135,7 @@ pub enum DeleteStreamErrorModeled {
     LimitExceededException(LimitExceededException),
     ResourceInUseException(ResourceInUseException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -155,6 +161,128 @@ impl From<DeleteStreamErrorModeled> for DeleteStreamError {
 /// concrete engine where it mounts the service, not here.
 pub struct DeleteStream<Eng> {
     engine: ::std::sync::Arc<Eng>,
+}
+
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the stream was deleted in, and how the
+/// call ended. No stream name and no ARN: a log sink needs neither to attribute the change.
+fn audit(akid: &str, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "DeleteStream",
+        akid = %akid,
+        region = %region,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
+/// Refuse the request with the error this operation models for a parameter that "exceeds
+/// its restrictions, is not supported, or can't be used".
+fn invalid_argument(message: String) -> DeleteStreamError {
+    DeleteStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The identifier the request addressed the stream by, which is what a refusal names.
+fn stream_identifier(input: &DeleteStreamInput) -> &str {
+    input
+        .stream_name
+        .as_deref()
+        .or(input.stream_arn.as_deref())
+        .unwrap_or_default()
+}
+
+/// The modelled refusal for a request whose `StreamName` / `StreamARN` pair names no stream
+/// of this account and region: the rule the operation's own doc publishes for a request that
+/// names neither ("you must use either the StreamARN or the StreamName parameter, or both"),
+/// and `ResourceNotFoundException` for one that names a stream nothing created — "If an
+/// application attempts to operate on a deleted stream, it receives the exception
+/// ResourceNotFoundException".
+fn lookup_refusal(
+    failure: crate::state::StreamLookupFailure,
+    input: &DeleteStreamInput,
+) -> DeleteStreamError {
+    match failure {
+        crate::state::StreamLookupFailure::Unspecified => {
+            invalid_argument(crate::state::STREAM_IDENTIFIER_REQUIRED_MESSAGE.to_string())
+        }
+        crate::state::StreamLookupFailure::Mismatch => {
+            invalid_argument(crate::state::STREAM_IDENTIFIER_MISMATCH_MESSAGE.to_string())
+        }
+        crate::state::StreamLookupFailure::NotFound => {
+            DeleteStreamErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::stream_not_found_message(stream_identifier(
+                    input,
+                ))),
+            })
+            .into()
+        }
+    }
+}
+
+/// Arm the removal of the stream the request names, or answer the modelled refusal that
+/// stands in the way. The whole write lives here so the caller holds the store's lock for
+/// exactly this long.
+fn delete_stream(
+    store: &mut crate::state::ComAmazonawsKinesisKinesis20131202State,
+    region: &str,
+    now: ::std::time::SystemTime,
+    input: &DeleteStreamInput,
+) -> Result<(), DeleteStreamError> {
+    // A stream whose removal has already fallen due names no resource any more, so the
+    // store hands its memory back here, where the streams this account holds change.
+    store.drop_removed_streams(now);
+
+    // `StreamId` is documented "Not Implemented. Reserved for future use", so no stream
+    // carries one and a request naming only that member names no stream.
+    let identifier = stream_identifier(input).to_string();
+    let stream = store
+        .resolve_stream_mut(
+            now,
+            region,
+            input.stream_name.as_deref(),
+            input.stream_arn.as_deref(),
+        )
+        .map_err(|failure| lookup_refusal(failure, input))?;
+
+    // "If the stream is in the ACTIVE state, you can delete it" (`DeleteStream`), so a
+    // stream still inside the transition its create armed, and one a delete has already
+    // been accepted for, are refused with the error that rule publishes ("The resource is
+    // not available for this operation. For successful operation, the resource must be in
+    // the ACTIVE state").
+    let status = stream.status(now);
+    if status != crate::state::STREAM_ACTIVE {
+        let identifier = if identifier.is_empty() {
+            stream.name.clone()
+        } else {
+            identifier
+        };
+        return Err(DeleteStreamErrorModeled::ResourceInUseException(
+            ResourceInUseException {
+                message: Some(crate::state::stream_not_active_message(
+                    &identifier,
+                    status,
+                )),
+            },
+        )
+        .into());
+    }
+
+    // "If this parameter is unset (null) or if you set it to false, and the stream has
+    // registered consumers, the call to DeleteStream fails with a ResourceInUseException"
+    // (`DeleteStreamInput$EnforceConsumerDeletion`): no consumer is registered until
+    // `RegisterStreamConsumer` registers one, so no stream of this emulator has one
+    // standing in the way of its removal whichever way the member is set.
+    //
+    // DELETING is not terminal: the stream is owed its removal, and the instant that is due
+    // is stored rather than slept on. "When you delete a stream, any shards in that stream
+    // are also deleted, and any tags are dissociated from the stream" — the whole record
+    // goes, so nothing of it is read once the removal falls due.
+    stream.deleted_at = Some(now + crate::state::DELETION_DELAY);
+    Ok(())
 }
 
 impl<Eng> DeleteStream<Eng> {
@@ -183,18 +311,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteStream"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region whose streams this request
+        // addresses, since a stream name "is also scoped by Amazon Web Services Region".
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, "unavailable");
+            DeleteStreamError::from(DeleteStreamErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the stream store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let deleted = {
+            let mut store = state.lock();
+            delete_stream(&mut store, &region, now, &input)
+        };
+        audit(
+            &akid,
+            &region,
+            if deleted.is_ok() { "deleting" } else { "refused" },
+        );
+        deleted?;
+
+        // `DeleteStream` models no output members: the call "is an asynchronous operation"
+        // whose answer is the stream's status, which `DescribeStreamSummary` reports.
+        Ok(DeleteStreamOutput)
     }
 }
