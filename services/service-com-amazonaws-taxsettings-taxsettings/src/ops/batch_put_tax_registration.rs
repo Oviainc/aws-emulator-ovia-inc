@@ -23,7 +23,12 @@
 //!   single-account write answers 409 with: the account's stored TRN is still
 //!   `Pending` ("You can't set a TRN if there's a pending TRN. You'll need to
 //!   delete the pending TRN first" — that account's record is left exactly as it
-//!   was), and the resident bound [`crate::state::MAX_STORED_REGISTRATIONS`].
+//!   was), and the resident bound [`crate::state::MAX_STORED_REGISTRATIONS`] —
+//!   plus the one refusal that is about the account's stored record rather than
+//!   about the entry: a registration type that record BLOCKS
+//!   ([`crate::state::ComAmazonawsTaxsettingsTaxsettingsState::check_registration_type_against_stored`]),
+//!   which the single-account write answers 400 `ValidationException` with and
+//!   whose row carries that refusal's own `errorCode`.
 //!
 //! `status` is the status the registrations were stored with — `Pending`, while
 //! the validation each write started is outstanding (see
@@ -239,6 +244,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // whose TRN is still pending, or a new record this emulator has no
             // room for — is reported against that account with its record left
             // as it was, and the rest of the batch still goes through.
+            //
+            // What the account already holds can refuse the type this entry
+            // sets, which is a fact about THAT account's record rather than
+            // about the entry the whole call carries, so it is judged here, per
+            // account, and reported against the account it refused. The `code`
+            // of such a row is the refusal's own `errorCode`, the discriminator
+            // the service publishes for a validation refusal; a
+            // `ConflictException` publishes none, so for those rows the
+            // exception's name is the only code there is.
+            if let Err(refusal) = store.check_registration_type_against_stored(account_id, entry) {
+                errors.push(BatchPutTaxRegistrationError2 {
+                    account_id: account_id.clone(),
+                    message: refusal.message,
+                    code: Some(refusal.error_code),
+                });
+                continue;
+            }
             match store.store_registration(account_id, entry, written_at) {
                 Ok(status) => stored_status = Some(status),
                 Err(conflict) => errors.push(BatchPutTaxRegistrationError2 {
