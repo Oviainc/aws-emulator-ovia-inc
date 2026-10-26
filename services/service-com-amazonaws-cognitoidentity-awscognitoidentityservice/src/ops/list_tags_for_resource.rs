@@ -147,8 +147,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A read: `ctx` carries only request metadata, and nothing here needs it.
-        let _ = ctx;
+        // Authorization comes first, before the pool the `ResourceArn` names is looked up:
+        // this operation is served only to a caller whose identity-based IAM policies allow
+        // its own action on the resource the request names.
+        if let Some(denied) = crate::state::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            Some(&input.resource_arn),
+        ) {
+            return Err(denied);
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::InternalErrorException(
                 InternalErrorException {

@@ -8,6 +8,11 @@
 //! wire shapes live in `crate::ops::types` and each handler builds its own output from
 //! the record it read.
 
+/// Whether IAM lets a request to this service do what it asks — the authorization gate
+/// every developer-credentials operation of this service consults before it reads or
+/// writes anything.
+pub mod authorization;
+
 use crate::ops::types::{CognitoIdentityProvider, RoleMapping};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};

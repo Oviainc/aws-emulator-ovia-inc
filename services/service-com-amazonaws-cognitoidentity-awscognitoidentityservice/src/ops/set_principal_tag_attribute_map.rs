@@ -169,9 +169,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A write to one named provider of one named pool: `ctx` carries only request
-        // metadata, and both are named by the request itself.
-        let _ = ctx;
+        // Authorization comes first, before anything is read or written: this operation is
+        // served only to a caller whose identity-based IAM policies allow its own action on
+        // the pool the request names.
+        if let Some(denied) = crate::state::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            Some(&crate::state::identity_pool_arn(&input.identity_pool_id)),
+        ) {
+            return Err(denied);
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 SetPrincipalTagAttributeMapErrorModeled::InternalErrorException(
