@@ -27,7 +27,9 @@
 //! the subscriber types in the set, the Region of the topic, the budget type and the limit
 //! the alert names, and what the notification alerts on — the notification type, the
 //! comparison operator, both published `Threshold` bounds and a fractional value in
-//! between, and whether `ThresholdType` was supplied.
+//! between, and whether `ThresholdType` was supplied. The tables after it carry the same
+//! rule onto the writes that REPLACE part of the pairing — the notification, a subscriber,
+//! and the budget whose own figures the alarm decision is read from.
 //!
 //! The last test is the one assertion the delivery path cannot show: an alert is owed only
 //! on a topic of the account whose budget it names, and no topic of another account can
@@ -49,6 +51,7 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
 use service_com_amazonaws_sns_amazonsimplenotificationservice::ComAmazonawsSnsAmazonsimplenotificationserviceState;
 
 use super::budget_lifecycle::{caller_account, call, same};
+use super::budget_read_projection::month_start_offset;
 
 /// The Region the budgets requests below are signed for, and the Region the topic a row
 /// names lives in unless the row says otherwise.
@@ -910,6 +913,27 @@ async fn an_update_that_leaves_a_notification_in_alarm_publishes_its_alert() {
     }
 }
 
+/// The alerts in `found` that `before` does not already account for — a MULTISET
+/// difference, not a containment filter: a write can owe an alert IDENTICAL to one an
+/// earlier write already published, and a containment filter would hide that second copy
+/// instead of reporting it as the alert the write under test published.
+fn published_since(
+    before: &[(String, Value)],
+    found: Vec<(String, Value)>,
+) -> Vec<(String, Value)> {
+    let mut remaining = before.to_vec();
+    let mut published: Vec<(String, Value)> = Vec::new();
+    for alert in found {
+        match remaining.iter().position(|held| *held == alert) {
+            Some(position) => {
+                remaining.remove(position);
+            }
+            None => published.push(alert),
+        }
+    }
+    published
+}
+
 /// Rule, on the write that REPLACES a subscriber: `UpdateSubscriber` attaches
 /// `NewSubscriber` to the notification in `OldSubscriber`'s place, so a notification the
 /// service holds in alarm owes its alert to the subscriber that call ATTACHES — one alert
@@ -1014,21 +1038,10 @@ async fn updating_a_subscriber_of_a_notification_in_alarm_publishes_its_alert() 
             "case {case:?}: UpdateSubscriber answered {status} {body}"
         );
 
-        let found = delivered(&emulator);
-        // A MULTISET difference, not a containment filter: the row whose replacement
-        // names the subscriber already held would publish an alert IDENTICAL to the one
-        // the create owed, and a containment filter would hide that second copy — the
-        // very behaviour that row exists to refuse.
-        let mut remaining = before.clone();
-        let mut published: Vec<(String, Value)> = Vec::new();
-        for alert in found {
-            match remaining.iter().position(|held| *held == alert) {
-                Some(position) => {
-                    remaining.remove(position);
-                }
-                None => published.push(alert),
-            }
-        }
+        // The row whose replacement names the subscriber already held would publish an
+        // alert IDENTICAL to the one the create owed, which is why this is a multiset
+        // difference ([`published_since`]) and not a containment filter.
+        let published = published_since(&before, delivered(&emulator));
         match expected {
             Some(topic) => {
                 // One alert, on the topic the REPLACEMENT names, naming what the
@@ -1135,5 +1148,369 @@ fn an_alert_is_owed_only_on_a_topic_of_the_budgets_own_account() {
             expected,
             "case {case:?}: expected {expected} alert(s) owed on {address}, got {owed:?}"
         );
+    }
+}
+
+/// The budget every row of [`update_rows`] creates and then replaces.
+const UPDATED_BUDGET: &str = "alert-budget-update";
+
+/// One row of the budget-replacing table: the budget as created with its notifications,
+/// the `NewBudget` that replaces it, the `NotificationState` each notification reads back
+/// with afterwards, and the alerts the UPDATE itself must publish.
+struct UpdateRow {
+    case: &'static str,
+    /// The `Budget` the row creates, minus its name.
+    created: Value,
+    /// The `NotificationsWithSubscribers` entries created with it.
+    attached: Value,
+    /// The `NewBudget` `UpdateBudget` replaces it with, minus its name.
+    updated: Value,
+    /// The state each attached notification reads back with after the update, in the
+    /// order the notifications were attached.
+    states: Vec<&'static str>,
+    /// `(topic ARN, alert)` for every alert the update must publish, in any order.
+    expected: Vec<(String, Value)>,
+}
+
+/// A `COST` budget on a monthly period limited to `amount` USD.
+fn cost_budget_limited(amount: &str) -> Value {
+    json!({
+        "TimeUnit": "MONTHLY",
+        "BudgetType": "COST",
+        "BudgetLimit": {"Amount": amount, "Unit": "USD"}
+    })
+}
+
+/// The budget-replacing table. Nothing spends behind a budget here, so the watched spend
+/// is zero in the budget's own unit and what each row turns on is the limit the threshold
+/// is measured against — which is exactly what the update replaces.
+///
+/// The rows differ along what the update changes (the limit, what the budget tracks and
+/// over what period, a fixed limit replaced by a `PlannedBudgetLimits` map), along what
+/// the notifications of it alert on (threshold type, comparison operator, notification
+/// type, how many are attached), along the subscriber types held with them, and along the
+/// Region of the topic addressed.
+fn update_rows() -> Vec<UpdateRow> {
+    let percentage_notification = json!({
+        "NotificationType": "ACTUAL",
+        "ComparisonOperator": "LESS_THAN",
+        "Threshold": 50
+    });
+    vec![
+        UpdateRow {
+            // The limit was zero, so 50% of it was zero and nothing spent was below it;
+            // the replacement puts the threshold above the spend.
+            case: "a new limit that moves a percentage notification into alarm",
+            created: cost_budget_limited("0"),
+            attached: json!([{
+                "Notification": percentage_notification,
+                "Subscribers": [sns_subscriber(&primary_topic()), email_subscriber(0)]
+            }]),
+            updated: cost_budget_limited("100"),
+            states: vec!["ALARM"],
+            expected: vec![(
+                primary_topic(),
+                alert(
+                    UPDATED_BUDGET,
+                    "COST",
+                    "MONTHLY",
+                    Some(("100", "USD")),
+                    "ACTUAL",
+                    "LESS_THAN",
+                    50.0,
+                    THRESHOLD_TYPE_PERCENTAGE,
+                ),
+            )],
+        },
+        UpdateRow {
+            // The mirror image: the create owed the alert, and the update leaves the
+            // notification with nothing passed, so it owes none.
+            case: "a new limit that moves a percentage notification out of alarm",
+            created: cost_budget_limited("100"),
+            attached: json!([{
+                "Notification": percentage_notification,
+                "Subscribers": [sns_subscriber(&primary_topic())]
+            }]),
+            updated: cost_budget_limited("0"),
+            states: vec!["OK"],
+            expected: Vec::new(),
+        },
+        UpdateRow {
+            // An absolute threshold does not move with the limit, so this notification was
+            // in alarm before and after — and the alert the update owes names the limit
+            // this call stored, not the one the create alert named.
+            case: "a notification left in alarm, whose alert names the updated limit",
+            created: cost_budget_limited("0"),
+            attached: json!([{
+                "Notification": {
+                    "NotificationType": "ACTUAL",
+                    "ComparisonOperator": "LESS_THAN",
+                    "Threshold": 42.5,
+                    "ThresholdType": "ABSOLUTE_VALUE"
+                },
+                "Subscribers": [sns_subscriber(&primary_topic())]
+            }]),
+            updated: cost_budget_limited("250.75"),
+            states: vec!["ALARM"],
+            expected: vec![(
+                primary_topic(),
+                alert(
+                    UPDATED_BUDGET,
+                    "COST",
+                    "MONTHLY",
+                    Some(("250.75", "USD")),
+                    "ACTUAL",
+                    "LESS_THAN",
+                    42.5,
+                    "ABSOLUTE_VALUE",
+                ),
+            )],
+        },
+        UpdateRow {
+            // The same budget figures decide both notifications, and only one of them
+            // compares in a direction the new limit satisfies.
+            case: "two notifications, only one of which the update leaves in alarm",
+            created: cost_budget_limited("0"),
+            attached: json!([
+                {
+                    "Notification": percentage_notification,
+                    "Subscribers": [sns_subscriber(&primary_topic())]
+                },
+                {
+                    "Notification": {
+                        "NotificationType": "ACTUAL",
+                        "ComparisonOperator": "GREATER_THAN",
+                        "Threshold": 50
+                    },
+                    "Subscribers": [sns_subscriber(&primary_topic())]
+                }
+            ]),
+            updated: cost_budget_limited("100"),
+            states: vec!["ALARM", "OK"],
+            expected: vec![(
+                primary_topic(),
+                alert(
+                    UPDATED_BUDGET,
+                    "COST",
+                    "MONTHLY",
+                    Some(("100", "USD")),
+                    "ACTUAL",
+                    "LESS_THAN",
+                    50.0,
+                    THRESHOLD_TYPE_PERCENTAGE,
+                ),
+            )],
+        },
+        UpdateRow {
+            // In alarm on every read, with no address any transport here hosts: the state
+            // is reported and nothing is published.
+            case: "a notification the update leaves in alarm holding only email addresses",
+            created: cost_budget_limited("0"),
+            attached: json!([{
+                "Notification": percentage_notification,
+                "Subscribers": [email_subscriber(0), email_subscriber(1)]
+            }]),
+            updated: cost_budget_limited("100"),
+            states: vec!["ALARM"],
+            expected: Vec::new(),
+        },
+        UpdateRow {
+            // What the budget tracks and over what period is part of the alert, so an
+            // update that changes them is named by the alert it owes; the Region the
+            // publish is addressed in comes from the topic's own ARN, not the budget.
+            case: "an update that changes what the budget tracks, on a topic in another \
+                   Region",
+            created: cost_budget_limited("0"),
+            attached: json!([{
+                "Notification": {
+                    "NotificationType": "ACTUAL",
+                    "ComparisonOperator": "LESS_THAN",
+                    "Threshold": 100
+                },
+                "Subscribers": [sns_subscriber(&other_topic())]
+            }]),
+            updated: json!({
+                "TimeUnit": "ANNUALLY",
+                "BudgetType": "USAGE",
+                "BudgetLimit": {"Amount": "5", "Unit": "GB"}
+            }),
+            states: vec!["ALARM"],
+            expected: vec![(
+                other_topic(),
+                alert(
+                    UPDATED_BUDGET,
+                    "USAGE",
+                    "ANNUALLY",
+                    Some(("5", "GB")),
+                    "ACTUAL",
+                    "LESS_THAN",
+                    100.0,
+                    THRESHOLD_TYPE_PERCENTAGE,
+                ),
+            )],
+        },
+        UpdateRow {
+            // The limit a percentage is taken of is the one the READ reports, which for a
+            // planned-limit budget is the entry in force — so an update that replaces a
+            // fixed limit with a plan is judged against that entry.
+            case: "a fixed limit replaced by the planned entry in force",
+            created: cost_budget_limited("0"),
+            attached: json!([{
+                "Notification": percentage_notification,
+                "Subscribers": [sns_subscriber(&primary_topic())]
+            }]),
+            updated: json!({
+                "TimeUnit": "MONTHLY",
+                "BudgetType": "COST",
+                "PlannedBudgetLimits": {
+                    month_start_offset(-1).to_string(): {"Amount": "400", "Unit": "USD"}
+                }
+            }),
+            states: vec!["ALARM"],
+            expected: vec![(
+                primary_topic(),
+                alert(
+                    UPDATED_BUDGET,
+                    "COST",
+                    "MONTHLY",
+                    Some(("400", "USD")),
+                    "ACTUAL",
+                    "LESS_THAN",
+                    50.0,
+                    THRESHOLD_TYPE_PERCENTAGE,
+                ),
+            )],
+        },
+        UpdateRow {
+            // No forecast is reported for a budget here, so no threshold of a
+            // `FORECASTED` notification was ever measured and no limit the update stores
+            // brings it into alarm.
+            case: "a forecasted notification, which no new limit brings into alarm",
+            created: cost_budget_limited("0"),
+            attached: json!([{
+                "Notification": {
+                    "NotificationType": "FORECASTED",
+                    "ComparisonOperator": "LESS_THAN",
+                    "Threshold": 50
+                },
+                "Subscribers": [sns_subscriber(&primary_topic())]
+            }]),
+            updated: cost_budget_limited("100"),
+            states: vec!["OK"],
+            expected: Vec::new(),
+        },
+    ]
+}
+
+/// Rule, on the write that REPLACES the BUDGET: a notification's alarm state is read off
+/// the figures of the budget that owns it — the limit its threshold is measured against
+/// and the spend it watches — so `UpdateBudget` decides, from the budget it leaves stored,
+/// the alert every notification attached to that budget owes: one per `SNS` subscriber of
+/// each notification it leaves in alarm, naming the UPDATED budget, and none for one it
+/// leaves out of alarm, exactly as every other write that leaves such a pairing decides
+/// it.
+///
+/// Each row reads the notifications back through `DescribeNotificationsForBudget`, so the
+/// alerts asserted are asserted beside the states the service reports after the update:
+/// no row can report a notification in `ALARM` to every later reader while the subscriber
+/// held with it was told nothing.
+#[tokio::test]
+async fn an_update_to_a_budget_publishes_the_alerts_its_new_figures_leave_owed() {
+    for row in update_rows() {
+        let emulator = emulator();
+        given_topic(&emulator, REGION, "budget-alerts").await;
+        given_topic(&emulator, OTHER_REGION, "budget-alerts").await;
+
+        let mut created = row.created.clone();
+        created["BudgetName"] = json!(UPDATED_BUDGET);
+        let (status, body) = call(
+            &emulator.router,
+            "CreateBudget",
+            &json!({
+                "AccountId": account_id(),
+                "Budget": created,
+                "NotificationsWithSubscribers": row.attached
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: CreateBudget answered {status} {body}",
+            row.case
+        );
+        // Whatever the creating write already owed is set aside, so what is asserted below
+        // is what the UPDATE published.
+        let before = delivered(&emulator);
+
+        let mut updated = row.updated.clone();
+        updated["BudgetName"] = json!(UPDATED_BUDGET);
+        let (status, body) = call(
+            &emulator.router,
+            "UpdateBudget",
+            &json!({"AccountId": account_id(), "NewBudget": updated}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: UpdateBudget answered {status} {body}",
+            row.case
+        );
+
+        // The states the service reports for the notifications of the budget this call
+        // stored — the read half of the same decision the alerts are owed by.
+        let (status, read) = call(
+            &emulator.router,
+            "DescribeNotificationsForBudget",
+            &json!({"AccountId": account_id(), "BudgetName": UPDATED_BUDGET}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: DescribeNotificationsForBudget answered {status} {read}",
+            row.case
+        );
+        let held = read["Notifications"].as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            held.len(),
+            row.states.len(),
+            "case {:?}: expected the budget to still hold {} notification(s), got {held:?}",
+            row.case,
+            row.states.len()
+        );
+        for (position, expected) in row.states.iter().enumerate() {
+            let found = held[position]["NotificationState"].as_str().unwrap_or("");
+            assert_eq!(
+                found, *expected,
+                "case {:?}: expected notification {position} to read back {expected}, got \
+                 {found:?}",
+                row.case
+            );
+        }
+
+        let mut published = published_since(&before, delivered(&emulator));
+        published.sort_by_key(|(topic, message)| (topic.clone(), message.to_string()));
+        let mut expected = row.expected.clone();
+        expected.sort_by_key(|(topic, message)| (topic.clone(), message.to_string()));
+        assert_eq!(
+            published.len(),
+            expected.len(),
+            "case {:?}: expected {} alert(s) from the update, got {published:?}",
+            row.case,
+            expected.len()
+        );
+        for (published, expected) in published.iter().zip(&expected) {
+            assert_eq!(
+                published.0, expected.0,
+                "case {:?}: expected the alert on {}, got it on {}",
+                row.case, expected.0, published.0
+            );
+            assert!(
+                same(&published.1, &expected.1),
+                "case {:?}: expected the alert {}, got {}",
+                row.case,
+                expected.1,
+                published.1
+            );
+        }
     }
 }

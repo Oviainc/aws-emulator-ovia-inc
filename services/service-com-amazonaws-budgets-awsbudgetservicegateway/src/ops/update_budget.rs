@@ -12,6 +12,11 @@
 //! `crate::state::stamp_service_owned` discards whatever `NewBudget` carried for them,
 //! together with a `CostTypes` selection the budget's own type does not have.
 //!
+//! The budget's own figures are what a notification's alarm state is read from, so a
+//! notification this write leaves in alarm owes the alert it exists to deliver to the
+//! subscribers held with it ([`crate::state::alerts`]), decided from the state this call
+//! leaves behind and published once the store's lock is released.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -160,7 +165,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // The budgets control plane is scoped to the account the caller signed with, so
         // an `AccountId` naming any other account is refused with the modelled 403
         // before anything is read or written (`crate::state::foreign_account_refusal`).
@@ -201,24 +205,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.new_budget.budget_name.clone(),
         );
         let now = ::std::time::SystemTime::now();
-        let mut store = crate::state::store_at(&state, now);
-        let stored = store.budgets.get_mut(&key).ok_or_else(|| {
-            UpdateBudgetErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "Unable to update budget: {} - the budget doesn't exist.",
-                    input.new_budget.budget_name
-                )),
-            })
-        })?;
+        // The alerts this write leaves owed, decided under the store's lock and published
+        // once it is released, so no delivery is made while the store is held.
+        let alerts = {
+            let mut store = crate::state::store_at(&state, now);
+            let stored = store.budgets.get_mut(&key).ok_or_else(|| {
+                UpdateBudgetErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(format!(
+                        "Unable to update budget: {} - the budget doesn't exist.",
+                        key.1
+                    )),
+                })
+            })?;
 
-        let mut budget = input.new_budget;
-        // The same service-owned members the create path stamps — including the
-        // `calculatedSpend` this operation documents a caller cannot change. The
-        // `HealthStatus` the budget already carried is kept: the operational state of the
-        // billing view it derives from did not change because the caller edited the
-        // budget.
-        crate::state::stamp_service_owned(&mut budget, now, stored.budget.health_status.clone());
-        stored.budget = budget;
+            let mut budget = input.new_budget;
+            // The same service-owned members the create path stamps — including the
+            // `calculatedSpend` this operation documents a caller cannot change. The
+            // `HealthStatus` the budget already carried is kept: the operational state of
+            // the billing view it derives from did not change because the caller edited
+            // the budget.
+            crate::state::stamp_service_owned(
+                &mut budget,
+                now,
+                stored.budget.health_status.clone(),
+            );
+            stored.budget = budget;
+
+            // Whether a notification is in alarm is read off the budget's own figures —
+            // the limit its threshold is measured against and the spend it watches — and
+            // those are exactly what this call replaces, so the budget it leaves behind
+            // decides the alarm state of EVERY notification attached to it. Each one this
+            // write leaves in alarm has passed the threshold it alerts on and owes its
+            // alert to the subscribers still held with it, the way every other write that
+            // leaves such a pairing decides it. The budget is read back the way a read
+            // reports it, so an alert cannot name figures `DescribeBudget` disagrees with.
+            let source = crate::state::alerts::source(
+                &input.account_id,
+                &crate::state::project_budget(stored, now),
+            );
+            stored
+                .notifications
+                .iter()
+                .flat_map(|held| {
+                    crate::state::alerts::owed(&source, &held.notification, &held.subscribers)
+                })
+                .collect::<Vec<crate::state::alerts::BudgetAlert>>()
+        };
+
+        crate::state::alerts::deliver(ctx, &alerts).await;
 
         Ok(UpdateBudgetOutput {})
     }
