@@ -185,8 +185,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let limit = crate::state::page_size(input.max_results);
 
         let region = crate::state::request_region(ctx.parts());
-        let store = state.lock();
         let now = crate::state::now_millis();
+        let mut store = state.lock();
+        // A teardown the clock has already finished is materialised first, so a plan
+        // whose `DELETING` span has passed is listed no more.
+        store.complete_due_teardowns(now);
         // Only the plans of THIS request's region are listed: a plan belongs to the
         // region its create was signed for, so a region nothing was created in reports
         // an empty page. `plans` is a BTreeMap, so this walk is in ascending id order:

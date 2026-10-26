@@ -27,6 +27,8 @@ mod list_plans_page_bound;
 mod plan_capacity_quota;
 #[path = "all/plan_capacity_units.rs"]
 mod plan_capacity_units;
+#[path = "all/plan_deletion_window.rs"]
+mod plan_deletion_window;
 #[path = "all/plan_update.rs"]
 mod plan_update;
 #[path = "all/regional_isolation.rs"]

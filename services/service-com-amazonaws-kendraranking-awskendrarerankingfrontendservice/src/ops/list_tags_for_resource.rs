@@ -159,7 +159,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // A teardown the clock has already finished is materialised first — it was owed
+        // at this instant whether or not anybody called — so an ARN whose plan is gone
+        // names no taggable resource.
+        store.complete_due_teardowns(crate::state::now_millis());
         // An ARN this emulator holds no rescore execution plan under names no taggable
         // resource: the modelled `ResourceUnavailableException` (HTTP 404), built by
         // `state::plan_for_arn` so every ARN-addressed operation resolves the ARN and

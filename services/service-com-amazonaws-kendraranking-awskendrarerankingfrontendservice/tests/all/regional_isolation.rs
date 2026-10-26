@@ -390,6 +390,9 @@ async fn a_deleted_plan_frees_only_its_own_region() {
             status, 200,
             "case {case:?}: deleting in the plan's own region: got {status} {answer}"
         );
+        // Deleting is asynchronous: the plan is listed, in DELETING, until the clock has
+        // finished the teardown.
+        sleep_past_the_transition();
 
         let home_ids = listed_ids(&router, pair.home).await;
         assert!(

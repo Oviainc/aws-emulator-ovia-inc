@@ -176,25 +176,36 @@ async fn the_plan_lifecycle_is_served_from_the_persisted_plan() {
         "rescore: RescoreId must be 1..36 characters, got {rescore_id:?}"
     );
 
-    // DELETE — an empty 200, and the plan is gone from every reader.
+    // DELETE — an empty 200 that STARTS the teardown: the plan reports DELETING until
+    // the clock has finished it, and only then is it gone from every reader.
     let (status, deleted) = call(&router, "DeleteRescoreExecutionPlan", json!({ "Id": id })).await;
     assert_eq!(status, 200, "delete: unexpected answer {deleted}");
 
+    let (status, deleting) =
+        call(&router, "DescribeRescoreExecutionPlan", json!({ "Id": id })).await;
+    assert_eq!(status, 200, "describe mid-teardown: got {deleting}");
+    assert_eq!(
+        deleting["Status"],
+        json!("DELETING"),
+        "describe mid-teardown: got {deleting}"
+    );
+
+    sleep_past_the_transition();
     let (status, described) =
         call(&router, "DescribeRescoreExecutionPlan", json!({ "Id": id })).await;
-    assert_eq!(status, 400, "describe after delete: got {described}");
+    assert_eq!(status, 400, "describe after the teardown: got {described}");
     assert_eq!(
         error_code(&described),
         "ResourceNotFoundException",
-        "describe after delete: got {described}"
+        "describe after the teardown: got {described}"
     );
 
     let (status, listed) = call(&router, "ListRescoreExecutionPlans", json!({})).await;
-    assert_eq!(status, 200, "list after delete: got {listed}");
+    assert_eq!(status, 200, "list after the teardown: got {listed}");
     assert_eq!(
         listed["SummaryItems"],
         json!([]),
-        "list after delete: got {listed}"
+        "list after the teardown: got {listed}"
     );
 }
 
@@ -290,7 +301,8 @@ async fn an_id_no_plan_was_created_for_is_not_found_on_every_operation_that_addr
         );
     }
 
-    // And deleting the live plan twice: the second delete is the same refusal.
+    // And deleting the live plan twice: once the teardown the first delete started has
+    // finished, the id names no plan and the second delete is the same refusal.
     let (status, first) = call(
         &router,
         "DeleteRescoreExecutionPlan",
@@ -298,6 +310,7 @@ async fn an_id_no_plan_was_created_for_is_not_found_on_every_operation_that_addr
     )
     .await;
     assert_eq!(status, 200, "first delete: got {first}");
+    sleep_past_the_transition();
     let (status, second) = call(
         &router,
         "DeleteRescoreExecutionPlan",
@@ -792,6 +805,9 @@ async fn a_plan_past_the_quota_is_refused_with_the_modelled_quota_error() {
     )
     .await;
     assert_eq!(status, 200, "freeing one plan: got {deleted}");
+    // Deleting is asynchronous: the plan holds its slot until the clock has finished
+    // tearing it down.
+    sleep_past_the_transition();
     let (status, created) = call(
         &router,
         "CreateRescoreExecutionPlan",

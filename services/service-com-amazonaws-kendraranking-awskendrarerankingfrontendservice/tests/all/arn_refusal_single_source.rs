@@ -50,6 +50,9 @@ async fn every_arn_addressed_operation_states_the_same_unavailable_refusal() {
     sleep_past_the_transition();
     let (status, answer) = call(&router, "DeleteRescoreExecutionPlan", json!({ "Id": gone_id })).await;
     assert_eq!(status, 200, "delete the doomed plan: got {answer}");
+    // Deleting is asynchronous: the plan's ARN names a resource until the clock has
+    // finished the teardown.
+    sleep_past_the_transition();
 
     // The classes of `ResourceARN` that resolve to no plan in this request's region:
     // the rule generalises over the FORM of the ARN, so the rows differ in form, not in

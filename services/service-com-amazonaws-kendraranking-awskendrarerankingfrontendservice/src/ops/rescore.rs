@@ -264,6 +264,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let plan_state = {
             let mut store = state.lock();
             let now = crate::state::now_millis();
+            // A teardown the clock has already finished is materialised first, so an id
+            // whose plan is gone is not found rather than refused as not ready.
+            store.complete_due_teardowns(now);
             // A transition the clock already owes is reported as due, so a plan whose
             // transient span has passed serves this call even if nobody polled it. The
             // plan is resolved in THIS request's region only: a plan created in another

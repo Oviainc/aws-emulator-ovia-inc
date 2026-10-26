@@ -218,7 +218,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
-
+        // A teardown the clock has already finished is materialised first, so a plan on
+        // its way out frees the slot it holds and releases the `ClientToken` that minted
+        // it the moment its span has passed.
+        store.complete_due_teardowns(now);
         // "Multiple calls to the CreateRescoreExecutionPlanRequest API with the same
         // client token will create only one rescore execution plan." The token is
         // scoped to the region this request is addressed to, like the plan it created:
@@ -301,6 +304,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     now,
                 )),
                 error_message: None,
+                deletion_due_millis: None,
                 tags: std::collections::BTreeMap::new(),
                 tags_written: 0,
             },

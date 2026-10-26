@@ -157,6 +157,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
+        // A teardown the clock has already finished is materialised first, so an ARN
+        // whose plan is gone names no taggable resource.
+        store.complete_due_teardowns(crate::state::now_millis());
         // Every key here is a `TagKey`, so the documented character set applies to it
         // as it does to a key being written ("A tag key and value can consist of
         // Unicode letters, digits, white space, and any of the following symbols:

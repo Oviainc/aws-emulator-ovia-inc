@@ -2,11 +2,14 @@
 
 //! @op DeleteRescoreExecutionPlan
 //!
-//! REMOVES the plan from this service's store, so a later Describe, Rescore or Delete
-//! of the same id answers `ResourceNotFoundException` and the plan no longer appears in
-//! `ListRescoreExecutionPlans`. A plan that is not `ACTIVE` — one an
-//! `UpdateRescoreExecutionPlan` call is still having re-provisioned — is refused with
-//! the modelled `ConflictException` instead.
+//! STARTS the asynchronous teardown of the plan: it takes the modelled `DELETING`
+//! status, which `DescribeRescoreExecutionPlan` and `ListRescoreExecutionPlans` report
+//! for the teardown span, and only once the clock has finished that teardown does the
+//! id stop resolving — a later Describe, Rescore or Delete of it then answers
+//! `ResourceNotFoundException` and the plan appears in `ListRescoreExecutionPlans` no
+//! more. A plan that is not `ACTIVE` — one an `UpdateRescoreExecutionPlan` call is
+//! still having re-provisioned, or one already being torn down — is refused with the
+//! modelled `ConflictException` instead.
 //!
 //! ## Shape of an operation
 //!
@@ -188,6 +191,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = crate::state::now_millis();
         let mut store = state.lock();
+        // A teardown the clock has already finished is materialised first, so an id
+        // whose plan is gone is not found here rather than refused as a conflict.
+        store.complete_due_teardowns(now);
         // A plan lives in the region its create was signed for, so an id is resolved in
         // THIS request's region only: a plan of another region cannot be deleted here.
         let Some(plan) = store.plan_mut(&region, &input.id) else {
@@ -203,9 +209,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // decides against the status a reader sees now rather than a stale one.
         plan.settle_status(now);
         // A plan the service is still provisioning cannot be deleted out from under
-        // that work: that is the modelled `ConflictException` ("A conflict occurred
-        // with the request. Please fix any inconsistencies with your resources and try
-        // again.").
+        // that work, and neither can one already being torn down: that is the modelled
+        // `ConflictException` ("A conflict occurred with the request. Please fix any
+        // inconsistencies with your resources and try again.").
         if plan.status != crate::state::STATUS_ACTIVE {
             return Err(
                 DeleteRescoreExecutionPlanErrorModeled::ConflictException(ConflictException {
@@ -220,11 +226,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The plan's ARN index entry and the idempotency tokens that created it go with
-        // it, or a repeated create would answer with the id of a plan that no longer
-        // exists.
-        let id = plan.id.clone();
-        store.remove_plan(&region, &id);
+        // Deleting a plan is asynchronous, like creating and updating one: the plan
+        // leaves `ACTIVE` for `DELETING` now — which is what every reader reports for it
+        // and what refuses a second delete, an update or a `Rescore` meanwhile — and the
+        // clock owes its removal a span later, materialised by
+        // `complete_due_teardowns` above.
+        plan.begin_deletion(now);
 
         Ok(DeleteRescoreExecutionPlanOutput)
     }

@@ -159,6 +159,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
+        // A teardown the clock has already finished is materialised first, so an ARN
+        // whose plan is gone names no taggable resource.
+        store.complete_due_teardowns(crate::state::now_millis());
         // "A tag key and value can consist of Unicode letters, digits, white space,
         // and any of the following symbols: _ . : / = + - @." (`Tag`) — and the `aws:`
         // key prefix is AWS's own. Neither is expressible in the model, so a tag

@@ -210,6 +210,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = crate::state::now_millis();
         let mut store = state.lock();
+        // A teardown the clock has already finished is materialised first, so an id
+        // whose plan is gone is not found here rather than refused as a conflict.
+        store.complete_due_teardowns(now);
         // A plan lives in the region its create was signed for, so an id is resolved in
         // THIS request's region only: a plan of another region cannot be updated here.
         let Some(plan) = store.plan_mut(&region, &input.id) else {

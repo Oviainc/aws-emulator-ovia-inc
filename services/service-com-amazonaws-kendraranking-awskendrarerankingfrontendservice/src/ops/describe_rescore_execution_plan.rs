@@ -4,8 +4,11 @@
 //!
 //! Reports the plan `CreateRescoreExecutionPlan` persisted under `Id`, member for
 //! member, and answers `ResourceNotFoundException` for an id the store does not
-//! hold. A pure read: a transition the clock already owes (`CREATING` -> `ACTIVE`,
-//! `UPDATING` -> `ACTIVE`) is reported as due without writing anything.
+//! hold. A REPORTING operation: a transition the clock already owes (`CREATING` ->
+//! `ACTIVE`, `UPDATING` -> `ACTIVE`) is reported as due without writing anything, and
+//! the only thing it writes is a teardown the clock has already finished (a plan whose
+//! `DELETING` span has passed is gone), which was owed at this instant whether or not
+//! anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -188,8 +191,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx.parts());
-        let store = state.lock();
         let now = crate::state::now_millis();
+        let mut store = state.lock();
+        // A teardown the clock has already finished is materialised first, so an id
+        // whose plan is gone reads as not found rather than as a plan.
+        store.complete_due_teardowns(now);
         // A plan lives in the region its create was signed for, so an id is resolved in
         // THIS request's region only: a plan of another region names nothing here.
         let Some(plan) = store.plan(&region, &input.id) else {

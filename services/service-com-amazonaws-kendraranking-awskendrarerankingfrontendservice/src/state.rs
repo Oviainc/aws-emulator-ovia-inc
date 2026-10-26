@@ -235,16 +235,26 @@ pub fn constraint_report(member: &str, kind: ViolationKind) -> String {
 /// five values `RescoreExecutionPlanStatus` models).
 pub const STATUS_UPDATING: &str = "UPDATING";
 
+/// The `RescoreExecutionPlanStatus` value a plan carries while the service tears it
+/// down for a `DeleteRescoreExecutionPlan` call (`DELETING` is one of the five values
+/// `RescoreExecutionPlanStatus` models). Deleting a plan is asynchronous like creating
+/// and updating one: the plan is reported in this non-terminal status first, every
+/// mutating call is refused while it is, and only once the teardown is due does the id
+/// stop resolving.
+pub const STATUS_DELETING: &str = "DELETING";
+
 /// How long a plan the service put into a transient status stays there before the
-/// clock owes it its settled status — a freshly created plan's `CREATING` -> `ACTIVE`
-/// and an updated plan's `UPDATING` -> `ACTIVE` alike.
+/// clock owes it what comes next — a freshly created plan's `CREATING` -> `ACTIVE`, an
+/// updated plan's `UPDATING` -> `ACTIVE`, and a deleted plan's `DELETING` -> gone
+/// alike.
 ///
-/// The model publishes no duration for either transition and the service provisions the
-/// plan after the call has returned, so this span is the emulator's own. It is never
+/// The model publishes no duration for any of those transitions and the service does
+/// the work after the call has returned, so this span is the emulator's own. It is never
 /// zero: a caller acting straight after the call observes the transient status — and the
 /// refusals it causes — exactly as it would on the real service. Nothing sleeps for it:
 /// the due instant is stored and read back through
-/// [`status_at`](RescoreExecutionPlan::status_at).
+/// [`status_at`](RescoreExecutionPlan::status_at) and
+/// [`teardown_is_complete`](RescoreExecutionPlan::teardown_is_complete).
 pub const TRANSIENT_STATUS_MILLIS: i64 = 500;
 
 /// A status the clock owes a plan: the value the plan takes once `due_millis` has
@@ -305,6 +315,17 @@ pub struct RescoreExecutionPlan {
     /// The status the clock owes this plan, while a transition is in flight; `None`
     /// once the plan has settled.
     pub pending_status: Option<PendingStatus>,
+    /// The instant this plan's teardown is finished, Unix epoch milliseconds, for a plan
+    /// a `DeleteRescoreExecutionPlan` call put into [`STATUS_DELETING`]; `None` for a
+    /// plan no delete has started.
+    ///
+    /// Read it through
+    /// [`teardown_is_complete`](RescoreExecutionPlan::teardown_is_complete): until that
+    /// instant the plan still exists and still reports its `DELETING` status, and from
+    /// it the clock owes its removal, which
+    /// [`complete_due_teardowns`](ComAmazonawsKendrarankingAwskendrarerankingfrontendserviceState::complete_due_teardowns)
+    /// materialises.
+    pub deletion_due_millis: Option<i64>,
     /// Set only for a plan whose status is `FAILED`; absent otherwise.
     pub error_message: Option<String>,
     /// This plan's tags, keyed by [`normalized_tag_key`] so one key holds at most one
@@ -411,6 +432,26 @@ impl RescoreExecutionPlan {
     pub fn begin_transition(&mut self, transient: &str, settled: &str, now_millis: i64) {
         self.status = transient.to_string();
         self.pending_status = Some(PendingStatus::due_after_transient_span(settled, now_millis));
+    }
+
+    /// Start this plan's teardown: it takes [`STATUS_DELETING`] now, and the clock owes
+    /// its removal [`TRANSIENT_STATUS_MILLIS`] later.
+    ///
+    /// `DELETING` is terminal for the plan — nothing settles out of it — so any status
+    /// the clock still owed it is dropped: the plan is on its way out, not on its way to
+    /// `ACTIVE`.
+    pub fn begin_deletion(&mut self, now_millis: i64) {
+        self.status = STATUS_DELETING.to_string();
+        self.pending_status = None;
+        self.deletion_due_millis = Some(now_millis.saturating_add(TRANSIENT_STATUS_MILLIS));
+    }
+
+    /// Whether the clock has already finished this plan's teardown, so its id resolves
+    /// to nothing and it is listed no more. False for a plan no delete has started, and
+    /// for one whose teardown span has not passed yet.
+    pub fn teardown_is_complete(&self, now_millis: i64) -> bool {
+        self.deletion_due_millis
+            .is_some_and(|due_millis| now_millis >= due_millis)
     }
 }
 
@@ -663,6 +704,20 @@ pub struct RegionalPlans {
     pub client_tokens: HashMap<String, String>,
 }
 
+impl RegionalPlans {
+    /// Drop the plan that id names here, answering it when there was one.
+    ///
+    /// Its ARN index entry and the idempotency tokens that created it go with it — or a
+    /// repeated create would answer with the id of a plan that no longer exists. The ONE
+    /// place a plan leaves the store, so no index can outlive the plan it resolves.
+    pub fn remove(&mut self, id: &str) -> Option<RescoreExecutionPlan> {
+        let removed = self.plans.remove(id)?;
+        self.arn_index.remove(&removed.arn);
+        self.client_tokens.retain(|_, plan_id| plan_id != id);
+        Some(removed)
+    }
+}
+
 /// Per-service state for com-amazonaws-kendraranking-awskendrarerankingfrontendservice. A handler reaches it through [`service_state`].
 ///
 /// Plans are keyed by REGION first, because a rescore execution plan is a regional
@@ -776,20 +831,30 @@ impl ComAmazonawsKendrarankingAwskendrarerankingfrontendserviceState {
         regional.plans.insert(plan.id.clone(), plan);
     }
 
-    /// Drop the plan that id names in `region`, answering it when there was one.
+    /// Drop every plan whose teardown the clock has already finished, so an id a
+    /// `DeleteRescoreExecutionPlan` call put into [`STATUS_DELETING`] stops resolving
+    /// once its span has passed — the plan is gone from every reader, its ARN names
+    /// nothing, the `ClientToken` that minted it mints a new plan again, and the slot it
+    /// held counts against [`MAX_RESCORE_EXECUTION_PLANS`] no more. A region left
+    /// holding no plans keeps no bucket.
     ///
-    /// Its ARN index entry and the idempotency tokens that created it go with it — or a
-    /// repeated create would answer with the id of a plan that no longer exists — and a
-    /// region left holding no plans keeps no bucket.
-    pub fn remove_plan(&mut self, region: &str, id: &str) -> Option<RescoreExecutionPlan> {
-        let regional = self.regions.get_mut(region)?;
-        let removed = regional.plans.remove(id)?;
-        regional.arn_index.remove(&removed.arn);
-        regional.client_tokens.retain(|_, plan_id| plan_id != id);
-        if regional.plans.is_empty() {
-            self.regions.remove(region);
-        }
-        Some(removed)
+    /// Every operation calls this before it resolves anything: the removal was owed at
+    /// this instant whether or not anybody called, so materialising it changes nothing a
+    /// caller could otherwise have seen, and it is what keeps the store bounded however
+    /// many plans are created and deleted.
+    pub fn complete_due_teardowns(&mut self, now_millis: i64) {
+        self.regions.retain(|_, regional| {
+            let torn_down: Vec<String> = regional
+                .plans
+                .values()
+                .filter(|plan| plan.teardown_is_complete(now_millis))
+                .map(|plan| plan.id.clone())
+                .collect();
+            for id in torn_down {
+                regional.remove(&id);
+            }
+            !regional.plans.is_empty()
+        });
     }
 
     /// How many plans this store holds across every region — what

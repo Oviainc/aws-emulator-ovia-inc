@@ -334,6 +334,9 @@ async fn an_id_that_names_no_plan_is_answered_with_the_constant_not_found_messag
         assert_eq!(status, 200, "delete {id}: got {answer}");
         unknown.push(id);
     }
+    // Deleting is asynchronous: a deleted id names no plan only once the clock has
+    // finished the teardown the delete started.
+    sleep_past_the_transition();
 
     let mut seen: Vec<String> = Vec::new();
     for id in &unknown {

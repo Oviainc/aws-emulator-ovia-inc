@@ -286,6 +286,9 @@ async fn an_arn_that_names_no_plan_is_refused_with_resource_unavailable() {
     )
     .await;
     assert_eq!(status, 200, "delete the doomed plan: got {answer}");
+    // Deleting is asynchronous: the plan's ARN names a resource until the clock has
+    // finished the teardown.
+    sleep_past_the_transition();
 
     // One row per class of ARN that resolves to nothing: a well-formed plan ARN for an
     // id this store never minted, a deleted plan's ARN, the same plan's ARN in another
