@@ -257,6 +257,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 written.pillar_notes = pillar_notes.into_iter().collect();
             }
             written.updated_at = now;
+            // Writing a lens review's notes changes the template that carries that lens
+            // review, so both report this write as the instant they were last updated —
+            // exactly as recording an answer against the template does.
+            template.updated_at = now;
         }
 
         Ok(UpdateReviewTemplateLensReviewOutput {

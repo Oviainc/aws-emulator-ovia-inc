@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ReportInstanceStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ReportInstanceStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ReportInstanceStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: collects the caller's feedback about every instance the request names,
+//! each as one report filed under that instance
+//! ([`crate::state::InstanceStatusReport`]), and answers the envelope's success flag.
+//!
+//! The instances are resolved and checked BEFORE the first report is filed, so a request
+//! naming one instance it cannot report on collects nothing at all. Submitting a report
+//! moves no instance and changes no status a reader reports: "Use of this action does not
+//! change the value returned by DescribeInstanceStatus".
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +167,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ReportInstanceStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ReportInstanceStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            date_time_key, date_time_to_system_time, deduplicate_ids, instance_id_is_well_formed,
+            instance_status_report_payload_bytes, require_service_state, resource_limit_exceeded,
+            InstanceStateName, InstanceStatusReport, MAX_RESOURCE_IDS, MAX_STORED_BYTES,
+            MAX_STORED_RECORDS_PER_STORE,
+        };
+
+        let _ = ctx;
+
+        // The two LIST members a report is built from. A request that OMITS one of them
+        // is already refused by the boundary validator, which reads the model's
+        // `@required` marking; these guards are this operation's own answer for a list
+        // that arrives EMPTY, which the model cannot express — a report is about instances
+        // and it says why. (`Status` needs no such guard: it is a modelled enum, so the
+        // boundary refuses an empty value for it.) Each names the parameter the way the
+        // request spells it on the wire (the member's `ec2QueryName`).
+        if input.instances.is_empty() {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain the parameter InstanceId",
+            ));
+        }
+        if input.reason_codes.is_empty() {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain the parameter ReasonCode",
+            ));
+        }
+        // The model declares no `@length` on `Instances`, so this is the only place the
+        // batch size can be bounded — the same ceiling the lifecycle operations hold their
+        // instance lists to.
+        if input.instances.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "InstanceId carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                input.instances.len()
+            )));
+        }
+
+        // `Status` ("the status of all instances listed") and every entry of `ReasonCodes`
+        // are modelled enums — `ReportStatusType` and `ReportInstanceReasonCodes` — so the
+        // boundary validator has already refused every spelling outside those catalogs
+        // before this handler runs, and the report below records the words it was given.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ReportInstanceStatus"))
+        // The two times are the ends of the window the reported health state held over —
+        // "the time at which the reported instance health state began" / "… ended" — so an
+        // end that falls before its start describes no window at all. A window whose ends
+        // COINCIDE is a report about one instant and is accepted, which is why this is
+        // worded "not earlier than" where `GetAwsNetworkPerformanceData`, whose window has
+        // to hold at least one aggregation period, demands a strictly later end.
+        if let (Some(start), Some(end)) = (input.start_time, input.end_time) {
+            if date_time_key(start) > date_time_key(end) {
+                return Err(Scaffolded::invalid_parameter_value(
+                    "EndTime must not be earlier than StartTime",
+                ));
+            }
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // Which state an instance is in is a fact of where the clock stands, so every move
+        // it already owed is materialised before one is read: an instance whose `running`
+        // transition fell due is running whether or not anybody called in the meantime.
+        store.materialize_due_transitions();
+
+        // One instance collects one report however many times the batch names it — a
+        // repeat is the same observation, not a second one.
+        let instance_ids = deduplicate_ids(&input.instances);
+
+        // The whole batch is resolved and checked before the first report is filed, so a
+        // request naming one instance it cannot report on collects nothing at all.
+        for instance_id in &instance_ids {
+            // Malformed before unknown, the order this service resolves an instance id
+            // in. The malformed half is worded the way THIS operation's validator words
+            // it — "The instance ID '<id>' is malformed", the wording
+            // `crate::scaffolded::Scaffolded::instance_id_is_malformed` records, not the
+            // bare "Invalid id" of the operations that answer that one: EC2's
+            // per-operation validators do not agree about an unresolvable instance id, so
+            // which of the two wordings an operation answers is a fact of that operation.
+            if !instance_id_is_well_formed(instance_id) {
+                return Err(Scaffolded::instance_id_is_malformed(instance_id));
+            }
+            let Some(instance) = store.instances.get(instance_id) else {
+                return Err(Scaffolded::invalid_instance_id_not_found(instance_id));
+            };
+            // "The instance must be in the running state" — the second sentence of this
+            // operation's own modelled documentation, quoted in the "Modeled contract"
+            // section at the head of this file
+            // (`smithy_query(query="doc",shape="ReportInstanceStatus")`). An instance in
+            // `pending` is one the clock is about to make `running` and
+            // nothing else — the same reading `ResetInstanceAttribute` gives a transient
+            // state — so a caller reporting on the instance it has just launched is
+            // reporting on a running one, and this service's own launch delay cannot be
+            // what refuses it. Every other state is on its way DOWN or already gone, and
+            // feedback about one is refused rather than collected against a state the
+            // caller cannot have experienced.
+            if !matches!(
+                instance.state,
+                InstanceStateName::Running | InstanceStateName::Pending
+            ) {
+                return Err(Scaffolded::incorrect_instance_state(
+                    instance_id,
+                    instance.state.as_str(),
+                    "reported on",
+                ));
+            }
+        }
+
+        // One report, filed under each instance the request named: the submission says the
+        // same thing about all of them ("the status of ALL instances listed").
+        let report = InstanceStatusReport {
+            status: input.status.clone(),
+            reason_codes: input.reason_codes.clone(),
+            start_time: input.start_time.map(date_time_to_system_time),
+            end_time: input.end_time.map(date_time_to_system_time),
+            description: input.description.clone(),
+            submitted_at: ::std::time::SystemTime::now(),
+        };
+        // Nothing reclaims a collected report, so both ceilings are asked BEFORE the first
+        // write: the number of reports this store holds, and the caller-chosen bytes they
+        // carry — a count being no bound on the bytes one report's description holds.
+        if !store.has_instance_status_report_capacity(instance_ids.len()) {
+            return Err(resource_limit_exceeded(format!(
+                "This emulator holds {MAX_STORED_RECORDS_PER_STORE} instance status \
+                 reports, which is as many as it stores"
+            )));
+        }
+        let payload_bytes: usize = instance_ids
+            .iter()
+            .map(|instance_id| instance_status_report_payload_bytes(instance_id, &report))
+            .sum();
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes()
+            )));
+        }
+
+        // DryRun sits AFTER everything that could refuse the request and BEFORE the first
+        // write: the flag asks whether the request WOULD have succeeded, so one that would
+        // have been refused is refused with that reason instead, and one that would have
+        // succeeded collects nothing.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        for instance_id in &instance_ids {
+            store.collect_instance_status_report(instance_id, report.clone());
+        }
+
+        // The modelled output is `Unit`, and EC2's envelope carries the success flag
+        // itself (`crate::service`), so there is no member for this handler to fill.
+        Ok(ReportInstanceStatusOutput)
     }
 }

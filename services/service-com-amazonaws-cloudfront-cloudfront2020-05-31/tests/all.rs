@@ -135,6 +135,8 @@ mod streaming_distribution_list;
 mod tag_resource;
 #[path = "all/tenant_distribution_and_method_order.rs"]
 mod tenant_distribution_and_method_order;
+#[path = "all/tenant_domain_admission.rs"]
+mod tenant_domain_admission;
 #[path = "all/tenant_invalidations.rs"]
 mod tenant_invalidations;
 #[path = "all/tenant_web_acl_association.rs"]

@@ -41,5 +41,7 @@ mod resolver_endpoints;
 mod resolver_rule_deletion;
 #[path = "all/resolver_rules.rs"]
 mod resolver_rules;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

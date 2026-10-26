@@ -76,6 +76,9 @@ pub const GET_GROUP: &str = "iam:GetGroup";
 /// `iam:ListUserTags`.
 pub const LIST_USER_TAGS: &str = "iam:ListUserTags";
 
+/// `iam:ListRoleTags`.
+pub const LIST_ROLE_TAGS: &str = "iam:ListRoleTags";
+
 /// `iam:ListPolicyTags`.
 pub const LIST_POLICY_TAGS: &str = "iam:ListPolicyTags";
 

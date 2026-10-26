@@ -37,6 +37,9 @@ mod chime_signing_name_routing;
 // of its own name or in the appended tail, both of which concurrent suites land into.
 #[path = "all/cognito_vended_session_reads_sse_kms_object.rs"]
 mod cognito_vended_session_reads_sse_kms_object;
+// Declared beside the suite above, at the head, for the same reason it is here.
+#[path = "all/cognito_vended_session_is_audited.rs"]
+mod cognito_vended_session_is_audited;
 #[path = "all/pi_resource_metadata_reflects_rds_configuration.rs"]
 mod pi_resource_metadata_reflects_rds_configuration;
 // Out of order for the same reason as the two entries above it.

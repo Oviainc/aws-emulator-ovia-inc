@@ -202,9 +202,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         // A REPORTING operation: it reads the custom key stores of this account and
-        // Region and writes nothing, so two reads of an untouched store answer the
-        // same.
-        let state = state.lock();
+        // Region. The only thing it writes is a connection change the CLOCK has
+        // already made due — one that was owed at this instant even if nobody had
+        // called — so two reads of an untouched store answer the same.
+        let mut state = state.lock();
+        state.settle_custom_key_stores();
 
         // "By default, this operation returns information about all custom key stores
         // in the account and Region", in creation order, so a page boundary is stable

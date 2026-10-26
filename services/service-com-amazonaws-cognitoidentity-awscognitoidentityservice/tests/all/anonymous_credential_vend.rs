@@ -140,6 +140,30 @@ async fn every_operation_the_model_leaves_unsigned_reaches_this_service() {
         .expect("CreateIdentityPool returns an IdentityPoolId")
         .to_string();
 
+    // `GetCredentialsForIdentity` vends a session of the pool's role, so the pool is
+    // configured with one that trusts its own users — otherwise the row below would be
+    // answered with the modelled refusal for a pool that has no role for the request,
+    // which says nothing about whether the request was CLAIMED.
+    let role_arn = crate::identity_pool_flow::seed_role(
+        &engine,
+        &crate::identity_pool_flow::seeded_role_arn("unsigned-operations", "vend"),
+        crate::identity_pool_flow::cognito_trust_policy(&pool_id),
+    );
+    let (status, configured) = call(
+        &credentialed,
+        true,
+        "SetIdentityPoolRoles",
+        &json!({
+            "IdentityPoolId": &pool_id,
+            "Roles": {"authenticated": &role_arn, "unauthenticated": &role_arn},
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "setup: SetIdentityPoolRoles must succeed, got {status} with {configured}"
+    );
+
     // Request authentication ON from here on, as the emulator runs it: every row below
     // carries no signature at all.
     let mut serving = MultiServiceRouter::new();

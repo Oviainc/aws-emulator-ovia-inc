@@ -73,7 +73,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::Cancellation;
+use crate::state::{Cancellation, UNKNOWN_QUERY_MESSAGE, UNKNOWN_QUERY_STATUS};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -189,13 +189,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into())
             }
-            Cancellation::Unknown => Err(CancelStatementErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("Query does not exist: {}", input.id),
+            // An `Id` this service holds no query for gets the same refusal, in
+            // the same fixed words and at the same status, as every other reader
+            // of a statement gives (see `describe_statement::no_such_query`).
+            Cancellation::Unknown => Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                CancelStatementErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: UNKNOWN_QUERY_MESSAGE.to_string(),
                     resource_id: input.id.clone(),
-                },
-            )
-            .into()),
+                }),
+                UNKNOWN_QUERY_STATUS,
+            )),
         }
     }
 }

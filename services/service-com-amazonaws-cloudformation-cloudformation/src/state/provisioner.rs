@@ -1821,13 +1821,20 @@ async fn delete_collection(
 const NO_SUCH_BUCKET: &str = "NoSuchBucket";
 
 /// Create the bucket an `AWS::S3::Bucket` declares, and apply the
-/// `VersioningConfiguration` and the tags it carries.
+/// `VersioningConfiguration`, the `NotificationConfiguration` and the tags it carries.
 ///
 /// "Ref returns the bucket name" for this type, so the physical resource id the stack
 /// reports IS the bucket a client addresses, and it is the bucket created here.
 /// `CreateBucketConfiguration$LocationConstraint` is what decides a bucket's Region and
 /// "buckets in Region us-east-1 have a LocationConstraint of null", so the stack's own
 /// Region is sent as that constraint for every other Region and as nothing for that one.
+///
+/// A bucket's sub-resource configurations are not members of `CreateBucket` at all: each is
+/// applied by the one call Amazon S3 publishes for it, made here on the created bucket, so a
+/// read of that sub-resource straight after the stack completes reports what the template
+/// declared. `VersioningConfiguration` is a `PutBucketVersioning` and the whole
+/// `NotificationConfiguration` is a `PutBucketNotificationConfiguration`
+/// ([`declared_notification_configuration`]).
 ///
 /// `CreateBucket` takes no tag set at all, so the bucket's tags are a `PutBucketTagging` of
 /// its own — "sets the tags for a bucket", the one call S3 publishes for them — carrying
@@ -1888,6 +1895,19 @@ async fn create_bucket(
             .await
             .map_err(|error| refusal_of(&error))?;
     }
+    // "NotificationConfiguration — configuration that defines how Amazon S3 handles bucket
+    // notifications" (this type's own property): the declared destination configurations are
+    // applied to the created bucket through `PutBucketNotificationConfiguration`, the one
+    // call Amazon S3 publishes for them.
+    if let Some(configuration) = declared_notification_configuration(resource)? {
+        client
+            .put_bucket_notification_configuration()
+            .bucket(bucket)
+            .notification_configuration(configuration)
+            .send()
+            .await
+            .map_err(|error| refusal_of(&error))?;
+    }
     // The bucket's whole tag set, in the one call Amazon S3 takes it through.
     let tags = tags_of(&resource.properties, propagated);
     if !tags.is_empty() {
@@ -1922,6 +1942,221 @@ async fn create_bucket(
     Ok(Created::default())
 }
 
+/// The property an `AWS::S3::Bucket` declares its event notifications under.
+const NOTIFICATION_CONFIGURATION: &str = "NotificationConfiguration";
+
+/// One declared destination configuration, translated out of the template's spelling.
+///
+/// Every one of the API's three destination configurations carries the same three things —
+/// a destination ARN, the events the destination is notified about and an optional key-name
+/// filter — so the reading is shared and only the shape it is built into differs.
+struct DeclaredNotification {
+    /// The destination's ARN, as the template's `Function`, `Queue` or `Topic` resolved to.
+    arn: String,
+    /// The events the destination is notified about. The template states ONE `Event` per
+    /// configuration where the API takes an `Events` LIST, so this carries that one event.
+    events: Vec<::aws_sdk_s3::types::Event>,
+    /// The key-name filter the configuration's `Filter` states, or `None` when it states
+    /// none (and so every key notifies).
+    filter: Option<::aws_sdk_s3::types::NotificationConfigurationFilter>,
+}
+
+/// The configurations one destination kind of a declared `NotificationConfiguration` lists.
+///
+/// `member` is the property that lists them (`LambdaConfigurations`, `QueueConfigurations`
+/// or `TopicConfigurations`) and `destination` the property inside one that names the
+/// destination (`Function`, `Queue` or `Topic`) — the members `AWS::S3::Bucket`'s
+/// `NotificationConfiguration` publishes. A configuration missing the destination or the
+/// event its type REQUIRES is refused rather than sent incomplete or dropped: the stack must
+/// not complete with a notification it could not install.
+fn declared_notifications(
+    declared: &Value,
+    member: &str,
+    destination: &str,
+) -> Result<Vec<DeclaredNotification>, Refusal> {
+    let mut notifications = Vec::new();
+    let listed = declared
+        .get(member)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for configuration in listed {
+        let arn = configuration
+            .get(destination)
+            .and_then(scalar_text)
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| Refusal {
+                code: MISSING_PROPERTY_CODE.to_string(),
+                message: format!(
+                    "a {NOTIFICATION_CONFIGURATION}.{member} entry of {S3_BUCKET} declares no \
+                     {destination}"
+                ),
+            })?;
+        let event = configuration
+            .get("Event")
+            .and_then(scalar_text)
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| Refusal {
+                code: MISSING_PROPERTY_CODE.to_string(),
+                message: format!(
+                    "a {NOTIFICATION_CONFIGURATION}.{member} entry of {S3_BUCKET} declares no \
+                     Event"
+                ),
+            })?;
+        notifications.push(DeclaredNotification {
+            arn,
+            events: vec![::aws_sdk_s3::types::Event::from(event.as_str())],
+            filter: notification_filter(configuration),
+        });
+    }
+    Ok(notifications)
+}
+
+/// The key-name filter one declared configuration's `Filter` states, as Amazon S3 takes it.
+///
+/// The template nests the rules as `Filter.S3Key.Rules` where the API nests them as
+/// `Filter.Key.FilterRules`, with the same two members on each rule (`Name` and `Value`), so
+/// the rules are carried through one for one and in the declared order. A configuration
+/// stating no filter gets none, which is the configuration that matches every key.
+fn notification_filter(
+    configuration: &Value,
+) -> Option<::aws_sdk_s3::types::NotificationConfigurationFilter> {
+    use ::aws_sdk_s3::types::{
+        FilterRule, FilterRuleName, NotificationConfigurationFilter, S3KeyFilter,
+    };
+
+    let rules = configuration
+        .get("Filter")
+        .and_then(|filter| filter.get("S3Key"))
+        .and_then(|key| key.get("Rules"))
+        .and_then(Value::as_array)?;
+    let filter_rules: Vec<FilterRule> = rules
+        .iter()
+        .map(|rule| {
+            let mut builder = FilterRule::builder();
+            // Both members are optional in the API's own shape, so each is sent only where
+            // the rule states it: Amazon S3 is what judges a rule naming neither.
+            if let Some(name) = rule.get("Name").and_then(scalar_text) {
+                builder = builder.name(FilterRuleName::from(name.as_str()));
+            }
+            if let Some(value) = rule.get("Value").and_then(scalar_text) {
+                builder = builder.value(value);
+            }
+            builder.build()
+        })
+        .collect();
+    Some(
+        NotificationConfigurationFilter::builder()
+            .key(
+                S3KeyFilter::builder()
+                    .set_filter_rules(Some(filter_rules))
+                    .build(),
+            )
+            .build(),
+    )
+}
+
+/// The whole `NotificationConfiguration` a bucket's declaration states, as the
+/// `PutBucketNotificationConfiguration` request Amazon S3 takes — `None` for a declaration
+/// that states no notifications at all, which is the state a bucket is created in.
+///
+/// The template's spelling differs from the API's in three ways, and this is the one place
+/// they are reconciled: the destination configurations are listed under
+/// `LambdaConfigurations`/`QueueConfigurations`/`TopicConfigurations` against the API's
+/// `LambdaFunctionConfigurations`/`QueueConfigurations`/`TopicConfigurations`, each states
+/// ONE `Event` where the API takes an `Events` list, and each names its destination with
+/// `Function`/`Queue`/`Topic` against the API's `LambdaFunctionArn`/`QueueArn`/`TopicArn`.
+/// Nothing else is renamed: a `Filter`'s rules travel through [`notification_filter`], and
+/// an `Id` is not a member of this type's configurations at all — "if you don't provide one,
+/// Amazon S3 will assign an ID", and S3 is what does so here.
+///
+/// `EventBridgeConfiguration` is the fourth member, and the one whose shapes disagree: the
+/// template states `EventBridgeEnabled`, while the API's shape has no members and its
+/// PRESENCE is what "enables delivery of events to Amazon EventBridge" — so it is sent for a
+/// declaration that enables it and left out otherwise.
+fn declared_notification_configuration(
+    resource: &StoredResource,
+) -> Result<Option<::aws_sdk_s3::types::NotificationConfiguration>, Refusal> {
+    use ::aws_sdk_s3::types::{
+        EventBridgeConfiguration, LambdaFunctionConfiguration, NotificationConfiguration,
+        QueueConfiguration, TopicConfiguration,
+    };
+
+    let Some(declared) = resource.properties.get(NOTIFICATION_CONFIGURATION) else {
+        return Ok(None);
+    };
+    let incomplete = |member: &str, error: &dyn ::std::fmt::Display| Refusal {
+        code: UNIDENTIFIED_FAILURE.to_string(),
+        message: format!(
+            "a {NOTIFICATION_CONFIGURATION}.{member} entry of {S3_BUCKET} cannot be sent to \
+             Amazon S3: {error}"
+        ),
+    };
+
+    let mut lambda_configurations = Vec::new();
+    for notification in declared_notifications(declared, "LambdaConfigurations", "Function")? {
+        lambda_configurations.push(
+            LambdaFunctionConfiguration::builder()
+                .lambda_function_arn(notification.arn)
+                .set_events(Some(notification.events))
+                .set_filter(notification.filter)
+                .build()
+                .map_err(|error| incomplete("LambdaConfigurations", &error))?,
+        );
+    }
+    let mut queue_configurations = Vec::new();
+    for notification in declared_notifications(declared, "QueueConfigurations", "Queue")? {
+        queue_configurations.push(
+            QueueConfiguration::builder()
+                .queue_arn(notification.arn)
+                .set_events(Some(notification.events))
+                .set_filter(notification.filter)
+                .build()
+                .map_err(|error| incomplete("QueueConfigurations", &error))?,
+        );
+    }
+    let mut topic_configurations = Vec::new();
+    for notification in declared_notifications(declared, "TopicConfigurations", "Topic")? {
+        topic_configurations.push(
+            TopicConfiguration::builder()
+                .topic_arn(notification.arn)
+                .set_events(Some(notification.events))
+                .set_filter(notification.filter)
+                .build()
+                .map_err(|error| incomplete("TopicConfigurations", &error))?,
+        );
+    }
+    let event_bridge_enabled = declared
+        .get("EventBridgeConfiguration")
+        .and_then(|configuration| configuration.get("EventBridgeEnabled"))
+        .and_then(scalar_text)
+        .is_some_and(|enabled| enabled.eq_ignore_ascii_case("true"));
+
+    if lambda_configurations.is_empty()
+        && queue_configurations.is_empty()
+        && topic_configurations.is_empty()
+        && !event_bridge_enabled
+    {
+        return Ok(None);
+    }
+    Ok(Some(
+        NotificationConfiguration::builder()
+            .set_lambda_function_configurations(
+                (!lambda_configurations.is_empty()).then_some(lambda_configurations),
+            )
+            .set_queue_configurations(
+                (!queue_configurations.is_empty()).then_some(queue_configurations),
+            )
+            .set_topic_configurations(
+                (!topic_configurations.is_empty()).then_some(topic_configurations),
+            )
+            .set_event_bridge_configuration(
+                event_bridge_enabled.then(|| EventBridgeConfiguration::builder().build()),
+            )
+            .build(),
+    ))
+}
+
 /// Delete the bucket a stack created. A bucket S3 no longer has is already in the state
 /// the delete asks for; one that still holds objects is NOT deleted, and that refusal is
 /// what the stack reports.
@@ -1954,11 +2189,14 @@ const BUCKET_NOT_FOUND: &str = "NotFound";
 /// The bucket's configuration as Amazon S3 reports it, for drift detection.
 ///
 /// A bucket S3 no longer holds was deleted. For one it still holds, the configuration
-/// reported is the `VersioningConfiguration` the create applies — the one property of this
-/// type this emulator sets in S3 — under the property name the template spells it with, so
-/// a bucket whose versioning was changed outside the stack is MODIFIED. A versioning read
-/// the owning service refuses leaves the bucket reported as existing with no comparable
-/// property rather than failing the whole detection.
+/// reported is the `VersioningConfiguration` the create applies, under the property name the
+/// template spells it with, so a bucket whose versioning was changed outside the stack is
+/// MODIFIED. A versioning read the owning service refuses leaves the bucket reported as
+/// existing with no comparable property rather than failing the whole detection. A declared
+/// property this read does not report is not compared at all ("only resource properties
+/// explicitly defined in the stack template are checked for drift", against what the owning
+/// service reports), so the bucket's notification configuration — which the create installs
+/// but this read does not fetch — is outside this detection rather than reported as changed.
 async fn describe_bucket(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,

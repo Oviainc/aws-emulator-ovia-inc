@@ -24,6 +24,12 @@
 //! or as an inline template document, and how many tags the stack carries. Every expected
 //! value is computed here from what the row declares, never read back out of the answer being
 //! checked.
+//!
+//! The last two suites here add the other half of the same rule: what the stack creates is
+//! the resource's declaration EVALUATED against the stack's own parameters, so a dashboard
+//! whose name, body or tag value is stated through a parameter is created under the value
+//! that parameter resolves to, and changing a parameter is applied as the same kind of change
+//! a literal rewrite of the template would be.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -963,4 +969,465 @@ async fn a_dashboard_cloudwatch_refuses_fails_the_stack() {
             "case {case:?}: expected no dashboard of that name, got {status} with {gone}"
         );
     }
+}
+
+/// The `Parameters.member.N.ParameterKey` / `.ParameterValue` pairs a stack operation carries
+/// for the parameter values a row supplies, as an SDK flattens the list.
+fn parameter_members(parameters: &[(&str, &str)]) -> Vec<(String, String)> {
+    parameters
+        .iter()
+        .enumerate()
+        .flat_map(|(index, (key, value))| {
+            let ordinal = index + 1;
+            [
+                (
+                    format!("Parameters.member.{ordinal}.ParameterKey"),
+                    (*key).to_string(),
+                ),
+                (
+                    format!("Parameters.member.{ordinal}.ParameterValue"),
+                    (*value).to_string(),
+                ),
+            ]
+        })
+        .collect()
+}
+
+/// A template declaring a `Parameters` section and ONE dashboard whose properties are stated
+/// through those parameters, with an output resolving the resource's `Ref`.
+fn parameterised_template(logical_id: &str, declarations: &Value, properties: &Value) -> String {
+    json!({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Description": "one CloudWatch dashboard declared through the stack's parameters",
+        "Parameters": declarations.clone(),
+        "Resources": {
+            logical_id: {
+                "Type": "AWS::CloudWatch::Dashboard",
+                "Properties": properties.clone(),
+            },
+        },
+        "Outputs": {"DashboardName": {"Value": {"Ref": logical_id}}},
+    })
+    .to_string()
+}
+
+/// Run one stack operation that supplies parameter values, wait past the stack's clock-owed
+/// span, and answer the `DescribeStacks` body.
+async fn deploy_with_parameters(
+    router: &MultiServiceRouter,
+    case: &str,
+    action: &str,
+    stack_name: &str,
+    template: &str,
+    stack_tags: &[(&str, &str)],
+    parameters: &[(&str, &str)],
+) -> String {
+    let mut members = tag_members(stack_tags);
+    members.extend(parameter_members(parameters));
+    let (status, body) = cloudformation(
+        router,
+        action,
+        &stack_request(stack_name, template, &members),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from {action}, got {status} with body {body}"
+    );
+    tokio::time::sleep(PAST_STACK_SPAN).await;
+    describe_stack(router, case, stack_name).await
+}
+
+/// The dashboard document the `Fn::Sub` row declares, as the template states it: one text
+/// widget whose markdown is a variable the stack's parameters supply.
+const SUBSTITUTED_BODY: &str =
+    r#"{"widgets":[{"type":"text","properties":{"markdown":"${Title}"}}]}"#;
+
+/// The variable that body names, and the value its row's parameter gives it — so the
+/// declaration and the expectation are built from the one pair and cannot drift.
+const SUBSTITUTED_BODY_VARIABLE: &str = "${Title}";
+const SUBSTITUTED_BODY_TITLE: &str = "Requests";
+
+/// That same document with the variable substituted: what `Fn::Sub` resolves the declared
+/// body to, and so what CloudWatch must hold.
+fn substituted_body() -> String {
+    SUBSTITUTED_BODY.replace(SUBSTITUTED_BODY_VARIABLE, SUBSTITUTED_BODY_TITLE)
+}
+
+/// One row of the parameter table: how the declaration reaches a parameter, and what the
+/// supplied values make the dashboard.
+struct ParameterisedRow {
+    case: &'static str,
+    stack_name: &'static str,
+    logical_id: &'static str,
+    /// The template's own `Parameters` section.
+    declarations: fn() -> Value,
+    /// The parameter values the stack operation supplies, which a row may leave empty where
+    /// the declaration carries a `Default`.
+    parameters: &'static [(&'static str, &'static str)],
+    /// The dashboard's `Properties`, stating its name, body or tags through those parameters.
+    properties: fn() -> Value,
+    /// The name those values resolve the declaration to.
+    expected_name: &'static str,
+    /// The document text they resolve its body to.
+    expected_body: fn() -> String,
+    /// The stack-level tags the stack operation carries.
+    stack_tags: &'static [(&'static str, &'static str)],
+    /// The tags the dashboard's own `Tags` property resolves to.
+    expected_declared_tags: &'static [(&'static str, &'static str)],
+}
+
+/// A dashboard whose declaration is stated through the stack's PARAMETERS is created in
+/// CloudWatch under the values those parameters resolve to — the name its `Ref` publishes,
+/// the document it holds and the tags it carries — and deleting the stack deletes it there.
+#[tokio::test]
+async fn a_dashboard_declared_through_the_stacks_parameters_is_created_under_their_values() {
+    // Rows differ along HOW a parameter reaches the declaration: a `Ref` straight to one, a
+    // name joined out of one, a value the request omits so the declaration's own `Default`
+    // supplies it, a name selected out of a list-typed one, and a body substituted into by
+    // `Fn::Sub` — and along WHICH property reads it (the name, the body, a tag's value).
+    let rows: Vec<ParameterisedRow> = vec![
+        ParameterisedRow {
+            case: "a name and a tag value each a Ref to a parameter",
+            stack_name: "cwdash-params-ref",
+            logical_id: "Dashboard",
+            declarations: || {
+                json!({"DashboardName": {"Type": "String"}, "Team": {"Type": "String"}})
+            },
+            parameters: &[
+                ("DashboardName", "cwdash-params-ref-board"),
+                ("Team", "platform"),
+            ],
+            properties: || {
+                json!({
+                    "DashboardName": {"Ref": "DashboardName"},
+                    "DashboardBody": body_with_widgets(1),
+                    "Tags": [{"Key": "team", "Value": {"Ref": "Team"}}],
+                })
+            },
+            expected_name: "cwdash-params-ref-board",
+            expected_body: || body_with_widgets(1),
+            stack_tags: &[("env", "prod")],
+            expected_declared_tags: &[("team", "platform")],
+        },
+        ParameterisedRow {
+            case: "a name joined from a parameter and a literal suffix",
+            stack_name: "cwdash-params-join",
+            logical_id: "Joined",
+            declarations: || json!({"Prefix": {"Type": "String"}}),
+            parameters: &[("Prefix", "cwdash-params-join")],
+            properties: || {
+                json!({
+                    "DashboardName": {"Fn::Join": ["-", [{"Ref": "Prefix"}, "board"]]},
+                    "DashboardBody": body_with_widgets(3),
+                })
+            },
+            expected_name: "cwdash-params-join-board",
+            expected_body: || body_with_widgets(3),
+            stack_tags: &[("team", "platform")],
+            expected_declared_tags: &[],
+        },
+        ParameterisedRow {
+            case: "a name from the parameter's own default, the request supplying no value",
+            stack_name: "cwdash-params-default",
+            logical_id: "Defaulted",
+            declarations: || {
+                json!({
+                    "DashboardName": {
+                        "Type": "String",
+                        "Default": "cwdash-params-default-board",
+                    },
+                })
+            },
+            parameters: &[],
+            properties: || {
+                json!({"DashboardName": {"Ref": "DashboardName"}, "DashboardBody": "{}"})
+            },
+            expected_name: "cwdash-params-default-board",
+            expected_body: || "{}".to_string(),
+            stack_tags: &[("team", "platform")],
+            expected_declared_tags: &[],
+        },
+        ParameterisedRow {
+            case: "a name selected out of a list-typed parameter, and a substituted body",
+            stack_name: "cwdash-params-select",
+            logical_id: "Selected",
+            declarations: || {
+                json!({
+                    "Names": {"Type": "CommaDelimitedList"},
+                    "Title": {"Type": "String"},
+                })
+            },
+            parameters: &[
+                ("Names", "cwdash-params-zero,cwdash-params-one"),
+                ("Title", SUBSTITUTED_BODY_TITLE),
+            ],
+            properties: || {
+                json!({
+                    "DashboardName": {"Fn::Select": ["1", {"Ref": "Names"}]},
+                    "DashboardBody": {"Fn::Sub": SUBSTITUTED_BODY},
+                })
+            },
+            expected_name: "cwdash-params-one",
+            expected_body: substituted_body,
+            stack_tags: &[("team", "platform"), ("env", "staging")],
+            expected_declared_tags: &[],
+        },
+    ];
+
+    for row in &rows {
+        let router = build_router();
+        let case = row.case;
+        let described = deploy_with_parameters(
+            &router,
+            case,
+            "CreateStack",
+            row.stack_name,
+            &parameterised_template(
+                row.logical_id,
+                &(row.declarations)(),
+                &(row.properties)(),
+            ),
+            row.stack_tags,
+            row.parameters,
+        )
+        .await;
+        assert_eq!(
+            opt_element(&described, "StackStatus").as_deref(),
+            Some("CREATE_COMPLETE"),
+            "case {case:?}: expected the stack to complete, got {described}"
+        );
+        assert_eq!(
+            outputs_of(&described)
+                .get("DashboardName")
+                .map(String::as_str),
+            Some(row.expected_name),
+            "case {case:?}: expected Ref to resolve to the name the parameters make, got \
+             {described}"
+        );
+
+        let reported = get_dashboard(&router, case, row.expected_name).await;
+        assert_eq!(
+            reported.get("DashboardName").and_then(Value::as_str),
+            Some(row.expected_name),
+            "case {case:?}: expected the dashboard to answer under that name, got {reported}"
+        );
+        assert_eq!(
+            reported.get("DashboardArn").and_then(Value::as_str),
+            Some(dashboard_arn(row.expected_name).as_str()),
+            "case {case:?}: expected the global dashboard ARN of that name, got {reported}"
+        );
+        let expected_body = (row.expected_body)();
+        let actual_body = reported
+            .get("DashboardBody")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        // Every row states its body as the JSON TEXT of a document (`Fn::Sub` resolves to
+        // text too), so the stored document comes back character for character.
+        assert_eq!(
+            actual_body, expected_body,
+            "case {case:?}: expected the document the parameters make, got {actual_body:?}"
+        );
+
+        let stack_id = opt_element(&described, "StackId").unwrap_or_default();
+        let tags = resource_tags(&router, case, &dashboard_arn(row.expected_name)).await;
+        assert_eq!(
+            tags,
+            expected_tags(
+                row.stack_name,
+                &stack_id,
+                row.logical_id,
+                row.stack_tags,
+                row.expected_declared_tags,
+            ),
+            "case {case:?}: expected the tags the parameters and the stack give it, got \
+             {tags:?}"
+        );
+
+        let (status, deleted) =
+            cloudformation(&router, "DeleteStack", &[("StackName", row.stack_name)]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from DeleteStack, got {status} with {deleted}"
+        );
+        tokio::time::sleep(PAST_STACK_SPAN).await;
+        let (status, gone) = cloudwatch(
+            &router,
+            "GetDashboard",
+            &json!({"DashboardName": row.expected_name}),
+        )
+        .await;
+        assert_eq!(
+            (status, cloudwatch_error_code(&gone).as_str()),
+            (404, "DashboardNotFoundError"),
+            "case {case:?}: expected the stack's deletion to delete the dashboard in \
+             CloudWatch, got {status} with {gone}"
+        );
+    }
+}
+
+/// A deployment that changes only a parameter VALUE, the template text unchanged, reaches
+/// CloudWatch as the change that value makes: a tag parameter re-tags the dashboard the stack
+/// already has, in place and under the same name and ARN, while the name parameter replaces
+/// it — the new dashboard created and the displaced one deleted — and the stack's deletion
+/// then removes whichever one it currently has.
+#[tokio::test]
+async fn a_changed_parameter_value_reaches_cloudwatch_as_the_change_it_makes() {
+    let router = build_router();
+    let stack_name = "cwdash-param-changes";
+    let logical_id = "Dashboard";
+    let first = "cwdash-param-changes-first";
+    let second = "cwdash-param-changes_2";
+    let stack_tags: &[(&str, &str)] = &[("env", "prod")];
+    let template = parameterised_template(
+        logical_id,
+        &json!({"DashboardName": {"Type": "String"}, "Team": {"Type": "String"}}),
+        &json!({
+            "DashboardName": {"Ref": "DashboardName"},
+            "DashboardBody": body_with_widgets(2),
+            "Tags": [{"Key": "team", "Value": {"Ref": "Team"}}],
+        }),
+    );
+
+    let case = "the first deployment";
+    let created = deploy_with_parameters(
+        &router,
+        case,
+        "CreateStack",
+        stack_name,
+        &template,
+        stack_tags,
+        &[("DashboardName", first), ("Team", "platform")],
+    )
+    .await;
+    assert_eq!(
+        opt_element(&created, "StackStatus").as_deref(),
+        Some("CREATE_COMPLETE"),
+        "case {case:?}: expected the stack to complete, got {created}"
+    );
+    let stack_id = opt_element(&created, "StackId").unwrap_or_default();
+    assert_eq!(
+        outputs_of(&created).get("DashboardName").map(String::as_str),
+        Some(first),
+        "case {case:?}: expected Ref to resolve to the name the parameter gives, got {created}"
+    );
+    assert_eq!(
+        resource_tags(&router, case, &dashboard_arn(first)).await,
+        expected_tags(
+            stack_name,
+            &stack_id,
+            logical_id,
+            stack_tags,
+            &[("team", "platform")],
+        ),
+        "case {case:?}: expected the tag the parameter's value makes"
+    );
+
+    // A change to the TAG parameter alone: the dashboard is the same one, re-tagged.
+    let case = "a changed tag parameter";
+    let retagged = deploy_with_parameters(
+        &router,
+        case,
+        "UpdateStack",
+        stack_name,
+        &template,
+        stack_tags,
+        &[("DashboardName", first), ("Team", "payments")],
+    )
+    .await;
+    assert_eq!(
+        opt_element(&retagged, "StackStatus").as_deref(),
+        Some("UPDATE_COMPLETE"),
+        "case {case:?}: expected the update to complete, got {retagged}"
+    );
+    assert_eq!(
+        outputs_of(&retagged)
+            .get("DashboardName")
+            .map(String::as_str),
+        Some(first),
+        "case {case:?}: expected Ref to stay the name it was, got {retagged}"
+    );
+    let reported = get_dashboard(&router, case, first).await;
+    assert_eq!(
+        reported.get("DashboardArn").and_then(Value::as_str),
+        Some(dashboard_arn(first).as_str()),
+        "case {case:?}: expected the same dashboard under the same ARN, got {reported}"
+    );
+    assert_eq!(
+        reported.get("DashboardBody").and_then(Value::as_str),
+        Some(body_with_widgets(2).as_str()),
+        "case {case:?}: expected the document to be the one still declared, got {reported}"
+    );
+    assert_eq!(
+        resource_tags(&router, case, &dashboard_arn(first)).await,
+        expected_tags(
+            stack_name,
+            &stack_id,
+            logical_id,
+            stack_tags,
+            &[("team", "payments")],
+        ),
+        "case {case:?}: expected the tag the parameter's new value makes"
+    );
+
+    // A change to the NAME parameter: the new dashboard is created, the displaced one deleted.
+    let case = "a changed name parameter";
+    let renamed = deploy_with_parameters(
+        &router,
+        case,
+        "UpdateStack",
+        stack_name,
+        &template,
+        stack_tags,
+        &[("DashboardName", second), ("Team", "payments")],
+    )
+    .await;
+    assert_eq!(
+        opt_element(&renamed, "StackStatus").as_deref(),
+        Some("UPDATE_COMPLETE"),
+        "case {case:?}: expected the update to complete, got {renamed}"
+    );
+    assert_eq!(
+        outputs_of(&renamed).get("DashboardName").map(String::as_str),
+        Some(second),
+        "case {case:?}: expected Ref to resolve to the name now parameterised, got {renamed}"
+    );
+    let reported = get_dashboard(&router, case, second).await;
+    assert_eq!(
+        reported.get("DashboardArn").and_then(Value::as_str),
+        Some(dashboard_arn(second).as_str()),
+        "case {case:?}: expected the new dashboard to carry its own ARN, got {reported}"
+    );
+    assert_eq!(
+        reported.get("DashboardBody").and_then(Value::as_str),
+        Some(body_with_widgets(2).as_str()),
+        "case {case:?}: expected the declared document on the new dashboard, got {reported}"
+    );
+    let (status, gone) =
+        cloudwatch(&router, "GetDashboard", &json!({"DashboardName": first})).await;
+    assert_eq!(
+        (status, cloudwatch_error_code(&gone).as_str()),
+        (404, "DashboardNotFoundError"),
+        "case {case:?}: expected the displaced dashboard {first:?} to be deleted, got {status} \
+         with {gone}"
+    );
+
+    // The stack's deletion removes whichever dashboard it currently has.
+    let case = "the stack's deletion";
+    let (status, deleted) =
+        cloudformation(&router, "DeleteStack", &[("StackName", stack_name)]).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from DeleteStack, got {status} with {deleted}"
+    );
+    tokio::time::sleep(PAST_STACK_SPAN).await;
+    let (status, gone) =
+        cloudwatch(&router, "GetDashboard", &json!({"DashboardName": second})).await;
+    assert_eq!(
+        (status, cloudwatch_error_code(&gone).as_str()),
+        (404, "DashboardNotFoundError"),
+        "case {case:?}: expected the dashboard the stack last declared to be deleted, got \
+         {status} with {gone}"
+    );
 }

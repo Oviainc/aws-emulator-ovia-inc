@@ -236,6 +236,15 @@ pub const RSLVR_CODE_FORWARD_RULE_FORWARDING_TARGET_REQUIRED: &str = "RSLVR-0070
 /// Resolver-on-Outpost write operations.
 pub const RSLVR_CODE_INSTANCE_COUNT_BELOW_MINIMUM: &str = "RSLVR-03002";
 
+/// The Route 53 Resolver service error code reported when a tag operation names
+/// a resource the service holds nothing under.
+///
+/// Carried for the same reason as [`RSLVR_CODE_ENDPOINT_NOT_FOUND`]: the HTTP
+/// status (400) and the exception shape name together do not say which Resolver
+/// fault occurred, and the model states no message text, so this code comes
+/// from the recorded responses of the tag operations.
+pub const RSLVR_CODE_TAGGED_RESOURCE_NOT_FOUND: &str = "RSLVR-02025";
+
 /// `ResourceNotFoundException$ResourceType`, "the type of resource that doesn't
 /// exist": the modelled shape name of a Resolver endpoint.
 pub const RESOURCE_TYPE_RESOLVER_ENDPOINT: &str = "ResolverEndpoint";
@@ -1825,6 +1834,162 @@ impl ResolverConfigRecord {
     }
 }
 
+/// The most tags one resource carries.
+///
+/// The model's `TagList` is length 0..200 — it is both the list `TagResource`
+/// takes and the list `ListTagsForResource` reports — so 200 tags is the most
+/// one call can hand over and the most a resource can report back. A write that
+/// would take a resource past it is refused with the `LimitExceededException`
+/// `TagResource` models, and the stored set is left exactly as it was.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
+/// The resource-type segment of each taggable resource's ARN, with the modelled
+/// shape name of that resource.
+///
+/// The segments are the ones the create operations mint an ARN out of
+/// (`resolver-endpoint/<id>`, `resolver-rule/<id>`, `outpost-resolver/<id>`,
+/// `firewall-domain-list/<id>`); the shape names are what every other refusal
+/// of this service reports in `ResourceNotFoundException$ResourceType`.
+const TAGGABLE_ARN_SEGMENTS: [(&str, &str); 4] = [
+    ("resolver-endpoint", RESOURCE_TYPE_RESOLVER_ENDPOINT),
+    ("resolver-rule", RESOURCE_TYPE_RESOLVER_RULE),
+    ("outpost-resolver", RESOURCE_TYPE_OUTPOST_RESOLVER),
+    ("firewall-domain-list", RESOURCE_TYPE_FIREWALL_DOMAIN_LIST),
+];
+
+/// The resource type an ARN states, when the ARN names one of this service's
+/// taggable resources: the segment that follows the account id, up to the `/`
+/// that separates it from the resource id
+/// (`arn:<partition>:<service>:<region>:<account>:<type>/<id>`).
+///
+/// `None` for anything else, so a tag operation's refusal names a resource type
+/// only when the ARN it was handed actually states one.
+pub fn arn_resource_type(resource_arn: &str) -> Option<&'static str> {
+    let (segment, _) = resource_arn.split(':').nth(5)?.split_once('/')?;
+    TAGGABLE_ARN_SEGMENTS
+        .iter()
+        .find(|(name, _)| *name == segment)
+        .map(|(_, resource_type)| *resource_type)
+}
+
+/// A resource of this service that carries tags, as a tag operation's
+/// `ResourceArn` resolves it: which collection holds it, and its key there.
+///
+/// `TagResource$ResourceArn`'s doc names the Get and List commands an ARN comes
+/// from, so the resources whose records carry an `Arn` are the ones the tag
+/// operations address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    ResolverEndpoint(String),
+    ResolverRule(String),
+    OutpostResolver(String),
+    FirewallDomainList(String),
+}
+
+/// The id an ARN names the resource by: everything after the last `/`, the
+/// separator between an ARN's resource type and its resource id
+/// (`arn:<partition>:<service>:<region>:<account>:<type>/<id>`).
+///
+/// A string carrying no `/` is taken as naming the resource by itself, so the
+/// refusal still states what was asked for.
+pub fn arn_resource_id(resource_arn: &str) -> &str {
+    match resource_arn.rsplit_once('/') {
+        Some((_, id)) => id,
+        None => resource_arn,
+    }
+}
+
+/// The `ResourceNotFoundException` the tag operations answer for an ARN this
+/// store holds no resource under.
+///
+/// Built here so `TagResource`, `UntagResource` and `ListTagsForResource`
+/// cannot drift apart: all of them report the RSLVR-coded message, which names
+/// the resource by the id its ARN carries, and the resource type the model asks
+/// for.
+pub fn tagged_resource_not_found(resource_arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(rslvr_message(
+            RSLVR_CODE_TAGGED_RESOURCE_NOT_FOUND,
+            &format!(
+                "Can’t find the resource with ID \"{}\"",
+                arn_resource_id(resource_arn)
+            ),
+        )),
+        resource_type: arn_resource_type(resource_arn).map(str::to_string),
+    }
+}
+
+/// The `LimitExceededException` `TagResource` answers for a write that would
+/// take a resource past [`MAX_TAGS_PER_RESOURCE`] tags.
+///
+/// The sentence states the limit the model's `TagList` length fixes and nothing
+/// from the request, so the rejected tags are not echoed back. No recorded
+/// response available here states the wording Route 53 Resolver uses for this
+/// fault, and the model states no message text, so — as for
+/// [`resolver_rule_not_found`] — the HTTP status (400) and the error shape are
+/// what the contract fixes and the wording is an example.
+pub fn tag_limit_exceeded(resource_arn: &str) -> LimitExceededException {
+    LimitExceededException {
+        message: Some(format!(
+            "A resource can have at most {MAX_TAGS_PER_RESOURCE} tags"
+        )),
+        resource_type: arn_resource_type(resource_arn).map(str::to_string),
+    }
+}
+
+/// Add `requested` to `stored`, one resource's tag set.
+///
+/// A tag write is an upsert keyed on the tag key: a key the resource already
+/// carries keeps its position and takes the requested value, and a key new to
+/// the resource is appended — so the order a resource reports its tags in is the
+/// order its keys were first written in, and no key is ever reported twice.
+/// Keys are compared exactly, as tag keys are case-sensitive. `requested` is
+/// applied in order, so a request that names one key twice leaves the value it
+/// named last.
+///
+/// Answers `false`, leaving `stored` EXACTLY as it was, when the result would
+/// hold more than [`MAX_TAGS_PER_RESOURCE`] tags.
+pub fn merge_tags(stored: &mut Vec<Tag>, requested: &[Tag]) -> bool {
+    let projected = {
+        let mut keys: HashSet<&str> = stored.iter().map(|tag| tag.key.as_str()).collect();
+        keys.extend(requested.iter().map(|tag| tag.key.as_str()));
+        keys.len()
+    };
+    if projected > MAX_TAGS_PER_RESOURCE {
+        return false;
+    }
+
+    for tag in requested {
+        match stored.iter_mut().find(|held| held.key == tag.key) {
+            Some(held) => held.value = tag.value.clone(),
+            None => stored.push(tag.clone()),
+        }
+    }
+    true
+}
+
+/// Drop every tag of `stored` whose key is named in `keys`, and leave the rest
+/// in the order they were written in.
+///
+/// Idempotent: a key the resource does not carry removes nothing, so removing
+/// the same keys twice leaves the same tag set.
+pub fn remove_tags(stored: &mut Vec<Tag>, keys: &[String]) {
+    stored.retain(|tag| !keys.contains(&tag.key));
+}
+
+/// The cursor scope of one `ListTagsForResource` query.
+///
+/// The offset a cursor carries is an index into ONE resource's tags, so — for
+/// the same reason as [`endpoint_list_scope`] — a cursor minted while paging one
+/// resource is not read as an offset into another resource's tags, but refused
+/// as a cursor this query did not issue.
+pub fn tag_list_scope(resource_arn: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ListTagsForResource/resource-arn/v1");
+    feed_field(&mut hasher, resource_arn.as_bytes());
+    format!("ListTagsForResource/{}", hex::encode(&hasher.finalize()[..8]))
+}
+
 /// Per-service state for com-amazonaws-route53resolver-route53resolver. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsRoute53resolverRoute53resolverState {
@@ -2161,6 +2326,91 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
         let mut all: Vec<&FirewallDomainListRecord> = self.firewall_domain_lists.values().collect();
         all.sort_by_key(|record| record.seq);
         all
+    }
+
+    /// The resource an ARN names, when this store holds one under it.
+    ///
+    /// Matched against the ARN each record was minted with, so an ARN resolves
+    /// only to the resource it was issued for — in the region and account that
+    /// created it — and no ARN text is parsed to find the record. Each scan is
+    /// over a store bounded by the `MAX_STORED_*` cap of its resource.
+    pub fn find_tagged_resource(&self, resource_arn: &str) -> Option<TaggedResource> {
+        if let Some(record) = self
+            .resolver_endpoints
+            .values()
+            .find(|record| record.arn == resource_arn)
+        {
+            return Some(TaggedResource::ResolverEndpoint(record.id.clone()));
+        }
+        if let Some(record) = self
+            .resolver_rules
+            .values()
+            .find(|record| record.arn == resource_arn)
+        {
+            return Some(TaggedResource::ResolverRule(record.id.clone()));
+        }
+        if let Some(record) = self
+            .outpost_resolvers
+            .values()
+            .find(|record| record.arn == resource_arn)
+        {
+            return Some(TaggedResource::OutpostResolver(record.id.clone()));
+        }
+        if let Some(record) = self
+            .firewall_domain_lists
+            .values()
+            .find(|record| record.arn == resource_arn)
+        {
+            return Some(TaggedResource::FirewallDomainList(record.id.clone()));
+        }
+        None
+    }
+
+    /// The tags of the resource `resource_arn` names, for reading, or `None`
+    /// when this store holds no resource under that ARN.
+    pub fn resource_tags(&self, resource_arn: &str) -> Option<&[Tag]> {
+        match self.find_tagged_resource(resource_arn)? {
+            TaggedResource::ResolverEndpoint(id) => self
+                .resolver_endpoints
+                .get(&id)
+                .map(|record| record.tags.as_slice()),
+            TaggedResource::ResolverRule(id) => self
+                .resolver_rules
+                .get(&id)
+                .map(|record| record.tags.as_slice()),
+            TaggedResource::OutpostResolver(id) => self
+                .outpost_resolvers
+                .get(&id)
+                .map(|record| record.tags.as_slice()),
+            TaggedResource::FirewallDomainList(id) => self
+                .firewall_domain_lists
+                .get(&id)
+                .map(|record| record.tags.as_slice()),
+        }
+    }
+
+    /// The same tag set, for writing: the tags live ON the resource's record, so
+    /// a tag write is a write to that record and every operation that reports
+    /// the resource sees it.
+    pub fn resource_tags_mut(&mut self, resource_arn: &str) -> Option<&mut Vec<Tag>> {
+        match self.find_tagged_resource(resource_arn)? {
+            TaggedResource::ResolverEndpoint(id) => self
+                .resolver_endpoints
+                .get_mut(&id)
+                .map(|record| &mut record.tags),
+            TaggedResource::ResolverRule(id) => self
+                .resolver_rules
+                .get_mut(&id)
+                .map(|record| &mut record.tags),
+            TaggedResource::OutpostResolver(id) => self
+                .outpost_resolvers
+                .get_mut(&id)
+                .map(|record| &mut record.tags),
+            TaggedResource::FirewallDomainList(id) => self
+                .firewall_domain_lists
+                .get_mut(&id)
+                .map(|record| &mut record.tags),
+        }
     }
 }
 

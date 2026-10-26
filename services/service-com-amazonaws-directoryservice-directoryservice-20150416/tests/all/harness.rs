@@ -32,12 +32,15 @@ pub(crate) fn service() -> MultiServiceRouter {
     router
 }
 
-/// One `awsJson1_1` call, returning the HTTP status and the parsed response body.
-pub(crate) async fn call(
+/// One `awsJson1_1` call, returning the WHOLE response — headers included.
+///
+/// The seam [`call`] is built on, for a rule about the response envelope itself (the
+/// request-id header a refusal carries) rather than about its body.
+pub(crate) async fn call_raw(
     router: &MultiServiceRouter,
     operation: &str,
     body: Value,
-) -> (u16, Value) {
+) -> http::Response<bytes::Bytes> {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -54,7 +57,16 @@ pub(crate) async fn call(
         ))
         .expect("a well-formed request");
 
-    let response = router.dispatch(request).await;
+    router.dispatch(request).await
+}
+
+/// One `awsJson1_1` call, returning the HTTP status and the parsed response body.
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
+    let response = call_raw(router, operation, body).await;
     let status = response.status().as_u16();
     let payload = response.into_body();
     let parsed = if payload.is_empty() {

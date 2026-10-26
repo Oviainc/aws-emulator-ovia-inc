@@ -2832,6 +2832,20 @@ pub fn property_is_time_series(
     definition.is_some_and(|definition| definition.is_time_series.unwrap_or(false))
 }
 
+/// The message a refusal carries for a property the time-series data plane
+/// serves nothing of, because its definition does not MARK it as a time series
+/// property ([`property_is_time_series`]).
+///
+/// Built from the request: the only thing that varies between two of these
+/// refusals is which property the caller named, so the wording is fixed and the
+/// property name is the one it was asked about. One construction shared by
+/// every operation that can be asked for such a property — the data plane's
+/// write and its history read — so the same refusal reads the same wherever it
+/// is reported.
+pub fn property_not_time_series_message(property_name: &str) -> String {
+    format!("{property_name} is not marked as a time-series property.")
+}
+
 /// Which `Type` the value in a `DataValue` belongs to — the member it travels
 /// in, spelled as the `Type` enum spells it
 /// (`crate::ops::types::TYPE_VALUES`) — or `None` when it carries no typed

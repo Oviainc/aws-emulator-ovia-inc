@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListReceiptRuleSets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListReceiptRuleSets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListReceiptRuleSets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports this account's receipt rule sets — the name and creation timestamp of
+//! each — in one stable order, a page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -104,6 +98,19 @@ impl From<ListReceiptRuleSetsErrorModeled> for ListReceiptRuleSetsError {
     }
 }
 
+/// The entries one page of this listing carries. The request names no page size,
+/// so the operation's own is the one its output documents:
+/// `ListReceiptRuleSetsResponse$NextToken` is "A token indicating that there are
+/// additional receipt rule sets available to be listed. Pass this token to
+/// successive calls of ListReceiptRuleSets to retrieve up to 100 receipt rule
+/// sets at a time."
+///
+/// Larger than the rule sets one account may hold
+/// ([`crate::state::MAX_RECEIPT_RULE_SETS`]), so a caller that created every set
+/// it holds sees them all on the first page; the page boundary is still what
+/// serves the listing, rather than the ceiling being assumed.
+const PAGE_SIZE: usize = 100;
+
 /// The `ListReceiptRuleSets` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -140,18 +147,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListReceiptRuleSets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListReceiptRuleSetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListReceiptRuleSets"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+
+        // A page token is OPAQUE and self-verifying: only a cursor this listing
+        // issued names a position in it, so anything else is refused instead of
+        // being read as some arbitrary position. Checked before the store is
+        // reached, because the answer does not depend on it. The refusal quotes
+        // the rejected value in angle brackets, as this service words it.
+        let resume_from = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(crate::state::LISTING_RECEIPT_RULE_SETS, token)
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
+                            "Invalid PageToken <{token}>."
+                        ))
+                    })?,
+            ),
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and it models no server
+            // error of its own.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListReceiptRuleSets",
+            ));
+        };
+        // A read: the stored records are projected, never written.
+        let state = state.lock();
+
+        // The store is keyed by the rule set name, so iteration is in one stable
+        // (lexicographic) order for every caller — which is what makes a
+        // `NextToken` resumable at all. The cursor names the set the next page
+        // starts at, so a page boundary never repeats or skips an entry even when
+        // sets are added or removed between calls.
+        let page = match resume_from.as_deref() {
+            Some(resume_from) => (
+                std::ops::Bound::Included(resume_from),
+                std::ops::Bound::Unbounded,
+            ),
+            None => (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+        };
+        let mut rule_sets: Vec<ReceiptRuleSetMetadata> = Vec::new();
+        let mut next_token = None;
+        for (name, rule_set) in state.receipt_rule_sets.range::<str, _>(page) {
+            if rule_sets.len() == PAGE_SIZE {
+                next_token = Some(crate::state::encode_page_token(
+                    crate::state::LISTING_RECEIPT_RULE_SETS,
+                    name,
+                ));
+                break;
+            }
+            rule_sets.push(ReceiptRuleSetMetadata {
+                name: Some(rule_set.name.clone()),
+                created_timestamp: Some(::aws_smithy_types::DateTime::from(rule_set.created_at)),
+            });
+        }
+
+        Ok(ListReceiptRuleSetsOutput {
+            // Present even when empty: an account with no receipt rule sets has
+            // an empty list, which is a different answer from an absent member.
+            rule_sets: Some(rule_sets),
+            next_token,
+        })
     }
 }

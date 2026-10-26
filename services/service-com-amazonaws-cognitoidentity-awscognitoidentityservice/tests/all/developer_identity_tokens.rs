@@ -27,7 +27,9 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Map, Value};
 
-use crate::identity_pool_flow::{error_code, Emulator, ABSENT_POOL_ID};
+use crate::identity_pool_flow::{
+    cognito_trust_policy, error_code, seeded_role_arn, Emulator, ABSENT_POOL_ID,
+};
 
 /// The operation under test, spelled once.
 const OPERATION: &str = "GetOpenIdTokenForDeveloperIdentity";
@@ -237,6 +239,21 @@ async fn a_developer_login_resolves_one_identity_and_mints_a_token_per_call() {
 
     for (case, developer_provider, public_logins, token_duration) in cases {
         let pool_id = pool_with_developer_provider(&emulator, case, Some(developer_provider)).await;
+        // The credentials this case vends below are a session of the pool's role, so the
+        // pool is given one that trusts its own users.
+        let role_arn = emulator.seed_role(
+            &seeded_role_arn(developer_provider, "unauth"),
+            cognito_trust_policy(&pool_id),
+        );
+        emulator
+            .ok(
+                "SetIdentityPoolRoles",
+                &json!({
+                    "IdentityPoolId": &pool_id,
+                    "Roles": {"unauthenticated": role_arn},
+                }),
+            )
+            .await;
         let developer_user_identifier = format!("backend-user-of-{developer_provider}");
         let mut logins: Vec<Login<'_>> = vec![(developer_provider, &developer_user_identifier)];
         logins.extend(public_logins.iter().copied());

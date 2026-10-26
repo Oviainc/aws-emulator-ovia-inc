@@ -257,6 +257,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A source references the flow's own sub-resources BY NAME: its media stream
+        // associations name media streams of this flow
+        // (`MediaStreamSourceConfigurationRequest$MediaStreamName`), and `VpcInterfaceName`
+        // — like the attachment a gateway-bridge source carries — names a VPC interface of
+        // this flow. Each name is resolved against what the flow actually holds, through
+        // the one place this crate resolves such a reference (`crate::state`), BEFORE
+        // anything is stored.
+        let held_media_streams = flow.media_stream_names();
+        let held_vpc_interfaces = flow.vpc_interface_names();
+        for (index, source) in input.sources.iter().enumerate() {
+            if let Some(rejection) = crate::state::source_request_reference_rejection(
+                &format!("Sources[{index}]"),
+                source,
+                &held_media_streams,
+                &held_vpc_interfaces,
+            ) {
+                return Err(bad_request(rejection));
+            }
+        }
+
         // `Source.Name` is required while `SetSourceRequest.Name` is optional, so a
         // source whose request named none is named by the service — against the flow's
         // existing source names AND the names resolved for earlier sources of this same

@@ -45,6 +45,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{ColumnMetadata, Field, SqlParameter};
 
+/// Whether the cluster or workgroup a submit request names exists at all — a
+/// fact the services that OWN those resources answer, not this one.
+pub mod warehouse;
+
 /// How long after `ExecuteStatement` the statement's move out of `SUBMITTED`
 /// falls due.
 ///
@@ -94,6 +98,48 @@ pub const NO_RESULT_MESSAGE: &str =
 pub const BATCH_PARENT_RESULT_MESSAGE: &str =
     "Query is a batch statement; fetch the results of each SQL statement of the batch with its \
      own Id, which is this Id with a :<n> suffix";
+
+/// The message the Data API answers an `Id` it holds no query for with.
+///
+/// Fixed text, carrying no part of the request: the service states that the
+/// query does not exist and nothing about the id that was asked for. It lives
+/// here so `DescribeStatement`, `GetStatementResult` and `CancelStatement` — the
+/// three readers that take an `Id` — cannot drift apart on either the wording or
+/// the error it travels with.
+pub const UNKNOWN_QUERY_MESSAGE: &str = "Query does not exist.";
+
+/// The HTTP status the Data API answers that refusal with.
+///
+/// The missing-resource shape it carries declares `@httpError 404`, which is the
+/// status that shape renders with WHEREVER it is used; on this path the service
+/// answers it as a client-input failure instead, so the three readers state the
+/// status here and serve the error at it
+/// ([`crate::scaffolded::Scaffolded::ModeledWithStatus`]) rather than swapping
+/// the error code to move the status.
+pub const UNKNOWN_QUERY_STATUS: u16 = 400;
+
+/// The message the Data API answers a continuation token it did not issue with.
+///
+/// Fixed text for every paginated operation of the service: a token is opaque to
+/// the caller, so the refusal says only that the value is not a token and never
+/// which operation minted (or did not mint) it.
+pub const INVALID_TOKEN_MESSAGE: &str = "Invalid token value";
+
+/// The message the Data API answers a request that does not name one compute
+/// target with.
+///
+/// One canonical, request-independent sentence enumerating every target the
+/// service accepts — a provisioned cluster, a serverless workgroup, a Glue
+/// resource or an existing session — and it is the answer both when the request
+/// names none of them and when it names more than one.
+pub const ONE_TARGET_MESSAGE: &str =
+    "There should be only one of the following: ClusterIdentifier, WorkgroupName, Glue resource, \
+     SessionId";
+
+/// The message the Data API answers a target that resolves to no endpoint in the
+/// caller's Region with. Fixed text: it names neither the cluster nor the
+/// workgroup that could not be resolved.
+pub const ABSENT_ENDPOINT_MESSAGE: &str = "Redshift endpoint doesn't exist in this region.";
 
 /// Wall-clock bound on one statement's execution. The SQL engine runs
 /// in-process with no isolation boundary, so a statement that never terminates
@@ -2052,13 +2098,21 @@ pub struct Connection {
 
 /// Why a request's connection members do not name exactly one data warehouse,
 /// one database and one authorization method.
+///
+/// The two target faults are kept apart although the service answers both with
+/// the same sentence: they are different requests — one selects nothing, the
+/// other selects two endpoints — and only the second has a warehouse whose
+/// endpoint can be resolved at all (see
+/// [`warehouse::names_absent_warehouse`], which is asked before either is
+/// reported).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BadConnection {
-    /// A provisioned cluster AND a serverless workgroup.
-    BothWarehouses,
-    /// Neither of them, and no session either.
-    NoWarehouse,
-    /// Neither of them, but a `SessionId`: the warehouse and database this
+    /// The request names NO compute target at all: no warehouse and no session.
+    NoTarget,
+    /// The request names more than one compute target at once, so which endpoint
+    /// it addresses is not decided.
+    SeveralTargets,
+    /// No warehouse, but a `SessionId`: the warehouse and database this
     /// request runs against are the ones its SESSION was opened with, so they
     /// are resolved from the session store
     /// ([`ComAmazonawsRedshiftdataRedshiftdataState::session_connection`])
@@ -2076,14 +2130,11 @@ impl BadConnection {
     /// says what is missing from the emulator instead.
     pub fn message(self) -> &'static str {
         match self {
-            Self::BothWarehouses => {
-                "ClusterIdentifier and WorkgroupName cannot both be supplied: a statement runs \
-                 against either a provisioned cluster or a serverless workgroup"
-            }
-            Self::NoWarehouse => {
-                "one of ClusterIdentifier (a provisioned cluster) or WorkgroupName (a serverless \
-                 workgroup) is required"
-            }
+            // Nothing the request named could resolve to an endpoint, so there
+            // is nothing but the SELECTION to report: the canonical sentence,
+            // which is also what naming two warehouses gets.
+            Self::NoTarget => ONE_TARGET_MESSAGE,
+            Self::SeveralTargets => ONE_TARGET_MESSAGE,
             Self::SessionOnly => {
                 "SessionId does not name a live session: the warehouse and database a statement \
                  runs against are the ones its session was opened with"
@@ -2095,39 +2146,69 @@ impl BadConnection {
             }
         }
     }
+
+    /// Whether this is a fault of the request's TARGET SELECTION rather than of
+    /// its database or its authorization method.
+    ///
+    /// Only a selection verdict is reported after the endpoint a request named is
+    /// resolved (see [`warehouse::names_absent_warehouse`]): the database and the
+    /// authorization members say nothing about which endpoint the request
+    /// addresses, so a request that is wrong about one of those is told so
+    /// whatever its target resolves to.
+    pub fn is_target_selection(self) -> bool {
+        matches!(self, Self::NoTarget | Self::SeveralTargets)
+    }
 }
 
 impl ConnectionRequest<'_> {
     /// Resolve the one data warehouse, database and authorization method the
     /// documented combinations name.
     ///
-    /// A statement runs against exactly one data warehouse: every documented
-    /// authorization combination names either a provisioned cluster
-    /// (`ClusterIdentifier`) or a serverless workgroup (`WorkgroupName`), never
-    /// both and never neither, and supplies the database. `SecretArn` selects
-    /// Secrets Manager authorization and `DbUser` temporary credentials; they
-    /// are alternatives, so supplying both names two methods for one
-    /// submission.
+    /// A statement runs against ONE target. The service enumerates the targets
+    /// it accepts in the one sentence it refuses a bad selection with — a
+    /// provisioned cluster (`ClusterIdentifier`), a serverless workgroup
+    /// (`WorkgroupName`), a Glue resource, or a session a previous statement
+    /// opened (`SessionId`) — so a request that names two of them does not
+    /// decide which endpoint it addresses ([`BadConnection::SeveralTargets`]),
+    /// and one that names none of them selects nothing
+    /// ([`BadConnection::NoTarget`]); both carry that message
+    /// ([`ONE_TARGET_MESSAGE`]). Every documented authorization combination then
+    /// supplies the database; `SecretArn` selects Secrets Manager authorization
+    /// and `DbUser` temporary credentials, which are alternatives, so supplying
+    /// both names two methods for one submission.
     ///
-    /// The session-reuse form, where a caller that already holds a `SessionId`
-    /// names neither warehouse, carries its connection on the SESSION: it is
-    /// reported as [`BadConnection::SessionOnly`], which a handler resolves
-    /// against the session store
+    /// The session-reuse form, where the single target is the `SessionId`,
+    /// carries its connection on the SESSION: it is reported as
+    /// [`BadConnection::SessionOnly`], which a handler resolves against the
+    /// session store
     /// ([`ComAmazonawsRedshiftdataRedshiftdataState::session_connection`])
     /// before deciding anything — only a `SessionId` that names no live session
     /// is a request this cannot serve.
     pub fn resolve(self) -> Result<Connection, BadConnection> {
-        let target = match (
-            non_empty(self.cluster_identifier),
-            non_empty(self.workgroup_name),
-        ) {
+        let cluster = non_empty(self.cluster_identifier);
+        let workgroup = non_empty(self.workgroup_name);
+        let session = non_empty(self.session_id);
+        // ONE target, counted over every target the service's own message
+        // enumerates: a provisioned cluster, a serverless workgroup and a
+        // session a previous statement opened are each an endpoint of their own,
+        // so a request naming two of them does not decide which it addresses and
+        // one naming none of them selects nothing.
+        let selected = [cluster.is_some(), workgroup.is_some(), session.is_some()]
+            .into_iter()
+            .filter(|named| *named)
+            .count();
+        if selected > 1 {
+            return Err(BadConnection::SeveralTargets);
+        }
+        if selected == 0 {
+            return Err(BadConnection::NoTarget);
+        }
+        let target = match (cluster, workgroup) {
             (Some(cluster), None) => ConnectionTarget::Cluster(cluster),
             (None, Some(workgroup)) => ConnectionTarget::Workgroup(workgroup),
-            (Some(_), Some(_)) => return Err(BadConnection::BothWarehouses),
-            (None, None) if non_empty(self.session_id).is_some() => {
-                return Err(BadConnection::SessionOnly)
-            }
-            (None, None) => return Err(BadConnection::NoWarehouse),
+            // The one remaining selection is the session, whose connection the
+            // session store holds rather than the request.
+            _ => return Err(BadConnection::SessionOnly),
         };
         let Some(database) = non_empty(self.database) else {
             return Err(BadConnection::NoDatabase);
@@ -2143,6 +2224,21 @@ impl ConnectionRequest<'_> {
             db_user,
             secret_arn,
         })
+    }
+
+    /// The data warehouses this request NAMES, whether or not the selection it
+    /// makes is a valid one: the provisioned cluster, the serverless workgroup,
+    /// or both when the request names both.
+    ///
+    /// The endpoint of a named warehouse is resolved before the SELECTION is
+    /// judged (see [`warehouse::names_absent_warehouse`]), so the targets a
+    /// refused selection named still have to be enumerable.
+    pub fn named_warehouses(self) -> Vec<ConnectionTarget> {
+        non_empty(self.cluster_identifier)
+            .map(ConnectionTarget::Cluster)
+            .into_iter()
+            .chain(non_empty(self.workgroup_name).map(ConnectionTarget::Workgroup))
+            .collect()
     }
 }
 

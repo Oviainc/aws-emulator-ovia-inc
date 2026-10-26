@@ -562,13 +562,21 @@ async fn a_tenant_that_asked_for_no_certificate_has_none() {
     let router = emulator();
     let distribution_id = multi_tenant_distribution(&router, "ref-certificate-absent").await;
     let case = "no managed certificate request";
+    // A create that asks for no certificate asks CloudFront to validate nothing, so the
+    // domain it claims has to be one this service already resolves to a CloudFront
+    // resource — here a minted routing endpoint.
+    let domain = resolvable_domains(&router, "cert-none", 1)
+        .await
+        .pop()
+        .expect("one resolvable domain was minted");
     let body = format!(
         "<CreateDistributionTenantRequest \
          xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
          <DistributionId>{distribution_id}</DistributionId><Name>cert-none</Name>\
-         <Domains><member><Domain>none.example.com</Domain></member></Domains>\
+         <Domains><member><Domain>{}</Domain></member></Domains>\
          <Parameters><member><Name>tenantName</Name><Value>cert-none</Value></member>\
-         </Parameters></CreateDistributionTenantRequest>"
+         </Parameters></CreateDistributionTenantRequest>",
+        escape(&domain)
     );
     let created = create_distribution_tenant(&router, &body).await;
     assert_eq!(
