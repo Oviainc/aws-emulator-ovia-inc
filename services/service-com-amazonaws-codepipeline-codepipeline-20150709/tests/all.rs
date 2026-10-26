@@ -25,6 +25,8 @@ mod action_type_catalog;
 mod action_type_declarations;
 #[path = "all/action_type_definitions.rs"]
 mod action_type_definitions;
+#[path = "all/approval_result_messages.rs"]
+mod approval_result_messages;
 #[path = "all/custom_action_job_results.rs"]
 mod custom_action_job_results;
 #[path = "all/custom_action_jobs.rs"]
