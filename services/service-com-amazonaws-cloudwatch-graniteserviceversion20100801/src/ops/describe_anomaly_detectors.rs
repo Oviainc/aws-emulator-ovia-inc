@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAnomalyDetectors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAnomalyDetectors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAnomalyDetectors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the anomaly detection models this service's store holds, filtered the way the
+//! request asks and paged. Implemented here, and the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +164,176 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAnomalyDetectors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAnomalyDetectorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAnomalyDetectors"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeAnomalyDetectorsErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch anomaly detector store is unavailable".into()),
+            })
+        })?;
+
+        // "If you specify this parameter, you cannot also specify the Namespace, MetricName,
+        // Dimensions, or AnomalyDetectorTypes metric filters."
+        // (`DescribeAnomalyDetectorsInput$AnomalyDetectorIds`) — identifiers name the models
+        // themselves, so a filter over metrics cannot narrow them further.
+        let ids = input.anomaly_detector_ids.as_deref();
+        if ids.is_some()
+            && (input.namespace.is_some()
+                || input.metric_name.is_some()
+                || input.dimensions.is_some()
+                || input.anomaly_detector_types.is_some())
+        {
+            return Err(
+                DescribeAnomalyDetectorsErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(
+                            "When using AnomalyDetectorIds, you cannot also specify the \
+                             Namespace, MetricName, Dimensions, or AnomalyDetectorTypes metric \
+                             filters"
+                                .into(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The maximum number of results to return in one operation. The maximum value that
+        // you can specify is 100." (`DescribeAnomalyDetectorsInput$MaxResults`) — the member is
+        // modelled with a minimum only, so the published ceiling is enforced here, and a
+        // request that omits it is answered at that ceiling.
+        const MAX_RESULTS: usize = 100;
+        const MIN_RESULTS: usize = 1;
+        let page_size = match input.max_results {
+            None => MAX_RESULTS,
+            Some(requested) => usize::try_from(requested)
+                .unwrap_or(MIN_RESULTS)
+                .clamp(MIN_RESULTS, MAX_RESULTS),
+        };
+
+        // "Use the token returned by the previous operation to request the next page of
+        // results." (`DescribeAnomalyDetectorsInput$NextToken`) — a token this service did not
+        // issue is the `InvalidNextToken` this operation models.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                DescribeAnomalyDetectorsErrorModeled::InvalidNextToken(InvalidNextToken {
+                    message: Some("NextToken is not a token this service issued".into()),
+                })
+            })?),
+        };
+
+        // "The anomaly detector types to request when using DescribeAnomalyDetectorsInput. If
+        // empty, defaults to SINGLE_METRIC."
+        // (`DescribeAnomalyDetectorsInput$AnomalyDetectorTypes`) — so a metric-math model is
+        // listed only when the request asks for that type by name.
+        let requested_types: Vec<&str> = input
+            .anomaly_detector_types
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        let types: Vec<&str> = if requested_types.is_empty() {
+            vec![crate::state::ANOMALY_DETECTOR_TYPE_SINGLE_METRIC]
+        } else {
+            requested_types
+        };
+
+        let filter_dimensions = crate::state::dimension_set(input.dimensions.as_deref());
+
+        let mut store = state.lock();
+        // The training each stored model's write started: a transition the clock owed at this
+        // instant whether or not anybody called, so materialising it here reports what the
+        // store already owed rather than changing it.
+        store.settle_anomaly_detector_training(crate::state::now_secs());
+
+        // Ordered by identifier so paging is stable and a token can simply name the model the
+        // next page starts at.
+        let mut matched: Vec<&crate::state::StoredAnomalyDetector> = store
+            .anomaly_detectors
+            .values()
+            .filter(|stored| match ids {
+                Some(ids) => ids.iter().any(|wanted| {
+                    stored.detector.anomaly_detector_id.as_deref() == Some(wanted.as_str())
+                }),
+                None => {
+                    matches_type(&stored.detector, &types)
+                        && matches_metric(
+                            &stored.detector,
+                            input.namespace.as_deref(),
+                            input.metric_name.as_deref(),
+                            &filter_dimensions,
+                        )
+                }
+            })
+            .collect();
+        matched.sort_unstable_by(|left, right| {
+            detector_id_of(left).cmp(detector_id_of(right))
+        });
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => matched.partition_point(|stored| detector_id_of(stored) < cursor),
+        };
+        let page = matched.get(from..).unwrap_or_default();
+        let next_token = page
+            .get(page_size)
+            .map(|stored| crate::state::encode_page_token(detector_id_of(stored)));
+
+        Ok(DescribeAnomalyDetectorsOutput {
+            anomaly_detectors: Some(
+                page.iter()
+                    .take(page_size)
+                    .map(|stored| stored.detector.clone())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// The identifier a stored model is ordered and paged by, which every model this store holds
+/// carries ([`crate::state::AnomalyDetectorForm::detector_id`]).
+fn detector_id_of(stored: &crate::state::StoredAnomalyDetector) -> &str {
+    stored
+        .detector
+        .anomaly_detector_id
+        .as_deref()
+        .unwrap_or_default()
+}
+
+/// Whether `detector` is one of the modelled `AnomalyDetectorType`s the request asked for: a
+/// model carrying a single metric is `SINGLE_METRIC` and one carrying queries is
+/// `METRIC_MATH`.
+fn matches_type(detector: &AnomalyDetector, types: &[&str]) -> bool {
+    let detector_type = if detector.metric_math_anomaly_detector.is_some() {
+        crate::state::ANOMALY_DETECTOR_TYPE_METRIC_MATH
+    } else {
+        crate::state::ANOMALY_DETECTOR_TYPE_SINGLE_METRIC
+    };
+    types.contains(&detector_type)
+}
+
+/// Whether `detector` watches the metric the request's filters name.
+///
+/// "Limits the results to only the anomaly detection models that are associated with the
+/// specified metric dimensions. If there are multiple metrics that have these dimensions and
+/// have anomaly detection models associated, they're all returned."
+/// (`DescribeAnomalyDetectorsInput$Dimensions`) — so a named dimension NARROWS the listing to
+/// the models whose metric carries it, and a filter the request omits narrows nothing.
+fn matches_metric(
+    detector: &AnomalyDetector,
+    namespace: Option<&str>,
+    metric_name: Option<&str>,
+    dimensions: &crate::state::DimensionSet,
+) -> bool {
+    let single = detector.single_metric_anomaly_detector.as_ref();
+    let detector_namespace = single.and_then(|single| single.namespace.as_deref());
+    let detector_metric_name = single.and_then(|single| single.metric_name.as_deref());
+    let detector_dimensions =
+        crate::state::dimension_set(single.and_then(|single| single.dimensions.as_deref()));
+    namespace.is_none_or(|wanted| detector_namespace == Some(wanted))
+        && metric_name.is_none_or(|wanted| detector_metric_name == Some(wanted))
+        && dimensions
+            .iter()
+            .all(|(name, value)| detector_dimensions.get(name) == Some(value))
 }

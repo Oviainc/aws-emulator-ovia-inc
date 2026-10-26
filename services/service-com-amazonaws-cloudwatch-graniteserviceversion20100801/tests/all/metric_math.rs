@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-use crate::harness::{build_router, call, error_code, ok};
+use crate::harness::{build_router, call, error_code, ok, wait_for_evaluation};
 
 /// One minute, in the epoch seconds every published time stamp carries.
 const MINUTE: f64 = 60.0;
@@ -675,27 +675,100 @@ async fn an_anomaly_detection_band_reports_its_two_bounds() {
         "case a zero band width: expected HTTP 400, got {status} with {body}"
     );
 
-    // The band's points come from the model an anomaly DETECTOR trained, and no detector can
-    // be created while `PutAnomalyDetector` is a scaffold — which is why the bounds above
-    // carry none. This row fails the day a detector CAN be stored, which is the day the band
-    // has to be drawn from it.
-    let (status, body) = call(
+    // The band's points come from the model an anomaly DETECTOR trained, so the bounds above
+    // carry none: no detector was created for the metric. A detector for THIS metric and
+    // statistic is what gives the band its points.
+    let detector = json!({
+        "SingleMetricAnomalyDetector": {
+            "Namespace": NAMESPACE,
+            "MetricName": "Requests",
+            "Dimensions": [
+                {"Name": "Service", "Value": "api"},
+                {"Name": "Host", "Value": "a"},
+            ],
+            "Stat": "Sum",
+        },
+    });
+    ok(&router, "PutAnomalyDetector", &detector).await;
+
+    // A model still being trained says nothing about the metric yet, so the band is still
+    // reported with no points.
+    let pending = evaluate(&router, base, "ANOMALY_DETECTION_BAND(m1, 2)").await;
+    for result in &results(&pending) {
+        assert_values(
+            "a model still being trained",
+            &pairs(result).iter().map(|(_, value)| *value).collect::<Vec<f64>>(),
+            &[],
+        );
+    }
+
+    // Once the training the write started comes due, the band is drawn from what the metric's
+    // own history says is normal: the mean of the values the model was trained on, and the
+    // requested number of their deviations either side of it.
+    wait_for_evaluation();
+    let trained = [10.0_f64, 20.0, 30.0];
+    #[allow(clippy::cast_precision_loss)]
+    let count = trained.len() as f64;
+    let mean = trained.iter().sum::<f64>() / count;
+    let deviation = (trained.iter().map(|value| (value - mean) * (value - mean)).sum::<f64>()
+        / count)
+        .sqrt();
+    // Rows differ along the band width, which is counted in those deviations: a wider band
+    // reaches further either side of the same expectation.
+    for (case, width) in [("the default width", 2.0_f64), ("a width of 3", 3.0)] {
+        let expression = if (width - 2.0).abs() < TOLERANCE {
+            "ANOMALY_DETECTION_BAND(m1)".to_string()
+        } else {
+            format!("ANOMALY_DETECTION_BAND(m1, {width})")
+        };
+        let body = evaluate(&router, base, &expression).await;
+        let listed = results(&body);
+        for result in &listed {
+            let label = result
+                .get("Label")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let bound = if label.ends_with("High") {
+                mean + width * deviation
+            } else {
+                mean - width * deviation
+            };
+            assert_values(
+                &format!("{case}: {label}"),
+                &pairs(result).iter().map(|(_, value)| *value).collect::<Vec<f64>>(),
+                &[bound, bound, bound],
+            );
+        }
+    }
+
+    // A band over a series no detector was created for still has no points: the model is the
+    // DETECTOR's, and the other host's series has none.
+    let mut queries = source_queries();
+    queries.push(retrieving_query("m3", "Requests", "b"));
+    queries.push(json!({
+        "Id": "e1",
+        "Expression": "ANOMALY_DETECTION_BAND(m3, 2)",
+        "Period": 60,
+    }));
+    let body = ok(
         &router,
-        "PutAnomalyDetector",
+        "GetMetricData",
         &json!({
-            "SingleMetricAnomalyDetector": {
-                "Namespace": NAMESPACE,
-                "MetricName": "Requests",
-                "Stat": "Sum",
-            },
+            "MetricDataQueries": queries,
+            "StartTime": base,
+            "EndTime": base + 3.0 * MINUTE,
+            "ScanBy": "TimestampAscending",
         }),
     )
     .await;
-    assert_eq!(
-        status, 501,
-        "case a stored detector: once PutAnomalyDetector keeps a detector, the band must be \
-         drawn from its model instead of reported empty, got {status} with {body}"
-    );
+    for result in &results(&body) {
+        assert_values(
+            "another host's series",
+            &pairs(result).iter().map(|(_, value)| *value).collect::<Vec<f64>>(),
+            &[],
+        );
+    }
 }
 
 /// An expression that asks for more than this service evaluates is REFUSED rather than

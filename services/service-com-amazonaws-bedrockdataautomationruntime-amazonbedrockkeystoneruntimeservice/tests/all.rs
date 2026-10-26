@@ -17,3 +17,5 @@ mod asset_processing_configuration;
 mod data_automation_invocations;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_key_refusal.rs"]
+mod tag_key_refusal;

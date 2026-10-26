@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTenant
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTenant`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTenant::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a tenant under the name the request names — its id, its ARN and its creation
+//! instant — and stores it with the tags and suppression preferences the request
+//! carried. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -95,6 +89,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::TenantRecord;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -167,18 +162,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTenant` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTenantErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTenant"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to write to. That is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateTenant without the shared emulator state",
+            ));
+        };
+
+        let name = input.tenant_name;
+        // The model binds only `length 1..` on `TenantName`; the documented form
+        // (letters, numbers, hyphens and underscores, up to 64 of them) is the
+        // handler's to enforce, with the `BadRequestException` the model binds for
+        // "the input you provided is invalid".
+        if !crate::state::tenant_name_is_well_formed(&name) {
+            return Err(CreateTenantErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_tenant_name(&name)),
+            })
+            .into());
+        }
+
+        // The ARN carries the region the request was signed for, so a tenant minted
+        // in one region does not claim another's.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        if store.tenants.contains_key(&name) {
+            return Err(CreateTenantErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(crate::state::tenant_already_exists(&name)),
+                },
+            )
+            .into());
+        }
+
+        if store.tenants.len() >= crate::state::MAX_TENANTS {
+            return Err(CreateTenantErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The account already holds the maximum of {} tenants.",
+                        crate::state::MAX_TENANTS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let tenant_id = store.next_tenant_id(now);
+        let arn = crate::state::tenant_arn(&region, &name, &tenant_id);
+        let mut record = TenantRecord::new(&name, tenant_id, arn, now);
+        record.tags = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+        // "You can optionally specify SuppressionAttributes to configure tenant-level
+        // suppression at creation time": what the request names is stored, and what it
+        // leaves out keeps the tenant's default (the account-level suppression list).
+        if let Some(requested) = input.suppression_attributes {
+            if let Some(reasons) = requested.suppressed_reasons {
+                record.suppressed_reasons = reasons;
+            }
+            if let Some(scope) = requested.suppression_scope {
+                record.suppression_scope = scope;
+            }
+        }
+
+        // Everything reported comes from ONE projection of the record that was just
+        // persisted — the same `TenantRecord::view` `GetTenant` answers with — so the
+        // write and the read after it cannot disagree.
+        store.tenants.insert(name.clone(), record);
+        let view = store
+            .tenants
+            .get(&name)
+            .map(crate::state::TenantRecord::view)
+            .ok_or_else(|| {
+                crate::scaffolded::Scaffolded::not_implemented(
+                    "CreateTenant without the shared emulator state",
+                )
+            })?;
+
+        Ok(CreateTenantOutput {
+            tenant_name: view.tenant_name,
+            tenant_id: view.tenant_id,
+            tenant_arn: view.tenant_arn,
+            created_timestamp: view.created_timestamp,
+            tags: view.tags,
+            sending_status: view.sending_status,
+            suppression_attributes: view.suppression_attributes,
+        })
     }
 }

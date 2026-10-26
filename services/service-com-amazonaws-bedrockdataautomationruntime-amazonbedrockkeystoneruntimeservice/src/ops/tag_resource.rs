@@ -156,18 +156,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         // Every tag key must satisfy the modelled `TagKey` pattern, which the boundary
-        // walk cannot enforce (see `crate::state::tag_key_is_well_formed`). A malformed
+        // walk cannot enforce (see `crate::state::malformed_tag_refusal`). A malformed
         // key is refused before the resource is resolved, so nothing is edited.
-        if input
-            .tags
-            .iter()
-            .any(|tag| !crate::state::tag_key_is_well_formed(&tag.key))
-        {
+        if let Some(message) = crate::state::malformed_tag_refusal(&input.tags) {
             return Err(TagResourceErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(crate::state::malformed_tag_key_message(
-                        "tags.member.key",
-                    )),
+                    message: Some(message),
                 },
             )
             .into());

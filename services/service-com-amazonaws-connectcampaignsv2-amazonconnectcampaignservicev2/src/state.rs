@@ -930,6 +930,18 @@ pub const ONBOARDING_JOB_NOT_FAILED_MESSAGE: &str =
 /// campaign: that operation's message is composed from the request.)
 pub const CAMPAIGN_NOT_FOUND_MESSAGE: &str = "CampaignId not found.";
 
+/// What this service answers when a campaign name is already held by another
+/// campaign of the same Connect instance, at HTTP 409.
+///
+/// Composed from the request and the store, so the refusal names the name and the
+/// instance it collides in. The one text every writer of a campaign name shares
+/// (`CreateCampaign` and `UpdateCampaignName`), so two of them cannot disagree
+/// about the invariant they both uphold (see
+/// [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::campaign_named`]).
+pub fn campaign_name_taken_message(name: &str, connect_instance_id: &str) -> String {
+    format!("A campaign named {name} already exists in Connect instance {connect_instance_id}")
+}
+
 /// The `CampaignDeletionPolicy` value that has `DeleteConnectInstanceConfig` remove
 /// the instance's existing campaigns along with its configuration, as the model's
 /// catalog declares it (see `CAMPAIGN_DELETION_POLICY_VALUES` in
@@ -1281,6 +1293,23 @@ pub enum InsertRejected {
     NameTaken,
 }
 
+/// Why the store refused to rename a campaign, as
+/// [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::rename_campaign`]
+/// reports it. The stored name is unchanged in either case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenameRejected {
+    /// The region holds no campaign under that id, so there is nothing to rename.
+    /// The caller answers this with the modelled `ResourceNotFoundException`
+    /// (HTTP 404).
+    NotFound,
+    /// Another campaign of the same Connect instance already holds that name, and a
+    /// campaign name identifies a campaign within its instance (see
+    /// [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::campaign_named`]).
+    /// Carries the instance the collision is in, so the caller's refusal can name
+    /// it. Answered with the modelled `ConflictException` (HTTP 409).
+    NameTaken { connect_instance_id: String },
+}
+
 /// The records of ONE region: everything a client talking to that region's endpoint
 /// can see or change.
 ///
@@ -1469,6 +1498,47 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     /// reaches only the region it was signed for.
     pub fn campaign_mut(&mut self, region: &str, id: &str) -> Option<&mut StoredCampaign> {
         self.regions.get_mut(region)?.campaigns.get_mut(id)
+    }
+
+    /// Rename the campaign `campaign` names to `name`, upholding the invariant that
+    /// a campaign name identifies a campaign within its Connect instance (see
+    /// [`Self::campaign_named`]).
+    ///
+    /// The lookup, the uniqueness check and the write happen under the one lock the
+    /// caller holds, so two concurrent renames onto one name cannot both pass it.
+    /// Renaming a campaign to the name it already carries is accepted and changes
+    /// nothing — the campaign is not in conflict with itself — which is what makes
+    /// the rename idempotent. A refusal ([`RenameRejected`]) writes nothing.
+    pub fn rename_campaign(
+        &mut self,
+        campaign: CampaignRef<'_>,
+        name: &str,
+    ) -> Result<(), RenameRejected> {
+        let Some(stored) = self.campaign(campaign.region, campaign.id) else {
+            return Err(RenameRejected::NotFound);
+        };
+        if stored.name == name {
+            return Ok(());
+        }
+        let connect_instance_id = stored.connect_instance_id.clone();
+        if self
+            .campaign_named(campaign.region, &connect_instance_id, name)
+            .is_some()
+        {
+            return Err(RenameRejected::NameTaken {
+                connect_instance_id,
+            });
+        }
+        match self.campaign_mut(campaign.region, campaign.id) {
+            Some(stored) => {
+                stored.name = name.to_string();
+                Ok(())
+            }
+            // The lookup above succeeded under this same borrow, so this arm is
+            // unreachable; it is reported rather than ignored so that an `Ok` from
+            // this method always means the name was written.
+            None => Err(RenameRejected::NotFound),
+        }
     }
 
     /// Remove the campaign `region` stores under `id`, returning it when it was there.

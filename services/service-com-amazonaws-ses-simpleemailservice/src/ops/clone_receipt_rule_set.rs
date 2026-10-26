@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CloneReceiptRuleSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CloneReceiptRuleSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CloneReceiptRuleSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a receipt rule set by copying an existing one: the new set holds the
+//! source set's rules, and is independent of it from then on. The source must
+//! exist, the new name must be free, and the account's rule-set limit applies.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +141,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CloneReceiptRuleSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CloneReceiptRuleSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CloneReceiptRuleSet"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+        let original = input.original_rule_set_name;
+        let rule_set_name = input.rule_set_name;
+        // `ReceiptRuleSetName` is only a string in the model, so a name outside the
+        // form the member documents reaches here. This operation models no error
+        // for a malformed name, so it is refused through the service's 400 channel
+        // rather than recording a set under a name SES would never accept. The
+        // SOURCE name needs no such check: a name SES cannot hold is a name the
+        // store does not hold, which is the `RuleSetDoesNotExist` below.
+        if !crate::state::is_receipt_rule_set_name(&rule_set_name) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "RuleSetName must contain only ASCII letters, numbers, underscores or \
+                 dashes, start and end with a letter or number, and contain {} characters \
+                 or fewer, got {rule_set_name:?}",
+                crate::state::MAX_RECEIPT_RULE_SET_NAME
+            )));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and every error this
+            // operation models is a client error, so none of them fits.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CloneReceiptRuleSet",
+            ));
+        };
+        let mut state = state.lock();
+
+        // The source is read FIRST: nothing is cloned from a set that does not
+        // exist, whatever else is wrong with the request.
+        let Some(source) = state.receipt_rule_sets.get(&original) else {
+            return Err(
+                CloneReceiptRuleSetErrorModeled::RuleSetDoesNotExistException(
+                    RuleSetDoesNotExistException {
+                        name: Some(original.clone()),
+                        message: Some(format!("Rule set does not exist: {original}")),
+                    },
+                )
+                .into(),
+            );
+        };
+        // Copied, not shared: "All receipt rules and configurations are copied to
+        // the new receipt rule set and are completely independent of the source
+        // rule set", so a later change to either set leaves the other alone.
+        let rules = source.rules.clone();
+
+        if state.receipt_rule_sets.contains_key(&rule_set_name) {
+            return Err(CloneReceiptRuleSetErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    name: Some(rule_set_name.clone()),
+                    message: Some(format!("Rule set already exists: {rule_set_name}")),
+                },
+            )
+            .into());
+        }
+        if state.add_receipt_rule_set(&rule_set_name, rules).is_none() {
+            return Err(CloneReceiptRuleSetErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Rule set limit exceeded: this account may hold {} receipt rule sets.",
+                        crate::state::MAX_RECEIPT_RULE_SETS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        Ok(CloneReceiptRuleSetOutput {})
     }
 }

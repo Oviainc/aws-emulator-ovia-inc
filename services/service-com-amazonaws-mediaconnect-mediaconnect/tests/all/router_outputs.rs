@@ -1228,7 +1228,11 @@ async fn create_refuses_past_the_store_ceiling() {
 
 /// Put `count` router outputs straight into the store, the way CreateRouterOutput stores
 /// one.
-fn seed_router_outputs(emulator: &Emulator, count: usize) {
+///
+/// `pub(crate)` because `tests/all/router_output_listing.rs` needs more router outputs than
+/// the largest page a listing returns, and a bound on what is STORED is set up through the
+/// store rather than through thousands of round trips.
+pub(crate) fn seed_router_outputs(emulator: &Emulator, count: usize) {
     use service_com_amazonaws_mediaconnect_mediaconnect::ops::types::{
         FabricConfiguration, MaintenanceConfiguration, RouterOutputConfiguration,
         RouterOutputProtocolConfiguration, RtpRouterOutputConfiguration,

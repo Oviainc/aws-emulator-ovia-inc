@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCampaignName
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCampaignName`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCampaignName::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Renames the campaign the `{id}` label names to the `name` the request carries.
+//! The name lives on the stored campaign record (`StoredCampaign$name`), which is what
+//! `DescribeCampaign` and `ListCampaigns` project, so this handler writes the store
+//! and nothing else: it keeps no copy of its own. A campaign name identifies a
+//! campaign within its Connect instance, so a rename onto a name another campaign of
+//! that instance already holds is refused; the one place that invariant lives is
+//! `rename_campaign` on this service's state.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +168,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCampaignName` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCampaignNameErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateCampaignNameErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the ConnectCampaignsV2 campaign store is unavailable".to_string(),
+                    x_amz_error_type: None,
+                },
+            )
+            .into());
+        };
+
+        // One guard spans the lookup, the uniqueness check and the write, so two
+        // concurrent writers of a campaign name cannot both pass it and leave one
+        // Connect instance holding two campaigns under one name.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCampaignName"))
+        // A campaign is reachable only through the endpoint of the region it was
+        // created in, so the id is resolved in the region this request was signed for
+        // and the rename never reaches another region's campaign.
+        //
+        // The model declares no `InvalidCampaignStateException` for this operation,
+        // unlike the other campaign updates, so the lifecycle state a campaign is at
+        // does not decide whether it can be renamed.
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+        match store.rename_campaign(
+            crate::state::CampaignRef {
+                region: &region,
+                id: &input.id,
+            },
+            &input.name,
+        ) {
+            // Renaming to the name the campaign already carries is the same write,
+            // which is what makes the operation idempotent, as the model declares.
+            Ok(()) => Ok(UpdateCampaignNameOutput),
+            // This region holds no campaign under that id: there is nothing to
+            // rename, and nothing was written.
+            Err(crate::state::RenameRejected::NotFound) => {
+                Err(UpdateCampaignNameErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::CAMPAIGN_NOT_FOUND_MESSAGE.to_string(),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into())
+            }
+            // Another campaign of the same Connect instance already answers to that
+            // name, so the rename would leave the instance with two campaigns under
+            // one name: refused with the error the model declares for a conflict with
+            // the current state of the resource, and the stored name is unchanged.
+            Err(crate::state::RenameRejected::NameTaken {
+                connect_instance_id,
+            }) => Err(UpdateCampaignNameErrorModeled::ConflictException(
+                ConflictException {
+                    message: crate::state::campaign_name_taken_message(
+                        &input.name,
+                        &connect_instance_id,
+                    ),
+                    x_amz_error_type: None,
+                },
+            )
+            .into()),
+        }
     }
 }

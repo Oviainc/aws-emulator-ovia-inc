@@ -200,9 +200,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         };
 
-        // `MaxResults` carries `@default: 20` and `@range(1..100)`, both applied
-        // before this handler runs, so the value is already a usable page size.
-        let page_size = usize::try_from(input.max_results).unwrap_or(0);
+        // The page size this walk serves, through the one derivation every paginated
+        // listing of this service shares (`crate::state::page_size`).
+        let page_size = crate::state::page_size(input.max_results);
 
         let lower = after.as_deref();
         let mut page = store.workflows_in_after(&region, lower);
