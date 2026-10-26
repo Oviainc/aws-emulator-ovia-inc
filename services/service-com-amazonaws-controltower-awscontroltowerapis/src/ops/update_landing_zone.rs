@@ -176,8 +176,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
 
-        // The same two input rules a create is held to, because they are properties of a
-        // landing zone configuration rather than of one call: `version` must name a
+        // The same two front-door rules a create is held to, because they are properties
+        // of a landing zone configuration rather than of one call: `version` must name a
         // version the service OFFERS (the modelled pattern bounds the shape of the
         // string, not the set of versions that exist), and a manifest the request carries
         // must describe a configuration the service could deploy. An update that supplies
@@ -187,6 +187,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a landing zone names no landing zone at all, which is a malformed input rather
         // than a reference to a resource that does not exist (the ARN of that shape naming
         // no stored landing zone, refused below).
+        //
+        // One more rule binds `version` — that it does not move this landing zone
+        // BACKWARDS — and that one depends on the version the landing zone has, so it is
+        // checked further down, once the landing zone has been resolved.
         if let Some(message) =
             crate::state::non_landing_zone_identifier_message(&input.landing_zone_identifier)
         {
@@ -243,6 +247,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // A landing zone moves FORWARD only. The catalog check above says the requested
+        // version EXISTS; this one says the landing zone can get there from where it is:
+        // an update deploys the requested version over the version the landing zone
+        // already has, so the same version (re-applying the configuration) or a newer one
+        // is reachable and an older one is not. Ordered against the version an in-flight
+        // deployment is on its way to, when there is one, so the answer does not depend on
+        // whether the clock has made that deployment due yet. Decided through a SHARED
+        // borrow, before anything takes a mutable one: a refused update writes nothing.
+        let refusal = store
+            .landing_zones
+            .get(&arn)
+            .and_then(|landing_zone| {
+                crate::state::version_downgrade_message(
+                    landing_zone.configured_version(),
+                    &input.version,
+                )
+            });
+        if let Some(message) = refusal {
+            return Err(
+                UpdateLandingZoneErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
         }
 
         // `resolve_landing_zone_arn` only answers with a key this map holds, so the lookup

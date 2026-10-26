@@ -38,7 +38,7 @@ pub(crate) fn emulator() -> MultiServiceRouter {
 
 /// As [`emulator`], also handing back the shared engine, for the one case whose subject
 /// is the store's retention bound rather than a wire behaviour.
-fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);

@@ -59,6 +59,8 @@ mod landing_zone_reset;
 mod landing_zone_update;
 #[path = "all/landing_zone_validation.rs"]
 mod landing_zone_validation;
+#[path = "all/landing_zone_version_order.rs"]
+mod landing_zone_version_order;
 #[path = "all/list_baselines.rs"]
 mod list_baselines;
 #[path = "all/list_enabled_baselines.rs"]

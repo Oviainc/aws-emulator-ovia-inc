@@ -233,6 +233,36 @@ pub fn unsupported_version_message(version: &str) -> Option<String> {
     ))
 }
 
+/// Why `requested` cannot be deployed over `deployed`, or `None` when it does not move
+/// the landing zone backwards.
+///
+/// A landing zone is updated FORWARD only: an update deploys the requested version over
+/// the version the landing zone already has, so the same version (a re-apply of the
+/// configuration at that version) or a numerically newer one is a configuration the
+/// service can reach from there, while an older one is not — the landing zone would have
+/// to be un-deployed to reach it. Versions are ordered per component numerically, the
+/// same order [`latest_available_version`] uses, so `3.10` is newer than `3.3`.
+///
+/// A value neither side can order (the modelled `LandingZoneVersion` pattern
+/// `^\d+.\d+$` leaves its separator unescaped, so it admits some) is not refused here:
+/// nothing establishes that it is older. The one place this refusal's wording is built,
+/// and the message is built from the request and from the landing zone's own version, so
+/// it tells the caller what it may ask for.
+pub fn version_downgrade_message(deployed: &str, requested: &str) -> Option<String> {
+    let (Some(deployed_order), Some(requested_order)) =
+        (version_order(deployed), version_order(requested))
+    else {
+        return None;
+    };
+    if requested_order >= deployed_order {
+        return None;
+    }
+    Some(format!(
+        "version {requested:?} is older than the landing zone's version {deployed:?}; a \
+         landing zone can only be updated to the same or a newer version"
+    ))
+}
+
 /// What one documented `Manifest` member's value must be.
 ///
 /// The manifest's full schema "is not published, by design"
@@ -707,6 +737,27 @@ pub struct LandingZone {
     /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
     pub pending_deletion: Option<PendingLandingZoneDeletion>,
     pub created_at: SystemTime,
+}
+
+impl LandingZone {
+    /// The newest version this landing zone has accepted: the one an in-flight `UPDATE`
+    /// is deploying while there is one, otherwise the deployed one.
+    ///
+    /// A further update is ordered against THIS rather than against `version`, so a
+    /// version already on its way to being deployed cannot be walked backwards by a
+    /// second call that arrives before the first is due. DEFENSIVE on the wire path:
+    /// `UpdateLandingZone` refuses a landing zone with an operation in flight with
+    /// `ConflictException` before it gets here, and a deployment the clock has made due
+    /// has already been applied by [`settle`], so the pending branch is what keeps the
+    /// order right if either of those ever stops holding.
+    ///
+    /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
+    pub fn configured_version(&self) -> &str {
+        match &self.pending_configuration {
+            Some(pending) => &pending.version,
+            None => &self.version,
+        }
+    }
 }
 
 /// One entry of the landing zone operation log.
