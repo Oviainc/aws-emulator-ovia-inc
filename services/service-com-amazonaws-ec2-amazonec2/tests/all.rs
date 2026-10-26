@@ -516,3 +516,8 @@ mod describe_fpga_image_attribute;
 // `CreateVerifiedAccessInstance` mints and persists, and the group create that resolves it.
 #[path = "all/verified_access_instances.rs"]
 mod verified_access_instances;
+// Declared LAST for the reason the header gives: the sorted region of this file is where
+// every new ec2 suite inserts its lines. What `ValidateSecurityGroupQuotasForInterface`
+// answers every caller of this emulator, and what it leaves the store holding.
+#[path = "all/validate_security_group_quotas_for_interface.rs"]
+mod validate_security_group_quotas_for_interface;

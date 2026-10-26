@@ -1750,6 +1750,29 @@ pub const INVALID_PARAMETER_COMBINATION: &str = "InvalidParameterCombination";
 /// `DryRunOperation`" (the `DryRun` member's own doc).
 pub const DRY_RUN_OPERATION: &str = "DryRunOperation";
 
+/// EC2's error code for a caller that may not make the request AT ALL — the other side of
+/// the `DryRun` probe ("If you have the required permissions, the error response is
+/// `DryRunOperation`. Otherwise, it is `UnauthorizedOperation`", the `DryRun` member's own
+/// doc), answered whether or not the request carries that flag.
+///
+/// About the caller's permission to call the OPERATION, where
+/// [`crate::scaffolded::Scaffolded::auth_failure`]'s `AuthFailure` is about the caller's
+/// standing with the RESOURCE a request names.
+pub const UNAUTHORIZED_OPERATION: &str = "UnauthorizedOperation";
+
+/// The HTTP status EC2 answers [`UNAUTHORIZED_OPERATION`] with: 403, where this service's
+/// other client refusals are 400 — the status an SDK maps to an authorization failure
+/// rather than to a bad request.
+pub const UNAUTHORIZED_OPERATION_STATUS: u16 = 403;
+
+/// The sentence EC2 answers [`UNAUTHORIZED_OPERATION`] with for an operation it permits only
+/// to authorized Amazon Web Services services rather than to a caller's own principal.
+///
+/// FIXED text: it names nothing of the request — not the operation, not the resources it
+/// named — so it is the whole message rather than one run's sample of a varying one. Named
+/// here so the refusal and the suites that assert it cannot drift apart.
+pub const CALLER_NOT_ALLOWED_MESSAGE: &str = "Caller is not allowed to call this API.";
+
 /// EC2's error code for a request that named a VPC id no VPC of the account has.
 pub const INVALID_VPC_ID_NOT_FOUND: &str = "InvalidVpcID.NotFound";
 
@@ -9886,6 +9909,32 @@ pub fn dry_run_operation<E>() -> crate::scaffolded::Scaffolded<E> {
         412,
         "Request would have succeeded, but DryRun flag is set.",
     )
+}
+
+/// Refuse a caller that may not make the request at all, the way EC2 does:
+/// [`UNAUTHORIZED_OPERATION_STATUS`] [`UNAUTHORIZED_OPERATION`].
+///
+/// The counterpart of [`dry_run_operation`] — the two are the two sides of one permission
+/// decision — and of `AuthFailure`, which is about the caller's standing with a resource
+/// the request names rather than with the operation itself.
+pub fn unauthorized_operation<E>(message: impl Into<String>) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        UNAUTHORIZED_OPERATION,
+        UNAUTHORIZED_OPERATION_STATUS,
+        message,
+    )
+}
+
+/// Refuse the caller of an operation EC2 permits only to authorized Amazon Web Services
+/// services: [`unauthorized_operation`] carrying [`CALLER_NOT_ALLOWED_MESSAGE`].
+///
+/// Such an operation is not one a principal can be granted; every caller of this emulator
+/// signs as a principal of the account, so none of them is one of those services and the
+/// answer does not depend on the resources the request names. It is NOT what a `DryRun`
+/// request is answered with: that flag asks only whether the caller holds the ACTION, which
+/// is [`dry_run_operation`].
+pub fn caller_not_allowed_to_call_this_api<E>() -> crate::scaffolded::Scaffolded<E> {
+    unauthorized_operation(CALLER_NOT_ALLOWED_MESSAGE)
 }
 
 // =============================================================================
