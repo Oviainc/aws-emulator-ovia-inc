@@ -295,14 +295,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A definition delivers one experiment at a time: while a run of it is still
         // running, a start of another conflicts with the state of the definition that
-        // holds it and writes nothing, so the duplicate starter can attach to the run
-        // that won instead of creating a second one.
-        if let Some(active) = definition.active_run() {
+        // holds it and writes nothing, so the duplicate starter can stop the run that won
+        // instead of creating a second one. The refusal names the definition the request
+        // addressed and what must happen before a start is accepted, and nothing about the
+        // run in flight.
+        if definition.active_run().is_some() {
             return Err(StartExperimentRunErrorModeled::ConflictException(
                 ConflictException {
                     message: Some(crate::state::experiment_run_already_active(
-                        &definition.id,
-                        active.run,
+                        &input.experiment_definition_identifier,
                     )),
                 },
             )

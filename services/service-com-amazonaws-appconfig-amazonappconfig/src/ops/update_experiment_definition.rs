@@ -243,14 +243,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the one reporting `ACTIVE` — so such an update conflicts with the current state
         // of the resource and writes nothing. No other status is refused: a definition
         // that is IDLE has no run in flight, and nothing is documented about updating an
-        // archived one.
+        // archived one. The refusal names the definition the request addressed and the
+        // status that blocked it, so the caller can tell this lifecycle conflict from any
+        // other.
         if definition.status == crate::state::EXPERIMENT_DEFINITION_ACTIVE {
             return Err(UpdateExperimentDefinitionErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "Experiment definition {} cannot be updated while an experiment run is \
-                         active.",
-                        definition.id
+                    message: Some(crate::state::experiment_definition_not_updatable(
+                        &input.experiment_definition_identifier,
+                        &definition.status,
                     )),
                 },
             )

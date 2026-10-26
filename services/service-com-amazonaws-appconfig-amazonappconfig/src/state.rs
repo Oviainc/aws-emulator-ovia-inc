@@ -2498,22 +2498,25 @@ pub fn experiment_definition_not_found(
 /// `Message` for a run number the named experiment definition never issued, or no longer
 /// holds a record for.
 ///
-/// Labelled like [`experiment_definition_not_found`]: the two identifiers are echoed as
-/// the caller wrote them, and the run number as the request carried it.
+/// The experiment run's OWN template: the kind is written `Experiment run`, the
+/// identifiers are labelled `Experiment Definition Id`, `Application Id` and
+/// `Experiment Run` and appear in THAT order — the definition before the application that
+/// holds it, which is not the order the path nests them in — and each value is echoed as
+/// the request carried it.
 pub fn experiment_run_not_found(
     application_identifier: &str,
     experiment_definition_identifier: &str,
     run: i32,
 ) -> String {
     not_found_message(
-        "Experiment Run",
+        "Experiment run",
         &[
-            ("Application Identifier", application_identifier),
             (
-                "Experiment Definition Identifier",
+                "Experiment Definition Id",
                 experiment_definition_identifier,
             ),
-            ("Run", &run.to_string()),
+            ("Application Id", application_identifier),
+            ("Experiment Run", &run.to_string()),
         ],
         AccountClause::Reported,
         NOT_FOUND_FULL_STOP,
@@ -2522,12 +2525,31 @@ pub fn experiment_run_not_found(
 
 /// `Message` for a start refused because the definition already has a run in flight.
 ///
-/// Derived from the state that refused it — the definition the start addressed and the
-/// run of it that is still running — so the caller can address the run it lost to.
-pub fn experiment_run_already_active(experiment_definition_id: &str, active_run: i32) -> String {
+/// Derived from the request alone — the definition the start addressed, echoed as the
+/// caller wrote it — followed by the fixed sentence naming what must finish first. The run
+/// holding the definition is NOT disclosed: neither its number nor its status is part of
+/// this refusal, so a caller learns that the definition is busy and nothing about the run
+/// it lost to.
+pub fn experiment_run_already_active(experiment_definition_identifier: &str) -> String {
     format!(
-        "Experiment definition {experiment_definition_id} already has an active experiment \
-         run: run {active_run} is {EXPERIMENT_RUN_RUNNING}."
+        "Experiment definition {experiment_definition_identifier} already has a running \
+         experiment. The current experiment run must be stopped before a run can be started."
+    )
+}
+
+/// `Message` for an update of an experiment definition refused because the lifecycle the
+/// definition is in does not take one.
+///
+/// Built from the request's definition identifier and the status the stored definition
+/// holds — the status is what blocked the call, so the refusal names it — followed by the
+/// fixed sentence saying what must finish before an update is accepted.
+pub fn experiment_definition_not_updatable(
+    experiment_definition_identifier: &str,
+    status: &str,
+) -> String {
+    format!(
+        "Cannot update experiment definition {experiment_definition_identifier} with status \
+         {status}. Stop the current experiment run before updating the experiment definition."
     )
 }
 
