@@ -560,6 +560,16 @@ pub fn invalid_source_message(name: &str) -> String {
     )
 }
 
+/// A put refused because the stream's data comes from a configured source rather than
+/// from direct puts: the `DeliveryStreamType` that says so.
+///
+/// The sentence names the stream's TYPE and not its name, so it is stated for whichever
+/// non-direct-put type the stream carries rather than asserting one of them, and it
+/// discloses no name in this account's namespace.
+pub fn not_direct_put_message(stream_type: &str) -> String {
+    format!("This operation is not permitted on {stream_type} delivery stream type.")
+}
+
 /// A put refused because the stream it named is not accepting data: the stream the
 /// request named and the account the put was scoped to.
 ///

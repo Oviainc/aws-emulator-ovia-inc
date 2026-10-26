@@ -31,6 +31,8 @@ mod description_defaults;
 mod destination_delivery;
 #[path = "all/destination_update.rs"]
 mod destination_update;
+#[path = "all/direct_put_source_gate.rs"]
+mod direct_put_source_gate;
 #[path = "all/http_endpoint_delivery.rs"]
 mod http_endpoint_delivery;
 #[path = "all/processor_parameters.rs"]

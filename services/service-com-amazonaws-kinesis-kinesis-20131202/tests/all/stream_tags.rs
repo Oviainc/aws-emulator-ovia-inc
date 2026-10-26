@@ -13,10 +13,10 @@
 //! changes nothing. Either operation resolves its stream by `StreamName`, by `StreamARN` or
 //! by both, inside the region the request was signed for; a request naming a stream this
 //! account and region do not hold is `ResourceNotFoundException`, one naming no stream at
-//! all (or two different streams) is `InvalidArgumentException`, an assignment that would
-//! leave the stream carrying more tags than one stream may carry is
-//! `LimitExceededException`, and an assignment to a stream that is not `ACTIVE` yet is
-//! `ResourceInUseException`.
+//! all (or two different streams) is `InvalidArgumentException`, and an assignment that
+//! would leave the stream carrying more tags than one stream may carry is
+//! `LimitExceededException`. A stream's tag set exists for as long as the stream does, so
+//! an assignment is served in every lifecycle status the stream has.
 //!
 //! The recorded flow this was derived from tags ONE stream with ONE pair
 //! (`add_tags_to_stream(StreamName=…, Tags={…})`) and is one row of the tables below. The
@@ -36,9 +36,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
-    stream_not_active_message, stream_not_found_message, ACTIVATION_DELAY,
-    MAX_LIST_TAGS_FOR_STREAM_LIMIT, MAX_STREAM_TAGS, STREAM_CREATING,
-    STREAM_IDENTIFIER_MISMATCH_MESSAGE, STREAM_IDENTIFIER_REQUIRED_MESSAGE,
+    stream_not_found_message, ACTIVATION_DELAY, MAX_LIST_TAGS_FOR_STREAM_LIMIT, MAX_STREAM_TAGS,
+    STREAM_ACTIVE, STREAM_CREATING, STREAM_DELETING, STREAM_IDENTIFIER_MISMATCH_MESSAGE,
+    STREAM_IDENTIFIER_REQUIRED_MESSAGE,
 };
 use service_com_amazonaws_kinesis_kinesis_20131202::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -704,65 +704,126 @@ async fn an_assignment_past_the_tag_ceiling_is_refused_and_changes_nothing() {
     );
 }
 
+/// One row of the lifecycle table: the status a stream is put into before it is tagged,
+/// and how it is put there.
+struct LifecycleCase {
+    /// The case's label, which is also its stream's name.
+    label: &'static str,
+    /// Whether the case waits past the instant the create armed the activation for.
+    wait_for_activation: bool,
+    /// Whether the case accepts a `DeleteStream` for the stream first, which leaves it in
+    /// `DELETING` until the removal that delete owes falls due.
+    delete_first: bool,
+    /// The `StreamStatus` the stream is in when the assignment lands, which the case
+    /// asserts through `DescribeStreamSummary` rather than assuming.
+    expected_status: &'static str,
+}
+
+/// A stream's TAG SET is addressed in every lifecycle status the stream has.
+///
+/// RULE: a tag operation addresses the stored tag set of a stream this account and region
+/// hold, and that set exists for as long as the stream does — so an assignment is served
+/// whatever `StreamStatus` the stream is in, exactly as the `RemoveTagsFromStream` that
+/// unassigns from the same set is. The status gate belongs to the operations that act on
+/// the stream's SHARDS and to the ones that change its lifecycle, not to its metadata.
+///
+/// The rows span the statuses `StreamStatus` reaches here: a stream still inside the
+/// transition its create armed (`CREATING`), one past it (`ACTIVE`), and one a delete has
+/// been accepted for (`DELETING`).
 #[tokio::test]
-async fn an_assignment_to_a_stream_that_is_not_active_yet_is_refused() {
-    let emulator = Emulator::new();
-    let name = "not-active-yet";
-    emulator
-        .ok(
-            name,
-            "CreateStream",
-            &json!({ "StreamName": name, "ShardCount": 1 }),
-        )
-        .await;
+async fn an_assignment_is_served_in_every_lifecycle_status() {
+    let cases = [
+        LifecycleCase {
+            label: "creating",
+            wait_for_activation: false,
+            delete_first: false,
+            expected_status: STREAM_CREATING,
+        },
+        LifecycleCase {
+            label: "active",
+            wait_for_activation: true,
+            delete_first: false,
+            expected_status: STREAM_ACTIVE,
+        },
+        LifecycleCase {
+            label: "deleting",
+            wait_for_activation: true,
+            delete_first: true,
+            expected_status: STREAM_DELETING,
+        },
+    ];
 
-    // A caller acting straight after the create still sees the transient state the create
-    // armed, and a write to the stream's tags is not available in it.
-    let (status, response) = emulator
-        .call(
-            "AddTagsToStream",
-            &json!({ "StreamName": name, "Tags": { "owner": "team-a" } }),
-        )
-        .await;
-    assert_eq!(
-        (status, error_code(&response).as_str()),
-        (400, "ResourceInUseException"),
-        "case creating: tagging a stream that is not ACTIVE is refused, got {status} with \
-         body {response}"
-    );
-    assert_eq!(
-        error_message(&response),
-        stream_not_active_message(name, STREAM_CREATING),
-        "case creating: the refusal names the stream and the status at fault, got {response}"
-    );
+    for case in &cases {
+        let emulator = Emulator::new();
+        emulator
+            .ok(
+                case.label,
+                "CreateStream",
+                &json!({ "StreamName": case.label, "ShardCount": 1 }),
+            )
+            .await;
+        if case.wait_for_activation {
+            tokio::time::sleep(past_activation()).await;
+        }
+        if case.delete_first {
+            emulator
+                .ok(
+                    case.label,
+                    "DeleteStream",
+                    &json!({ "StreamName": case.label }),
+                )
+                .await;
+        }
 
-    // A read of the tag list is allowed throughout: it reports, it does not write.
-    let during = emulator
-        .ok("creating-read", "ListTagsForStream", &json!({ "StreamName": name }))
-        .await;
-    assert!(
-        reported_tags("creating-read", &during).is_empty(),
-        "case creating-read: the refused assignment persisted nothing, got {during}"
-    );
+        let summary = emulator
+            .ok(
+                case.label,
+                "DescribeStreamSummary",
+                &json!({ "StreamName": case.label }),
+            )
+            .await;
+        let reported_status = summary
+            .get("StreamDescriptionSummary")
+            .and_then(|summary| summary.get("StreamStatus"))
+            .and_then(Value::as_str)
+            .unwrap_or("<no StreamStatus>");
+        assert_eq!(
+            reported_status, case.expected_status,
+            "case {}: the stream is in {} when the assignment lands, got {summary}",
+            case.label, case.expected_status
+        );
 
-    // Once the transition is due the same assignment is served.
-    tokio::time::sleep(past_activation()).await;
-    emulator
-        .ok(
-            "active",
-            "AddTagsToStream",
-            &json!({ "StreamName": name, "Tags": { "owner": "team-a" } }),
-        )
-        .await;
-    let after = emulator
-        .ok("active-read", "ListTagsForStream", &json!({ "StreamName": name }))
-        .await;
-    assert_eq!(
-        reported_tags("active-read", &after),
-        vec![pair("owner", "team-a")],
-        "case active-read: the assignment served once the stream is ACTIVE is reported, got \
-         {after}"
-    );
+        let (status, response) = emulator
+            .call(
+                "AddTagsToStream",
+                &json!({ "StreamName": case.label, "Tags": { "owner": "team-a" } }),
+            )
+            .await;
+        assert_eq!(
+            (status, &response),
+            (200, &json!({})),
+            "case {}: an assignment to a stream in {} is served, got {status} with body \
+             {response}",
+            case.label,
+            case.expected_status
+        );
+
+        // What the assignment wrote is what a read of the stored set reports.
+        let after = emulator
+            .ok(
+                case.label,
+                "ListTagsForStream",
+                &json!({ "StreamName": case.label }),
+            )
+            .await;
+        assert_eq!(
+            reported_tags(case.label, &after),
+            vec![pair("owner", "team-a")],
+            "case {}: the assignment served in {} is reported, got {after}",
+            case.label,
+            case.expected_status
+        );
+    }
 }
 
 /// One row of the refusal table: a request that names no stream of this account and region,

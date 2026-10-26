@@ -14,9 +14,9 @@
 //! ARN this account and region hold no resource under is the modelled
 //! `ResourceNotFoundException`. A request that would take the resource past the documented
 //! ceiling of tags is refused with the modelled `LimitExceededException` BEFORE the stored
-//! map grows, and a resource that is not `ACTIVE` yet is refused with the modelled
-//! `ResourceInUseException` — the same rules `AddTagsToStream` applies, because they are one
-//! rule about one stored tag set.
+//! map grows, and the write is served whatever lifecycle status the resource is in — the
+//! same rules `AddTagsToStream` applies, because they are one rule about one stored tag
+//! set.
 //!
 //! ## Shape of an operation
 //!
@@ -219,21 +219,11 @@ fn apply_assignment(
         .resolve_stream_mut(now, region, None, Some(input.resource_arn.as_str()))
         .map_err(|failure| lookup_refusal(failure, &input.resource_arn))?;
 
-    // "The resource is not available for this operation. For successful operation, the
-    // resource must be in the ACTIVE state" (`ResourceInUseException`): a stream still
-    // inside the transition its create armed is not available for a write to its tags.
-    let status = stream.status(now);
-    if status != crate::state::STREAM_ACTIVE {
-        return Err(TagResourceErrorModeled::ResourceInUseException(
-            ResourceInUseException {
-                message: Some(crate::state::stream_not_active_message(
-                    &input.resource_arn,
-                    status,
-                )),
-            },
-        )
-        .into());
-    }
+    // A resource's tags are control-plane metadata of the resource itself, not of the
+    // shards its create is provisioning: the stored tag set exists for as long as the
+    // resource does, so this write is served for a resource in any lifecycle status — the
+    // same as the `UntagResource` that unassigns from that very set, and the same rule
+    // `AddTagsToStream` applies to the one stored tag set both write.
 
     // "You can assign up to 50 tags to a Kinesis resource" — the ceiling is on what the
     // RESOURCE carries once the request is served, not on what the request names, and it is

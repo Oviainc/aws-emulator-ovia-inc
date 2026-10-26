@@ -481,6 +481,21 @@ impl DeliveryStream {
             .is_some_and(|encryption| encryption.status.as_deref() == Some(ENCRYPTION_ENABLED))
     }
 
+    /// Whether this stream's data comes from a source OTHER than direct puts — a Kinesis
+    /// data stream, an Amazon MSK cluster or a database — which is what the stream's
+    /// `DeliveryStreamType` says: of the modelled values
+    /// (`crate::ops::types::DELIVERY_STREAM_TYPE_VALUES`) only
+    /// [`DIRECT_PUT_STREAM_TYPE`] is the one where "provider applications access the
+    /// Firehose stream directly"; every other value names the service that feeds the
+    /// stream instead.
+    ///
+    /// Such a stream is fed by that source, so the direct-put ingestion operations are not
+    /// available on it and a `PutRecord` / `PutRecordBatch` naming it is refused whatever
+    /// it carries.
+    pub fn takes_a_configured_source(&self) -> bool {
+        self.stream_type != DIRECT_PUT_STREAM_TYPE
+    }
+
     /// Whether this stream takes data from CloudWatch Logs only, because one of its
     /// destinations has data processing enabled with a processor of the CloudWatch Logs
     /// decompression pipeline ([`CLOUDWATCH_LOGS_PROCESSOR_TYPES`]).
@@ -702,6 +717,12 @@ impl ComAmazonawsFirehoseFirehose20150804State {
         if stream.status != StreamStatus::Active {
             return Err(StreamRefusal::NotActive);
         }
+        // A stream whose data comes from a configured source is fed by that source, so
+        // the direct-put ingestion operations are not available on it: the refusal names
+        // the type that says so.
+        if stream.takes_a_configured_source() {
+            return Err(StreamRefusal::SourceNotDirectPut(stream.stream_type.clone()));
+        }
         // A stream configured for the CloudWatch Logs decompression pipeline takes data
         // from CloudWatch Logs only; an API put is by definition not that producer.
         if stream.takes_cloudwatch_logs_only() {
@@ -718,7 +739,7 @@ impl ComAmazonawsFirehoseFirehose20150804State {
 /// [`MAX_BUFFERED_RECORDS_PER_STREAM`]) that leaves no room is NOT one of these: it is
 /// reported per record (a `None` record id), because `PutRecordBatch` answers a record it
 /// could not store with that record's own entry rather than failing the batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamRefusal {
     /// No stream of that name exists.
     NoSuchStream,
@@ -730,6 +751,11 @@ pub enum StreamRefusal {
     /// ([`DeliveryStream::takes_cloudwatch_logs_only`]), and an API put is not that
     /// producer: the modelled `InvalidSourceException`.
     SourceNotCloudWatchLogs,
+    /// The stream's data comes from a configured source rather than from direct puts
+    /// ([`DeliveryStream::takes_a_configured_source`]), so the direct-put ingestion
+    /// operations are not available on it: the modelled `InvalidArgumentException`,
+    /// carrying the stream's own `DeliveryStreamType`, which the refusal names.
+    SourceNotDirectPut(String),
 }
 
 /// Buffer `data` under a freshly minted `RecordId` and answer that id, or `None` when the

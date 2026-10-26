@@ -231,6 +231,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Err(crate::state::StreamRefusal::SourceNotCloudWatchLogs) => {
                 return Err(not_from_cloudwatch_logs(&input.delivery_stream_name))
             }
+            Err(crate::state::StreamRefusal::SourceNotDirectPut(stream_type)) => {
+                return Err(not_direct_put(&stream_type))
+            }
         };
 
         // "If the record is successfully added to your Firehose stream, it receives a
@@ -322,6 +325,26 @@ fn not_from_cloudwatch_logs(name: &str) -> PutRecordBatchError {
     PutRecordBatchErrorModeled::InvalidSourceException(InvalidSourceException {
         code: None,
         message: Some(crate::service::invalid_source_message(name)),
+    })
+    .into()
+}
+
+/// The stream's data comes from a configured source rather than from direct puts, so this
+/// operation is not available on it.
+///
+/// "DirectPut: Provider applications access the Firehose stream directly" is the one
+/// `DeliveryStreamType` whose producer is a caller of this operation
+/// (`CreateDeliveryStreamInput$DeliveryStreamType`); a stream of any other type is fed by
+/// the source its configuration names, and Firehose disables its direct-put ingestion
+/// operations. The gate is a property of the stream's configuration and not of any
+/// payload, so it refuses the WHOLE batch rather than reporting per record: there is no
+/// record the stream would have taken. The fault is the request's own argument — it names
+/// a stream this operation cannot write to — so it is the modelled
+/// `InvalidArgumentException` (HTTP 400), not `InvalidSourceException`, whose documented
+/// scope is the CloudWatch Logs decompression case above.
+fn not_direct_put(stream_type: &str) -> PutRecordBatchError {
+    PutRecordBatchErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(crate::service::not_direct_put_message(stream_type)),
     })
     .into()
 }

@@ -12,8 +12,10 @@
 //! lookup every operation of this service that addresses a stream shares
 //! ([`crate::state::ComAmazonawsKinesisKinesis20131202State::resolve_stream_mut`]). A
 //! request that would take the stream past the documented ceiling of tags is refused with
-//! the modelled `LimitExceededException` BEFORE the stored map grows, and a stream that is
-//! not `ACTIVE` yet is refused with the modelled `ResourceInUseException`.
+//! the modelled `LimitExceededException` BEFORE the stored map grows. A stream's tag set
+//! exists for as long as the stream does, so this write is served whatever lifecycle
+//! status the stream is in — as is the `RemoveTagsFromStream` that unassigns from the same
+//! stored set.
 //!
 //! ## Shape of an operation
 //!
@@ -234,21 +236,11 @@ fn assign_tags(
         )
         .map_err(|failure| lookup_refusal(failure, input))?;
 
-    // "The resource is not available for this operation. For successful operation, the
-    // resource must be in the ACTIVE state" (`ResourceInUseException`): a stream still
-    // inside the transition its create armed is not available for a write to its tags.
-    let status = stream.status(now);
-    if status != crate::state::STREAM_ACTIVE {
-        return Err(AddTagsToStreamErrorModeled::ResourceInUseException(
-            ResourceInUseException {
-                message: Some(crate::state::stream_not_active_message(
-                    stream_identifier(input),
-                    status,
-                )),
-            },
-        )
-        .into());
-    }
+    // A stream's tags are control-plane metadata of the stream itself, not of the shards
+    // its create is provisioning: the stored tag set exists for as long as the stream
+    // does, so this write is served for a stream in any lifecycle status — the same as the
+    // `RemoveTagsFromStream` that unassigns from that very set. Nothing here reads or
+    // moves the stream's status.
 
     // "You can assign up to 50 tags to a data stream" — the ceiling is on what the STREAM
     // carries once the request is served, not on what the request names, and it is checked

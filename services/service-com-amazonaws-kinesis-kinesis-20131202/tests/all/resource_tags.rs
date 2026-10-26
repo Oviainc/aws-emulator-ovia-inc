@@ -14,10 +14,10 @@
 //! The refusals are the ones that rule implies and the operation models: an ARN this
 //! account and region hold no resource under is `ResourceNotFoundException` (including an
 //! ARN of a resource KIND this emulator holds none of, and the ARN of a stream that lives
-//! in another region), a resource that is not `ACTIVE` yet is `ResourceInUseException`, and
-//! an assignment that would leave the resource carrying more tags than one resource may
-//! carry is `LimitExceededException` — refused before the stored map grows, so it changes
-//! nothing.
+//! in another region), and an assignment that would leave the resource carrying more tags
+//! than one resource may carry is `LimitExceededException` — refused before the stored map
+//! grows, so it changes nothing. A resource's tag set exists for as long as the resource
+//! does, so an assignment is served in every lifecycle status it has.
 //!
 //! The rows differ along what the rule generalises over: how many pairs an assignment
 //! carries (one, several, the whole ceiling), whether its keys are new or already present,
@@ -27,10 +27,10 @@
 //! The wire harness, the ARN builder and the tag helpers are [`crate::stream_tags`]',
 //! reused rather than copied.
 
-use serde_json::json;
+use serde_json::{json, Value};
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
-    stream_not_active_message, stream_not_found_message, tag_ceiling_exceeded_message,
-    MAX_STREAM_TAGS, STREAM_CREATING,
+    stream_not_found_message, tag_ceiling_exceeded_message, MAX_STREAM_TAGS, STREAM_ACTIVE,
+    STREAM_CREATING, STREAM_DELETING,
 };
 
 use crate::stream_tags::{
@@ -246,66 +246,82 @@ async fn an_arn_naming_no_resource_of_this_account_and_region_is_refused() {
     );
 }
 
-/// A resource that is not `ACTIVE` yet is not available for a write to its tags, and the
-/// write lands once the transition the create armed has fallen due.
+/// A resource's tag set exists for as long as the resource does, so an assignment by ARN
+/// is served whatever lifecycle status the resource is in — the same rule
+/// `AddTagsToStream` applies to the one stored tag set both write, and the rule the
+/// `UntagResource` that unassigns from it already follows.
+///
+/// The rows span the statuses a stream reaches here: still inside the transition its
+/// create armed (`CREATING`), past it (`ACTIVE`), and with a delete accepted for it
+/// (`DELETING`).
 #[tokio::test]
-async fn an_assignment_to_a_resource_that_is_not_active_yet_is_refused() {
-    let emulator = Emulator::new();
-    let name = "tag-resource-not-active-yet";
-    emulator
-        .ok(
-            name,
-            "CreateStream",
-            &json!({ "StreamName": name, "ShardCount": 1 }),
-        )
-        .await;
-    let arn = stream_arn(REGION, name);
+async fn an_assignment_is_served_in_every_lifecycle_status() {
+    // (label, wait past the activation, delete first, the status the assignment lands in)
+    let cases = [
+        ("tag-resource-creating", false, false, STREAM_CREATING),
+        ("tag-resource-active", true, false, STREAM_ACTIVE),
+        ("tag-resource-deleting", true, true, STREAM_DELETING),
+    ];
 
-    // A caller acting straight after the create still sees the transient state the create
-    // armed.
-    let (status, response) = emulator
-        .call(
-            "TagResource",
-            &json!({ "ResourceARN": arn, "Tags": tag_map(&[pair("k", "v")]) }),
-        )
-        .await;
-    assert_eq!(
-        status, 400,
-        "case not-active-yet: expected the modelled refusal, got {status} with body {response}"
-    );
-    assert_eq!(
-        error_code(&response),
-        "ResourceInUseException",
-        "case not-active-yet: expected ResourceInUseException, got {response}"
-    );
-    assert_eq!(
-        error_message(&response),
-        stream_not_active_message(&arn, STREAM_CREATING),
-        "case not-active-yet: expected the not-active sentence this service states, got \
-         {response}"
-    );
+    for (name, wait_for_activation, delete_first, expected_status) in cases {
+        let emulator = Emulator::new();
+        emulator
+            .ok(
+                name,
+                "CreateStream",
+                &json!({ "StreamName": name, "ShardCount": 1 }),
+            )
+            .await;
+        if wait_for_activation {
+            tokio::time::sleep(past_activation()).await;
+        }
+        if delete_first {
+            emulator
+                .ok(name, "DeleteStream", &json!({ "StreamName": name }))
+                .await;
+        }
+        let arn = stream_arn(REGION, name);
 
-    // Once the transition is due, the same request is served and the tag is stored.
-    tokio::time::sleep(past_activation()).await;
-    emulator
-        .ok(
-            "once active",
-            "TagResource",
-            &json!({ "ResourceARN": arn, "Tags": tag_map(&[pair("k", "v")]) }),
-        )
-        .await;
-    let read = emulator
-        .ok(
-            "once active",
-            "ListTagsForStream",
-            &json!({ "StreamARN": arn }),
-        )
-        .await;
-    assert_eq!(
-        reported_tags("once active", &read),
-        vec![pair("k", "v")],
-        "case once active: expected the assignment to be stored, got {read}"
-    );
+        let summary = emulator
+            .ok(
+                name,
+                "DescribeStreamSummary",
+                &json!({ "StreamName": name }),
+            )
+            .await;
+        let reported_status = summary
+            .get("StreamDescriptionSummary")
+            .and_then(|summary| summary.get("StreamStatus"))
+            .and_then(Value::as_str)
+            .unwrap_or("<no StreamStatus>");
+        assert_eq!(
+            reported_status, expected_status,
+            "case {name}: the resource is in {expected_status} when the assignment lands, \
+             got {summary}"
+        );
+
+        let (status, response) = emulator
+            .call(
+                "TagResource",
+                &json!({ "ResourceARN": arn, "Tags": tag_map(&[pair("k", "v")]) }),
+            )
+            .await;
+        assert_eq!(
+            (status, &response),
+            (200, &json!({})),
+            "case {name}: an assignment to a resource in {expected_status} is served, got \
+             {status} with body {response}"
+        );
+
+        let read = emulator
+            .ok(name, "ListTagsForStream", &json!({ "StreamARN": arn }))
+            .await;
+        assert_eq!(
+            reported_tags(name, &read),
+            vec![pair("k", "v")],
+            "case {name}: the assignment served in {expected_status} is stored, got {read}"
+        );
+    }
 }
 
 /// An assignment that would take the resource past the documented tag ceiling is refused
