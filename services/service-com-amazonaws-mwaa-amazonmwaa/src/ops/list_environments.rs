@@ -141,15 +141,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one Region: the listing names that Region's environments and no others.
         let region = crate::state::request_region(ctx);
 
-        // A `NextToken` this service never minted names no position to resume from. The
-        // operation models no pagination-token error, so it is refused as a bad request.
-        let after = crate::state::decode_cursor(input.next_token.as_deref()).map_err(|_| {
-            ListEnvironmentsErrorModeled::ValidationException(ValidationException {
-                message: Some(
-                    "NextToken is not a pagination token issued by this service".to_string(),
-                ),
-            })
-        })?;
+        // A `NextToken` this service never minted, or one another Region's listing minted,
+        // names no position to resume from in THIS listing: a cursor is a position in the
+        // ordering of the Region it was issued for. The operation models no pagination-token
+        // error, so it is refused as a bad request.
+        let after =
+            crate::state::decode_cursor(&region, input.next_token.as_deref()).map_err(|_| {
+                ListEnvironmentsErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+                })
+            })?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListEnvironmentsErrorModeled::InternalServerException(InternalServerException {
@@ -163,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Sorted within the Region, so a cursor naming a name always resumes at the right
         // position.
         let names = store.names_in_region(&region);
-        let page = crate::state::page_of(names, after.as_deref(), input.max_results);
+        let page = crate::state::page_of(&region, names, after.as_deref(), input.max_results);
 
         Ok(ListEnvironmentsOutput {
             environments: page.items,

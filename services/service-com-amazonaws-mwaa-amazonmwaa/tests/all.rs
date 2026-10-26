@@ -31,6 +31,8 @@ mod environment_service_defaults;
 mod environment_unit_count_ranges;
 #[path = "all/environment_update_status_sequence.rs"]
 mod environment_update_status_sequence;
+#[path = "all/list_environments_cursor_scope.rs"]
+mod list_environments_cursor_scope;
 #[path = "all/rejection_contract.rs"]
 mod rejection_contract;
 #[path = "all/reserved_tag_keys.rs"]

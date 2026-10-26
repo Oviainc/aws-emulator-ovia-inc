@@ -1308,7 +1308,18 @@ pub struct Page {
     pub next_token: Option<String>,
 }
 
-/// A `NextToken` no listing of this service ever minted.
+/// What a `ListEnvironments` refusal of a `NextToken` it cannot resume from says.
+///
+/// The condition is the same whether the token is one no listing of this service minted or
+/// one another Region's listing minted: either way it names no position in THIS listing,
+/// and the sentence states that condition and nothing else — nothing in a rejected token
+/// is worth echoing back. What a client branches on is the 400 and the
+/// `ValidationException` wire code beside it, not this prose.
+pub const INVALID_NEXT_TOKEN_MESSAGE: &str =
+    "NextToken is not a pagination token issued by this listing";
+
+/// A `NextToken` no listing of this service ever minted, or one minted by a listing of a
+/// scope other than the one it was presented to.
 #[derive(Debug, Clone, Copy)]
 pub struct MalformedCursor;
 
@@ -1316,22 +1327,45 @@ pub struct MalformedCursor;
 /// decode into a usable position.
 const CURSOR_PREFIX: &str = "mwaa-after-environment:";
 
-/// Encode the resume cursor that follows the environment named `name`.
+/// Separates the scope a cursor was issued for from the position it names. Neither
+/// segment can carry it, so the split is unambiguous: a Region code (the shape
+/// `EnvironmentArn`'s own Region segment, `[a-z0-9\-]+`) and an `EnvironmentName`
+/// (`^[a-zA-Z][0-9a-zA-Z-_]*$`) both exclude it.
+const CURSOR_SCOPE_SEPARATOR: char = ':';
+
+/// Encode the resume cursor that follows the environment named `name` in the listing of
+/// `region`.
 ///
 /// Opaque to the caller (hex of the internal cursor text) and well within `NextToken`'s
 /// `@length(0, 2048)`. The cursor names a POSITION in the name ordering rather than an
 /// offset, so resuming never repeats or skips an environment when one is created or
 /// deleted between pages.
 ///
+/// Beside the position it carries the SCOPE the page was computed over. A listing serves
+/// one Region's environments, so a position in it means nothing in another Region's
+/// ordering: carrying the Region is what lets [`decode_cursor`] refuse a token from
+/// another Region's listing instead of resuming at a name that silently drops every
+/// environment sorting at or before it.
+///
 /// It is self-describing, so `ListEnvironments` validates a token by decoding it and
 /// never has to record the tokens it issued — which matters because `ListEnvironments` is
 /// a reporting operation: remembering an issued token would make a read mutate state.
-pub fn encode_cursor(name: &str) -> String {
-    ::hex::encode(format!("{CURSOR_PREFIX}{name}"))
+pub fn encode_cursor(region: &str, name: &str) -> String {
+    ::hex::encode(format!(
+        "{CURSOR_PREFIX}{region}{CURSOR_SCOPE_SEPARATOR}{name}"
+    ))
 }
 
-/// Decode a cursor minted by [`encode_cursor`]; `None` starts at the beginning.
-pub fn decode_cursor(next_token: Option<&str>) -> Result<Option<String>, MalformedCursor> {
+/// Decode a cursor minted by [`encode_cursor`] for the listing of `region`; `None` starts
+/// at the beginning.
+///
+/// A token this service never minted, and one minted for another Region's listing, both
+/// name no position here: the caller gets [`MalformedCursor`] rather than a position read
+/// against the wrong Region's names.
+pub fn decode_cursor(
+    region: &str,
+    next_token: Option<&str>,
+) -> Result<Option<String>, MalformedCursor> {
     let Some(token) = next_token else {
         return Ok(None);
     };
@@ -1342,17 +1376,26 @@ pub fn decode_cursor(next_token: Option<&str>) -> Result<Option<String>, Malform
     }
     let bytes = ::hex::decode(token).map_err(|_| MalformedCursor)?;
     let text = String::from_utf8(bytes).map_err(|_| MalformedCursor)?;
-    text.strip_prefix(CURSOR_PREFIX)
-        .map(|name| Some(name.to_string()))
-        .ok_or(MalformedCursor)
+    let position = text.strip_prefix(CURSOR_PREFIX).ok_or(MalformedCursor)?;
+    let (issued_for, name) = position
+        .split_once(CURSOR_SCOPE_SEPARATOR)
+        .ok_or(MalformedCursor)?;
+    if issued_for != region {
+        return Err(MalformedCursor);
+    }
+    Ok(Some(name.to_string()))
 }
 
 /// Take the page of `ordered` names (sorted) that follows `after`, at most `max_results`
-/// long.
+/// long, for the listing of `region`.
+///
+/// `region` is the scope `ordered` was gathered over, and goes into any cursor this page
+/// mints, so resuming is only ever accepted by the listing that issued it.
 ///
 /// `max_results` is `@range(1, 25)`, so the boundary validator has already refused
 /// anything outside it; an absent one takes a full page.
 pub fn page_of(
+    region: &str,
     ordered: impl IntoIterator<Item = String>,
     after: Option<&str>,
     max_results: Option<i32>,
@@ -1375,7 +1418,7 @@ pub fn page_of(
         items.push(name);
     }
     let next_token = more_follow
-        .then(|| items.last().map(|name| encode_cursor(name)))
+        .then(|| items.last().map(|name| encode_cursor(region, name)))
         .flatten();
     Page { items, next_token }
 }
