@@ -236,6 +236,36 @@ pub const RSLVR_CODE_FORWARD_RULE_FORWARDING_TARGET_REQUIRED: &str = "RSLVR-0070
 /// Resolver-on-Outpost write operations.
 pub const RSLVR_CODE_INSTANCE_COUNT_BELOW_MINIMUM: &str = "RSLVR-03002";
 
+/// The Route 53 Resolver service error code reported when a request names a
+/// Resolver rule the service holds no rule under.
+///
+/// Carried for the same reason as [`RSLVR_CODE_ENDPOINT_NOT_FOUND`]: the HTTP
+/// status (400) and the exception shape name together do not say which Resolver
+/// fault occurred, and the model states no message text, so this code comes
+/// from the recorded responses of the rule operations that resolve a
+/// `ResolverRuleId` and raise `ResourceNotFoundException`.
+pub const RSLVR_CODE_RULE_NOT_FOUND: &str = "RSLVR-00703";
+
+/// The Route 53 Resolver service error code reported when a delete names a
+/// Resolver rule that is still associated with a VPC.
+///
+/// Carried for the same reason as [`RSLVR_CODE_ENDPOINT_NOT_FOUND`]: the HTTP
+/// status (400) and the exception shape name together do not say which Resolver
+/// fault occurred, and the model states no message text, so this code comes
+/// from the recorded responses of the rule delete operation that raises
+/// `ResourceInUseException` for it.
+pub const RSLVR_CODE_RULE_IN_USE: &str = "RSLVR-00702";
+
+/// The Route 53 Resolver service error code reported when a request addresses a
+/// rule-to-VPC association the service holds no association for.
+///
+/// Carried for the same reason as [`RSLVR_CODE_ENDPOINT_NOT_FOUND`]: the HTTP
+/// status (400) and the exception shape name together do not say which Resolver
+/// fault occurred, and the model states no message text, so this code comes
+/// from the recorded responses of the operation that addresses an association by
+/// its rule/VPC pair and raises `ResourceNotFoundException`.
+pub const RSLVR_CODE_RULE_VPC_ASSOCIATION_NOT_FOUND: &str = "RSLVR-00800";
+
 /// The Route 53 Resolver service error code reported when a tag operation names
 /// a resource the service holds nothing under.
 ///
@@ -573,16 +603,16 @@ pub fn system_rule_forbids_forwarding_target() -> InvalidRequestException {
 /// The `ResourceNotFoundException` the rule operations answer for an id they
 /// hold no Resolver rule under.
 ///
-/// Unlike the endpoint message, this one carries no `RSLVR-nnnnn` service error
-/// code: no recorded response available here states the code Route 53 Resolver
-/// uses for a missing rule, and the model states no message text, so the
-/// message states the fault plainly instead of inventing one. The HTTP status
-/// (400) and the error shape are what the contract fixes; the wording is an
-/// example.
+/// Built here rather than in each handler so every operation that resolves a
+/// `ResolverRuleId` (`GetResolverRule`, `UpdateResolverRule`,
+/// `DeleteResolverRule`, `AssociateResolverRule`) reports the one body: the
+/// RSLVR-coded message, with the requested id double-quoted inside it, and the
+/// resource type the model asks for.
 pub fn resolver_rule_not_found(resolver_rule_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!(
-            r#"Resolver rule with ID "{resolver_rule_id}" does not exist."#
+        message: Some(rslvr_message(
+            RSLVR_CODE_RULE_NOT_FOUND,
+            &format!(r#"Resolver rule with ID "{resolver_rule_id}" does not exist"#),
         )),
         resource_type: Some(RESOURCE_TYPE_RESOLVER_RULE.to_string()),
     }
@@ -590,7 +620,9 @@ pub fn resolver_rule_not_found(resolver_rule_id: &str) -> ResourceNotFoundExcept
 
 /// The `ResourceNotFoundException` `GetResolverRuleAssociation` answers for an
 /// id it holds no rule association under. See
-/// [`resolver_rule_not_found`] on the absent service error code.
+/// [`outpost_resolver_not_found`] on the absent service error code: the
+/// recordings available here state no code for an association addressed by its
+/// OWN id, so none is invented for it.
 pub fn resolver_rule_association_not_found(
     resolver_rule_association_id: &str,
 ) -> ResourceNotFoundException {
@@ -604,15 +636,21 @@ pub fn resolver_rule_association_not_found(
 
 /// The `ResourceNotFoundException` `DisassociateResolverRule` answers when the
 /// store holds no association of that RULE with that VPC — the pair that call
-/// addresses an association by, rather than the association's own id. See
-/// [`resolver_rule_not_found`] on the absent service error code.
+/// addresses an association by, rather than the association's own id.
+///
+/// The missing resource the sentence names is the ASSOCIATION itself, not a
+/// property of the rule, and its two variable parts are the rule and the VPC the
+/// request named.
 pub fn resolver_rule_vpc_association_not_found(
     resolver_rule_id: &str,
     vpc_id: &str,
 ) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!(
-            r#"Resolver rule with ID "{resolver_rule_id}" is not associated with VPC with ID "{vpc_id}"."#
+        message: Some(rslvr_message(
+            RSLVR_CODE_RULE_VPC_ASSOCIATION_NOT_FOUND,
+            &format!(
+                r#"Resolver Rule Association between Resolver Rule "{resolver_rule_id}" and VPC "{vpc_id}" does not exist"#
+            ),
         )),
         resource_type: Some(RESOURCE_TYPE_RESOLVER_RULE_ASSOCIATION.to_string()),
     }
@@ -621,15 +659,15 @@ pub fn resolver_rule_vpc_association_not_found(
 /// The `ResourceInUseException` `DeleteResolverRule` answers for a rule that is
 /// still associated with a VPC.
 ///
-/// The fixed part of the sentence is the operation's own documented one —
-/// "Before you can delete a Resolver rule, you must disassociate it from all the
-/// VPCs that you associated the Resolver rule with" — and the variable parts are
-/// the rule the request named and how many associations the store still holds
-/// for it, so the message states what the caller has to undo.
-pub fn resolver_rule_in_use(resolver_rule_id: &str, associations: usize) -> ResourceInUseException {
+/// The sentence is entirely fixed: it states the remedy the caller has to apply
+/// before the delete can succeed, and echoes nothing from the request or the
+/// store — neither the rule, nor a VPC, nor how many associations are still
+/// held.
+pub fn resolver_rule_in_use() -> ResourceInUseException {
     ResourceInUseException {
-        message: Some(format!(
-            r#"Before you can delete a Resolver rule, you must disassociate it from all the VPCs that you associated the Resolver rule with. Resolver rule with ID "{resolver_rule_id}" is still associated with {associations} VPC(s)."#
+        message: Some(rslvr_message(
+            RSLVR_CODE_RULE_IN_USE,
+            "Please disassociate this resolver rule from VPC first before deleting",
         )),
         resource_type: Some(RESOURCE_TYPE_RESOLVER_RULE.to_string()),
     }
@@ -676,7 +714,8 @@ pub fn name_satisfies_pattern(name: &str) -> bool {
 /// The `ResourceNotFoundException` the firewall domain-list operations answer
 /// for an id they hold no list under, built here so every operation that
 /// resolves a `FirewallDomainListId` reports the same body. See
-/// [`resolver_rule_not_found`] on the absent `RSLVR-nnnnn` service error code.
+/// [`outpost_resolver_not_found`] on the absent `RSLVR-nnnnn` service error
+/// code.
 pub fn firewall_domain_list_not_found(
     firewall_domain_list_id: &str,
 ) -> ResourceNotFoundException {
@@ -1489,6 +1528,71 @@ impl ResolverRuleAssociationRecord {
             status_message: self.status_message.clone(),
         }
     }
+
+    /// Whether this association satisfies one `ListResolverRuleAssociations`
+    /// filter: whether the value it presents for that member is among the
+    /// filter's values, as [`ResolverRuleRecord::matches_filter`] decides it for
+    /// a rule. A member the association does not carry matches nothing, and the
+    /// status it is matched on is the one it reports as of `now`.
+    pub fn matches_filter(
+        &self,
+        key: RuleAssociationFilterKey,
+        values: &HashSet<String>,
+        now: Instant,
+    ) -> bool {
+        match key {
+            RuleAssociationFilterKey::Name => {
+                self.name.as_deref().is_some_and(|name| values.contains(name))
+            }
+            RuleAssociationFilterKey::ResolverRuleId => {
+                values.contains(self.resolver_rule_id.as_str())
+            }
+            RuleAssociationFilterKey::Status => values.contains(self.status_at(now)),
+            RuleAssociationFilterKey::VpcId => values.contains(self.vpc_id.as_str()),
+        }
+    }
+}
+
+/// The member a `ListResolverRuleAssociations` filter selects on.
+///
+/// The catalog is exactly the one the model documents for this operation
+/// (`smithy_query(query="doc",shape="Filter",member="Name")`, section
+/// **ListResolverRuleAssociations**): `Name`, `ResolverRuleId`, `Status`,
+/// `VPCId`. It is a different catalog from [`RuleFilterKey`]'s, because the
+/// valid filter names "depend on the action that you're including the filter
+/// in".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleAssociationFilterKey {
+    Name,
+    ResolverRuleId,
+    Status,
+    VpcId,
+}
+
+impl RuleAssociationFilterKey {
+    /// The canonical name of this key, used to describe a filter set in a
+    /// pagination cursor's scope.
+    pub fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::ResolverRuleId => "ResolverRuleId",
+            Self::Status => "Status",
+            Self::VpcId => "VPCId",
+        }
+    }
+
+    /// Resolve a wire filter name, or `None` when it is outside the documented
+    /// catalog. The name is folded by [`fold_filter_name`], as
+    /// [`RuleFilterKey::parse`] folds the rule catalog's names.
+    pub fn parse(name: &str) -> Option<Self> {
+        match fold_filter_name(name).as_str() {
+            "NAME" => Some(Self::Name),
+            "RESOLVERRULEID" => Some(Self::ResolverRuleId),
+            "STATUS" => Some(Self::Status),
+            "VPCID" => Some(Self::VpcId),
+            _ => None,
+        }
+    }
 }
 
 /// `Validation` values, the model's whole enum
@@ -1926,8 +2030,8 @@ pub fn tagged_resource_not_found(resource_arn: &str) -> ResourceNotFoundExceptio
 /// from the request, so the rejected tags are not echoed back. No recorded
 /// response available here states the wording Route 53 Resolver uses for this
 /// fault, and the model states no message text, so — as for
-/// [`resolver_rule_not_found`] — the HTTP status (400) and the error shape are
-/// what the contract fixes and the wording is an example.
+/// [`outpost_resolver_not_found`] — the HTTP status (400) and the error shape
+/// are what the contract fixes and the wording is an example.
 pub fn tag_limit_exceeded(resource_arn: &str) -> LimitExceededException {
     LimitExceededException {
         message: Some(format!(
@@ -2127,6 +2231,16 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
     /// order of the map that holds the records.
     pub fn rules_in_creation_order(&self) -> Vec<&ResolverRuleRecord> {
         let mut all: Vec<&ResolverRuleRecord> = self.resolver_rules.values().collect();
+        all.sort_by_key(|record| record.seq);
+        all
+    }
+
+    /// Every stored rule association in creation order — the order
+    /// `ListResolverRuleAssociations`' pages and its cursor are defined over,
+    /// for the same reason as [`Self::rules_in_creation_order`].
+    pub fn rule_associations_in_creation_order(&self) -> Vec<&ResolverRuleAssociationRecord> {
+        let mut all: Vec<&ResolverRuleAssociationRecord> =
+            self.resolver_rule_associations.values().collect();
         all.sort_by_key(|record| record.seq);
         all
     }
@@ -2582,6 +2696,19 @@ pub fn endpoint_list_scope(filters: &[(FilterKey, HashSet<String>)]) -> String {
 pub fn rule_list_scope(filters: &[(RuleFilterKey, HashSet<String>)]) -> String {
     filter_list_scope(
         "ListResolverRules",
+        filters
+            .iter()
+            .map(|(key, values)| (key.canonical_name(), values)),
+    )
+}
+
+/// The cursor scope of one `ListResolverRuleAssociations` query, for the same
+/// reason and in the same shape as [`endpoint_list_scope`]'s.
+pub fn rule_association_list_scope(
+    filters: &[(RuleAssociationFilterKey, HashSet<String>)],
+) -> String {
+    filter_list_scope(
+        "ListResolverRuleAssociations",
         filters
             .iter()
             .map(|(key, values)| (key.canonical_name(), values)),

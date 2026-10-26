@@ -175,10 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // all the VPCs that you associated the Resolver rule with": a rule a VPC
         // still uses is the resource "that you tried to update or delete [and
         // that] is currently in use", so the delete is refused and the rule stays.
-        let associations = store.rule_association_count(&input.resolver_rule_id);
-        if associations > 0 {
+        if store.rule_association_count(&input.resolver_rule_id) > 0 {
             return Err(DeleteResolverRuleErrorModeled::ResourceInUseException(
-                crate::state::resolver_rule_in_use(&input.resolver_rule_id, associations),
+                crate::state::resolver_rule_in_use(),
             )
             .into());
         }

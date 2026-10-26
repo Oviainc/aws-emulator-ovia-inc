@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResolverRuleAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResolverRuleAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResolverRuleAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the associations this account made between Resolver rules and VPCs, in
+//! creation order, narrowed by the `Filters` the request carries and cut into pages.
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +85,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use ::std::collections::HashSet;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -165,18 +159,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResolverRuleAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResolverRuleAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResolverRuleAssociations"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListResolverRuleAssociationsErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Resolve and bound every filter BEFORE touching the store, exactly as
+        // `ListResolverRules` does: a request carrying more filter terms than any
+        // query needs is refused up front rather than multiplying the scan the
+        // store lock is held for, and a name outside the documented catalog for
+        // THIS operation is refused rather than silently ignored.
+        let requested_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if requested_filters > crate::state::MAX_FILTERS {
+            return Err(
+                ListResolverRuleAssociationsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: format!(
+                            "ListResolverRuleAssociations accepts at most {} filters",
+                            crate::state::MAX_FILTERS
+                        ),
+                        field_name: Some("Filters".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        let requested_values: usize = input
+            .filters
+            .iter()
+            .flatten()
+            .map(|filter| filter.values.as_ref().map_or(0, Vec::len))
+            .sum();
+        if requested_values > crate::state::MAX_FILTER_VALUES {
+            return Err(
+                ListResolverRuleAssociationsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: format!(
+                            "ListResolverRuleAssociations accepts at most {} filter values in total",
+                            crate::state::MAX_FILTER_VALUES
+                        ),
+                        field_name: Some("Values".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut filters: Vec<(crate::state::RuleAssociationFilterKey, HashSet<String>)> =
+            Vec::new();
+        for filter in input.filters.iter().flatten() {
+            let name = filter.name.clone().unwrap_or_default();
+            let Some(key) = crate::state::RuleAssociationFilterKey::parse(&name) else {
+                return Err(
+                    ListResolverRuleAssociationsErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: format!(
+                                "'{name}' is not a valid filter name for ListResolverRuleAssociations"
+                            ),
+                            field_name: Some("Name".to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            filters.push((key, filter.values.iter().flatten().cloned().collect()));
+        }
+
+        // A pure read: the page is computed from the stored records and the
+        // cursor is a pure function of the offset, so nothing is written. The
+        // store lock is released as soon as the page is built.
+        let page = {
+            let now = ::std::time::Instant::now();
+            let store = state.lock();
+            let matching: Vec<ResolverRuleAssociation> = store
+                .rule_associations_in_creation_order()
+                .into_iter()
+                // Filters combine with AND; one matches when the value the
+                // association presents for that member is among that filter's
+                // values.
+                .filter(|record| {
+                    filters
+                        .iter()
+                        .all(|(key, values)| record.matches_filter(*key, values, now))
+                })
+                .map(|record| record.to_association(now))
+                .collect();
+
+            // The cursor indexes the FILTERED collection, so resuming under a
+            // different `Filters` is an unknown cursor and not a page cut at the
+            // wrong position: "you must use the same values for Filters, if any,
+            // as in the previous request."
+            let scope = crate::state::rule_association_list_scope(&filters);
+            crate::state::paginate(
+                matching,
+                &scope,
+                input.max_results,
+                input.next_token.as_deref(),
+            )
+        };
+
+        let Some(page) = page else {
+            return Err(
+                ListResolverRuleAssociationsErrorModeled::InvalidNextTokenException(
+                    InvalidNextTokenException {
+                        message: Some(
+                            "The NextToken you provided was not issued by this service for this query"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(ListResolverRuleAssociationsOutput {
+            next_token: page.next_token,
+            // "The value that you specified for MaxResults in the request."
+            max_results: input.max_results,
+            resolver_rule_associations: Some(page.items),
+        })
     }
 }
