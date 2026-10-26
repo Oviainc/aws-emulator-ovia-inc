@@ -22,7 +22,8 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AccessControlAttribute, AccountAssignment, AccountAssignmentOperationStatus, Application,
+    AccessControlAttribute, AccountAssignment, AccountAssignmentOperationStatus,
+    AccountAssignmentOperationStatusMetadata, Application,
     ApplicationProvider, AttachedManagedPolicy, AuthenticationMethod,
     CustomerManagedPolicyReference, DisplayData, EncryptionConfigurationDetails, Grant,
     InstanceAccessControlAttributeConfiguration, InstanceMetadata,
@@ -501,6 +502,19 @@ pub fn provisioning_status_unknown_message(provisioning_status: &str) -> String 
     format!(
         "ProvisioningStatus must be one of {}, got {provisioning_status}",
         crate::ops::types::PROVISIONING_STATUS_VALUES.join(", ")
+    )
+}
+
+/// The refusal an operation-status filter value outside the model's `StatusValues` enum
+/// earns, as the message of the caller's own `ValidationException`. BUILT from the member
+/// the request got wrong and the values the model declares for it
+/// ([`crate::ops::types::STATUS_VALUES_VALUES`]), exactly as
+/// [`provisioning_status_unknown_message`] is, so the caller can fix the request from this
+/// text alone.
+pub fn operation_status_unknown_message(status: &str) -> String {
+    format!(
+        "Status must be one of {}, got {status}",
+        crate::ops::types::STATUS_VALUES_VALUES.join(", ")
     )
 }
 
@@ -2155,6 +2169,36 @@ impl AssignmentOperationRecord {
         }
     }
 
+    /// The record's sort/pagination key within the history of one instance's assignment
+    /// operations: the instant the operation was accepted, then its `RequestId`.
+    ///
+    /// Ordering an enumeration by this key walks the history oldest first, which is the
+    /// order it was recorded in, and the `RequestId` tail makes the key UNIQUE — two
+    /// operations accepted in the same nanosecond still get distinct keys — so a page can
+    /// resume after it. The instant is rendered fixed-width and zero-padded so the
+    /// lexicographic comparison the paging helper makes is the chronological one.
+    pub fn page_key(&self) -> String {
+        format!(
+            "{:011}.{:09}#{}",
+            self.created_date.secs(),
+            self.created_date.subsec_nanos(),
+            self.request_id
+        )
+    }
+
+    /// This record as the modeled `AccountAssignmentOperationStatusMetadata` shape, as of
+    /// `now` — the three members an operation-status ENUMERATION reports (the status the
+    /// clock implies, the `RequestId` to poll it by and the date it was accepted), which
+    /// are exactly the members [`Self::to_tracking_shape`] fills on the fuller status
+    /// object, so a list and the call that started the operation cannot disagree.
+    pub fn to_metadata_shape(&self, now: SystemTime) -> AccountAssignmentOperationStatusMetadata {
+        AccountAssignmentOperationStatusMetadata {
+            status: Some(self.status(now).to_string()),
+            request_id: Some(self.request_id.clone()),
+            created_date: Some(self.created_date),
+        }
+    }
+
     /// This record as the modeled `AccountAssignmentOperationStatus` shape, as of `now`:
     /// the whole status object, tracking members and the assignment the operation is
     /// about — what a status DESCRIBE reports.
@@ -3783,6 +3827,20 @@ pub fn cursor_account_assignments(
     permission_set_arn: &str,
 ) -> String {
     format!("accountAssignments|{instance_arn}|{account_id}|{permission_set_arn}")
+}
+
+/// Cursor scope of a `ListAccountAssignmentDeletionStatus` enumeration: the operation and
+/// the whole filter that selected the rows — the instance whose deletion history it walks
+/// and the `StatusValues` it was filtered by — since the key only distinguishes rows
+/// WITHIN one such filter.
+pub fn cursor_account_assignment_deletion_status(
+    instance_arn: &str,
+    status: Option<&str>,
+) -> String {
+    format!(
+        "accountAssignmentDeletionStatus|{instance_arn}|{}",
+        status.unwrap_or_default()
+    )
 }
 
 /// Cursor scope of a `ListAccountsForProvisionedPermissionSet` enumeration: the operation

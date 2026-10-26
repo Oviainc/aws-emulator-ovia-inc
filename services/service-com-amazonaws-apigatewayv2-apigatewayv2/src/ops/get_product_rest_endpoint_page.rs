@@ -213,16 +213,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A page is addressed UNDER its product, so an unknown product and an unknown
-        // page under a known one both name no page: 404 `NotFoundException`.
+        // page under a known one both name no page: 404 `NotFoundException`, worded as the
+        // portal resources word an unresolved identifier (see
+        // [`crate::state::PRODUCT_REST_ENDPOINT_PAGE_NOT_FOUND_MESSAGE`]).
         let Some(page) = stored else {
             return Err(GetProductRestEndpointPageErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!(
-                        "Invalid ProductRestEndpointPage identifier specified {}:{}:{}",
-                        ::engine::emulator_account_id(),
-                        input.portal_product_id,
-                        input.product_rest_endpoint_page_id
-                    )),
+                    message: Some(
+                        crate::state::PRODUCT_REST_ENDPOINT_PAGE_NOT_FOUND_MESSAGE.to_string(),
+                    ),
                     resource_type: ::std::option::Option::None,
                 },
             )

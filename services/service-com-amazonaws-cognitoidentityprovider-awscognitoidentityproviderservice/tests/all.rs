@@ -57,6 +57,8 @@ mod list_devices;
 mod list_groups;
 #[path = "all/list_identity_providers.rs"]
 mod list_identity_providers;
+#[path = "all/list_resource_servers.rs"]
+mod list_resource_servers;
 #[path = "all/list_terms.rs"]
 mod list_terms;
 #[path = "all/list_user_pools.rs"]

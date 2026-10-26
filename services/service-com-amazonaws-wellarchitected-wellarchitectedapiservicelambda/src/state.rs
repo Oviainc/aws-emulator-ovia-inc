@@ -28,7 +28,11 @@
 //! `ProfileArn` the create minted, and the association of one with a workload
 //! (`AssociateProfiles`, `DisassociateProfiles`) is held on the workload the association is
 //! OF, pinned at the profile version the workload is reviewed against — the version
-//! `UpgradeProfileVersion` moves to the one that profile is at. The shares of a profile
+//! `UpgradeProfileVersion` moves to the one that profile is at. The profile notifications
+//! `ListProfileNotifications` reports are DERIVED from those associations rather than
+//! stored: an association pinned at a version the profile has moved past is the
+//! notification, so nothing has to be recorded when a profile is revised and no read has
+//! to write. The shares of a profile
 //! (`CreateProfileShare`, `ListProfileShares`, `DeleteProfileShare`) are held like a
 //! workload's, keyed by the `ProfileArn` they share then by the share's own `ShareId`, and
 //! each raises the invitation `ListShareInvitations` reports to the principal it was
@@ -4206,6 +4210,17 @@ pub const PROFILE_OWNER_TYPE_SELF: &str = "SELF";
 /// `ProfileOwnerType$SHARED`: a profile another account owns and shared with the caller.
 pub const PROFILE_OWNER_TYPE_SHARED: &str = "SHARED";
 
+/// `ProfileNotificationType$PROFILE_ANSWERS_UPDATED`: the profile a workload is reviewed
+/// against has been revised since the workload's association pinned a version of it
+/// (`smithy_query(query="shape", shape="ProfileNotificationType")`, which publishes
+/// `PROFILE_ANSWERS_UPDATED` and `PROFILE_DELETED`).
+///
+/// The other member cannot arise from the state this emulator keeps: an association names
+/// a profile that has to resolve, so [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::remove_profile`]
+/// drops every association of a deleted profile with the profile itself, leaving no
+/// association that points at one that is gone.
+pub const PROFILE_NOTIFICATION_ANSWERS_UPDATED: &str = "PROFILE_ANSWERS_UPDATED";
+
 /// One stored Well-Architected Tool profile: the resource `CreateProfile` mints and
 /// `GetProfile` reports.
 ///
@@ -7261,6 +7276,27 @@ pub fn encode_profile_next_token(profile_arn: &str) -> String {
 /// token is not one this service issued.
 pub fn decode_profile_next_token(token: &str) -> Option<String> {
     Some(decode_cursor(token)?.get("o")?.as_str()?.to_string())
+}
+
+/// Encode a `ListProfileNotifications` cursor: the `(WorkloadId, ProfileArn)` of the last
+/// notification the page served, in the same opaque scheme as [`encode_next_token`].
+///
+/// A notification is ABOUT one association of one profile with one workload, so the pair
+/// that names that association is the whole cursor; both halves are fixed for the life of
+/// the resources they name, where `WorkloadName` is a member `UpdateWorkload` can move and
+/// `ProfileName` one `UpdateProfile` can. Its own keys, so a cursor issued by another
+/// paginated operation is not a cursor here.
+pub fn encode_profile_notification_next_token(workload_id: &str, profile_arn: &str) -> String {
+    encode_cursor(&::serde_json::json!({ "w": workload_id, "f": profile_arn }))
+}
+
+/// The `(WorkloadId, ProfileArn)` a `ListProfileNotifications` `NextToken` points just
+/// past, or `None` when the token is not one this service issued.
+pub fn decode_profile_notification_next_token(token: &str) -> Option<(String, String)> {
+    let cursor = decode_cursor(token)?;
+    let workload_id = cursor.get("w")?.as_str()?.to_string();
+    let profile_arn = cursor.get("f")?.as_str()?.to_string();
+    Some((workload_id, profile_arn))
 }
 
 /// Encode a `ListAgentContexts` cursor: the context `UUID` last served, in the same

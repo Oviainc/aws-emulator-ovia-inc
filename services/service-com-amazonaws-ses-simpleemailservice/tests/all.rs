@@ -19,6 +19,8 @@ mod ses_identity_policies;
 mod ses_identity_send_loop;
 #[path = "all/ses_store_bounds.rs"]
 mod ses_store_bounds;
+#[path = "all/ses_template_listing.rs"]
+mod ses_template_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 // The `zz_` prefix keeps this service-wide suite sorted after the per-operation

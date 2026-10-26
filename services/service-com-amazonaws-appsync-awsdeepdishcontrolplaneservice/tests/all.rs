@@ -33,6 +33,8 @@ mod environment_variables;
 mod error_contract;
 #[path = "all/event_api.rs"]
 mod event_api;
+#[path = "all/function_update.rs"]
+mod function_update;
 #[path = "all/functions.rs"]
 mod functions;
 #[path = "all/graphql_api_create_rules.rs"]

@@ -133,6 +133,8 @@ mod notebook_instance_lifecycle;
 mod notebook_instance_stop;
 #[path = "all/notebook_lifecycle_config.rs"]
 mod notebook_lifecycle_config;
+#[path = "all/partner_app_creation.rs"]
+mod partner_app_creation;
 #[path = "all/partner_apps.rs"]
 mod partner_apps;
 #[path = "all/pipeline_execution.rs"]

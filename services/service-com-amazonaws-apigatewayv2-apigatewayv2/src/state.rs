@@ -2569,6 +2569,17 @@ pub const DEFAULT_TRY_IT_STATE: &str = "DISABLED";
 /// `/portalproducts/{portalProductId}/productrestendpointpages/{pageId}`.
 pub const PRODUCT_REST_ENDPOINT_PAGE_RESOURCE_SEGMENT: &str = "/productrestendpointpages/";
 
+/// The sentence this service answers `NotFoundException` with for a request addressing a
+/// product REST endpoint page no record holds, whatever operation addressed it.
+///
+/// The portal resources of this API answer an unresolved identifier by naming the resource
+/// type alone, rather than with the `Invalid {resource} identifier specified
+/// {account}:{identifier}` sentence the older api-level resources use (see
+/// [`invalid_identifier_message`]) — so the sentence names neither the account nor the
+/// identifiers the request carried. Held here once so the wording cannot drift between the
+/// readers and the writers of one page.
+pub const PRODUCT_REST_ENDPOINT_PAGE_NOT_FOUND_MESSAGE: &str = "ProductRestEndpointPage not found";
+
 /// The ARN of a stored product REST endpoint page.
 ///
 /// Built like every other ARN this store names — through [`::engine::emulator_arn`] under

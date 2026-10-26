@@ -17,10 +17,12 @@
 //!
 //! Resources whose own `Create*` is implemented — clusters, model cards, model package
 //! groups — are created over the wire like everything else. The ones whose create is
-//! still a scaffolded stub (experiments, partner apps and Inference Recommender jobs)
-//! are seeded directly into the one shared store through this crate's public `state`
+//! still a scaffolded stub (experiments and Inference Recommender jobs) are seeded
+//! directly into the one shared store through this crate's public `state`
 //! module, which is the same store those operations will write when they are
-//! implemented. The operations UNDER TEST are always driven over the wire.
+//! implemented. Partner apps are seeded the same way where a case needs one in a given
+//! status, so the clock does not settle it out from under the call under test. The
+//! operations UNDER TEST are always driven over the wire.
 
 use std::time::{Duration, SystemTime};
 
@@ -163,6 +165,11 @@ fn seed_partner_app(emulator: &Emulator, app_id: &str, status: &str) -> String {
             creation_time: now,
             last_modified_time: now,
             available_at: now + Duration::from_secs(3_600),
+            // The configuration a create carries is not what this suite is about, and a
+            // seeded app has no idempotency token and no tags.
+            settings: sm::PartnerAppSettings::default(),
+            client_token: None,
+            tags: Vec::new(),
             grants: Vec::new(),
         },
     );

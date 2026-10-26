@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTemplates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTemplates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTemplates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports this account's email templates — the name and creation timestamp of
+//! each — in one stable order, a page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -103,6 +97,19 @@ impl From<ListTemplatesErrorModeled> for ListTemplatesError {
     }
 }
 
+/// The page sizes `MaxItems` admits, from its own documentation: "This value must
+/// be at least 1 and less than or equal to 100." The model carries no `@range`, so
+/// the boundary validator passes a value outside it and this operation answers for
+/// it itself — and the two ends are NOT symmetric: the member's documentation goes
+/// on to say "If more than 100 items are requested, the page size will
+/// automatically set to 100", so a value past the ceiling is CLAMPED, while one
+/// below the floor is refused.
+const MAX_ITEMS_RANGE: std::ops::RangeInclusive<i32> = 1..=100;
+
+/// The page size used when the request names none: "If you do not specify a value,
+/// 10 is the default page size" (`ListTemplatesRequest$MaxItems`).
+const DEFAULT_MAX_ITEMS: usize = 10;
+
 /// The `ListTemplates` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -139,18 +146,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTemplates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTemplatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTemplates"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+        let page_size = match input.max_items {
+            // Absent `MaxItems`: the operation's own default page size, never the
+            // whole store.
+            None => DEFAULT_MAX_ITEMS,
+            // At or above the floor, the ceiling is applied by clamping rather
+            // than refusing, which is what the member documents.
+            Some(max_items) if max_items >= *MAX_ITEMS_RANGE.start() => {
+                max_items.min(*MAX_ITEMS_RANGE.end()) as usize
+            }
+            Some(max_items) => {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    format!("Invalid MaxItems <{max_items}>."),
+                ))
+            }
+        };
+
+        // A page token is OPAQUE and self-verifying: only a cursor this listing
+        // issued names a position in it, so anything else is refused instead of
+        // being read as some arbitrary position. Checked before the store is
+        // reached, because the answer does not depend on it. The refusal quotes
+        // the rejected value in angle brackets, as this service words it.
+        let resume_from = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(crate::state::LISTING_TEMPLATES, token).ok_or_else(
+                    || {
+                        crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
+                            "Invalid PageToken <{token}>."
+                        ))
+                    },
+                )?,
+            ),
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and it models no server
+            // error of its own.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListTemplates",
+            ));
+        };
+        let state = state.lock();
+
+        // The store is keyed by the template name, so iteration is in one stable
+        // (lexicographic) order for every caller — which is what makes a
+        // `NextToken` resumable at all. The cursor names the template the next
+        // page starts at, so a page boundary never repeats or skips an entry even
+        // when templates are added or removed between calls.
+        let page = match resume_from.as_deref() {
+            Some(resume_from) => (
+                std::ops::Bound::Included(resume_from),
+                std::ops::Bound::Unbounded,
+            ),
+            None => (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+        };
+        let mut templates_metadata: Vec<TemplateMetadata> = Vec::new();
+        let mut next_token = None;
+        for (name, template) in state.templates.range::<str, _>(page) {
+            if templates_metadata.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(
+                    crate::state::LISTING_TEMPLATES,
+                    name,
+                ));
+                break;
+            }
+            templates_metadata.push(TemplateMetadata {
+                name: Some(template.name.clone()),
+                created_timestamp: Some(::aws_smithy_types::DateTime::from(template.created_at)),
+            });
+        }
+
+        Ok(ListTemplatesOutput {
+            // Present even when empty: an account with no templates has an empty
+            // list, which is a different answer from an absent member.
+            templates_metadata: Some(templates_metadata),
+            next_token,
+        })
     }
 }

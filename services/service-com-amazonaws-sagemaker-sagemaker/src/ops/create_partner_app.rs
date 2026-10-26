@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePartnerApp
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePartnerApp`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePartnerApp::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: admits a `Type` this account holds a partner-application subscription
+//! for, refuses a `Name` it already holds an app under and a store past its bound, and
+//! otherwise mints the app's id, ARN and base URL into `crate::state` in `Creating`, with
+//! the instant the clock owes its move to `Available`.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +169,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePartnerApp` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePartnerAppErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePartnerApp"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // `ClientToken` "guarantees that the call to this API is idempotent" (the member's
+        // model doc), so a create presenting a token an app in the store was already minted
+        // under answers THAT app's ARN and mints nothing: a client retrying its own call
+        // must not end up with two apps. Judged first, so a retry is answered the same way
+        // however full the store has since become.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = store.partner_app_for_client_token(token) {
+                return Ok(CreatePartnerAppOutput {
+                    arn: Some(existing.arn.clone()),
+                });
+            }
+        }
+        // A partner AI app runs a third party's licensed application, which the account
+        // subscribes to in AWS Marketplace rather than through this API — so a type the
+        // account holds no subscription for cannot be provisioned at all. The model gives
+        // this operation no error for an unmet prerequisite of the request, so it is a 400
+        // `ValidationException`, and nothing is persisted.
+        if !store.subscribed_to_partner_app(&input.r#type) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::partner_app_not_subscribed(&input.r#type),
+            ));
+        }
+        // `Name` is the one identity the caller chooses (the id and the ARN are
+        // SageMaker's to mint), so a name this account already holds an app under is
+        // refused rather than given a second ARN the caller cannot tell from the first.
+        // The name is held against EVERYTHING this account holds, not against one Region:
+        // that is the scope the store and `ListPartnerApps` have, so a name a listing
+        // reports twice is never created (see `partner_app_named`).
+        // `ConflictException` is the conflict this operation models, and it is decided
+        // before the quota below: a create that cannot add a record cannot exceed a count
+        // limit.
+        if let Some(existing) = store.partner_app_named(&input.name) {
+            let arn = existing.arn.clone();
+            return Err(CreatePartnerAppErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Partner app {arn} already exists with the name {}.",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+        // The store is bounded, so a caller varying `Name` cannot grow it without end.
+        // `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.partner_apps_below_quota() {
+            return Err(CreatePartnerAppErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for SageMaker Partner AI Apps is \
+                         {}, with current utilization of {} and a request delta of 1.",
+                        crate::state::PARTNER_APP_QUOTA,
+                        store.partner_apps.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The id is the ARN's identity, so a clash is re-minted rather than assumed away.
+        let mut app_id = crate::state::mint_partner_app_id();
+        while store.partner_apps.contains_key(&app_id) {
+            app_id = crate::state::mint_partner_app_id();
+        }
+        let arn = crate::state::resource_arn(&region, "partner-app", &app_id);
+        let app = crate::state::PartnerApp {
+            base_url: crate::state::partner_app_base_url(&region, &app_id),
+            app_id: app_id.clone(),
+            arn: arn.clone(),
+            name: input.name,
+            app_type: input.r#type,
+            // A freshly created app is being provisioned and serves nothing yet: the clock
+            // owes it the move to `Available` at `available_at`, which the reporting
+            // operations materialise.
+            status: crate::state::PARTNER_APP_STATUS_CREATING.to_string(),
+            creation_time: now,
+            last_modified_time: now,
+            available_at: now + crate::state::PARTNER_APP_AVAILABLE_AFTER,
+            settings: crate::state::PartnerAppSettings {
+                execution_role_arn: input.execution_role_arn,
+                tier: input.tier,
+                auth_type: input.auth_type,
+                kms_key_id: input.kms_key_id,
+                maintenance_config: input.maintenance_config,
+                application_config: input.application_config,
+                idc_config: input.idc_config,
+                enable_iam_session_based_identity: input.enable_iam_session_based_identity,
+                enable_auto_minor_version_upgrade: input.enable_auto_minor_version_upgrade,
+            },
+            client_token: input.client_token,
+            tags: input.tags.unwrap_or_default(),
+            // No presigned URL has been asked for yet.
+            grants: Vec::new(),
+        };
+        store.partner_apps.insert(app_id, app);
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreatePartnerAppOutput { arn: Some(arn) })
     }
 }
