@@ -643,6 +643,38 @@ pub fn decode_resource_name_page_token(token: &str) -> Option<String> {
     is_resource_name(&decoded).then_some(decoded)
 }
 
+/// Decode a page token [`encode_page_token`] produced for a report positioned by
+/// `RepositoryLinkId` (`ListRepositoryLinks`), or `None` when it is not one.
+///
+/// The same rule as [`decode_page_token`], applied to the key the repository-link store
+/// is ordered by: a token names a position only if it decodes to a label the modeled
+/// `RepositoryLinkId` admits, so a resource name's or an ARN's token names no position
+/// in the link store.
+pub fn decode_repository_link_id_page_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    is_repository_link_id(&decoded).then_some(decoded)
+}
+
+/// The group lengths of the modeled `RepositoryLinkId` pattern
+/// `^[0-9a-fA-F]{8}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{12}$`
+/// (`smithy_query(query="shape", shape="RepositoryLinkId")`) — the same 8-4-4-4-12
+/// grouping [`resource_id`] mints.
+const REPOSITORY_LINK_ID_GROUPS: &[usize] = &[8, 4, 4, 4, 12];
+
+/// Whether `candidate` satisfies the modeled `RepositoryLinkId` constraints: hex groups
+/// in the 8-4-4-4-12 grouping above.
+///
+/// The same rule the request walk applies to a `RepositoryLinkId` member, so the page
+/// token reader can never refuse a position this service issued itself.
+fn is_repository_link_id(candidate: &str) -> bool {
+    let mut groups = candidate.split('-');
+    REPOSITORY_LINK_ID_GROUPS.iter().all(|width| {
+        groups.next().is_some_and(|group| {
+            group.len() == *width && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    }) && groups.next().is_none()
+}
+
 /// The published maximum length of the modeled `ResourceName` (`length 1..100`, from
 /// `smithy_query(query="shape", shape="ResourceName")`).
 const MAX_RESOURCE_NAME_LEN: usize = 100;

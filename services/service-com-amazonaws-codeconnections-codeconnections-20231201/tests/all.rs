@@ -23,6 +23,8 @@ mod host_association;
 mod host_deletion;
 #[path = "all/list_hosts.rs"]
 mod list_hosts;
+#[path = "all/list_repository_links.rs"]
+mod list_repository_links;
 #[path = "all/list_repository_sync_definitions.rs"]
 mod list_repository_sync_definitions;
 #[path = "all/list_sync_configurations.rs"]

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRepositoryLinks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRepositoryLinks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRepositoryLinks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: a pure report over the repository links this account holds, walked in
+//! the store's own `RepositoryLinkId` order and paged through `state::page_of`, the one
+//! page bound and token rule every paginated report of this service applies.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +150,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRepositoryLinks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRepositoryLinksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRepositoryLinks"))
+        // A pure report over the stored repository links: "Lists the repository links
+        // created for connections in your account." Nothing here writes, so a later
+        // caller sees exactly what this one did.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRepositoryLinksErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The CodeConnections resource store is unavailable. Try again.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A token this service did not issue names no position, so the request is
+        // refused rather than silently answered from the top of the list — the same rule
+        // every paginated report of this service applies, on the key THIS report is
+        // positioned by (`RepositoryLinkId`). The refusal is this operation's modeled
+        // `InvalidInputException` (400), the code the rest of the repository-link
+        // surface answers for an input it cannot use: the input is what is wrong, and
+        // nothing is missing.
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(
+                crate::state::decode_repository_link_id_page_token(token).ok_or_else(|| {
+                    ListRepositoryLinksErrorModeled::InvalidInputException(InvalidInputException {
+                        message: Some(format!(
+                            "NextToken is not a token this service issued: '{token}'"
+                        )),
+                    })
+                })?,
+            ),
+            None => None,
+        };
+
+        let store = state.lock();
+        // Walked in `RepositoryLinkId` order (the `BTreeMap` key order), so the page a
+        // token resumes is the continuation of the page that issued it.
+        let matching: Vec<&crate::state::StoredRepositoryLink> = store
+            .repository_links
+            .values()
+            .filter(|link| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| link.repository_link_id.as_str() > after)
+            })
+            .collect();
+
+        // Server-side page bound and token: the one rule `state::page_of` holds for
+        // every paginated report of this service.
+        let (page, next_token) = crate::state::page_of(&matching, input.max_results, |link| {
+            link.repository_link_id.as_str()
+        });
+
+        Ok(ListRepositoryLinksOutput {
+            // The modeled `RepositoryLinks` member is required, so the list is always
+            // rendered — empty when the account holds no link, which is an answer
+            // rather than a missing member.
+            repository_links: page.iter().map(|link| link.to_modeled()).collect(),
+            next_token,
+        })
     }
 }
