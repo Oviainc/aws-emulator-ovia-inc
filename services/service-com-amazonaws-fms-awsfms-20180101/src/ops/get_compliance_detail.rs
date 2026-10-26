@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetComplianceDetail
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetComplianceDetail`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetComplianceDetail::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports, for ONE stored policy and ONE member account the policy applies to,
+//! the noncompliant resources Firewall Manager holds for that pair: the
+//! `PolicyComplianceDetail` whose `Violators` NAME the resources
+//! `ListComplianceStatus` only counts.
+//!
+//! The read is organisation-scoped — it answers about an organisation member
+//! account — so with no Firewall Manager administrator association in this
+//! account/Region it is refused by [`crate::state::require_administrator`]
+//! BEFORE any identifier is looked up. The pair is then resolved: a `PolicyId`
+//! naming no stored policy, and a `MemberAccount` the stored policy does not
+//! apply to
+//! ([`crate::state::ComAmazonawsFmsAwsfms20180101State::policy_scope_accounts`],
+//! the same scope `ListComplianceStatus` enumerates), are both the modelled
+//! not-found: Firewall Manager evaluates a policy only against the accounts it
+//! applies to, so no other pair has an evaluation to report.
+//!
+//! The detail itself is
+//! [`crate::state::ComAmazonawsFmsAwsfms20180101State::policy_compliance_detail`],
+//! which reads the SAME violation inventory the summary counts, so the two
+//! surfaces cannot disagree. Nothing is invented and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +166,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetComplianceDetail` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetComplianceDetailErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetComplianceDetail"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetComplianceDetailErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the Firewall Manager store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        // Authorization FIRST, before any identifier is looked up: this read
+        // answers about an organisation member account, so a caller that is
+        // neither a Firewall Manager administrator nor the organisation's
+        // management account is refused identically whatever it sent — a refusal
+        // that leaked whether the policy exists would tell an unauthorized
+        // caller what the organisation holds.
+        crate::state::require_administrator(&store, &region)?;
+
+        // "The ID of the policy that you want to get the details for": an id
+        // naming no stored policy is the modelled not-found.
+        let Some(policy) = store.policies.get(&input.policy_id) else {
+            return Err(GetComplianceDetailErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            )
+            .into());
+        };
+
+        // "The Amazon Web Services account that owns the resources that you want
+        // to get the details for" is a MEMBER account of the policy: Firewall
+        // Manager evaluates a policy against the accounts the policy applies to,
+        // which is the scope `ListComplianceStatus` enumerates one entry per. An
+        // account outside that scope was never evaluated against this policy, so
+        // there is no compliance detail of it to report, and the pair is the same
+        // modelled not-found as an unknown policy — rather than an invented
+        // evaluation that would contradict the summary.
+        if !store
+            .policy_scope_accounts(&policy.policy)
+            .contains(&input.member_account)
+        {
+            return Err(GetComplianceDetailErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            )
+            .into());
+        }
+
+        Ok(GetComplianceDetailOutput {
+            policy_compliance_detail: Some(
+                store.policy_compliance_detail(policy, &input.member_account),
+            ),
+        })
     }
 }

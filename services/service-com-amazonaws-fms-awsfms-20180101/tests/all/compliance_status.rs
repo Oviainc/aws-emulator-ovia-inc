@@ -83,7 +83,10 @@ const UNKNOWN_POLICY_ID: &str = "99999999-8888-7777-6666-555555555555";
 /// The account associated as the Firewall Manager administrator, which is also an
 /// account of its own organisation ("This account must be a member account of the
 /// organization", `AssociateAdminAccount`).
-const ADMIN: &str = "123456789012";
+///
+/// `pub(crate)` so a sibling suite in this test target reads its scope rows
+/// against the SAME organisation.
+pub(crate) const ADMIN: &str = "123456789012";
 
 /// Accounts a second stored policy names, so the organisation this store records
 /// holds accounts beside the administrator's own.
@@ -105,7 +108,10 @@ fn at(secs: u64) -> SystemTime {
 /// The `message` member of an awsJson1_1 error envelope, under either casing: the
 /// modelled error shapes of this service spell it `Message`, the synthetic
 /// authorization refusal `message`.
-fn error_message(body: &Value) -> String {
+///
+/// `pub(crate)` so a sibling suite in this test target reads a refusal's text
+/// through this one reader rather than a second copy of it.
+pub(crate) fn error_message(body: &Value) -> String {
     body.get("message")
         .or_else(|| body.get("Message"))
         .and_then(Value::as_str)
@@ -115,7 +121,10 @@ fn error_message(body: &Value) -> String {
 
 /// Make `admin` the Firewall Manager default administrator, which is what opens
 /// the organisation-scoped gate.
-async fn associate(router: &MultiServiceRouter, admin: &str) {
+///
+/// `pub(crate)` so a sibling suite in this test target opens the gate for the
+/// same administrator.
+pub(crate) async fn associate(router: &MultiServiceRouter, admin: &str) {
     let (status, body) = call(
         router,
         "AssociateAdminAccount",
@@ -155,7 +164,10 @@ fn policy_document(name: &str, include: Option<Value>, exclude: Option<Value>) -
 }
 
 /// Store one policy and return the `PolicyId` the service minted for it.
-async fn put_policy(
+///
+/// `pub(crate)` so a sibling suite in this test target scopes a policy through
+/// this one writer rather than a second copy of the document builder.
+pub(crate) async fn put_policy(
     router: &MultiServiceRouter,
     name: &str,
     include: Option<Value>,
@@ -175,7 +187,10 @@ async fn put_policy(
 
 /// The accounts the organisation records beside the administrator, contributed by
 /// a policy that names them: the roster every scope row is read against.
-async fn put_roster(router: &MultiServiceRouter) {
+///
+/// `pub(crate)` so a sibling suite in this test target reads its scope rows
+/// against the SAME organisation roster.
+pub(crate) async fn put_roster(router: &MultiServiceRouter) {
     put_policy(
         router,
         "organisation-roster",

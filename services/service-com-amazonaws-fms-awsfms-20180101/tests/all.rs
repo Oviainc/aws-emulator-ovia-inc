@@ -47,6 +47,8 @@ mod apps_list_reporting;
 mod apps_lists_enumeration;
 #[path = "all/associable_discovered_resources.rs"]
 mod associable_discovered_resources;
+#[path = "all/compliance_detail.rs"]
+mod compliance_detail;
 #[path = "all/compliance_status.rs"]
 mod compliance_status;
 #[path = "all/discovered_resources.rs"]

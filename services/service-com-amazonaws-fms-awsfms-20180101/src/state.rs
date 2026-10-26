@@ -17,7 +17,7 @@ use crate::ops::types::{
     AccountScope, AdminAccountSummary, AdminScope, AppsListData, AppsListDataSummary,
     ComplianceViolator,
     DiscoveredResource, EvaluationResult, InvalidOperationException, OrganizationalUnitScope,
-    Policy, PolicyComplianceStatus,
+    Policy, PolicyComplianceDetail, PolicyComplianceStatus,
     PolicySummary, PolicyTypeScope, ProtocolsListData, ProtocolsListDataSummary, RegionScope,
     ResourceNotFoundException, ResourceSet, ResourceSetSummary, Tag,
 };
@@ -1610,16 +1610,40 @@ impl ComAmazonawsFmsAwsfms20180101State {
         })
     }
 
+    /// The violations recorded against ONE stored policy in ONE member account,
+    /// in ascending resource-id order.
+    ///
+    /// The ONE reading of the violation inventory both compliance surfaces make
+    /// — the per-account summary ([`Self::policy_compliance_status`]) and the
+    /// per-resource detail ([`Self::policy_compliance_detail`]) — so the two can
+    /// never disagree about what the evaluation of one account found.
+    ///
+    /// The records are keyed by [`policy_violation_key`], so one account's
+    /// violations under one policy are a CONTIGUOUS range: this walks that range
+    /// rather than filtering the whole inventory, and the order it yields them in
+    /// is the order of the last key segment, the violating resource's own id.
+    pub fn account_violations<'store>(
+        &'store self,
+        policy_id: &str,
+        account_id: &str,
+    ) -> impl Iterator<Item = &'store PolicyViolationRecord> + 'store {
+        let prefix = policy_violation_account_prefix(policy_id, account_id);
+        self.policy_violations
+            .range(prefix.clone()..)
+            .take_while(move |(key, _)| key.starts_with(&prefix))
+            .map(|(_, violation)| violation)
+    }
+
     /// The `PolicyComplianceStatus` of ONE member account under ONE stored
     /// policy: the per-account summary `ListComplianceStatus` reports.
     ///
     /// Every member is read off the store. The evaluation is the violations
-    /// recorded against THIS policy in THIS account ([`Self::policy_violations`]):
-    /// `ViolatorCount` is how many there are ("the number of resources that are
-    /// noncompliant with the specified policy"), the account is
-    /// [`POLICY_COMPLIANCE_NON_COMPLIANT`] exactly while at least one is recorded
-    /// and [`POLICY_COMPLIANCE_COMPLIANT`] otherwise, and
-    /// `EvaluationLimitExceeded` is set exactly when more than
+    /// recorded against THIS policy in THIS account
+    /// ([`Self::account_violations`]): `ViolatorCount` is how many there are
+    /// ("the number of resources that are noncompliant with the specified
+    /// policy"), the account is [`POLICY_COMPLIANCE_NON_COMPLIANT`] exactly while
+    /// at least one is recorded and [`POLICY_COMPLIANCE_COMPLIANT`] otherwise,
+    /// and `EvaluationLimitExceeded` is set exactly when more than
     /// [`EVALUATION_VIOLATOR_LIMIT`] of them are.
     ///
     /// `LastUpdated` is "the timestamp of the last update to the
@@ -1638,15 +1662,9 @@ impl ComAmazonawsFmsAwsfms20180101State {
         policy: &PolicyRecord,
         account_id: &str,
     ) -> PolicyComplianceStatus {
-        let prefix = policy_violation_account_prefix(&policy.policy_id, account_id);
         let mut violator_count: i64 = 0;
         let mut last_updated = policy.updated_at;
-        for violation in self
-            .policy_violations
-            .range(prefix.clone()..)
-            .take_while(|(key, _)| key.starts_with(&prefix))
-            .map(|(_, violation)| violation)
-        {
+        for violation in self.account_violations(&policy.policy_id, account_id) {
             violator_count += 1;
             last_updated = last_updated.max(violation.detected_at);
         }
@@ -1669,6 +1687,68 @@ impl ComAmazonawsFmsAwsfms20180101State {
                 evaluation_limit_exceeded: violator_count > EVALUATION_VIOLATOR_LIMIT,
             }]),
             last_updated: Some(::aws_smithy_types::DateTime::from(last_updated)),
+            issue_info_map: None,
+        }
+    }
+
+    /// The `PolicyComplianceDetail` of ONE member account under ONE stored
+    /// policy: the per-RESOURCE detail `GetComplianceDetail` reports, where
+    /// [`Self::policy_compliance_status`] reports the same evaluation counted.
+    ///
+    /// The evaluation is the one reading both surfaces make
+    /// ([`Self::account_violations`]) — the violations recorded against THIS
+    /// policy in THIS account — so the detail of an account and its summary can
+    /// never disagree: the detail names exactly the resources the summary
+    /// counted, in the inventory's own ascending resource-id order, each
+    /// projected by [`PolicyViolationRecord::violator`].
+    ///
+    /// The shape's own documentation is the rule for how much of that evaluation
+    /// it reports: "A maximum of 100 entries are displayed. If more than 100
+    /// resources are noncompliant, `EvaluationLimitExceeded` is set to `True`".
+    /// So `Violators` carries at most [`EVALUATION_VIOLATOR_LIMIT`] of them and
+    /// `EvaluationLimitExceeded` is set exactly when MORE than that many are
+    /// recorded — the same threshold, read off the same violations, as the
+    /// summary's `EvaluationResult$EvaluationLimitExceeded`. An account with
+    /// nothing recorded against it has an empty violator list, because no
+    /// violating resource of its is known.
+    ///
+    /// `IssueInfoMap` is left out for the reason it is on the summary. `ExpiredAt`
+    /// is left out too: it is "a timestamp that indicates when the returned
+    /// information should be considered out of date", so it reports how long this
+    /// evaluation stays valid, and nothing in this store holds that — the
+    /// violation inventory records when a violation was DETECTED, never when the
+    /// finding lapses, and Firewall Manager documents no validity window to
+    /// derive one from. A timestamp invented here would claim a freshness
+    /// guarantee no recorded state backs.
+    pub fn policy_compliance_detail(
+        &self,
+        policy: &PolicyRecord,
+        account_id: &str,
+    ) -> PolicyComplianceDetail {
+        let limit = usize::try_from(EVALUATION_VIOLATOR_LIMIT).unwrap_or(usize::MAX);
+        // ONE walk of the account's range decides both members: every recorded
+        // violation is counted, so the flag is about what the evaluation FOUND,
+        // while only the first `limit` of them are reported, which is what the
+        // flag then tells the caller it is missing.
+        let mut recorded: usize = 0;
+        let mut violators: Vec<ComplianceViolator> = Vec::new();
+        for violation in self.account_violations(&policy.policy_id, account_id) {
+            recorded += 1;
+            if violators.len() < limit {
+                violators.push(violation.violator());
+            }
+        }
+        PolicyComplianceDetail {
+            // "The Amazon Web Services account that created the Firewall Manager
+            // policy" (`PolicyComplianceDetail$PolicyOwner`): this emulator
+            // presents one account, and it is the account every stored policy's
+            // ARN names — the same reading the summary makes.
+            policy_owner: Some(::engine::emulator_account_id().to_string()),
+            policy_id: Some(policy.policy_id.clone()),
+            member_account: Some(account_id.to_string()),
+            violators: Some(violators),
+            evaluation_limit_exceeded: recorded > limit,
+            expired_at: None,
             issue_info_map: None,
         }
     }
