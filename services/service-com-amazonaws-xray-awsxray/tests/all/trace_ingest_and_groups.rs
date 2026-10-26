@@ -25,7 +25,7 @@
 //!   is deleted, and the reserved account-level `Default` group is listed
 //!   beside the stored ones (`group_control_plane.rs` owns that rule);
 //! * behaviour this slice does not implement (a `GetTraceSummaries`
-//!   `FilterExpression`, another `TimeRangeType`, sampling, a token this
+//!   `FilterExpression` that is not of the language, sampling, a token this
 //!   service never issued) is REFUSED with the service's own
 //!   `InvalidRequestException`, never answered with a success that ignored it,
 //!   while a violated MODELLED constraint is refused by the request layer as
@@ -134,7 +134,7 @@ fn trace_cases() -> Vec<TraceCase> {
             annotation_keys: vec![],
         },
         TraceCase {
-            case: "a 404 response is a 400-series error",
+            case: "a declared error beside the 404 response an SDK records with it",
             trace: three.clone(),
             documents: vec![json!({
                 "trace_id": three,
@@ -142,6 +142,7 @@ fn trace_cases() -> Vec<TraceCase> {
                 "name": "svc",
                 "start_time": 200.0_f64,
                 "end_time": 200.25_f64,
+                "error": true,
                 "http": {"request": {"method": "POST", "url": "http://localhost/missing"}, "response": {"status": 404}},
             })
             .to_string()],
@@ -157,7 +158,11 @@ fn trace_cases() -> Vec<TraceCase> {
             annotation_keys: vec![],
         },
         TraceCase {
-            case: "a 503 response is a 500-series fault",
+            // The same response with NO flag declared: the status is reported
+            // as `Http$HttpStatus` and sets no flag, because the status-to-flag
+            // convention belongs to the instrumentation that writes the
+            // document.
+            case: "a 503 response that declares no fault is no fault",
             trace: four.clone(),
             documents: vec![json!({
                 "trace_id": four,
@@ -171,7 +176,7 @@ fn trace_cases() -> Vec<TraceCase> {
             duration: 0.5,
             response_time: Some(0.5),
             has_error: false,
-            has_fault: true,
+            has_fault: false,
             has_throttle: false,
             is_partial: false,
             http_status: Some(503),
@@ -180,12 +185,11 @@ fn trace_cases() -> Vec<TraceCase> {
             annotation_keys: vec![],
         },
         TraceCase {
-            // 429 is IN the 400 series, so a throttled request is reported by
-            // both flags: `$HasThrottle` ("a 429 throttling error") and
-            // `$HasError` ("a 400 series error"), which the model does not make
-            // exclusive. Only the COUNTERS split it
-            // (`ErrorStatistics$ThrottleCount` rather than `$OtherCount`).
-            case: "a 429 response is a throttle and a 400-series error",
+            // A throttle DECLARED as a flag, beside the 429 an SDK records with
+            // it: X-Ray reclassifies a declared throttle rather than unioning
+            // it, so `$HasThrottle` alone is set and the counters count it under
+            // `ErrorStatistics$ThrottleCount`.
+            case: "a declared throttle beside a 429 response",
             trace: five.clone(),
             documents: vec![json!({
                 "trace_id": five,
@@ -193,12 +197,13 @@ fn trace_cases() -> Vec<TraceCase> {
                 "name": "svc",
                 "start_time": 400.0_f64,
                 "end_time": 400.125_f64,
+                "throttle": true,
                 "http": {"request": {"method": "GET", "url": "http://localhost/busy"}, "response": {"status": 429}},
             })
             .to_string()],
             duration: 0.125,
             response_time: Some(0.125),
-            has_error: true,
+            has_error: false,
             has_fault: false,
             has_throttle: true,
             is_partial: false,
@@ -1339,18 +1344,6 @@ async fn a_request_the_service_cannot_satisfy_is_refused_as_invalid() {
             "InvalidRequestException",
         ),
         (
-            "TimeRangeType Event",
-            "/TraceSummaries",
-            json!({"StartTime": 0.0_f64, "EndTime": 1.0_f64, "TimeRangeType": "Event"}),
-            "InvalidRequestException",
-        ),
-        (
-            "TimeRangeType Service",
-            "/TraceSummaries",
-            json!({"StartTime": 0.0_f64, "EndTime": 1.0_f64, "TimeRangeType": "Service"}),
-            "InvalidRequestException",
-        ),
-        (
             "TimeRangeType outside the model's value set",
             "/TraceSummaries",
             json!({"StartTime": 0.0_f64, "EndTime": 1.0_f64, "TimeRangeType": "Whenever"}),
@@ -1472,7 +1465,7 @@ async fn a_batch_at_the_cap_is_ingested_and_one_past_it_is_refused() {
 
 #[tokio::test]
 async fn the_options_this_slice_does_serve_are_accepted() {
-    use service_com_amazonaws_xray_awsxray::ops::get_trace_summaries::SUPPORTED_TIME_RANGE_TYPE;
+    use service_com_amazonaws_xray_awsxray::ops::get_trace_summaries::TIME_RANGE_TYPE_TRACE_ID;
 
     let xray = Xray::new();
     let trace = trace_id(80);
@@ -1481,13 +1474,14 @@ async fn the_options_this_slice_does_serve_are_accepted() {
     let put = xray.put_segments(std::slice::from_ref(&document)).await;
     assert_eq!(put.status, 200, "seeding must succeed, got {put:?}");
 
-    // Rows: the one supported TimeRangeType, sampling explicitly declined, an
+    // Rows: the trace-id TimeRangeType, sampling explicitly declined, an
     // empty FilterExpression, and one that selects the stored trace — each
-    // selects it.
+    // selects it. (The other two `TimeRangeType` members window a different
+    // instant of a trace, which `time_range_type.rs` covers row by row.)
     let rows: Vec<(&str, Value)> = vec![
         (
-            "the supported TimeRangeType",
-            json!({"StartTime": 7_999.0_f64, "EndTime": 8_001.0_f64, "TimeRangeType": SUPPORTED_TIME_RANGE_TYPE}),
+            "the trace-id TimeRangeType",
+            json!({"StartTime": 7_999.0_f64, "EndTime": 8_001.0_f64, "TimeRangeType": TIME_RANGE_TYPE_TRACE_ID}),
         ),
         (
             "sampling explicitly declined",

@@ -13,7 +13,8 @@
 //!   default (`Type` `NONE`, `Status` `ACTIVE`, no `KeyId`) until one is put —
 //!   and reading it never changes what a later caller sees;
 //! * `PutEncryptionConfig` replaces the whole document, so the next read answers
-//!   with the `Type` and `KeyId` it stored, whatever form the key selector took;
+//!   with the `Type` it stored and the ARN of the key its selector named,
+//!   whatever of the three selector forms the request used;
 //! * a stored configuration reports `Status` `UPDATING` until the clock makes it
 //!   `ACTIVE` ([`state::ENCRYPTION_SETTLE_AFTER`]), and that instant does not
 //!   depend on whether anybody read;
@@ -81,8 +82,8 @@ impl Xray {
     async fn call(&self, path: &str, body: &Value) -> Answer {
         let request = ::http::Request::builder()
             .method("POST")
-            .uri(format!("https://xray.us-east-1.amazonaws.com{path}"))
-            .header("host", "xray.us-east-1.amazonaws.com")
+            .uri(format!("https://xray.{REGION}.amazonaws.com{path}"))
+            .header("host", format!("xray.{REGION}.amazonaws.com"))
             .header("content-type", "application/json")
             .body(::bytes::Bytes::from(body.to_string()))
             .expect("the request builds");
@@ -116,6 +117,30 @@ impl Xray {
     }
 }
 
+/// The region every request below is addressed to, which is the one an
+/// unqualified key selector is qualified in.
+const REGION: &str = "us-east-1";
+
+/// The `KeyId` the configuration reports for a submitted selector: a selector
+/// that already carries the ARN fields as submitted, and an unqualified one
+/// (`alias/<name>`, or a bare key id, whose ARN resource is `key/<id>`)
+/// qualified with the region the request was addressed to and the account this
+/// emulator serves.
+fn expected_key(key_id: &str) -> String {
+    if key_id.starts_with("arn:") {
+        return key_id.to_string();
+    }
+    let resource = if key_id.starts_with("alias/") {
+        key_id.to_string()
+    } else {
+        format!("key/{key_id}")
+    };
+    format!(
+        "arn:aws:kms:{REGION}:{}:{resource}",
+        emulator_server::emulator_account_id()
+    )
+}
+
 /// Assert one answer carries exactly the `EncryptionConfig` document expected.
 fn assert_config(
     case: &str,
@@ -141,7 +166,7 @@ fn assert_config(
         "case {case:?}: expected Status {status:?}, got {:?}",
         answer.config("Status")
     );
-    let expected_key = key_id.map_or(Value::Null, |key_id| json!(key_id));
+    let expected_key = key_id.map_or(Value::Null, |key_id| json!(expected_key(key_id)));
     assert_eq!(
         answer.config("KeyId"),
         &expected_key,

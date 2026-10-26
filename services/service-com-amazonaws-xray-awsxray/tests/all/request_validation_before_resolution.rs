@@ -33,7 +33,8 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_xray_awsxray::ops::update_indexing_rule::ONLY_DEFAULT_RULE_IS_UPDATABLE;
 use service_com_amazonaws_xray_awsxray::state::{
-    CONFLICTING_GROUP_SELECTORS_MESSAGE, RETRIEVAL_TOKEN_HEX_DIGITS, TRACE_FORMAT_XRAY,
+    retrieval_token_check, CONFLICTING_GROUP_SELECTORS_MESSAGE, RETRIEVAL_TOKEN_HEX_DIGITS,
+    TRACE_FORMAT_XRAY,
 };
 
 use crate::xray_wire::{array, root_document, trace_id, Answer, Xray};
@@ -250,6 +251,19 @@ async fn seed_traffic(xray: &Xray) {
             "request": {"method": "GET", "url": "http://localhost/"},
             "response": {"status": request.status},
         });
+        // The outcome an instrumentation DECLARES beside the status it recorded:
+        // a 5xx answer is a fault, a 429 a throttle, any other 4xx an error. The
+        // service reads the declared flag and never the status, so a row that is
+        // to be selected by `fault` or `throttle` declares it here.
+        let declared = match request.status {
+            429 => Some("throttle"),
+            status if (400..500).contains(&status) => Some("error"),
+            status if status >= 500 => Some("fault"),
+            _ => None,
+        };
+        if let Some(flag) = declared {
+            document[flag] = json!(true);
+        }
         if let Some(annotations) = &request.annotations {
             document["annotations"] = annotations.clone();
         }
@@ -400,7 +414,12 @@ async fn a_groups_filter_expression_narrows_the_statistics_and_the_graph() {
 
     // An expression the compiler cannot evaluate is the ONE filter refusal left,
     // and it names what is at fault rather than claiming the group is missing.
-    create_group(&xray, "unevaluated", "rootcause.responsetime.service.name = \"alpha\"").await;
+    create_group(
+        &xray,
+        "unevaluated",
+        "rootcause.fault.service.account.id = \"000000000000\"",
+    )
+    .await;
     let mut body = window.clone();
     body["GroupName"] = json!("unevaluated");
     let refused = xray.call("/TimeSeriesServiceStatistics", &body).await;
@@ -563,13 +582,21 @@ async fn a_malformed_retrieval_token_is_refused_before_the_store_is_consulted() 
             "59adda79-1d1f-4b1e-9f3a-2c7d5e8a9b01".to_string(),
         ),
         ("a real token with surrounding space", format!(" {real} ")),
+        (
+            "the minted width and alphabet, carrying no check",
+            "0".repeat(RETRIEVAL_TOKEN_HEX_DIGITS),
+        ),
     ];
-    // The same length and alphabet the mint uses, so these COULD have been
-    // issued — and were not.
+    // Assembled the way the mint assembles one — a check half derived from the
+    // identifying half — so these COULD have been issued, and were not.
+    let intact = |identity: &str| format!("{identity}{}", retrieval_token_check(identity));
     let well_formed = [
-        ("all zeroes", "0".repeat(RETRIEVAL_TOKEN_HEX_DIGITS)),
-        ("all f", "f".repeat(RETRIEVAL_TOKEN_HEX_DIGITS)),
-        ("upper-case hexadecimal", "0123456789ABCDEF".repeat(2)),
+        ("an intact token nothing minted", intact("0000000000000000")),
+        ("another, over a different identity", intact("ffffffffffffffff")),
+        (
+            "upper-case hexadecimal",
+            intact("0123456789abcdef").to_uppercase(),
+        ),
     ];
 
     for (case, token) in &malformed {
@@ -595,7 +622,7 @@ async fn a_malformed_retrieval_token_is_refused_before_the_store_is_consulted() 
             assert_eq!(
                 (answer.status, answer.error_type.as_deref()),
                 (404, Some("ResourceNotFoundException")),
-                "case {case:?} on {path}: a well-formed token whose retrieval is not there is a 404, got {answer:?}"
+                "case {case:?} on {path}: an intact token whose retrieval is not there is a 404, got {answer:?}"
             );
         }
     }

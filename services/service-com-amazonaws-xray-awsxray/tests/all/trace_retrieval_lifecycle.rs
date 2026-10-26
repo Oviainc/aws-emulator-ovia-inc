@@ -24,9 +24,10 @@
 //!   uses;
 //! * a page carries at most the modelled maximum of traces, and a `NextToken`
 //!   is emitted only when traces are still unread;
-//! * a `RetrievalToken` that is not of the form this service mints is refused
-//!   with `InvalidRequestException` at HTTP 400 — before any lookup — by every
-//!   operation that takes one, while a WELL-FORMED token no stored retrieval
+//! * a `RetrievalToken` this service could not have ISSUED is refused with
+//!   `InvalidRequestException` at HTTP 400 — before any lookup — by every
+//!   operation that takes one, whether it is of another form entirely or an
+//!   issued token damaged in transit, while an INTACT token no stored retrieval
 //!   stands behind is refused with `ResourceNotFoundException` at HTTP 404;
 //! * `ListRetrievedTraces` requires a `TraceFormat`, and judges it before it
 //!   resolves the token; and
@@ -41,10 +42,10 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_xray_awsxray::ops::list_retrieved_traces::RETRIEVED_TRACES_PAGE_SIZE;
 use service_com_amazonaws_xray_awsxray::state::{
-    ComAmazonawsXrayAwsxrayState, RETRIEVAL_STATUS_CANCELLED, RETRIEVAL_STATUS_COMPLETE,
-    RETRIEVAL_STATUS_RUNNING, RETRIEVAL_STATUS_SCHEDULED, TRACE_FORMAT_OTEL, TRACE_FORMAT_XRAY,
-    TRACE_RETRIEVAL_RUNNING_SPAN_SECONDS, TRACE_RETRIEVAL_SCHEDULED_SPAN_SECONDS,
-    TRACE_RETRIEVAL_TIMEOUT_SECONDS,
+    retrieval_token_check, ComAmazonawsXrayAwsxrayState, RETRIEVAL_STATUS_CANCELLED,
+    RETRIEVAL_STATUS_COMPLETE, RETRIEVAL_STATUS_RUNNING, RETRIEVAL_STATUS_SCHEDULED,
+    TRACE_FORMAT_OTEL, TRACE_FORMAT_XRAY, TRACE_RETRIEVAL_RUNNING_SPAN_SECONDS,
+    TRACE_RETRIEVAL_SCHEDULED_SPAN_SECONDS, TRACE_RETRIEVAL_TIMEOUT_SECONDS,
 };
 
 use crate::trace_ingest_and_groups::{array, close, root_document, trace_id, Answer, Xray};
@@ -652,6 +653,15 @@ async fn a_retrieval_of_more_traces_than_a_page_is_paginated() {
 
 #[tokio::test]
 async fn a_malformed_token_is_a_bad_request_and_a_well_formed_unknown_one_is_not_found() {
+    /// One character of `token` changed, the last: a token damaged in transit.
+    fn damage_last(token: &str) -> String {
+        let mut digits: Vec<char> = token.chars().collect();
+        if let Some(last) = digits.last_mut() {
+            *last = if *last == 'a' { 'b' } else { 'a' };
+        }
+        digits.into_iter().collect()
+    }
+
     let xray = Xray::new();
     let base = base_window_start();
     // One real retrieval, so the store is not empty and the refusals below are
@@ -665,11 +675,16 @@ async fn a_malformed_token_is_a_bad_request_and_a_well_formed_unknown_one_is_not
     altered[0] = if altered[0] == 'a' { 'b' } else { 'a' };
     let altered: String = altered.into_iter().collect();
 
-    // Rows differ in HOW the token misses: one that could never have been
-    // minted (400, a request to fix) against one that could have been and was
-    // not (404, a retrieval that is not there). The lengths sit either side of
-    // the minted width, and `RetrievalToken`'s modelled `@length` is 0..1020, so
-    // every row below reaches the handler.
+    // Rows differ in HOW the token misses: one this service could not have
+    // issued (400, a request to fix) against one it could have and did not
+    // (404, a retrieval that is not there). A token carries a check over its
+    // own identifying half, so a value of the right width and charset that was
+    // damaged in transit — by ONE character — could not have been issued either,
+    // while an INTACT token naming no retrieval is assembled here by deriving
+    // the check the way the mint does. The lengths sit either side of the minted
+    // width, and `RetrievalToken`'s modelled `@length` is 0..1020, so every row
+    // below reaches the handler.
+    let intact = |identity: &str| format!("{identity}{}", retrieval_token_check(identity));
     let malformed = [
         ("the empty token", String::new()),
         ("a token that is not hexadecimal", "not-a-retrieval".to_string()),
@@ -680,11 +695,25 @@ async fn a_malformed_token_is_a_bad_request_and_a_well_formed_unknown_one_is_not
         ("one digit short of the minted width", "a".repeat(31)),
         ("one digit past the minted width", "a".repeat(33)),
         ("the longest token the model allows", "a".repeat(1_020)),
+        (
+            "the right width and charset, carrying no check",
+            "0".repeat(32),
+        ),
+        ("one character off a real token", altered),
+        (
+            "an intact token whose check half was damaged",
+            damage_last(&intact("0123456789abcdef")),
+        ),
     ];
     let well_formed = [
-        ("a well-formed token nothing minted", "0".repeat(32)),
-        ("the same, in upper case", "0123456789ABCDEF".repeat(2)),
-        ("one character off a real token", altered),
+        (
+            "an intact token nothing minted",
+            intact("0123456789abcdef"),
+        ),
+        (
+            "the same, in upper case",
+            intact("0123456789abcdef").to_uppercase(),
+        ),
     ];
     let operations = [
         "/ListRetrievedTraces",
@@ -709,7 +738,7 @@ async fn a_malformed_token_is_a_bad_request_and_a_well_formed_unknown_one_is_not
             assert_eq!(
                 (answer.status, answer.error_type.as_deref()),
                 (400, Some("InvalidRequestException")),
-                "case {case:?} on {path}: a token that could never have been minted must be refused as an invalid request, got {answer:?}"
+                "case {case:?} on {path}: a token this service could not have issued must be refused as an invalid request, got {answer:?}"
             );
             assert!(
                 answer
@@ -723,7 +752,7 @@ async fn a_malformed_token_is_a_bad_request_and_a_well_formed_unknown_one_is_not
             assert_eq!(
                 (answer.status, answer.error_type.as_deref()),
                 (404, Some("ResourceNotFoundException")),
-                "case {case:?} on {path}: a well-formed token no retrieval stands behind must be refused as not found, got {answer:?}"
+                "case {case:?} on {path}: an intact token no retrieval stands behind must be refused as not found, got {answer:?}"
             );
         }
     }

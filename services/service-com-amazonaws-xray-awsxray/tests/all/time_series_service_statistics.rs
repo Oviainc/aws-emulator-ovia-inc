@@ -9,10 +9,10 @@
 //!
 //! * every COMPLETED segment whose `start_time` falls in the half-open window
 //!   [`StartTime`, `EndTime`) is one request, counted into the `Period`-wide
-//!   aggregation period that contains it, and classified by the status it
-//!   recorded — 429 as `ErrorStatistics$ThrottleCount`, any other 4xx as
-//!   `ErrorStatistics$OtherCount`, 5xx under `FaultStatistics`, and every other
-//!   completed request as `OkCount` — with `TotalCount` the sum,
+//!   aggregation period that contains it, and classified by the outcome its
+//!   document DECLARED — a throttle as `ErrorStatistics$ThrottleCount`, another
+//!   error as `ErrorStatistics$OtherCount`, a fault under `FaultStatistics`, and
+//!   every other completed request as `OkCount` — with `TotalCount` the sum,
 //!   `TotalResponseTime` the aggregate of the counted requests' spans and
 //!   `ResponseTimeHistogram` their (value, prevalence) pairs;
 //! * aggregation periods are aligned to multiples of `Period` since the epoch,
@@ -26,10 +26,14 @@
 //!   `FilterExpression` selects \u2014 all of it when the group carries none, none of
 //!   it when the expression matches nothing \u2014 and either way the request is
 //!   ANSWERED, with `ContainsOldGroupVersions` false;
-//! * a selection this slice does not evaluate (an `EntitySelectorExpression`, a
-//!   forecast, a group that does not exist), a `Period` that is not a positive
-//!   number of seconds and a window the crate's shared check refuses (inverted,
-//!   or a bound no recorded traffic could carry) are REFUSED with
+//! * an `EntitySelectorExpression` narrows the aggregation to the entities it
+//!   names — one service's segments under `ServiceSummaryStatistics`, one edge's
+//!   calls under `EdgeSummaryStatistics` — and a selector naming nothing the
+//!   store recorded is ANSWERED with an empty series;
+//! * a selection this slice cannot read (a selector that is not of the
+//!   language, a forecast, a group that does not exist), a `Period` that is not
+//!   a positive number of seconds and a window the crate's shared check refuses
+//!   (inverted, or a bound no recorded traffic could carry) are REFUSED with
 //!   `InvalidRequestException`, never answered with an aggregation that ignored
 //!   them.
 
@@ -44,15 +48,41 @@ const PATH: &str = "/TimeSeriesServiceStatistics";
 /// are easy to read: `1_699_999_980 == 60 * 28_333_333`.
 const ALIGNED: f64 = 1_699_999_980.0;
 
+/// The outcome an instrumentation DECLARES on a document beside the status it
+/// recorded: a 5xx answer is a fault, a 429 a throttle, any other 4xx an error,
+/// and anything else none. The service classifies a request by the flag its
+/// document declared and never by the status it recorded, so a row that wants a
+/// request counted as a fault, an error or a throttle has to declare it — which
+/// is what this does for the status each row names.
+fn declared_for(status: Option<i64>) -> Option<&'static str> {
+    match status? {
+        429 => Some("throttle"),
+        status if (400..500).contains(&status) => Some("error"),
+        status if status >= 500 => Some("fault"),
+        _ => None,
+    }
+}
+
 /// One submitted segment document: a root segment named `svc`, optionally
-/// carrying an `http.response.status`, and in progress when it has no end.
-fn document(n: usize, trace: &str, start: f64, end: Option<f64>, status: Option<i64>) -> String {
+/// carrying an `http.response.status` and declaring an outcome beside it, and in
+/// progress when it has no end.
+fn document(
+    n: usize,
+    trace: &str,
+    start: f64,
+    end: Option<f64>,
+    status: Option<i64>,
+    flag: Option<&str>,
+) -> String {
     let mut segment = root_document(&format!("{n:016x}"), trace, "svc", start, end);
     if let Some(status) = status {
         segment["http"] = json!({
             "request": {"method": "GET", "url": "http://localhost/"},
             "response": {"status": status},
         });
+    }
+    if let Some(flag) = flag {
+        segment[flag] = json!(true);
     }
     segment.to_string()
 }
@@ -64,7 +94,8 @@ struct Request {
     start: f64,
     /// How long it took, or `None` while it is still in progress.
     duration: Option<f64>,
-    /// Its `http.response.status`, when it recorded one.
+    /// Its `http.response.status`, when it recorded one. The outcome its
+    /// document declares beside it is [`declared_for`].
     status: Option<i64>,
 }
 
@@ -529,6 +560,7 @@ async fn aggregates_the_stored_segments_into_periods() {
                     request.start,
                     request.duration.map(|duration| request.start + duration),
                     request.status,
+                    declared_for(request.status),
                 )
             })
             .collect();
@@ -587,7 +619,7 @@ async fn one_request_is_reported_under_one_period_whatever_window_asks() {
     let trace = trace_id(20);
     let at = ALIGNED + 42.0;
     let put = xray
-        .put_segments(&[document(0, &trace, at, Some(at + 0.5), Some(200))])
+        .put_segments(&[document(0, &trace, at, Some(at + 0.5), Some(200), None)])
         .await;
     assert_eq!(put.status, 200, "the ingest must succeed, got {put:?}");
 
@@ -636,7 +668,7 @@ async fn pages_the_periods_and_resumes_exactly_once() {
     let documents: Vec<String> = (0..MINUTES)
         .map(|minute| {
             let start = ALIGNED + 60.0 * minute as f64 + 5.0;
-            document(minute, &trace, start, Some(start + 0.25), Some(200))
+            document(minute, &trace, start, Some(start + 0.25), Some(200), None)
         })
         .collect();
     let put = xray.put_segments(&documents).await;
@@ -712,6 +744,7 @@ async fn refuses_what_it_cannot_aggregate() {
             ALIGNED + 1.0,
             Some(ALIGNED + 2.0),
             Some(200),
+            None,
         )])
         .await;
     assert_eq!(put.status, 200, "the ingest must succeed, got {put:?}");
@@ -754,11 +787,19 @@ async fn refuses_what_it_cannot_aggregate() {
     let base = json!({"StartTime": ALIGNED, "EndTime": ALIGNED + 60.0});
     let rows: Vec<(&str, Value)> = vec![
         (
-            "an EntitySelectorExpression is not evaluated",
-            json!({"EntitySelectorExpression": "service(id(name: \"svc\"))"}),
+            "an EntitySelectorExpression that is not of the language",
+            json!({"EntitySelectorExpression": "select everything"}),
         ),
         (
-            "a forecast needs an EntitySelectorExpression ID",
+            "an EntitySelectorExpression naming a function that selects no entity",
+            json!({"EntitySelectorExpression": "group(\"Default\")"}),
+        ),
+        (
+            "an id function labelling a member no entity has",
+            json!({"EntitySelectorExpression": "id(colour: \"red\")"}),
+        ),
+        (
+            "a forecast is not computed from recorded traffic",
             json!({"ForecastStatistics": true}),
         ),
         (

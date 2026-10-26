@@ -584,18 +584,22 @@ async fn a_remote_subsegment_infers_a_segment_for_the_service_it_called() {
 
 #[tokio::test]
 async fn the_outcome_flags_are_derived_from_each_recorded_outcome() {
-    // Rows: which outcome fields the document sets, or which status it
-    // recorded, and the three flags that follow.
+    // Rows: which outcome fields the document DECLARES, beside the status it
+    // also recorded, and the three flags that follow.
     //
     // Two rules meet here. The COUNTERS classify an entity exclusively (a fault
     // outranks a throttle, which outranks an error), which is what
-    // `ErrorStatistics` splits a call into. The FLAGS are the model's own
-    // wording: `$HasFault` is "a 500 series error", `$HasError` "a 400 series
-    // error" and `$HasThrottle` "a 429 throttling error", and nothing makes
-    // them exclusive — so a 429, being a 400-series status, is reported as both
-    // a throttle and an error. The one case X-Ray RECLASSIFIES rather than
-    // unions is a document that DECLARES the outcome a throttle: `throttle:
-    // true` with `error: true` is a throttle and not also an error.
+    // `ErrorStatistics` splits a call into. The FLAGS are the union of the
+    // outcomes the documents declared, which is not exclusive: two entities
+    // classified differently report two flags. The one case X-Ray RECLASSIFIES
+    // rather than unions is a document that DECLARES the outcome a throttle:
+    // `throttle: true` with `error: true` is a throttle and not also an error.
+    // A recorded `http.response.status` sets NO flag: it is data the document
+    // carries, reported as `Http$HttpStatus` and selectable through the
+    // `http.status` keyword, and the status-to-flag convention belongs to the
+    // instrumentation that writes the document, not to the service that reads
+    // it — so each status row below is also a row for "a document that declared
+    // nothing".
     let rows: Vec<(&str, Value, (bool, bool, bool))> = vec![
         ("nothing set", json!({}), (false, false, false)),
         ("fault", json!({"fault": true}), (true, false, false)),
@@ -617,24 +621,29 @@ async fn the_outcome_flags_are_derived_from_each_recorded_outcome() {
             (true, false, false),
         ),
         (
-            "a 500 status is a fault",
+            "a 500 status with no fault declared is no fault",
             json!({"http": {"response": {"status": 500}}}),
-            (true, false, false),
+            (false, false, false),
         ),
         (
-            "a 404 status is an error",
+            "a 404 status with no error declared is no error",
             json!({"http": {"response": {"status": 404}}}),
-            (false, true, false),
+            (false, false, false),
         ),
         (
-            "a 429 status is a throttle and a 400-series error",
+            "a 429 status with no throttle declared is no throttle",
             json!({"http": {"response": {"status": 429}}}),
-            (false, true, true),
+            (false, false, false),
+        ),
+        (
+            "a declared fault beside the 500 status an SDK records with it",
+            json!({"fault": true, "http": {"response": {"status": 500}}}),
+            (true, false, false),
         ),
         (
             "a throttle flag beside the 429 status an SDK records with it",
             json!({"throttle": true, "error": true, "http": {"response": {"status": 429}}}),
-            (false, true, true),
+            (false, false, true),
         ),
         (
             "a 200 status is none of them",
@@ -709,7 +718,8 @@ async fn each_outcome_flag_is_read_in_the_scope_the_model_documents_for_it() {
     // (`smithy_query(query="doc",shape="TraceSummary",member="HasFault")`), so
     // an outcome recorded by a document that is NOT the root sets only the
     // third. Each row puts the outcome on a second, child document of a root
-    // that recorded nothing.
+    // that recorded nothing. A row that records a STATUS and declares no flag
+    // records no outcome at all, so it sets no flag and is no root cause.
     let rows: Vec<ScopeCase> = vec![
         ScopeCase {
             case: "a child document's fault",
@@ -730,15 +740,21 @@ async fn each_outcome_flag_is_read_in_the_scope_the_model_documents_for_it() {
             causes: (0, 0),
         },
         ScopeCase {
-            case: "a child document's 500 status",
+            case: "a child document's 500 status, declaring no fault",
             recorded: json!({"http": {"response": {"status": 500}}}),
+            flags: (false, false, false),
+            causes: (0, 0),
+        },
+        ScopeCase {
+            case: "a child document's declared fault beside a 500 status",
+            recorded: json!({"fault": true, "http": {"response": {"status": 500}}}),
             flags: (false, false, false),
             causes: (1, 0),
         },
         ScopeCase {
-            case: "a child document's 429 status",
+            case: "a child document's 429 status, declaring no throttle",
             recorded: json!({"http": {"response": {"status": 429}}}),
-            flags: (false, false, true),
+            flags: (false, false, false),
             causes: (0, 0),
         },
     ];
@@ -823,8 +839,9 @@ async fn a_cause_block_becomes_a_root_cause_of_its_own_class() {
             "FaultRootCauses",
         ),
         (
-            "a 500 status with a cause",
+            "a declared fault beside a 500 status, with a cause",
             json!({
+                "fault": true,
                 "http": {"response": {"status": 500}},
                 "cause": cause("System.NullReferenceException", "null"),
             }),
@@ -1184,6 +1201,7 @@ fn corpus() -> Vec<(&'static str, String, Vec<String>)> {
                 "name": "shop",
                 "start_time": 1_500.0_f64,
                 "end_time": 1_500.2_f64,
+                "error": true,
                 "http": {"request": {"method": "GET", "url": "http://shop.example.com/cart"}, "response": {"status": 404}},
                 "annotations": {"stage": "prod"},
             })
@@ -1195,11 +1213,12 @@ fn corpus() -> Vec<(&'static str, String, Vec<String>)> {
             vec![root_document("0000000000000007", &partial, "slow", 1_600.0, None).to_string()],
         ),
         (
-            // A gateway that recorded the throttle as a STATUS rather than as a
-            // flag. 429 is in the 400 series, so this trace is a throttle AND a
-            // 400-series error, where the one above — which DECLARES `throttle`
-            // — is only a throttle.
-            "throttled-429",
+            // A gateway that recorded a 429 as a STATUS and DECLARED no
+            // outcome. The status is data the document carries, not a flag, so
+            // this trace records no outcome at all — where the one above, which
+            // declares `throttle`, is a throttle — while `http.status` still
+            // selects it.
+            "status-only",
             throttled_status.clone(),
             vec![json!({
                 "trace_id": throttled_status,
@@ -1234,12 +1253,12 @@ async fn a_filter_expression_selects_the_traces_it_matches() {
     // Rows: one expression per keyword class and per operator shape, with the
     // corpus traces it selects.
     let rows: Vec<(&str, Vec<&str>)> = vec![
-        ("ok", vec!["ok", "async-tail", "partial"]),
+        ("ok", vec!["ok", "async-tail", "partial", "status-only"]),
         ("fault", vec!["faulting", "remote"]),
-        // The 429 recorded as a STATUS is a 400-series error as well as a
-        // throttle; the one DECLARED with `throttle: true` is only a throttle.
-        ("error", vec!["errored", "throttled-429"]),
-        ("throttle", vec!["throttled", "throttled-429"]),
+        // Only a DECLARED outcome sets a flag: the trace that recorded a 429 as
+        // a status alone declares none, so neither keyword selects it.
+        ("error", vec!["errored"]),
+        ("throttle", vec!["throttled"]),
         ("partial", vec!["partial"]),
         ("fault = true", vec!["faulting", "remote"]),
         (
@@ -1247,7 +1266,7 @@ async fn a_filter_expression_selects_the_traces_it_matches() {
             vec![
                 "ok",
                 "throttled",
-                "throttled-429",
+                "status-only",
                 "async-tail",
                 "errored",
                 "partial",
@@ -1258,7 +1277,7 @@ async fn a_filter_expression_selects_the_traces_it_matches() {
             vec![
                 "ok",
                 "throttled",
-                "throttled-429",
+                "status-only",
                 "async-tail",
                 "errored",
                 "partial",
@@ -1266,11 +1285,11 @@ async fn a_filter_expression_selects_the_traces_it_matches() {
         ),
         (
             "NOT (fault OR error OR throttle)",
-            vec!["ok", "async-tail", "partial"],
+            vec!["ok", "async-tail", "partial", "status-only"],
         ),
         (
             "fault OR error",
-            vec!["faulting", "remote", "errored", "throttled-429"],
+            vec!["faulting", "remote", "errored"],
         ),
         ("service(\"api.example.com\")", vec!["faulting"]),
         ("service(\"frontend\", \"AWS::EC2::Instance\")", vec!["ok"]),
@@ -1282,7 +1301,7 @@ async fn a_filter_expression_selects_the_traces_it_matches() {
         ("service(\"frontend\") { http.status = 200 }", vec!["ok"]),
         ("service(\"frontend\") { http.status = 500 }", vec![]),
         ("http.status = 200", vec!["ok"]),
-        ("http.status >= 400", vec!["faulting", "errored", "throttled-429"]),
+        ("http.status >= 400", vec!["faulting", "errored", "status-only"]),
         ("http.status < 400", vec!["ok"]),
         ("http.url = \"http://api.example.com/\"", vec!["ok"]),
         ("http.url != \"http://api.example.com/\"", vec!["errored"]),
@@ -1329,9 +1348,12 @@ async fn a_filter_expression_selects_the_traces_it_matches() {
         ("fault AND service(\"gateway\")", vec![]),
         (
             "(fault OR throttle) AND NOT partial",
-            vec!["faulting", "throttled", "throttled-429", "remote"],
+            vec!["faulting", "throttled", "remote"],
         ),
-        ("not fault and not error and not throttle", vec!["ok", "async-tail", "partial"]),
+        (
+            "not fault and not error and not throttle",
+            vec!["ok", "async-tail", "partial", "status-only"],
+        ),
     ];
 
     #[allow(clippy::cast_possible_wrap)]
@@ -1515,8 +1537,26 @@ async fn an_expression_the_language_cannot_read_is_refused_on_both_surfaces() {
             stored_too: false,
         },
         BadExpression {
-            case: "a keyword with no value derived",
-            expression: "rootcause.responsetime.entity.name = \"x\"",
+            case: "a root cause member with no value derived",
+            expression: "rootcause.fault.service.account.id = \"000000000000\"",
+            stored_too: false,
+        },
+        // A root-cause block's keywords are the members of the part it names,
+        // and a comparison inside one is type-checked like any other: an entity
+        // name against a number can never hold, so every surface refuses it.
+        BadExpression {
+            case: "an entity name in a block compared to a number",
+            expression: "rootcause.responsetime.entity { name = 7 }",
+            stored_too: true,
+        },
+        BadExpression {
+            case: "an unknown member inside a root cause block",
+            expression: "rootcause.fault.entity { colour = \"red\" }",
+            stored_too: false,
+        },
+        BadExpression {
+            case: "a block on a keyword that scopes nothing",
+            expression: "http.status { name = \"x\" }",
             stored_too: false,
         },
     ];

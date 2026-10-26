@@ -550,6 +550,10 @@ async fn the_group_the_insight_belongs_to_narrows_the_graph() {
     let answered_trace = trace_id(21);
     let faulting_trace = trace_id(22);
     let mut faulting = root_document("c000000000000001", &faulting_trace, "lonely", base, Some(base + 1.0));
+    // The DECLARED fault is what makes this trace a faulting one: the 503 beside
+    // it is the status the instrumentation also recorded, and a status sets no
+    // flag.
+    faulting["fault"] = json!(true);
     faulting["http"] = json!({"response": {"status": 503}});
     let ingested = xray
         .put_segments(&[

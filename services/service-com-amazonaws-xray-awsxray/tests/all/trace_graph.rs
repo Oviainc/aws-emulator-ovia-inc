@@ -26,7 +26,9 @@
 //!   `ReferenceId` that resolves inside the same graph;
 //! * every node's `Root`, `State`, window and `SummaryStatistics` are
 //!   recomputed from the stored segments: only completed requests are counted,
-//!   classified fault / 429 throttle / other 4xx / ok;
+//!   classified fault / throttle / error / ok by the flags their documents
+//!   declared, and a node the graph knows only through another service's
+//!   downstream subsegment is `passive` rather than `active` or `unknown`;
 //! * the graph covers exactly the requested traces, a `NextToken` is emitted
 //!   only while nodes are unread and resumes exactly once, and a request this
 //!   operation cannot serve — an unstored trace id, a token it never issued,
@@ -37,7 +39,8 @@ use service_com_amazonaws_xray_awsxray::ops::get_trace_graph::{
     TRACE_GRAPH_PAGE_SIZE, TRACE_ID_NOT_FOUND,
 };
 use service_com_amazonaws_xray_awsxray::state::{
-    MAX_TRACE_IDS_PER_CALL, SERVICE_STATE_ACTIVE, SERVICE_STATE_UNKNOWN, SERVICE_TYPE_CLIENT,
+    MAX_TRACE_IDS_PER_CALL, SERVICE_STATE_ACTIVE, SERVICE_STATE_PASSIVE, SERVICE_STATE_UNKNOWN,
+    SERVICE_TYPE_CLIENT,
 };
 
 use super::trace_ingest_and_groups::{array, close, trace_id, Answer, Xray};
@@ -337,7 +340,7 @@ fn graph_cases() -> Vec<GraphCase> {
         nodes: vec![
             ("frontend", None, true, SERVICE_STATE_ACTIVE),
             ("frontend", Some(SERVICE_TYPE_CLIENT), false, SERVICE_STATE_UNKNOWN),
-            ("payments", Some("remote"), false, SERVICE_STATE_UNKNOWN),
+            ("payments", Some("remote"), false, SERVICE_STATE_PASSIVE),
         ],
         edges: vec![
             ("frontend", "payments#remote"),
@@ -357,7 +360,7 @@ fn graph_cases() -> Vec<GraphCase> {
         nodes: vec![
             ("frontend", None, true, SERVICE_STATE_ACTIVE),
             ("frontend", Some(SERVICE_TYPE_CLIENT), false, SERVICE_STATE_UNKNOWN),
-            ("DynamoDB", Some("AWS::DynamoDB"), false, SERVICE_STATE_UNKNOWN),
+            ("DynamoDB", Some("AWS::DynamoDB"), false, SERVICE_STATE_PASSIVE),
         ],
         edges: vec![
             ("frontend", "DynamoDB#AWS::DynamoDB"),
@@ -379,7 +382,7 @@ fn graph_cases() -> Vec<GraphCase> {
         nodes: vec![
             ("frontend", None, true, SERVICE_STATE_ACTIVE),
             ("frontend", Some(SERVICE_TYPE_CLIENT), false, SERVICE_STATE_UNKNOWN),
-            ("cache", Some("remote"), false, SERVICE_STATE_UNKNOWN),
+            ("cache", Some("remote"), false, SERVICE_STATE_PASSIVE),
         ],
         edges: vec![("frontend", "cache#remote"), ("frontend#client", "frontend")],
     });
@@ -418,7 +421,7 @@ fn graph_cases() -> Vec<GraphCase> {
         nodes: vec![
             ("frontend", None, true, SERVICE_STATE_ACTIVE),
             ("frontend", Some(SERVICE_TYPE_CLIENT), false, SERVICE_STATE_UNKNOWN),
-            ("queue", Some("remote"), false, SERVICE_STATE_UNKNOWN),
+            ("queue", Some("remote"), false, SERVICE_STATE_PASSIVE),
         ],
         edges: vec![("frontend", "queue#remote"), ("frontend#client", "frontend")],
     });
@@ -510,26 +513,40 @@ struct StatisticsCase {
     total_response_time: f64,
 }
 
-/// A completed root segment recording `status`, spanning `span` seconds.
-fn recording(trace: &str, id: &str, start: f64, span: f64, status: Option<i64>) -> String {
+/// A completed root segment spanning `span` seconds, recording `status` and
+/// DECLARING the outcome `flag` beside it, the way an instrumentation that saw
+/// that status does.
+fn recording(
+    trace: &str,
+    id: &str,
+    start: f64,
+    span: f64,
+    status: Option<i64>,
+    flag: Option<&str>,
+) -> String {
     let mut document = segment(trace, id, None, "svc", start, Some(start + span));
     if let Some(status) = status {
         document["http"] = json!({"request": {"method": "GET", "url": "http://localhost/"}, "response": {"status": status}});
+    }
+    if let Some(flag) = flag {
+        document[flag] = json!(true);
     }
     document.to_string()
 }
 
 fn statistics_cases() -> Vec<StatisticsCase> {
-    // The rows walk the outcome classes a recorded `http.response.status`
-    // selects — 2xx ok, other 4xx, 429 throttle, 5xx fault — plus a request that
-    // never completed and a service that handled more than one.
+    // The rows walk the outcome classes a DECLARED flag selects — none ok, an
+    // error, a throttle, a fault — beside the status an instrumentation records
+    // with each, plus a 500 status that declares nothing (which records no
+    // outcome), a request that never completed, and a service that handled more
+    // than one.
     let mut cases = Vec::new();
 
     let trace = trace_id(211);
     cases.push(StatisticsCase {
         case: "a completed 200 is one ok request",
         trace: trace.clone(),
-        documents: vec![recording(&trace, "2110000000000001", 200.0, 0.5, Some(200))],
+        documents: vec![recording(&trace, "2110000000000001", 200.0, 0.5, Some(200), None)],
         ok: 1,
         throttle: 0,
         error_other: 0,
@@ -540,9 +557,16 @@ fn statistics_cases() -> Vec<StatisticsCase> {
 
     let trace = trace_id(212);
     cases.push(StatisticsCase {
-        case: "a completed 404 is one other error",
+        case: "a completed 404 that declares an error is one other error",
         trace: trace.clone(),
-        documents: vec![recording(&trace, "2120000000000001", 200.0, 0.25, Some(404))],
+        documents: vec![recording(
+            &trace,
+            "2120000000000001",
+            200.0,
+            0.25,
+            Some(404),
+            Some("error"),
+        )],
         ok: 0,
         throttle: 0,
         error_other: 1,
@@ -553,9 +577,16 @@ fn statistics_cases() -> Vec<StatisticsCase> {
 
     let trace = trace_id(213);
     cases.push(StatisticsCase {
-        case: "a completed 429 is one throttled error",
+        case: "a completed 429 that declares a throttle is one throttled error",
         trace: trace.clone(),
-        documents: vec![recording(&trace, "2130000000000001", 200.0, 0.125, Some(429))],
+        documents: vec![recording(
+            &trace,
+            "2130000000000001",
+            200.0,
+            0.125,
+            Some(429),
+            Some("throttle"),
+        )],
         ok: 0,
         throttle: 1,
         error_other: 0,
@@ -566,9 +597,16 @@ fn statistics_cases() -> Vec<StatisticsCase> {
 
     let trace = trace_id(214);
     cases.push(StatisticsCase {
-        case: "a completed 503 is one fault",
+        case: "a completed 503 that declares a fault is one fault",
         trace: trace.clone(),
-        documents: vec![recording(&trace, "2140000000000001", 200.0, 0.75, Some(503))],
+        documents: vec![recording(
+            &trace,
+            "2140000000000001",
+            200.0,
+            0.75,
+            Some(503),
+            Some("fault"),
+        )],
         ok: 0,
         throttle: 0,
         error_other: 0,
@@ -577,14 +615,36 @@ fn statistics_cases() -> Vec<StatisticsCase> {
         total_response_time: 0.75,
     });
 
+    // The status alone declares no outcome, so the request is one its service
+    // completed without error or fault.
+    let trace = trace_id(216);
+    cases.push(StatisticsCase {
+        case: "a completed 500 that declares no fault is one ok request",
+        trace: trace.clone(),
+        documents: vec![recording(&trace, "2160000000000001", 200.0, 0.5, Some(500), None)],
+        ok: 1,
+        throttle: 0,
+        error_other: 0,
+        fault: 0,
+        total: 1,
+        total_response_time: 0.5,
+    });
+
     let trace = trace_id(215);
     cases.push(StatisticsCase {
         case: "three segments of one service aggregate into its statistics",
         trace: trace.clone(),
         documents: vec![
-            recording(&trace, "2150000000000001", 200.0, 0.25, Some(200)),
-            recording(&trace, "2150000000000002", 201.0, 0.5, Some(200)),
-            recording(&trace, "2150000000000003", 202.0, 0.5, Some(500)),
+            recording(&trace, "2150000000000001", 200.0, 0.25, Some(200), None),
+            recording(&trace, "2150000000000002", 201.0, 0.5, Some(200), None),
+            recording(
+                &trace,
+                "2150000000000003",
+                202.0,
+                0.5,
+                Some(500),
+                Some("fault"),
+            ),
         ],
         ok: 2,
         throttle: 0,

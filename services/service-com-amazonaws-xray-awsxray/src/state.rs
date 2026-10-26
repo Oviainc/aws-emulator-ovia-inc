@@ -49,12 +49,13 @@
 //!   an INFERRED top-level segment synthesised for that downstream service
 //!   ([`inferred_segments`]), which is the service X-Ray attributes the call to;
 //! * every entity (a segment, or a subsegment inside one) records an
-//!   [`Outcome`], read from its own `fault`/`error`/`throttle` fields and
-//!   `http.response.status`: the one [`Classification`] a COUNTER splits it
+//!   [`Outcome`], read from the `fault`/`error`/`throttle` fields its document
+//!   DECLARED: the one [`Classification`] a COUNTER splits it
 //!   into (a fault outranks a throttle, which outranks an error), and whether it
-//!   recorded a 400-series error at all — which a throttle's own 429 status also
-//!   is, because the model's `HasError` ("a 400 series error") and `HasThrottle`
-//!   ("a 429 throttling error") are not exclusive. The trace's
+//!   recorded a 400-series error at all. A recorded `http.response.status` is
+//!   data the document carries, reported as `Http$HttpStatus` and selectable
+//!   through the `http.status` keyword, and it never stands in for a flag the
+//!   document did not set. The trace's
 //!   `HasFault`/`HasError`/`HasThrottle` flags and its root causes are read off
 //!   those outcomes.
 //!
@@ -248,6 +249,32 @@ pub fn is_kms_key_selector(key_id: &str) -> bool {
     is_kms_alias(key_id) || is_kms_key_id(key_id) || is_kms_arn(key_id)
 }
 
+/// The ARN of the KMS key a submitted `KeyId` selector names, as a caller in
+/// `region` reads it.
+///
+/// The configuration a reader reports IDENTIFIES the key that protects the
+/// account's trace data, and an identifier that names a key only inside one
+/// account and region does not identify it: a bare key id or alias is the same
+/// text in every account. So the stored configuration holds the FULLY QUALIFIED
+/// form — the partition, the region the configuration was put in and the account
+/// this service serves — whatever form the request used, and a selector that
+/// already carries those fields is kept exactly as submitted, including the
+/// partition, region and account it names.
+pub fn kms_key_arn(key_id: &str, region: &str) -> String {
+    if is_kms_arn(key_id) {
+        return key_id.to_string();
+    }
+    // The two unqualified forms `PutEncryptionConfig$KeyId` documents: an alias
+    // path, which an ARN carries as its resource unchanged, and a key id, whose
+    // resource is `key/<id>`.
+    let resource = if is_kms_alias(key_id) {
+        key_id.to_string()
+    } else {
+        format!("key/{key_id}")
+    };
+    ::emulator_server::emulator_arn("kms", region, &resource)
+}
+
 /// The encryption configuration this service reports: what `PutEncryptionConfig`
 /// last stored, and when the clock owes it `ACTIVE`.
 #[derive(Debug, Clone)]
@@ -255,9 +282,9 @@ pub struct EncryptionConfigRecord {
     /// `EncryptionConfig$Type`: [`ENCRYPTION_TYPE_KMS`] or
     /// [`ENCRYPTION_TYPE_NONE`].
     pub encryption_type: String,
-    /// `EncryptionConfig$KeyId`: the key the caller selected, kept in the form it
-    /// was given (the emulator resolves no KMS key, so it invents no other form);
-    /// `None` under [`ENCRYPTION_TYPE_NONE`].
+    /// `EncryptionConfig$KeyId`: the ARN of the key the caller selected, which
+    /// is what IDENTIFIES it ([`kms_key_arn`]); `None` under
+    /// [`ENCRYPTION_TYPE_NONE`].
     pub key_id: Option<String>,
     /// When `UPDATING` -> `ACTIVE` falls due; `None` once the configuration is
     /// active. See [`ENCRYPTION_SETTLE_AFTER`].
@@ -513,6 +540,26 @@ pub const MAX_SUBSEGMENT_DEPTH: usize = 16;
 /// the square of its size. Past the cap the answer is the first causes derived,
 /// which degrades the answer rather than the service.
 pub const MAX_ROOT_CAUSES_PER_TRACE: usize = 32;
+
+/// The most frames one response-time root cause's chain descends through
+/// ([`TraceRecord::root_causes`] for `RootCauseKind::ResponseTime`).
+///
+/// The descent takes one step per frame, and a stored trace can grow in two
+/// dimensions at once — [`MAX_SEGMENTS_PER_TRACE`] segments, each
+/// [`MAX_SUBSEGMENT_DEPTH`] levels deep — so this caps their product rather than
+/// either factor. Past it the chain reports the frames it reached.
+pub const MAX_CRITICAL_PATH_FRAMES: usize = MAX_SEGMENTS_PER_TRACE + MAX_SUBSEGMENT_DEPTH;
+
+/// How much of a trace's response time one component below its root segment must
+/// have been running for to be reported as the trace's response-time root cause
+/// ([`TraceRecord::root_causes`] for `RootCauseKind::ResponseTime`).
+///
+/// A response-time root cause names the component the time went to, so there has
+/// to be one: a trace whose root segment spent its span on nothing in particular
+/// — several short children, or no child at all — has no such component, and
+/// reports no cause. X-Ray publishes no threshold, so "most of the response
+/// time" is this emulator's reading of it.
+pub const RESPONSE_TIME_ROOT_CAUSE_MIN_COVERAGE: f64 = 0.5;
 
 /// The most sampling rules the store keeps; `CreateSamplingRule` past this is
 /// refused with the modelled `RuleLimitExceededException`.
@@ -986,6 +1033,12 @@ pub struct TraceRecord {
     /// When this trace was last ingested into, in [`ComAmazonawsXrayAwsxrayState::ingest_seq`]
     /// ticks. Orders eviction once the store is full.
     pub ingest_seq: u64,
+    /// When a segment of this trace was last accepted, in seconds of epoch
+    /// time: the trace's UPDATE time, which is the instant
+    /// `GetTraceSummaries$TimeRangeType` `Event` windows a trace by. Written at
+    /// ingest, so it is the service's own clock rather than anything a document
+    /// carried.
+    pub last_updated_at: f64,
 }
 
 /// One segment document, with the fields a reader needs lifted out of it and the
@@ -1111,18 +1164,23 @@ pub enum Classification {
     Fault,
 }
 
-/// Classify one entity from its own flags and recorded HTTP status.
+/// Classify one entity from the flags its own document declared.
 ///
-/// The flags come first and the status stands in for a flag the document did not
-/// set, which is what [`recorded_fault`] / [`recorded_throttle`] /
-/// [`recorded_error`] each state for one outcome; this is where the three become
-/// EXCLUSIVE, in the order X-Ray reclassifies them.
-fn classify(fault: bool, error: bool, throttle: bool, status: Option<i32>) -> Classification {
-    if recorded_fault(fault, status) {
+/// The outcome of an entity is the `fault` / `error` / `throttle` booleans its
+/// document SET. A recorded `http.response.status` is data the document carries
+/// — reported as `Http$HttpStatus` and selectable through the `http.status`
+/// keyword — and not one of those flags, so a document that declares none of
+/// them recorded none, whatever status it also recorded; the status-to-flag
+/// convention belongs to the instrumentation that writes the document, not to
+/// the service that reads it. This is where the three become EXCLUSIVE, in the
+/// order X-Ray reclassifies them: a fault outranks a throttle, which outranks
+/// an error.
+fn classify(fault: bool, error: bool, throttle: bool) -> Classification {
+    if fault {
         Classification::Fault
-    } else if recorded_throttle(throttle, status) {
+    } else if throttle {
         Classification::Throttle
-    } else if recorded_error(error, throttle, status) {
+    } else if recorded_error(error, throttle) {
         Classification::Error
     } else {
         Classification::Ok
@@ -1911,10 +1969,10 @@ fn cause_document(exceptions: &[CauseException]) -> serde_json::Value {
 ///
 /// Two facts, because the model reports two: the EXCLUSIVE class the counters
 /// split a call into ([`Classification`]), and whether the entity recorded a
-/// 400-series error at all — which a throttle's own 429 status also is. They
-/// disagree exactly where X-Ray does: a throttled request is counted under
-/// `ErrorStatistics$ThrottleCount` rather than `$OtherCount`, and still reported
-/// by `TraceSummary$HasError` when its status says 429.
+/// 400-series error at all. They disagree exactly where X-Ray does: a throttled
+/// request is counted under `ErrorStatistics$ThrottleCount` rather than
+/// `$OtherCount`, and a document that declared both a throttle and an error is a
+/// throttle alone.
 #[derive(Debug, Clone, Copy)]
 pub struct Outcome {
     /// The one class this entity is counted as.
@@ -1929,14 +1987,14 @@ impl SubsegmentRecord {
         self.http.as_ref().and_then(|http| http.response_status)
     }
 
-    /// This subsegment's outcome, from its own flags and recorded status.
+    /// This subsegment's outcome, from the flags it declared.
     pub fn classification(&self) -> Classification {
-        classify(self.fault, self.error, self.throttle, self.http_status())
+        classify(self.fault, self.error, self.throttle)
     }
 
     /// Whether this subsegment recorded a 400-series error.
     pub fn is_error(&self) -> bool {
-        recorded_error(self.error, self.throttle, self.http_status())
+        recorded_error(self.error, self.throttle)
     }
 
     /// This subsegment's recorded outcome: its exclusive class, and whether it
@@ -1948,19 +2006,26 @@ impl SubsegmentRecord {
         }
     }
 
-    /// Whether this subsegment recorded a 500-series fault.
+    /// Whether this subsegment declared a 500-series fault.
     pub fn is_fault(&self) -> bool {
-        recorded_fault(self.fault, self.http_status())
+        self.fault
     }
 
-    /// Whether this subsegment recorded a throttling error.
+    /// Whether this subsegment declared a throttling error.
     pub fn is_throttle(&self) -> bool {
-        recorded_throttle(self.throttle, self.http_status())
+        self.throttle
     }
 
     /// Whether this subsegment is a call OUT of the service it sits in.
     pub fn is_remote(&self) -> bool {
         self.namespace.as_deref() == Some(REMOTE_NAMESPACE)
+    }
+
+    /// How long this subsegment ran, in seconds; `None` unless it recorded both
+    /// of the instants a duration needs.
+    pub fn duration(&self) -> Option<f64> {
+        let span = self.end_time? - self.start_time?;
+        (span.is_finite() && span >= 0.0).then_some(span)
     }
 
     /// This subsegment as one frame of a root cause's entity path.
@@ -1969,6 +2034,16 @@ impl SubsegmentRecord {
             name: self.name.clone(),
             exceptions: self.exceptions.clone(),
             remote: self.is_remote(),
+            coverage: None,
+        }
+    }
+
+    /// This subsegment as one frame of a root cause's entity path, covering
+    /// `coverage` of the trace's response time.
+    fn entity_covering(&self, coverage: Option<f64>) -> RootCauseEntityView {
+        RootCauseEntityView {
+            coverage,
+            ..self.entity()
         }
     }
 
@@ -2019,33 +2094,14 @@ impl SubsegmentRecord {
 }
 
 /// Whether a recorded outcome is a 400-series error: the `error` flag the
-/// document set, or an `http.response.status` in the 400 series — which the 429
-/// of a throttled request is one of.
+/// document set, unless the same document also declared a `throttle`.
 ///
-/// `throttle` is consulted for ONE case, the only one a recorded response pins:
-/// a document whose FLAGS say `throttle: true, error: true` and that recorded no
-/// status comes back as a throttle and NOT as an error (X-Ray reclassifies a
-/// declared throttle rather than unioning it). A 400-series STATUS stands on its
-/// own, because the model words `TraceSummary$HasError` as "The root segment
-/// document has a 400 series error" and `$HasThrottle` as "One or more of the
-/// segment documents has a 429 throttling error"
-/// (`smithy_query(query="doc",shape="TraceSummary",member="HasError")`) without
-/// making the two exclusive: a 429 IS a 400-series status, so a request the
-/// service throttled is reported as both.
-fn recorded_error(error: bool, throttle: bool, status: Option<i32>) -> bool {
-    (error && !throttle) || status.is_some_and(|status| (400..500).contains(&status))
-}
-
-/// Whether a recorded outcome is a 500-series fault: the `fault` flag, or an
-/// `http.response.status` of 500 or above.
-fn recorded_fault(fault: bool, status: Option<i32>) -> bool {
-    fault || status.is_some_and(|status| status >= 500)
-}
-
-/// Whether a recorded outcome is a throttling error: the `throttle` flag, or an
-/// `http.response.status` of 429.
-fn recorded_throttle(throttle: bool, status: Option<i32>) -> bool {
-    throttle || status == Some(429)
+/// X-Ray reclassifies a declared throttle rather than unioning it, so a document
+/// whose flags say `throttle: true, error: true` comes back as a throttle and
+/// NOT as an error. Nothing else is consulted: `TraceSummary$HasError` reports
+/// what the documents declared, not what their recorded statuses imply.
+fn recorded_error(error: bool, throttle: bool) -> bool {
+    error && !throttle
 }
 
 impl SegmentRecord {
@@ -2054,9 +2110,9 @@ impl SegmentRecord {
         self.http.as_ref().and_then(|http| http.response_status)
     }
 
-    /// This segment's own outcome, from its own flags and recorded status.
+    /// This segment's own outcome, from the flags it declared.
     pub fn classification(&self) -> Classification {
-        classify(self.fault, self.error, self.throttle, self.http_status())
+        classify(self.fault, self.error, self.throttle)
     }
 
     /// How long this segment took, in seconds; `None` while it is in progress.
@@ -2090,10 +2146,10 @@ impl SegmentRecord {
             .collect()
     }
 
-    /// Whether this segment recorded a 400-series error — its `error` flag, or
-    /// an `http.response.status` in the 400 series.
+    /// Whether this segment recorded a 400-series error — the `error` flag it
+    /// declared, a throttle apart.
     pub fn is_error(&self) -> bool {
-        recorded_error(self.error, self.throttle, self.http_status())
+        recorded_error(self.error, self.throttle)
     }
 
     /// This segment's recorded outcome: its exclusive class, and whether it
@@ -2105,16 +2161,16 @@ impl SegmentRecord {
         }
     }
 
-    /// Whether this segment recorded a 500-series fault — its `fault` flag, or
-    /// an `http.response.status` of 500 or above.
+    /// Whether this segment declared a 500-series fault — the `fault` flag it
+    /// carried.
     pub fn is_fault(&self) -> bool {
-        recorded_fault(self.fault, self.http_status())
+        self.fault
     }
 
-    /// Whether this segment recorded a throttling error — its `throttle` flag,
-    /// or an `http.response.status` of 429.
+    /// Whether this segment declared a throttling error — the `throttle` flag it
+    /// carried.
     pub fn is_throttle(&self) -> bool {
-        recorded_throttle(self.throttle, self.http_status())
+        self.throttle
     }
 
     /// Whether this document is a SUBSEGMENT sent on its own, which the X-Ray
@@ -2135,6 +2191,16 @@ impl SegmentRecord {
             name: self.name.clone(),
             exceptions: self.exceptions.clone(),
             remote: self.inferred,
+            coverage: None,
+        }
+    }
+
+    /// This segment as one frame of a root cause's entity path, covering
+    /// `coverage` of the trace's response time.
+    fn entity_covering(&self, coverage: Option<f64>) -> RootCauseEntityView {
+        RootCauseEntityView {
+            coverage,
+            ..self.entity()
         }
     }
 
@@ -2227,26 +2293,36 @@ pub struct RootCauseEntityView {
     /// Whether this entity is a call out of its service (a dependency frame)
     /// rather than work inside it (a pipeline frame).
     pub remote: bool,
+    /// How much of the trace's response time this frame ran for, as a fraction
+    /// of it — `ResponseTimeRootCauseEntity$Coverage`, "the relative amount of
+    /// time that the component was running". Only a response-time root cause
+    /// reports it; the fault and error entity shapes carry no `Coverage` member,
+    /// so their frames leave it unset.
+    pub coverage: Option<f64>,
 }
 
-/// Which root causes a reader is asking for. X-Ray reports three lists on a
-/// `TraceSummary`; the two below are the ones a submitted document states an
-/// outcome for, and `ResponseTimeRootCauses` is derived from a response-time
-/// analysis this emulator does not perform, so it names no kind here.
+/// Which root causes a reader is asking for — the three lists X-Ray reports on a
+/// `TraceSummary`. Two are read off the outcome a submitted document declared;
+/// the third is read off the TIMING those documents recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootCauseKind {
     /// `TraceSummary$FaultRootCauses`.
     Fault,
     /// `TraceSummary$ErrorRootCauses`.
     Error,
+    /// `TraceSummary$ResponseTimeRootCauses`.
+    ResponseTime,
 }
 
 impl RootCauseKind {
-    /// The entity classification this kind of root cause is built from.
-    pub fn classification(self) -> Classification {
+    /// The entity classification this kind of root cause is built from, for the
+    /// two kinds a declared outcome builds; `None` for the response-time kind,
+    /// which is built from the recorded timing instead.
+    pub fn classification(self) -> Option<Classification> {
         match self {
-            Self::Fault => Classification::Fault,
-            Self::Error => Classification::Error,
+            Self::Fault => Some(Classification::Fault),
+            Self::Error => Some(Classification::Error),
+            Self::ResponseTime => None,
         }
     }
 }
@@ -2372,10 +2448,8 @@ impl TraceRecord {
     /// its document.
     ///
     /// Read off each entity's [`Outcome::error_400`] rather than its exclusive
-    /// class, because the two differ for a throttled request: a 429 is a
-    /// 400-series status, so the request is reported here AND by
-    /// [`has_throttle`](Self::has_throttle), while the counters still split it
-    /// under `ErrorStatistics$ThrottleCount` ([`recorded_error`]).
+    /// class, because the two differ where a document declared an error inside a
+    /// segment that is itself counted as something else ([`recorded_error`]).
     pub fn has_error(&self) -> bool {
         self.root().is_some_and(|root| {
             root.outcomes().iter().any(|outcome| outcome.error_400)
@@ -2400,7 +2474,9 @@ impl TraceRecord {
     }
 
     /// The root causes of `kind` this trace recorded
-    /// (`TraceSummary$FaultRootCauses` / `$ErrorRootCauses`).
+    /// (`TraceSummary$FaultRootCauses` / `$ErrorRootCauses`), or the one the
+    /// recorded timing explains ([`response_time_root_causes`](Self::response_time_root_causes))
+    /// for `RootCauseKind::ResponseTime`.
     ///
     /// One per segment whose own tree recorded the outcome: its `Services` are
     /// the chain of services from the trace's root down to that segment, each
@@ -2416,7 +2492,9 @@ impl TraceRecord {
     /// hop. A trace that recorded more outcomes than the cap therefore reports
     /// the first of them rather than making one read do super-linear work.
     pub fn root_causes(&self, kind: RootCauseKind) -> Vec<RootCauseView> {
-        let class = kind.classification();
+        let Some(class) = kind.classification() else {
+            return self.response_time_root_causes();
+        };
         let client_impacting = self
             .root()
             .is_some_and(|root| root.classification() == class);
@@ -2434,6 +2512,134 @@ impl TraceRecord {
             }
         }
         causes
+    }
+
+    /// The response-time root cause of this trace
+    /// (`TraceSummary$ResponseTimeRootCauses`), derived from the TIMING the
+    /// stored documents recorded rather than from an outcome any of them
+    /// declared.
+    ///
+    /// A trace's response time is its root segment's own span, and what explains
+    /// that span is the chain of components the time was spent in: starting at
+    /// the root segment, each step descends into the child entity that ran
+    /// LONGEST — a subsegment of the entity in hand, or the segment another
+    /// service reported under it — until no child recorded a span. That chain is
+    /// the cause's `Services`, root first, each carrying the frames inside it the
+    /// time ran through: the frame that called out of its service (`Remote`, a
+    /// dependency frame) or the work it did itself (a pipeline frame), with each
+    /// frame's `Coverage` the part of the response time it ran for.
+    ///
+    /// A cause is reported only when the chain reaches a component BELOW the
+    /// root segment that ran for at least
+    /// [`RESPONSE_TIME_ROOT_CAUSE_MIN_COVERAGE`] of the response time: a trace
+    /// whose time is not attributable to one component inside it has no
+    /// response-time root cause, which is why most traces report none. An
+    /// in-progress root segment has no response time yet, so it has none either.
+    ///
+    /// Bounded: the index of child segments is built once, the descent takes at
+    /// most [`MAX_CRITICAL_PATH_FRAMES`] steps, and each step looks only at the
+    /// children of the entity in hand.
+    fn response_time_root_causes(&self) -> Vec<RootCauseView> {
+        let Some(root_at) = self
+            .segments
+            .iter()
+            .position(|segment| segment.parent_id.is_none() && !segment.inferred)
+        else {
+            return Vec::new();
+        };
+        let Some(response_time) = self.segments[root_at]
+            .duration()
+            .filter(|span| span.is_finite() && *span > 0.0)
+        else {
+            return Vec::new();
+        };
+        let covers = |span: Option<f64>| span.map(|span| (span / response_time).clamp(0.0, 1.0));
+
+        // Which segments hang off which entity id, so a descent resolves the
+        // next service by lookup instead of re-scanning the trace per step.
+        let mut children_of: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        for (at, segment) in self.segments.iter().enumerate() {
+            if let Some(parent_id) = segment.parent_id.as_deref() {
+                children_of.entry(parent_id).or_default().push(at);
+            }
+        }
+
+        // The chain, root first: which segment each frame belongs to, so the
+        // frames can be grouped into one service per segment below.
+        let mut frames: Vec<(usize, RootCauseEntityView)> = vec![(
+            root_at,
+            self.segments[root_at].entity_covering(covers(Some(response_time))),
+        )];
+        let mut at = root_at;
+        let mut standing_on: Option<&SubsegmentRecord> = None;
+        let mut leaf_coverage = 0.0_f64;
+        for _ in 0..MAX_CRITICAL_PATH_FRAMES {
+            let (entity_id, subsegments) = match standing_on {
+                None => (
+                    Some(self.segments[at].id.as_str()),
+                    &self.segments[at].subsegments,
+                ),
+                Some(subsegment) => (subsegment.id.as_deref(), &subsegment.subsegments),
+            };
+            let longest_subsegment = subsegments
+                .iter()
+                .filter_map(|subsegment| Some((subsegment, subsegment.duration()?)))
+                .max_by(|left, right| left.1.total_cmp(&right.1));
+            let longest_segment = entity_id
+                .and_then(|entity_id| children_of.get(entity_id))
+                .into_iter()
+                .flatten()
+                .filter_map(|child| Some((*child, self.segments[*child].duration()?)))
+                .max_by(|left, right| left.1.total_cmp(&right.1));
+            let subsegment_span = longest_subsegment.map_or(f64::NEG_INFINITY, |(_, span)| span);
+            let segment_span = longest_segment.map_or(f64::NEG_INFINITY, |(_, span)| span);
+            if subsegment_span >= segment_span {
+                let Some((subsegment, span)) = longest_subsegment else {
+                    break;
+                };
+                leaf_coverage = covers(Some(span)).unwrap_or_default();
+                frames.push((at, subsegment.entity_covering(covers(Some(span)))));
+                standing_on = Some(subsegment);
+            } else {
+                let Some((child, span)) = longest_segment else {
+                    break;
+                };
+                leaf_coverage = covers(Some(span)).unwrap_or_default();
+                frames.push((child, self.segments[child].entity_covering(covers(Some(span)))));
+                at = child;
+                standing_on = None;
+            }
+        }
+
+        if frames.len() < 2 || leaf_coverage < RESPONSE_TIME_ROOT_CAUSE_MIN_COVERAGE {
+            return Vec::new();
+        }
+
+        // One service per segment the chain passed through, in the order it
+        // passed through them, carrying that segment's frames.
+        let mut services: Vec<RootCauseServiceView> = Vec::new();
+        let mut current: Option<(usize, Vec<RootCauseEntityView>)> = None;
+        for (segment_at, frame) in frames {
+            match &mut current {
+                Some((holder, path)) if *holder == segment_at => path.push(frame),
+                _ => {
+                    if let Some((holder, path)) = current.take() {
+                        services.push(self.segments[holder].service(path));
+                    }
+                    current = Some((segment_at, vec![frame]));
+                }
+            }
+        }
+        if let Some((holder, path)) = current {
+            services.push(self.segments[holder].service(path));
+        }
+
+        vec![RootCauseView {
+            services,
+            // The chain explains the ROOT segment's own span, which is the time
+            // the trace's client waited for, so the client saw it.
+            client_impacting: true,
+        }]
     }
 
     /// Every entity id in this trace — each segment's own, and each id in its
@@ -2533,6 +2739,7 @@ impl TraceRecord {
             last_end: 0.0,
             limit_exceeded: self.limit_exceeded,
             ingest_seq: self.ingest_seq,
+            last_updated_at: self.last_updated_at,
         };
         trimmed.recompute_bounds();
         trimmed
@@ -2659,6 +2866,9 @@ impl ComAmazonawsXrayAwsxrayState {
                 ..TraceRecord::default()
             });
         trace.ingest_seq = seq;
+        // The trace's update time: when THIS service accepted a document for
+        // it, which is what the `Event` time range windows a trace by.
+        trace.last_updated_at = now_epoch_seconds();
         match trace.segment_index.get(&segment.id).copied() {
             Some(at) => {
                 trace.segments[at] = segment;
@@ -3720,6 +3930,77 @@ pub mod filter_expression {
             Err(self.invalid())
         }
 
+        /// ```text
+        /// selector := "service" "(" id ")" | "edge" "(" id "," id ")" | id
+        /// ```
+        fn entity_selector(&mut self) -> Result<EntitySelector, Error> {
+            let start = self.peek_start();
+            let Some(Token::Field(function)) = self.peek().cloned() else {
+                return Err(self.invalid());
+            };
+            match function.as_str() {
+                "id" => Ok(EntitySelector::Service(self.entity_id()?)),
+                "service" => {
+                    self.at += 1;
+                    self.expect(&Token::OpenParen)?;
+                    let entity = self.entity_id()?;
+                    self.expect(&Token::CloseParen)?;
+                    Ok(EntitySelector::Service(entity))
+                }
+                "edge" => {
+                    self.at += 1;
+                    self.expect(&Token::OpenParen)?;
+                    let source = self.entity_id()?;
+                    self.expect(&Token::Comma)?;
+                    let destination = self.entity_id()?;
+                    self.expect(&Token::CloseParen)?;
+                    Ok(EntitySelector::Edge {
+                        source,
+                        destination,
+                    })
+                }
+                _ => Err(self.unreadable_at(start)),
+            }
+        }
+
+        /// ```text
+        /// id       := "id" "(" argument ("," argument)* ")"
+        /// argument := label ":" text
+        /// ```
+        fn entity_id(&mut self) -> Result<EntityId, Error> {
+            let start = self.peek_start();
+            match self.peek() {
+                Some(Token::Field(function)) if function == "id" => self.at += 1,
+                Some(_) => return Err(self.unreadable_at(start)),
+                None => return Err(self.invalid()),
+            }
+            self.expect(&Token::OpenParen)?;
+            let mut entity = EntityId::default();
+            loop {
+                let label_at = self.peek_start();
+                let Some(Token::Field(label)) = self.peek().cloned() else {
+                    return Err(self.invalid());
+                };
+                self.at += 1;
+                self.expect(&Token::Colon)?;
+                let value_at = self.peek_start();
+                let Operand::Text(value) = self.operand()? else {
+                    return Err(self.unreadable_at(value_at));
+                };
+                match label.as_str() {
+                    "name" => entity.name = Some(value),
+                    "type" => entity.r#type = Some(value),
+                    "account.id" => entity.account_id = Some(value),
+                    _ => return Err(self.unreadable_at(label_at)),
+                }
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
+            self.expect(&Token::CloseParen)?;
+            Ok(entity)
+        }
+
         fn expression(&mut self, depth: usize) -> Result<Node, Error> {
             // The terms and the operators between them, folded below so `AND`
             // binds tighter than `OR` while the WALK stays exactly what it was:
@@ -3911,6 +4192,64 @@ pub mod filter_expression {
     /// STORES it: [`parse`] with the tree thrown away.
     pub fn validate(expression: &str) -> Result<(), Error> {
         parse(expression).map(drop)
+    }
+
+    /// Which entities of the recorded traffic an aggregation covers.
+    ///
+    /// `GetTimeSeriesServiceStatistics$EntitySelectorExpression` is "a filter
+    /// expression defining entities that will be aggregated for statistics.
+    /// Supports ID, service, and edge functions" — a production of its own over
+    /// the same lexis as the boolean expression above, so it is read here, by the
+    /// same tokenizer, and refused in the same words.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum EntitySelector {
+        /// `id(…)` on its own, or wrapped in `service(…)`: the segments of the
+        /// service it names.
+        Service(EntityId),
+        /// `edge(id(…), id(…))`: the calls that reached the second entity from
+        /// the first.
+        Edge {
+            /// The entity the calls came from.
+            source: EntityId,
+            /// The entity they reached, whose segments the aggregate counts.
+            destination: EntityId,
+        },
+    }
+
+    /// What one `id(…)` function names: each member it labels is one the entity
+    /// has to match, and a member it omits narrows nothing.
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
+    pub struct EntityId {
+        /// `id(name: "…")`: the service's name.
+        pub name: Option<String>,
+        /// `id(type: "…")`: the service's type.
+        pub r#type: Option<String>,
+        /// `id(account.id: "…")`: the account the service runs in.
+        pub account_id: Option<String>,
+    }
+
+    /// Parse an `EntitySelectorExpression` into the entities it names, answering
+    /// `Ok` only for a selector X-Ray would accept.
+    pub fn parse_entity_selector(expression: &str) -> Result<EntitySelector, Error> {
+        if expression.trim().is_empty() {
+            return Err(Error::Empty);
+        }
+        if expression.chars().count() > MAX_LENGTH {
+            return Err(Error::Bound(format!(
+                "longer than the {MAX_LENGTH} characters this emulator parses"
+            )));
+        }
+        let characters: Vec<char> = expression.chars().collect();
+        let mut parser = Parser {
+            source: &characters,
+            tokens: tokenize(&characters)?,
+            at: 0,
+        };
+        let selector = parser.entity_selector()?;
+        if parser.peek().is_some() {
+            return Err(parser.invalid());
+        }
+        Ok(selector)
     }
 }
 
@@ -4271,55 +4610,90 @@ impl ComAmazonawsXrayAwsxrayState {
             .retain(|_, retrieval| retrieval.expires_at > now);
     }
 
-    /// Mint an opaque `RetrievalToken`: 32 hexadecimal digits, the first half the
-    /// never-reset [`retrieval_seq`](Self::retrieval_seq) and the second a mix of
-    /// what was asked for, so no two retrievals share a token even when they ask
-    /// for the same traces and no clock enters the value.
+    /// Mint an opaque `RetrievalToken`: [`RETRIEVAL_TOKEN_HEX_DIGITS`]
+    /// hexadecimal digits, of which the first half identifies the retrieval and
+    /// the second half is a CHECK over that first half
+    /// ([`retrieval_token_check`]), so a token that was damaged in transit can be
+    /// told from one this service never issued.
+    ///
+    /// The identifying half mixes the never-reset
+    /// [`retrieval_seq`](Self::retrieval_seq) with what the retrieval asked for,
+    /// so no two retrievals share a token even when they ask for the same traces
+    /// and no clock enters the value; a mixing that happened to land on a token
+    /// already held is re-mixed rather than returned, so the token a caller gets
+    /// names its own retrieval and no other.
     fn mint_retrieval_token(&self, trace_ids: &[String], start_time: f64, end_time: f64) -> String {
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.retrieval_seq.hash(&mut hasher);
-        trace_ids.hash(&mut hasher);
-        start_time.to_bits().hash(&mut hasher);
-        end_time.to_bits().hash(&mut hasher);
-        format!("{:016x}{:016x}", self.retrieval_seq, hasher.finish())
+        let mut token = String::new();
+        for attempt in 0..=MAX_TRACE_RETRIEVALS {
+            let identity = ::service_common::stable_hex_id(&[
+                &self.retrieval_seq.to_string(),
+                &attempt.to_string(),
+                &trace_ids.join(","),
+                &start_time.to_bits().to_string(),
+                &end_time.to_bits().to_string(),
+            ]);
+            token = format!("{identity}{}", retrieval_token_check(&identity));
+            if !self.retrievals.contains_key(&token) {
+                break;
+            }
+        }
+        token
     }
+}
+
+/// The CHECK half of a `RetrievalToken` whose identifying half is `identity`:
+/// the same deterministic mixing every derived id of this crate uses, so the
+/// check can be recomputed from the token alone
+/// ([`is_retrieval_token_form`]).
+///
+/// This makes the token integrity-checked, not unguessable: it tells a damaged
+/// token from an intact one, and nothing authenticates on it.
+pub fn retrieval_token_check(identity: &str) -> String {
+    ::service_common::stable_hex_id(&["retrieval-token", identity])
 }
 
 /// How many hexadecimal digits a `RetrievalToken` this service mints carries
 /// ([`ComAmazonawsXrayAwsxrayState::mint_retrieval_token`]).
 pub const RETRIEVAL_TOKEN_HEX_DIGITS: usize = 32;
 
-/// Whether `token` has the FORM a `RetrievalToken` this service issues has.
+/// Whether `token` is a `RetrievalToken` this service could have ISSUED: the
+/// right number of hexadecimal digits, and a check half that matches its
+/// identifying half ([`retrieval_token_check`]).
 ///
 /// The only retrieval tokens that exist are the ones `StartTraceRetrieval`
-/// minted, and every one of them is [`RETRIEVAL_TOKEN_HEX_DIGITS`] hexadecimal
-/// digits, so text of any other form could never have named a retrieval: it is a
-/// malformed parameter rather than a retrieval that is gone. That distinction is
-/// what lets the retrieval readers answer a malformed token with
-/// `InvalidRequestException` (HTTP 400) and reserve `ResourceNotFoundException`
-/// (HTTP 404) for a well-formed token whose retrieval was never started, has
-/// been evicted, or has timed out.
+/// minted, and every one of them carries that check, so a value whose check does
+/// not match could never have named a retrieval however much it looks like one:
+/// it is a malformed parameter rather than a retrieval that is gone — which is
+/// what a token damaged in transit, by one character or by many, is. That
+/// distinction is what lets the retrieval readers answer such a token with
+/// `InvalidRequestException` (HTTP 400) BEFORE any existence lookup, and reserve
+/// `ResourceNotFoundException` (HTTP 404) for an intact token whose retrieval was
+/// never started, has been evicted, or has timed out.
 ///
 /// Case-insensitive: the mint emits lowercase, but a token differing only in the
-/// case of its digits is still of the form, so it is answered as a retrieval
+/// case of its digits carries the same value, so it is answered as a retrieval
 /// that is not there rather than as a request that is wrong.
 pub fn is_retrieval_token_form(token: &str) -> bool {
-    token.len() == RETRIEVAL_TOKEN_HEX_DIGITS && token.chars().all(|c| c.is_ascii_hexdigit())
+    if token.len() != RETRIEVAL_TOKEN_HEX_DIGITS
+        || !token.chars().all(|digit| digit.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    let lowered = token.to_ascii_lowercase();
+    let (identity, check) = lowered.split_at(RETRIEVAL_TOKEN_HEX_DIGITS / 2);
+    retrieval_token_check(identity) == check
 }
 
 /// What a `RetrievalToken` that is not of [`is_retrieval_token_form`] is refused
 /// with, before any lookup: the name the operation gives the member, the value
 /// the request submitted, and why it could not be read.
 ///
-/// X-Ray words this refusal as "Invalid <member> <value> passed: Invalid
-/// Execution Id" — recorded as "Invalid execution id <token> passed: Invalid
-/// Execution Id" from `GetRetrievedTracesGraph` and "Invalid retrieval token
-/// <token> passed: Invalid Execution Id" from `CancelTraceRetrieval` — so the
-/// sentence is built here once and each reader passes the member name it uses.
+/// X-Ray words this refusal "Invalid <member> <value> passed: Invalid execution
+/// id provided: <value>" — the member the operation names, then the reason with
+/// the value it could not read — so the sentence is built here once and each
+/// reader passes the member name it uses (`retrieval token`, `execution id`).
 pub fn malformed_retrieval_token_message(member: &str, token: &str) -> String {
-    format!("Invalid {member} {token} passed: Invalid Execution Id")
+    format!("Invalid {member} {token} passed: Invalid execution id provided: {token}")
 }
 
 // ---------------------------------------------------------------------------
@@ -5463,10 +5837,15 @@ impl SamplingStatisticsStore {
 /// graph's window: the service answered.
 pub const SERVICE_STATE_ACTIVE: &str = "active";
 
-/// `Service$State` for a node whose every segment in the window is still in
-/// progress: nothing is known about how it answered. An INFERRED node — one no
-/// segment reported, such as a `client` — is always in this state.
+/// `Service$State` for a node whose every segment in the graph's window is still
+/// in progress: the service reported, but nothing is known yet about how it
+/// answered.
 pub const SERVICE_STATE_UNKNOWN: &str = "unknown";
+
+/// `Service$State` for a node the graph knows only through another service's
+/// downstream subsegment — a service that submitted no segment of its own, so
+/// X-Ray knows it passively, by being called.
+pub const SERVICE_STATE_PASSIVE: &str = "passive";
 
 /// `Service$Type` for the node that "represents the clients that sent requests
 /// to a root service".
@@ -5601,11 +5980,11 @@ impl CallStatistics {
     /// state uses, read here rather than recomputed.
     fn record(&mut self, call: Call) {
         self.total_count += 1;
-        // The call's flags already fold in the recorded `http.response.status`
+        // The call's flags are the ones its document declared
         // ([`Call::of_segment`] / [`Call::of_subsegment`] read them through
-        // `is_fault`/`is_throttle`/`is_error`), so the status is not consulted
-        // a second time here.
-        match classify(call.fault, call.error, call.throttle, None) {
+        // `is_fault`/`is_throttle`/`is_error`), and a recorded status is not one
+        // of them, so nothing here consults it.
+        match classify(call.fault, call.error, call.throttle) {
             Classification::Fault => self.fault_count += 1,
             Classification::Throttle => self.throttle_count += 1,
             Classification::Error => self.error_other_count += 1,
@@ -5816,13 +6195,17 @@ impl NodeAccumulator {
                 .clone()
                 .or_else(|| self.service_type.clone()),
             state: Some(
-                // An inferred node reported no segment of its own, so nothing
-                // about its state is known; a reported one is active once one of
-                // its segments completed.
-                if self.complete && key.inferred_type.is_none() {
-                    SERVICE_STATE_ACTIVE
-                } else {
-                    SERVICE_STATE_UNKNOWN
+                // A node the graph DISCOVERED downstream reported no segment of
+                // its own: it is known passively, by having been called, which
+                // is what distinguishes it from a service that reports. A node
+                // whose own segments are all still in progress has reported
+                // nothing to judge yet, and the `client` node is the stand-in
+                // for the callers of a root service rather than a service the
+                // graph discovered, so neither is passive.
+                match key.inferred_type.as_deref() {
+                    Some(SERVICE_TYPE_CLIENT) | None if self.complete => SERVICE_STATE_ACTIVE,
+                    Some(SERVICE_TYPE_CLIENT) | None => SERVICE_STATE_UNKNOWN,
+                    Some(_) => SERVICE_STATE_PASSIVE,
                 }
                 .to_string(),
             ),

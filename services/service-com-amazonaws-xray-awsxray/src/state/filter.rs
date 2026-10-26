@@ -44,20 +44,29 @@
 //! | `user` | string | `TraceUser$UserName` |
 //! | `resource.arn` | string | `ResourceARNDetail$ARN` |
 //! | `annotation.<key>` | any | `TraceSummary$Annotations` |
-//! | `rootcause.{fault,error}.service.{name,type}` | string | `FaultRootCauseService$Name` / `$Type` |
-//! | `rootcause.{fault,error}.service.inferred` | boolean | `FaultRootCauseService$Inferred` |
-//! | `rootcause.{fault,error}.entity.name` | string | `FaultRootCauseEntity$Name` |
-//! | `rootcause.{fault,error}.entity.remote` | boolean | `FaultRootCauseEntity$Remote` |
-//! | `rootcause.{fault,error}.exception.{name,message}` | string | `RootCauseException$Name` / `$Message` |
+//! | `rootcause.{fault,error,responsetime}.service.{name,type}` | string | `FaultRootCauseService$Name` / `$Type` |
+//! | `rootcause.{fault,error,responsetime}.service.inferred` | boolean | `FaultRootCauseService$Inferred` |
+//! | `rootcause.{fault,error,responsetime}.entity.name` | string | `FaultRootCauseEntity$Name` |
+//! | `rootcause.{fault,error,responsetime}.entity.remote` | boolean | `FaultRootCauseEntity$Remote` |
+//! | `rootcause.responsetime.entity.coverage` | number | `ResponseTimeRootCauseEntity$Coverage` |
+//! | `rootcause.{fault,error,responsetime}.exception.{name,message}` | string | `RootCauseException$Name` / `$Message` |
+//!
+//! A root-cause keyword is written either as the whole path above or as the
+//! class and part followed by a `{ … }` block whose keywords are that part's
+//! own members — `rootcause.responsetime.entity { name = "…" }` is
+//! `rootcause.responsetime.entity.name = "…"` — so the two forms compile to one
+//! field and are evaluated by one rule. A member the part does not carry is
+//! refused by name, and a comparison inside a block is type-checked like any
+//! other: an entity name against a number can never hold, so it is refused.
 //!
 //! `service("name"[, "type"])` and `edge("source", "destination")` scope the
 //! keywords inside their `{ … }` block to one service's segments, or to one
 //! edge's destination segments; a scope keyword without a block asks only
 //! whether the trace ran through it.
 //!
-//! A keyword whose value this emulator does not derive is REFUSED by name:
-//! `rootcause.responsetime.*` needs `TraceSummary$ResponseTimeRootCauses`, which
-//! nothing in a submitted document states, so it is not answered here.
+//! A keyword whose value this emulator does not derive is REFUSED by name,
+//! rather than answered with silence: a caller is not told "no traces match" for
+//! a question that was never asked.
 //!
 //! A value a trace carries more than once (an annotation several services
 //! recorded, the entities of a root cause) satisfies a comparison when ANY of
@@ -165,10 +174,13 @@ impl FilterError {
     }
 
     /// A comparison whose operands cannot be compared.
-    fn operands(detail: impl std::fmt::Display) -> Self {
+    ///
+    /// Worded as the SERVICE words it, so the sentence stands on its own rather
+    /// than under this module's "Invalid filter expression" preamble.
+    fn operands(message: impl std::fmt::Display) -> Self {
         Self {
+            message: message.to_string(),
             operand_mismatch: true,
-            ..Self::new(detail)
         }
     }
 }
@@ -194,6 +206,7 @@ pub struct FilterExpression {
 struct Reads {
     fault_root_causes: bool,
     error_root_causes: bool,
+    response_time_root_causes: bool,
     annotations: bool,
     /// Whether any scope is an `edge(…)`, which resolves a parent entity id to
     /// the service that holds it.
@@ -207,7 +220,7 @@ pub fn parse(source: &str) -> Result<FilterExpression, FilterError> {
         message: failure.message(),
         operand_mismatch: false,
     })?;
-    let root = compile(&parsed)?;
+    let root = compile(&parsed, None)?;
     let mut reads = Reads::default();
     note_reads(&root, &mut reads);
     Ok(FilterExpression { root, reads })
@@ -286,11 +299,12 @@ enum Literal {
 }
 
 impl Literal {
+    /// The data type this literal is of, as a refusal names it.
     fn kind(&self) -> &'static str {
         match self {
-            Self::Str(_) => "a string",
-            Self::Num(_) => "a number",
-            Self::Bool(_) => "a boolean",
+            Self::Str(_) => "String",
+            Self::Num(_) => "Number",
+            Self::Bool(_) => "Boolean",
         }
     }
 
@@ -318,27 +332,52 @@ enum Selector {
     Edge { source: String, destination: String },
 }
 
-/// Compile one parsed node.
+/// Which root cause's members the keywords of a `{ … }` block address, when the
+/// block is a root-cause one: `rootcause.<class>.<part> { … }` scopes its
+/// keywords to the members of that part, so `name` inside it is the part's own
+/// name and not a keyword of the trace.
+#[derive(Debug, Clone, Copy)]
+struct RootCauseBlock {
+    /// Which of the three root-cause lists the block reads.
+    kind: RootCauseKind,
+    /// Which member of a cause its keywords name.
+    part: RootCauseBlockPart,
+}
+
+/// The parts of a root cause a block can address — the three shapes a cause's
+/// `Services` carry: the service itself, the entity frames inside it, and the
+/// exceptions those frames named.
+#[derive(Debug, Clone, Copy)]
+enum RootCauseBlockPart {
+    Service,
+    Entity,
+    Exception,
+}
+
+/// Compile one parsed node, inside `block` when it sits in a root-cause block.
 ///
 /// The recursion follows the parsed tree's height, which
 /// [`super::filter_expression`] bounds.
-fn compile(node: &filter_expression::Node) -> Result<Node, FilterError> {
+fn compile(
+    node: &filter_expression::Node,
+    block: Option<RootCauseBlock>,
+) -> Result<Node, FilterError> {
     match node {
         filter_expression::Node::And(left, right) => Ok(Node::And(
-            Box::new(compile(left)?),
-            Box::new(compile(right)?),
+            Box::new(compile(left, block)?),
+            Box::new(compile(right, block)?),
         )),
         filter_expression::Node::Or(left, right) => Ok(Node::Or(
-            Box::new(compile(left)?),
-            Box::new(compile(right)?),
+            Box::new(compile(left, block)?),
+            Box::new(compile(right, block)?),
         )),
-        filter_expression::Node::Not(inner) => Ok(Node::Not(Box::new(compile(inner)?))),
+        filter_expression::Node::Not(inner) => Ok(Node::Not(Box::new(compile(inner, block)?))),
         filter_expression::Node::Predicate {
             path,
             arguments,
-            block,
+            block: inner,
             comparison,
-        } => compile_predicate(path, arguments, block.as_deref(), comparison.as_ref()),
+        } => compile_predicate(path, arguments, inner.as_deref(), comparison.as_ref(), block),
     }
 }
 
@@ -348,16 +387,24 @@ fn compile_predicate(
     arguments: &[filter_expression::Argument],
     block: Option<&filter_expression::Node>,
     comparison: Option<&(Operator, Operand)>,
+    inside: Option<RootCauseBlock>,
 ) -> Result<Node, FilterError> {
-    if path == "service" || path == "edge" {
+    if inside.is_none() && (path == "service" || path == "edge") {
         let selector = selector_of(path, arguments)?;
         let inner = match block {
             None => None,
-            Some(inner) => Some(Box::new(compile(inner)?)),
+            Some(inner) => Some(Box::new(compile(inner, None)?)),
         };
         return Ok(Node::Scoped { selector, inner });
     }
-    if block.is_some() {
+    // `rootcause.<class>.<part> { … }`: the block's keywords are the members of
+    // that part of a cause, so the block is compiled with them in scope.
+    if let Some(inner) = block {
+        if inside.is_none() {
+            if let Some(rest) = path.strip_prefix("rootcause.") {
+                return compile(inner, Some(root_cause_block(rest)?));
+            }
+        }
         return Err(unevaluated(format!(
             "`{path}` with a `{{ … }}` block is not evaluated by this emulator yet"
         )));
@@ -367,7 +414,10 @@ fn compile_predicate(
             "`{path}` with arguments is not evaluated by this emulator yet"
         )));
     }
-    let field = field_of(path)?;
+    let field = match inside {
+        None => field_of(path)?,
+        Some(block) => root_cause_member(block, path)?,
+    };
     match comparison {
         Some((op, operand)) => {
             let Some(value) = Literal::of(operand) else {
@@ -469,6 +519,10 @@ fn note_reads(node: &Node, reads: &mut Reads) {
                 kind: RootCauseKind::Error,
                 ..
             } => reads.error_root_causes = true,
+            Field::RootCause {
+                kind: RootCauseKind::ResponseTime,
+                ..
+            } => reads.response_time_root_causes = true,
             Field::Annotation(_) => reads.annotations = true,
             _ => {}
         },
@@ -522,6 +576,9 @@ enum RootCausePart {
     EntityRemote,
     ExceptionName,
     ExceptionMessage,
+    /// `ResponseTimeRootCauseEntity$Coverage`: the part of the trace's response
+    /// time the frame ran for.
+    EntityCoverage,
 }
 
 /// What type a keyword's value has, which is what a comparison is checked
@@ -544,6 +601,7 @@ impl Field {
             Self::Annotation(_) => ValueType::Any,
             Self::RootCause { part, .. } => match part {
                 RootCausePart::ServiceInferred | RootCausePart::EntityRemote => ValueType::Bool,
+                RootCausePart::EntityCoverage => ValueType::Num,
                 _ => ValueType::Str,
             },
         }
@@ -590,49 +648,114 @@ fn field_of(keyword: &str) -> Result<Field, FilterError> {
     }
 }
 
-/// `rootcause.<fault|error>.<service|entity|exception>.<member>`.
+/// `rootcause.<fault|error|responsetime>.<service|entity|exception>.<member>` —
+/// the whole path written out, as a keyword that stands on its own.
 fn root_cause_field(rest: &str) -> Result<Field, FilterError> {
     let (class, selector) = rest.split_once('.').ok_or_else(|| {
         unevaluated(format!(
             "`rootcause.{rest}` is not a root cause member this emulator evaluates"
         ))
     })?;
-    let kind = match class {
-        "fault" => RootCauseKind::Fault,
-        "error" => RootCauseKind::Error,
-        // `ResponseTimeRootCauses` is derived from a response-time analysis of
-        // the trace, which nothing in a submitted segment document states, so
-        // this emulator derives none and says so rather than answering a filter
-        // on them with silence.
-        "responsetime" => {
-            return Err(unevaluated(
-                "`rootcause.responsetime` is not evaluated by this emulator: it reports no ResponseTimeRootCauses",
-            ))
+    let kind = root_cause_kind(class)?;
+    let (part_name, member) = selector.split_once('.').ok_or_else(|| {
+        unevaluated(format!(
+            "`rootcause.{class}.{selector}` is not a root cause member this emulator evaluates"
+        ))
+    })?;
+    let part = root_cause_part(part_name).ok_or_else(|| {
+        unevaluated(format!(
+            "`rootcause.{class}.{part_name}` is not a part of a root cause"
+        ))
+    })?;
+    root_cause_member(RootCauseBlock { kind, part }, member)
+}
+
+/// Which of the three root-cause lists a class names.
+fn root_cause_kind(class: &str) -> Result<RootCauseKind, FilterError> {
+    match class {
+        "fault" => Ok(RootCauseKind::Fault),
+        "error" => Ok(RootCauseKind::Error),
+        "responsetime" => Ok(RootCauseKind::ResponseTime),
+        other => Err(unevaluated(format!(
+            "`rootcause.{other}` is not a root cause class"
+        ))),
+    }
+}
+
+/// Which part of a cause a path element names.
+fn root_cause_part(part: &str) -> Option<RootCauseBlockPart> {
+    match part {
+        "service" => Some(RootCauseBlockPart::Service),
+        "entity" => Some(RootCauseBlockPart::Entity),
+        "exception" => Some(RootCauseBlockPart::Exception),
+        _ => None,
+    }
+}
+
+/// The root cause class and part a `rootcause.<class>.<part>` keyword carrying a
+/// `{ … }` block addresses.
+fn root_cause_block(rest: &str) -> Result<RootCauseBlock, FilterError> {
+    let (class, part_name) = rest.split_once('.').ok_or_else(|| {
+        unevaluated(format!(
+            "`rootcause.{rest}` names no part of a root cause to scope a `{{ … }}` block to"
+        ))
+    })?;
+    let kind = root_cause_kind(class)?;
+    let part = root_cause_part(part_name).ok_or_else(|| {
+        unevaluated(format!(
+            "`rootcause.{class}.{part_name}` is not a part of a root cause"
+        ))
+    })?;
+    Ok(RootCauseBlock { kind, part })
+}
+
+/// The member `keyword` names inside a root-cause block: the members of the
+/// shapes a cause's `Services` carry — `FaultRootCauseService` /
+/// `ErrorRootCauseService` / `ResponseTimeRootCauseService`, their entity frames
+/// and those frames' exceptions — so a keyword addressing anything else is
+/// refused by name rather than evaluated to nothing.
+fn root_cause_member(block: RootCauseBlock, keyword: &str) -> Result<Field, FilterError> {
+    let part = match (block.part, keyword) {
+        (RootCauseBlockPart::Service, "name") => RootCausePart::ServiceName,
+        (RootCauseBlockPart::Service, "type") => RootCausePart::ServiceType,
+        (RootCauseBlockPart::Service, "inferred") => RootCausePart::ServiceInferred,
+        (RootCauseBlockPart::Entity, "name") => RootCausePart::EntityName,
+        (RootCauseBlockPart::Entity, "remote") => RootCausePart::EntityRemote,
+        // `Coverage` is a member of the response-time entity shape alone, so it
+        // reads nothing on a fault or an error cause.
+        (RootCauseBlockPart::Entity, "coverage")
+            if block.kind == RootCauseKind::ResponseTime =>
+        {
+            RootCausePart::EntityCoverage
         }
-        other => {
+        (RootCauseBlockPart::Exception, "name") => RootCausePart::ExceptionName,
+        (RootCauseBlockPart::Exception, "message") => RootCausePart::ExceptionMessage,
+        (part, other) => {
             return Err(unevaluated(format!(
-                "`rootcause.{other}` is not a root cause class"
+                "`{other}` is not a member of a root cause {} this emulator evaluates",
+                match part {
+                    RootCauseBlockPart::Service => "service",
+                    RootCauseBlockPart::Entity => "entity",
+                    RootCauseBlockPart::Exception => "exception",
+                }
             )))
         }
     };
-    let part = match selector {
-        "service.name" => RootCausePart::ServiceName,
-        "service.type" => RootCausePart::ServiceType,
-        "service.inferred" => RootCausePart::ServiceInferred,
-        "entity.name" => RootCausePart::EntityName,
-        "entity.remote" => RootCausePart::EntityRemote,
-        "exception.name" => RootCausePart::ExceptionName,
-        "exception.message" => RootCausePart::ExceptionMessage,
-        other => {
-            return Err(unevaluated(format!(
-                "`rootcause.{class}.{other}` is not a root cause member this emulator evaluates"
-            )))
-        }
-    };
-    Ok(Field::RootCause { kind, part })
+    Ok(Field::RootCause {
+        kind: block.kind,
+        part,
+    })
 }
 
 /// Refuse a comparison whose operands cannot be compared at all.
+///
+/// X-Ray words this refusal "You can't compare property [<property>] against
+/// the <Type> data type.", naming the keyword as the expression wrote it and
+/// the data type of the value it was compared to, so that is the sentence
+/// [`FilterError::operands`] carries — the one wording for every comparison this
+/// language cannot make, whether the types differ outright, the operator orders
+/// a value that has no order, or a string operator was given something that is
+/// not a string.
 fn check(keyword: &str, field: &Field, op: Operator, value: &Literal) -> Result<(), FilterError> {
     let expected = field.value_type();
     let compatible = matches!(
@@ -642,27 +765,14 @@ fn check(keyword: &str, field: &Field, op: Operator, value: &Literal) -> Result<
             | (ValueType::Num, Literal::Num(_))
             | (ValueType::Str, Literal::Str(_))
     );
-    if !compatible {
-        let wanted = match expected {
-            ValueType::Bool => "a boolean",
-            ValueType::Num => "a number",
-            ValueType::Str => "a string",
-            ValueType::Any => "a value",
-        };
+    // An ordering operator takes only a value that HAS an order, and a string
+    // operator only a string, so each operator class narrows what it can be
+    // given beyond the field's own type.
+    let ordered_well = !orders(op) || matches!(value, Literal::Num(_));
+    let textual_well = !textual(op) || matches!(value, Literal::Str(_));
+    if !(compatible && ordered_well && textual_well) {
         return Err(FilterError::operands(format!(
-            "`{keyword}` is {wanted} and cannot be compared to {}",
-            value.kind()
-        )));
-    }
-    if orders(op) && !matches!(value, Literal::Num(_)) {
-        return Err(FilterError::operands(format!(
-            "`{keyword}` cannot be ordered against {}",
-            value.kind()
-        )));
-    }
-    if textual(op) && !matches!(value, Literal::Str(_)) {
-        return Err(FilterError::operands(format!(
-            "a string operator cannot compare `{keyword}` to {}",
+            "You can't compare property [{keyword}] against the {} data type.",
             value.kind()
         )));
     }
@@ -730,6 +840,8 @@ struct Facts<'a> {
     fault_causes: Vec<RootCauseView>,
     /// The error root causes, when the expression reads them.
     error_causes: Vec<RootCauseView>,
+    /// The response-time root cause, when the expression reads it.
+    response_time_causes: Vec<RootCauseView>,
 }
 
 impl<'a> Facts<'a> {
@@ -772,6 +884,13 @@ impl<'a> Facts<'a> {
         } else {
             Vec::new()
         };
+        let response_time_causes = if reads.response_time_root_causes {
+            let causes = trace.root_causes(RootCauseKind::ResponseTime);
+            budget.spend(trace.segments.len() + causes.len());
+            causes
+        } else {
+            Vec::new()
+        };
         // `HasFault` and `HasError` are the ROOT segment document's and
         // `HasThrottle` is any document's, as `TraceSummary` documents each
         // (see `TraceRecord::root_document_has`), read here off the
@@ -785,8 +904,7 @@ impl<'a> Facts<'a> {
             fault: root_outcomes
                 .iter()
                 .any(|outcome| outcome.class == Classification::Fault),
-            // A 400-series error of the root document, which a throttled
-            // request's own 429 status is one of — exactly what
+            // A 400-series error the root document declared — exactly what
             // `TraceRecord::has_error` reports, so the keyword and the summary
             // cannot disagree.
             error: root_outcomes.iter().any(|outcome| outcome.error_400),
@@ -803,6 +921,7 @@ impl<'a> Facts<'a> {
             trace_flags,
             fault_causes,
             error_causes,
+            response_time_causes,
         }
     }
 
@@ -811,6 +930,7 @@ impl<'a> Facts<'a> {
         match kind {
             RootCauseKind::Fault => &self.fault_causes,
             RootCauseKind::Error => &self.error_causes,
+            RootCauseKind::ResponseTime => &self.response_time_causes,
         }
     }
 }
@@ -1147,6 +1267,11 @@ fn root_cause_matches(
                 .entity_path
                 .iter()
                 .any(|entity| matches_bool(entity.remote, op, value)),
+            RootCausePart::EntityCoverage => service.entity_path.iter().any(|entity| {
+                entity
+                    .coverage
+                    .is_some_and(|coverage| matches_num(coverage, op, value))
+            }),
             RootCausePart::ExceptionName => service.entity_path.iter().any(|entity| {
                 entity.exceptions.iter().any(|exception| {
                     exception

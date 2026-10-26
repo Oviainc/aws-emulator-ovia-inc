@@ -32,6 +32,9 @@ mod insight_impact_graph;
 #[path = "all/insight_summaries.rs"]
 mod insight_summaries;
 
+#[path = "all/query_surface_selection.rs"]
+mod query_surface_selection;
+
 #[path = "all/refusal_message_rules.rs"]
 mod refusal_message_rules;
 

@@ -9,11 +9,15 @@
 //! recomputed from those stored documents on every call — nothing is echoed from
 //! the request and nothing is persisted here.
 //!
-//! A request asking for behaviour this slice does not evaluate — an
-//! `EntitySelectorExpression`, a forecast (which the model documents as
-//! requiring one) — is REFUSED with `InvalidRequestException` naming what is
-//! unsupported, rather than answered with an aggregation that quietly ignored
-//! it, and the window itself goes through the crate's one check in
+//! An `EntitySelectorExpression` RESTRICTS that aggregation to the entities it
+//! names — one service's segments, or the calls one edge carried — and is read by
+//! the one parser every surface of this crate reads this language with
+//! ([`crate::state::filter_expression::parse_entity_selector`]); a selector that
+//! names no recorded entity aggregates nothing, which is an empty list and not a
+//! refusal. A request asking for behaviour this slice does not compute — a
+//! forecast — is REFUSED with `InvalidRequestException` naming what is
+//! unsupported, rather than answered with numbers nothing computed, and the
+//! window itself goes through the crate's one check in
 //! [`crate::state::validate_window`].
 //!
 //! A `GroupName` / `GroupARN` narrows the aggregation to the traffic that
@@ -183,26 +187,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Behaviour this slice does not evaluate is REFUSED, never answered with
-        // an aggregation that ignored it: a caller asking for the statistics of a
-        // selected entity, or of a group whose filter expression narrows them,
-        // would otherwise get the whole window's unfiltered aggregate under HTTP
-        // 200.
-        if input
-            .entity_selector_expression
-            .as_deref()
-            .is_some_and(|selector| !selector.trim().is_empty())
-        {
-            return Err(unsupported(
-                "EntitySelectorExpression is not evaluated by this emulator yet; omit it to aggregate every completed request in [StartTime, EndTime)",
-            ));
-        }
-        // `ForecastStatistics`: "Forecast enabled requests require the
-        // EntitySelectorExpression ID be provided" — and that expression is not
-        // evaluated here, so a forecast cannot be computed from state either.
+        // The selector restricts WHICH entities the aggregation covers, so it
+        // is read by the one parser every surface of this crate reads this
+        // language with and applied per stored segment below: a well-formed
+        // selector is ANSWERED — with an empty list when it names nothing the
+        // store recorded — and only one that is not of the language is refused.
+        let selector = match input.entity_selector_expression.as_deref() {
+            None => None,
+            Some(source) if source.trim().is_empty() => None,
+            Some(source) => Some(
+                crate::state::filter_expression::parse_entity_selector(source)
+                    .map_err(|failure| unsupported(failure.message()))?,
+            ),
+        };
+        // `ForecastStatistics`: "the forecasted high and low fault count
+        // values" — a prediction, which nothing in the recorded traffic
+        // computes, so it is refused rather than answered with numbers nothing
+        // derived.
         if input.forecast_statistics == Some(true) {
             return Err(unsupported(
-                "ForecastStatistics requires an EntitySelectorExpression ID, which this emulator does not evaluate yet; omit ForecastStatistics",
+                "ForecastStatistics asks for forecast fault counts, which this emulator does not compute; omit ForecastStatistics",
             ));
         }
 
@@ -284,9 +288,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     continue;
                 }
             }
+            // An edge selector resolves a segment's `parent_id` to the service
+            // that holds it, through the index the trace builds once; no other
+            // selector reads it, so no other pays for it.
+            let owners = match &selector {
+                Some(crate::state::filter_expression::EntitySelector::Edge { .. }) => {
+                    Some(trace.entity_owners())
+                }
+                _ => None,
+            };
             for segment in &trace.segments {
                 if segment.start_time < start || segment.start_time >= end {
                     continue;
+                }
+                if let Some(selector) = &selector {
+                    if !selects_entity(selector, trace, segment, owners.as_ref()) {
+                        continue;
+                    }
                 }
                 // "The total number of COMPLETED requests" — a segment still in
                 // progress has no response time yet, so it is not counted.
@@ -339,7 +357,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 next_token = Some(period_start.to_string());
                 break;
             }
-            time_series_service_statistics.push(aggregate.to_statistics(*period_start));
+            time_series_service_statistics.push(aggregate.to_statistics(*period_start, selector.as_ref()));
         }
 
         Ok(GetTimeSeriesServiceStatisticsOutput {
@@ -467,32 +485,52 @@ impl Aggregate {
 
     /// This period as one `TimeSeriesServiceStatistics`.
     ///
-    /// `EdgeSummaryStatistics` carries the counts because "if no selector
-    /// expression is specified, edge statistics are returned", and a selector
-    /// expression is refused by this slice: every counted request arrived at its
-    /// service over one inbound edge, so the aggregate is that of the edges the
-    /// window covers. `ServiceForecastStatistics` stays absent — a forecast
-    /// request is refused rather than answered with numbers nothing computed.
-    fn to_statistics(&self, period_start: i64) -> TimeSeriesServiceStatistics {
+    /// WHICH summary carries the counts follows what the request selected. "If
+    /// no selector expression is specified, edge statistics are returned", and
+    /// every counted request arrived at its service over one inbound edge, so an
+    /// unselected aggregate and an edge-selected one are aggregates of edges. A
+    /// selector naming a SERVICE asks about that service's own requests, which
+    /// `ServiceSummaryStatistics` reports — and those requests are exactly the
+    /// calls its inbound edges carried, so the same counts stand under both
+    /// summaries rather than one of the two being left for the caller to
+    /// recompute. `ServiceForecastStatistics` stays absent — a forecast request
+    /// is refused rather than answered with numbers nothing computed.
+    fn to_statistics(
+        &self,
+        period_start: i64,
+        selector: Option<&crate::state::filter_expression::EntitySelector>,
+    ) -> TimeSeriesServiceStatistics {
+        let of_service = matches!(
+            selector,
+            Some(crate::state::filter_expression::EntitySelector::Service(_))
+        );
+        let error_statistics = || ErrorStatistics {
+            throttle_count: Some(self.throttle_count),
+            other_count: Some(self.error_other_count),
+            total_count: Some(self.error_total_count()),
+        };
+        let fault_statistics = || FaultStatistics {
+            // Nothing here categorises a 5xx further, so every counted
+            // fault is an untracked one.
+            other_count: Some(self.fault_count),
+            total_count: Some(self.fault_count),
+        };
         TimeSeriesServiceStatistics {
             timestamp: Some(::aws_smithy_types::DateTime::from_secs(period_start)),
             edge_summary_statistics: Some(EdgeStatistics {
                 ok_count: Some(self.ok_count),
-                error_statistics: Some(ErrorStatistics {
-                    throttle_count: Some(self.throttle_count),
-                    other_count: Some(self.error_other_count),
-                    total_count: Some(self.error_total_count()),
-                }),
-                fault_statistics: Some(FaultStatistics {
-                    // Nothing here categorises a 5xx further, so every counted
-                    // fault is an untracked one.
-                    other_count: Some(self.fault_count),
-                    total_count: Some(self.fault_count),
-                }),
+                error_statistics: Some(error_statistics()),
+                fault_statistics: Some(fault_statistics()),
                 total_count: Some(self.total_count()),
                 total_response_time: Some(self.total_response_time),
             }),
-            service_summary_statistics: None,
+            service_summary_statistics: of_service.then(|| ServiceStatistics {
+                ok_count: Some(self.ok_count),
+                error_statistics: Some(error_statistics()),
+                fault_statistics: Some(fault_statistics()),
+                total_count: Some(self.total_count()),
+                total_response_time: Some(self.total_response_time),
+            }),
             service_forecast_statistics: None,
             response_time_histogram: Some(
                 self.histogram
@@ -506,4 +544,55 @@ impl Aggregate {
             ),
         }
     }
+}
+
+/// Whether one stored segment is an entity the selector names.
+///
+/// A `service(id(…))` / `id(…)` selector names the segments of the service its
+/// members match; an `edge(id(…), id(…))` names the segments of the second
+/// entity that were reached from the first, which is the call the edge carried —
+/// resolved through `owners`, the trace's entity index.
+fn selects_entity(
+    selector: &crate::state::filter_expression::EntitySelector,
+    trace: &crate::state::TraceRecord,
+    segment: &crate::state::SegmentRecord,
+    owners: Option<&std::collections::BTreeMap<&str, usize>>,
+) -> bool {
+    use crate::state::filter_expression::EntitySelector;
+
+    match selector {
+        EntitySelector::Service(entity) => names_entity(entity, segment),
+        EntitySelector::Edge {
+            source,
+            destination,
+        } => {
+            names_entity(destination, segment)
+                && segment.parent_id.as_deref().is_some_and(|parent_id| {
+                    owners
+                        .and_then(|owners| owners.get(parent_id))
+                        .and_then(|at| trace.segments.get(*at))
+                        .is_some_and(|holder| names_entity(source, holder))
+                })
+        }
+    }
+}
+
+/// Whether a segment is the entity one `id(…)` names: every member the selector
+/// labelled has to match, and one it omitted narrows nothing.
+fn names_entity(
+    entity: &crate::state::filter_expression::EntityId,
+    segment: &crate::state::SegmentRecord,
+) -> bool {
+    entity
+        .name
+        .as_ref()
+        .is_none_or(|name| &segment.name == name)
+        && entity
+            .r#type
+            .as_ref()
+            .is_none_or(|wanted| segment.origin.as_ref() == Some(wanted))
+        && entity
+            .account_id
+            .as_ref()
+            .is_none_or(|wanted| segment.account_id.as_ref() == Some(wanted))
 }

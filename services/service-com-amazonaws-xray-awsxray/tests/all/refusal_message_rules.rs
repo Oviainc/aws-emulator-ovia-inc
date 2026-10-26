@@ -37,7 +37,8 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_xray_awsxray::state::{
-    INVALID_INPUT_PARAMETERS_PREAMBLE, INVERTED_WINDOW_MESSAGE, MAX_TRACE_IDS_PER_CALL,
+    retrieval_token_check, INVALID_INPUT_PARAMETERS_PREAMBLE, INVERTED_WINDOW_MESSAGE,
+    MAX_TRACE_IDS_PER_CALL,
 };
 
 use super::xray_wire::{array, trace_id, Answer, Xray};
@@ -684,17 +685,21 @@ async fn a_token_of_no_minted_form_is_refused_with_the_services_template() {
     let xray = Xray::new();
 
     // Rows differ in how the token misses the minted form: prose, one digit
-    // short, one digit long, a non-hexadecimal digit, and a value of another
-    // service's token shape.
+    // short, one digit long, a non-hexadecimal digit, a value of another
+    // service's token shape, and one of the right width and charset whose check
+    // half does not derive from its identifying half.
     let tokens = [
         ("prose", "sim2real-behav-not-a-real-token".to_string()),
         ("one digit short", "a".repeat(31)),
         ("one digit long", "a".repeat(33)),
         ("a non-hexadecimal digit", format!("{}g", "a".repeat(31))),
         ("a dashed identifier", "11111111-2222-3333-4444-555555".to_string()),
+        ("the minted width, carrying no check", "a".repeat(32)),
     ];
     for (label, token) in tokens {
-        let expected = format!("Invalid execution id {token} passed: Invalid Execution Id");
+        let expected = format!(
+            "Invalid execution id {token} passed: Invalid execution id provided: {token}"
+        );
         for (operation, body) in [
             (
                 "ListRetrievedTraces",
@@ -726,9 +731,12 @@ async fn a_token_of_no_minted_form_is_refused_with_the_services_template() {
         }
     }
 
-    // The boundary: a token OF the minted form that nothing stands behind is a
-    // different class — the resource is not there, not the request wrong.
-    let well_formed = "0123456789abcdef0123456789abcdef";
+    // The boundary: a token the service COULD have issued — its check half
+    // derived from its identifying half, as the mint derives it — that nothing
+    // stands behind is a different class: the resource is not there, not the
+    // request wrong.
+    let identity = "0123456789abcdef";
+    let well_formed = format!("{identity}{}", retrieval_token_check(identity));
     let missing = xray
         .call(
             "/ListRetrievedTraces",
@@ -738,11 +746,11 @@ async fn a_token_of_no_minted_form_is_refused_with_the_services_template() {
     assert_eq!(
         (missing.status, missing.error_type.as_deref()),
         (404, Some("ResourceNotFoundException")),
-        "a well-formed token nothing stands behind must be 404 ResourceNotFoundException, got \
+        "an intact token nothing stands behind must be 404 ResourceNotFoundException, got \
          {missing:?}"
     );
     assert!(
-        !said(&missing).contains("Invalid Execution Id"),
+        !said(&missing).contains("Invalid execution id provided"),
         "a token that is not there must not be stated as a malformed one, got {:?}",
         said(&missing)
     );

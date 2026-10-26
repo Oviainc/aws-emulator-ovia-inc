@@ -7,7 +7,7 @@
 //! the ones that expression selects ([`crate::state::filter`]); each
 //! `TraceSummary` is then built from the persisted segment documents, so a trace
 //! just written by `PutTraceSegments` appears here. A request asking for
-//! behaviour this slice does not implement — another `TimeRangeType`, sampling —
+//! behaviour this slice does not implement — sampling —
 //! is REFUSED with `InvalidRequestException` naming what is unsupported, rather
 //! than answered with an unfiltered 200, and so is an inverted time range.
 //!
@@ -198,20 +198,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_request(window.message(start, end)));
         }
 
-        // A request asking for behaviour this slice does not implement is
-        // REFUSED, never answered with a success that quietly ignored it: a
-        // caller that asks for a differently-ranged or sampled selection would
-        // otherwise get the full window under HTTP 200. The selection below is
-        // on the trace's own start time, which is the `TraceId` time range;
-        // `Event` and `Service` range over a different clock this slice does not
-        // keep.
-        if let Some(range) = input.time_range_type.as_deref() {
-            if range != SUPPORTED_TIME_RANGE_TYPE {
+        // Which instant the window is applied to is the request's to choose:
+        // `TimeRangeType` selects "TraceId (trace start time), Event (trace
+        // update time), or Service (trace segment end time)", so the member
+        // changes WHICH time of each stored trace has to fall inside
+        // [StartTime, EndTime) and nothing else about the selection. The value
+        // set is the model's enum, so the request layer has already refused
+        // anything outside it; this is the handler's backstop, which refuses
+        // rather than quietly windowing on a time the caller did not ask for.
+        let range = input
+            .time_range_type
+            .as_deref()
+            .unwrap_or(TIME_RANGE_TYPE_TRACE_ID);
+        let window_instant: fn(&crate::state::TraceRecord) -> f64 = match range {
+            TIME_RANGE_TYPE_TRACE_ID => |trace| trace.first_start,
+            TIME_RANGE_TYPE_EVENT => |trace| trace.last_updated_at,
+            TIME_RANGE_TYPE_SERVICE => |trace| trace.last_end,
+            other => {
                 return Err(invalid_request(format!(
-                    "TimeRangeType `{range}` is not supported by this emulator yet; only `{SUPPORTED_TIME_RANGE_TYPE}` is"
-                )));
+                    "TimeRangeType `{other}` is not a TimeRangeType; expected one of {}",
+                    TIME_RANGE_TYPE_VALUES.join(", ")
+                )))
             }
-        }
+        };
         if input.sampling == Some(true) || input.sampling_strategy.is_some() {
             return Err(invalid_request(
                 "sampling is not supported by this emulator yet; omit Sampling and SamplingStrategy to select every matching trace",
@@ -277,7 +286,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut candidates: Vec<String> = Vec::new();
             for trace in scan {
                 scanned += 1;
-                if trace.first_start >= start && trace.first_start < end {
+                let instant = window_instant(trace);
+                if instant >= start && instant < end {
                     candidates.push(trace.id.clone());
                 }
             }
@@ -358,10 +368,19 @@ const FILTER_YIELD_EVERY: usize = 32;
 /// resuming from that token returns the remainder.
 pub const TRACE_SUMMARIES_PAGE_SIZE: usize = 5;
 
-/// The one `TimeRangeType` this slice serves. The selection is on each trace's
-/// own earliest segment `start_time`, which is the trace-id range; `Event` and
-/// `Service` range over times this slice does not keep.
-pub const SUPPORTED_TIME_RANGE_TYPE: &str = "TraceId";
+/// `TimeRangeType` `TraceId`: the window is applied to each trace's own start
+/// time, which is the earliest `start_time` its segments reported. The default
+/// when the request names no range.
+pub const TIME_RANGE_TYPE_TRACE_ID: &str = "TraceId";
+
+/// `TimeRangeType` `Event`: the window is applied to each trace's update time,
+/// which is when this service last accepted a segment for it.
+pub const TIME_RANGE_TYPE_EVENT: &str = "Event";
+
+/// `TimeRangeType` `Service`: the window is applied to each trace's segment end
+/// time, which is the latest instant its segments reached — the range that finds
+/// the traces that FINISHED inside the window.
+pub const TIME_RANGE_TYPE_SERVICE: &str = "Service";
 
 /// Refuse a request this operation cannot serve as asked — an inverted time
 /// range, an unreadable filter expression, a token this service never issued, or
@@ -427,6 +446,13 @@ fn summary_of(trace: &crate::state::TraceRecord) -> TraceSummary {
                 .map(error_root_cause_of)
                 .collect(),
         ),
+        response_time_root_causes: Some(
+            trace
+                .root_causes(crate::state::RootCauseKind::ResponseTime)
+                .iter()
+                .map(response_time_root_cause_of)
+                .collect(),
+        ),
         ..TraceSummary::default()
     }
 }
@@ -483,6 +509,42 @@ fn error_root_cause_of(cause: &crate::state::RootCauseView) -> ErrorRootCause {
                             .map(|entity| ErrorRootCauseEntity {
                                 name: Some(entity.name.clone()),
                                 exceptions: Some(exceptions_of(&entity.exceptions)),
+                                remote: Some(entity.remote),
+                            })
+                            .collect(),
+                    ),
+                    inferred: Some(service.inferred),
+                })
+                .collect(),
+        ),
+        client_impacting: Some(cause.client_impacting),
+    }
+}
+
+/// The derived response-time root cause, as the modelled `ResponseTimeRootCause`.
+///
+/// `ResponseTimeRootCauseService` carries the same members the fault and error
+/// service shapes do; its entity frames report `Coverage` — the part of the
+/// trace's response time the frame ran for — in place of the exceptions a
+/// declared outcome names, because a response time is not an exception.
+fn response_time_root_cause_of(cause: &crate::state::RootCauseView) -> ResponseTimeRootCause {
+    ResponseTimeRootCause {
+        services: Some(
+            cause
+                .services
+                .iter()
+                .map(|service| ResponseTimeRootCauseService {
+                    name: Some(service.name.clone()),
+                    names: Some(vec![service.name.clone()]),
+                    r#type: service.r#type.clone(),
+                    account_id: service.account_id.clone(),
+                    entity_path: Some(
+                        service
+                            .entity_path
+                            .iter()
+                            .map(|entity| ResponseTimeRootCauseEntity {
+                                name: Some(entity.name.clone()),
+                                coverage: entity.coverage,
                                 remote: Some(entity.remote),
                             })
                             .collect(),

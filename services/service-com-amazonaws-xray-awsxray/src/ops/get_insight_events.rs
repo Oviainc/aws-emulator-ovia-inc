@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInsightEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetInsightEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetInsightEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers with the event timeline of the STORED insight the request's
+//! `InsightId` names, and refuses an id that names none with
+//! `InvalidRequestException` (400) — the refusal the model declares for a request
+//! that "has invalid parameters", and the same one `GetInsight` gives for the
+//! same id, so the two readers of an insight cannot disagree about whether it
+//! exists.
+//!
+//! The `@pattern` on `InsightId` is modelled, so an id that is not a UUID is
+//! already refused at the boundary; what is left to decide is whether a
+//! well-formed id resolves, and that is a lookup in
+//! [`crate::state::ComAmazonawsXrayAwsxrayState::insights`].
+//!
+//! Nothing in the X-Ray API creates an insight — "when fault rates go outside of
+//! the expected range, X-Ray creates an insight" — and this emulator does not run
+//! that anomaly detection, so that map holds an insight only once something
+//! writes one into it. Until then every well-formed id names no insight and gets
+//! the modelled refusal, which is what AWS answers for an id naming no insight.
+//!
+//! An insight that IS stored reports the state X-Ray recorded for it: "X-Ray
+//! reevaluates insights periodically until they're resolved, and records each
+//! intermediate state as an event", and the states this store holds for one
+//! insight are the instants on the insight itself, so the timeline is built from
+//! them ([`events_of`]) rather than echoed from the request. The page is cut to
+//! `MaxResults` and resumed from `NextToken`, as a paginated reader is.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +167,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetInsightEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetInsightEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetInsightEvents"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetInsightEventsErrorModeled::ThrottledException(
+                ThrottledException {
+                    message: Some(
+                        "the X-Ray insight store is unavailable on this emulator engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // "Used to retrieve at most the specified value of events", bounded
+        // 1..50 by the model and so already checked; absent, one page is
+        // [`INSIGHT_EVENTS_PAGE_SIZE`].
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(INSIGHT_EVENTS_PAGE_SIZE);
+
+        let store = state.lock();
+        let Some(insight) = store.insights.get(&input.insight_id) else {
+            return Err(refuse(
+                crate::ops::get_insight::INSIGHT_NOT_FOUND.to_string(),
+            ));
+        };
+
+        // A token this service issued names the event the next page starts at,
+        // by its position in the timeline; anything else never came from here.
+        let events = events_of(insight);
+        let resume = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => token.parse::<usize>().ok().filter(|at| *at <= events.len()).ok_or_else(
+                || {
+                    refuse(format!(
+                        "NextToken `{token}` was not issued by this service"
+                    ))
+                },
+            )?,
+        };
+
+        let remaining = &events[resume..];
+        let page = remaining.len().min(page_size);
+        // A token only when the timeline was truncated; it names where the next
+        // page resumes.
+        let next_token = (page < remaining.len()).then(|| (resume + page).to_string());
+
+        Ok(GetInsightEventsOutput {
+            insight_events: Some(remaining[..page].to_vec()),
+            next_token,
+        })
     }
+}
+
+/// How many `InsightEvent` values one page carries when the request names no
+/// `MaxResults`. The model bounds `MaxResults` to 1..50 but declares no default,
+/// so this is the emulator's.
+pub const INSIGHT_EVENTS_PAGE_SIZE: usize = 5;
+
+/// Refuse the request with the error this operation models for an invalid one.
+fn refuse(message: String) -> GetInsightEventsError {
+    GetInsightEventsErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// One stored insight's event timeline, oldest event first.
+///
+/// An event is "an intermediate state" of the insight, carrying "the time of the
+/// event, client and root cause impact statistics, and the top anomalous service
+/// at the time of the event" — every member read off the insight itself. The
+/// states this store knows for an insight are the instants IT carries: the one
+/// it began at, and — once it has ended — the one it ended at, which is the state
+/// it was reevaluated into last. Nothing is invented beside them: an insight that
+/// reports no instant at all has no event to report either.
+fn events_of(insight: &Insight) -> Vec<InsightEvent> {
+    let event_at = |event_time: ::aws_smithy_types::DateTime| InsightEvent {
+        summary: insight.summary.clone(),
+        event_time: Some(event_time),
+        client_request_impact_statistics: insight.client_request_impact_statistics.clone(),
+        root_cause_service_request_impact_statistics: insight
+            .root_cause_service_request_impact_statistics
+            .clone(),
+        top_anomalous_services: insight.top_anomalous_services.clone(),
+    };
+    insight
+        .start_time
+        .into_iter()
+        .chain(insight.end_time)
+        .map(event_at)
+        .collect()
 }

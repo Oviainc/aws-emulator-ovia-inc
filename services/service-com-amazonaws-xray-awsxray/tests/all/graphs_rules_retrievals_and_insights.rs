@@ -52,8 +52,22 @@ fn now() -> f64 {
     service_com_amazonaws_xray_awsxray::state::now_epoch_seconds()
 }
 
+/// The outcome an instrumentation DECLARES on a document beside the status it
+/// recorded: a 5xx answer is a fault, a 429 a throttle, any other 4xx an error.
+/// The service classifies a call by the flag its document declared and never by
+/// the status, so a fixture whose node is to report a fault or a throttle
+/// declares it here.
+fn declared_for(status: i64) -> Option<&'static str> {
+    match status {
+        429 => Some("throttle"),
+        status if (400..500).contains(&status) => Some("error"),
+        status if status >= 500 => Some("fault"),
+        _ => None,
+    }
+}
+
 /// A child segment document under `parent`, with an optional recorded HTTP
-/// status.
+/// status and the outcome declared beside it.
 fn child_document(
     id: &str,
     parent: &str,
@@ -73,11 +87,15 @@ fn child_document(
     });
     if let Some(status) = status {
         document["http"] = json!({"response": {"status": status}});
+        if let Some(flag) = declared_for(status) {
+            document[flag] = json!(true);
+        }
     }
     document
 }
 
-/// A root segment document with a recorded HTTP status.
+/// A root segment document with a recorded HTTP status and the outcome declared
+/// beside it.
 fn root_with_status(
     id: &str,
     trace: &str,
@@ -88,6 +106,9 @@ fn root_with_status(
 ) -> Value {
     let mut document = root_document(id, trace, name, start, Some(end));
     document["http"] = json!({"response": {"status": status}});
+    if let Some(flag) = declared_for(status) {
+        document[flag] = json!(true);
+    }
     document
 }
 

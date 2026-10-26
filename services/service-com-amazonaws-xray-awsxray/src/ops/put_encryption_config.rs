@@ -11,6 +11,12 @@
 //! selector, a `KMS` request without one, and a `NONE` request that carries one
 //! are each refused with `InvalidRequestException` rather than stored.
 //!
+//! What is stored under `KMS` is the key's ARN
+//! ([`crate::state::kms_key_arn`]), whatever of the three selector forms the
+//! request used: the configuration a reader takes to a KMS policy or compares
+//! across accounts has to identify WHICH key protects the data, and a bare id or
+//! alias is the same text in every account and region.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -147,8 +153,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); the request
-        // metadata selects nothing here, as the configuration is service-wide.
-        let _ = ctx;
+        // metadata names the region the selected key is qualified in.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(PutEncryptionConfigErrorModeled::ThrottledException(
                 ThrottledException {
@@ -186,7 +192,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                          (alias/MyKey), a key id, or the full ARN of either"
                     )));
                 }
-                Some(key_id)
+                // Stored as the key's ARN, not as the selector the request
+                // happened to use: the configuration a reader reports has to
+                // identify WHICH key, in which account and region, protects the
+                // account's trace data.
+                Some(crate::state::kms_key_arn(&key_id, &region))
             }
             crate::state::ENCRYPTION_TYPE_NONE => {
                 if let Some(key_id) = input.key_id {
