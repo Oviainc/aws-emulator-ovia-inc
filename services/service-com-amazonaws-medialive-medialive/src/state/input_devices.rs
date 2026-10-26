@@ -79,6 +79,17 @@
 //! [`engine::emulator_account_id`], and one addressed to any other account id
 //! stays pending for a recipient that never calls.
 //!
+//! REJECTING is the recipient's OTHER decision
+//! ([`InputDeviceRecord::reject_transfer`]): "[r]eject the transfer of the
+//! specified input device to your AWS account" ends the very same pending
+//! transfer the accept would have ended, and is therefore open to the very same
+//! account — the recipient — so both decisions resolve a transfer through the
+//! slice's one rule ([`InputDeviceRecord::end_incoming_transfer`]). What differs
+//! is where the device ends up: an accepted device is the recipient's and a
+//! rejected one stays the sender's. Either way nothing is pending on it
+//! afterwards, so the device is transferable again and the other decision has
+//! nothing left to resolve.
+//!
 //! The SENDER's own way out of a pending transfer is
 //! `CancelInputDeviceTransfer` ([`InputDeviceRecord::cancel_transfer`]):
 //! "[c]ancel an input device transfer that you have requested" ends the
@@ -823,16 +834,59 @@ impl InputDeviceRecord {
     /// then on, so nothing is pending on it any more and a second accept has
     /// nothing left to resolve.
     pub fn accept_transfer(&mut self) -> TransferAcceptance {
+        match self.end_incoming_transfer() {
+            Ok(()) => TransferAcceptance::Accepted,
+            Err(IncomingTransferRefusal::NotBeingTransferred) => {
+                TransferAcceptance::NotBeingTransferred
+            }
+            Err(IncomingTransferRefusal::NotTheRecipient(recipient)) => {
+                TransferAcceptance::NotTheRecipient(recipient)
+            }
+        }
+    }
+
+    /// Reject the transfer pending on this device on behalf of the account this
+    /// emulator serves, and report what that resolved to.
+    ///
+    /// The mirror of [`InputDeviceRecord::accept_transfer`]: "[r]eject the
+    /// transfer of the specified input device to your AWS account" is the other
+    /// decision the SAME pending transfer waits on, so it is open to the same
+    /// account — the recipient the transfer names — through the same rule
+    /// ([`InputDeviceRecord::end_incoming_transfer`]). Rejecting is what ENDS
+    /// the transfer: the device never changes hands, so it stays the sender's
+    /// with nothing pending on it, and a second reject has nothing left to
+    /// resolve.
+    pub fn reject_transfer(&mut self) -> TransferRejection {
+        match self.end_incoming_transfer() {
+            Ok(()) => TransferRejection::Rejected,
+            Err(IncomingTransferRefusal::NotBeingTransferred) => {
+                TransferRejection::NotBeingTransferred
+            }
+            Err(IncomingTransferRefusal::NotTheRecipient(recipient)) => {
+                TransferRejection::NotTheRecipient(recipient)
+            }
+        }
+    }
+
+    /// End the INCOMING transfer pending on this device, whatever decision the
+    /// recipient took on it, or report why no decision could be taken.
+    ///
+    /// The slice's ONE rule for resolving a transfer from the recipient's side,
+    /// so accepting and rejecting cannot disagree about which transfer the
+    /// recipient may decide: only an incoming one ([`transfer_has_direction`],
+    /// the same definition the listing filters by), and resolving it is what
+    /// clears it off the device.
+    fn end_incoming_transfer(&mut self) -> Result<(), IncomingTransferRefusal> {
         let Some(transfer) = &self.transfer else {
-            return TransferAcceptance::NotBeingTransferred;
+            return Err(IncomingTransferRefusal::NotBeingTransferred);
         };
         if !transfer_has_direction(transfer, input_device_transfer_type::INCOMING) {
-            return TransferAcceptance::NotTheRecipient(transfer_recipient(
+            return Err(IncomingTransferRefusal::NotTheRecipient(transfer_recipient(
                 transfer.target_customer_id.as_deref(),
-            ));
+            )));
         }
         self.transfer = None;
-        TransferAcceptance::Accepted
+        Ok(())
     }
 
     /// Cancel the transfer pending on this device on behalf of the account that
@@ -910,6 +964,38 @@ pub enum TransferAcceptance {
     NotTheRecipient(String),
 }
 
+/// What rejecting a device's pending transfer resolved to
+/// ([`InputDeviceRecord::reject_transfer`]).
+///
+/// Beside [`TransferAcceptance`] rather than shared with it: the two decisions
+/// read the same transfer through the same rule, but they are different
+/// decisions, and each operation reports its own in its own words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferRejection {
+    /// The transfer was incoming and is now over, refused: the device stays the
+    /// SENDER's and nothing is pending on it any more.
+    Rejected,
+    /// No transfer is pending on this device, so there is none to reject.
+    NotBeingTransferred,
+    /// The pending transfer names a different recipient, so the account asking
+    /// is its sender rather than the account it waits on. Carries the recipient
+    /// ALREADY WORDED for a refusal to report ([`transfer_recipient`]), for the
+    /// same reason [`TransferAcceptance::NotTheRecipient`] does.
+    NotTheRecipient(String),
+}
+
+/// Why the recipient's decision on a pending transfer could not be taken
+/// ([`InputDeviceRecord::end_incoming_transfer`]).
+///
+/// Private to the slice: a caller reads the refusal through the
+/// [`TransferAcceptance`] or [`TransferRejection`] its own operation reports.
+enum IncomingTransferRefusal {
+    /// No transfer is pending on the device at all.
+    NotBeingTransferred,
+    /// A transfer is pending, but it names another account as its recipient.
+    NotTheRecipient(String),
+}
+
 /// What cancelling a device's pending transfer resolved to
 /// ([`InputDeviceRecord::cancel_transfer`]).
 ///
@@ -930,9 +1016,10 @@ pub enum TransferCancellation {
 /// `TargetCustomerId` member is optional in the model).
 ///
 /// ONE helper, so the operations that refuse something about a pending transfer
-/// — `AcceptInputDeviceTransfer` today, and `RejectInputDeviceTransfer` when
-/// its own issue lands — cannot word its recipient two ways. Private to the slice: every caller reads it through the
-/// [`TransferAcceptance::NotTheRecipient`] it is carried in.
+/// — `AcceptInputDeviceTransfer` and `RejectInputDeviceTransfer` — cannot word
+/// its recipient two ways. Private to the slice: every caller reads it through
+/// the [`TransferAcceptance::NotTheRecipient`] or
+/// [`TransferRejection::NotTheRecipient`] it is carried in.
 fn transfer_recipient(target_customer_id: Option<&str>) -> String {
     target_customer_id.map_or_else(
         || "no account".to_string(),

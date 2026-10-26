@@ -38,7 +38,9 @@
 //! [`input_devices`]. A device also carries the TRANSFER pending on it, which
 //! `TransferInputDevice` records, `ListInputDeviceTransfers` reports in the
 //! direction the reader asks for, `AcceptInputDeviceTransfer` ends for the
-//! account the transfer names as its recipient and `CancelInputDeviceTransfer`
+//! account the transfer names as its recipient, `RejectInputDeviceTransfer`
+//! ends for that same recipient when it refuses the device instead, and
+//! `CancelInputDeviceTransfer`
 //! ends for the account that requested it, and the latest THUMBNAIL it has
 //! sent, which `DescribeInputDeviceThumbnail` reports — one only a connected
 //! Link unit sends, so a device claimed through this emulator's API has none.
@@ -360,6 +362,7 @@ pub use input_devices::{
     is_account_id, not_a_device_id_message, not_an_account_id_message,
     settings_member_mismatch_message, InputDeviceConfiguration, InputDeviceRecord,
     InputDeviceThumbnailRecord, InputDeviceTransferRecord, TransferAcceptance, TransferCancellation,
+    TransferRejection,
     MAX_INPUT_DEVICES,
     MAX_INPUT_DEVICE_THUMBNAIL_BYTES, MAX_TRANSFER_MESSAGE_CHARS,
 };

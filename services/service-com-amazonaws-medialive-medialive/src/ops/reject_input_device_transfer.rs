@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RejectInputDeviceTransfer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RejectInputDeviceTransfer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RejectInputDeviceTransfer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Rejecting is the recipient's OTHER way of ending a transfer another account
+//! started towards this one: the transfer `TransferInputDevice` recorded on the
+//! device ([`crate::state::InputDeviceTransferRecord`]) is resolved and the
+//! device is NOT taken over — "Reject the transfer of the specified input
+//! device to your AWS account". Only an INCOMING transfer can be rejected, for
+//! the same reason only an incoming one can be accepted, and the store is what
+//! decides that from the recipient the transfer names
+//! ([`crate::state::InputDeviceRecord::reject_transfer`]).
 //!
 //! ## Shape of an operation
 //!
@@ -149,20 +149,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RejectInputDeviceTransfer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RejectInputDeviceTransferErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RejectInputDeviceTransfer"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        state.settle(now);
+
+        // The reject is ABOUT a device, so the id is resolved through the store:
+        // an id that names no claimed device at all is the operation's own
+        // modelled 404, never a transfer rejected for nothing.
+        let device = state
+            .input_device_mut(&input.input_device_id)
+            .ok_or_else(|| {
+                RejectInputDeviceTransferErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::not_found_message(
+                        "InputDevice",
+                        &input.input_device_id,
+                    )),
+                })
+            })?;
+
+        // The store owns which transfer an account may reject. A device with
+        // nothing pending, and one whose pending transfer names another
+        // recipient, are both the device's CURRENT STATE conflicting with the
+        // request rather than a missing resource, which is this operation's
+        // modelled 409.
+        match device.reject_transfer() {
+            crate::state::TransferRejection::Rejected => {}
+            crate::state::TransferRejection::NotBeingTransferred => {
+                return Err(RejectInputDeviceTransferErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "InputDevice {} is not being transferred, so there is no transfer to \
+                             reject",
+                            input.input_device_id
+                        )),
+                    },
+                )
+                .into());
+            }
+            crate::state::TransferRejection::NotTheRecipient(recipient) => {
+                return Err(RejectInputDeviceTransferErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "InputDevice {} is being transferred to {recipient}, and only the \
+                             recipient of a transfer can reject it",
+                            input.input_device_id
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The response shape models no member
+        // (`smithy_query(query="operation",
+        // operation="RejectInputDeviceTransfer")`), so what the call asserts is
+        // that nothing waits on this account's decision any more: a second
+        // reject has no transfer left to resolve, and the device can be
+        // transferred on again.
+        Ok(RejectInputDeviceTransferOutput {})
     }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no device store to resolve the transfer in. A modelled server
+/// error, never a fresh engine (which would drop the write on return).
+fn unavailable() -> RejectInputDeviceTransferError {
+    RejectInputDeviceTransferErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: Some(crate::state::NO_STORE.to_string()),
+        },
+    )
+    .into()
 }
