@@ -1357,7 +1357,9 @@ pub fn page_bound(member_path: &str, max_results: i32, maximum: i32) -> Result<u
 /// is an offset into their deterministic order, not a key of a stored record. Each read
 /// passes its own [`SERVICE_OPERATIONS_TOKEN_TAG`]-style tag, so a token is only ever
 /// resolved against the projection that issued it; `Err` carries the refusal message for a
-/// token that is not one this service issued under that tag.
+/// token that is not one this service issued under that tag. A read whose projection is ONE
+/// subject's set passes that tag with the subject bound into it ([`subject_token_tag`]),
+/// since the operation alone does not name the projection there.
 pub fn page_of<T>(
     items: Vec<T>,
     tag: &str,
@@ -1385,6 +1387,45 @@ pub fn page_of<T>(
         None
     };
     Ok((page, next_token))
+}
+
+/// The `NextToken` tag a read whose projection is ONE subject's set issues its page tokens
+/// under: the read's own [`SERVICE_OPERATIONS_TOKEN_TAG`]-style tag, plus a fingerprint of the
+/// subject the page was taken over.
+///
+/// A [`page_of`] cursor is an offset within one subject's ordered set, so a token issued for
+/// another subject would silently skip that subject's first entries if it were honoured.
+/// Binding the subject into the tag makes such a token fail to decode, so it is refused like
+/// any other token this service did not issue — the rule the scoped instrumentation reads
+/// already hold ([`instrumentation_token_tag`]), stated once here for every read whose set
+/// belongs to a subject the request names.
+///
+/// `subject` is the subject's RESOLVED identity — what the store holds it under, not how the
+/// request spelled it — so a token handed back for a read that named the subject one way
+/// still resumes a read naming the SAME subject another way. A field list is injectively
+/// rendered ([`stable_hash`]), so no two different subjects share a tag.
+pub fn subject_token_tag(tag: &str, subject: &[Option<&str>]) -> String {
+    format!("{tag}{}/", stable_hash(subject))
+}
+
+/// [`subject_token_tag`] for a read whose subject is the entity a key-attribute map selects.
+///
+/// The whole map is the subject's identity, because the projection is a function of all of it:
+/// a stored entity is selected when it carries every entry the map states
+/// ([`attributes_contain`]), so two maps that differ in one entry select different sets. The
+/// entries are fingerprinted in key order, since a map carries no order of its own while one
+/// subject must yield the same tag on every call.
+pub fn entity_token_tag(tag: &str, attributes: &HashMap<String, String>) -> String {
+    let mut entries: Vec<(&str, &str)> = attributes
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    entries.sort_unstable();
+    let fields: Vec<Option<&str>> = entries
+        .into_iter()
+        .flat_map(|(key, value)| [Some(key), Some(value)])
+        .collect();
+    subject_token_tag(tag, &fields)
 }
 
 /// Whether `candidate` holds every entry of `filter` with the same value.
@@ -1609,7 +1650,9 @@ pub const MAX_EXCLUSION_WINDOW_ERRORS: usize = 10;
 /// ([`MAX_EXCLUSION_WINDOWS_PER_SLO`]).
 pub const DEFAULT_EXCLUSION_WINDOW_PAGE: i32 = MAX_EXCLUSION_WINDOWS_PER_SLO as i32;
 
-/// [`SERVICE_OPERATIONS_TOKEN_TAG`], for `ListServiceLevelObjectiveExclusionWindows`.
+/// [`SERVICE_OPERATIONS_TOKEN_TAG`], for `ListServiceLevelObjectiveExclusionWindows`, whose
+/// projection is one SLO's own window set — so every token it issues carries this tag with
+/// that SLO bound into it ([`subject_token_tag`]).
 pub const EXCLUSION_WINDOWS_TOKEN_TAG: &str = "exclusion-windows/1/";
 
 /// Why one SLO named by a `BatchUpdateExclusionWindows` request was not updated.

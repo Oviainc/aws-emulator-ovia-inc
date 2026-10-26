@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAuthenticationProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAuthenticationProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAuthenticationProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts a new authentication profile into this service's store under the name
+//! the request gives it and reports back what it persisted: that name and the
+//! content, kept verbatim for every later read. A second create under a name the
+//! account already holds a profile under is refused with
+//! `AuthenticationProfileAlreadyExistsFault` and overwrites nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -91,12 +88,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `CreateAuthenticationProfileError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#CreateAuthenticationProfile")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#CreateAuthenticationProfile",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum CreateAuthenticationProfileErrorModeled {
     AuthenticationProfileAlreadyExistsFault(AuthenticationProfileAlreadyExistsFault),
     AuthenticationProfileQuotaExceededFault(AuthenticationProfileQuotaExceededFault),
     InvalidAuthenticationProfileRequestFault(InvalidAuthenticationProfileRequestFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -148,20 +149,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAuthenticationProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAuthenticationProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAuthenticationProfile"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                CreateAuthenticationProfileErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The name's syntax and length are MODELED (`^[a-zA-Z0-9\-]+$`, at most
+        // 63 characters), so a name reaching here satisfies both — the pattern
+        // admits no empty value, which is the one name the modelled
+        // `InvalidAuthenticationProfileRequestFault` doc rules out. What is NOT
+        // modeled is the size and the form of the content, so both are checked
+        // here, before the store is locked and before anything is stored.
+        if let Err(refusal) =
+            st::check_authentication_profile_content(&input.authentication_profile_content)
+        {
+            return Err(match refusal {
+                st::AuthenticationProfileContentRefusal::NotJson(message) => {
+                    CreateAuthenticationProfileErrorModeled::InvalidAuthenticationProfileRequestFault(
+                        InvalidAuthenticationProfileRequestFault {
+                            message: Some(message),
+                        },
+                    )
+                    .into()
+                }
+                st::AuthenticationProfileContentRefusal::TooLong(message) => {
+                    CreateAuthenticationProfileErrorModeled::AuthenticationProfileQuotaExceededFault(
+                        AuthenticationProfileQuotaExceededFault {
+                            message: Some(message),
+                        },
+                    )
+                    .into()
+                }
+            });
+        }
+
+        let mut store = state.lock();
+
+        // Identity before capacity: a request that would create nothing keeps
+        // the more specific fault even when the store is at its bound. The NAME
+        // is what an account's profiles are unique on, so a second create under
+        // one name is refused and overwrites nothing.
+        if store
+            .authentication_profile(&input.authentication_profile_name)
+            .is_some()
+        {
+            return Err(
+                CreateAuthenticationProfileErrorModeled::AuthenticationProfileAlreadyExistsFault(
+                    AuthenticationProfileAlreadyExistsFault {
+                        message: Some(st::authentication_profile_exists_message(
+                            &input.authentication_profile_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.authentication_profiles.len() >= st::AUTHENTICATION_PROFILE_QUOTA {
+            return Err(
+                CreateAuthenticationProfileErrorModeled::AuthenticationProfileQuotaExceededFault(
+                    AuthenticationProfileQuotaExceededFault {
+                        message: Some(format!(
+                            "The request would exceed the allowed number of authentication profiles ({}).",
+                            st::AUTHENTICATION_PROFILE_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The record every later read reports verbatim: the name the request
+        // gave the profile and the content it carried.
+        let profile = AuthenticationProfile {
+            authentication_profile_name: Some(input.authentication_profile_name.clone()),
+            authentication_profile_content: Some(input.authentication_profile_content.clone()),
+        };
+        store.authentication_profiles.push(profile.clone());
+
+        Ok(CreateAuthenticationProfileOutput {
+            authentication_profile_name: profile.authentication_profile_name,
+            authentication_profile_content: profile.authentication_profile_content,
+        })
     }
 }

@@ -78,7 +78,7 @@ use super::types::*;
 // The filter-matching rule every list operation of this service shares, so a change to
 // it (normalising a compared identifier, say) narrows every listing the same way; see
 // `crate::state` for how a sent filter member becomes the set it matches against.
-use crate::state::{filter_set, selected};
+use crate::state::{filter_set, resolve_control, selected, selected_resolved};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -203,7 +203,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .control_operations
             .values()
             .filter(|record| {
-                selected(&control_identifiers, &record.control_identifier)
+                // A control is selected by the catalog entry a filter value resolves to,
+                // so a record is found by either of the ARN forms that name its control,
+                // not only by the one the call that produced it sent.
+                selected_resolved(
+                    &control_identifiers,
+                    &record.control_identifier,
+                    resolve_control,
+                )
                     && selected(&target_identifiers, &record.target_identifier)
                     && selected(&enabled_control_identifiers, &record.enabled_control_arn)
                     && selected(&statuses, record.status.as_wire())

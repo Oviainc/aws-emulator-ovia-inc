@@ -50,7 +50,7 @@ const VERSIONS: [&str; 10] = [
     "Elasticsearch_7.9",
     "Elasticsearch_7.10",
     "OpenSearch_1.0",
-    "OpenSearch_2.10",
+    "OpenSearch_2.9",
     "OpenSearch_2.11",
     "OpenSearch_2.19",
 ];
@@ -254,7 +254,7 @@ async fn listing_spans_the_instance_types_the_version_offers() {
         ("ultrawarm1.medium.search", "Elasticsearch_6.7", "Elasticsearch_6.8"),
         ("r6g.large.search", "Elasticsearch_7.8", "Elasticsearch_7.9"),
         ("t4g.small.search", "Elasticsearch_7.8", "Elasticsearch_7.9"),
-        ("or1.medium.search", "OpenSearch_2.10", "OpenSearch_2.11"),
+        ("or1.medium.search", "OpenSearch_2.9", "OpenSearch_2.11"),
     ] {
         let absent = instance_types(&whole_listing(&emulator, before, "").await);
         let present = instance_types(&whole_listing(&emulator, from, "").await);

@@ -31,11 +31,12 @@
 //! ([`ComAmazonawsEventbridgeAwseventsState::settle_connections`]).
 //!
 //! Two resources hang off those: the ARCHIVE ([`ArchiveRecord`]), bound to one
-//! event bus, which `CreateArchive` writes, `DescribeArchive` reports and
+//! event bus, which `CreateArchive` writes, `UpdateArchive` changes,
+//! `DescribeArchive` and `ListArchives` report, `DeleteArchive` removes and
 //! `PutEvents` captures matching events into, and the API DESTINATION
 //! ([`ApiDestinationRecord`]), the HTTP endpoint `CreateApiDestination` writes
-//! and `DescribeApiDestination` reports, whose state follows the connection it
-//! invokes through
+//! and `DescribeApiDestination` and `ListApiDestinations` report, whose state
+//! follows the connection it invokes through
 //! ([`ComAmazonawsEventbridgeAwseventsState::api_destination_state`]).
 //!
 //! It also owns the GLOBAL ENDPOINT ([`EndpointRecord`]), the pair of event
@@ -68,7 +69,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    Connection, ConnectionAuthResponseParameters, DeadLetterConfig, DescribeApiDestinationOutput,
+    ApiDestination as ApiDestinationSummary, Archive as ArchiveSummary, Connection,
+    ConnectionAuthResponseParameters, DeadLetterConfig, DescribeApiDestinationOutput,
     DescribeArchiveOutput, DescribeConnectionOutput, DescribeEndpointOutput, DescribeReplayOutput,
     Endpoint as EndpointSummary, EndpointEventBus, LogConfig, PartnerEventSourceAccount,
     Replay as ReplaySummary, ReplayDestination, ReplicationConfig, RoutingConfig,
@@ -969,6 +971,15 @@ pub const ARCHIVE_STATE_CREATING: &str = "CREATING";
 /// The `ArchiveState` an archive that is capturing events is in.
 pub const ARCHIVE_STATE_ENABLED: &str = "ENABLED";
 
+/// The `ArchiveState` an archive an `UpdateArchive` has just changed is in.
+///
+/// The update is applied to the archive and then takes effect on its ingestion,
+/// the way a create does ("allow a short period of time for changes to take
+/// effect", `CreateArchive`), so the call answers this non-terminal state and the
+/// archive reaches [`ARCHIVE_STATE_ENABLED`] again [`ARCHIVE_TRANSITION`] later
+/// ([`ComAmazonawsEventbridgeAwseventsState::settle_archives`]).
+pub const ARCHIVE_STATE_UPDATING: &str = "UPDATING";
+
 /// How long after `CreateArchive` the archive's `ENABLED` state becomes due.
 ///
 /// "When you create an archive, incoming events might not immediately start
@@ -1085,11 +1096,19 @@ impl ArchiveRecord {
         }
     }
 
-    /// Whether this archive captures published events at all: only one that has
-    /// reached `ENABLED` does, which is what "incoming events might not
-    /// immediately start being sent to the archive" (`CreateArchive`) means.
+    /// Whether this archive captures published events at all.
+    ///
+    /// An archive that has not reached `ENABLED` yet captures nothing, which is
+    /// what "incoming events might not immediately start being sent to the
+    /// archive" (`CreateArchive`) means. An `UpdateArchive` does not interrupt
+    /// that: it changes WHAT the archive keeps
+    /// ([`ARCHIVE_STATE_UPDATING`]) rather than stopping it keeping anything, so
+    /// an archive mid-update captures by the pattern the update wrote.
     pub fn captures_events(&self) -> bool {
-        self.state == ARCHIVE_STATE_ENABLED
+        matches!(
+            self.state.as_str(),
+            ARCHIVE_STATE_ENABLED | ARCHIVE_STATE_UPDATING
+        )
     }
 
     /// Append one captured event, evicting the oldest first so the archive never
@@ -1155,6 +1174,24 @@ impl ArchiveRecord {
             state: Some(self.state.clone()),
             state_reason: self.state_reason.clone(),
             kms_key_identifier: self.kms_key_identifier.clone(),
+            retention_days: self.retention_days,
+            size_bytes: i64::try_from(self.captured_bytes).unwrap_or(i64::MAX),
+            event_count: i64::try_from(self.events.len()).unwrap_or(i64::MAX),
+            creation_time: Some(to_wire_timestamp(self.created)),
+        }
+    }
+
+    /// The `Archive` summary a LISTING reports, projected from the SAME stored
+    /// record [`Self::to_describe_output`] reports, so a listing and a read of one
+    /// archive cannot disagree. The summary shape carries no `Description`,
+    /// `EventPattern` or `KmsKeyIdentifier` — those are read with
+    /// `DescribeArchive`.
+    pub fn to_summary(&self) -> ArchiveSummary {
+        ArchiveSummary {
+            archive_name: Some(self.name.clone()),
+            event_source_arn: Some(self.event_source_arn.clone()),
+            state: Some(self.state.clone()),
+            state_reason: self.state_reason.clone(),
             retention_days: self.retention_days,
             size_bytes: i64::try_from(self.captured_bytes).unwrap_or(i64::MAX),
             event_count: i64::try_from(self.events.len()).unwrap_or(i64::MAX),
@@ -2262,9 +2299,10 @@ impl ComAmazonawsEventbridgeAwseventsState {
     /// Materialise every archive change the clock has ALREADY made due at `now`,
     /// and answer how many archives one was applied to.
     ///
-    /// Two changes are owed by the clock alone: the `CREATING` -> `ENABLED`
-    /// transition [`ARCHIVE_TRANSITION`] after the create, and the expiry of a
-    /// captured event past the archive's `RetentionDays`
+    /// Two changes are owed by the clock alone: the transition into
+    /// [`ARCHIVE_STATE_ENABLED`] that a create ([`ARCHIVE_STATE_CREATING`]) or an
+    /// update ([`ARCHIVE_STATE_UPDATING`]) left due [`ARCHIVE_TRANSITION`] later,
+    /// and the expiry of a captured event past the archive's `RetentionDays`
     /// ([`ArchiveRecord::expire_captured`]). Both were owed at the same instant
     /// even if nobody had called, which is why a reporting operation may finish
     /// them.
@@ -2365,6 +2403,26 @@ impl ComAmazonawsEventbridgeAwseventsState {
             api_destination_arn: Some(destination.arn.clone()),
             name: Some(destination.name.clone()),
             description: destination.description.clone(),
+            api_destination_state: Some(self.api_destination_state(destination)),
+            connection_arn: Some(destination.connection_arn.clone()),
+            invocation_endpoint: Some(destination.invocation_endpoint.clone()),
+            http_method: Some(destination.http_method.clone()),
+            invocation_rate_limit_per_second: Some(destination.invocation_rate_limit_per_second),
+            creation_time: Some(to_wire_timestamp(destination.created)),
+            last_modified_time: Some(to_wire_timestamp(destination.last_modified)),
+        }
+    }
+
+    /// The `ApiDestination` summary a LISTING reports, projected from the SAME
+    /// stored record [`Self::to_api_destination_output`] reports — state included,
+    /// so a listing and a read of one destination cannot disagree.
+    pub fn to_api_destination_summary(
+        &self,
+        destination: &ApiDestinationRecord,
+    ) -> ApiDestinationSummary {
+        ApiDestinationSummary {
+            api_destination_arn: Some(destination.arn.clone()),
+            name: Some(destination.name.clone()),
             api_destination_state: Some(self.api_destination_state(destination)),
             connection_arn: Some(destination.connection_arn.clone()),
             invocation_endpoint: Some(destination.invocation_endpoint.clone()),
@@ -4100,19 +4158,58 @@ pub mod event_pattern {
     }
 
     /// How many bytes of PATTERN a term's argument may make the matcher walk:
-    /// the argument's own string lengths, one level deep. Bounded by
-    /// `EventPattern`'s modelled 4096 characters, so this walk is cheap.
+    /// every string it carries and every member it holds, AT EVERY LEVEL.
+    ///
+    /// Recursive rather than one level deep, because the walks this pays for
+    /// descend: a nested `anything-but` argument
+    /// (`{"anything-but": {"wildcard": ["*a*", "*b*"]}}`) compares the leaf
+    /// against every member of its inner list, so a charge that stopped at the
+    /// outer object would pay one unit for all of it. The pattern is bounded by
+    /// `EventPattern`'s modelled 4096 characters, so this walk is itself cheap.
     fn argument_cost(argument: &Value) -> usize {
         match argument {
             Value::String(text) => text.len().max(1),
             Value::Array(members) => members
                 .iter()
-                .map(|member| member.as_str().map_or(1, str::len))
+                .map(argument_cost)
                 .sum::<usize>()
+                .saturating_add(members.len())
                 .max(1),
             Value::Object(map) => map
                 .values()
-                .map(|value| value.as_str().map_or(1, str::len))
+                .map(argument_cost)
+                .sum::<usize>()
+                .saturating_add(map.len())
+                .max(1),
+            _ => 1,
+        }
+    }
+
+    /// What comparing ONE leaf against `argument` may walk: the argument's own
+    /// text at every level, PLUS the leaf once for EVERY argument the comparison
+    /// can try it against.
+    ///
+    /// The leaf is charged per argument because each try walks it again — a
+    /// `wildcard` or `prefix` comparison scans the whole leaf — so a list of
+    /// arguments costs the leaf's length times its length, which is the work
+    /// [`match_operator`] can actually perform.
+    fn comparison_cost(argument: &Value, leaf: &Value) -> usize {
+        argument_cost(argument)
+            .saturating_add(leaf_cost(leaf).saturating_mul(argument_terms(argument)))
+    }
+
+    /// How many separate arguments one comparison can try against the leaf: the
+    /// members of a list, the members of a nested operator's list, and one for a
+    /// single argument.
+    fn argument_terms(argument: &Value) -> usize {
+        match argument {
+            Value::Array(members) => members.len().max(1),
+            Value::Object(map) => map
+                .values()
+                .map(|nested| match nested {
+                    Value::Array(members) => members.len().max(1),
+                    _ => 1,
+                })
                 .sum::<usize>()
                 .max(1),
             _ => 1,
@@ -4472,7 +4569,7 @@ pub mod event_pattern {
                 return false;
             };
             return any_leaf(value, |leaf| {
-                budget.charge(leaf_cost(leaf) + argument_cost(term)) && same_value(leaf, term)
+                budget.charge(comparison_cost(term, leaf)) && same_value(leaf, term)
             });
         };
         let Some((operator, argument)) = map.iter().next().filter(|_| map.len() == 1) else {
@@ -4484,7 +4581,11 @@ pub mod event_pattern {
             // It does not work on intermediate nodes": a field whose value is an
             // object, or an array carrying no leaf at all, is therefore absent as
             // far as this operator is concerned ([`leaf_exists`]).
-            return budget.charge(1)
+            // Charged by what the presence test may WALK: "exists only works on
+            // leaf nodes", and finding whether the field carries one descends
+            // every member of an array-valued field ([`leaf_exists`]), so the
+            // charge is the size of the value rather than one unit.
+            return budget.charge(field.map_or(1, argument_cost))
                 && argument.as_bool() == Some(field.is_some_and(leaf_exists));
         }
         let Some(value) = field else {
@@ -4492,9 +4593,10 @@ pub mod event_pattern {
         };
         any_leaf(value, |leaf| {
             // Charged BEFORE the comparison, by the number of bytes the
-            // comparison may walk, so the budget bounds the work rather than
-            // merely counting calls.
-            budget.charge(leaf_cost(leaf) + argument_cost(argument))
+            // comparison may walk — the argument at every level, and the leaf
+            // once per argument tried against it ([`comparison_cost`]) — so the
+            // budget bounds the work rather than merely counting calls.
+            budget.charge(comparison_cost(argument, leaf))
                 && match_operator(operator, argument, leaf)
         })
     }

@@ -66,6 +66,7 @@ use crate::ops::types::{
     VpcEndpoint, VpcEndpointError, VpcEndpointSummary,
     INBOUND_CONNECTION_STATUS_CODE_VALUES,
     OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES, RESERVED_INSTANCE_PAYMENT_OPTION_VALUES,
+    SCHEDULE_AT_VALUES,
     VOLUME_TYPE_VALUES,
 };
 
@@ -126,6 +127,17 @@ pub const SUPPORTED_ENGINE_VERSIONS: [&str; 32] = [
 /// when it is omitted. It is one of [`SUPPORTED_ENGINE_VERSIONS`], so a domain
 /// created without one runs a version the service publishes.
 pub const DEFAULT_ENGINE_VERSION: &str = "OpenSearch_2.11";
+
+/// Whether the service OFFERS `engine_version`: whether it is one of the versions
+/// [`SUPPORTED_ENGINE_VERSIONS`] publishes, which is the set `ListVersions`
+/// advertises.
+///
+/// `VersionString`'s pattern admits every `Elasticsearch_X.Y` and `OpenSearch_X.Y`
+/// value, so being well formed does not make a value a release the service has:
+/// which releases exist is this catalog's answer, not the pattern's.
+pub fn offers_engine_version(engine_version: &str) -> bool {
+    SUPPORTED_ENGINE_VERSIONS.contains(&engine_version)
+}
 
 /// How far along the upgrade path a version sits: its engine generation (the
 /// OpenSearch line succeeds the Elasticsearch one, OpenSearch 1.0 being the fork of
@@ -373,6 +385,10 @@ pub const DEPLOYMENT_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 /// `DeploymentStatus`'s `ELIGIBLE` value: a service software release the domain can
 /// be moved onto is available.
 pub const DEPLOYMENT_STATUS_ELIGIBLE: &str = "ELIGIBLE";
+
+/// `DeploymentStatus`'s `PENDING_UPDATE` value: a deployment has been requested for a
+/// later instant and has not begun yet.
+pub const DEPLOYMENT_STATUS_PENDING_UPDATE: &str = "PENDING_UPDATE";
 
 /// `OverallChangeStatus`'s `PROCESSING` value: the configuration change is being
 /// applied to the domain.
@@ -1422,6 +1438,75 @@ pub const NO_ROLLBACK_TARGET_DESCRIPTION: &str =
     "No previous software version available for rollback. Please contact AWS Support \
      for assistance.";
 
+/// How a descriptor of a domain names the domain it describes: itself. A refusal
+/// names it by the name the request carried instead, which is the only difference
+/// between the two statements of the sentences below.
+const THIS_DOMAIN: &str = "this domain";
+
+/// How the service states that a domain has no service software update to apply.
+///
+/// `ServiceSoftwareOptions$Description` states it about the domain being described
+/// and a refused `StartServiceSoftwareUpdate` states it about the domain the request
+/// named, so the sentence is written ONCE and only `domain` differs.
+fn no_update_available_sentence(domain: &str) -> String {
+    format!("There is no software update available for {domain}.")
+}
+
+/// The same for a domain that is already applying a deployment.
+fn deployment_in_progress_sentence(domain: &str) -> String {
+    format!("A service software deployment is already in progress on {domain}.")
+}
+
+/// The same for a domain that has an update scheduled and not yet begun.
+fn scheduled_update_sentence(domain: &str) -> String {
+    format!("A service software update is already scheduled on {domain}.")
+}
+
+/// The `ValidationException` payload for a service software update a domain's record
+/// has nothing to deploy for: a deployment is already in flight on it, one is already
+/// scheduled, or no release is available for it to be moved onto.
+///
+/// `StartServiceSoftwareUpdate` models `ValidationException` for a request the
+/// service cannot serve as asked, and a domain whose record has no update available
+/// is exactly that — there is no release to deploy, so nothing is scheduled. The
+/// sentence is the one that record's own `ServiceSoftwareOptions$Description` states
+/// for the condition, naming the domain the request asked about.
+pub fn no_software_update_available(
+    domain_name: &str,
+    deploying: bool,
+    scheduled: bool,
+) -> ValidationException {
+    let named = format!("domain {domain_name}");
+    let message = if deploying {
+        deployment_in_progress_sentence(&named)
+    } else if scheduled {
+        scheduled_update_sentence(&named)
+    } else {
+        no_update_available_sentence(&named)
+    };
+    ValidationException {
+        message: Some(message),
+    }
+}
+
+/// A service software update a caller asked to start LATER: the release it will move
+/// the domain onto, and the instant the schedule the caller named puts it at.
+///
+/// An update asked for at an instant still ahead has been REQUESTED and has not begun,
+/// which is `DeploymentStatus`'s `PENDING_UPDATE` and the one state
+/// `ServiceSoftwareOptions$Cancellable` ("true if you're able to cancel your service
+/// software version update") is true in. It becomes a [`SoftwareDeployment`] when the
+/// clock reaches `starts_at` — materialised by whichever later call reads the record,
+/// so nothing sleeps.
+#[derive(Debug, Clone)]
+pub struct PendingUpdate {
+    /// The release the domain will be moved onto, reported as
+    /// `ServiceSoftwareOptions$NewVersion` while the update waits.
+    pub target_version: String,
+    /// When the schedule the request named has the update begin.
+    pub starts_at: SystemTime,
+}
+
 /// The service software of one domain: the release it runs, the deployment in flight
 /// on it, and whether the release it last came off is still within its rollback
 /// window.
@@ -1439,6 +1524,9 @@ pub struct ServiceSoftware {
     pub available_version: Option<String>,
     /// The deployment in flight, if any.
     pub deployment: Option<SoftwareDeployment>,
+    /// The update a caller asked to start at a later instant, if any: requested, not
+    /// begun, and so the one thing a cancel could still call off.
+    pub pending_update: Option<PendingUpdate>,
     /// The release a rollback would return the domain to: the one it ran before the
     /// deployment that last landed. `None` on a domain no deployment has landed on,
     /// and on one whose last deployment was itself a rollback.
@@ -1460,6 +1548,7 @@ impl ServiceSoftware {
             current_version: DEFAULT_SERVICE_SOFTWARE_VERSION.to_string(),
             available_version: None,
             deployment: None,
+            pending_update: None,
             rollback_to: None,
             rollback_until: None,
             // No automated deployment is scheduled on a domain this emulator holds,
@@ -1477,9 +1566,31 @@ impl ServiceSoftware {
     /// past its due instant: the release it was moving onto becomes the one running,
     /// and what the domain can do next follows from which direction it ran.
     ///
+    /// An update asked for at a later instant is begun here too, once the clock has
+    /// reached it: that deployment was owed at the same instant whether or not anybody
+    /// called.
+    ///
     /// The landing is dated at the DUE instant rather than at `now`, so the rollback
     /// window a caller reads does not move with the moment it happened to look.
     fn settle(&mut self, now: SystemTime) {
+        // An update is begun before any landing is considered, so one whose whole span
+        // has passed between two reads both begins and lands in a single settling.
+        if self
+            .pending_update
+            .as_ref()
+            .is_some_and(|pending| now >= pending.starts_at)
+        {
+            if let Some(pending) = self.pending_update.take() {
+                self.deployment = Some(SoftwareDeployment {
+                    completes_at: pending
+                        .starts_at
+                        .checked_add(PROVISIONING)
+                        .unwrap_or(pending.starts_at),
+                    target_version: pending.target_version,
+                    rollback: false,
+                });
+            }
+        }
         let Some(deployment) = self.deployment.as_ref() else {
             return;
         };
@@ -1505,11 +1616,56 @@ impl ServiceSoftware {
         }
     }
 
+    /// Whether a service software update is available on this domain: a release it can
+    /// be moved onto is available, no deployment is in flight to interrupt and none is
+    /// waiting to begin.
+    ///
+    /// This is `ServiceSoftwareOptions$UpdateAvailable` — "true if you're able to
+    /// update your service software version" — so the member a descriptor reports and
+    /// the eligibility [`ServiceSoftware::begin_update`] tests are ONE answer.
+    pub fn update_available(&self) -> bool {
+        !self.deploying() && self.pending_update.is_none() && self.available_version.is_some()
+    }
+
+    /// Start the update a call at `now` asked for, to begin at `starts_at`, or answer
+    /// `None` when no update is available — which is the whole eligibility test, so a
+    /// caller cannot start one the record does not allow.
+    ///
+    /// A start at or behind `now` begins the deployment with this call; one still ahead
+    /// is recorded as the [`PendingUpdate`] the schedule asked for, which the clock
+    /// turns into a deployment when it reaches that instant. Either way the domain keeps
+    /// running the release it is on until the deployment lands, and the release it is
+    /// moving onto is that deployment's target.
+    pub fn begin_update(
+        &mut self,
+        now: SystemTime,
+        starts_at: SystemTime,
+    ) -> Option<ServiceSoftwareOptions> {
+        if !self.update_available() {
+            return None;
+        }
+        let target = self.available_version.take()?;
+        if starts_at <= now {
+            self.deployment = Some(SoftwareDeployment {
+                target_version: target,
+                completes_at: starts_at.checked_add(PROVISIONING).unwrap_or(starts_at),
+                rollback: false,
+            });
+        } else {
+            self.pending_update = Some(PendingUpdate {
+                target_version: target,
+                starts_at,
+            });
+        }
+        Some(self.to_options())
+    }
+
     /// Whether a service software rollback is available on this domain at `now`: a
     /// deployment has landed leaving an earlier release to return to, its window is
-    /// still open, and no deployment is in flight to interrupt.
+    /// still open, and no deployment is in flight or waiting to begin.
     pub fn rollback_available(&self, now: SystemTime) -> bool {
         !self.deploying()
+            && self.pending_update.is_none()
             && self.rollback_to.is_some()
             && self.rollback_until.is_some_and(|until| now < until)
     }
@@ -1556,7 +1712,9 @@ impl ServiceSoftware {
     /// including the direction it gives a caller that believes a rollback was due.
     pub fn rollback_unavailable(&self) -> RollbackServiceSoftwareOptions {
         let description = if self.deploying() {
-            "A service software deployment is already in progress on this domain.".to_string()
+            deployment_in_progress_sentence(THIS_DOMAIN)
+        } else if self.pending_update.is_some() {
+            scheduled_update_sentence(THIS_DOMAIN)
         } else if self.rollback_to.is_some() {
             "The rollback window of this domain's last service software update has closed."
                 .to_string()
@@ -1574,12 +1732,15 @@ impl ServiceSoftware {
     }
 
     /// `ServiceSoftwareOptions$UpdateStatus`, one of `DeploymentStatus`'s values:
-    /// `IN_PROGRESS` while a deployment is being applied, `ELIGIBLE` when a release
+    /// `IN_PROGRESS` while a deployment is being applied, `PENDING_UPDATE` while one
+    /// waits for the instant it was asked to start at, `ELIGIBLE` when a release
     /// the domain can take is available, and `COMPLETED` when the domain is settled on
     /// the release it runs.
     pub fn update_status(&self) -> &'static str {
         if self.deploying() {
             DEPLOYMENT_STATUS_IN_PROGRESS
+        } else if self.pending_update.is_some() {
+            DEPLOYMENT_STATUS_PENDING_UPDATE
         } else if self.available_version.is_some() {
             DEPLOYMENT_STATUS_ELIGIBLE
         } else {
@@ -1590,19 +1751,27 @@ impl ServiceSoftware {
     /// "A description of the service software update status" — derived from the record
     /// rather than stored, so it cannot disagree with the status beside it.
     fn description(&self) -> String {
-        match (&self.deployment, &self.available_version) {
-            (Some(deployment), _) if deployment.rollback => format!(
+        match (
+            &self.deployment,
+            &self.pending_update,
+            &self.available_version,
+        ) {
+            (Some(deployment), _, _) if deployment.rollback => format!(
                 "Service software rollback to {} is in progress.",
                 deployment.target_version
             ),
-            (Some(deployment), _) => format!(
+            (Some(deployment), _, _) => format!(
                 "Service software update to {} is in progress.",
                 deployment.target_version
             ),
-            (None, Some(available)) => {
+            (None, Some(pending), _) => format!(
+                "Service software update to {} is scheduled.",
+                pending.target_version
+            ),
+            (None, None, Some(available)) => {
                 format!("Service software update {available} is available.")
             }
-            (None, None) => "There is no software update available for this domain.".to_string(),
+            (None, None, None) => no_update_available_sentence(THIS_DOMAIN),
         }
     }
 
@@ -1615,13 +1784,18 @@ impl ServiceSoftware {
                 .deployment
                 .as_ref()
                 .map(|deployment| deployment.target_version.clone())
+                .or_else(|| {
+                    self.pending_update
+                        .as_ref()
+                        .map(|pending| pending.target_version.clone())
+                })
                 .or_else(|| self.available_version.clone()),
-            update_available: Some(!self.deploying() && self.available_version.is_some()),
+            update_available: Some(self.update_available()),
             // "True if you're able to cancel your service software version update":
             // only a deployment that has been requested and not yet begun can be
-            // cancelled, and a deployment here begins with the call that asks for it,
-            // so there is never one waiting.
-            cancellable: Some(false),
+            // cancelled, which is an update asked for at an instant still ahead of the
+            // call that asked for it.
+            cancellable: Some(self.pending_update.is_some()),
             update_status: Some(self.update_status().to_string()),
             description: Some(self.description()),
             // "The timestamp ... until which you can manually request a service
@@ -1993,6 +2167,17 @@ pub fn instant_of_epoch_millis(millis: i64) -> SystemTime {
 /// `SystemTime` represents on both sides of the epoch, which is more than four
 /// centuries.
 const MAX_REPRESENTABLE_OFFSET: Duration = Duration::from_secs(400 * 365 * 24 * 60 * 60);
+
+/// The `ValidationException` payload for a `ScheduleAt` outside the modelled enum:
+/// the value asked for and the values that name a schedule.
+pub fn schedule_at_outside_the_enum(value: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "ScheduleAt must be one of [{}]: {value}",
+            SCHEDULE_AT_VALUES.join(", ")
+        )),
+    }
+}
 
 /// Whether the `DesiredStartTime` a request carries belongs with the `ScheduleAt` it
 /// names: "only specify this parameter if you set `ScheduleAt` to `TIMESTAMP`", and
@@ -3941,6 +4126,40 @@ pub fn malformed_engine_version(member: &str, value: &str) -> ValidationExceptio
             "{member} must be Elasticsearch_X.Y or OpenSearch_X.Y: {value}"
         )),
     }
+}
+
+/// The `ValidationException` payload for a member naming an engine version the
+/// service does not offer: the value exactly as the request carried it, and the
+/// catalog it was resolved against — the same set `ListVersions` advertises, so a
+/// caller is told which releases it could have asked for and the two catalog answers
+/// cannot disagree.
+pub fn unsupported_engine_version(value: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "Unsupported Version: {value}, allowed Versions are: [{}]",
+            SUPPORTED_ENGINE_VERSIONS.join(", ")
+        )),
+    }
+}
+
+/// The engine release `value` names, for an operation that reports what the service
+/// offers FOR a named release.
+///
+/// Two things have to hold, and this is the ONE statement of both: the value has to
+/// be readable as a version at all ([`parse_engine_version`]), and it has to resolve
+/// against the published catalog ([`offers_engine_version`]). Nothing is offered for
+/// a release the service does not have, so a value that resolves to none of them is
+/// refused rather than answered for an engine nothing runs.
+pub fn resolve_engine_version(
+    member: &str,
+    value: &str,
+) -> Result<EngineVersion, ValidationException> {
+    let version =
+        parse_engine_version(value).ok_or_else(|| malformed_engine_version(member, value))?;
+    if !offers_engine_version(value) {
+        return Err(unsupported_engine_version(value));
+    }
+    Ok(version)
 }
 
 /// The `ValidationException` payload for a member that must name an instance type the

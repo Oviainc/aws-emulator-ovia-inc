@@ -10,31 +10,13 @@
 //! names no plan.
 
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
 
 // The wire harness every suite in this crate shares (`tests/all/harness.rs`): the
 // suites differ in the rules they assert, not in how they reach the service.
 use super::harness::{
-    call, call_in, create_plan_with_tags, emulator, error_code, sleep_past_the_transition,
+    call, call_in, create_plan_with_tags, emulator, error_code, list_tags,
+    sleep_past_the_transition,
 };
-
-/// The tags `ListTagsForResource` reports for `arn`, as `(Key, Value)` pairs in the
-/// order the service returned them.
-async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Vec<(String, String)> {
-    let (status, answer) = call(router, "ListTagsForResource", json!({ "ResourceARN": arn })).await;
-    assert_eq!(status, 200, "list tags for {arn}: unexpected answer {answer}");
-    answer["Tags"]
-        .as_array()
-        .unwrap_or_else(|| panic!("list tags for {arn}: no Tags list in {answer}"))
-        .iter()
-        .map(|tag| {
-            (
-                tag["Key"].as_str().unwrap_or_default().to_string(),
-                tag["Value"].as_str().unwrap_or_default().to_string(),
-            )
-        })
-        .collect()
-}
 
 /// A `TagList` request member built from `(Key, Value)` pairs.
 fn tag_list(pairs: &[(&str, &str)]) -> Value {

@@ -178,6 +178,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let issued_after = input.after_issued_time.map(|bound| bound.as_secs_f64());
         let issued_before = input.before_issued_time.map(|bound| bound.as_secs_f64());
+        // The two bounds name ONE window, each of them exclusive: an
+        // `afterIssuedTime` at or after the `beforeIssuedTime` beside it spans
+        // no instant, so the pair states a period rather than selecting on one
+        // (`crate::state::time_window_refusal`).
+        if let Some(refusal) = crate::state::time_window_refusal(
+            issued_after,
+            issued_before,
+            "afterIssuedTime",
+            "beforeIssuedTime",
+        ) {
+            return Err(
+                ListAgreementInvoiceLineItemsErrorModeled::ValidationException(refusal).into(),
+            );
+        }
+
         // The token resumes THIS listing: one minted for a different agreement
         // or a different set of filters would index into a different sequence.
         let scope = crate::state::invoice_line_item_scope(

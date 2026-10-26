@@ -19,6 +19,8 @@ mod application_group_identity;
 mod cancel_tag_sync_task;
 #[path = "all/delete_group_protection.rs"]
 mod delete_group_protection;
+#[path = "all/delete_group_tag_sync_tasks.rs"]
+mod delete_group_tag_sync_tasks;
 #[path = "all/get_tag_sync_task.rs"]
 mod get_tag_sync_task;
 #[path = "all/group_owner_configuration_and_update.rs"]

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAuthenticationProfiles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAuthenticationProfiles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAuthenticationProfiles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the authentication profiles this service's store holds: the ONE the
+//! request names, or every profile the account owns when it names none, in
+//! creation order. A name that identifies no profile is refused with
+//! `AuthenticationProfileNotFoundFault` rather than reported as an empty list.
 //!
 //! ## Shape of an operation
 //!
@@ -84,11 +80,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `DescribeAuthenticationProfilesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DescribeAuthenticationProfiles")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DescribeAuthenticationProfiles",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeAuthenticationProfilesErrorModeled {
     AuthenticationProfileNotFoundFault(AuthenticationProfileNotFoundFault),
     InvalidAuthenticationProfileRequestFault(InvalidAuthenticationProfileRequestFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -140,20 +140,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAuthenticationProfiles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAuthenticationProfilesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAuthenticationProfiles"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribeAuthenticationProfilesErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A pure report: nothing here changes what a later caller sees, and an
+        // authentication profile has no status the clock owes a transition on.
+        let store = state.lock();
+
+        // The profiles this request reports: the ONE the name identifies, or
+        // every one the account owns when it names none ("If not specified then
+        // all authentication profiles owned by the account are listed"). ONE
+        // lookup decides both, so the refusal and the selection can never
+        // disagree — a name that identifies no profile is a refusal, not an
+        // empty report.
+        let selected: Vec<AuthenticationProfile> = match input
+            .authentication_profile_name
+            .as_deref()
+        {
+            Some(requested) => match store.authentication_profile(requested) {
+                Some(profile) => vec![profile.clone()],
+                None => {
+                    return Err(
+                        DescribeAuthenticationProfilesErrorModeled::AuthenticationProfileNotFoundFault(
+                            AuthenticationProfileNotFoundFault {
+                                message: Some(st::authentication_profile_not_found_message(
+                                    requested,
+                                )),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => store.authentication_profiles.clone(),
+        };
+
+        Ok(DescribeAuthenticationProfilesOutput {
+            authentication_profiles: Some(selected),
+        })
     }
 }

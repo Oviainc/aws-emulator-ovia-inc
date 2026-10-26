@@ -522,7 +522,9 @@ async fn a_read_reports_the_time_period_the_caller_sent_or_the_service_defaulted
 
 /// The per-member defaults the model documents on `CostTypes` ("The default value is
 /// `true`" on every `Include*` member, `false` on `UseBlended` and `UseAmortized`).
-const COST_TYPE_DEFAULTS: &[(&str, bool)] = &[
+/// `pub(crate)` so the sibling suite that asserts WHICH budgets hold cost types
+/// (`tests/all/budget_cost_types_by_type.rs`) spans the same member list.
+pub(crate) const COST_TYPE_DEFAULTS: &[(&str, bool)] = &[
     ("IncludeTax", true),
     ("IncludeSubscription", true),
     ("IncludeRefund", true),
@@ -580,22 +582,12 @@ async fn a_read_reports_the_cost_types_and_health_status_the_service_stamped() {
                     );
                 }
             } else {
-                match sent {
-                    // A value the caller sent is stored and reported whatever the type.
-                    Some(supplied) => {
-                        let cost_types = cost_types.unwrap_or(Value::Null);
-                        assert!(
-                            same(supplied, &cost_types),
-                            "case {case:?}: expected the CostTypes the caller sent {supplied}, \
-                             got {cost_types}"
-                        );
-                    }
-                    // Nothing is defaulted for a budget type that has no cost types.
-                    None => assert!(
-                        cost_types.as_ref().is_none_or(Value::is_null),
-                        "case {case:?}: expected no CostTypes, got {cost_types:?}"
-                    ),
-                }
+                // A budget type that has no cost types reads back with none: nothing is
+                // defaulted for it, and a map the caller sent is not stored either.
+                assert!(
+                    cost_types.as_ref().is_none_or(Value::is_null),
+                    "case {case:?}: expected no CostTypes, got {cost_types:?}"
+                );
             }
 
             let health = read["HealthStatus"].clone();

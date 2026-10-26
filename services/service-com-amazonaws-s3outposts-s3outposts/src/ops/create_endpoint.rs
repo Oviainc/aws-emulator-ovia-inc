@@ -166,24 +166,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `AccessType` documents the one cross-member rule the model cannot
-        // express: the two access types are alternative network paths — "to use
-        // the Amazon Web Services VPC, choose Private. To use the endpoint with
-        // an on-premises network, choose CustomerOwnedIp. If you choose
+        // `AccessType` documents the one cross-member requirement the model
+        // cannot express, and states it in a single direction: "if you choose
         // CustomerOwnedIp, you must also provide the customer-owned IP address
-        // pool (CoIP pool)". The CoIP pool is the pool "IP addresses are
-        // allocated from ... for the endpoint", so the two members have to agree
-        // in BOTH directions: an on-premises endpoint names the pool it
-        // allocates from, and a VPC endpoint allocates from its subnet and so
-        // names none. An absent `AccessType` is `Private`, which the same
-        // documentation names "the default access type value".
+        // pool (CoIP pool)". Nothing requires the converse, so a pool named
+        // with the VPC access type — explicitly, or through the default an
+        // absent member takes, which the same documentation names "the default
+        // access type value" — is an admitted optional member and the request
+        // carries on to resolve the resources it names.
         let access_type = input
             .access_type
             .unwrap_or_else(|| crate::state::ACCESS_TYPE_PRIVATE.to_string());
-        if let Err(invalid) = crate::state::check_coip_pool(
-            &access_type,
-            input.customer_owned_ipv4_pool.as_deref(),
-        ) {
+        if let Err(invalid) =
+            crate::state::check_coip_pool(&access_type, input.customer_owned_ipv4_pool.as_deref())
+        {
             return Err(CreateEndpointErrorModeled::ValidationException(invalid).into());
         }
 

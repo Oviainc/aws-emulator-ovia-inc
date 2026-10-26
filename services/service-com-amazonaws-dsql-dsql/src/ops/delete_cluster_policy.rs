@@ -5,7 +5,10 @@
 //! Detaches the resource-based policy from a cluster and answers with the
 //! `policyVersion` it removed, so a later `GetClusterPolicy` is
 //! `ResourceNotFoundException` again. A cluster with no policy attached has
-//! nothing to delete, which is a 404 rather than a silent success.
+//! nothing to delete, which is a 404 rather than a silent success, and a cluster
+//! whose status does not accept a mutation — one the clock still owes a
+//! transition, or one already on its way out — keeps the policy it has and
+//! answers 409 `ConflictException`, exactly as the attaching sibling does.
 //!
 //! ## Shape of an operation
 //!

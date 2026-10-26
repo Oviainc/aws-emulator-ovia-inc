@@ -373,6 +373,8 @@ mod volumes_in_recycle_bin;
 mod vpc_attributes;
 #[path = "all/vpc_block_public_access_exclusions.rs"]
 mod vpc_block_public_access_exclusions;
+#[path = "all/vpc_endpoint_connection_notifications.rs"]
+mod vpc_endpoint_connection_notifications;
 #[path = "all/vpc_endpoint_connections.rs"]
 mod vpc_endpoint_connections;
 #[path = "all/vpc_endpoints_and_byoip.rs"]

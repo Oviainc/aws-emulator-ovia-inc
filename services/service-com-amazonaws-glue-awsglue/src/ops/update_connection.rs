@@ -202,9 +202,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(entry) = store.connection_mut(&catalog_id, &input.name) else {
             return Err(UpdateConnectionErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(format!(
-                        "Connection {} not found in catalog {catalog_id}",
-                        input.name
+                    message: Some(crate::state::messages::connection_not_found_for_write(
+                        &input.name,
                     )),
                     from_federation_source: None,
                 },

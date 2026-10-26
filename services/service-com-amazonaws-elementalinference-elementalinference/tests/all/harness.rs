@@ -97,6 +97,17 @@ pub async fn untag_resource(
     resource_arn: &str,
     tag_keys: &[String],
 ) -> (u16, Value) {
+    untag_resource_in(router, REGION, resource_arn, tag_keys).await
+}
+
+/// As [`untag_resource`], through `region`'s endpoint — for a suite that asserts which
+/// Region owns the resource a tagging request names.
+pub async fn untag_resource_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    resource_arn: &str,
+    tag_keys: &[String],
+) -> (u16, Value) {
     assert!(
         !tag_keys.is_empty(),
         "tagKeys is @required, so every request under test names at least one key"
@@ -107,7 +118,7 @@ pub async fn untag_resource(
         .collect::<Vec<String>>()
         .join("&");
     let uri = format!("{}?{query}", tags_path(resource_arn));
-    call(router, "DELETE", &uri, None).await
+    call_in_region(router, region, "DELETE", &uri, None).await
 }
 
 /// A router serving this service alone over one shared engine.
@@ -381,11 +392,25 @@ pub async fn create_tagged_resource(
     name: &str,
     tags: &[(String, String)],
 ) -> (String, String) {
+    create_tagged_resource_in(router, REGION, kind, name, tags).await
+}
+
+/// As [`create_tagged_resource`], through `region`'s endpoint: the resource belongs to
+/// the Region whose endpoint created it, and the ARN it returns is the one that endpoint
+/// minted.
+pub async fn create_tagged_resource_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    kind: &str,
+    name: &str,
+    tags: &[(String, String)],
+) -> (String, String) {
     let body = tagged_create_body(kind, name, tags);
-    let (status, created) = call(router, "POST", &format!("/v1/{kind}"), Some(body)).await;
+    let (status, created) =
+        call_in_region(router, region, "POST", &format!("/v1/{kind}"), Some(body)).await;
     assert_eq!(
         status, 202,
-        "creating a {kind} named {name:?} answers 202, got {status} with {created}"
+        "creating a {kind} named {name:?} in {region:?} answers 202, got {status} with {created}"
     );
     let id = created["id"]
         .as_str()
@@ -401,7 +426,17 @@ pub async fn create_tagged_resource(
 /// Read one resource of `kind` back through its own implemented reader (`GetFeed` /
 /// `GetDictionary`), which is where a tag write or delete has to show up.
 pub async fn read_resource(router: &MultiServiceRouter, kind: &str, id: &str) -> (u16, Value) {
-    call(router, "GET", &format!("/v1/{kind}/{id}"), None).await
+    read_resource_in(router, REGION, kind, id).await
+}
+
+/// As [`read_resource`], through `region`'s endpoint.
+pub async fn read_resource_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    kind: &str,
+    id: &str,
+) -> (u16, Value) {
+    call_in_region(router, region, "GET", &format!("/v1/{kind}/{id}"), None).await
 }
 
 /// The ids one endpoint's list operation reports, sorted so a comparison does not

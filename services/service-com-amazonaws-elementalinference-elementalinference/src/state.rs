@@ -39,10 +39,10 @@
 //! [`ComAmazonawsElementalinferenceElementalinferenceState::dictionaries_in`]): a
 //! resource is listed, read and mutated through the endpoint that created it alone, an
 //! id presented to any other Region names nothing there, and the quotas below are each
-//! Region's own. It is the same whole-ARN rule
-//! [`ComAmazonawsElementalinferenceElementalinferenceState::tagged_resource_mut`] holds
-//! the tagging path to, so the id-based and the ARN-based paths cannot disagree about
-//! which resources a Region holds.
+//! Region's own. The ARN-based tagging path resolves within that same Region
+//! ([`ComAmazonawsElementalinferenceElementalinferenceState::tagged_resource_mut`]), so
+//! the id-based and the ARN-based paths cannot disagree about which resources a Region
+//! holds.
 //!
 //! A FIXTURE is not one of those resources: no operation of this service creates,
 //! updates or deletes one. A fixture is a sports event "as provided by the data
@@ -1219,16 +1219,21 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
             .len()
     }
 
-    /// The resource a `resourceArn` names, if this store holds it.
+    /// The resource a `resourceArn` names IN `region`, if that Region holds it.
     ///
     /// An ARN identifies a resource WHOLE: the kind of resource (`feed` or
     /// `dictionary`), its id, and the region and account it was minted in. So an ARN
     /// resolves only when it is exactly the ARN the stored record carries, and every
     /// other well-formed value — another kind, another id, another region, another
-    /// account — names no resource of this store and so resolves to nothing. That is
-    /// what makes the resource "the resource identified by the specified resourceArn in
-    /// the current region" (`TagResource`) rather than whichever record happens to share
-    /// its id.
+    /// account — names no resource of this store and so resolves to nothing.
+    ///
+    /// It must ALSO be a resource of the endpoint the request reached, which is what
+    /// makes it "the resource identified by the specified resourceArn in the current
+    /// region" (`TagResource`, `UntagResource`): the lookup goes through the same
+    /// (Region, id) resolution every id-based operation uses ([`Self::feed_mut`],
+    /// [`Self::dictionary_mut`]), so an ARN that is a perfectly good ARN of ANOTHER
+    /// Region's resource names nothing here, exactly as that resource's bare id does.
+    /// The two paths therefore cannot disagree about which resources a Region holds.
     ///
     /// One resolution shared by every operation that reaches a resource by its
     /// `resourceArn`, so none of them can disagree about what an ARN names.
@@ -1237,20 +1242,22 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
     /// the ARN of a deleted feed or dictionary resolves here no more than one of a
     /// resource that never existed, so a tagging call about it is refused exactly as
     /// that one is.
-    pub fn tagged_resource_mut(&mut self, resource_arn: &str) -> Option<TaggedResourceMut<'_>> {
+    pub fn tagged_resource_mut(
+        &mut self,
+        region: &str,
+        resource_arn: &str,
+    ) -> Option<TaggedResourceMut<'_>> {
         // `arn:<partition>:<service>:<region>:<account>:<kind>/<id>` — field 5 is the
         // resource segment, which the modelled `resourceArn` pattern spells
         // `(feed|dictionary)/[a-zA-Z0-9]{1,19}`.
         let (kind, id) = resource_arn.split(':').nth(5)?.split_once('/')?;
         match kind {
             "feed" => self
-                .feeds
-                .get_mut(id)
+                .feed_mut(region, id)
                 .filter(|feed| feed.arn == resource_arn)
                 .map(TaggedResourceMut::Feed),
             "dictionary" => self
-                .dictionaries
-                .get_mut(id)
+                .dictionary_mut(region, id)
                 .filter(|dictionary| dictionary.arn == resource_arn)
                 .map(TaggedResourceMut::Dictionary),
             _ => None,

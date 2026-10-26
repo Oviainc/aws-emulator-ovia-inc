@@ -21,6 +21,8 @@ mod access_key_status;
 mod access_keys;
 #[path = "all/account_aliases.rs"]
 mod account_aliases;
+#[path = "all/account_authorization_details.rs"]
+mod account_authorization_details;
 #[path = "all/account_properties.rs"]
 mod account_properties;
 #[path = "all/aws_managed_policy_catalog.rs"]

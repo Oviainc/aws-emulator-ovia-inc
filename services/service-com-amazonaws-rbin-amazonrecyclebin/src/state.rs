@@ -255,6 +255,17 @@ impl Rule {
         unlockable_rule(&self.resource_tags, &self.exclude_resource_tags)
     }
 
+    /// Whether the rule holds a lock — a lock configuration, and with it a lock state.
+    ///
+    /// True for every rule that has ever been locked, whatever lock state the clock has
+    /// since brought it to: "Once a retention rule has been locked, it can transition
+    /// between the locked and unlocked states only; it can never transition back to
+    /// null". So it is still true of an `unlocked` rule whose unlock delay has run out —
+    /// the one window in which a rule that holds a lock can be modified at all.
+    pub fn holds_lock(&self) -> bool {
+        self.lock_configuration.is_some() || self.lock_state.is_some()
+    }
+
     /// Assign `tags` to the rule, as [`upsert_tags`] defines assigning.
     pub fn apply_tags(&mut self, tags: Vec<Tag>) {
         upsert_tags(&mut self.tags, tags);
@@ -493,10 +504,12 @@ impl BlockingCondition {
 /// "You can't lock tag-level retention rules, or Region-level retention rules that have
 /// exclusion tags" (smithy_query(query="doc", shape="LockRule")): a rule carrying
 /// resource tags is tag-level, and one carrying exclusion tags is a Region-level rule
-/// with exclusions. The invariant lives HERE, in one place, because every door a lock
-/// can arrive through is held to it — `LockRule`, which refuses the rule the request
-/// addressed, and `CreateRule`, which refuses a request that would mint the same
-/// combination — so the two cannot disagree about which rules a lock can hold on.
+/// with exclusions. The invariant lives HERE, in one place, because every door the
+/// combination can arrive through is held to it — `LockRule`, which refuses the rule the
+/// request addressed, `CreateRule`, which refuses a request that would mint the same
+/// combination, and `UpdateRule`, which refuses a request that would change a
+/// lock-holding rule's selection into one — so no two of them can disagree about which
+/// rules a lock can hold on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnlockableRule {
     /// The rule selects resources by resource tags, which makes it tag-level.
@@ -527,6 +540,16 @@ impl UnlockableRule {
             }
         }
     }
+
+    /// The member that carries the selection making a rule one of these — the member a
+    /// validation clause names when the request CHANGES the selection of a rule that
+    /// already holds a lock, rather than asking for the lock itself.
+    pub fn selection_member(self) -> &'static str {
+        match self {
+            Self::TagLevel => RESOURCE_TAGS_MEMBER,
+            Self::ExclusionTags => EXCLUDE_RESOURCE_TAGS_MEMBER,
+        }
+    }
 }
 
 /// Whether a rule that retains what `resource_tags` select, less what
@@ -554,6 +577,9 @@ pub const LOCK_CONFIGURATION_MEMBER: &str = "lockConfiguration";
 /// The member path a refused `ExcludeResourceTags` is named by.
 pub const EXCLUDE_RESOURCE_TAGS_MEMBER: &str = "excludeResourceTags";
 
+/// The member path a refused `ResourceTags` is named by.
+pub const RESOURCE_TAGS_MEMBER: &str = "resourceTags";
+
 /// The requirement ANY member fails by being specified for a tag-level retention rule —
 /// a rule that selects what it retains by resource tags. Two members fail it, for
 /// reasons the service states separately, so the sentence is written once here and both
@@ -578,6 +604,23 @@ pub fn lock_configuration_not_allowed(blocker: UnlockableRule) -> ValidationExce
         LOCK_CONFIGURATION_MEMBER,
         blocker.lock_configuration_requirement(),
     )
+}
+
+/// The requirement a selection member fails by being specified for a retention rule that
+/// already holds a lock: a lock holds only on a Region-level rule with no exclusion tags,
+/// so neither selection member can be given a value on such a rule.
+const LOCK_HOLDING_MEMBER_REQUIREMENT: &str =
+    "Member must not be specified for a retention rule with a lock configuration";
+
+/// The modelled 400 for a request that would change the resource selection of a rule
+/// HOLDING a lock into one a lock cannot hold on.
+///
+/// The mirror image of [`lock_configuration_not_allowed`], over the same invariant read
+/// from the other side: there the selection is settled and the lock is the member that
+/// cannot hold, here the lock is settled and the selection the request names is the
+/// member that cannot hold, so the clause names that member.
+pub fn lock_holding_selection_not_allowed(blocker: UnlockableRule) -> ValidationException {
+    member_validation_failed(blocker.selection_member(), LOCK_HOLDING_MEMBER_REQUIREMENT)
 }
 
 /// The modelled 409 for a lock, modify or delete the rule's own state forbids.

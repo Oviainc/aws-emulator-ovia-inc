@@ -76,7 +76,20 @@ impl ::aws_smithy_schema_server::DeserializableStruct for ReceivedExportSpecific
     }
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.backupsearch#StartSearchResultExportJobInput")]
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.backupsearch#StartSearchResultExportJobInput",
+    // `skip_validation = ["RoleArn"]`: the published `IamRoleArn` syntax is NOT what this
+    // service refuses a bad role on. The value is a role the service ASSUMES to write the
+    // results, so a well-formed ARN it cannot pass is an authorization failure — the
+    // modelled `AccessDeniedException` (HTTP 403) — and not the boundary's
+    // `ValidationException` (HTTP 400). The constraint traits are therefore kept off the
+    // generated member schema and the handler judges the value itself
+    // (`crate::state::role_arn_input_refusal` for the modelled `@length`, and the
+    // `@pattern` for a value that is no ARN at all; `crate::state::pass_role_denial` for
+    // the pass-role decision). Every other member of this input keeps its modelled
+    // constraints.
+    skip_validation = ["RoleArn"]
+)]
 #[derive(Debug, Clone)]
 pub struct StartSearchResultExportJobInput {
     pub search_job_identifier: String,

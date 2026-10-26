@@ -1548,6 +1548,85 @@ impl UserPool {
             .is_some_and(|factors| factors.iter().any(|allowed| allowed == factor))
     }
 
+    /// The `AuthFactorType` values `user` can authenticate with in a choice-based
+    /// (`USER_AUTH`) sign-in of this pool, in [`AUTH_FACTOR_ORDER`].
+    ///
+    /// A factor is available to the user when this pool offers it as a first
+    /// authentication factor and the user holds what that factor needs
+    /// ([`UserPool::offers_first_auth_factor`]), or when the user has it available
+    /// as an MFA factor ([`UserPool::offers_mfa_auth_factor`]) — "EMAIL_OTP,
+    /// SMS_OTP, and WEB_AUTHN can be used as either a first authentication factor
+    /// or an MFA factor" (`ConfiguredUserAuthFactors` in this service's model). A
+    /// factor neither half offers is not one the user can sign in with, so it is
+    /// not reported.
+    ///
+    /// A PURE read, computed from the stored pool and the stored user.
+    pub fn configured_user_auth_factors(&self, user: &User) -> Vec<String> {
+        AUTH_FACTOR_ORDER
+            .iter()
+            .copied()
+            .filter(|factor| {
+                self.offers_first_auth_factor(user, factor)
+                    || self.offers_mfa_auth_factor(user, factor)
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Whether `user` can present `factor` as the FIRST authentication factor of a
+    /// choice-based sign-in of this pool.
+    ///
+    /// The pool has to admit the factor ([`UserPool::allows_first_auth_factor`])
+    /// AND the user has to hold what presenting it needs: a stored password, a
+    /// verified address a one-time password can be delivered to, or a registered
+    /// passkey. `SOFTWARE_TOKEN` "can only be used as an MFA factor"
+    /// (`ConfiguredUserAuthFactors` in this service's model), so no sign-in policy
+    /// entry makes it a first factor.
+    pub fn offers_first_auth_factor(&self, user: &User, factor: &str) -> bool {
+        if !self.allows_first_auth_factor(factor) {
+            return false;
+        }
+        match factor {
+            PASSWORD_AUTH_FACTOR => user.password.is_some(),
+            EMAIL_OTP_AUTH_FACTOR => user.verified_destination_of("email").is_some(),
+            SMS_OTP_AUTH_FACTOR => user.verified_destination_of("phone_number").is_some(),
+            WEB_AUTHN_AUTH_FACTOR => !user.web_authn_credentials.is_empty(),
+            _ => false,
+        }
+    }
+
+    /// Whether `user` can present `factor` as an MFA factor of a choice-based
+    /// sign-in of this pool.
+    ///
+    /// A factor the user has ACTIVATED is available as one
+    /// ([`User::activates_mfa_auth_factor`]). `WEB_AUTHN` is the one factor the
+    /// POOL activates rather than the user: it "is available as an MFA factor only
+    /// when passkey MFA is enabled at the user pool level"
+    /// (`ConfiguredUserAuthFactors`), which
+    /// `WebAuthnConfigurationType.FactorConfiguration` is "when set to
+    /// `MULTI_FACTOR_WITH_USER_VERIFICATION`, passkey authentication with user
+    /// verification satisfies MFA requirements. When set to `SINGLE_FACTOR` or not
+    /// set, passkeys are a single authentication factor" (both in this service's
+    /// model) — and presenting it still needs a registered passkey.
+    pub fn offers_mfa_auth_factor(&self, user: &User, factor: &str) -> bool {
+        if factor == WEB_AUTHN_AUTH_FACTOR {
+            return self.passkeys_satisfy_mfa() && !user.web_authn_credentials.is_empty();
+        }
+        user.activates_mfa_auth_factor(factor)
+    }
+
+    /// Whether a passkey of this pool satisfies an MFA requirement:
+    /// `WebAuthnConfigurationType.FactorConfiguration` set to
+    /// [`WEB_AUTHN_MULTI_FACTOR`], the one of that enum's values that makes passkey
+    /// authentication "satisfy MFA requirements" (this service's model). A pool
+    /// that stores no passkey configuration at all has not enabled it.
+    pub fn passkeys_satisfy_mfa(&self) -> bool {
+        self.web_authn_configuration
+            .as_ref()
+            .and_then(|config| config.factor_configuration.as_deref())
+            .is_some_and(|configuration| configuration == WEB_AUTHN_MULTI_FACTOR)
+    }
+
     /// Whether this pool holds a new value of `name` PENDING until the user
     /// confirms it:
     /// `UserAttributeUpdateSettings.AttributesRequireVerificationBeforeUpdate`
@@ -2294,6 +2373,20 @@ impl User {
         // A successful call stores the submitted configuration over the one the
         // user held, which is a change to the user record itself.
         self.user_last_modified_date = now;
+    }
+
+    /// Whether this user has ACTIVATED `factor` as an MFA factor.
+    ///
+    /// `UserMFASettingList` reports "the MFA options that are activated for the
+    /// user. The possible values in this list are `SMS_MFA`, `EMAIL_OTP`, and
+    /// `SOFTWARE_TOKEN_MFA`", and `ConfiguredUserAuthFactors` reports the same
+    /// factors under `AuthFactorType`'s names (both in this service's model), so
+    /// each activated setting activates the factor it maps to
+    /// ([`mfa_auth_factor_of`]) and a setting that maps to none activates nothing.
+    pub fn activates_mfa_auth_factor(&self, factor: &str) -> bool {
+        self.mfa_setting_list
+            .iter()
+            .any(|setting| mfa_auth_factor_of(setting.as_str()) == Some(factor))
     }
 
     /// Whether the stored password is a temporary one that has outlived
@@ -3423,6 +3516,63 @@ pub fn delivery_medium(attribute: &str) -> Option<&'static str> {
 /// `SMS_MFA`, `EMAIL_OTP`, and `SOFTWARE_TOKEN_MFA`" (this service's model), and
 /// SMS is the one factor an `MFAOptionType` configures.
 pub const SMS_MFA_SETTING: &str = "SMS_MFA";
+
+/// The `UserMFASettingList` value for email message MFA, the second of the three
+/// values that member documents (see [`SMS_MFA_SETTING`]).
+pub const EMAIL_OTP_MFA_SETTING: &str = "EMAIL_OTP";
+
+/// The `UserMFASettingList` value for time-based one-time password MFA, the third
+/// of the three values that member documents (see [`SMS_MFA_SETTING`]).
+pub const SOFTWARE_TOKEN_MFA_SETTING: &str = "SOFTWARE_TOKEN_MFA";
+
+/// `AuthFactorType`'s password factor, which "can only be used as a first
+/// authentication factor" (`ConfiguredUserAuthFactors` in this service's model).
+pub const PASSWORD_AUTH_FACTOR: &str = "PASSWORD";
+
+/// `AuthFactorType`'s email one-time-password factor.
+pub const EMAIL_OTP_AUTH_FACTOR: &str = "EMAIL_OTP";
+
+/// `AuthFactorType`'s SMS one-time-password factor.
+pub const SMS_OTP_AUTH_FACTOR: &str = "SMS_OTP";
+
+/// `AuthFactorType`'s passkey factor.
+pub const WEB_AUTHN_AUTH_FACTOR: &str = "WEB_AUTHN";
+
+/// `AuthFactorType`'s time-based one-time-password factor, which "can only be
+/// used as an MFA factor" (`ConfiguredUserAuthFactors` in this service's model).
+pub const SOFTWARE_TOKEN_AUTH_FACTOR: &str = "SOFTWARE_TOKEN";
+
+/// Every `AuthFactorType` value, in the order the model DECLARES them in
+/// (`smithy_query(query="shape",shape="AuthFactorType")`) rather than the
+/// alphabetical order the generated `crate::ops::types::AUTH_FACTOR_TYPE_VALUES`
+/// catalog carries them in. `ConfiguredUserAuthFactors` reports a user's factors
+/// in that declared order, as its own example `["PASSWORD", "WEB_AUTHN"]` shows
+/// (this service's model).
+pub const AUTH_FACTOR_ORDER: [&str; 5] = [
+    PASSWORD_AUTH_FACTOR,
+    EMAIL_OTP_AUTH_FACTOR,
+    SMS_OTP_AUTH_FACTOR,
+    WEB_AUTHN_AUTH_FACTOR,
+    SOFTWARE_TOKEN_AUTH_FACTOR,
+];
+
+/// The `WebAuthnFactorConfigurationType` value under which "passkey
+/// authentication with user verification satisfies MFA requirements"
+/// (`WebAuthnConfigurationType.FactorConfiguration` in this service's model); its
+/// only other value makes passkeys a single authentication factor.
+pub const WEB_AUTHN_MULTI_FACTOR: &str = "MULTI_FACTOR_WITH_USER_VERIFICATION";
+
+/// The `AuthFactorType` value a `UserMFASettingList` setting activates as an MFA
+/// factor, or `None` for a setting that names no `AuthFactorType` value. The one
+/// place the two value sets are mapped to each other.
+pub fn mfa_auth_factor_of(setting: &str) -> Option<&'static str> {
+    match setting {
+        SMS_MFA_SETTING => Some(SMS_OTP_AUTH_FACTOR),
+        EMAIL_OTP_MFA_SETTING => Some(EMAIL_OTP_AUTH_FACTOR),
+        SOFTWARE_TOKEN_MFA_SETTING => Some(SOFTWARE_TOKEN_AUTH_FACTOR),
+        _ => None,
+    }
+}
 
 /// The only `DeliveryMediumType` an `MFAOptionType` may set:
 /// `MFAOptionType.DeliveryMedium` is "the delivery medium to send the MFA code.

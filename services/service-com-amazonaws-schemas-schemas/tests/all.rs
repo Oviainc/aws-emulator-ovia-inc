@@ -71,5 +71,7 @@ mod state_roundtrip;
 mod stop_discoverer;
 #[path = "all/update_description.rs"]
 mod update_description;
+#[path = "all/update_discoverer.rs"]
+mod update_discoverer;
 #[path = "all/update_schema_versions.rs"]
 mod update_schema_versions;

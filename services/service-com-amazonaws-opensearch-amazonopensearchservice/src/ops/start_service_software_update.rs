@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartServiceSoftwareUpdate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartServiceSoftwareUpdate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartServiceSoftwareUpdate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deploys the service software release a domain's own record has available onto that
+//! domain, starting a deployment the clock lands — at once, or at the instant the
+//! schedule the request named puts it at, which is a requested-but-not-begun update
+//! until the clock reaches it. The record it reads and writes is
+//! [`crate::state::ServiceSoftware`], the one copy of a domain's service software
+//! every descriptor of the domain reports, and the eligibility test is that record's
+//! ([`crate::state::ServiceSoftware::begin_update`]): a domain with no release
+//! available to move onto, or one already applying a deployment, has nothing to
+//! deploy, so the request cannot be served as asked and is refused with the modelled
+//! `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +88,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::{
+    check_desired_start_time, domain_not_found, no_software_update_available, rescheduled_instant,
+    schedule_at_outside_the_enum, SCHEDULE_AT_NOW, SCHEDULE_AT_TIMESTAMP,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -157,18 +166,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartServiceSoftwareUpdate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartServiceSoftwareUpdateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartServiceSoftwareUpdate"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // "Default: NOW if you don't specify a value for DesiredStartTime, and
+        // TIMESTAMP if you do" — so a request that sends no `ScheduleAt` is read as the
+        // value its `DesiredStartTime` implies, before the pairing between the two is
+        // decided.
+        let schedule_at = input.schedule_at.clone().unwrap_or_else(|| {
+            if input.desired_start_time.is_some() {
+                SCHEDULE_AT_TIMESTAMP
+            } else {
+                SCHEDULE_AT_NOW
+            }
+            .to_string()
+        });
+
+        // `ScheduleAt` targets an enum of exactly three values, the model's record of
+        // when an update can be asked to start, so a value outside it names no schedule
+        // at all. The boundary refuses one before this handler runs; the check is
+        // repeated here so the rule holds however the request reached us.
+        if !SCHEDULE_AT_VALUES.contains(&schedule_at.as_str()) {
+            return Err(StartServiceSoftwareUpdateErrorModeled::ValidationException(
+                schedule_at_outside_the_enum(&schedule_at),
+            )
+            .into());
+        }
+
+        // "You only need to specify this parameter if you set ScheduleAt to TIMESTAMP",
+        // and that value "must also provide a value for DesiredStartTime": the pairing
+        // is a property of the REQUEST, so it is decided before anything the request
+        // names is resolved — a request that cannot be served as asked is refused
+        // whether or not its domain exists.
+        check_desired_start_time(&schedule_at, input.desired_start_time)
+            .map_err(StartServiceSoftwareUpdateErrorModeled::ValidationException)?;
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+
+        // "The name of the domain that you want to update to the latest service
+        // software": the deployment is a change to THAT domain, so a name the store
+        // holds no domain under names nothing to update. `settled_mut` first
+        // materialises whatever the clock already owed the record — including the
+        // completion of a deployment in flight, which is what decides whether this call
+        // has anything to deploy.
+        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
+            StartServiceSoftwareUpdateErrorModeled::ResourceNotFoundException(domain_not_found(
+                &input.domain_name,
+            ))
+        })?;
+
+        // When the update starts: `NOW` the moment of the call, `TIMESTAMP` the instant
+        // the caller gave, `OFF_PEAK_WINDOW` the next opening of this domain's own
+        // window — the one derivation every scheduled change of this service shares. A
+        // start already behind us is a start now, because a deployment never runs
+        // backwards.
+        let starts_at =
+            rescheduled_instant(domain, &schedule_at, input.desired_start_time, now).max(now);
+
+        // The eligibility test lives on the record: a release has to be available for
+        // the domain to move onto, and neither a deployment in flight nor an update
+        // already scheduled may be interrupted. Outside it there is no deployment to
+        // schedule, so the call is REFUSED with the operation's modelled
+        // `ValidationException` — naming which part of the rule it failed — and the
+        // record is left exactly as it was. A start the caller put in the future is
+        // recorded as the pending update it is, which the clock begins when it reaches
+        // that instant.
+        let software = &mut domain.service_software;
+        let deploying = software.deploying();
+        let scheduled = software.pending_update.is_some();
+        let options = software.begin_update(now, starts_at).ok_or_else(|| {
+            StartServiceSoftwareUpdateErrorModeled::ValidationException(
+                no_software_update_available(&input.domain_name, deploying, scheduled),
+            )
+        })?;
+
+        // Answered from the STORED record, through the one `ServiceSoftwareOptions`
+        // projection every operation that reports a domain's service software uses, so
+        // this answer and a later `DescribeDomain` cannot disagree.
+        Ok(StartServiceSoftwareUpdateOutput {
+            service_software_options: Some(options),
+        })
     }
 }
+

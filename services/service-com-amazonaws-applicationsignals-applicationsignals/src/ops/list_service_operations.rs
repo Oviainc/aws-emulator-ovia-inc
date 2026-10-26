@@ -200,9 +200,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let observed = state
             .lock()
             .observed_operations(&input.key_attributes, &input.start_time, &input.end_time);
+        // The cursor is an offset into the ordered set of THIS entity, so the entity is bound
+        // into the token's tag and a token issued for another entity's set is refused rather
+        // than honoured as a boundary here ([`crate::state::entity_token_tag`]).
+        let token_tag = crate::state::entity_token_tag(
+            crate::state::SERVICE_OPERATIONS_TOKEN_TAG,
+            &input.key_attributes,
+        );
         let (service_operations, next_token) = crate::state::page_of(
             observed,
-            crate::state::SERVICE_OPERATIONS_TOKEN_TAG,
+            &token_tag,
             input.next_token.as_deref(),
             input.max_results.max(0) as usize,
         )

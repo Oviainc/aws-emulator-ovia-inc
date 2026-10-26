@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDiscoverer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDiscoverer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDiscoverer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates one stored discoverer: the members the request sends are written into the
+//! discoverer the id names, and the answer is read back out of the store, so every
+//! later read — `DescribeDiscoverer`, `ListDiscoverers` — reports what this write
+//! left. A `Description` the request omits asks for no change; `CrossAccount` carries
+//! a documented default on this request, so a request that omits it stores that
+//! default. What the request never names — the id, the ARN, the source and the state —
+//! this call leaves exactly as it found it, and an id this store holds no discoverer
+//! under is refused as a missing resource.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +155,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDiscoverer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDiscovererErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDiscoverer"))
+        // A discoverer reports the ARN its create minted, so nothing here derives an
+        // ARN and the request's region is not consulted.
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateDiscovererError::from(
+                UpdateDiscovererErrorModeled::InternalServerErrorException(
+                    crate::state::internal_error(),
+                ),
+            )
+        })?;
+        // ONE lock for the read-decide-write, so the discoverer this call answers from
+        // is the one it just wrote.
+        let mut state = store.lock();
+
+        // A discoverer is named by the id the service minted for it, so an id this
+        // store holds nothing under names no resource to update.
+        let stored = state
+            .discoverers
+            .get_mut(&input.discoverer_id)
+            .ok_or_else(|| {
+                UpdateDiscovererError::from(UpdateDiscovererErrorModeled::NotFoundException(
+                    crate::state::discoverer_not_found(&input.discoverer_id),
+                ))
+            })?;
+
+        // `Description` carries no default, so a request that sends one REPLACES the
+        // stored value and one that omits it asks for no change — exactly as
+        // `UpdateRegistry` and `UpdateSchema` treat a member their request omits.
+        if let Some(description) = input.description {
+            stored.description = Some(description);
+        }
+
+        // `CrossAccount` DOES carry a default on this request
+        // (`smithy_query(query="doc", shape="UpdateDiscovererRequest",
+        // member="CrossAccount")`: "(default: true)"), so the member a request omits is
+        // the documented default and not "no change".
+        stored.cross_account = input.cross_account.unwrap_or(true);
+
+        // Answered from the STORED discoverer rather than from `input`, so this
+        // response can only ever describe what a later read will report.
+        Ok(UpdateDiscovererOutput {
+            description: stored.description.clone(),
+            discoverer_arn: Some(stored.arn.clone()),
+            discoverer_id: Some(stored.id.clone()),
+            source_arn: Some(stored.source_arn.clone()),
+            state: Some(stored.state.as_wire().to_string()),
+            cross_account: Some(stored.cross_account),
+            tags: crate::state::tags_to_output(&stored.tags),
+        })
     }
 }
