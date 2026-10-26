@@ -244,50 +244,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The members a `Scope` / `Type` makes meaningful are the ones the model's own
-        // documentation conditions on them, so a request that omits one describes no
-        // rule the service could apply. Each refusal is the modelled
-        // `ValidationException` with the reason `ValidationExceptionReason` enumerates
-        // for that member.
-        //
-        // `Service`: "If the Scope attribute is set to SERVICE or SKU, the attribute
-        // indicates which service the PricingRule is applicable for."
-        if matches!(input.scope.as_str(), "SERVICE" | "SKU") && input.service.is_none() {
-            return Err(validation(
-                "ILLEGAL_SERVICE",
-                "Service",
-                format!("a pricing rule scoped to {} must name a Service", input.scope),
-            ));
-        }
-        // `UsageType` / `Operation`: "If the Scope attribute is set to SKU, this
-        // attribute indicates which usage type / operation the PricingRule is
-        // modifying."
-        if input.scope == "SKU" {
-            if input.usage_type.is_none() {
-                return Err(validation(
-                    "ILLEGAL_USAGE_TYPE",
-                    "UsageType",
-                    "a pricing rule scoped to SKU must name a UsageType",
-                ));
-            }
-            if input.operation.is_none() {
-                return Err(validation(
-                    "ILLEGAL_OPERATION",
-                    "Operation",
-                    "a pricing rule scoped to SKU must name an Operation",
-                ));
-            }
-        }
-        // `BillingEntity` is what a `BILLING_ENTITY`-scoped rule applies to: "The
-        // seller of services provided by Amazon Web Services, their affiliates, or
-        // third-party providers selling services via Amazon Web Services Marketplace."
-        if input.scope == "BILLING_ENTITY" && input.billing_entity.is_none() {
-            return Err(validation(
-                "ILLEGAL_BILLING_ENTITY",
-                "BillingEntity",
-                "a pricing rule scoped to BILLING_ENTITY must name a BillingEntity",
-            ));
-        }
+        // A rule describes exactly ONE scope, and the members it is keyed by are the
+        // ones the model's own documentation conditions on that scope — so a request
+        // that omits one of them, and equally one that names a member the scope does
+        // NOT key on, describes no rule the service could apply and is refused with
+        // the modelled `ValidationException` under the reason
+        // `ValidationExceptionReason` enumerates for that member. Both directions of
+        // that one condition are decided by the shared
+        // [`crate::state::check_pricing_rule_scope_members`], so nothing is stored
+        // behind a rule the service's pricing semantics cannot act on.
+        crate::state::check_pricing_rule_scope_members(
+            &input.scope,
+            input.service.as_deref(),
+            input.usage_type.as_deref(),
+            input.operation.as_deref(),
+            input.billing_entity.as_deref(),
+        )
+        .map_err(|(reason, member, message)| validation(reason, member, message))?;
         // A `TIERING` rule IS its tiering configuration ("The set of tiering
         // configurations for the pricing rule"); a `MARKUP` or `DISCOUNT` rule is the
         // percentage it moves the public rates by ("A percentage modifier that's

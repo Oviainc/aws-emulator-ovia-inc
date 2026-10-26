@@ -19,6 +19,8 @@ mod channel_lifecycle;
 mod cmaf_child_manifest_name;
 #[path = "all/dash_live_manifest_defaults.rs"]
 mod dash_live_manifest_defaults;
+#[path = "all/duration_floor_one_implementation.rs"]
+mod duration_floor_one_implementation;
 #[path = "all/empty_response_framing.rs"]
 mod empty_response_framing;
 #[path = "all/error_envelope.rs"]
