@@ -757,6 +757,26 @@ impl GroupRecord {
             .unwrap_or_default()
     }
 
+    /// The resource types this group's query LIMITS its members to, or `None`
+    /// when its query imposes no such limit.
+    ///
+    /// A limit exists only when the stored query names the types it admits: a
+    /// group created without a query, one whose query document names no
+    /// resource types at all, and one that names
+    /// [`ALL_SUPPORTED_RESOURCE_TYPES`] all admit any supported type, so they
+    /// carry no limit to judge a request's resource types against.
+    pub fn query_resource_type_limit(&self) -> Option<Vec<String>> {
+        let declared = self.query_resource_types();
+        if declared.is_empty()
+            || declared
+                .iter()
+                .any(|declared| declared == ALL_SUPPORTED_RESOURCE_TYPES)
+        {
+            return None;
+        }
+        Some(declared)
+    }
+
     /// The modelled `ResourceQuery` for this record, if it was created with one.
     pub fn to_resource_query(&self) -> Option<ResourceQuery> {
         self.resource_query.as_ref().map(|q| ResourceQuery {
@@ -1197,6 +1217,13 @@ pub struct ResourceQueryRecord {
 /// identifiers (`smithy_query(query="doc",shape="ResourceQuery",member="Query")`),
 /// so it is read the same way whatever the query's type.
 pub const RESOURCE_TYPE_FILTERS_ELEMENT: &str = "ResourceTypeFilters";
+
+/// The [`RESOURCE_TYPE_FILTERS_ELEMENT`] value that names no limit at all: the
+/// model documents it as making the query "match resources of any resource type
+/// that also match the query"
+/// (`smithy_query(query="doc",shape="ResourceQuery",member="Query")`), so a query
+/// carrying it admits every type the query type supports.
+pub const ALL_SUPPORTED_RESOURCE_TYPES: &str = "AWS::AllSupported";
 
 impl ResourceQueryRecord {
     /// The resource types this query is limited to: the string entries of its

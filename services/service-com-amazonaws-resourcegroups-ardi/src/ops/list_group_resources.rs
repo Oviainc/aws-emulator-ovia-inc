@@ -7,6 +7,11 @@
 //! `ResourceIdentifiers`. A page carries at most `MaxResults` members and, when more
 //! remain, a `NextToken` the next call resumes after.
 //!
+//! A `resource-type` filter is judged against the resource types the addressed
+//! group's stored query admits before any page is computed: a value that query does
+//! not admit is a `BadRequestException`, unless the query names no type limit at
+//! all (see [`crate::state::GroupRecord::query_resource_type_limit`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -239,6 +244,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = store.lookup(&region, identifier).ok_or_else(not_found)?;
         let group = store.groups.get(&key).ok_or_else(not_found)?;
 
+        // A `resource-type` filter selects AMONG the types the group's query
+        // admits, so a value the query does not admit is not a narrower request
+        // but an inconsistent one, and the model documents it as refused. A group
+        // whose query names no type limit — none stored, none named, or
+        // `AWS::AllSupported` — admits any supported type, so nothing is judged
+        // against it.
+        if let Some(limit) = group.query_resource_type_limit() {
+            let invalid = unadmitted_types(&filters, &limit);
+            if !invalid.is_empty() {
+                // The documented sentence, then the types that failed the
+                // validation — which the model documents the error as including —
+                // taken from the request itself.
+                return Err(bad_request(format!(
+                    "The resource types specified as filters in the request are not valid. {}",
+                    invalid.join(", "),
+                )));
+            }
+        }
+
         // The token is this service's own opaque encoding of the ARN the previous
         // page stopped at, scoped to THIS listing of THIS group; anything else
         // cannot name a resume point in it.
@@ -330,6 +354,30 @@ fn matches_filter(member: &crate::state::MemberRecord, filter: &ResourceFilter) 
         .resource_type
         .as_ref()
         .is_some_and(|resource_type| filter.values.contains(resource_type))
+}
+
+/// The resource types `filters` names that `limit` — the types the addressed
+/// group's query admits — does not, in the order the request lists them and each
+/// reported once however many filters repeat it.
+///
+/// Filter values are case-sensitive (the modelled `ResourceFilter$Values`), so a
+/// value is admitted only by an identical declared type. Each value is judged and
+/// de-duplicated through a set, so one request's work grows with the values it
+/// carries rather than with their product.
+fn unadmitted_types<'filters>(
+    filters: &'filters [ResourceFilter],
+    limit: &[String],
+) -> Vec<&'filters str> {
+    let admitted: std::collections::BTreeSet<&str> = limit.iter().map(String::as_str).collect();
+    let mut reported: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut unadmitted: Vec<&str> = Vec::new();
+    for value in filters.iter().flat_map(|filter| filter.values.iter()) {
+        let value = value.as_str();
+        if !admitted.contains(value) && reported.insert(value) {
+            unadmitted.push(value);
+        }
+    }
+    unadmitted
 }
 
 /// A `BadRequestException` (HTTP 400) — the modelled refusal for a request whose
