@@ -187,25 +187,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|name| name.starts_with(&prefix))
             .collect();
 
-        // `NextToken` is this listing's own cursor: the count of entries already
-        // returned. A token that is not such a count — unparseable, or past the end of
-        // the listing it claims to continue — is refused rather than silently treated as
-        // "start again", which would loop a paging client forever.
-        let start: usize = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => match token.parse() {
-                Ok(start) if start <= names.len() => start,
-                _ => {
-                    return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                        crate::state::invalid_parameter_message(
-                            token,
-                            "NextToken",
-                            "it was not issued by this listing.",
-                        ),
-                    ))
-                }
-            },
-        };
+        // `NextToken` is this listing's own cursor, under the one cursor rule every paged
+        // listing of this service shares: the count of entries already returned.
+        let start =
+            crate::state::count_cursor("NextToken", input.next_token.as_deref(), names.len())
+                .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?;
         let page_size = input
             .max_results
             // Inside the range checked above, so the conversion holds.
@@ -220,8 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .take(page_size)
             .filter_map(|name| state.queues.get(*name).map(|queue| queue.url.clone()))
             .collect();
-        let next = start + page.len();
-        let next_token = (next < names.len()).then(|| next.to_string());
+        let next_token = crate::state::next_count_cursor(start, page.len(), names.len());
 
         Ok(ListQueuesOutput {
             queue_urls: (!page.is_empty()).then_some(page),

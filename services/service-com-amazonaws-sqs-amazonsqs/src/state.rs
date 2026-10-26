@@ -586,6 +586,55 @@ pub const DEFAULT_LIST_PAGE_SIZE: usize = 100;
 /// so a paginating client is told its request was wrong.
 pub const LIST_QUEUES_MAX_RESULTS_RANGE: (i32, i32) = (1, 1_000);
 
+/// The inclusive range `ListDeadLetterSourceQueues` accepts for `MaxResults`: "Maximum
+/// number of results to include in the response. Value range is 1 to 1000"
+/// (`ListDeadLetterSourceQueuesRequest$MaxResults`) — the same range `ListQueues`
+/// publishes for its own page size, so the two name ONE value rather than two that have
+/// to be kept equal. Refused rather than clamped, as every page size this service takes
+/// is.
+pub const LIST_DEAD_LETTER_SOURCE_QUEUES_MAX_RESULTS_RANGE: (i32, i32) =
+    LIST_QUEUES_MAX_RESULTS_RANGE;
+
+/// How many source queues `ListDeadLetterSourceQueues` reports when the caller names no
+/// `MaxResults`: "If you do not set MaxResults, the response includes a maximum of 1,000
+/// results" (`ListDeadLetterSourceQueues`), which is the upper end of the range that
+/// parameter publishes. It is at least [`MAX_QUEUES`], so an unparameterised request
+/// cannot leave a source queue behind.
+pub const LIST_DEAD_LETTER_SOURCE_QUEUES_DEFAULT_RESULTS: usize =
+    LIST_DEAD_LETTER_SOURCE_QUEUES_MAX_RESULTS_RANGE.1 as usize;
+
+/// Where in a listing the `NextToken` a request carried continues it, or the text of the
+/// refusal a token this listing never issued is answered with.
+///
+/// Every paged listing of this service carries its cursor the same way: the COUNT of
+/// entries already handed over. `total` is how many entries the listing holds now, and a
+/// token that is not such a count — unparseable, or past the end of the listing it claims
+/// to continue — is refused rather than silently treated as "start again", which would
+/// loop a paging client forever. A request carrying no token starts at the beginning.
+///
+/// One place for the rule and its wording, so two listings cannot drift on either.
+pub fn count_cursor(parameter: &str, token: Option<&str>, total: usize) -> Result<usize, String> {
+    match token {
+        None => Ok(0),
+        Some(token) => match token.parse() {
+            Ok(start) if start <= total => Ok(start),
+            _ => Err(invalid_parameter_message(
+                token,
+                parameter,
+                "it was not issued by this listing.",
+            )),
+        },
+    }
+}
+
+/// The `NextToken` a page that began at `start` and handed over `handed` of `total`
+/// entries answers with: the count the NEXT page continues from, and nothing at all for a
+/// page that reached the end of the listing, which is how a paging client stops.
+pub fn next_count_cursor(start: usize, handed: usize, total: usize) -> Option<String> {
+    let next = start + handed;
+    (next < total).then(|| next.to_string())
+}
+
 /// Why the value a listing's page-size parameter carried was refused, as the text of the
 /// refusal a caller has to fix the request from, or `None` when `requested` is inside the
 /// inclusive `(min, max)` that parameter publishes.

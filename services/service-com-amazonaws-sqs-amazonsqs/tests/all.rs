@@ -19,6 +19,8 @@ mod delete_message_batch;
 mod fifo_queue;
 #[path = "all/fifo_receive_idempotency.rs"]
 mod fifo_receive_idempotency;
+#[path = "all/list_dead_letter_source_queues.rs"]
+mod list_dead_letter_source_queues;
 #[path = "all/list_message_move_tasks.rs"]
 mod list_message_move_tasks;
 #[path = "all/message_attribute_rules.rs"]

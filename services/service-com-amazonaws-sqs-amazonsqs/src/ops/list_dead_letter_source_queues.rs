@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDeadLetterSourceQueues
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDeadLetterSourceQueues`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDeadLetterSourceQueues::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The queues whose `RedrivePolicy` names the addressed queue as their dead-letter
+//! target, projected from [`crate::state`] rather than stored anywhere of its own: a
+//! source queue is one whose CURRENT `RedrivePolicy` points here, so a policy set at
+//! create, changed by `SetQueueAttributes` or left naming another queue is reflected by
+//! the very next listing, and a queue that is deleted stops being a source with its
+//! record.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +89,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state as sqs;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -164,18 +163,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDeadLetterSourceQueues` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDeadLetterSourceQueuesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDeadLetterSourceQueues"))
+        // Reporting which queues redrive here reads the store and writes nothing: the
+        // answer is a function of the queues' current `RedrivePolicy` values.
+        let _ = ctx;
+        let store = sqs::service_state(&*self.engine).ok_or_else(|| {
+            ListDeadLetterSourceQueuesErrorModeled::UnsupportedOperation(sqs::store_unavailable())
+        })?;
+        let state = store.lock();
+
+        // `MaxResults` is the page size the caller asks for: "Value range is 1 to 1000."
+        // A value outside that range is refused rather than quietly replaced with a page
+        // size the caller did not ask for, exactly as every other listing of this
+        // service refuses it.
+        if let Some(requested) = input.max_results {
+            if let Some(why) = sqs::max_results_refusal(
+                "MaxResults",
+                sqs::LIST_DEAD_LETTER_SOURCE_QUEUES_MAX_RESULTS_RANGE,
+                requested,
+            ) {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
+            }
+        }
+
+        // "The URL of a dead-letter queue": the queue whose sources are wanted has to be
+        // one this account has, which is the absence `QueueDoesNotExist` reports, and it
+        // is resolved exactly as every url-addressed operation of this service resolves
+        // one.
+        let dead_letter_name = sqs::queue_name_from_url(&input.queue_url)
+            .filter(|name| state.queues.contains_key(*name))
+            .ok_or_else(|| {
+                ListDeadLetterSourceQueuesErrorModeled::QueueDoesNotExist(
+                    sqs::queue_does_not_exist(),
+                )
+            })?;
+
+        // Name-ordered, so a page boundary means the same thing on the next call.
+        let sources = state.dead_letter_source_queue_names(dead_letter_name);
+
+        // Where this request's `NextToken` continues the listing, under the one cursor
+        // rule every paged listing of this service shares.
+        let start = sqs::count_cursor("NextToken", input.next_token.as_deref(), sources.len())
+            .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?;
+        // "If you do not set MaxResults, the response includes a maximum of 1,000
+        // results": the upper end of the range the parameter itself publishes.
+        let page_size = input
+            .max_results
+            // Inside the range checked above, so the conversion holds.
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(sqs::LIST_DEAD_LETTER_SOURCE_QUEUES_DEFAULT_RESULTS);
+
+        // The page is the slice of the listing the cursor and the page size name, so the
+        // next cursor counts the entries this page COVERED rather than the urls it
+        // resolved: a source queue the store no longer holds still advances the walk
+        // instead of letting the cursor stall on it.
+        let page: Vec<&String> = sources.iter().skip(start).take(page_size).collect();
+        let queue_urls: Vec<String> = page
+            .iter()
+            .filter_map(|name| state.queues.get(*name).map(|queue| queue.url.clone()))
+            .collect();
+
+        Ok(ListDeadLetterSourceQueuesOutput {
+            queue_urls,
+            // "If you set MaxResults and there are additional results to display, the
+            // response includes a value for NextToken."
+            next_token: sqs::next_count_cursor(start, page.len(), sources.len()),
+        })
     }
 }
