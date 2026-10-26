@@ -216,14 +216,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // be a service-authored series a client forged. Refused before anything is read or
         // written, so the store is untouched whatever else the request carries.
         //
-        // The refusal names the RESERVED PREFIX rather than the namespace the request
-        // carried, because that is what the rule is about and what the service's own answer
-        // reports ("The value AWS/ for parameter Namespace is invalid." for a publish into
-        // `AWS/ES`); the status and the error code are what a client branches on.
-        if input.namespace.starts_with(RESERVED_NAMESPACE_PREFIX) {
-            return Err(invalid_value(format!(
-                "The value {RESERVED_NAMESPACE_PREFIX} for parameter Namespace is invalid."
-            )));
+        // The value the refusal reports is the RESERVED PREFIX itself, in its own spelling —
+        // not the namespace the request carried, and not the case the request spelled the
+        // prefix in. That is what the service answers: a publish into `AWS/ES` and one into a
+        // lower-case `aws/…` namespace are both answered "The value AWS/ for parameter
+        // Namespace is invalid." — see the Resolution notes in this issue's report, which
+        // record both answers. The prefix is the part that is invalid, and it names one
+        // reserved space however a caller spells it.
+        if is_reserved_namespace(&input.namespace) {
+            return Err(value_is_invalid(RESERVED_NAMESPACE_PREFIX, "Namespace"));
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
@@ -232,65 +233,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // `StrictEntityValidation` only chooses how an INVALID ENTITY is answered ("Whether
-        // to accept valid metric data when an invalid entity is sent"). No entity validation
-        // runs in this slice, so no entity is ever invalid and the switch has nothing to
-        // select between; metric-data validation below fails the whole request either way,
-        // which is what the member documents for both settings.
-        let _ = input.strict_entity_validation;
-
         let now = crate::state::now_secs();
 
         // The caps this operation documents on ONE request. None of these lists carries a
         // modelled `length` constraint, so the boundary validator cannot refuse them and
         // the handler has to: without them a single request sizes the batch it builds.
         // (`Dimensions` is modelled `length 0..30`, so the "up to 30 dimensions per metric"
-        // cap is already refused before this handler runs.)
+        // cap is already refused before this handler runs.) A list over its cap is refused in
+        // the form AWS words a collection constraint in, naming the member and the cap.
         //
         // "Each request is also limited to no more than 1000 different metrics (across both
-        // the MetricData and EntityMetricData properties)."
+        // the MetricData and EntityMetricData properties)." The cap is ONE budget over both
+        // lists, and the collection it is reported against is `MetricData` whichever list the
+        // excess arrived on — which is what the entity-borne overflow recorded in this
+        // issue's report is answered with — because `EntityMetricData`'s own metric data is a
+        // `MetricData` list too. Capping the ENTRIES caps the distinct metrics they name with
+        // them, since a batch names no more metrics than it carries datums.
         const MAX_METRICS_PER_REQUEST: usize = 1000;
         // "Using the Values and Counts method enables you to publish up to 150 values per
         // metric with one PutMetricData request".
         const MAX_VALUES_PER_METRIC: usize = 150;
-        // "You can include up to two EntityMetricData objects, each of which can contain a
-        // single Entity and associated metrics." (PutMetricDataInput$EntityMetricData)
-        const MAX_ENTITY_METRIC_DATA: usize = 2;
-        // The ceiling on what ONE request can make this handler build: no legal request
-        // carries more observations than the two caps above allow together, so a batch
-        // beyond this cannot be legal whichever way the two are combined.
-        const MAX_OBSERVATIONS_PER_REQUEST: usize =
-            MAX_METRICS_PER_REQUEST * MAX_VALUES_PER_METRIC;
 
         let entities = input.entity_metric_data.as_deref().unwrap_or_default();
+        // The cap is the member's own two objects, and a call over it is answered under the
+        // failure name the strict flag's documentation gives that cap — see
+        // [`entity_size_too_large`].
         if entities.len() > MAX_ENTITY_METRIC_DATA {
-            return Err(invalid_value(format!(
-                "EntityMetricData must hold at most {MAX_ENTITY_METRIC_DATA} entries; got {}",
-                entities.len()
-            )));
+            return Err(entity_size_too_large());
         }
 
         // Entity-associated metric data carries the same `MetricDatum` list, and the
         // operation documents that its metric data is ingested too ("The EntityMetricData
         // structure includes MetricData structures for the metric data"), so both sources
-        // feed one ingest path — and one shared metric count.
-        let data: Vec<&MetricDatum> = input
+        // feed one ingest path — and one shared metric count. Each datum rides with the
+        // REQUEST MEMBER PATH it arrived on, which is what a refusal about it names.
+        let data: Vec<(String, &MetricDatum)> = input
             .metric_data
             .iter()
             .flatten()
-            .chain(
-                entities
+            .enumerate()
+            .map(|(index, datum)| (member_path("MetricData", index), datum))
+            .chain(entities.iter().enumerate().flat_map(|(entity, entry)| {
+                let prefix = member_path("EntityMetricData", entity);
+                entry
+                    .metric_data
                     .iter()
-                    .flat_map(|entity| entity.metric_data.iter().flatten()),
-            )
+                    .flatten()
+                    .enumerate()
+                    .map(move |(index, datum)| {
+                        (member_path(&format!("{prefix}.MetricData"), index), datum)
+                    })
+            }))
             .collect();
-        if data.len() > MAX_OBSERVATIONS_PER_REQUEST {
-            return Err(invalid_value(format!(
-                "MetricData and EntityMetricData together must carry at most \
-                 {MAX_OBSERVATIONS_PER_REQUEST} data points ({MAX_METRICS_PER_REQUEST} metrics \
-                 of {MAX_VALUES_PER_METRIC} values); got {} entries",
-                data.len()
-            )));
+        if data.len() > MAX_METRICS_PER_REQUEST {
+            return Err(collection_too_large("MetricData", MAX_METRICS_PER_REQUEST));
+        }
+
+        // "This parameter is <i>required</i> when EntityMetricData is
+        // included." (PutMetricDataInput$StrictEntityValidation) — an entity-bearing call that
+        // leaves the flag out is a combination of members the service cannot act on: it does
+        // not say which of the two entity outcomes the caller wanted.
+        if input.entity_metric_data.is_some() && input.strict_entity_validation.is_none() {
+            return Err(PutMetricDataErrorModeled::InvalidParameterCombinationException(
+                InvalidParameterCombinationException {
+                    message: Some(
+                        "Field StrictEntityValidation is required when setting EntityMetricData"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "When set to true: Any validation error (for entity or metric data) will fail the
+        // entire request, and no data will be ingested. […] When set to false: Validation
+        // errors in the entity will not associate the metric with the entity, but the metric
+        // data will still be accepted and ingested." This store holds no entity association,
+        // so the lax outcome IS the plain ingest below; the failure a lax call dropped is
+        // reported in its response header ([`dropped_entity_failure`]).
+        // (The flag is required above whenever an entity rides along, so the default here is
+        // reached only by a request that carries no entity to validate.)
+        if input.strict_entity_validation.unwrap_or(true) {
+            for entity in entities.iter().filter_map(|entry| entry.entity.as_ref()) {
+                if let Some(failure) = entity_failure(&key_attributes(entity)) {
+                    return Err(invalid_parameter_value(failure.message()));
+                }
+            }
         }
 
         // Validate EVERY datum before touching the store: the operation documents that a
@@ -300,8 +328,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it, so a long `Values` array cannot multiply the key.
         let mut ingest: Vec<(crate::state::MetricKey, Vec<crate::state::StoredDatum>)> =
             Vec::with_capacity(data.len());
-        let mut observation_count = 0usize;
-        for datum in data {
+        for (path, datum) in data {
             let key = crate::state::MetricKey {
                 namespace: input.namespace.clone(),
                 metric_name: datum.metric_name.clone(),
@@ -311,22 +338,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .timestamp
                 .as_ref()
                 .map_or(now, crate::state::from_timestamp);
-            let storage_resolution = storage_resolution(datum)?;
+            // "You can specify time stamps that are as much as two weeks before the current
+            // date, and as much as 2 hours after the current day and time." — a datapoint
+            // outside that window is one CloudWatch never stores, so the series a later read
+            // aggregates cannot hold it either. The refusal states the BOUND the time stamp
+            // broke, not the instant the request carried: the instant is one run's, the
+            // window is the rule.
+            if timestamp_secs < now - INGEST_WINDOW_BEHIND_SECS {
+                return Err(invalid_parameter_value(format!(
+                    "The parameter {path}.Timestamp must specify a time within the past two \
+                     weeks."
+                )));
+            }
+            if timestamp_secs > now + INGEST_WINDOW_AHEAD_SECS {
+                return Err(invalid_parameter_value(format!(
+                    "The parameter {path}.Timestamp must specify a time no more than two hours \
+                     in the future."
+                )));
+            }
+            // A dimension is part of a metric's identity, so a dimension AWS cannot hold is
+            // an identity AWS cannot hold: "Dimension values must contain only ASCII
+            // characters and must include at least one non-whitespace character. ASCII
+            // control characters are not supported as part of dimension values."
+            // (`Dimension$Value`; `Dimension$Name` carries the same rule and adds "cannot
+            // start with a colon".)
+            //
+            // Refused in the family this operation answers an unusable input VALUE in — the
+            // one its recorded `Value` and `Namespace` refusals carry — with the member path
+            // and the value taken from the request. The Resolution notes in this issue's
+            // report say what is known about the recorded sentence for this class.
+            for (index, dimension) in datum.dimensions.iter().flatten().enumerate() {
+                let dimension_path = member_path(&format!("{path}.Dimensions"), index);
+                // "Dimension names […] cannot start with a colon (:)." (`Dimension$Name`)
+                if !is_holdable_dimension_text(&dimension.name) || dimension.name.starts_with(':')
+                {
+                    return Err(value_is_invalid(
+                        &dimension.name,
+                        &format!("{dimension_path}.Name"),
+                    ));
+                }
+                if !is_holdable_dimension_text(&dimension.value) {
+                    return Err(value_is_invalid(
+                        &dimension.value,
+                        &format!("{dimension_path}.Value"),
+                    ));
+                }
+            }
+            let storage_resolution = storage_resolution(datum, &path)?;
 
-            let forms = usize::from(datum.value.is_some())
-                + usize::from(datum.statistic_values.is_some())
-                + usize::from(datum.values.is_some());
-            if forms > 1 {
-                return Err(PutMetricDataErrorModeled::InvalidParameterCombinationException(
-                    InvalidParameterCombinationException {
-                        message: Some(format!(
-                            "MetricData for metric {} must carry at most one of Value, \
-                             StatisticValues and Values",
-                            datum.metric_name
-                        )),
-                    },
-                )
-                .into());
+            // The three ways a datum may carry observations are alternatives, so a datum
+            // naming two of them states two different things about one metric; the refusal
+            // names the two member paths the request put them on.
+            let carried: Vec<&str> = [
+                ("Value", datum.value.is_some()),
+                ("StatisticValues", datum.statistic_values.is_some()),
+                ("Values", datum.values.is_some()),
+            ]
+            .into_iter()
+            .filter_map(|(member, carried)| carried.then_some(member))
+            .collect();
+            if let [first, second, ..] = carried.as_slice() {
+                return Err(mutually_exclusive(
+                    &format!("{path}.{first}"),
+                    &format!("{path}.{second}"),
+                ));
             }
             // "Array of numbers that is used along with the Values array." — `Counts` has no
             // meaning on its own, so a datum carrying it without `Values` is refused rather
@@ -335,8 +410,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(PutMetricDataErrorModeled::InvalidParameterCombinationException(
                     InvalidParameterCombinationException {
                         message: Some(format!(
-                            "Counts for metric {} can only be used along with Values",
-                            datum.metric_name
+                            "The parameters {path}.Counts and {path}.Values must be specified \
+                             together."
                         )),
                     },
                 )
@@ -354,7 +429,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
 
             let observations = if let Some(value) = datum.value {
-                let value = checked_value(value, "Value")?;
+                let value = checked_value(value, &format!("{path}.Value"))?;
                 vec![crate::state::StoredDatum {
                     sample_count: 1.0,
                     sum: value,
@@ -364,40 +439,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }]
             } else if let Some(set) = datum.statistic_values.as_ref() {
                 vec![crate::state::StoredDatum {
-                    sample_count: checked_value(set.sample_count, "StatisticValues.SampleCount")?,
-                    sum: checked_value(set.sum, "StatisticValues.Sum")?,
-                    minimum: checked_value(set.minimum, "StatisticValues.Minimum")?,
-                    maximum: checked_value(set.maximum, "StatisticValues.Maximum")?,
+                    sample_count: checked_value(
+                        set.sample_count,
+                        &format!("{path}.StatisticValues.SampleCount"),
+                    )?,
+                    sum: checked_value(set.sum, &format!("{path}.StatisticValues.Sum"))?,
+                    minimum: checked_value(set.minimum, &format!("{path}.StatisticValues.Minimum"))?,
+                    maximum: checked_value(set.maximum, &format!("{path}.StatisticValues.Maximum"))?,
                     ..base
                 }]
             } else if let Some(values) = datum.values.as_ref() {
                 if values.len() > MAX_VALUES_PER_METRIC {
-                    return Err(invalid_value(format!(
-                        "Values for metric {} must hold at most {MAX_VALUES_PER_METRIC} values; \
-                         got {}",
-                        datum.metric_name,
-                        values.len()
-                    )));
+                    return Err(collection_too_large(
+                        &format!("{path}.Values"),
+                        MAX_VALUES_PER_METRIC,
+                    ));
                 }
                 // "If you omit the Counts array, the default of 1 is used as the value for
                 // each count. If you include a Counts array, it must include the same amount
                 // of values as the Values array." (MetricDatum$Counts)
                 if let Some(counts) = datum.counts.as_ref() {
                     if counts.len() != values.len() {
-                        return Err(invalid_value(format!(
-                            "Counts for metric {} has {} entries but Values has {}; the arrays \
-                             must be the same length",
-                            datum.metric_name,
-                            counts.len(),
-                            values.len()
+                        return Err(invalid_parameter_value(format!(
+                            "The parameters {path}.Values and {path}.Counts must be the same \
+                             length."
                         )));
                     }
                 }
                 let mut observations = Vec::with_capacity(values.len());
                 for (index, value) in values.iter().enumerate() {
-                    let value = checked_value(*value, "Values")?;
+                    let value =
+                        checked_value(*value, &member_path(&format!("{path}.Values"), index))?;
                     let count = match datum.counts.as_ref().and_then(|c| c.get(index)) {
-                        Some(count) => checked_value(*count, "Counts")?,
+                        Some(count) => {
+                            checked_value(*count, &member_path(&format!("{path}.Counts"), index))?
+                        }
                         None => 1.0,
                     };
                     observations.push(crate::state::StoredDatum {
@@ -415,32 +491,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // ListMetrics reports it; there is simply no datapoint to append.
                 Vec::new()
             };
-            observation_count += observations.len();
-            // The binding bound on what one request builds: neither the datum count nor the
-            // per-datum value cap limits their PRODUCT, so the total is checked here as well.
-            if observation_count > MAX_OBSERVATIONS_PER_REQUEST {
-                return Err(invalid_value(format!(
-                    "MetricData and EntityMetricData together must carry at most \
-                     {MAX_OBSERVATIONS_PER_REQUEST} data points \
-                     ({MAX_METRICS_PER_REQUEST} metrics of {MAX_VALUES_PER_METRIC} values)"
-                )));
-            }
             ingest.push((key, observations));
-        }
-
-        // "Each request is also limited to no more than 1000 DIFFERENT metrics" — so the cap
-        // is on how many distinct series the batch names, not on how many data points it
-        // carries for them.
-        let distinct = ingest
-            .iter()
-            .map(|(key, _)| key)
-            .collect::<std::collections::HashSet<_>>()
-            .len();
-        if distinct > MAX_METRICS_PER_REQUEST {
-            return Err(invalid_value(format!(
-                "MetricData and EntityMetricData together must name at most \
-                 {MAX_METRICS_PER_REQUEST} different metrics; got {distinct}"
-            )));
         }
 
         // The lock is taken for the ingest only: an alarm evaluation takes it itself, and the
@@ -489,44 +540,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// not specify a namespace that begins with AWS/" (`PutMetricDataInput$Namespace`) — the
 /// reserved space is not merely discouraged on the write path: CloudWatch refuses a publish
 /// into it with `InvalidParameterValue`, so a client cannot forge a series an AWS service is
-/// supposed to own. The match is exact, because an AWS namespace is written in exactly this
-/// case (`AWS/ES`, `AWS/EC2`): a namespace differing in case is a customer namespace and is
-/// accepted.
+/// supposed to own.
 const RESERVED_NAMESPACE_PREFIX: &str = "AWS/";
 
-/// Refuse an input value outside what this operation documents.
-fn invalid_value(message: String) -> PutMetricDataError {
+/// How far BEHIND the current instant a datum's time stamp may be: "You can specify time
+/// stamps that are as much as two weeks before the current date" (`PutMetricData`).
+const INGEST_WINDOW_BEHIND_SECS: f64 = 14.0 * 24.0 * 60.0 * 60.0;
+
+/// How far AHEAD of the current instant a datum's time stamp may be: "and as much as 2 hours
+/// after the current day and time" (`PutMetricData`).
+const INGEST_WINDOW_AHEAD_SECS: f64 = 2.0 * 60.0 * 60.0;
+
+/// How many `EntityMetricData` objects one call may carry: "You can include up to two
+/// EntityMetricData objects, each of which can contain a single Entity and associated
+/// metrics." (`PutMetricDataInput$EntityMetricData`)
+const MAX_ENTITY_METRIC_DATA: usize = 2;
+
+/// What CloudWatch answers a call carrying more entity objects than it accepts.
+///
+/// The failure NAME is the one `PutMetricDataInput$StrictEntityValidation` gives this cap
+/// ("EntitySizeTooLarge - The number of EntityMetricData objects allowed is 2."); the sentence
+/// after it is the service's own, verbatim as a refused call reports it — this issue's report
+/// records that answer (the entity-cap trace, and the Resolution notes), and the fix for that
+/// trace is to say what the service says. The number in it is the CAP, so it moves with
+/// [`MAX_ENTITY_METRIC_DATA`] rather than being carried as fixed text; the sentence's own
+/// "shorter than" is the service's phrasing of it, and the bound the handler applies is the
+/// member's documented two objects, so two are accepted and a third is refused with this.
+fn entity_size_too_large() -> PutMetricDataError {
+    invalid_parameter_value(format!(
+        "EntitySizeTooLarge: The total number of EntityMetricData elements must be shorter than \
+         {MAX_ENTITY_METRIC_DATA}"
+    ))
+}
+
+/// Whether `namespace` lies in the AWS-reserved namespace space.
+///
+/// The prefix is matched without regard to case: the space a service's own metrics live in is
+/// the one the name NAMES, and a namespace is not a different space for being spelled in
+/// another case, so a publish into either spelling is a publish into the reserved space.
+fn is_reserved_namespace(namespace: &str) -> bool {
+    let prefix = RESERVED_NAMESPACE_PREFIX.as_bytes();
+    namespace
+        .as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+/// The request member path of entry `index` of the list at `list`, as a refusal names it:
+/// the list's own path, then the one-based position of the entry inside it.
+fn member_path(list: &str, index: usize) -> String {
+    format!("{list}.member.{}", index + 1)
+}
+
+/// Refuse an input value outside what this operation documents: the error channel every
+/// refusal in this file is built on, as the other operations of this crate name it.
+fn invalid_parameter_value(message: String) -> PutMetricDataError {
     PutMetricDataErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
         message: Some(message),
     })
     .into()
 }
 
-/// Refuse a value this operation documents as unsupported.
+/// Refuse `value`, naming the request member path `parameter` it arrived on.
+///
+/// A client acts on the member path: it is what locates the batch element — and the member of
+/// it — that has to change, which a message naming only the metric cannot do. This is the
+/// family this operation answers an unusable input value in, as its recorded `Value` and
+/// `Namespace` refusals carry it.
+fn value_is_invalid(value: &str, parameter: &str) -> PutMetricDataError {
+    invalid_parameter_value(format!(
+        "The value {value} for parameter {parameter} is invalid."
+    ))
+}
+
+/// Refuse a list that carries more entries than its documented cap.
+fn collection_too_large(collection: &str, cap: usize) -> PutMetricDataError {
+    invalid_parameter_value(format!(
+        "The collection {collection} must not have a size greater than {cap}."
+    ))
+}
+
+/// Refuse a request that carries two members which state the same thing two ways.
+fn mutually_exclusive(first: &str, second: &str) -> PutMetricDataError {
+    PutMetricDataErrorModeled::InvalidParameterCombinationException(
+        InvalidParameterCombinationException {
+            message: Some(format!(
+                "The parameters {first} and {second} are mutually exclusive and you have \
+                 specified both."
+            )),
+        },
+    )
+    .into()
+}
+
+/// A submitted number as the refusal that rejects it prints it, with the special values named
+/// the way the operation's own documentation names them ("NaN, +Infinity, -Infinity").
+fn printed(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value == f64::INFINITY {
+        return "Infinity".to_string();
+    }
+    if value == f64::NEG_INFINITY {
+        return "-Infinity".to_string();
+    }
+    value.to_string()
+}
+
+/// Whether CloudWatch can hold `text` as a dimension name or value: "Dimension values must
+/// contain only ASCII characters and must include at least one non-whitespace character. ASCII
+/// control characters are not supported as part of dimension values." (`Dimension$Value`, and
+/// `Dimension$Name` for a name.)
+fn is_holdable_dimension_text(text: &str) -> bool {
+    text.is_ascii()
+        && !text.chars().any(char::is_control)
+        && text.chars().any(|character| !character.is_whitespace())
+}
+
+/// Refuse a value this operation documents as unsupported, naming the member path it arrived
+/// on and the value as submitted.
 ///
 /// "Although the Value parameter accepts numbers of type Double, CloudWatch rejects values
 /// that are either too small or too large. Values must be in the range of -2^360 to 2^360.
 /// In addition, special values (for example, NaN, +Infinity, -Infinity) are not supported."
-fn checked_value(value: f64, member: &str) -> Result<f64, PutMetricDataError> {
+fn checked_value(value: f64, parameter: &str) -> Result<f64, PutMetricDataError> {
     // 2^360, the published magnitude limit on a metric value.
     let limit = 2.0_f64.powi(360);
 
     if value.is_finite() && value.abs() <= limit {
         return Ok(value);
     }
-    Err(
-        PutMetricDataErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
-            message: Some(format!(
-                "{member} must be a number in the range -2^360 to 2^360; got {value}"
-            )),
-        })
-        .into(),
-    )
+    Err(value_is_invalid(&printed(value), parameter))
 }
 
 /// The datum's storage resolution: "Valid values are 1 and 60. [...] This field is
 /// optional, if you do not specify it the default of 60 is used." (`MetricDatum$StorageResolution`)
-fn storage_resolution(datum: &MetricDatum) -> Result<i32, PutMetricDataError> {
+fn storage_resolution(datum: &MetricDatum, path: &str) -> Result<i32, PutMetricDataError> {
     /// The only resolutions `MetricDatum$StorageResolution` documents.
     const VALID: [i32; 2] = [1, 60];
     /// What the member documents as its default.
@@ -535,16 +685,138 @@ fn storage_resolution(datum: &MetricDatum) -> Result<i32, PutMetricDataError> {
     match datum.storage_resolution {
         None => Ok(DEFAULT),
         Some(resolution) if VALID.contains(&resolution) => Ok(resolution),
-        Some(resolution) => Err(
-            PutMetricDataErrorModeled::InvalidParameterValueException(
-                InvalidParameterValueException {
-                    message: Some(format!(
-                        "StorageResolution for metric {} must be 1 or 60; got {resolution}",
-                        datum.metric_name
-                    )),
-                },
-            )
-            .into(),
-        ),
+        Some(_) => {
+            let permitted: Vec<String> = VALID.iter().map(i32::to_string).collect();
+            Err(invalid_parameter_value(format!(
+                "The parameter {path}.StorageResolution must be a value in the set [ {} ].",
+                permitted.join(", ")
+            )))
+        }
     }
+}
+
+/// What a validation failure of one entity is reported as: the failure NAME the strict flag's
+/// documentation enumerates, and the sentence that states it.
+///
+/// The name is what a client branches on — it is what the lenient path reports in its
+/// response header — and the sentence is what the strict path's refusal says after it.
+pub(crate) struct EntityFailure {
+    /// The documented failure name (`InvalidKeyAttributes`, `InvalidTypeValue`, …).
+    pub(crate) name: &'static str,
+    /// What that failure says about the entity.
+    detail: &'static str,
+}
+
+impl EntityFailure {
+    /// The failure as a refusal states it: the failure name, then what it says.
+    fn message(&self) -> String {
+        format!("{}: {}", self.name, self.detail)
+    }
+}
+
+/// The validation failure the identifying attributes `attributes` carry, or `None` for an
+/// entity this service can hold.
+///
+/// "For an entity to be valid, the KeyAttributes must exist and be formatted correctly. There
+/// are five allowed attributes (key names): Type, ResourceType, Identifier, Name, and
+/// Environment." (`Entity$KeyAttributes`) — an entity whose identifying attributes are absent
+/// or name something else identifies nothing, and `Type` is the attribute the rest are
+/// required per ("MissingRequiredFields - There are missing required fields in the
+/// KeyAttributes for the provided Type", `PutMetricDataInput$StrictEntityValidation`). How
+/// MANY attributes may identify an entity is modelled (`length 2..4`), so the boundary
+/// validator refuses that before this runs.
+pub(crate) fn entity_failure(
+    attributes: &::std::collections::HashMap<String, String>,
+) -> Option<EntityFailure> {
+    /// The key names `Entity$KeyAttributes` allows.
+    const ALLOWED: [&str; 5] = ["Type", "ResourceType", "Identifier", "Name", "Environment"];
+    /// The key attribute the others are required per.
+    const TYPE: &str = "Type";
+    /// What an entity whose identifying attributes are not a well-formed set is reported as.
+    const INVALID_KEY_ATTRIBUTES: EntityFailure = EntityFailure {
+        name: "InvalidKeyAttributes",
+        detail: "The provided KeyAttributes of an entity is invalid.",
+    };
+    /// What an entity identified by too few of the attributes its type needs is reported as.
+    const MISSING_REQUIRED_FIELDS: EntityFailure = EntityFailure {
+        name: "MissingRequiredFields",
+        detail: "There are missing required fields in the KeyAttributes for the provided Type.",
+    };
+    /// What an entity whose `Type` is no entity type is reported as.
+    ///
+    /// The NAME is the model's ("InvalidTypeValue - The provided Type in the KeyAttributes of
+    /// an entity is invalid", `PutMetricDataInput$StrictEntityValidation`); the sentence after
+    /// it is the service's own, which the strict refusal of a malformed entity is recorded
+    /// answering with — see the Resolution notes in this issue's report. (The two sibling
+    /// failures above have no such recorded answer, so their sentence is the model's own
+    /// description of them.)
+    const INVALID_TYPE_VALUE: EntityFailure = EntityFailure {
+        name: "InvalidTypeValue",
+        detail: "Unknown entity type",
+    };
+
+    if attributes.is_empty() || attributes.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+        return Some(INVALID_KEY_ATTRIBUTES);
+    }
+    // The attributes an entity of a given `Type` is identified BY: a service by its name, a
+    // resource by what kind of resource it is and which one. The model names neither the
+    // types nor their required attributes — it points at "How to add related information to
+    // telemetry" (`Entity$KeyAttributes`) for them — so the two groups below are INFERRED
+    // from that guide's service and resource entities, and a reader should treat them as
+    // that rather than as a modelled list. What the model does state is that an unusable
+    // `Type` is its own failure, and a service refusing an unrecognised one is recorded
+    // behaviour (this issue's malformed-entity trace), which is why a `Type` outside the two
+    // groups — or an entity carrying no `Type` at all — is answered with it: accepting one
+    // would be the same silent acceptance this issue is about. A type the groups below miss
+    // is therefore refused under the strict flag, which is the cost of the inference and the
+    // reason the groups are stated where a reader can audit them.
+    let required: &[&str] = match attributes.get(TYPE).map(String::as_str) {
+        Some("Service" | "RemoteService" | "AWS::Service") => &["Name"],
+        Some("Resource" | "AWS::Resource") => &["ResourceType", "Identifier"],
+        // A `Type` outside those groups — or an entity that names none at all — is answered
+        // with the failure the model gives that case. Accepting an unrecognised one instead
+        // was tried and diverges: the recorded strictly-validated call this fix closes
+        // carries a non-empty type outside them and IS refused, so the groups have to be a
+        // closed set to answer it. The Resolution notes in this issue's report say so.
+        _ => return Some(INVALID_TYPE_VALUE),
+    };
+    if required.iter().any(|field| !attributes.contains_key(*field)) {
+        return Some(MISSING_REQUIRED_FIELDS);
+    }
+    None
+}
+
+/// The identifying attributes of `entity`, as the set [`entity_failure`] judges — an entity
+/// that carries none has an empty set, which identifies nothing.
+fn key_attributes(entity: &Entity) -> ::std::collections::HashMap<String, String> {
+    entity.key_attributes.clone().unwrap_or_default()
+}
+
+/// The failure name a LENIENT request's response reports, or `None` when the request carries
+/// no entity this service had to drop.
+///
+/// "When set to false: Validation errors in the entity will not associate the metric with the
+/// entity, but the metric data will still be accepted and ingested. [...] In the case of an
+/// invalid entity, the operation will return a 200 status, but an additional response header
+/// will contain information about the validation errors."
+/// (`PutMetricDataInput$StrictEntityValidation`) — the name the header carries is one of the
+/// values that member enumerates, which is how a client tells a dropped entity from an
+/// associated one.
+///
+/// Read from the input rather than reported by the handler because the accepted answer is
+/// `Unit`: it binds no member a handler could put this on, so the header is added where a
+/// response can still be touched (`crate::service`). The judgement itself is
+/// [`entity_failure`], the one this operation refuses a STRICT call with.
+pub(crate) fn dropped_entity_failure(input: &PutMetricDataInput) -> Option<&'static str> {
+    // Only a LENIENT call drops an entity: a strict one is refused outright, and a call that
+    // states no flag at all is refused for that.
+    if input.strict_entity_validation != Some(false) {
+        return None;
+    }
+    input
+        .entity_metric_data
+        .iter()
+        .flatten()
+        .filter_map(|entry| entry.entity.as_ref())
+        .find_map(|entity| entity_failure(&key_attributes(entity)).map(|failure| failure.name))
 }

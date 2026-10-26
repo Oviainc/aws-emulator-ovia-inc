@@ -8,11 +8,50 @@
 //! (publish form, dimension ordering, period length, requested statistic set, page size),
 //! so the recorded happy path is one row among many rather than the specification.
 
-use crate::harness::{build_router, call, error_code, ok};
+use crate::harness::{build_router, build_router_with_engine, call, error_code, ok};
 use serde_json::{json, Value};
 
-/// A fixed epoch second used as the base of every published time stamp, so the aggregation
-/// windows a test asserts on never depend on the wall clock.
+/// Write one datapoint of the `Service=api` series of `metric` straight into the store, at an
+/// instant a publish can no longer stamp.
+///
+/// The ingest window `PutMetricData` documents is about WHEN a datapoint may be written, not
+/// about how long CloudWatch keeps one: a series read in an older age band holds datapoints
+/// written when their instants were current. That history is what this seeds.
+fn seed_datapoint(
+    engine: &std::sync::Arc<engine::InMemoryEngine>,
+    metric: &str,
+    at_secs: f64,
+    value: f64,
+) {
+    use service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state as cloudwatch;
+
+    let key = cloudwatch::MetricKey {
+        namespace: "MyApp".to_string(),
+        metric_name: metric.to_string(),
+        dimensions: [("Service".to_string(), "api".to_string())]
+            .into_iter()
+            .collect(),
+    };
+    engine
+        .state::<cloudwatch::ComAmazonawsCloudwatchGraniteserviceversion20100801State>()
+        .lock()
+        .append_datapoints(
+            key,
+            vec![cloudwatch::StoredDatum {
+                timestamp_secs: at_secs,
+                sample_count: 1.0,
+                sum: value,
+                minimum: value,
+                maximum: value,
+                unit: None,
+                // The default `StorageResolution` of a published datum.
+                storage_resolution: 60,
+            }],
+        )
+        .expect("the metric store has room for the seeded series");
+}
+
+/// The base of every published time stamp: a whole hour in the RECENT past.
 ///
 /// Aligned on a whole HOUR, which is the coarsest boundary a read rounds a requested start
 /// time down to ("Start time greater than 63 days ago - Round down to the nearest 1-hour clock
@@ -20,7 +59,24 @@ use serde_json::{json, Value};
 /// exactly where it says, so the rows below assert the bucketing on its own. The rounding
 /// itself is asserted by
 /// [`a_start_time_off_the_boundary_is_rounded_down_before_the_windows_are_laid`].
-const T0: f64 = 1_699_999_200.0;
+///
+/// It tracks the clock because a publish is what puts the datapoints there, and `PutMetricData`
+/// takes only a time stamp inside the window it documents ("as much as two weeks before the
+/// current date, and as much as 2 hours after the current day and time"): a fixed instant would
+/// fall out of that window as the wall clock moved past it. One hour back leaves room for a row
+/// that reads a window ending after its own datapoints.
+fn t0() -> f64 {
+    const HOUR: f64 = 60.0 * 60.0;
+    // Settled ONCE per test binary, so every reader in a suite measures against the same
+    // instant however long the suite runs — the property the fixed instant used to give.
+    static BASE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *BASE.get_or_init(|| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |since| since.as_secs_f64());
+        (now / HOUR).floor() * HOUR - HOUR
+    })
+}
 
 /// A numeric member, treating an absent member and an explicit null alike.
 fn number(value: &Value, member: &str) -> Option<f64> {
@@ -49,7 +105,7 @@ fn datum(metric: &str, value: f64, offset: f64) -> Value {
         "Dimensions": [{"Name": "Service", "Value": "api"}],
         "Value": value,
         "Unit": "Milliseconds",
-        "Timestamp": T0 + offset,
+        "Timestamp": t0() + offset,
     })
 }
 
@@ -59,8 +115,8 @@ fn statistics_request(metric: &str, period: i64, end_offset: f64, statistics: &[
         "Namespace": "MyApp",
         "MetricName": metric,
         "Dimensions": [{"Name": "Service", "Value": "api"}],
-        "StartTime": T0,
-        "EndTime": T0 + end_offset,
+        "StartTime": t0(),
+        "EndTime": t0() + end_offset,
         "Period": period,
         "Statistics": statistics,
     })
@@ -142,19 +198,23 @@ async fn published_datapoints_are_listed_and_aggregated_from_the_store() {
 async fn entity_associated_metric_data_is_ingested_too() {
     // Rows differ in where the metric data rides: the plain `MetricData` list, the
     // `EntityMetricData` list, and both at once — the documented limit of two entity
-    // objects is the upper row.
+    // objects is the upper row. Every entity-bearing row carries `StrictEntityValidation`,
+    // which "is <i>required</i> when EntityMetricData is included"
+    // (`PutMetricDataInput$StrictEntityValidation`); the refusal of a row that leaves it out
+    // is asserted in `put_metric_data_validation.rs`.
     let cases: Vec<(&str, Value, f64)> = vec![
         (
             "MetricData only",
-            json!({"MetricData": [{"MetricName": "Mixed", "Value": 1.0, "Timestamp": T0}]}),
+            json!({"MetricData": [{"MetricName": "Mixed", "Value": 1.0, "Timestamp": t0()}]}),
             1.0,
         ),
         (
             "EntityMetricData only",
             json!({
+                "StrictEntityValidation": true,
                 "EntityMetricData": [{
                     "Entity": {"KeyAttributes": {"Type": "Service", "Name": "api"}},
-                    "MetricData": [{"MetricName": "Mixed", "Value": 2.0, "Timestamp": T0}],
+                    "MetricData": [{"MetricName": "Mixed", "Value": 2.0, "Timestamp": t0()}],
                 }],
             }),
             1.0,
@@ -162,10 +222,11 @@ async fn entity_associated_metric_data_is_ingested_too() {
         (
             "both lists, and two entity objects",
             json!({
-                "MetricData": [{"MetricName": "Mixed", "Value": 3.0, "Timestamp": T0}],
+                "StrictEntityValidation": true,
+                "MetricData": [{"MetricName": "Mixed", "Value": 3.0, "Timestamp": t0()}],
                 "EntityMetricData": [
-                    {"MetricData": [{"MetricName": "Mixed", "Value": 4.0, "Timestamp": T0}]},
-                    {"MetricData": [{"MetricName": "Mixed", "Value": 5.0, "Timestamp": T0}]},
+                    {"MetricData": [{"MetricName": "Mixed", "Value": 4.0, "Timestamp": t0()}]},
+                    {"MetricData": [{"MetricName": "Mixed", "Value": 5.0, "Timestamp": t0()}]},
                 ],
             }),
             3.0,
@@ -184,8 +245,8 @@ async fn entity_associated_metric_data_is_ingested_too() {
             &json!({
                 "Namespace": "MyApp",
                 "MetricName": "Mixed",
-                "StartTime": T0,
-                "EndTime": T0 + 60.0,
+                "StartTime": t0(),
+                "EndTime": t0() + 60.0,
                 "Period": 60,
                 "Statistics": ["SampleCount"],
             }),
@@ -241,7 +302,7 @@ async fn every_publish_form_folds_into_the_same_aggregation() {
     let router = build_router();
     for (case, mut published, [sample_count, sum, minimum, maximum]) in cases {
         let metric = published["MetricName"].as_str().expect("a metric name").to_string();
-        published["Timestamp"] = json!(T0);
+        published["Timestamp"] = json!(t0());
         published["Dimensions"] = json!([{"Name": "Service", "Value": "api"}]);
         ok(
             &router,
@@ -333,7 +394,7 @@ async fn a_dimension_set_identifies_a_series_regardless_of_order() {
                     "MetricName": metric,
                     "Dimensions": published,
                     "Value": 5.0,
-                    "Timestamp": T0,
+                    "Timestamp": t0(),
                 }],
             }),
         )
@@ -346,8 +407,8 @@ async fn a_dimension_set_identifies_a_series_regardless_of_order() {
                 "Namespace": "MyApp",
                 "MetricName": metric,
                 "Dimensions": queried,
-                "StartTime": T0,
-                "EndTime": T0 + 60.0,
+                "StartTime": t0(),
+                "EndTime": t0() + 60.0,
                 "Period": 60,
                 "Statistics": ["SampleCount"],
             }),
@@ -438,7 +499,7 @@ async fn datapoints_bucket_into_period_windows_anchored_at_the_start_time() {
             .iter()
             .map(|point| {
                 (
-                    number(point, "Timestamp").unwrap_or_default() - T0,
+                    number(point, "Timestamp").unwrap_or_default() - t0(),
                     number(point, "SampleCount").unwrap_or_default(),
                 )
             })
@@ -465,7 +526,7 @@ async fn datapoints_bucket_into_period_windows_anchored_at_the_start_time() {
 /// with a start time deliberately off its own boundary.
 #[tokio::test]
 async fn a_start_time_off_the_boundary_is_rounded_down_before_the_windows_are_laid() {
-    let router = build_router();
+    let (router, engine) = build_router_with_engine();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("the clock is after the epoch")
@@ -475,6 +536,9 @@ async fn a_start_time_off_the_boundary_is_rounded_down_before_the_windows_are_la
     // one 30 days before it is in the five-minute band.
     let recent = (now / 3600.0).floor() * 3600.0 - 3600.0;
     const DAY: f64 = 24.0 * 60.0 * 60.0;
+    /// How far back a publish may stamp a datapoint: "You can specify time stamps that are as
+    /// much as two weeks before the current date" (`PutMetricData`).
+    const INGEST_WINDOW_BEHIND: f64 = 14.0 * 24.0 * 60.0 * 60.0;
 
     // (case, the whole-boundary base, how far past it the request starts, the period, the
     // interval the start time rounds to)
@@ -504,20 +568,28 @@ async fn a_start_time_off_the_boundary_is_rounded_down_before_the_windows_are_la
         let metric = format!("Rounded{period}x{offset}");
         let at = base + offset;
         let expected_start = ((at / interval).floor() * interval).max(0.0);
-        ok(
-            &router,
-            "PutMetricData",
-            &json!({
-                "Namespace": "MyApp",
-                "MetricData": [{
-                    "MetricName": metric,
-                    "Dimensions": [{"Name": "Service", "Value": "api"}],
-                    "Value": 4.0,
-                    "Timestamp": at,
-                }],
-            }),
-        )
-        .await;
+        if at < now - INGEST_WINDOW_BEHIND {
+            // A datapoint this old is one no publish can put there NOW: `PutMetricData` takes
+            // a time stamp only inside the window above. The series an older band reads was
+            // written while its instant was still current, so the row seeds the store the way
+            // that write left it — what it asserts is the READ's rounding.
+            seed_datapoint(&engine, &metric, at, 4.0);
+        } else {
+            ok(
+                &router,
+                "PutMetricData",
+                &json!({
+                    "Namespace": "MyApp",
+                    "MetricData": [{
+                        "MetricName": metric,
+                        "Dimensions": [{"Name": "Service", "Value": "api"}],
+                        "Value": 4.0,
+                        "Timestamp": at,
+                    }],
+                }),
+            )
+            .await;
+        }
         let stats = ok(
             &router,
             "GetMetricStatistics",
@@ -648,8 +720,8 @@ async fn percentiles_come_from_the_published_values_or_are_not_reported() {
                 "Namespace": "MyApp",
                 "MetricName": "Percentiles",
                 "Dimensions": [{"Name": "Service", "Value": "api"}],
-                "StartTime": T0,
-                "EndTime": T0 + 60.0,
+                "StartTime": t0(),
+                "EndTime": t0() + 60.0,
                 "Period": 60,
                 "ExtendedStatistics": [statistic],
             }),
@@ -680,7 +752,7 @@ async fn percentiles_come_from_the_published_values_or_are_not_reported() {
                 "MetricName": "Opaque",
                 "Dimensions": [{"Name": "Service", "Value": "api"}],
                 "StatisticValues": {"SampleCount": 4.0, "Sum": 20.0, "Minimum": 1.0, "Maximum": 9.0},
-                "Timestamp": T0,
+                "Timestamp": t0(),
             }],
         }),
     )
@@ -692,8 +764,8 @@ async fn percentiles_come_from_the_published_values_or_are_not_reported() {
             "Namespace": "MyApp",
             "MetricName": "Opaque",
             "Dimensions": [{"Name": "Service", "Value": "api"}],
-            "StartTime": T0,
-            "EndTime": T0 + 60.0,
+            "StartTime": t0(),
+            "EndTime": t0() + 60.0,
             "Period": 60,
             "ExtendedStatistics": ["p50"],
         }),
@@ -718,9 +790,9 @@ async fn list_metrics_filters_only_the_series_that_exist() {
         &json!({
             "Namespace": "MyApp",
             "MetricData": [
-                {"MetricName": "Latency", "Dimensions": [{"Name": "Service", "Value": "api"}], "Value": 1.0, "Timestamp": T0},
-                {"MetricName": "Latency", "Dimensions": [{"Name": "Service", "Value": "worker"}], "Value": 1.0, "Timestamp": T0},
-                {"MetricName": "Errors", "Dimensions": [{"Name": "Service", "Value": "api"}], "Value": 1.0, "Timestamp": T0},
+                {"MetricName": "Latency", "Dimensions": [{"Name": "Service", "Value": "api"}], "Value": 1.0, "Timestamp": t0()},
+                {"MetricName": "Latency", "Dimensions": [{"Name": "Service", "Value": "worker"}], "Value": 1.0, "Timestamp": t0()},
+                {"MetricName": "Errors", "Dimensions": [{"Name": "Service", "Value": "api"}], "Value": 1.0, "Timestamp": t0()},
             ],
         }),
     )
@@ -730,7 +802,7 @@ async fn list_metrics_filters_only_the_series_that_exist() {
         "PutMetricData",
         &json!({
             "Namespace": "Other",
-            "MetricData": [{"MetricName": "Latency", "Value": 1.0, "Timestamp": T0}],
+            "MetricData": [{"MetricName": "Latency", "Value": 1.0, "Timestamp": t0()}],
         }),
     )
     .await;
@@ -1256,6 +1328,7 @@ async fn refusals_carry_the_modelled_status_and_code() {
             "PutMetricData",
             json!({
                 "Namespace": "MyApp",
+                "StrictEntityValidation": true,
                 "EntityMetricData": (0..3)
                     .map(|index| json!({
                         "MetricData": [{"MetricName": format!("E{index}"), "Value": 1.0}],
@@ -1302,8 +1375,8 @@ async fn refusals_carry_the_modelled_status_and_code() {
             json!({
                 "Namespace": "MyApp",
                 "MetricName": "Refused",
-                "StartTime": T0,
-                "EndTime": T0 + 60.0,
+                "StartTime": t0(),
+                "EndTime": t0() + 60.0,
                 "Period": 60,
             }),
             400,
@@ -1315,8 +1388,8 @@ async fn refusals_carry_the_modelled_status_and_code() {
             json!({
                 "Namespace": "MyApp",
                 "MetricName": "NothingHere",
-                "StartTime": T0,
-                "EndTime": T0 + 60.0,
+                "StartTime": t0(),
+                "EndTime": t0() + 60.0,
                 "Period": 60,
                 "ExtendedStatistics": ["notapercentile"],
             }),

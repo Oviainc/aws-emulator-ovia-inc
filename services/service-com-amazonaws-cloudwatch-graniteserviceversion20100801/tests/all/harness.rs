@@ -355,6 +355,29 @@ pub async fn call_in_region(
     operation: &str,
     body: &Value,
 ) -> (u16, Value) {
+    let (status, _headers, parsed) = call_with_headers_in_region(router, region, operation, body).await;
+    (status, parsed)
+}
+
+/// The same call, with the response HEADERS as well.
+///
+/// The seam for an answer that carries something its body does not — the header
+/// `PutMetricData` reports a dropped entity in, say.
+pub async fn call_with_headers(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, http::HeaderMap, Value) {
+    call_with_headers_in_region(router, DEFAULT_REGION, operation, body).await
+}
+
+/// The same, with the request signed for `region`.
+pub async fn call_with_headers_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> (u16, http::HeaderMap, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -376,13 +399,14 @@ pub async fn call_in_region(
 
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
+    let headers = response.headers().clone();
     let payload = response.into_body();
     let parsed = if payload.is_empty() {
         Value::Null
     } else {
         serde_json::from_slice(&payload).unwrap_or(Value::Null)
     };
-    (status, parsed)
+    (status, headers, parsed)
 }
 
 /// Call one operation, requiring a 200, and return its body.

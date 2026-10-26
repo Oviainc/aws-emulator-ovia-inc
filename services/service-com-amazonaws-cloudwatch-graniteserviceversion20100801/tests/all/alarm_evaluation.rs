@@ -1036,15 +1036,18 @@ async fn a_publish_into_the_reserved_namespace_is_refused_and_stores_nothing() {
     //
     // The reserved space is the one `PutMetricDataInput$Namespace` names: "To avoid conflicts
     // with Amazon Web Services service namespaces, you should not specify a namespace that
-    // begins with AWS/". The accepted rows are the ones just outside it.
+    // begins with AWS/". The space a namespace names does not change with its spelling's
+    // case, so every case of the prefix is inside it; the accepted rows are the ones just
+    // outside it.
     let rows: &[(&str, &str, bool)] = &[
         ("the namespace of the recorded case", "AWS/ES", false),
         ("a namespace of another AWS service", "AWS/EC2", false),
         ("a namespace of a third AWS service", "AWS/Lambda", false),
         ("the bare reserved prefix", "AWS/", false),
         ("a deeper reserved namespace", "AWS/ApplicationELB/Target", false),
+        ("the reserved prefix in lower case", "aws/es", false),
+        ("the reserved prefix in mixed case", "Aws/Es", false),
         ("a customer namespace", "MyApplication", true),
-        ("the reserved prefix in another case", "aws/es", true),
         ("the reserved prefix without its separator", "AWSMyApp", true),
         ("the reserved prefix inside a namespace", "MyApp/AWS/Metrics", true),
         ("a namespace that only starts with the letter A", "A/WS", true),

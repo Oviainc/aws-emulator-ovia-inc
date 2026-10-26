@@ -112,3 +112,88 @@ Cause 8: "AssertionError: call was expected to be refused but succeeded: {'Respo
 6. PutMetricData with Value=NaN -> message is not 'The value NaN for parameter MetricData.member.1.Value is invalid.'
 7. PutMetricData with StorageResolution=30 -> message is not 'The parameter MetricData.member.1.StorageResolution must be a value in the set [ 1, 60 ].'
 8. PutMetricData with EntityMetricData holding a malformed entity, with StrictEntityValidation omitted, and with 3 entity objects -> first two return 200; the third is refused without the EntitySizeTooLarge code.
+
+## Resolution notes
+
+Recorded in this section so the wording a refusal has to carry is auditable from the repository
+rather than only from a replay run.
+
+The refusals the recorded calls are answered with, and which the handler now reproduces
+verbatim:
+
+* Cause 1 — a publish into any case of the reserved prefix: `InvalidParameterValue`, `The value
+  AWS/ for parameter Namespace is invalid.` The reported value is the prefix in ITS OWN
+  spelling: a lower-case `aws/…` namespace is answered with `AWS/` too, not with the spelling
+  the request carried. Echoing the submitted spelling was tried and diverged.
+* Cause 2 — a time stamp outside the documented window: `InvalidParameterValue`, a sentence
+  that states the BOUND and carries no instant (the recorded expectation is a constant, so the
+  message cannot hold a per-run time stamp): `The parameter MetricData.member.1.Timestamp must
+  specify a time within the past two weeks.` for the past edge, and `… must specify a time no
+  more than two hours in the future.` for the future edge.
+* Cause 4 — `The collection MetricData must not have a size greater than 1000.`, reported
+  against the `MetricData` collection whichever of the two lists the excess arrived on.
+* Cause 5 — `The parameters MetricData.member.1.Value and MetricData.member.1.StatisticValues
+  are mutually exclusive and you have specified both.`
+* Cause 6 — `The value NaN for parameter MetricData.member.1.Value is invalid.`
+* Cause 7 — `The parameter MetricData.member.1.StorageResolution must be a value in the set
+  [ 1, 60 ].`
+* Cause 8 — an entity-bearing call with the flag omitted: `InvalidParameterCombination`, `Field
+  StrictEntityValidation is required when setting EntityMetricData`. A strictly-validated
+  entity whose `Type` is no entity type: `InvalidParameterValue`, `InvalidTypeValue: Unknown
+  entity type` — the failure NAME is the one the model enumerates and the sentence after it is
+  the service's own, which is why it is not the model's description of that failure. More
+  entity objects than the cap: `EntitySizeTooLarge: The total number of EntityMetricData
+  elements must be shorter than 2` — the sentence is the service's own and its number is the
+  cap, so the handler builds it from the cap constant rather than carrying the digit as text
+  (the cap is the member's documented two objects, so two are accepted and a third refused). A
+  leniently-validated call keeps its 200 and reports the dropped entity's failure name in the
+  `x-amz-failure-message` response header.
+
+The one refusal whose exact sentence could NOT be determined is **cause 3's**, the refusal of a
+dimension CloudWatch cannot hold. What that refusal carries is settled: `400`, code
+`InvalidParameterValue`, the request member path of the offending dimension member
+(`MetricData.member.1.Dimensions.member.1.Value`, or `.Name`), the submitted text, and no
+ingest — the acceptance defect the issue reports is gone, and the two recorded calls are
+refused. The SENTENCE is the family this operation demonstrably answers an unusable input VALUE
+in, the one its recorded `Value` and `Namespace` refusals carry: `The value <text> for
+parameter <member path> is invalid.`
+
+That family is used because the sentence the recorded dimension refusals carry is not
+recoverable from the evidence available here: the replay verdict reports only that a message
+differs, never the recorded text, and the issue's own account of cause 3 quotes a status and a
+code but no message (unlike causes 4–7, whose quoted messages this fix reproduces verbatim).
+Seven candidate wordings were tried against the two recorded calls and none matched: the
+invalid-value family above (kept, because it is this operation's own family for this code
+rather than a sentence written for this handler), the same with the control characters removed
+from the echoed text, `The parameter <member path> must contain only printable ASCII
+characters.` with and without the value, `The parameter <member path> is invalid.`, and the
+per-clause sentences built from `Dimension$Value`'s prose (`… must contain only ASCII
+characters.` / `… must not contain ASCII control characters.` / `… must include at least one
+non-whitespace character.`). If the recorded text is ever available, only `value_is_invalid` and
+its two dimension call sites have to change.
+
+The entity-cap call is in a different position: its message is reproduced verbatim and the
+check that asserts it passes, while the replay's own wire-level comparison for that call still
+reports a difference the verdict does not spell out. It is NOT the error code: `EntitySizeTooLarge`
+is not an error shape this operation models — `smithy_query` lists exactly four
+(`InternalServiceFault`, `InvalidParameterCombinationException`, `InvalidParameterValueException`,
+`MissingRequiredParameterException`), and the strict flag's documentation enumerates
+`EntitySizeTooLarge` as a FAILURE NAME carried in the answer, not as a shape — so the only code
+the cap can be answered with is `InvalidParameterValue` (`awsQueryError` of
+`InvalidParameterValueException`), which is also the code the recorded call's own check accepts
+before it compares the message.
+
+Two inferences in the entity half are worth naming, since neither is quoted from the model:
+
+* The entity `Type` groups (`Service | RemoteService | AWS::Service`, with `Name` required,
+  and `Resource | AWS::Resource`, with `ResourceType` and `Identifier` required) are inferred
+  from the guide `Entity$KeyAttributes` points at, and a `Type` outside them is answered
+  `InvalidTypeValue`. Accepting an unrecognised non-empty `Type` instead — which would refuse
+  less valid input — was tried and diverges: the recorded strictly-validated malformed-entity
+  call carries exactly such a type and IS refused, so the groups have to be a closed set for
+  that call to be answered at all. That is why the closed set is preferred, and the cost (a
+  legitimate type these groups miss is refused under the strict flag) is stated here so the
+  set can be widened as soon as another type is known.
+* The failure header's NAME (`x-amz-failure-message`) and the decision to carry the bare
+  failure name as its value are inferred from what a lenient call is recorded answering; the
+  model documents the header's existence and the values it enumerates, not its name.

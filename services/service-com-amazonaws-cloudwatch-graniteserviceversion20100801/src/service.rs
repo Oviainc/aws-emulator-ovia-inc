@@ -20,9 +20,10 @@
 //!   request's resolved route key against this service's signing name. Edit it
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
-//! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//! - `override_operation` — EDITED HERE: not a re-route. The key and the handler stay the
+//!   generated routing table's, but `PutMetricData` is served through
+//!   [`ReportingDroppedEntities`], so an accepted call whose entity this service could not
+//!   hold says so in its response header; every other key falls through to that table.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -41,7 +42,8 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable, Refusal,
+    Refused, Service,
 };
 use std::sync::Arc;
 
@@ -68,6 +70,10 @@ pub(crate) fn off_the_async_worker<T>(work: impl FnOnce() -> T) -> T {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// `PutMetricData`, the one operation whose answer carries something the response body
+    /// cannot: built from the SAME shared engine as the generated table's, and keyed by the
+    /// routing key the protocol resolves, so the operation served is the modelled one.
+    reporting_dropped_entities: OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -75,9 +81,102 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let mut reporting_dropped_entities = OperationRoutingTable::new();
+        reporting_dropped_entities.add_operation(
+            "PutMetricData",
+            Box::new(ReportingDroppedEntities::new(
+                crate::ops::put_metric_data::PutMetricData::new(Arc::clone(&engine)),
+            )) as Box<dyn ErasedOperation>,
+        );
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            reporting_dropped_entities,
         }
+    }
+}
+
+/// The response header an ACCEPTED `PutMetricData` reports a dropped entity in.
+///
+/// `PutMetricDataInput$StrictEntityValidation` documents that such an answer carries "an
+/// additional response header [which] will contain information about the validation errors"
+/// and enumerates the values that information is drawn from, but it does not name the header
+/// itself: this name, and carrying the bare failure name as its value, are INFERRED from what
+/// a lenient call is recorded answering, not quoted from the model.
+const ENTITY_FAILURE_HEADER: &str = "x-amz-failure-message";
+
+/// `PutMetricData`, served so that an accepted call which DROPPED an entity says so.
+///
+/// "In the case of an invalid entity, the operation will return a 200 status, but an
+/// additional response header will contain information about the validation errors."
+/// (`PutMetricDataInput$StrictEntityValidation`) — the accepted answer's shape is `Unit`, so
+/// it binds no member the handler could put that on, and the header is added here, the one
+/// place a response can still be touched. Nothing else is re-implemented: the request is
+/// handed to the generated [`ErasedOperation::run`], which owns deserialize -> validate ->
+/// handle -> serialize and every modelled error, and the failure the header names comes from
+/// the operation's OWN entity validation
+/// (`crate::ops::put_metric_data::dropped_entity_failure`), so the two cannot disagree.
+struct ReportingDroppedEntities<O> {
+    operation: O,
+}
+
+impl<O> ReportingDroppedEntities<O> {
+    /// Wrap the operation, already constructed from the shared engine.
+    fn new(operation: O) -> Self {
+        Self { operation }
+    }
+}
+
+impl<O> ErasedOperation for ReportingDroppedEntities<O>
+where
+    O: Operation + ErasedOperation,
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            // The protocol is read, used and dropped inside this one statement:
+            // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the await
+            // below would make this future non-`Send`. The request is read through the
+            // service's OWN protocol into the operation's OWN input shape, and judged by the
+            // operation's OWN entity validation, so what the header reports and what the
+            // handler did cannot disagree. The cost is DELIBERATE: a request is read twice,
+            // once here and once in the operation's own sequence, because the framework
+            // hands no already-built input to an operation.
+            let dropped = service_common::event_stream::deserialize_request::<
+                crate::ops::types::PutMetricDataInput,
+            >(
+                svc.definition().protocol(),
+                req,
+                crate::ops::types::PUT_METRIC_DATA_INPUT_SCHEMA,
+            )
+            .ok()
+            .and_then(|input| crate::ops::put_metric_data::dropped_entity_failure(&input));
+            let mut response = self.operation.run(svc, req, ctx).await;
+            // Only an ACCEPTED call drops an entity: a refused one ingested nothing, so it
+            // has no accepted metric data to report an unassociated entity for.
+            //
+            // The failure is one of a FIXED set of names, never text from the request, so it
+            // is always a representable header value; the fallible insert is used all the
+            // same, so that a header which could not be built could only cost the answer its
+            // header and never the answer itself.
+            if response.status().is_success() {
+                if let Some(failure) = dropped {
+                    let _ = response
+                        .headers_mut()
+                        .try_insert(ENTITY_FAILURE_HEADER, failure);
+                }
+            }
+            response
+        })
+    }
+
+    /// The wrapped operation's modelled auth schemes: wrapping an operation must not change
+    /// which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
     }
 }
 
@@ -103,12 +202,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // NOT a re-route: the key is the one the generated table's own protocol resolves, and
+        // the operation it names is the one served — `PutMetricData` wrapped in
+        // [`ReportingDroppedEntities`] so an accepted call reports the entity it dropped.
+        // Every other key resolves to `None` here, exactly as it would in an unedited
+        // service, and falls through to the generated table.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.reporting_dropped_entities.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
