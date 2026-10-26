@@ -272,6 +272,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
                 let key_id = match state.resolve(&region, requested_key) {
                     crate::state::KeyRef::Found(key) => key.key_id.clone(),
+                    crate::state::KeyRef::UnauthorizedAccount => {
+                        return Err(crate::state::unauthorized_account(
+                            Self::NAME,
+                            requested_key,
+                        ));
+                    }
                     crate::state::KeyRef::MalformedArn => {
                         return Err(RetireGrantErrorModeled::InvalidArnException(
                             InvalidArnException {
