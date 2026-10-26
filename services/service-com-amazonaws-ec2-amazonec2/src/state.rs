@@ -1247,6 +1247,12 @@ pub mod instance_event_windows;
 
 pub use instance_event_windows::*;
 
+/// The ClassicLink links the account holds — the store `DescribeClassicLinkInstances`
+/// reports, its bounds and its projection — in a module of its own, re-exported so a
+/// handler reaches them as `crate::state::<item>` like every other primitive here.
+mod classic_link;
+pub use classic_link::*;
+
 /// The one region whose Amazon-provided private DNS suffix is `ec2.internal`
 /// rather than `<region>.compute.internal`.
 pub const EC2_INTERNAL_REGION: &str = "us-east-1";
@@ -2127,6 +2133,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     pub reservation_order: Vec<String>,
     /// Instances by `InstanceId`.
     pub instances: HashMap<String, InstanceRecord>,
+    /// The ClassicLink link of each LINKED EC2-Classic instance, by the `InstanceId` it is
+    /// a link of: only what the link itself adds (the VPC and the security groups), since
+    /// the tags and group names `ClassicLinkInstance` also reports belong to the instance
+    /// and the groups and are read off them. Ordered by instance id, the one stable order
+    /// `DescribeClassicLinkInstances` reports and pages over, so a pagination token can
+    /// name the id the next page starts at. Starts EMPTY: no EC2 operation creates an
+    /// EC2-Classic instance, and a link is made by `AttachClassicLinkVpc`. See
+    /// [`classic_link`].
+    pub classic_link_instances: BTreeMap<String, ClassicLinkRecord>,
     /// A `RunInstances` `ClientToken` and the reservation it minted, so a repeat
     /// of the same request returns that reservation instead of launching again.
     pub client_tokens: HashMap<String, String>,
@@ -3094,6 +3109,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             reservations: HashMap::new(),
             reservation_order: Vec::new(),
             instances: HashMap::new(),
+            // A fresh account holds no EC2-Classic instance, so nothing is linked to a
+            // ClassicLink-enabled VPC either.
+            classic_link_instances: BTreeMap::new(),
             client_tokens: HashMap::new(),
             assigned_private_ips: ::std::collections::HashSet::new(),
             stored_bytes: 0,

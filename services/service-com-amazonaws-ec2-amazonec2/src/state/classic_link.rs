@@ -1,0 +1,156 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The ClassicLink links the account holds: for each linked EC2-Classic instance, the
+//! ClassicLink-enabled VPC it is linked to and the VPC security groups it was linked with.
+//!
+//! A submodule of [`crate::state`] rather than more lines in `state.rs`, for the reason
+//! `client_vpn.rs` gives: one subject — the link, its bounds and its projection — in one
+//! file, and out of the end of `state.rs`, where every concurrently landing EC2 fix
+//! inserts. Everything here is re-exported by `crate::state`, so a handler reaches it as
+//! `crate::state::<item>` exactly as it reaches the helpers in the parent module.
+//!
+//! The store itself is a field of [`ComAmazonawsEc2Amazonec2State`]
+//! (`classic_link_instances`), because the state struct is one struct; only the code that
+//! reads and writes it lives here.
+//!
+//! ## Why the link is stored, and not the instance again
+//!
+//! A ClassicLink link is a RELATIONSHIP between an instance the account already holds and
+//! a VPC it already holds, so this store keeps only what the link itself adds — the VPC and
+//! the security groups — keyed by the `InstanceId` it is a link of. Everything else
+//! `ClassicLinkInstance` reports is read back off those resources by
+//! [`ComAmazonawsEc2Amazonec2State::classic_link_instance_view`]: the instance's own tags
+//! (which `CreateTags` and `DeleteTags` write) and each security group's name (which
+//! `CreateSecurityGroup` writes). So a tag written after the link is reported by the next
+//! describe, and no second copy of a tag or a group name can drift from the resource it
+//! belongs to.
+//!
+//! The store starts EMPTY and stays empty until something links an instance: EC2-Classic
+//! instances are not created by any EC2 API operation, and the link is made by
+//! `AttachClassicLinkVpc`, which is still a scaffold.
+//! [`ComAmazonawsEc2Amazonec2State::link_classic_link_vpc`] is the one way a link is
+//! stored — the seam that operation writes through — and it keeps the store consistent by
+//! refusing a link whose instance or VPC this account does not hold, so a reported link
+//! always names resources that exist.
+
+use super::*;
+
+/// One ClassicLink link: where an EC2-Classic instance is linked, and with what.
+///
+/// Not the modelled `ClassicLinkInstance` shape, unlike most stores of this module,
+/// because two of that shape's four members are not facts of the LINK: the instance's tags
+/// and a security group's name belong to the instance and the group, and are read off them
+/// when the link is projected.
+#[derive(Debug, Clone)]
+pub struct ClassicLinkRecord {
+    /// "The ID of the ClassicLink-enabled VPC" the instance is linked to
+    /// (`AttachClassicLinkVpcRequest$VpcId`), reported as `ClassicLinkInstance$VpcId`.
+    pub vpc_id: String,
+    /// "The IDs of the security groups" the instance was linked with
+    /// (`AttachClassicLinkVpcRequest$Groups`), in the order they were named, reported as
+    /// `ClassicLinkInstance$Groups`.
+    pub group_ids: Vec<String>,
+}
+
+/// The caller-chosen bytes one stored link holds: the VPC id and the security group ids a
+/// writer named. The key is an instance id this service minted, so it is fixed-size.
+///
+/// The ONE definition of that charge, the way every other store of this module has one:
+/// [`ComAmazonawsEc2Amazonec2State::link_classic_link_vpc`] charges exactly it, and a path
+/// that takes a link back out must give back the same number.
+pub fn classic_link_payload_bytes(record: &ClassicLinkRecord) -> usize {
+    record
+        .group_ids
+        .iter()
+        .fold(record.vpc_id.len(), |total, group_id| {
+            total.saturating_add(group_id.len())
+        })
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Link the instance `instance_id` to the ClassicLink-enabled VPC `vpc_id` with the VPC
+    /// security groups `group_ids`, and answer whether the store took the link.
+    ///
+    /// `false` means the link was not stored, and the caller must refuse the request rather
+    /// than report a link that does not exist. That happens when the account holds no such
+    /// instance or no such VPC (the store never holds a link to a resource that is not
+    /// there, so a describe cannot report one), when more security groups are named than an
+    /// instance may carry ([`MAX_SECURITY_GROUPS_PER_INSTANCE`]), or when the link's
+    /// caller-chosen bytes do not fit the store's byte budget
+    /// ([`Self::would_exceed_stored_bytes_after_refund`]) — nothing in this emulator
+    /// reclaims a stored link, so the one seam it is written through is where that budget
+    /// has to be asked.
+    ///
+    /// An instance can be linked to one VPC at a time, so a second link for the same
+    /// instance REPLACES the first and the bytes the first was charged are given back.
+    ///
+    /// Its only caller today is this crate's tests, because `AttachClassicLinkVpc` is still
+    /// a scaffold: this is the seam that operation must write through, not dead code.
+    pub fn link_classic_link_vpc(
+        &mut self,
+        instance_id: &str,
+        vpc_id: &str,
+        group_ids: Vec<String>,
+    ) -> bool {
+        if !self.instances.contains_key(instance_id) || !self.vpcs.contains_key(vpc_id) {
+            return false;
+        }
+        if group_ids.len() > MAX_SECURITY_GROUPS_PER_INSTANCE {
+            return false;
+        }
+        let record = ClassicLinkRecord {
+            vpc_id: vpc_id.to_string(),
+            group_ids,
+        };
+        let charge = classic_link_payload_bytes(&record);
+        let refund = self
+            .classic_link_instances
+            .get(instance_id)
+            .map_or(0, classic_link_payload_bytes);
+        if self.would_exceed_stored_bytes_after_refund(charge, refund) {
+            return false;
+        }
+        self.release_stored_bytes(refund);
+        self.add_stored_bytes(charge);
+        self.classic_link_instances
+            .insert(instance_id.to_string(), record);
+        true
+    }
+
+    /// The modelled `ClassicLinkInstance` for `instance_id`, or `None` when that instance
+    /// holds no ClassicLink link.
+    ///
+    /// The one projection of a link, so every operation that reports one reports it
+    /// identically. Two of its members are read off the resources the link names rather
+    /// than off the link: "Any tags assigned to the instance"
+    /// (`ClassicLinkInstance$Tags`) comes from the instance record, so a tag written after
+    /// the link is reported, and each group's "name of the security group"
+    /// (`GroupIdentifier$GroupName`) comes from the security group store — absent for a
+    /// group this account no longer holds, which is what AWS reports for a member a
+    /// resource carries no value for.
+    pub fn classic_link_instance_view(
+        &self,
+        instance_id: &str,
+    ) -> Option<crate::ops::types::ClassicLinkInstance> {
+        let record = self.classic_link_instances.get(instance_id)?;
+        let instance = self.instances.get(instance_id)?;
+        Some(crate::ops::types::ClassicLinkInstance {
+            instance_id: Some(instance.instance_id.clone()),
+            vpc_id: Some(record.vpc_id.clone()),
+            groups: Some(
+                record
+                    .group_ids
+                    .iter()
+                    .map(|group_id| GroupIdentifier {
+                        group_id: Some(group_id.clone()),
+                        group_name: self
+                            .security_groups
+                            .get(group_id)
+                            .and_then(|group| group.group_name.clone()),
+                    })
+                    .collect(),
+            ),
+            tags: Some(tag_list(&instance.tags)),
+        })
+    }
+}
