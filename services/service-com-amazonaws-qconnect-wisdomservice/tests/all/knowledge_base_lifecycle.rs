@@ -199,8 +199,50 @@ fn is_modelled_uuid(value: &str) -> bool {
             })
 }
 
-/// One row of the create/read table: what varies between knowledge bases.
-#[derive(Debug, Clone)]
+/// The `sourceConfiguration` a knowledge base of `knowledge_base_type` cannot be created
+/// without, or `None` for a type whose content lives in the service itself.
+///
+/// The model documents that member as the source of "EXTERNAL or Managed" knowledge bases
+/// (`smithy_query(query="doc",shape="CreateKnowledgeBaseRequest",member="sourceConfiguration")`),
+/// and declares one union member per source
+/// (`smithy_query(query="shape",shape="SourceConfiguration")`: `appIntegrations`,
+/// `managedSourceConfiguration`), so a create of one of those types carries the member its
+/// source needs — `appIntegrationArn` is `@required` on the first
+/// (`smithy_query(query="shape",shape="AppIntegrationsConfiguration")`) and
+/// `urlConfiguration` on the web crawler the second names
+/// (`smithy_query(query="shape",shape="WebCrawlerConfiguration")`).
+fn source_configuration(knowledge_base_type: &str) -> Option<Value> {
+    match knowledge_base_type {
+        "EXTERNAL" => Some(json!({
+            "appIntegrations": {
+                "appIntegrationArn": format!(
+                    "arn:aws:app-integrations:{REGION}:{account}:data-integration/kb-source",
+                    account = engine::EMULATOR_ACCOUNT_ID
+                )
+            }
+        })),
+        "MANAGED" => Some(json!({
+            "managedSourceConfiguration": {
+                "webCrawlerConfiguration": {
+                    "urlConfiguration": { "seedUrls": [{ "url": "https://example.test/docs" }] }
+                }
+            }
+        })),
+        _ => None,
+    }
+}
+
+/// A `CreateKnowledgeBase` body for one name and type, carrying the source that type
+/// needs — see [`source_configuration`].
+fn create_body(name: &str, knowledge_base_type: &str) -> Value {
+    let mut body = json!({ "name": name, "knowledgeBaseType": knowledge_base_type });
+    if let Some(source) = source_configuration(knowledge_base_type) {
+        body["sourceConfiguration"] = source;
+    }
+    body
+}
+
+/// One row of the create/read table: what varies between knowledge bases.#[derive(Debug, Clone)]
 struct KnowledgeBaseCase {
     label: &'static str,
     name: String,
@@ -213,7 +255,7 @@ struct KnowledgeBaseCase {
 
 impl KnowledgeBaseCase {
     fn create_body(&self) -> Value {
-        let mut body = json!({ "name": self.name, "knowledgeBaseType": self.knowledge_base_type });
+        let mut body = create_body(&self.name, self.knowledge_base_type);
         if let Some(description) = &self.description {
             body["description"] = json!(description);
         }
@@ -441,13 +483,13 @@ async fn a_duplicate_knowledge_base_name_is_a_conflict() {
         ),
         (
             "same name, extra members on the second create",
-            json!({ "name": "duplicate-kb-3", "knowledgeBaseType": "EXTERNAL" }),
-            json!({
-                "name": "duplicate-kb-3",
-                "knowledgeBaseType": "EXTERNAL",
-                "description": "second try",
-                "tags": { "env": "test" }
-            }),
+            create_body("duplicate-kb-3", "EXTERNAL"),
+            {
+                let mut body = create_body("duplicate-kb-3", "EXTERNAL");
+                body["description"] = json!("second try");
+                body["tags"] = json!({ "env": "test" });
+                body
+            },
         ),
     ] {
         let created = emulator.create_knowledge_base(first).await;
@@ -765,10 +807,10 @@ async fn a_delete_leaves_every_other_knowledge_base_alone() {
         let mut ids = Vec::new();
         for index in 0..5 {
             let created = emulator
-                .create_knowledge_base(json!({
-                    "name": format!("neighbour-kb-{label}-{index}").replace(' ', "-"),
-                    "knowledgeBaseType": KNOWLEDGE_BASE_TYPES[index % KNOWLEDGE_BASE_TYPES.len()],
-                }))
+                .create_knowledge_base(create_body(
+                    &format!("neighbour-kb-{label}-{index}").replace(' ', "-"),
+                    KNOWLEDGE_BASE_TYPES[index % KNOWLEDGE_BASE_TYPES.len()],
+                ))
                 .await;
             ids.push(
                 created
@@ -830,7 +872,7 @@ async fn a_delete_releases_the_name_it_held() {
         ),
     ] {
         let first = emulator
-            .create_knowledge_base(json!({ "name": name, "knowledgeBaseType": first_type }))
+            .create_knowledge_base(create_body(&name, first_type))
             .await;
         let first_id = first
             .string("/knowledgeBase/knowledgeBaseId")
@@ -838,7 +880,7 @@ async fn a_delete_releases_the_name_it_held() {
 
         // While it is live, the name is taken.
         let refused = emulator
-            .create_knowledge_base(json!({ "name": name, "knowledgeBaseType": second_type }))
+            .create_knowledge_base(create_body(&name, second_type))
             .await;
         assert_eq!(
             refused.status, 409,
@@ -855,7 +897,7 @@ async fn a_delete_releases_the_name_it_held() {
         );
 
         let second = emulator
-            .create_knowledge_base(json!({ "name": name, "knowledgeBaseType": second_type }))
+            .create_knowledge_base(create_body(&name, second_type))
             .await;
         assert_eq!(
             second.status, 200,

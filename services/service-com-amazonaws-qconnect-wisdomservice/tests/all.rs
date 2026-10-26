@@ -25,6 +25,8 @@ mod content_upload;
 mod enum_value_refusal;
 #[path = "all/knowledge_base_lifecycle.rs"]
 mod knowledge_base_lifecycle;
+#[path = "all/knowledge_base_listing_and_queries.rs"]
+mod knowledge_base_listing_and_queries;
 #[path = "all/modelled_refusals.rs"]
 mod modelled_refusals;
 #[path = "all/resource_tags.rs"]

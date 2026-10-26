@@ -209,8 +209,7 @@ fn pending_span(engine: &engine::InMemoryEngine, id: &str, from: SystemTime) -> 
     let store = state::service_state(engine).expect("the mediapackage state store");
     let store = store.lock();
     store
-        .harvest_jobs
-        .get(id)?
+        .harvest_job(REGION, id)?
         .next_status_due
         .and_then(|(due, _)| due.duration_since(from).ok())
 }

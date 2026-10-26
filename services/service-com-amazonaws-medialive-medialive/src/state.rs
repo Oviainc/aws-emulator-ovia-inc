@@ -70,11 +70,23 @@
 //! an id, that id names no resource a caller may still change. Every MUTATION
 //! therefore resolves its id through the live lookups
 //! ([`ComAmazonawsMedialiveMedialiveState::live_input`],
-//! [`ComAmazonawsMedialiveMedialiveState::live_channel_mut`],
-//! [`ComAmazonawsMedialiveMedialiveState::live_input_security_group`], and the
-//! tag writers' own private `resource_tags_mut`) and answers a dead id with its
-//! own modelled not-found error, while a read goes on reporting the record in
-//! its terminal state.
+//! [`ComAmazonawsMedialiveMedialiveState::mutable_channel`] over
+//! [`ComAmazonawsMedialiveMedialiveState::live_channel_mut`], and the tag
+//! writers' own private `resource_tags_mut`) and answers a dead id with its own
+//! modelled not-found error. That resolution comes FIRST, before the mutation
+//! looks at the resource's state at all, so a tombstone is answered as not found
+//! and never with the state conflict a resource that still exists gets, while a
+//! read goes on reporting the record in its terminal state.
+//!
+//! The INPUT SECURITY GROUP is the one resource here whose delete is a SOFT
+//! delete: it only drops the group from `ListInputSecurityGroups`, leaving the
+//! group individually addressable AND still mutable. So a mutation of a group
+//! resolves its id across the whole
+//! [`ComAmazonawsMedialiveMedialiveState::input_security_groups`] store and
+//! refuses only an id this account never held.
+//! [`ComAmazonawsMedialiveMedialiveState::live_input_security_group`] is what a
+//! request REFERENCING a group resolves through instead: changing a deleted
+//! group is allowed, taking a new dependency on one is not.
 //!
 //! A channel's schedule lives on its own [`ChannelRecord`], as the
 //! [`ChannelSchedule`] of the [`schedules`] slice: the actions
@@ -1339,6 +1351,23 @@ impl ChannelRecord {
     }
 }
 
+/// Why a channel MUTATION could not resolve the `ChannelId` it was given, as
+/// [`ComAmazonawsMedialiveMedialiveState::mutable_channel`] reports it.
+///
+/// Carries what a refusal needs and nothing else, so each operation answers in
+/// the error shape its own model declares (a 404 for most of them, the 400
+/// `UpdateChannel` models instead) without re-reading the store.
+#[derive(Debug, Clone)]
+pub struct DeadChannel {
+    /// The message the refusal carries: `already deleted` for a tombstone the
+    /// account still holds, `not found` for an id it never held.
+    pub message: String,
+    /// The ARN of the record the account still holds under this id, when it
+    /// holds one — a tombstone keeps its ARN, and the batch operations report it
+    /// beside the per-entry refusal. `None` for an id no channel ever had.
+    pub arn: Option<String>,
+}
+
 /// One created eventbridge rule template group, as
 /// `CreateEventBridgeRuleTemplateGroup` stored it.
 ///
@@ -1423,6 +1452,10 @@ impl InputSecurityGroupRecord {
 /// transient step: `InputSecurityGroupState` models none between `IDLE`/`IN_USE`
 /// and `DELETED`, so the delete is done with the call. Deleting a group that is
 /// already `DELETED` changes nothing.
+///
+/// A SOFT delete: the record stays addressable through
+/// `DescribeInputSecurityGroup` and stays MUTABLE, and the only thing the delete
+/// takes away is the group's place in `ListInputSecurityGroups`.
 pub fn delete_input_security_group(group: &mut InputSecurityGroupRecord) {
     group.deleted = true;
 }
@@ -3211,10 +3244,62 @@ impl ComAmazonawsMedialiveMedialiveState {
             .filter(|channel| !channel.is_delete_accepted())
     }
 
-    /// The input security group `id` names while it is still LIVE, for the same
-    /// reason as [`Self::live_input`]: a group `DeleteInputSecurityGroup` has
-    /// put in the terminal `DELETED` state is no longer a group a caller may
-    /// change.
+    /// The channel a MUTATION may change, or the refusal to answer with — the
+    /// one guard every channel mutation resolves its id through, BEFORE it looks
+    /// at any channel's state.
+    ///
+    /// An id the account holds no record for and an id whose delete this service
+    /// has accepted (the record is `DELETING`, or in the terminal `DELETED`
+    /// state it keeps) are ONE refusal class: neither names a channel a caller
+    /// may still change, so each is answered with the operation's own modelled
+    /// not-found error and nothing is written. Only the message tells them
+    /// apart — `already deleted` for a tombstone the account still holds and
+    /// `not found` for an id it never held.
+    ///
+    /// Taking this refusal first is what keeps a state conflict
+    /// (`ConflictException`) for a channel that still EXISTS: a tombstone has no
+    /// state a caller can conflict with, so reporting one would tell a client to
+    /// retry an id that will never become startable again.
+    pub fn mutable_channel(&mut self, id: &str) -> Result<&mut ChannelRecord, DeadChannel> {
+        // The refusal is built from the SAME lookup that resolves the id, and
+        // before the mutable borrow, so a caller reporting it (the batch
+        // operations, which name the tombstone's ARN) needs no second read of
+        // the store.
+        let refusal = match self.channels.get(id) {
+            Some(channel) if channel.is_delete_accepted() => Some(DeadChannel {
+                message: already_deleted_message(&format!("Channel {id}")),
+                arn: Some(channel.arn.clone()),
+            }),
+            Some(_) => None,
+            None => Some(DeadChannel {
+                message: not_found_message("Channel", id),
+                arn: None,
+            }),
+        };
+        match refusal {
+            Some(refusal) => Err(refusal),
+            // The lookup above already resolved the id to a live channel, so
+            // this is that channel; the fallback keeps the function total
+            // rather than asserting it.
+            None => self.live_channel_mut(id).ok_or_else(|| DeadChannel {
+                message: not_found_message("Channel", id),
+                arn: None,
+            }),
+        }
+    }
+
+    /// The input security group `id` names while it is still LIVE: one
+    /// `DeleteInputSecurityGroup` has not deleted.
+    ///
+    /// The lookup a request REFERENCING a group resolves through — an input
+    /// configuration's `InputSecurityGroups` entry — because a deleted group is
+    /// gone from `ListInputSecurityGroups` and is not a group a new resource may
+    /// take a dependency on.
+    ///
+    /// NOT the lookup a mutation OF the group goes through: a group's delete is
+    /// a SOFT delete, so the deleted group stays addressable and stays mutable
+    /// (see the module docs), and `UpdateInputSecurityGroup` therefore resolves
+    /// its id across the whole [`Self::input_security_groups`] store.
     pub fn live_input_security_group(&self, id: &str) -> Option<&InputSecurityGroupRecord> {
         self.input_security_groups
             .get(id)
@@ -3829,6 +3914,11 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// modelled not-found error. The READ path ([`Self::resource_tags`]) keeps
     /// resolving a deleted resource, whose record stays in the account.
     ///
+    /// The INPUT SECURITY GROUP is handed out even once it is deleted, because
+    /// its delete is a SOFT delete: the group stays addressable and stays
+    /// mutable (see the module docs), so its tags are writable exactly as its
+    /// `WhitelistRules` are.
+    ///
     /// PRIVATE: the per-resource tag bounds are invariants of
     /// [`Self::insert_resource_tags`], which is the only way a tag is written,
     /// so no handler can grow a resource's tag map past them.
@@ -3847,7 +3937,6 @@ impl ComAmazonawsMedialiveMedialiveState {
             TaggedResource::InputSecurityGroup(id) => self
                 .input_security_groups
                 .get_mut(&id)
-                .filter(|record| !record.is_deleted())
                 .map(|record| &mut record.tags),
             TaggedResource::SdiSource(id) => self
                 .sdi_sources

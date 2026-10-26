@@ -18,8 +18,9 @@
 //!   re-starts converges on one report instead of accumulating them;
 //! * every record in a report agrees, field for field, with what the quota reads
 //!   report for the same `(ServiceCode, QuotaCode)` pair — for EVERY pair in the
-//!   catalog — and carries a `Utilization` exactly when that quota publishes a usage
-//!   metric;
+//!   catalog — and carries a `Utilization` only where that quota publishes the usage
+//!   metric its usage would be counted by (what the figure itself is, measured against
+//!   an account that holds resources, is tabled in `quota_utilization_usage`);
 //! * the report is ordered by utilization descending and is walked to the same
 //!   records whatever page size is used, with page boundaries that do not move;
 //! * a report is a SNAPSHOT: an increase approved after it was started does not change
@@ -470,39 +471,30 @@ async fn every_report_record_agrees_with_the_quota_reads_for_the_same_pair() {
         );
 
         // Service Quotas tracks usage through the CloudWatch usage metric a quota
-        // publishes, so the record carries the namespace of THAT metric, and carries a
-        // Utilization exactly when there is a metric to compute one from.
+        // publishes, so the record carries the namespace of THAT metric — and a
+        // Utilization can only ever accompany one: with no metric there is nothing to
+        // count the quota by, so there is no percentage to report.
         let metric_namespace = applied["UsageMetric"]["MetricNamespace"].clone();
         assert_eq!(
             record["Namespace"], metric_namespace,
             "case {case}: Namespace must be the usage metric's namespace, got {record}"
         );
-        assert_eq!(
-            record["Utilization"].is_null(),
-            metric_namespace.is_null(),
-            "case {case}: a Utilization is reported exactly for a quota with a usage \
-             metric, got {record}"
-        );
-        if let Some(utilization) = record["Utilization"].as_f64() {
-            let applied_value = record["AppliedValue"].as_f64().unwrap_or_default();
-            // Utilization is usage over the value in force; nothing in this emulator
-            // consumes a quota, so the usage it has recorded against one is zero. A
-            // quota whose value in force is zero (AWS publishes several) is no
-            // denominator: with nothing used, none of what it permits is used.
-            let recorded_usage = 0.0_f64;
-            let expected = if applied_value > 0.0 {
-                recorded_usage / applied_value * 100.0
-            } else {
-                0.0
-            };
+        if metric_namespace.is_null() {
             assert!(
-                (0.0..=100.0).contains(&utilization),
-                "case {case}: utilization must be a percentage, got {utilization}"
+                record["Utilization"].is_null(),
+                "case {case}: a quota with no usage metric cannot report a utilization, \
+                 got {record}"
             );
-            assert_eq!(
-                utilization, expected,
-                "case {case}: utilization must be the recorded usage over the applied \
-                 value, got {record}"
+        }
+        // The usage itself is counted in the services that OWN the resources a quota is
+        // counted in, and this suite mounts Service Quotas alone; the formula over an
+        // account whose usage was measured is tabled in `quota_utilization_usage`. What
+        // holds whatever was counted: a utilization is a percentage of the value in
+        // force, so it is never negative.
+        if let Some(utilization) = record["Utilization"].as_f64() {
+            assert!(
+                utilization >= 0.0,
+                "case {case}: utilization must be a percentage, got {utilization}"
             );
         }
     }

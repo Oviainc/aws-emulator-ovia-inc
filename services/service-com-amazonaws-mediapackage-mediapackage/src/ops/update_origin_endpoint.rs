@@ -191,10 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         mut input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing about an update depends on the request beyond its deserialized input:
-        // the endpoint's ARN, region, channel and CreatedAt were decided when it was
-        // created.
-        let _ = ctx;
+        // The endpoint's ARN, its Region, its channel and its CreatedAt were decided
+        // when it was created; the request's own Region is what decides WHICH endpoint
+        // this update reaches, because MediaPackage is regional.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateOriginEndpointErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -237,9 +237,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut state = state.lock();
 
-        // An update changes an endpoint this service holds; there is nothing to update
-        // for an id it does not, so the target is resolved before the request is judged.
-        if !state.origin_endpoints.contains_key(&id) {
+        // An update changes an endpoint this Region holds; there is nothing to update
+        // for an id it does not — including one only another Region holds, which this
+        // request must not reach — so the target is resolved before the request is judged.
+        if !state.has_origin_endpoint(&region, &id) {
             return Err(crate::state::origin_endpoint_not_found(&id).into());
         }
 
@@ -304,16 +305,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_else(|| crate::state::DEFAULT_MANIFEST_NAME.to_string());
 
         let record = state
-            .origin_endpoints
-            .get_mut(&id)
+            .origin_endpoint_mut(&region, &id)
             .expect("the endpoint resolved above, under this one hold of the lock");
 
-        // Values the SERVICE derives are re-derived from the endpoint's own region and
-        // channel, never from the region this particular request was signed for, so an
-        // update cannot move a stored endpoint's URLs to another region.
-        let region = crate::state::arn_region(&record.arn)
-            .unwrap_or(crate::state::DEFAULT_REGION)
-            .to_string();
+        // Values the SERVICE derives are re-derived from the endpoint's OWN region and
+        // channel: an endpoint resolves only in the Region it was created in, so the
+        // region resolved above IS the stored endpoint's, and no request can move a
+        // stored endpoint's URLs to another region.
         let channel_id = record.channel_id.clone();
 
         // `PUT /origin_endpoints/{Id}` carries the endpoint's updatable configuration:

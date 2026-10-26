@@ -225,6 +225,36 @@ impl Emulator {
         kms_key_id: Option<&str>,
     ) -> (String, String) {
         let mut body = json!({ "name": name, "knowledgeBaseType": knowledge_base_type });
+        // A knowledge base whose type names a source outside the service cannot be
+        // created without one: the model documents `sourceConfiguration` as the source of
+        // "EXTERNAL or Managed" knowledge bases
+        // (`smithy_query(query="doc",shape="CreateKnowledgeBaseRequest",member="sourceConfiguration")`),
+        // and declares one union member per source
+        // (`smithy_query(query="shape",shape="SourceConfiguration")`).
+        match knowledge_base_type {
+            "EXTERNAL" => {
+                body["sourceConfiguration"] = json!({
+                    "appIntegrations": {
+                        "appIntegrationArn": format!(
+                            "arn:aws:app-integrations:{REGION}:{account}:data-integration/src",
+                            account = engine::EMULATOR_ACCOUNT_ID
+                        )
+                    }
+                });
+            }
+            "MANAGED" => {
+                body["sourceConfiguration"] = json!({
+                    "managedSourceConfiguration": {
+                        "webCrawlerConfiguration": {
+                            "urlConfiguration": {
+                                "seedUrls": [{ "url": "https://example.test/docs" }]
+                            }
+                        }
+                    }
+                });
+            }
+            _ => {}
+        }
         if let Some(kms_key_id) = kms_key_id {
             body["serverSideEncryptionConfiguration"] = json!({ "kmsKeyId": kms_key_id });
         }

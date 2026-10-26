@@ -148,9 +148,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing about an update depends on the request beyond its deserialized input:
-        // the channel's ARN, region and CreatedAt were decided when it was created.
-        let _ = ctx;
+        // The channel's ARN, its Region and its CreatedAt were decided when it was
+        // created; the request's own Region is what decides WHICH channel this update
+        // reaches, because MediaPackage is regional.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateChannelErrorModeled::InternalServerErrorException(InternalServerErrorException {
                 message: Some("the mediapackage state store is unavailable".into()),
@@ -158,9 +159,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
-        // An update changes a channel this service holds; there is nothing to update for
-        // an id it does not, so the target is resolved before the request is judged.
-        if !state.channels.contains_key(&input.id) {
+        // An update changes a channel this Region holds; there is nothing to update for
+        // an id it does not — including one only another Region holds, which this request
+        // must not reach — so the target is resolved before the request is judged.
+        if !state.has_channel(&region, &input.id) {
             return Err(crate::state::channel_not_found(&input.id).into());
         }
 
@@ -173,8 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let record = state
-            .channels
-            .get_mut(&input.id)
+            .channel_mut(&region, &input.id)
             .expect("the channel resolved above, under this one hold of the lock");
 
         // `PUT /channels/{Id}` carries the channel's updatable configuration, and

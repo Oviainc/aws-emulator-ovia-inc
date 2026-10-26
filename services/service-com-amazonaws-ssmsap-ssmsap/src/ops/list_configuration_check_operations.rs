@@ -184,37 +184,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let latest_per_check = input.list_mode != LIST_MODE_ALL_OPERATIONS;
 
         let filters = input.filters.unwrap_or_default();
-        // The bounds the model declares on `FilterList`, `FilterName` and `FilterValue`,
-        // re-stated before any filtering runs so the work this request does over the
-        // store is bounded by a check in this crate rather than by request size.
-        crate::state::filters_within_bounds(&filters)
-            .map_err(ListConfigurationCheckOperationsErrorModeled::ValidationException)?;
-        for filter in &filters {
-            if !FILTER_OPERATOR_VALUES.contains(&filter.operator.as_str()) {
-                return Err(
-                    ListConfigurationCheckOperationsErrorModeled::ValidationException(
-                        crate::state::validation(format!(
-                            "Filter Operator must be one of {}, but was {}",
-                            FILTER_OPERATOR_VALUES.join(", "),
-                            filter.operator
-                        )),
-                    )
-                    .into(),
-                );
-            }
-            if !crate::state::CONFIGURATION_CHECK_FILTER_NAMES.contains(&filter.name.as_str()) {
-                return Err(
-                    ListConfigurationCheckOperationsErrorModeled::ValidationException(
-                        crate::state::validation(format!(
-                            "Filter Name must be one of {}, but was {}",
-                            crate::state::CONFIGURATION_CHECK_FILTER_NAMES.join(", "),
-                            filter.name
-                        )),
-                    )
-                    .into(),
-                );
-            }
-        }
+        // The validation every filtered listing of this service shares: the bounds the
+        // model declares on `FilterList`, `FilterName` and `FilterValue` — re-stated
+        // before any filtering runs so the work this request does over the store is
+        // bounded by a check in this crate rather than by request size — then an
+        // operator the model declares and a `Name` this listing reports.
+        crate::state::validate_filters(
+            &filters,
+            crate::state::FilterOperators::Modelled,
+            crate::state::CONFIGURATION_CHECK_FILTER_NAMES,
+        )
+        .map_err(ListConfigurationCheckOperationsErrorModeled::ValidationException)?;
 
         let region_state = state.region(&region);
         // `ApplicationId` is required, so the listing is always scoped to ONE

@@ -126,6 +126,15 @@ pub fn targets_per_target_group(group: &TargetGroupRecord) -> usize {
     }
 }
 
+/// How many tags one Elastic Load Balancing resource carries before a tag write refuses
+/// with the modelled `TooManyTagsException`: the maximum number of tags per resource
+/// Elastic Load Balancing publishes in its tag restrictions (50), which applies to every
+/// taggable kind alike.
+///
+/// Tags live on the record of the resource they are on, so what the store holds for them
+/// is bounded by this times the resource quotas above.
+pub const TAGS_PER_RESOURCE: usize = 50;
+
 /// The ARN/endpoint namespace for this service (`sigv4Name` / `arnNamespace` in the
 /// model's `aws.api#service` trait).
 pub const SERVICE_NAMESPACE: &str = "elasticloadbalancing";
@@ -2482,6 +2491,24 @@ pub fn taggable_resource(arn: &str) -> Option<TaggableResource> {
     }
 }
 
+/// The message a tag operation answers the `NotFound` of `kind` with for an ARN this
+/// store holds no resource for.
+///
+/// Built from the request, like every other not-found message here: a tag call addresses
+/// each resource by the ARN the caller supplied, so that ARN is what the caller has to
+/// fix, quoted under the noun of the kind the ARN itself declares. One function for every
+/// tag operation, so a read and a write of the tags of one absent resource cannot be
+/// refused in different words.
+pub fn taggable_not_found_message(kind: TaggableResource, arn: &str) -> String {
+    match kind {
+        TaggableResource::LoadBalancer => load_balancer_not_found_message(arn),
+        TaggableResource::TargetGroup => format!("Target group '{arn}' not found"),
+        TaggableResource::Listener => listener_not_found_message(arn),
+        TaggableResource::Rule => rule_not_found_message(arn),
+        TaggableResource::TrustStore => format!("Trust store '{arn}' not found"),
+    }
+}
+
 /// The ARN segment AWS uses for each load balancer type: `app` for an Application
 /// Load Balancer, `net` for a Network Load Balancer, `gwy` for a Gateway Load
 /// Balancer. Both load balancer and listener ARNs carry it.
@@ -2593,6 +2620,29 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
             .or_else(|| self.listeners.get(arn).map(|record| &record.tags))
             .or_else(|| self.trust_stores.get(arn).map(|record| &record.tags))
             .or_else(|| self.rule_record(arn).map(|record| &record.tags))
+    }
+
+    /// The tags stored on the resource `arn` names, to WRITE, or `None` when this store
+    /// holds no resource with that ARN — the mutable half of [`Self::tags_of`], which a
+    /// tag write goes through.
+    ///
+    /// The kind the ARN itself declares picks the store to look in ([`taggable_resource`]),
+    /// so one lookup resolves the record and an ARN of no kind this service knows
+    /// resolves nothing to write to.
+    pub fn tags_of_mut(&mut self, arn: &str) -> Option<&mut HashMap<String, String>> {
+        match taggable_resource(arn)? {
+            TaggableResource::LoadBalancer => {
+                self.load_balancers.get_mut(arn).map(|rec| &mut rec.tags)
+            }
+            TaggableResource::TargetGroup => {
+                self.target_groups.get_mut(arn).map(|rec| &mut rec.tags)
+            }
+            TaggableResource::Listener => self.listeners.get_mut(arn).map(|rec| &mut rec.tags),
+            TaggableResource::TrustStore => {
+                self.trust_stores.get_mut(arn).map(|rec| &mut rec.tags)
+            }
+            TaggableResource::Rule => self.rule_record_mut(arn).map(|rec| &mut rec.tags),
+        }
     }
 
     /// Load balancers in a stable order (oldest first, ARN breaking ties), which is
@@ -2748,6 +2798,13 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
     pub fn rule_record(&self, arn: &str) -> Option<&RuleRecord> {
         let listener = self.listeners.get(&rule_listener_arn(arn)?)?;
         listener.rules.iter().find(|rule| rule.arn == arn)
+    }
+
+    /// The record of the rule `arn` names, to WRITE: the mutable half of
+    /// [`Self::rule_record`], resolved through the same one listener lookup.
+    pub fn rule_record_mut(&mut self, arn: &str) -> Option<&mut RuleRecord> {
+        let listener = self.listeners.get_mut(&rule_listener_arn(arn)?)?;
+        listener.rules.iter_mut().find(|rule| rule.arn == arn)
     }
 
     /// The rule `arn` names, or `None` when no listener in this store holds it.

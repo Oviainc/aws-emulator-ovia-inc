@@ -198,7 +198,10 @@ fn listed_providers(body: &str) -> Vec<ListedProvider> {
 
 /// The content of the first `<tag ...>` element of `body` and the text that follows its
 /// closing tag, or `None` when `body` carries no such element.
-fn split_element<'a>(body: &'a str, tag: &str) -> Option<(&'a str, &'a str)> {
+///
+/// `pub(crate)` because the shared leaf scan cannot read a list whose entries are
+/// STRUCTURES, so every listing suite in this crate narrows with this first.
+pub(crate) fn split_element<'a>(body: &'a str, tag: &str) -> Option<(&'a str, &'a str)> {
     let open = format!("<{tag}");
     let close = format!("</{tag}>");
     let start = body.find(&open)?;

@@ -41,16 +41,20 @@ use super::domain_lifecycle::{create_baseline, error_code, Answer, Emulator, PRE
 /// One row of the scheduled-change table: the action id, its type, its severity, how
 /// far from the base instant it is scheduled, its description, who scheduled it, its
 /// status, whether it is mandatory and whether it is cancellable.
-struct Row {
-    id: &'static str,
-    action_type: &'static str,
-    severity: &'static str,
-    offset: i64,
-    description: Option<&'static str>,
-    scheduled_by: &'static str,
-    status: &'static str,
-    mandatory: bool,
-    cancellable: bool,
+///
+/// Visible to the crate's other suites because this table is the ONE set of seeded
+/// scheduled changes these tests drive: `super::scheduled_action_updates` re-times
+/// these same records rather than seeding a second table beside them.
+pub(crate) struct Row {
+    pub(crate) id: &'static str,
+    pub(crate) action_type: &'static str,
+    pub(crate) severity: &'static str,
+    pub(crate) offset: i64,
+    pub(crate) description: Option<&'static str>,
+    pub(crate) scheduled_by: &'static str,
+    pub(crate) status: &'static str,
+    pub(crate) mandatory: bool,
+    pub(crate) cancellable: bool,
 }
 
 /// The scheduled changes every case below is asserted over.
@@ -64,7 +68,7 @@ struct Row {
 /// `ACTION_SEVERITY_VALUES`, `ACTION_STATUS_VALUES` and `SCHEDULED_BY_VALUES`
 /// (asserted below) — and `alpha-tie` is scheduled for the SAME instant as
 /// `ssu-pending`, so the order of two changes that fall together is exercised too.
-fn rows() -> Vec<Row> {
+pub(crate) fn rows() -> Vec<Row> {
     vec![
         Row {
             id: "ssu-pending",
@@ -160,7 +164,7 @@ const EXPECTED_ORDER: [&str; 7] = [
 
 /// The instant the offsets of [`rows`] are measured from, rounded down to the second
 /// so the millisecond count a case computes for itself is exact.
-fn base_instant() -> SystemTime {
+pub(crate) fn base_instant() -> SystemTime {
     let since = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("the test clock is after the epoch");
@@ -169,7 +173,7 @@ fn base_instant() -> SystemTime {
 
 /// `base` as an epoch-millisecond count, computed here rather than taken from the
 /// emulator, so a case asserts the UNIT of `ScheduledTime` and not just its value.
-fn base_millis(base: SystemTime) -> i64 {
+pub(crate) fn base_millis(base: SystemTime) -> i64 {
     i64::try_from(
         base.duration_since(UNIX_EPOCH)
             .expect("the test clock is after the epoch")
@@ -199,7 +203,7 @@ fn stored(row: &Row, base: SystemTime) -> ScheduledChange {
 }
 
 /// Put the whole [`rows`] table into `name`'s store entry, measured from `base`.
-fn seed(emulator: &Emulator, name: &str, base: SystemTime) {
+pub(crate) fn seed(emulator: &Emulator, name: &str, base: SystemTime) {
     let store = emulator.store();
     let mut guard = store.lock();
     let domain = guard

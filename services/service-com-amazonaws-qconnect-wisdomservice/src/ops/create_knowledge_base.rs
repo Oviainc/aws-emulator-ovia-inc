@@ -7,6 +7,12 @@
 //! answers with the knowledge base that token already created; a second live knowledge
 //! base under one name is the conflict `ConflictException` describes.
 //!
+//! A knowledge base whose type names a source outside this service
+//! (`crate::state::SOURCED_KNOWLEDGE_BASE_TYPES`) cannot be created without a
+//! `sourceConfiguration`: the model documents that member as the source of exactly those
+//! types, so a create of one that carries none describes no content at all and is refused
+//! with the modelled `ValidationException` (HTTP 400).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -186,6 +192,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(&ctx.parts().headers);
         let mut store = state.lock();
+
+        // A knowledge base of a type whose content comes from OUTSIDE this service is
+        // that source: created without a `sourceConfiguration` it would describe no
+        // content at all, so the create is refused rather than stored. Which types those
+        // are is the model's own
+        // (`crate::state::SOURCED_KNOWLEDGE_BASE_TYPES`), and the refusal states the type
+        // the request named. It depends on nothing in the store, so it is decided before
+        // anything else this handler reads.
+        if crate::state::requires_source_configuration(&input.knowledge_base_type)
+            && input.source_configuration.is_none()
+        {
+            return Err(CreateKnowledgeBaseErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::message_source_configuration_required(
+                        &input.knowledge_base_type,
+                    )),
+                },
+            )
+            .into());
+        }
 
         // A replayed `@idempotencyToken` answers with the knowledge base it already
         // created rather than creating a second one. The token is scoped to this

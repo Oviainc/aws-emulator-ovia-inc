@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes the tag keys the request names from a stored resource, resolved from the ARN
+//! in the path. The request is checked and resolved in exactly the order its sibling
+//! `TagResource` uses, because the two share one rule: the tag KEYS are checked first of
+//! all — they are an input constraint, and a request whose input is malformed is refused
+//! before any resource is resolved, so a bad key on an ARN that names nothing answers the
+//! modelled `ValidationException` (HTTP 400) rather than a not-found. The ARN's resource
+//! path is parsed next: an ARN that is not a connect-campaigns campaign is refused with
+//! the code the service answers for an unresolvable resource path (`BadRequestException`,
+//! HTTP 400) before anything is looked up; a campaign ARN that matches no stored campaign
+//! is `NotFoundException` (HTTP 404). Both codes are the RECORDED wire codes, which differ
+//! from the model's shape names — see `crate::state::TAG_NOT_FOUND_CODE` and
+//! `crate::scaffolded::WireCoded`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removal is by key alone and is IDEMPOTENT, as the operation's `@idempotent` trait
+//! says: a key the resource holds goes whatever value it carried, a key it does not hold
+//! leaves the map as it was, and the keys the request does not name are untouched. The
+//! map written here is the one `ListTagsForResource` / `DescribeCampaign` read back, so
+//! there is one tag map per resource and no reader reports a tag this call removed.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +177,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // The keys are checked FIRST, as on the tagging path: they are an input
+        // constraint, and a request whose input is malformed is refused before any
+        // resource is resolved. The centralized walk does not reach a tag key's
+        // `@pattern` — its leading negative lookahead is one the pattern engine cannot
+        // compile, so it treats it as matching — so the key shape's bounds are enforced
+        // here, against the same rule `TagResource` and `CreateCampaign` hold keys to.
+        if let Some(message) = crate::state::tag_key_list_violation("tagKeys", &input.tag_keys) {
+            return Err(UntagResourceErrorModeled::ValidationException(ValidationException {
+                message,
+                x_amz_error_type: None,
+            })
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the ConnectCampaignsV2 campaign store is unavailable".to_string(),
+                    x_amz_error_type: None,
+                },
+            )
+            .into());
+        };
+
+        // The ARN is resolved in the region this request was signed for: a campaign is
+        // only this endpoint's to untag when it was created through it. The resource
+        // path is parsed before anything is looked up, so an ARN this service mints no
+        // resource under is a bad request rather than a missing resource — both
+        // refusals live with the resolution step in `crate::state`.
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+        let campaign = store.tagged_campaign_mut(&region, &input.arn)?;
+
+        // Removal is by key: a key the campaign holds goes whatever value it carried, a
+        // key it does not hold leaves the map as it was — the operation is idempotent —
+        // and a key the request does not name is left alone.
+        for key in &input.tag_keys {
+            campaign.tags.remove(key);
+        }
+
+        Ok(UntagResourceOutput)
     }
 }

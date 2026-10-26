@@ -135,7 +135,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // MediaPackage is regional: a delete reaches only the endpoints of the Region its
+        // own request is served in, so an id another Region holds is missing here rather
+        // than destroyed.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteOriginEndpointErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -145,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
-        if state.origin_endpoints.remove(&input.id).is_none() {
+        if state.remove_origin_endpoint(&region, &input.id).is_none() {
             return Err(crate::state::origin_endpoint_not_found(&input.id).into());
         }
         Ok(DeleteOriginEndpointOutput {})

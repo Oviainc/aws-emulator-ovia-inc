@@ -71,13 +71,13 @@ impl ProviderCase {
 /// A 40-character hex thumbprint — "the hex-encoded SHA-1 hash value of the X.509
 /// certificate" is 40 characters, which is also the length `thumbprintType` declares
 /// (len 40..40).
-fn thumbprint(seed: u32) -> String {
+pub(crate) fn thumbprint(seed: u32) -> String {
     format!("{seed:040x}")
 }
 
 /// `seed` client IDs, distinct so the order the read reports can be checked. "There is no
 /// defined format for a client ID" (`CreateOpenIDConnectProvider$ClientIDList`).
-fn client_ids(count: usize) -> Vec<String> {
+pub(crate) fn client_ids(count: usize) -> Vec<String> {
     (0..count).map(|index| format!("audience-{index}")).collect()
 }
 
@@ -123,7 +123,7 @@ fn provider_cases() -> Vec<ProviderCase> {
 /// An OIDC provider ARN is `arn:aws:iam::<account>:oidc-provider/<url without its
 /// scheme>` — IAM is global, so the region segment is EMPTY, and the provider is named by
 /// its URL.
-fn expected_arn(url: &str) -> String {
+pub(crate) fn expected_arn(url: &str) -> String {
     format!(
         "arn:aws:iam::{}:oidc-provider/{}",
         account_id(),
@@ -133,7 +133,7 @@ fn expected_arn(url: &str) -> String {
 
 /// The ISSUER form of a URL: the URL with its `https://` scheme removed, which is what a
 /// provider is stored and reported under (and the resource portion of its ARN).
-fn issuer_of(url: &str) -> &str {
+pub(crate) fn issuer_of(url: &str) -> &str {
     url.strip_prefix("https://")
         .expect("every fixture URL carries the scheme the model requires")
 }

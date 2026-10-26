@@ -2391,8 +2391,12 @@ pub fn region_from_request(parts: &::http::request::Parts) -> String {
 /// The `EntityDoesNotExistException` message for an id that names no stored snapshot.
 /// Shared so every operation that resolves a snapshot says the same thing about the
 /// same failure.
+///
+/// Directory Service words this one as the kind of entity, a colon, the id the request
+/// asked for and "does not exist" — so the message is built from the request and names
+/// what the caller has to fix, and nothing else. [`refusal`] appends the request id.
 pub fn no_such_snapshot(snapshot_id: &str) -> String {
-    format!("Snapshot {snapshot_id} does not exist")
+    format!("Snapshot: {snapshot_id} does not exist")
 }
 
 /// The `EntityDoesNotExistException` message for an id that names no stored trust

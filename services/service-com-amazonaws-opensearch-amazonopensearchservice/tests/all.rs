@@ -51,6 +51,8 @@ mod instance_type_limits;
 mod package_association_listings;
 #[path = "all/package_associations.rs"]
 mod package_associations;
+#[path = "all/package_dissociation.rs"]
+mod package_dissociation;
 #[path = "all/package_listing_page_bounds.rs"]
 mod package_listing_page_bounds;
 #[path = "all/package_registry.rs"]
@@ -63,6 +65,8 @@ mod reserved_instance_offerings;
 mod reserved_instances;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/scheduled_action_updates.rs"]
+mod scheduled_action_updates;
 #[path = "all/scheduled_actions.rs"]
 mod scheduled_actions;
 #[path = "all/service_software_rollback.rs"]

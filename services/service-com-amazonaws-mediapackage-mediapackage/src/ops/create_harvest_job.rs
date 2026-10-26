@@ -265,6 +265,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut state = state.lock();
+        // MediaPackage is regional: this job belongs to the Region this request is served
+        // in, and the endpoint it names resolves only among that Region's records.
+        let region = crate::state::request_region(ctx.parts());
         // The clock, not this call, moves a submitted job's status: materialise first
         // what was already due, so the duplicate-id rule below and the response are
         // decided against the jobs as the clock has left them.
@@ -272,11 +275,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle_harvest_jobs(now);
 
         // A HarvestJob harvests ONE origin endpoint: an `OriginEndpointId` naming no
-        // stored endpoint has nothing to harvest, so the job is not created. This is a
-        // value in the REQUEST the caller has to fix — not a resource the request
-        // addressed — so it is `UnprocessableEntityException` (422) keyed by the member,
-        // exactly as `CreateOriginEndpoint` answers an unresolvable `channelId`.
-        let Some(endpoint) = state.origin_endpoints.get(&input.origin_endpoint_id) else {
+        // stored endpoint OF THIS REGION has nothing to harvest, so the job is not
+        // created. This is a value in the REQUEST the caller has to fix — not a resource
+        // the request addressed — so it is `UnprocessableEntityException` (422) keyed by
+        // the member, exactly as `CreateOriginEndpoint` answers an unresolvable
+        // `channelId`.
+        let Some(endpoint) = state.origin_endpoint(&region, &input.origin_endpoint_id) else {
             return Err(crate::state::member_not_found("originEndpointId").into());
         };
         // A harvest exports content the endpoint has ALREADY published, which an endpoint
@@ -293,9 +297,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let channel_id = endpoint.channel_id.clone();
 
         // "The ID must be unique within the region and it cannot be changed after the
-        // HarvestJob is submitted": a second submit on an id already in use is refused,
-        // never an overwrite.
-        if state.harvest_jobs.contains_key(&input.id) {
+        // HarvestJob is submitted": a second submit on an id already in use in this
+        // Region is refused, never an overwrite.
+        if state.has_harvest_job(&region, &input.id) {
             return Err(crate::state::resource_already_exists(
                 crate::state::HARVEST_JOB_KIND,
                 &input.id,
@@ -304,7 +308,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The store lives for the life of the process and only a submit adds to it, so it
-        // is capped by entry count; past the cap the resource limit is reported.
+        // is capped by entry count — across every Region, because the memory the process
+        // holds is the sum of them; past the cap the resource limit is reported.
         if state.harvest_jobs.len() >= crate::state::MAX_HARVEST_JOBS {
             return Err(crate::state::resource_limit_reached(
                 crate::state::HARVEST_JOB_KIND,
@@ -313,9 +318,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let region = crate::state::request_region(ctx.parts());
         let record = crate::state::HarvestJobRecord {
             id: input.id.clone(),
+            region: region.clone(),
             arn: crate::state::harvest_job_arn(&region, &input.id),
             channel_id,
             origin_endpoint_id: input.origin_endpoint_id.clone(),
@@ -334,11 +339,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `insert` + the read back below: the record returned is always the STORED one,
         // and the id is free (refused as a duplicate above), so nothing is replaced.
         let id = input.id.clone();
-        state.harvest_jobs.insert(id.clone(), record);
+        state.insert_harvest_job(record);
         let stored = state
-            .harvest_jobs
-            .get(&id)
-            .expect("the record just inserted under this id");
+            .harvest_job(&region, &id)
+            .expect("the record just inserted under this region and id");
 
         // Rendered from the STORED record, so this response and every later
         // DescribeHarvestJob/ListHarvestJobs are the same bytes.

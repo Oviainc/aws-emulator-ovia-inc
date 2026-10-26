@@ -287,6 +287,12 @@ pub const MAX_THUMBPRINTS_PER_OPEN_ID_CONNECT_PROVIDER: usize = 5;
 /// growing without end.
 pub const MAX_OPEN_ID_CONNECT_PROVIDERS_PER_ACCOUNT: usize = 100;
 
+/// The name that stands for EVERY OIDC provider in the account, so
+/// [`open_id_connect_provider_arn`] builds the ARN of the provider collection rather than
+/// of one provider. An operation that names no provider is authorized on that collection,
+/// and a refusal names it, because the request is about all of them.
+pub const ANY_OPEN_ID_CONNECT_PROVIDER: &str = "*";
+
 /// How many SAML 2.0 identity providers one account may hold. AWS's "IAM and STS
 /// quotas" page gives the quota "SAML providers in an account: 100", and a create past
 /// it is refused with `LimitExceededException`, whose documentation says "the error
