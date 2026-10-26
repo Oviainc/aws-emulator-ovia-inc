@@ -173,6 +173,13 @@ impl ApiCacheRecord {
         self.status = CACHE_AVAILABLE.to_string();
     }
 
+    /// Whether the instance has finished being provisioned, i.e. carries the status
+    /// that reports it "available for use" ([`CACHE_AVAILABLE`]) rather than one of the
+    /// statuses in which the service is still working on it.
+    pub fn is_available(&self) -> bool {
+        self.status == CACHE_AVAILABLE
+    }
+
     /// Discard every entry the cache holds, as of `now`.
     ///
     /// The instance itself is untouched — its settings and the status it is in are
@@ -1789,6 +1796,12 @@ pub const CACHE_NOT_FOUND_MESSAGE: &str =
 /// already holds a cache: an API holds at most one.
 pub const CACHE_ALREADY_EXISTS_MESSAGE: &str =
     "The API already has a cache. Delete the existing cache before creating another one.";
+
+/// The text `BadRequestException` (HTTP 400) carries for a delete of a cache that is
+/// not [`CACHE_AVAILABLE`]: one sentence for the whole not-deletable class, naming
+/// neither the API nor the status the instance is in.
+pub const CACHE_NOT_DELETABLE_MESSAGE: &str =
+    "Cannot delete cache as it is either not available or its creation failed.";
 
 /// The `DataSourceType` of an HTTP endpoint, the one type whose need for a service
 /// role depends on how the endpoint is authorized ([`data_source_needs_service_role`]).
