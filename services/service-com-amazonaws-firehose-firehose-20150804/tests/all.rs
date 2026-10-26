@@ -15,6 +15,8 @@
 mod argument_validation;
 #[path = "all/cloudwatch_logs_source_gate.rs"]
 mod cloudwatch_logs_source_gate;
+#[path = "all/constraint_refusal_precedes_state.rs"]
+mod constraint_refusal_precedes_state;
 #[path = "all/delivery_stream_encryption.rs"]
 mod delivery_stream_encryption;
 #[path = "all/delivery_stream_lifecycle.rs"]

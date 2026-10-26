@@ -38,7 +38,10 @@ fn one_error(clause: String) -> String {
 
 /// The clause for a value that was supplied and rejected: the member and the
 /// constraint, and nothing of the value.
-fn value_at(member: &str, requirement: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite asserting a constraint refusal words it the same way
+/// rather than carrying a second copy of the sentence.
+pub(crate) fn value_at(member: &str, requirement: &str) -> String {
     one_error(format!(
         "Value at '{member}' failed to satisfy constraint: {requirement}"
     ))
@@ -46,7 +49,9 @@ fn value_at(member: &str, requirement: &str) -> String {
 
 /// The clause for a required member that was absent: there was no value at all, so the
 /// null the request held is what is reported.
-fn null_at(member: &str) -> String {
+///
+/// `pub(crate)` beside [`value_at`], for the same reason.
+pub(crate) fn null_at(member: &str) -> String {
     one_error(format!(
         "Value null at '{member}' failed to satisfy constraint: Member must not be null"
     ))

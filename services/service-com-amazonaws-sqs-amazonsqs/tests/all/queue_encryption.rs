@@ -36,6 +36,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::support::{as_map, error_code, REGION};
 
+// The sentence KMS itself words for a request addressing a resource through an ARN that
+// names no account, asked of the KMS crate so a test cannot re-word it.
+use ::service_com_amazonaws_kms_trentservice::state::unauthorized_account_message as kms_unauthorized_account_message;
+
 /// The three attributes that describe a queue's server-side encryption, which is the
 /// slice each projection row asserts over — so a row states the whole encryption the
 /// queue reports, not just the attribute it set.
@@ -1019,6 +1023,102 @@ async fn a_queue_whose_kms_key_cannot_serve_a_call_refuses_it() {
     ];
 
     drive(&emulator, "keyless", &rows).await;
+}
+
+/// A `KmsMasterKeyId` that has the shape of a KMS key ARN but whose account segment is not
+/// an account id names no account at all, so no account's permission can cover the key it
+/// addresses: KMS refuses such a request for want of permission BEFORE resolving the
+/// resource, and Amazon SQS relays that authorization failure — not a missing-key refusal —
+/// to both sides of the message plane.
+///
+/// The account segment is judged by form, so the table spans the ways a segment can fail to
+/// be one (`AccountIdType` is `@length(12, 12)` with `@pattern(^[0-9]{12}$)`) rather than
+/// one example, and the sentence asserted is the one KMS itself words for the operation the
+/// call performs.
+#[tokio::test]
+async fn a_queue_key_arn_whose_account_segment_names_no_account_relays_the_denial() {
+    let emulator = Emulator::new();
+    // A key that DOES exist, so what the rows below differ in is only the account segment
+    // of the ARN they address it through.
+    let (key_id, arn) = emulator.create_key(json!({})).await;
+
+    // (case, the account segment the ARN carries)
+    let segments: Vec<(&'static str, String)> = vec![
+        ("a word", "not-an-account".to_string()),
+        ("one digit short", "0".repeat(11)),
+        ("one digit long", "0".repeat(13)),
+        ("twelve characters, one of them a letter", format!("{}a", "0".repeat(11))),
+        ("a wildcard", "*".to_string()),
+        ("whitespace", " ".repeat(12)),
+    ];
+
+    let rows: Vec<GateRow> = segments
+        .iter()
+        .map(|(case, account)| GateRow {
+            case,
+            master_key_id: Some(format!("arn:aws:kms:{REGION}:{account}:key/{key_id}")),
+            access_key_id: ACCOUNT_KEY.to_string(),
+            // Not `KmsNotFound`: the key was never looked up.
+            send_refused_with: Some("KmsAccessDenied"),
+            receive_refused_with: Some("KmsAccessDenied"),
+        })
+        .collect();
+    drive(&emulator, "accountless", &rows).await;
+
+    // The relayed sentence is KMS's own for the KMS operation the call performs — a send
+    // generates a data key, a receive decrypts one — naming the identifier the request
+    // carried. Asked of KMS rather than re-worded here, so the two cannot drift apart.
+    let addressed = format!("arn:aws:kms:{REGION}:not-an-account:key/{key_id}");
+    let url = emulator
+        .queue("accountless-message", &json!({"KmsMasterKeyId": addressed}))
+        .await;
+    for (operation, body, kms_operation) in [
+        (
+            "SendMessage",
+            json!({"QueueUrl": url, "MessageBody": "sealed"}),
+            "GenerateDataKey",
+        ),
+        (
+            "ReceiveMessage",
+            json!({"QueueUrl": url, "MaxNumberOfMessages": 1}),
+            "Decrypt",
+        ),
+    ] {
+        let (status, refused) = emulator.sqs(ACCOUNT_KEY, operation, &body).await;
+        let expected = kms_unauthorized_account_message(kms_operation, &addressed);
+        let message = refused
+            .get("message")
+            .or_else(|| refused.get("Message"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(
+            status, 400,
+            "case {operation}: expected the relayed denial, got {status} with {refused}"
+        );
+        // The relay is KMS's sentence followed by the metadata block an AWS error carries,
+        // whose request id is minted per call — so the sentence is the prefix, and the
+        // block is checked for the code it reports rather than compared whole.
+        assert!(
+            message.starts_with(&expected),
+            "case {operation}: expected the message to open with {expected:?}, got {message:?}"
+        );
+        assert!(
+            message.contains("AccessDeniedException"),
+            "case {operation}: expected the relayed KMS error code, got {message:?}"
+        );
+    }
+
+    // The same key, addressed through an ARN that DOES name an account, is the account's
+    // own key again: the denial is a property of the identifier, not of the key.
+    let url = emulator
+        .queue("accounted-message", &json!({"KmsMasterKeyId": arn.clone()}))
+        .await;
+    let (status, code) = emulator.send(ACCOUNT_KEY, &url, "sealed").await;
+    assert_eq!(
+        (status, code.as_str()),
+        (200, "<no __type>"),
+        "the key's own ARN ({arn}) must serve the send"
+    );
 }
 
 /// A producer needs the data key generation grant on the queue's key and a consumer the

@@ -42,7 +42,10 @@ fn must_match_tag_key_pattern() -> String {
 
 /// The message a refusal of the tag key at the NAMED member `member` states: the one
 /// constraint the key violated, at the member's own dotted path.
-fn pattern_refusal(member: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite asserting the same refusal words it the same way
+/// rather than carrying a second copy of the sentence.
+pub(crate) fn pattern_refusal(member: &str) -> String {
     format!(
         "1 validation error detected: Value at '{member}' failed to satisfy constraint: {}",
         must_match_tag_key_pattern()
@@ -53,7 +56,9 @@ fn pattern_refusal(member: &str) -> String {
 /// list member, and the whole constraint set its elements carry (`TagKey` is
 /// `@length(1..128)` as well as patterned), because an element has no member name of its
 /// own to report one constraint at.
-fn element_refusal(member: &str) -> String {
+///
+/// `pub(crate)` beside [`pattern_refusal`], for the same reason.
+pub(crate) fn element_refusal(member: &str) -> String {
     format!(
         "1 validation error detected: Value at '{member}' failed to satisfy constraint: \
          Member must satisfy constraint: [Member must have length less than or equal to \
