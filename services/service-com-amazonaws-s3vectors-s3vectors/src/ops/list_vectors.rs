@@ -185,7 +185,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListVectorsErrorModeled::ServiceUnavailableException(
                 ServiceUnavailableException {
@@ -216,8 +215,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // Who the request speaks for, resolved before this service's own store is
+        // locked, so only one store is ever held at a time.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
         let store = state.lock();
         let index = store.index(&bucket_name, &index_name).map_err(refusal)?;
+
+        // The vector bucket's own resource policy decides this call before it reads
+        // anything: an explicit Deny of the action refuses it. Listing vector KEYS is
+        // this operation's own permission, while "if you set returnData or returnMetadata
+        // to true, you must have both s3vectors:ListVectors and s3vectors:GetVectors
+        // permissions", so a request that asks for either also stands on GetVectors.
+        let mut operations = vec![Self::NAME];
+        if input.return_data || input.return_metadata {
+            operations.push(crate::state::authorization::GET_VECTORS_OPERATION);
+        }
+        if let Some(message) = store
+            .authorization_target(&bucket_name, Some(&index_name))
+            .map_err(refusal)?
+            .refusal(&caller, &operations)
+        {
+            return Err(ListVectorsErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
 
         // The segments partition the index: every vector belongs to exactly one, by
         // its position in stored order, so listing all `segmentCount` segments lists

@@ -5,9 +5,10 @@
 //! RULE under test: a response with no body states its length — `content-length: 0` —
 //! rather than leaving the framing header off; a response that carries a body is framed
 //! from the body it carries. Every operation whose output is `Unit` answers with no
-//! body (`smithy_query(query="digest")`: the deletes at HTTP 204), so the rule is
+//! body (`smithy_query(query="digest")`), so the rule is
 //! asserted over each implemented one of them rather than over the one operation a
-//! recording happened to cover.
+//! recording happened to cover. WHICH STATUS each of them answers is a separate
+//! question, pinned in `tests/all/empty_result_statuses.rs`.
 //!
 //! The last case serves the router on a real socket, where the framing the service
 //! states is not the last word: see its own note.
@@ -56,13 +57,15 @@ async fn an_answer_with_no_body_states_its_length() {
     // Rows: one per implemented operation whose output is `Unit`, each reached after
     // the state it deletes was created, and each in the two shapes its resource comes
     // in — a schema deleted from a registry of its own, and the registry itself.
-    // `DeleteResourcePolicy` and `TagResource` are the same 204 in the
-    // model but are still scaffold stubs (each has its own stub issue), so they answer
-    // 501 with a body and are not rows here. `DeleteSchemaVersion` is implemented and
+    // `TagResource` is the same 204 in the
+    // model but is still a scaffold stub (it has its own stub issue), so it answers
+    // 501 with a body and is not a row here. `DeleteSchemaVersion` is implemented and
     // its own suite (`schema_version_deletion.rs`) carries its framing row, because the
     // version it deletes has to be minted first; `UntagResource` is implemented and its
     // own suite (`resource_tag_removal.rs`) carries its framing row for the same reason —
-    // the tag it removes has to be written first.
+    // the tag it removes has to be written first. `DeleteResourcePolicy` answers with no
+    // body too, but at 200 rather than 204, and its row lives with the other statuses in
+    // `empty_result_statuses.rs`.
     for (case, registry, schemas) in [
         ("one schema", "framing-one", vec!["only-schema"]),
         (
@@ -167,12 +170,13 @@ async fn an_empty_answer_on_the_wire_carries_the_status_and_no_body() {
 }
 
 /// One request written straight onto a socket, with everything the server answered
-/// read back as text.
+/// read back as text. Shared with the sibling suite that pins the STATUS a bodiless
+/// answer carries (`empty_result_statuses.rs`), so one socket exchange serves both.
 ///
 /// `connection: close` so the server closes the socket after answering and the read
 /// below terminates on EOF rather than on a parse of the framing this very case is
 /// about.
-fn raw_request(port: u16, method: &str, path: &str) -> String {
+pub(crate) fn raw_request(port: u16, method: &str, path: &str) -> String {
     use std::io::{Read, Write};
 
     let mut stream =

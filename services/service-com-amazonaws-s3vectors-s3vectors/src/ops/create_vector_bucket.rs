@@ -169,8 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(refusal)?;
         // The `aws:` tag-key namespace is AWS's own wherever a caller names tags.
         if let Some(tags) = input.tags.as_ref() {
-            crate::state::validate_tag_keys("tags", tags.keys().map(String::as_str))
-                .map_err(refusal)?;
+            crate::state::validate_tag_keys(tags.keys().map(String::as_str)).map_err(refusal)?;
         }
         let encryption = crate::state::encryption_record(
             input.encryption_configuration.as_ref(),

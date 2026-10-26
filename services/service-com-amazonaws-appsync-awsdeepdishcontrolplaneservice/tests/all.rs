@@ -53,6 +53,8 @@ mod graphql_api_create_rules;
 mod graphql_api_lifecycle;
 #[path = "all/graphql_api_update.rs"]
 mod graphql_api_update;
+#[path = "all/merged_api_disassociation.rs"]
+mod merged_api_disassociation;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/source_api_association.rs"]

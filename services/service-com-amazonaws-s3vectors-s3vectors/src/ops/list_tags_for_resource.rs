@@ -82,11 +82,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3vectors-s3vectors.jso
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.s3vectors#ListTagsForResource",
-    extra_errors = ["ValidationException"]
+    extra_errors = ["ValidationException", "AccessDeniedException"]
 )]
 #[derive(Debug)]
 pub enum ListTagsForResourceErrorModeled {
     ValidationException(ValidationException),
+    AccessDeniedException(AccessDeniedException),
     NotFoundException(NotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
 }
@@ -142,9 +143,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A pure read: the resource is named by an ARN, so nothing here depends on
-        // request metadata, and nothing is written.
-        let _ = ctx;
+        // A pure read: the resource is named by an ARN, so nothing about the tags it
+        // reports depends on request metadata, and nothing is written.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::ServiceUnavailableException(
                 ServiceUnavailableException {
@@ -154,10 +154,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Who the request speaks for, resolved before this service's own store is
+        // locked, so only one store is ever held at a time.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
         let store = state.lock();
         let arn = store
             .tagged_resource_arn("resourceArn", &input.resource_arn)
             .map_err(refusal)?;
+
+        // The resource policy of the vector bucket the ARN names — the bucket itself, or
+        // the bucket of the index it names — decides this call before it reports
+        // anything: an explicit Deny of the action refuses it.
+        if let Some(message) = store
+            .authorization_target_for_arn("resourceArn", &input.resource_arn)
+            .map_err(refusal)?
+            .refusal(&caller, &[Self::NAME])
+        {
+            return Err(ListTagsForResourceErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
         // `tags` is a required output member, so a resource carrying none reports an
         // EMPTY map rather than an absent one.
         let tags = store
