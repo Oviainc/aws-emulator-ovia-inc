@@ -14,7 +14,7 @@
 //! 2. The selected timestamp decides the schema and the TTL settings: a restore
 //!    reproduces the revision of them that was in effect at `restoreTimestamp`, and the
 //!    current one when the request names no timestamp.
-//! 3. The restore is asynchronous: the restored table is `CREATING` from the moment the
+//! 3. The restore is asynchronous: the restored table is `RESTORING` from the moment the
 //!    call is accepted until the clock owes it `ACTIVE`.
 //! 4. A request outside that contract is refused with the error the model declares for
 //!    it, and the refusal creates no table — including a `restoreTimestamp` outside the
@@ -28,8 +28,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_keyspaces_keyspacesservice::state as keyspaces;
 
 use super::keyspace_table_lifecycle::{
-    assert_failure, assert_ok, epoch_seconds, error_code, minimal_schema, settle_wait, table_arn,
-    Emulator, REGION,
+    assert_failure, assert_ok, ensure_keyspace, epoch_seconds, minimal_schema, settle_wait,
+    table_arn, Emulator, REGION,
 };
 
 /// A KMS key ARN for the `CUSTOMER_MANAGED_KMS_KEY` rows — the form
@@ -48,18 +48,6 @@ const TARGET_KEYSPACE: &str = "restore_tgt_ks";
 /// not carry it.
 fn at(body: &Value, path: &str) -> Value {
     body.pointer(path).cloned().unwrap_or(Value::Null)
-}
-
-/// Create a keyspace, ignoring a name already taken so a suite can call it per case.
-async fn ensure_keyspace(emulator: &Emulator, name: &str) {
-    let (status, body) = emulator
-        .call("CreateKeyspace", json!({"keyspaceName": name}))
-        .await;
-    assert!(
-        status == 200 || error_code(&body) == "ConflictException",
-        "case {name:?}: expected the keyspace to be created or to already exist, got \
-         {status} {body}"
-    );
 }
 
 /// Create `table` in `keyspace` from `request` (the names and a default schema are
@@ -424,7 +412,7 @@ fn cases() -> Vec<Case> {
 
 /// RULE 1 and RULE 3: a restore creates the target table out of the source table's
 /// settings and the request's overrides, answers with that table's ARN, leaves the source
-/// table untouched, and the created table is `CREATING` until the clock settles it.
+/// table untouched, and the created table is `RESTORING` until the clock settles it.
 #[tokio::test]
 async fn restore_creates_the_target_table_from_the_source_settings_and_the_overrides() {
     let emulator = Emulator::start();
@@ -455,13 +443,13 @@ async fn restore_creates_the_target_table_from_the_source_settings_and_the_overr
 
         // RULE 3: the restore is asynchronous, so the table it created is in the
         // transient status first and `ACTIVE` once the clock owes it.
-        let creating = get_table(&emulator, TARGET_KEYSPACE, &target_table).await;
+        let restoring = get_table(&emulator, TARGET_KEYSPACE, &target_table).await;
         assert_eq!(
-            creating["status"],
-            json!(keyspaces::TABLE_STATUS_CREATING),
-            "case {:?}: expected the restored table to be {}, got {creating}",
+            restoring["status"],
+            json!(keyspaces::TABLE_STATUS_RESTORING),
+            "case {:?}: expected the restored table to be {}, got {restoring}",
             case.name,
-            keyspaces::TABLE_STATUS_CREATING
+            keyspaces::TABLE_STATUS_RESTORING
         );
 
         // RULE 1: the source table is a source, not a resource the restore changed.
@@ -1143,7 +1131,7 @@ async fn restores_past_the_concurrent_limit_are_the_modelled_quota_failure() {
     )
     .await;
 
-    // Back to back, so every one of them is still `CREATING` when the next arrives.
+    // Back to back, so every one of them is still `RESTORING` when the next arrives.
     for index in 0..keyspaces::MAX_CONCURRENT_RESTORES {
         let case = format!("concurrent_{index}");
         assert_ok(
