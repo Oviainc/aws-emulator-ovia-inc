@@ -27,7 +27,7 @@ use crate::wire::{call, error_code, error_message, medialive, ACCOUNT};
 /// `CancelInputDeviceTransfer` on one device (`smithy_query(query="operation",
 /// operation="CancelInputDeviceTransfer")`: POST
 /// /prod/inputDevices/{InputDeviceId}/cancel).
-async fn cancel(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+pub(crate) async fn cancel(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(
         router,
         "POST",

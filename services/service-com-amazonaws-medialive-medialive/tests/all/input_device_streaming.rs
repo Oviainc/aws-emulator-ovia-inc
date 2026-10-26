@@ -24,7 +24,7 @@ use crate::wire::{call, error_code, error_message, medialive};
 
 /// `StopInputDevice`'s binding (`smithy_query(query="operation",
 /// operation="StopInputDevice")`: POST /prod/inputDevices/{InputDeviceId}/stop).
-async fn stop_device(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+pub(crate) async fn stop_device(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(
         router,
         "POST",
@@ -37,7 +37,7 @@ async fn stop_device(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
 /// `StartInputDevice`'s binding (`smithy_query(query="operation",
 /// operation="StartInputDevice")`: POST
 /// /prod/inputDevices/{InputDeviceId}/start).
-async fn start_device(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+pub(crate) async fn start_device(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(
         router,
         "POST",
@@ -48,8 +48,12 @@ async fn start_device(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
 }
 
 /// The one command a row of the state table issues.
+///
+/// `pub(crate)` so the suite that holds the run state against the device's OTHER
+/// writers ([`crate::input_device_run_state_independence`]) issues it through the
+/// same helpers rather than keeping a second copy of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Command {
+pub(crate) enum Command {
     Start,
     Stop,
 }
@@ -57,7 +61,7 @@ enum Command {
 /// Issue `command` against the device `id`, asserting it succeeded with the
 /// empty body its response shape models (neither operation models an output
 /// member).
-async fn command(router: &MultiServiceRouter, case: &str, id: &str, command: Command) {
+pub(crate) async fn command(router: &MultiServiceRouter, case: &str, id: &str, command: Command) {
     let (status, body) = match command {
         Command::Start => start_device(router, id).await,
         Command::Stop => stop_device(router, id).await,
@@ -77,7 +81,7 @@ async fn command(router: &MultiServiceRouter, case: &str, id: &str, command: Com
 /// `uhdDeviceSettings` for a UHD one ("Settings that describe an input device
 /// that is type HD" / "... type UHD"). The settings of the OTHER type are
 /// asserted absent, so a device is described by its own type's settings only.
-async fn device_state(router: &MultiServiceRouter, case: &str, id: &str) -> String {
+pub(crate) async fn device_state(router: &MultiServiceRouter, case: &str, id: &str) -> String {
     let described = device(router, case, id).await;
     let device_type = described["type"].as_str().unwrap_or_default().to_string();
     let (mine, other) = match device_type.as_str() {
@@ -112,10 +116,10 @@ async fn device_state(router: &MultiServiceRouter, case: &str, id: &str) -> Stri
 
 /// One row of the device table: a device id and the `InputDeviceType` its
 /// documented prefix names.
-struct Row {
-    case: &'static str,
-    id: &'static str,
-    device_type: &'static str,
+pub(crate) struct Row {
+    pub(crate) case: &'static str,
+    pub(crate) id: &'static str,
+    pub(crate) device_type: &'static str,
 }
 
 /// The device rows every suite below runs over. They differ along what the rules
@@ -124,7 +128,7 @@ struct Row {
 /// hd-123456789abcdef" —, its case, and the length and character class of the
 /// unit identifier after it), because the rules are about the run state of
 /// whatever device the id resolves to, not about any one device or id.
-const ROWS: [Row; 4] = [
+pub(crate) const ROWS: [Row; 4] = [
     Row {
         case: "the hd device the operation documents",
         id: "hd-123456789abcdef",

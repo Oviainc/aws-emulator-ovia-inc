@@ -32,7 +32,7 @@ use crate::wire::{call, error_code, error_message, medialive, ACCOUNT, DEFAULT_R
 /// The ARN a MediaLive input device carries: this service, the region the
 /// request was signed for, the account this emulator serves and the device's own
 /// id.
-fn device_arn(id: &str) -> String {
+pub(crate) fn device_arn(id: &str) -> String {
     format!("arn:aws:medialive:{DEFAULT_REGION}:{ACCOUNT}:inputDevice:{id}")
 }
 
