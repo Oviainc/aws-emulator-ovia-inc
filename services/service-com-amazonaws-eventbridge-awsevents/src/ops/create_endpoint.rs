@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation writes the global endpoint this service's state holds
+//! ([`crate::state::EndpointRecord`]) and `DescribeEndpoint` reports. This is the ONLY
+//! file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +166,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEndpoint"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateEndpointErrorModeled::InternalException(InternalException {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+            .into());
+        };
+
+        // `ReplicationConfig$State` is a modelled enum, which the boundary
+        // validator does not narrow to its values — so a state the enum does not
+        // have is refused here rather than stored and reported back as one AWS
+        // accepted. It is worded through the same builders a refusal found at the
+        // boundary is, so a client reads one form for both.
+        let named_state = input
+            .replication_config
+            .as_ref()
+            .and_then(|config| config.state.as_deref());
+        if let Some(named) = named_state.filter(|named| !REPLICATION_STATE_VALUES.contains(named)) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::validation_envelope(&[crate::state::constraint_clause(
+                    "replicationConfig.state",
+                    Some(named),
+                    &format!(
+                        "Member must satisfy enum value set: [{}]",
+                        REPLICATION_STATE_VALUES.join(", ")
+                    ),
+                )]),
+            ));
+        }
+        let replication_state = named_state
+            .unwrap_or(crate::state::DEFAULT_REPLICATION_STATE)
+            .to_string();
+
+        // "The default state is ENABLED which means you must supply a RoleArn.
+        // If you don't have a RoleArn or you don't want event replication
+        // enabled, set the state to DISABLED"
+        // (`CreateEndpoint$ReplicationConfig`): replication runs AS that role, so
+        // an endpoint that would replicate with no role to replicate as is
+        // refused rather than stored as one nothing could replicate for.
+        if replication_state == crate::state::REPLICATION_STATE_ENABLED && input.role_arn.is_none()
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::parameter_violation(
+                    "RoleArn",
+                    &format!(
+                        "RoleArn is required when event replication is {}.",
+                        crate::state::REPLICATION_STATE_ENABLED
+                    ),
+                ),
+            ));
+        }
+
+        // The pair of buses has to be ONE bus name in TWO Regions, which the
+        // model cannot express and the boundary validator therefore passes.
+        if let Some(reason) = crate::state::endpoint_event_bus_violation(&input.event_buses) {
+            return Err(crate::scaffolded::Scaffolded::validation(reason));
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // An endpoint whose clock has already moved it on is settled first, so
+        // the name check and the answer are taken from one state.
+        store.settle_endpoints(now);
+        // The name is the endpoint's identity, so a name already stored is a
+        // resource that already exists — never a silent overwrite.
+        if store.endpoint(&input.name).is_some() {
+            return Err(CreateEndpointErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(format!("Endpoint {} already exists.", input.name)),
+                },
+            )
+            .into());
+        }
+        if store.endpoints.len() >= crate::state::MAX_ENDPOINTS {
+            return Err(CreateEndpointErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The account already holds the maximum of {} global endpoints.",
+                        crate::state::MAX_ENDPOINTS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let minted = store.next_unique_id(now);
+        let record = crate::state::EndpointRecord {
+            name: input.name.clone(),
+            arn: crate::state::endpoint_arn(&region, &input.name),
+            description: input.description,
+            // The Region the create was signed for is the endpoint's primary
+            // Region, which is the Region a reader addresses it in.
+            home_region: region,
+            routing_config: input.routing_config,
+            replication_state,
+            event_buses: input.event_buses,
+            role_arn: input.role_arn,
+            endpoint_id: crate::state::endpoint_id(&minted),
+            state: crate::state::ENDPOINT_STATE_CREATING.to_string(),
+            state_reason: None,
+            created: now,
+            last_modified: now,
+            active_due: Some(now + crate::state::ENDPOINT_TRANSITION),
+        };
+        store.endpoints.insert(input.name.clone(), record);
+
+        // Reported from the STORED record rather than from the request, so this
+        // response and `DescribeEndpoint`'s cannot disagree.
+        let Some(stored) = store.endpoint(&input.name) else {
+            return Err(CreateEndpointErrorModeled::InternalException(InternalException {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+            .into());
+        };
+        Ok(CreateEndpointOutput {
+            name: Some(stored.name.clone()),
+            arn: Some(stored.arn.clone()),
+            routing_config: Some(stored.routing_config.clone()),
+            replication_config: Some(stored.replication_config()),
+            event_buses: Some(stored.event_buses.clone()),
+            role_arn: stored.role_arn.clone(),
+            state: Some(stored.state.clone()),
+        })
     }
 }

@@ -16,7 +16,7 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_networkmanager_networkmanager::state::{
-    FIELD_PREFIX_LIST_ARN, LIMIT_PREFIX_LIST_ASSOCIATIONS_PER_CORE_NETWORK,
+    CORE_NETWORK_KIND, FIELD_PREFIX_LIST_ARN, LIMIT_PREFIX_LIST_ASSOCIATIONS_PER_CORE_NETWORK,
     MAX_PREFIX_LIST_ASSOCIATIONS_PER_CORE_NETWORK, PREFIX_LIST_ASSOCIATION_KIND,
 };
 
@@ -85,6 +85,15 @@ fn disassociate_uri(core_network_id: &str, arn: &str) -> String {
 /// `DeleteCoreNetworkPrefixListAssociation` for one pair.
 async fn disassociate(emulator: &Emulator, core_network_id: &str, arn: &str) -> (u16, Value) {
     emulator.delete(&disassociate_uri(core_network_id, arn)).await
+}
+
+/// `ListCoreNetworkPrefixListAssociations` for one core network — the reader a stored
+/// association is observed through (`GET /prefix-list/core-network/{CoreNetworkId}`,
+/// `smithy_query query="operation" operation="ListCoreNetworkPrefixListAssociations"`).
+async fn list(emulator: &Emulator, core_network_id: &str) -> (u16, Value) {
+    emulator
+        .get(&format!("/prefix-list/core-network/{core_network_id}"))
+        .await
 }
 
 /// Assert that `core_network_id` holds an association for `arn`: the delete removes it and
@@ -500,6 +509,135 @@ async fn one_pair_and_one_client_token_hold_a_single_association() {
     assert_eq!(
         status, 404,
         "a conflicted retry must store nothing: expected 404, got {status} with {body}"
+    );
+}
+
+/// One row of the unknown-core-network table: an id the modelled `CoreNetworkId` pattern
+/// admits (`^core-network-([0-9a-f]{8,17})$`, `smithy_query shape=CoreNetworkId`) that
+/// names no stored core network, plus the association a create asks for under it.
+struct UnknownCoreNetworkCase {
+    name: &'static str,
+    id: String,
+    arn: String,
+    alias: String,
+}
+
+/// The ids that name nothing, spanning what the rule generalises over: the width of the
+/// id at each published bound and between them, carried with the prefix list ARN forms and
+/// the alias lengths the create otherwise accepts.
+fn unknown_core_network_cases() -> Vec<UnknownCoreNetworkCase> {
+    vec![
+        UnknownCoreNetworkCase {
+            name: "the shortest id width the pattern admits",
+            id: "core-network-0123abcd".to_string(),
+            arn: prefix_list_arn("63a5400a"),
+            alias: "routing".to_string(),
+        },
+        UnknownCoreNetworkCase {
+            name: "an id width between the bounds",
+            id: "core-network-00000000ffff".to_string(),
+            arn: "arn:aws-us-gov:ec2:us-gov-west-1:123456789012:prefix-list/pl-00112233".to_string(),
+            alias: String::new(),
+        },
+        UnknownCoreNetworkCase {
+            name: "the longest id width the pattern admits",
+            id: "core-network-0123456789abcdef1".to_string(),
+            arn: prefix_list_arn("0123456789abcdef1"),
+            alias: "a".repeat(256),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_create_naming_a_core_network_that_is_not_stored_is_refused_and_stores_nothing() {
+    let emulator = Emulator::new();
+
+    // One association that does exist, so the refusals below can be shown to have left the
+    // store exactly as they found it.
+    let stored_core = core_network(&emulator, "existing").await;
+    let kept = prefix_list_arn("0000000000000abcd");
+    let (status, body) = associate(&emulator, &stored_core, &kept, "kept").await;
+    assert_eq!(
+        status, 200,
+        "the control association: expected 200, got {status} with {body}"
+    );
+
+    // A core network that was created and then deleted names nothing just as one that never
+    // existed does, so its id is one more row of the same table.
+    let deleted = core_network(&emulator, "deleted").await;
+    let (status, body) = emulator.delete(&format!("/core-networks/{deleted}")).await;
+    assert_eq!(
+        status, 200,
+        "DeleteCoreNetwork({deleted}): expected 200, got {status} with {body}"
+    );
+
+    let mut cases = unknown_core_network_cases();
+    cases.push(UnknownCoreNetworkCase {
+        name: "the id of a deleted core network",
+        id: deleted,
+        arn: prefix_list_arn("0000000000000bcde"),
+        alias: "routing".to_string(),
+    });
+
+    for case in cases {
+        let UnknownCoreNetworkCase {
+            name,
+            id,
+            arn,
+            alias,
+        } = case;
+
+        let (status, refused) = associate(&emulator, &id, &arn, &alias).await;
+        assert_eq!(
+            status, 404,
+            "case {name:?}: CreateCoreNetworkPrefixListAssociation on {id}: expected 404, got {status} with {refused}"
+        );
+        assert_eq!(
+            (
+                error_code(&refused),
+                refused["ResourceType"].as_str(),
+                refused["ResourceId"].as_str()
+            ),
+            (
+                "ResourceNotFoundException",
+                Some(CORE_NETWORK_KIND),
+                Some(id.as_str())
+            ),
+            "case {name:?}: the refusal must name the core network as the missing resource, got {refused}"
+        );
+
+        // The association ties a core network that already exists to a prefix list rather
+        // than minting one, so the refused create left the id naming nothing — neither a
+        // core network for the reader nor an association for the listing.
+        let (status, body) = emulator.get(&format!("/core-networks/{id}")).await;
+        assert_eq!(
+            status, 404,
+            "case {name:?}: GetCoreNetwork after the refusal: expected 404, got {status} with {body}"
+        );
+        let (status, body) = list(&emulator, &id).await;
+        assert_eq!(
+            status, 404,
+            "case {name:?}: the listing after the refusal: expected 404, got {status} with {body}"
+        );
+    }
+
+    // The core network that does exist still holds exactly the one association its own
+    // create stored.
+    let (status, body) = list(&emulator, &stored_core).await;
+    assert_eq!(
+        status, 200,
+        "the listing of the stored core network: expected 200, got {status} with {body}"
+    );
+    let reported: Vec<(Option<&str>, Option<&str>)> = body["PrefixListAssociations"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the listing must carry the association list, got {body}"))
+        .iter()
+        .map(|item| (item["PrefixListArn"].as_str(), item["PrefixListAlias"].as_str()))
+        .collect();
+    assert_eq!(
+        reported,
+        vec![(Some(kept.as_str()), Some("kept"))],
+        "the refusals must leave the stored core network holding exactly its own association, got {body}"
     );
 }
 

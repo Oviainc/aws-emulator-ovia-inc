@@ -557,6 +557,64 @@ impl JobState {
     }
 }
 
+/// A leg of a device's journey, as the caller reports it: the whole `ShipmentState` enum
+/// (`shared_types::SHIPMENT_STATE_VALUES`).
+///
+/// Each value names a leg that has just finished — "Set to `RECEIVED` when the device
+/// arrives at your location. Set to `RETURNED` when you have returned the device to Amazon
+/// Web Services" (`UpdateJobShipmentStateRequest$ShipmentState`) — so a report is only
+/// meaningful while the device is on that leg, and once made it leaves the device where the
+/// leg ended. [`Self::reported_from`] and [`Self::reported_job_state`] are those two ends,
+/// both expressed as the `JobState` values that say where a device is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShipmentState {
+    Received,
+    Returned,
+}
+
+impl ShipmentState {
+    /// This shipment state's wire value, exactly as `ShipmentState` spells it.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Received => "RECEIVED",
+            Self::Returned => "RETURNED",
+        }
+    }
+
+    /// This shipment state, read back from the wire value [`Self::as_wire`] spells it as,
+    /// or `None` when `value` is not a `ShipmentState` this service models.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        [Self::Received, Self::Returned]
+            .into_iter()
+            .find(|state| state.as_wire() == value)
+    }
+
+    /// The `JobState` a job is in while the leg this report names is still running, i.e.
+    /// the only state the report can be made from.
+    ///
+    /// `RECEIVED` says the device "arrives at your location", which is the end of the leg
+    /// `InTransitToCustomer` names; `RETURNED` says the device has been returned to Amazon
+    /// Web Services, which is the end of the stay `WithCustomer` names. From any other
+    /// state the device is not on the reported leg at all, so there is no shipment state to
+    /// change.
+    pub fn reported_from(self) -> JobState {
+        match self {
+            Self::Received => JobState::InTransitToCustomer,
+            Self::Returned => JobState::WithCustomer,
+        }
+    }
+
+    /// The `JobState` the finished leg leaves the job in: the device is in the caller's
+    /// hands once it has arrived there, and on its way back to Amazon Web Services once the
+    /// caller has returned it.
+    pub fn reported_job_state(self) -> JobState {
+        match self {
+            Self::Received => JobState::WithCustomer,
+            Self::Returned => JobState::InTransitToAWS,
+        }
+    }
+}
+
 /// One stored shipping address: every `Address` member this service keeps, so
 /// `DescribeAddress` rebuilds the submitted address instead of echoing a request.
 ///

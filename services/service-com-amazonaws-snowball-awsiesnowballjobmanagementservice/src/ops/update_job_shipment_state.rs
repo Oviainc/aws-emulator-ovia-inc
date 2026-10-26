@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateJobShipmentState
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateJobShipmentState`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateJobShipmentState::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the leg of a device's journey the caller reports, by moving the stored job to
+//! the `JobState` that leg leaves the device in — which a later `DescribeJob` or `ListJobs`
+//! observes, and which is what releases or withdraws the device's credentials.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +135,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateJobShipmentState` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateJobShipmentStateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateJobShipmentState"))
+        // Nothing in this operation depends on the request's metadata: where a device has
+        // got to is a property of the job, which the request names by id.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STATE_UNAVAILABLE,
+            ));
+        };
+
+        // `ShipmentState` targets an enum, so a value outside that catalog names no leg of
+        // the device's journey and there is no shipment state to change: refuse it the way
+        // the boundary validator refuses a value a modelled constraint rejects. The lookup
+        // IS the catalog check, so the two cannot drift.
+        let Some(reported) = crate::state::ShipmentState::from_wire(&input.shipment_state) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::outside_catalog_message(
+                    "shipmentState",
+                    &input.shipment_state,
+                    SHIPMENT_STATE_VALUES,
+                ),
+            ));
+        };
+
+        let mut store = state.lock();
+        let Some(job) = store.jobs.get(&input.job_id) else {
+            return Err(UpdateJobShipmentStateErrorModeled::InvalidResourceException(
+                InvalidResourceException {
+                    message: Some(format!(
+                        "The job ID {} can't be found. Check the information you provided in \
+                         your last request, and try again.",
+                        input.job_id
+                    )),
+                    resource_type: Some("job".to_string()),
+                },
+            )
+            .into());
+        };
+        let is_master = job.is_master();
+        let job_state = job.job_state;
+
+        // "Main jobs aren't associated with any Snowballs. Instead, each main job will have
+        // at least one job part, and each job part is associated with a Snowball"
+        // (`JobListEntry$IsMaster`): a shipment state is where a DEVICE has got to, so the
+        // main job of an export order has none to report and the shipment this call names
+        // is a resource no record answers to, which is what `InvalidResourceException`
+        // states. Its job parts each carry a device and are reported on their own.
+        if is_master {
+            return Err(UpdateJobShipmentStateErrorModeled::InvalidResourceException(
+                InvalidResourceException {
+                    message: Some(format!(
+                        "The job {} is the main job of an export order and is associated with \
+                         no Snowball, so it has no device whose shipment state can be \
+                         updated. Update the shipment state of one of its job parts instead.",
+                        input.job_id
+                    )),
+                    resource_type: Some("job".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "Updates the state when a shipment state changes to a different state": the
+        // reported leg has to be the one the device is actually on, which is a property of
+        // where the job GOT TO and so is what `InvalidJobStateException` states. A device
+        // that has not left for the caller cannot have arrived, one already in the caller's
+        // hands cannot arrive again, and one whose order was cancelled or whose device is
+        // back at Amazon Web Services has no leg left to run.
+        let reported_from = reported.reported_from();
+        if job_state != reported_from {
+            return Err(UpdateJobShipmentStateErrorModeled::InvalidJobStateException(
+                InvalidJobStateException {
+                    message: Some(format!(
+                        "The job {} is in state {} and its shipment state can't be set to {}. \
+                         A job's shipment state can only be set to {} while its JobState \
+                         value is {}.",
+                        input.job_id,
+                        job_state.as_wire(),
+                        reported.as_wire(),
+                        reported.as_wire(),
+                        reported_from.as_wire()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Moving the job to where the finished leg left its device is what this operation
+        // DOES, and it is the one record it touches: every job that holds a device of its
+        // own travels on its own, so a job part and a cluster's node job are reported one
+        // by one rather than with the rest of their order.
+        if let Some(job) = store.jobs.get_mut(&input.job_id) {
+            job.job_state = reported.reported_job_state();
+        }
+
+        Ok(UpdateJobShipmentStateOutput {})
     }
 }

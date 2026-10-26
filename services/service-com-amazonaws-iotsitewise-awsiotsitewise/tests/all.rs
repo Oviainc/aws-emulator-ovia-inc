@@ -222,6 +222,11 @@ mod describe_search_reads;
 mod describe_storage_configuration_reads;
 #[path = "all/describe_task_reads.rs"]
 mod describe_task_reads;
+// In its alphabetical place inside the sorted list, rather than appended after it:
+// the end of this file is where every concurrent iotsitewise change appends a
+// declaration of its own, and each append there collided with this one.
+#[path = "all/enrichment_jobs.rs"]
+mod enrichment_jobs;
 #[path = "all/execute_query.rs"]
 mod execute_query;
 #[path = "all/execute_query_follows_the_store.rs"]

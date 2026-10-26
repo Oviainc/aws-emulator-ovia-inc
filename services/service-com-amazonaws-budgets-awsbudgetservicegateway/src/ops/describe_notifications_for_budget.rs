@@ -201,10 +201,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?;
 
+        // `NotificationState` "specifies whether this notification is in alarm" — the
+        // service's own reading of the spend behind the budget against the threshold the
+        // notification alerts on, which no request sets, so it is computed here from the
+        // budget as a read reports it rather than read out of the stored notification
+        // (`crate::state::project_notification`). Nothing is written.
+        let budget = crate::state::project_budget(stored, now);
         let notifications: Vec<Notification> = stored
             .notifications
             .iter()
-            .map(|held| held.notification.clone())
+            .map(|held| crate::state::project_notification(&budget, &held.notification))
             .collect();
         let (page, next_token) = crate::state::page(
             &notifications,

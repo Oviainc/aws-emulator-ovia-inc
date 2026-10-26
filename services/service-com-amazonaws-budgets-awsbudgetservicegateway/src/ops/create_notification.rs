@@ -282,14 +282,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             let mut notification = input.notification;
             // The one member of a notification the SERVICE owns rather than the caller —
-            // the alarm state a new notification starts in — is materialised here, so
-            // every later read reports what was stored rather than recomputing it.
-            crate::state::stamp_notification(&mut notification);
+            // the alarm state, which it reads off the spend behind the budget — is
+            // dropped here rather than stored, so no later read echoes a state this
+            // request asked for (`crate::state::drop_notification_derived`).
+            crate::state::drop_notification_derived(&mut notification);
             // A notification in alarm has passed its threshold, so it owes the alert it
             // exists to deliver to every subscriber this call attaches to it, decided
-            // from the state this call leaves behind.
+            // from the state this call leaves behind — the service's own, over the budget
+            // as a read reports it.
             let alerts = crate::state::alerts::owed(
-                &crate::state::alerts::source(&input.account_id, &stored.budget),
+                &crate::state::alerts::source(
+                    &input.account_id,
+                    &crate::state::budget_as_read(&stored.budget, now),
+                ),
                 &notification,
                 &subscribers,
             );

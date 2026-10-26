@@ -6,11 +6,16 @@
 //! RULE: the operation REPORTS the pricing plans this account holds — every plan
 //! `CreatePricingPlan` persisted and none it deleted — each element carrying that
 //! plan's stored `Arn`, `Name`, `Description`, creation instant and last-modified
-//! instant plus a `Size` DERIVED from the pricing rules currently associated with it,
-//! in ARN order, restricted to the ARNs `Filters.Arns` names (in either spelling the
-//! modelled `PricingPlanArn` pattern allows) and bounded by the request's `MaxResults`
+//! instant plus a `Size` DERIVED from the pricing rules associated with it, in ARN
+//! order, restricted to the ARNs `Filters.Arns` names (in either spelling the
+//! modelled `PricingPlanArn` pattern allows) and to the plans that existed in the
+//! `BillingPeriod` the read is scoped to, and bounded by the request's `MaxResults`
 //! with a `NextToken` naming the rest. Nothing is written: a later caller sees exactly
 //! what an earlier one did.
+//!
+//! `tests/all/pricing_plan_billing_periods.rs` owns the per-period dimension in full —
+//! which periods report a plan and with which values; this suite asserts the rest of the
+//! surface, and that the period a request names is the one the answer is scoped to.
 //!
 //! Every table's rows differ along what the rule generalises over: which optional
 //! members a plan carries (no description, a description, the empty description a
@@ -27,6 +32,14 @@ use service_com_amazonaws_billingconductor_awsbillingconductor::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
+
+use crate::pricing_rule_association_periods::{period_months, shift_period};
+
+/// The billing period the service calls current, read from the same clock it answers
+/// from so an expectation holds whatever month this suite runs in.
+fn current_period() -> String {
+    service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period()
+}
 
 /// `POST /list-pricing-plans` — the operation's modelled HTTP binding
 /// (`smithy_query(query="operation",operation="ListPricingPlans")`).
@@ -548,16 +561,33 @@ async fn the_arn_filter_selects_exactly_the_plans_it_names() {
 }
 
 /// RULE: the reported `BillingPeriod` is the one the request asked about, and a
-/// request that named none is not answered with one; which plans are reported does not
-/// depend on it, since this emulator keeps no per-period history of a plan.
+/// request that named none is not answered with one; the plans reported are the ones
+/// that existed in that period, i.e. the periods from the one a plan was created in
+/// onward (`tests/all/pricing_plan_billing_periods.rs` owns that dimension in full).
 #[tokio::test]
 async fn the_reported_period_is_the_one_the_request_named_and_otherwise_absent() {
     let em = Emulator::new();
     let plan = em.create_plan(&json!({ "Name": "Period-Plan" })).await;
+    // The create above ran NOW, so the plan was created in the current billing period —
+    // read from the same clock the service answers from, so the expectation holds
+    // whatever month this suite runs in.
+    let created_in = current_period();
 
     // Rows differ along the period asked for: a one-digit and a two-digit month, the
-    // months at each end of the modelled pattern, a past year and a future one.
-    for period in ["2020-01", "2026-9", "2026-09", "2031-12", "2031-1"] {
+    // months at each end of the modelled pattern, a past year and a future one, and the
+    // period the plan was created in with the months on either side of it.
+    let rows: Vec<String> = vec![
+        "2020-01".to_string(),
+        "2026-9".to_string(),
+        "2026-09".to_string(),
+        "2031-12".to_string(),
+        "2031-1".to_string(),
+        shift_period(&created_in, -1),
+        created_in.clone(),
+        shift_period(&created_in, 1),
+    ];
+    for period in rows {
+        let period = period.as_str();
         let (status, body) = em.list(None, None, None, Some(period)).await;
         assert_eq!(
             status, 200,
@@ -574,10 +604,13 @@ async fn the_reported_period_is_the_one_the_request_named_and_otherwise_absent()
             "case {period:?}: the reported period must satisfy the modelled YYYY-MM form, \
              got {body}"
         );
+        let existed = period_months(period) >= period_months(&created_in);
+        let expected: Vec<String> = if existed { vec![plan.clone()] } else { vec![] };
         assert_eq!(
             arns(&elements(&body)),
-            vec![plan.clone()],
-            "case {period:?}: the plans reported must not depend on the period, got {body}"
+            expected,
+            "case {period:?}: a plan created in {created_in:?} is reported exactly for the \
+             periods from then onward, expected {expected:?}, got {body}"
         );
     }
 

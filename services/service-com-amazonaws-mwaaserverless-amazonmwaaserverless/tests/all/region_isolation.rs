@@ -186,6 +186,15 @@ fn reference_cases() -> Vec<ReferenceCase> {
             foreign: ForeignAnswer::LookupMiss,
         },
         ReferenceCase {
+            case: "TagResource adds tags to it",
+            body: |arn, _run, _task| serde_json::json!({
+                "ResourceArn": arn,
+                "Tags": {"env": "prod"},
+            }),
+            operation: "TagResource",
+            foreign: ForeignAnswer::LookupMiss,
+        },
+        ReferenceCase {
             case: "UntagResource removes tags from it",
             body: |arn, _run, _task| serde_json::json!({
                 "ResourceArn": arn,
