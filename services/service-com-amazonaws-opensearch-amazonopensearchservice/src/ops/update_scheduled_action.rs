@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateScheduledAction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateScheduledAction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateScheduledAction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Re-times one scheduled change of a domain: the [`crate::state::ScheduledChange`]
+//! the request's `ActionID` names moves to the instant its `ScheduleAt` names, and
+//! the call answers with the stored record through the same `ScheduledAction`
+//! projection `ListScheduledActions` reports it with.
+//!
+//! The request is judged before anything is resolved — `DesiredStartTime` belongs
+//! with exactly one `ScheduleAt` value — then the domain, then the change itself, so
+//! a malformed request is refused whether or not the change it names exists.
 //!
 //! ## Shape of an operation
 //!
@@ -95,6 +95,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::{
+    check_desired_start_time, domain_not_found, rescheduled_instant,
+    scheduled_action_not_found, scheduled_action_type_mismatch, scheduled_action_under_way,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -169,18 +176,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateScheduledAction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateScheduledActionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateScheduledAction"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // "Only specify this parameter if you set `ScheduleAt` to `TIMESTAMP`", and
+        // that value "must also provide a value for `DesiredStartTime`": the pairing is
+        // a property of the REQUEST, so it is decided before anything the request names
+        // is resolved — a request that cannot be served as asked is refused whether or
+        // not its domain or its change exists.
+        check_desired_start_time(&input.schedule_at, input.desired_start_time)
+            .map_err(UpdateScheduledActionErrorModeled::ValidationException)?;
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+
+        // "The name of the domain to reschedule an action for": the change belongs to
+        // that domain, so a name the account holds no domain under names nothing to
+        // reschedule. Settling it materialises only what the clock already owed it.
+        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
+            UpdateScheduledActionErrorModeled::ResourceNotFoundException(domain_not_found(
+                &input.domain_name,
+            ))
+        })?;
+
+        // Where the change goes is decided from the domain's own record — its off-peak
+        // window, for a change marked to be picked up during one — so the instant is
+        // read before the change is touched.
+        let at = rescheduled_instant(
+            domain,
+            &input.schedule_at,
+            input.desired_start_time,
+            now,
+        );
+
+        let action = domain
+            .scheduled_actions
+            .get_mut(&input.action_id)
+            .ok_or_else(|| {
+                UpdateScheduledActionErrorModeled::ResourceNotFoundException(
+                    scheduled_action_not_found(&input.action_id, &input.domain_name),
+                )
+            })?;
+
+        // `ActionID` and `ActionType` are both "retrieve[d] … [by] a
+        // `ListScheduledActions` request", so they must name ONE change: a type that is
+        // not that change's own is a request the service cannot serve as asked.
+        if action.action_type != input.action_type {
+            return Err(UpdateScheduledActionErrorModeled::ValidationException(
+                scheduled_action_type_mismatch(
+                    &input.action_id,
+                    &input.action_type,
+                    &action.action_type,
+                ),
+            )
+            .into());
+        }
+
+        // A change the service has already begun or finished has no instant left to
+        // move: the record is in use by the change itself.
+        if action.under_way() {
+            return Err(UpdateScheduledActionErrorModeled::ConflictException(
+                scheduled_action_under_way(&input.action_id, &action.status),
+            )
+            .into());
+        }
+
+        action.reschedule(at);
+
+        // Answered from the STORED record, through the one projection every operation
+        // that reports a scheduled change answers with, so this call and a later
+        // listing cannot disagree about when the change happens.
+        Ok(UpdateScheduledActionOutput {
+            scheduled_action: Some(action.to_action()),
+        })
     }
 }

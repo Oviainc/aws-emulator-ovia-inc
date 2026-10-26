@@ -105,6 +105,15 @@ pub const MAX_GENERATED_TEMPLATE_RESOURCES: usize = 500;
 /// after it sees the generation complete.
 pub const GENERATION_DELAY: Duration = Duration::from_millis(500);
 
+/// How many summaries `ListGeneratedTemplates` answers for a request that names no
+/// `MaxResults`.
+///
+/// Documented on `ListGeneratedTemplatesInput$MaxResults`: "By default the
+/// ListGeneratedTemplates API action will return at most 50 results in each response. The
+/// maximum value is 100." The maximum is the modelled `@range(min: 1, max: 100)` on that
+/// member, which the request itself cannot exceed.
+pub const DEFAULT_LISTED_TEMPLATES: usize = 50;
+
 /// The `StatusReason` a generation that completed carries, as the service reports it for a
 /// template whose generation is `COMPLETE`.
 pub const GENERATION_COMPLETE_REASON: &str = "Template complete";

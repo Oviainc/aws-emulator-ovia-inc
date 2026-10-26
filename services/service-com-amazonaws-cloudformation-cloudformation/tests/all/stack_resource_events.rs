@@ -163,9 +163,11 @@ struct EventCase<'a> {
 /// A VPC, two subnets in it and a DB subnet group over those subnets, in JSON.
 ///
 /// `AWS::EC2::VPC` and `AWS::EC2::Subnet` are types this emulator provisions nowhere, so
-/// the stack records them from the template alone, while the `AWS::RDS::DBSubnetGroup` is
-/// really created in Amazon RDS — which refuses a group over subnets it cannot resolve.
-/// `Topic` is declared to depend on that group, so the walk never reaches it.
+/// the stack records them from the template alone — each under the `vpc-`/`subnet-`
+/// identifier its type's `Ref` returns — while the `AWS::RDS::DBSubnetGroup` is really
+/// created in Amazon RDS, which refuses the name AWS reserves for the DB subnet group of
+/// the account's default VPC. `Topic` is declared to depend on that group, so the walk
+/// never reaches it.
 const NETWORK_TEMPLATE: &str = r#"{"Resources":{
     "Vpc":{"Type":"AWS::EC2::VPC","Properties":{"CidrBlock":"10.0.0.0/16"}},
     "SubnetA":{"Type":"AWS::EC2::Subnet","Properties":{
@@ -175,6 +177,7 @@ const NETWORK_TEMPLATE: &str = r#"{"Resources":{
       "VpcId":{"Ref":"Vpc"},"CidrBlock":"10.0.2.0/24",
       "AvailabilityZone":{"Fn::Select":[0,{"Fn::GetAZs":""}]}}},
     "SubnetGroup":{"Type":"AWS::RDS::DBSubnetGroup","Properties":{
+      "DBSubnetGroupName":"default",
       "DBSubnetGroupDescription":"the probe stack's subnets",
       "SubnetIds":[{"Ref":"SubnetA"},{"Ref":"SubnetB"}]}},
     "Topic":{"Type":"AWS::SNS::Topic","DependsOn":"SubnetGroup"}}}"#;

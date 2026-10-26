@@ -483,7 +483,10 @@ async fn distinct_client_tokens_mint_distinct_job_templates() {
 /// Set `pointer` in `body` to `value`, CREATING the member when the base body does not
 /// carry it: a row that ADDS a member must be testable too, and `Value::pointer_mut`
 /// only reaches members that already exist.
-fn set_at(body: &mut Value, pointer: &str, value: Value, case: &str) {
+///
+/// `pub(crate)` because the suite beside this one asserts the same `@idempotencyToken`
+/// rule over the other operations that take one, from the same kind of table.
+pub(crate) fn set_at(body: &mut Value, pointer: &str, value: Value, case: &str) {
     let mut cursor = body;
     let mut segments = pointer.split('/').skip(1).peekable();
     while let Some(segment) = segments.next() {

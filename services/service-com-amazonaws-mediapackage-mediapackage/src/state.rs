@@ -6,6 +6,12 @@
 //! a create stores a record, and every later read (`Describe*`, `List*`) is rendered
 //! from the stored record, never from the request that asked for it.
 //!
+//! MediaPackage is a REGIONAL control plane, so each of the three resource maps is keyed
+//! by the Region the resource was created in together with its id (see [`ResourceKey`]):
+//! the same id in two Regions names two independent resources, and every operation
+//! resolves an id only among the records of the Region ITS OWN request is served in
+//! ([`request_region`]).
+//!
 //! Modelled shapes are reused as-is from [`crate::ops::types`] rather than mirrored
 //! into parallel structs, so a stored packaging configuration is byte-for-byte what a
 //! later read renders.
@@ -1657,10 +1663,53 @@ pub fn apply_origin_endpoint_defaults(record: &mut OriginEndpointRecord) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// How a resource is keyed: the Region it was created in, then its id
+//
+// MediaPackage is a REGIONAL control plane: every resource it holds belongs to the one
+// Region the request that created it was served in — the Region its ARN and its ingest
+// and playback URLs name — and an id only has to be unique within that Region. So the
+// Region is part of the identity of every resource this service stores, and every
+// lookup, listing, mutation, delete and tagging operation resolves an id only among the
+// records of the Region its own request is served in ([`request_region`]).
+// ---------------------------------------------------------------------------
+
+/// How every resource map in this state is keyed: the Region the resource was created
+/// in, then the caller-chosen id the REST routes address it by.
+///
+/// The Region comes FIRST, so one Region's records are a contiguous range of the
+/// `BTreeMap` read in id order ([`region_slice`]) — which is what lets a listing page
+/// one Region's resources in one stable order. The same id in two Regions is two
+/// distinct keys, so it names two independent resources.
+pub type ResourceKey = (String, String);
+
+/// The key `id` is stored under when the request that created it was served in `region`.
+pub fn resource_key(region: &str, id: &str) -> ResourceKey {
+    (region.to_string(), id.to_string())
+}
+
+/// The records of ONE Region, in id order.
+///
+/// A `BTreeMap` keyed by [`ResourceKey`] orders by Region first, so a Region's records
+/// are the contiguous range that starts at its smallest possible key; the scan stops at
+/// the first key naming another Region.
+fn region_slice<'map, V>(
+    map: &'map BTreeMap<ResourceKey, V>,
+    region: &str,
+) -> impl Iterator<Item = &'map V> {
+    let region = region.to_string();
+    map.range(resource_key(&region, "")..)
+        .take_while(move |((stored_region, _), _)| *stored_region == region)
+        .map(|(_, record)| record)
+}
+
 /// A Channel, exactly as `CreateChannel` stored it.
 #[derive(Debug, Clone, Default)]
 pub struct ChannelRecord {
     pub id: String,
+    /// The Region this channel was created in — the one its ARN and its ingest URLs
+    /// carry, and the only one it resolves in. See [`ResourceKey`].
+    pub region: String,
     pub arn: String,
     pub description: Option<String>,
     /// ISO-8601, minted once at creation and never recomputed on a read.
@@ -1711,6 +1760,9 @@ impl ChannelRecord {
 #[derive(Debug, Clone, Default)]
 pub struct OriginEndpointRecord {
     pub id: String,
+    /// The Region this endpoint was created in — the one its ARN and its playback URL
+    /// carry, and the only one it resolves in. See [`ResourceKey`].
+    pub region: String,
     pub arn: String,
     pub channel_id: String,
     pub description: Option<String>,
@@ -1838,6 +1890,9 @@ pub const HARVEST_OUTCOME: &str = HARVEST_FAILED;
 #[derive(Debug, Clone, Default)]
 pub struct HarvestJobRecord {
     pub id: String,
+    /// The Region this job was submitted in — the one its ARN carries, and the only one
+    /// it resolves in. See [`ResourceKey`].
+    pub region: String,
     pub arn: String,
     /// The channel the harvested endpoint packages, read from the STORED endpoint at
     /// submission time rather than from the request, which carries no channel id.
@@ -1894,21 +1949,117 @@ impl HarvestJobRecord {
 
 /// Per-service state for com-amazonaws-mediapackage-mediapackage. A handler reaches it through [`service_state`].
 ///
-/// Every collection is a `BTreeMap` keyed by the resource id the API itself keys on, so
-/// `List*` output and its paging tokens are in a stable, caller-independent order. Each
-/// is bounded by an entry count — [`MAX_CHANNELS`], [`MAX_ORIGIN_ENDPOINTS`] and
-/// [`MAX_HARVEST_JOBS`].
+/// Every collection is a `BTreeMap` keyed by a [`ResourceKey`] — the Region the resource
+/// was created in, then the resource id the API itself keys on — so one Region's records
+/// are a contiguous range read in id order, and `List*` output and its paging tokens are
+/// in a stable, caller-independent order within that Region. Each map is bounded by a
+/// total entry count — [`MAX_CHANNELS`], [`MAX_ORIGIN_ENDPOINTS`] and
+/// [`MAX_HARVEST_JOBS`] — because the memory the process holds is the sum over every
+/// Region.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMediapackageMediapackageState {
-    pub channels: BTreeMap<String, ChannelRecord>,
-    pub origin_endpoints: BTreeMap<String, OriginEndpointRecord>,
-    pub harvest_jobs: BTreeMap<String, HarvestJobRecord>,
+    pub channels: BTreeMap<ResourceKey, ChannelRecord>,
+    pub origin_endpoints: BTreeMap<ResourceKey, OriginEndpointRecord>,
+    pub harvest_jobs: BTreeMap<ResourceKey, HarvestJobRecord>,
     /// How many ids this store has minted. Part of every minted id's seed, so no two
     /// minted ids collide even when two calls land in the same nanosecond.
     pub minted: u64,
 }
 
 impl ComAmazonawsMediapackageMediapackageState {
+    /// The Channel `id` names IN `region`, for a reporting operation. `None` for an id
+    /// only another Region holds: that channel does not exist here.
+    pub fn channel(&self, region: &str, id: &str) -> Option<&ChannelRecord> {
+        self.channels.get(&resource_key(region, id))
+    }
+
+    /// The Channel `id` names in `region`, for an operation the spec says mutates it
+    /// (`UpdateChannel`, `ConfigureLogs`, the credential rotations).
+    pub fn channel_mut(&mut self, region: &str, id: &str) -> Option<&mut ChannelRecord> {
+        self.channels.get_mut(&resource_key(region, id))
+    }
+
+    /// Whether `region` holds a Channel under `id`.
+    pub fn has_channel(&self, region: &str, id: &str) -> bool {
+        self.channels.contains_key(&resource_key(region, id))
+    }
+
+    /// Store `record` as the Channel `id` of its own Region.
+    pub fn insert_channel(&mut self, record: ChannelRecord) {
+        let key = resource_key(&record.region, &record.id);
+        self.channels.insert(key, record);
+    }
+
+    /// Remove the Channel `id` names in `region`, returning what was stored.
+    pub fn remove_channel(&mut self, region: &str, id: &str) -> Option<ChannelRecord> {
+        self.channels.remove(&resource_key(region, id))
+    }
+
+    /// Every Channel stored in `region`, in id order.
+    pub fn channels_in(&self, region: &str) -> impl Iterator<Item = &ChannelRecord> {
+        region_slice(&self.channels, region)
+    }
+
+    /// The OriginEndpoint `id` names in `region`.
+    pub fn origin_endpoint(&self, region: &str, id: &str) -> Option<&OriginEndpointRecord> {
+        self.origin_endpoints.get(&resource_key(region, id))
+    }
+
+    /// The OriginEndpoint `id` names in `region`, for `UpdateOriginEndpoint`.
+    pub fn origin_endpoint_mut(
+        &mut self,
+        region: &str,
+        id: &str,
+    ) -> Option<&mut OriginEndpointRecord> {
+        self.origin_endpoints.get_mut(&resource_key(region, id))
+    }
+
+    /// Whether `region` holds an OriginEndpoint under `id`.
+    pub fn has_origin_endpoint(&self, region: &str, id: &str) -> bool {
+        self.origin_endpoints.contains_key(&resource_key(region, id))
+    }
+
+    /// Store `record` as the OriginEndpoint `id` of its own Region.
+    pub fn insert_origin_endpoint(&mut self, record: OriginEndpointRecord) {
+        let key = resource_key(&record.region, &record.id);
+        self.origin_endpoints.insert(key, record);
+    }
+
+    /// Remove the OriginEndpoint `id` names in `region`, returning what was stored.
+    pub fn remove_origin_endpoint(
+        &mut self,
+        region: &str,
+        id: &str,
+    ) -> Option<OriginEndpointRecord> {
+        self.origin_endpoints.remove(&resource_key(region, id))
+    }
+
+    /// Every OriginEndpoint stored in `region`, in id order.
+    pub fn origin_endpoints_in(&self, region: &str) -> impl Iterator<Item = &OriginEndpointRecord> {
+        region_slice(&self.origin_endpoints, region)
+    }
+
+    /// The HarvestJob `id` names in `region`.
+    pub fn harvest_job(&self, region: &str, id: &str) -> Option<&HarvestJobRecord> {
+        self.harvest_jobs.get(&resource_key(region, id))
+    }
+
+    /// Whether `region` holds a HarvestJob under `id`.
+    pub fn has_harvest_job(&self, region: &str, id: &str) -> bool {
+        self.harvest_jobs.contains_key(&resource_key(region, id))
+    }
+
+    /// Store `record` as the HarvestJob `id` of its own Region.
+    pub fn insert_harvest_job(&mut self, record: HarvestJobRecord) {
+        let key = resource_key(&record.region, &record.id);
+        self.harvest_jobs.insert(key, record);
+    }
+
+    /// Every HarvestJob stored in `region`, in id order.
+    pub fn harvest_jobs_in(&self, region: &str) -> impl Iterator<Item = &HarvestJobRecord> {
+        region_slice(&self.harvest_jobs, region)
+    }
+
     /// A fresh lowercase-hex id of `bytes` bytes (so `2 * bytes` characters).
     ///
     /// `minted` advances on every call and is hashed into the seed together with the wall
@@ -1970,42 +2121,64 @@ impl ComAmazonawsMediapackageMediapackageState {
     }
 
     /// The stored tag set of the resource a tagging operation's `ResourceArn` named, for
-    /// a REPORTING operation to render. `None` when this service holds no such resource,
-    /// which is what tells `ListTagsForResource` to report a 404 instead of a tag set.
+    /// a REPORTING operation to render. `None` when this request resolves no such
+    /// resource, which is what tells `ListTagsForResource` to report a 404 instead of a
+    /// tag set.
+    ///
+    /// Resolved like every other read of this regional control plane: only among the
+    /// resources `region` holds, and only when `arn` is the ARN the stored record
+    /// carries — so an ARN naming another Region, another account or another partition
+    /// resolves to nothing rather than to this Region's resource of the same id.
     ///
     /// The same lookup as [`tags_mut`](Self::tags_mut), without the write capability: a
     /// read must not be able to change what a later caller sees.
-    pub fn tags(&self, target: &TaggedResource) -> Option<&BTreeMap<String, String>> {
+    pub fn tags(
+        &self,
+        region: &str,
+        arn: &str,
+        target: &TaggedResource,
+    ) -> Option<&BTreeMap<String, String>> {
         match target {
-            TaggedResource::Channel(id) => self.channels.get(id).map(|record| &record.tags),
-            TaggedResource::OriginEndpoint(id) => {
-                self.origin_endpoints.get(id).map(|record| &record.tags)
-            }
+            TaggedResource::Channel(id) => self
+                .channel(region, id)
+                .filter(|record| record.arn == arn)
+                .map(|record| &record.tags),
+            TaggedResource::OriginEndpoint(id) => self
+                .origin_endpoint(region, id)
+                .filter(|record| record.arn == arn)
+                .map(|record| &record.tags),
         }
     }
 
     /// The stored tag set of the resource a tagging operation's `ResourceArn` named, for
-    /// that operation to change in place. `None` when this service holds no such
+    /// that operation to change in place. `None` when this request resolves no such
     /// resource, which is what tells `TagResource`/`UntagResource` to report a 404
-    /// instead of writing.
-    pub fn tags_mut(&mut self, target: &TaggedResource) -> Option<&mut BTreeMap<String, String>> {
+    /// instead of writing. Scoped exactly as [`tags`](Self::tags) is.
+    pub fn tags_mut(
+        &mut self,
+        region: &str,
+        arn: &str,
+        target: &TaggedResource,
+    ) -> Option<&mut BTreeMap<String, String>> {
         match target {
-            TaggedResource::Channel(id) => {
-                self.channels.get_mut(id).map(|record| &mut record.tags)
-            }
+            TaggedResource::Channel(id) => self
+                .channel_mut(region, id)
+                .filter(|record| record.arn == arn)
+                .map(|record| &mut record.tags),
             TaggedResource::OriginEndpoint(id) => self
-                .origin_endpoints
-                .get_mut(id)
+                .origin_endpoint_mut(region, id)
+                .filter(|record| record.arn == arn)
                 .map(|record| &mut record.tags),
         }
     }
 
-    /// How many stored origin endpoints package `channel_id`. `DeleteChannel` reads it:
-    /// a channel that still has endpoints cannot be deleted, which is what keeps the two
-    /// stores consistent (no endpoint ever names a channel this service no longer holds).
-    pub fn origin_endpoints_of(&self, channel_id: &str) -> usize {
-        self.origin_endpoints
-            .values()
+    /// How many stored origin endpoints OF `region` package `channel_id`.
+    /// `DeleteChannel` reads it: a channel that still has endpoints cannot be deleted,
+    /// which is what keeps the two stores consistent (no endpoint ever names a channel
+    /// this service no longer holds). An endpoint of another Region packages that
+    /// Region's channel of the same id, so it is not counted here.
+    pub fn origin_endpoints_of(&self, region: &str, channel_id: &str) -> usize {
+        self.origin_endpoints_in(region)
             .filter(|record| record.channel_id == channel_id)
             .count()
     }
@@ -2254,9 +2427,11 @@ impl TaggedResource {
 /// anything else: that is a malformed request, which is a different failure from an ARN
 /// naming a resource the service does not hold.
 ///
-/// The partition, region and account fields are not matched: a resource is keyed by its
-/// id, so an ARN minted for this resource in the caller's own account and region names
-/// the same channel or endpoint this store holds.
+/// This decides the resource TYPE and the id the ARN spells, and nothing else: whether
+/// the ARN's partition, region and account name a resource this request can reach is
+/// decided against the stored record by
+/// [`ComAmazonawsMediapackageMediapackageState::tags`], because an ARN whose fields name
+/// another Region or account is well-formed but resolves to nothing.
 pub fn parse_tag_arn(arn: &str) -> Option<TaggedResource> {
     let mut fields = arn.splitn(6, ':');
     if fields.next()? != "arn" {
@@ -2277,15 +2452,6 @@ pub fn parse_tag_arn(arn: &str) -> Option<TaggedResource> {
         "origin_endpoints" => Some(TaggedResource::OriginEndpoint(id.to_string())),
         _ => None,
     }
-}
-
-/// The region an ARN this service minted names (an ARN's fourth field).
-///
-/// A value derived for a stored resource — a playback URL — is re-derived from the
-/// resource's OWN region, not from the region the request that changed it happened to be
-/// signed for, so an update cannot move an existing endpoint's URL to another region.
-pub fn arn_region(arn: &str) -> Option<&str> {
-    arn.split(':').nth(3).filter(|region| !region.is_empty())
 }
 
 /// `arn:aws:mediapackage:<region>:<account>:channels/<id>`.

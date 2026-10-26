@@ -688,6 +688,8 @@ pub const OPERATION_TYPE_PUT_ALARM: &str = "PutAlarm";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DELETE_ALARM: &str = "DeleteAlarm";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_TEST_ALARM: &str = "TestAlarm";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_CERTIFICATE: &str = "CreateCertificate";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_ATTACH_CERTIFICATE_TO_DISTRIBUTION: &str =
@@ -8564,7 +8566,9 @@ pub fn instance_metric_unit(metric_name: &str) -> Option<&'static str> {
 /// documentation: "When this action creates an alarm, the alarm state is
 /// immediately set to INSUFFICIENT_DATA."
 ///
-/// It is also where an alarm of this store STAYS until something moves it: no
+/// It is also where an alarm of this store STAYS until something moves it, and
+/// the one call that moves one is `TestAlarm` — which puts an alarm into the
+/// state its caller asks to test: no
 /// metric an alarm can watch has a datapoint at all (this emulator runs no
 /// instance, container, load balancer or database workload and receives no
 /// measurement of one, which is why `GetInstanceMetricData` and
@@ -8939,7 +8943,7 @@ pub struct StoredAlarm {
     /// The current `AlarmState`. A create sets
     /// [`ALARM_STATE_INSUFFICIENT_DATA`]; an update leaves whatever is here
     /// alone, because "when you update an existing alarm, its state is left
-    /// unchanged".
+    /// unchanged"; and a test sets the state it was asked to test.
     pub state: String,
 }
 
@@ -11285,6 +11289,15 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// The alarm `name` names, for a reporting operation.
     pub fn alarm(&self, name: &str) -> Option<&StoredAlarm> {
         self.alarms.get(name)
+    }
+
+    /// The alarm `name` names, for an operation the spec says mutates it —
+    /// putting it into the state a test asks for.
+    ///
+    /// The name is this record's store key, so it may not be reassigned through
+    /// this handle; no operation in this slice renames an alarm.
+    pub fn alarm_mut(&mut self, name: &str) -> Option<&mut StoredAlarm> {
+        self.alarms.get_mut(name)
     }
 
     /// The contact method `protocol` addresses in `region`, for an operation the

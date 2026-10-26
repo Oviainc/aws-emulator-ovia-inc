@@ -203,27 +203,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The resource path is resolved before anything is looked up: an ARN this
-        // service mints no resource under is a bad request, not a missing resource.
-        if crate::state::campaign_id_from_arn(&input.arn).is_none() {
-            return Err(crate::scaffolded::Scaffolded::wire_coded(
-                crate::state::TAG_BAD_REQUEST_CODE,
-                400,
-                "Invalid input resource arn",
-            ));
-        }
-
-        // The ARN is resolved in the region this request was signed for: a campaign
-        // is only this endpoint's to tag when it was created through it.
+        // The ARN is resolved in the region this request was signed for: a campaign is
+        // only this endpoint's to tag when it was created through it. The resource path
+        // is parsed before anything is looked up, so an ARN this service mints no
+        // resource under is a bad request rather than a missing resource — both
+        // refusals live with the resolution step in `crate::state`.
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
-        let Some(campaign) = store.campaign_by_arn_mut(&region, &input.arn) else {
-            return Err(crate::scaffolded::Scaffolded::wire_coded(
-                crate::state::TAG_NOT_FOUND_CODE,
-                404,
-                "Resource was not found",
-            ));
-        };
+        let campaign = store.tagged_campaign_mut(&region, &input.arn)?;
 
         // Tagging is a merge: a key already on the resource takes the new value, and
         // the keys the request does not name are left alone. The merged map is

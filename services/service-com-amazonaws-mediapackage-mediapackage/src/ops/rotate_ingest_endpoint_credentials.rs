@@ -156,11 +156,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing about a rotation depends on the request beyond its deserialized input:
-        // the channel's ARN, region, `CreatedAt` and its ingest endpoints' ids and URLs
-        // were decided when the channel was created, and the new credentials are
-        // system-generated.
-        let _ = ctx;
+        // The channel's ARN, its Region, its `CreatedAt` and its ingest endpoints' ids
+        // and URLs were decided when the channel was created, and the new credentials are
+        // system-generated; the request's own Region is what decides WHICH channel this
+        // rotation reaches, because MediaPackage is regional.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             RotateIngestEndpointCredentialsErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -177,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // endpoint the RESOLVED channel does not hold is reported against that channel,
         // naming both ids — the lookup was scoped to it, and the same guid may well exist
         // under another channel (`crate::state::child_not_found`).
-        let Some(record) = state.channels.get(&input.id) else {
+        let Some(record) = state.channel(&region, &input.id) else {
             return Err(crate::state::channel_not_found(&input.id).into());
         };
         let Some(position) = record.ingest_endpoint_position(&input.ingest_endpoint_id) else {
@@ -194,8 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (username, password) = state.mint_ingest_credentials();
 
         let record = state
-            .channels
-            .get_mut(&input.id)
+            .channel_mut(&region, &input.id)
             .expect("the channel resolved above, under this one hold of the lock");
         let endpoint = record
             .ingest_endpoints
