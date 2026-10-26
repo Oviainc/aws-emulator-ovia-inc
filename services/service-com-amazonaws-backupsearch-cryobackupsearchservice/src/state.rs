@@ -49,6 +49,12 @@
 //! `ItemsScannedCount` count ([`scanned_items`]) and what `ListSearchJobResults` pages, so
 //! every one of those answers is counted from the records this store holds rather than
 //! assumed by a handler.
+//!
+//! A covered recovery point only reaches that inner layer when its backup index was in a
+//! state a search could read ([`index_searchable`]): one that was not takes no part in the
+//! search — nothing of it is scanned, counted or matched — and is only DISPLAYED, with the
+//! status and status message saying why, by the listing that pages
+//! [`SearchJob::backups`].
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -111,6 +117,28 @@ pub const FAILED: &str = "FAILED";
 /// The statuses a search job never leaves: a scan that ended, a stop that took effect,
 /// or a scan that failed. `CREATING`, `RUNNING` and `STOPPING` are the transient ones.
 pub const TERMINAL_STATES: &[&str] = &[COMPLETED, STOPPED, FAILED];
+
+/// The status a recovery point's record reports for its backup INDEX while that index is
+/// built and readable — the state an index has to be in for the backup to take part in a
+/// search at all (`smithy_query(query="doc", shape="ListSearchJobBackups")`: only a
+/// recovery point whose backup index has a status of `ACTIVE` is included in search
+/// results, and an index in any other status is merely displayed with its status and a
+/// status message).
+///
+/// This value is not in the model's `SearchJobState` enum, which is the type
+/// `SearchJobBackupsResult$Status` carries
+/// (`smithy_query(query="shape", shape="SearchJobBackupsResult")`), and that is not a
+/// contradiction: restJson1 enums are open on the wire, so the index vocabulary the
+/// operation's documentation uses can reach this store as it stands, while a record that
+/// reports a built index in the member's own vocabulary spells it [`COMPLETED`], the
+/// terminal success of that enum. [`SEARCHABLE_INDEX_STATUSES`] holds both spellings.
+pub const INDEX_ACTIVE: &str = "ACTIVE";
+
+/// The backup-index statuses that put a recovery point INSIDE a search — the two
+/// spellings of a built, readable index ([`INDEX_ACTIVE`]) and nothing else, because every
+/// other status (an index that failed, one still being built, one being deleted, or one a
+/// record does not report at all) says the index could not be read.
+pub const SEARCHABLE_INDEX_STATUSES: &[&str] = &[INDEX_ACTIVE, COMPLETED];
 
 /// The comparison an item-filter condition states, as the model's three condition-operator
 /// enums declare them (`types::STRING_CONDITION_OPERATOR_VALUES`,
@@ -740,6 +768,13 @@ pub struct SearchJob {
     /// The recovery points the scan covered, each with the status its backup index had.
     /// `ListSearchJobBackups` pages over exactly this: the recovery points of this account
     /// the job's scope resolved to ([`ComAmazonawsBackupsearchCryobackupsearchserviceState::recovery_points_in_scope`]).
+    ///
+    /// Every recovery point the scope selected is here, INCLUDING one whose backup index
+    /// was in no state to be read ([`index_searchable`]): that listing is where such a
+    /// backup is displayed with the status and status message saying why the search left
+    /// it out, so it is held here while none of its items reach
+    /// [`SearchJob::scan_matches`], [`SearchJob::results`] or either count of the
+    /// scope summary and the progress.
     pub backups: Vec<SearchJobBackupsResult>,
     pub tags: HashMap<String, String>,
     /// The `ClientToken` the call that minted this job carried, if any, with the instant
@@ -1116,6 +1151,11 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
     /// against (a tag filter: a recovery point record here carries no tags, nor does the
     /// model give it any) admits none, because this store holds nothing that can be
     /// shown to match it.
+    ///
+    /// The scope is what the search COVERS, which is wider than what it reads: whether a
+    /// covered recovery point's backup index could be read at all is a separate decision
+    /// ([`index_searchable`]), because a backup left out for that reason is still
+    /// displayed by `ListSearchJobBackups` ([`SearchJob::backups`]).
     pub fn recovery_points_in_scope(&self, scope: &SearchScope) -> Vec<IndexedRecoveryPoint> {
         self.recovery_points
             .iter()
@@ -1366,6 +1406,44 @@ pub fn scan_outcome(recovery_points_in_scope: usize) -> (&'static str, Option<&'
     }
 }
 
+/// Whether the backup index of `point` is in a state a search can read, and so whether
+/// that recovery point takes part in the search at all.
+///
+/// An index that is built is read, and its items are the ones a scan gets through
+/// ([`scanned_items`]); an index in any other state could not be read, so the recovery
+/// point is left OUT of the search — none of its items is scanned, counted or matched,
+/// and the backup itself is only displayed, with the status and status message that say
+/// why, by the listing that pages [`SearchJob::backups`]. A record reporting no index
+/// status at all cannot be shown to hold a readable index, so it is left out too — the
+/// same way the scope resolution treats a record it cannot judge ([`in_scope`]).
+pub fn index_searchable(point: &SearchJobBackupsResult) -> bool {
+    point
+        .status
+        .as_deref()
+        .is_some_and(|status| SEARCHABLE_INDEX_STATUSES.contains(&status))
+}
+
+/// The recovery points of `points` a scan actually READS: the covered ones whose backup
+/// index is in a state a search can read ([`index_searchable`]).
+///
+/// ONE filter behind both layers a job counts, so the backups it reports as to-be-scanned
+/// and the items it scans cannot disagree about which of the covered backups the search
+/// got into.
+fn searched(points: &[IndexedRecoveryPoint]) -> impl Iterator<Item = &IndexedRecoveryPoint> {
+    points
+        .iter()
+        .filter(|point| index_searchable(&point.backup))
+}
+
+/// How many of the covered `points` a scan reads, which is what
+/// `SearchScopeSummary.TotalRecoveryPointsToScanCount` — "the total number of backups that
+/// will be scanned in a search" (`smithy_query(query="shape",shape="SearchScopeSummary")`)
+/// — reports, and what `CurrentSearchProgress.RecoveryPointsScannedCount` reaches once the
+/// scan has got through them.
+pub fn searched_recovery_point_count(points: &[IndexedRecoveryPoint]) -> usize {
+    searched(points).count()
+}
+
 /// The items the backup indexes of `points` hold, in recovery-point order and then index
 /// order, each naming the backup it was found in.
 ///
@@ -1375,9 +1453,12 @@ pub fn scan_outcome(recovery_points_in_scope: usize) -> (&'static str, Option<&'
 /// the matches from. The three members naming the backup are stamped from the recovery
 /// point record the item was read out of, so a result never names a backup it was not
 /// found in and never reports a vault the record does not hold.
+///
+/// Only a recovery point the search could get into contributes items ([`searched`]): the
+/// items indexed under a backup whose index was in no state to be read are not part of
+/// this sequence, so they are neither counted nor matched nor paged.
 pub fn scanned_items(points: &[IndexedRecoveryPoint]) -> Vec<ResultItem> {
-    points
-        .iter()
+    searched(points)
         .flat_map(|point| point.items.iter().map(|item| item_of_backup(item, point)))
         .collect()
 }

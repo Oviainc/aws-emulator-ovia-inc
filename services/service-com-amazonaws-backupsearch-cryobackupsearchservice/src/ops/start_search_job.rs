@@ -16,6 +16,11 @@
 //! makes the scan's completion due — which is when `ListSearchJobResults` can page them
 //! and `ItemsMatchedCount` counts them.
 //!
+//! Both counts are over the covered recovery points the scan can READ: a backup whose
+//! index was in no state to be read ([`crate::state::index_searchable`]) takes no part in
+//! the search, so neither it nor any of its items is scanned, counted, matched or paged —
+//! it is only displayed, with the status saying why, by `ListSearchJobBackups`.
+//!
 //! The clock then owes the job `RUNNING` and after that a terminal status, and WHICH
 //! terminal one follows from the resolved scope: a scan with recovery points in scope
 //! runs to `COMPLETED`, while a scope that resolved to none ends `FAILED` with the
@@ -288,7 +293,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one, so ordinarily the scope resolves to the empty set — and then the scan has
         // nothing to search. The progress starts at nothing scanned: the clock has not
         // run the scan yet.
+        //
+        // The scope says which backups the search COVERS; which of them it can get into
+        // is the state of each one's backup index (`crate::state::index_searchable`), so a
+        // covered recovery point whose index was in no state to be read contributes
+        // neither itself nor its items to what the scan scans. It is still covered, so
+        // `ListSearchJobBackups` displays it with the status saying why it was left out.
         let points = state.recovery_points_in_scope(&input.search_scope);
+        let searched_points = crate::state::searched_recovery_point_count(&points);
         let scanned = crate::state::scanned_items(&points);
         // `@required` on GetSearchJob's output: a job started with no item filters
         // filtered on nothing, which is an `ItemFilters` holding no filter — and a filter
@@ -302,7 +314,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         let search_scope_summary = SearchScopeSummary {
             total_recovery_points_to_scan_count: Some(
-                i32::try_from(points.len()).unwrap_or(i32::MAX),
+                i32::try_from(searched_points).unwrap_or(i32::MAX),
             ),
             total_items_to_scan_count: Some(i64::try_from(scanned.len()).unwrap_or(i64::MAX)),
         };
@@ -316,7 +328,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // in StatusMessage, and anything else runs to COMPLETED.
         let (owed_status, owed_message) = crate::state::scan_outcome(points.len());
         // The recovery points the scan covers are exactly the ones in scope, which is
-        // what `ListSearchJobBackups` reports.
+        // what `ListSearchJobBackups` reports — including one the scan could not get into,
+        // which that listing displays with its status and status message.
         let backups: Vec<SearchJobBackupsResult> =
             points.into_iter().map(|point| point.backup).collect();
 

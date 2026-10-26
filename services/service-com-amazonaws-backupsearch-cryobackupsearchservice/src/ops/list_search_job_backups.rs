@@ -8,6 +8,12 @@
 //! is not a well-formed one at all is refused before the lookup as invalid input —
 //! `ValidationException` (400), see [`crate::state::check_job_identifier`].
 //!
+//! This is the DISPLAY path for a covered backup the search itself left out: a recovery
+//! point whose backup index was in no state to be read
+//! ([`crate::state::index_searchable`]) contributes nothing to the job's counts or results
+//! and is reported here with the status and status message the record holds, which is what
+//! tells a caller why an expected backup is absent from the results.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -175,8 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let mut state = state.lock();
-        // The status each covered backup is reported with is part of what a reader
-        // observes, so materialise what the clock already owed before reporting.
+        // A reader of a job observes what the clock has already made due, so materialise
+        // it before reporting. The per-backup status this listing reports is not part of
+        // that: it is the state of each covered backup's index, held on the record, and no
+        // owed transition of the job moves it.
         state.settle(SystemTime::now());
 
         let job = state.job(&input.search_job_identifier).ok_or_else(|| {
