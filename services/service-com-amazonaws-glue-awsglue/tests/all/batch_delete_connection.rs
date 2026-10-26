@@ -18,7 +18,9 @@
 //! The rows differ along what the rule generalises over: how many names the request
 //! carries (including the published lower bound of an empty list and the upper bound of
 //! 25), which of them the catalog holds, the order they are interleaved in, and whether
-//! the same name is deleted twice (within one request and across two).
+//! the same name is deleted twice (within one request and across two). A request one past
+//! a published bound — of the list or of one name — is refused instead, and the catalog
+//! the batch addresses is the account's own whether it is named or left out.
 
 use std::collections::BTreeMap;
 
@@ -370,6 +372,97 @@ async fn a_name_repeated_in_one_request_is_deleted_once_and_missed_once() {
         !is_stored(&router, "twice-named").await,
         "the connection must be gone after the batch"
     );
+}
+
+/// The request is bounded by the model: `ConnectionNameList` is `DeleteConnectionNameList`
+/// (length 0..25) over `NameString` (length 1..255), so a list one past the published
+/// maximum, or an entry outside the published name length, is refused at the request
+/// boundary — and a refused batch deletes nothing, not even the entries that would have
+/// been valid on their own. The bounds themselves (the empty list and 25 names) are served
+/// by the table above.
+///
+/// Source: `smithy_query(query="shape",shape="DeleteConnectionNameList")`.
+#[tokio::test]
+async fn a_name_list_outside_its_published_bounds_is_refused_and_deletes_nothing() {
+    let router = emulator();
+    let held = "bounded-conn";
+    given_connection(&router, held).await;
+
+    // (case, the names of a request lying one past a published bound)
+    let rows: Vec<(&str, Vec<String>)> = vec![
+        ("one name past the list maximum", {
+            let mut names: Vec<String> =
+                (0..MAX_NAMES).map(|at| format!("filler-{at:02}")).collect();
+            names.push(held.to_string());
+            names
+        }),
+        (
+            "a name one character past the member maximum",
+            vec![held.to_string(), "n".repeat(256)],
+        ),
+        (
+            "a name one character below the member minimum",
+            vec![held.to_string(), String::new()],
+        ),
+    ];
+
+    for (case, names) in rows {
+        let (status, body) = call(
+            &router,
+            "BatchDeleteConnection",
+            &json!({ "ConnectionNameList": names }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a request outside the published bounds must be refused, got \
+             {status} with {body}"
+        );
+        assert!(
+            is_stored(&router, held).await,
+            "case {case:?}: a refused batch must delete nothing, but {held:?} is gone"
+        );
+    }
+}
+
+/// Addressing this account's own catalog EXPLICITLY is the same batch as leaving
+/// `CatalogId` out: "[i]f none is provided, the Amazon Web Services account ID is used by
+/// default" (`BatchDeleteConnectionRequest$CatalogId`), so both spellings delete the same
+/// records and report the same per-entry outcome.
+#[tokio::test]
+async fn the_account_catalog_addressed_explicitly_is_the_default_catalog() {
+    for (case, catalog_id) in [
+        ("the catalog left out", None),
+        ("the catalog named explicitly", Some(ACCOUNT_ID)),
+    ] {
+        let router = emulator();
+        given_connection(&router, "addressed").await;
+
+        let mut request = json!({ "ConnectionNameList": ["addressed", "never-created"] });
+        if let Some(catalog_id) = catalog_id {
+            request["CatalogId"] = json!(catalog_id);
+        }
+        let (status, body) = call(&router, "BatchDeleteConnection", &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the account's own catalog is addressable, got {status} with {body}"
+        );
+        assert_eq!(
+            body["Succeeded"],
+            json!(["addressed"]),
+            "case {case:?}: the held connection must be deleted from the default catalog, got \
+             {body}"
+        );
+        assert_eq!(
+            body["Errors"]["never-created"]["ErrorMessage"].as_str(),
+            Some(expected_miss("never-created").as_str()),
+            "case {case:?}: the absent name must report the connection-miss wording, got {body}"
+        );
+        assert!(
+            !is_stored(&router, "addressed").await,
+            "case {case:?}: the deleted connection must be gone from the default catalog"
+        );
+    }
 }
 
 /// A `CatalogId` naming ANOTHER account is refused as unauthorized, before any entry is
