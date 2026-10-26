@@ -31,6 +31,8 @@ mod event_bus_deletion;
 mod event_bus_lifecycle;
 #[path = "all/global_endpoint.rs"]
 mod global_endpoint;
+#[path = "all/global_endpoint_identity.rs"]
+mod global_endpoint_identity;
 #[path = "all/implicit_default_bus.rs"]
 mod implicit_default_bus;
 #[path = "all/input_validation.rs"]

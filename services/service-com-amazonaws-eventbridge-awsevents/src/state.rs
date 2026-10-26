@@ -1806,17 +1806,43 @@ pub fn endpoint_arn(region: &str, name: &str) -> String {
 /// subdomain EventBridge publishes the endpoint at, so it is minted per
 /// endpoint and never derived from the endpoint's name: two endpoints of one run
 /// cannot share a subdomain.
+///
+/// The URL is how events reach the endpoint, so a subdomain two endpoints shared
+/// would make both unroutable. The id is therefore built from BOTH ends of the
+/// minted value: the first segment from its leading field, which the creation
+/// instant supplies, so ids of separate runs differ; the second from its
+/// trailing field, which is the mint's own per-store counter, so no two
+/// endpoints of one run can be handed the same subdomain however close together
+/// they were created. Each field is kept well inside `EndpointId`'s modelled
+/// `length 1..50`.
 pub fn endpoint_id(unique: &str) -> String {
-    let minted: String = unique
+    /// How many characters of the instant-derived field the subdomain carries.
+    const SUBDOMAIN_WIDTH: usize = 6;
+    /// Smallest number of characters the counter-derived segment carries, so a
+    /// low counter still reads as a subdomain rather than a single digit.
+    const COUNTER_WIDTH: usize = 3;
+
+    let field = |text: &str| -> String {
+        text.chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .map(|character| character.to_ascii_lowercase())
+            .collect()
+    };
+    let mut fields = unique.split('-');
+    let instant = field(fields.next().unwrap_or_default());
+    // The counter is the LAST field the mint formats, and the one that differs
+    // between two ids of a single run.
+    let counter = field(fields.next_back().unwrap_or_default());
+
+    // A field shorter than its segment is padded, so the value satisfies the
+    // modelled pattern whatever the mint handed back; the counter keeps every
+    // character that distinguishes it, with only its leading padding dropped.
+    let subdomain: String = format!("{instant:0<SUBDOMAIN_WIDTH$}")
         .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .map(|character| character.to_ascii_lowercase())
+        .take(SUBDOMAIN_WIDTH)
         .collect();
-    // An id shorter than the two segments is padded, so the value satisfies the
-    // modelled pattern whatever the mint handed back.
-    let padded = format!("{minted:0<9}");
-    let subdomain: String = padded.chars().take(6).collect();
-    let suffix: String = padded.chars().skip(6).take(3).collect();
+    let trimmed = counter.trim_start_matches('0');
+    let suffix = format!("{trimmed:0>COUNTER_WIDTH$}");
     format!("{subdomain}.{suffix}")
 }
 
