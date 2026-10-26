@@ -241,17 +241,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // marked Required must be entered for this field." Both halves are checked
         // against the version's own declaration: a name it does not declare is not a
         // parameter of this extension, and a required one it declares must be given.
-        // The refusal names the extension by its resolved id — the identifier AppConfig
-        // puts in the sentence — whichever form the request addressed it by.
-        let parameters = input.parameters.unwrap_or_default();
-        if let Some(reason) = crate::state::parameter_value_rejection(
-            &version.parameters,
-            &parameters,
-            &extension.id,
-            version.version_number,
-        ) {
+        //
+        // WHICH refusal is answered follows from whether the request carries the member at
+        // all. A request that supplies a map but omits a value the version requires is
+        // told WHICH parameter is missing, named with the extension's resolved id — the
+        // identifier AppConfig puts in that sentence — whichever form the request
+        // addressed it by. A request that supplies no map at all singles out no parameter:
+        // it is told the condition, that the version declares required parameters and
+        // nothing was supplied, with the extension named and the version it was checked
+        // against.
+        let rejection = match input.parameters.as_ref() {
+            Some(parameters) => crate::state::parameter_value_rejection(
+                &version.parameters,
+                parameters,
+                &extension.id,
+                version.version_number,
+            ),
+            None => crate::state::unsupplied_parameters_rejection(
+                &version.parameters,
+                &extension.name,
+                version.version_number,
+            ),
+        };
+        if let Some(reason) = rejection {
             return Err(bad_request(reason));
         }
+        let parameters = input.parameters.unwrap_or_default();
 
         let extension_id = extension.id.clone();
         let extension_arn = version.arn.clone();

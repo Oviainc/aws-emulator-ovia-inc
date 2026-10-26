@@ -673,6 +673,33 @@ pub fn parameter_value_rejection(
         })
 }
 
+/// Why a request that supplies NO parameter-value map at all is not one this service will
+/// store against an extension version declaring `declared`, or `None` when it is.
+///
+/// A request that carries no values has no single parameter at fault, so AppConfig words
+/// this refusal about the REQUEST — the version declares required parameters and nothing
+/// was supplied — and identifies the extension whose declaration was checked and the
+/// version of it, rather than singling out one of the parameters it declares. It names the
+/// extension by the `Name` it answers to, which is the value this template carries, where
+/// the per-value refusal ([`parameter_value_rejection`]) names the system-generated `Id`.
+/// Everything the version declares optional is irrelevant here: a version declaring no
+/// required parameter at all accepts a request that supplies nothing.
+pub fn unsupplied_parameters_rejection(
+    declared: &HashMap<String, Parameter>,
+    extension_name: &str,
+    version_number: i32,
+) -> Option<String> {
+    declared
+        .values()
+        .any(|parameter| parameter.required)
+        .then(|| {
+            format!(
+                "Extension {extension_name} version {version_number} has required \
+                 parameters, but no parameters have been supplied"
+            )
+        })
+}
+
 /// A resource one of this service's tag operations can address, as the resource portion
 /// of its ARN names it.
 ///

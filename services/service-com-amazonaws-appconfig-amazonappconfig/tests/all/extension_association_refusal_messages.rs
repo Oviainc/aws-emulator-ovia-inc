@@ -16,6 +16,11 @@
 //!    system-generated `Id` (never by the caller-chosen `Name`) and the version by its
 //!    number, and states the condition — no value was supplied. Every operation that
 //!    writes a `ParameterValueMap` words it the same way, and the refusal writes nothing.
+//! 3. A create that supplies NO parameter-value member at all against a version declaring
+//!    at least one required parameter singles out no parameter: it is refused with the
+//!    condition — the version has required parameters and nothing was supplied — naming
+//!    the extension by the name it answers to and the version whose declaration was
+//!    checked. A version declaring nothing required accepts such a request.
 //!
 //! The tables span what those rules generalise over: the operation reaching the refusal
 //! (the update and the create for rule 2, the update and the reader for rule 1), the length
@@ -23,19 +28,24 @@
 //! extension comes from (AWS-authored, where the id IS the published name, and created by
 //! this account, where the minted id and the chosen name differ), how many parameters the
 //! version declares required, which of them the map omits, which version of the extension
-//! the association binds, and whether the offending map is empty or carries the values the
-//! version does not require.
+//! the association binds, whether the offending map is empty or carries the values the
+//! version does not require, and — for rule 3 — whether the member is absent or present
+//! and empty, which is what chooses between the two sentences.
 
 use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_appconfig_amazonappconfig::ops::types::ACTION_POINT_VALUES;
-use service_com_amazonaws_appconfig_amazonappconfig::state::AWS_AUTHORED_EXTENSIONS;
+use service_com_amazonaws_appconfig_amazonappconfig::state::{
+    AWS_AUTHORED_EXTENSIONS, AWS_AUTHORED_EXTENSION_VERSION,
+};
 
-use crate::appconfig_workflow::{account, create_application, is_modelled_id, router, Answer};
-use crate::extension_associations::{associate, get_association};
+use crate::appconfig_workflow::{
+    account, create_application, is_modelled_id, json_call, router, Answer,
+};
+use crate::extension_associations::{associate, authored_without_parameter, get_association};
 use crate::extensions::{actions, create_extension, minted_id};
-use crate::resource_tags::arn;
+use crate::resource_tags::{arn, pct};
 use crate::update_extension_association::update_association;
 
 /// The error code of a refusal, without its namespace.
@@ -483,6 +493,311 @@ async fn a_missing_required_value_is_refused_naming_the_extension_by_id() {
             read.json().get("Parameters"),
             Some(&row.valid),
             "case {case:?}: expected the refused update to change nothing, got {}",
+            read.json()
+        );
+    }
+}
+
+/// The message AppConfig answers a request that supplies no parameter values at all with:
+/// the condition — the version declares required parameters and nothing was supplied — the
+/// extension named by the name it answers to, and the version whose declaration was
+/// checked. No parameter is singled out and the sentence carries no trailing stop.
+fn expected_nothing_supplied(extension_name: &str, version: i32) -> String {
+    format!(
+        "Extension {extension_name} version {version} has required parameters, but no \
+         parameters have been supplied"
+    )
+}
+
+/// `POST /extensionassociations` carrying NO `Parameters` member at all — the member is
+/// optional in the model, so a request omitting it is well formed and reaches the handler.
+async fn associate_without_parameters(
+    router: &MultiServiceRouter,
+    extension: &str,
+    pinned: Option<i32>,
+    resource_arn: &str,
+) -> Answer {
+    let mut body = Map::new();
+    body.insert("ExtensionIdentifier".to_string(), Value::from(extension));
+    body.insert("ResourceIdentifier".to_string(), Value::from(resource_arn));
+    if let Some(version) = pinned {
+        body.insert("ExtensionVersionNumber".to_string(), Value::from(version));
+    }
+    associate(router, &Value::Object(body)).await
+}
+
+/// How many associations this account holds for `extension`, read through
+/// `ListExtensionAssociations`, so a refusal that leaked one shows up as a count that grew.
+async fn associations_held(router: &MultiServiceRouter, case: &str, extension: &str) -> usize {
+    let answer = json_call(
+        router,
+        "GET",
+        &format!(
+            "/extensionassociations?extension_identifier={}",
+            pct(extension)
+        ),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "case {case:?}: ListExtensionAssociations expected 200, got {} / {}",
+        answer.status,
+        String::from_utf8_lossy(&answer.body)
+    );
+    answer
+        .json()
+        .get("Items")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default()
+}
+
+/// One create that supplies no parameter-value member at all.
+struct NothingSupplied {
+    case: String,
+    /// The identifier the request addresses the extension by — an id or a name, which the
+    /// message does not depend on.
+    identifier: String,
+    /// The name the refusal must name the extension by.
+    extension_name: String,
+    /// The version the request pins, or `None` to leave the create to take the highest.
+    pinned: Option<i32>,
+    /// The version number the refusal must name.
+    version: i32,
+    /// A parameter that version marks required, which this sentence must NOT single out.
+    required: String,
+}
+
+/// A create supplying no parameter values at all against a version that declares at least
+/// one required parameter is refused with the CONDITION — naming the extension and the
+/// version, singling out no parameter — while a request that does supply a map and omits a
+/// required value keeps the per-parameter sentence, and a version declaring nothing
+/// required accepts a request that supplies nothing. Nothing is written either way.
+#[tokio::test]
+async fn a_create_supplying_no_parameters_is_refused_naming_the_extension_and_version() {
+    let router = router();
+    let application = create_application(&router, "nothing-supplied").await;
+    let resource_arn = arn(&format!("application/{application}"));
+
+    // One extension declaring a required parameter beside an optional one; one declaring
+    // two required; one at TWO versions whose FIRST version requires nothing and whose
+    // second does, so the version's own declaration is what decides; and AppConfig's own
+    // published extension, whose id is its name.
+    let one_required_name = "nothing-supplied-one-required";
+    let one_required = created_extension(
+        &router,
+        one_required_name,
+        declaration(&["mandatory"], &["optional"]),
+        None,
+    )
+    .await;
+    let two_required_name = "nothing-supplied-two-required";
+    let two_required = created_extension(
+        &router,
+        two_required_name,
+        declaration(&["alpha", "zulu"], &[]),
+        None,
+    )
+    .await;
+    let versioned_name = "nothing-supplied-versioned-9f3b5c9b7b01";
+    let versioned = created_extension(&router, versioned_name, declaration(&[], &["optional"]), None)
+        .await;
+    let versioned_again =
+        created_extension(&router, versioned_name, declaration(&["needed"], &[]), Some(1)).await;
+    assert_eq!(
+        versioned, versioned_again,
+        "a second version keeps the extension's id, got {versioned_again:?}"
+    );
+    let (authored_name, authored_parameter) = authored_with_required_parameter();
+
+    let table: Vec<NothingSupplied> = vec![
+        NothingSupplied {
+            case: "one required parameter, the extension addressed by its id".to_string(),
+            identifier: one_required.clone(),
+            extension_name: one_required_name.to_string(),
+            pinned: None,
+            version: 1,
+            required: "mandatory".to_string(),
+        },
+        NothingSupplied {
+            case: "the same extension addressed by its name, with the version pinned"
+                .to_string(),
+            identifier: one_required_name.to_string(),
+            extension_name: one_required_name.to_string(),
+            pinned: Some(1),
+            version: 1,
+            required: "mandatory".to_string(),
+        },
+        NothingSupplied {
+            case: "two required parameters: neither is singled out".to_string(),
+            identifier: two_required.clone(),
+            extension_name: two_required_name.to_string(),
+            pinned: None,
+            version: 1,
+            required: "alpha".to_string(),
+        },
+        NothingSupplied {
+            case: "version 2, whose own declaration requires a value".to_string(),
+            identifier: versioned.clone(),
+            extension_name: versioned_name.to_string(),
+            pinned: Some(2),
+            version: 2,
+            required: "needed".to_string(),
+        },
+        NothingSupplied {
+            case: format!("the published extension {authored_name}"),
+            identifier: authored_name.to_string(),
+            extension_name: authored_name.to_string(),
+            pinned: None,
+            version: AWS_AUTHORED_EXTENSION_VERSION,
+            required: authored_parameter.to_string(),
+        },
+    ];
+
+    for row in &table {
+        let case = &row.case;
+        let held = associations_held(&router, case, &row.identifier).await;
+        let answer =
+            associate_without_parameters(&router, &row.identifier, row.pinned, &resource_arn).await;
+        assert_eq!(
+            answer.status,
+            400,
+            "case {case:?}: expected 400, got {} / {}",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(
+            code(&answer),
+            "BadRequestException",
+            "case {case:?}: expected BadRequestException, got {:?}",
+            code(&answer)
+        );
+        let expected = expected_nothing_supplied(&row.extension_name, row.version);
+        let actual = message(&answer);
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected message {expected:?}, got {actual:?}"
+        );
+        // The sentence is about the request, so it singles out no parameter at all.
+        assert!(
+            !actual.contains("Parameter "),
+            "case {case:?}: a request supplying nothing names no parameter, got {actual:?}"
+        );
+        if !row.extension_name.contains(row.required.as_str()) {
+            assert!(
+                !actual.contains(row.required.as_str()),
+                "case {case:?}: this sentence must not name the required parameter {:?}, got \
+                 {actual:?}",
+                row.required
+            );
+        }
+        assert_eq!(
+            associations_held(&router, case, &row.identifier).await,
+            held,
+            "case {case:?}: the refused create must leak no association"
+        );
+    }
+
+    // The member being ABSENT is what chooses that sentence: the same request carrying an
+    // empty map is present-but-incomplete, which is the per-parameter refusal.
+    for (case, identifier, extension_id, missing) in [
+        (
+            "an empty map against one required parameter",
+            one_required.clone(),
+            one_required.clone(),
+            "mandatory",
+        ),
+        (
+            "an empty map against two required parameters",
+            two_required.clone(),
+            two_required.clone(),
+            "alpha",
+        ),
+        (
+            "an empty map against the published extension",
+            authored_name.to_string(),
+            authored_name.to_string(),
+            authored_parameter,
+        ),
+    ] {
+        let answer = associate(
+            &router,
+            &json!({
+                "ExtensionIdentifier": identifier,
+                "ResourceIdentifier": resource_arn,
+                "Parameters": {},
+            }),
+        )
+        .await;
+        assert_eq!(
+            answer.status,
+            400,
+            "case {case:?}: expected 400, got {} / {}",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        let expected = expected_required(missing, &extension_id, 1);
+        let actual = message(&answer);
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected message {expected:?}, got {actual:?}"
+        );
+    }
+
+    // A version declaring nothing required accepts a request that supplies nothing, and
+    // the association it mints reports the empty map every reader then reports.
+    for (case, identifier, pinned, expected_version) in [
+        (
+            "version 1, which declares only an optional parameter",
+            versioned.clone(),
+            Some(1),
+            1,
+        ),
+        (
+            "the published extension that declares no parameter at all",
+            authored_without_parameter().to_string(),
+            None,
+            AWS_AUTHORED_EXTENSION_VERSION,
+        ),
+    ] {
+        let answer =
+            associate_without_parameters(&router, &identifier, pinned, &resource_arn).await;
+        assert_eq!(
+            answer.status,
+            201,
+            "case {case:?}: expected 201, got {} / {}",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        let created = answer.json();
+        assert_eq!(
+            created.get("Parameters"),
+            Some(&json!({})),
+            "case {case:?}: expected an empty parameter map, got {created}"
+        );
+        assert_eq!(
+            created.get("ExtensionVersionNumber"),
+            Some(&json!(expected_version)),
+            "case {case:?}: expected version {expected_version}, got {created}"
+        );
+        let id = created
+            .get("Id")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("case {case:?}: the create answered no Id: {created}"));
+        let read = get_association(&router, id).await;
+        assert_eq!(
+            read.status,
+            200,
+            "case {case:?}: GetExtensionAssociation expected 200, got {} / {}",
+            read.status,
+            String::from_utf8_lossy(&read.body)
+        );
+        assert_eq!(
+            read.json().get("Parameters"),
+            Some(&json!({})),
+            "case {case:?}: expected the reader to report the empty map, got {}",
             read.json()
         );
     }
