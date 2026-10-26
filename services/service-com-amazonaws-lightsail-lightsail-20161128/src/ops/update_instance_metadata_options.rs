@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateInstanceMetadataOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateInstanceMetadataOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Puts the metadata-service settings the request names on the ONE stored
+//! instance it addresses — leaving a setting it names no value for where it is —
+//! and answers the operation-log entry the change appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateInstanceMetadataOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -184,20 +180,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateInstanceMetadataOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateInstanceMetadataOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateInstanceMetadataOptions"))
+        // `httpTokens`, `httpEndpoint` and `httpProtocolIpv6` each target a
+        // modelled enum and `instanceName` carries the modelled `ResourceName`
+        // pattern, so the centralized walk refused anything outside them before
+        // this body ran. What is left is the one rule the model cannot express:
+        // `httpPutResponseHopLimit` targets a plain integer, and the metadata
+        // service takes a hop limit within the published range. It is checked
+        // BEFORE the first write, so a refused request changes nothing.
+        let instance_name = input.instance_name;
+        if let Some(hop_limit) = input.http_put_response_hop_limit {
+            if !(crate::state::MIN_HTTP_PUT_RESPONSE_HOP_LIMIT
+                ..=crate::state::MAX_HTTP_PUT_RESPONSE_HOP_LIMIT)
+                .contains(&hop_limit)
+            {
+                return Err(invalid(format!(
+                    "httpPutResponseHopLimit {hop_limit} is outside the {} to {} hops the \
+                     instance metadata service accepts",
+                    crate::state::MIN_HTTP_PUT_RESPONSE_HOP_LIMIT,
+                    crate::state::MAX_HTTP_PUT_RESPONSE_HOP_LIMIT
+                )));
+            }
+        }
+        let selection = crate::state::MetadataOptionsSelection {
+            http_tokens: input.http_tokens,
+            http_endpoint: input.http_endpoint,
+            http_put_response_hop_limit: input.http_put_response_hop_limit,
+            http_protocol_ipv6: input.http_protocol_ipv6,
+        };
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            let instance = store
+                .instance_mut(&instance_name)
+                .ok_or_else(|| not_found(&instance_name))?;
+            // The record carries the new selection from here on; the instant the
+            // clock owes the instance the applied options is what leaves the
+            // options — and the log entry for them — non-terminal until then.
+            let applied_at_ms = instance.apply_metadata_options(selection, now);
+            let location = instance.location.clone();
+            // `operation` is ONE entry, not a list: this call acts on the one
+            // instance its request names.
+            Ok(UpdateInstanceMetadataOptionsOutput {
+                operation: Some(
+                    store
+                        .start_operation(
+                            now,
+                            crate::state::OPERATION_TYPE_UPDATE_INSTANCE_METADATA_OPTIONS,
+                            crate::state::RESOURCE_TYPE_INSTANCE,
+                            &instance_name,
+                            &location,
+                            applied_at_ms,
+                        )
+                        .view(),
+                ),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not serve: the modelled `InvalidInputException`, whose message names the
+/// member that is wrong and the rule it broke.
+fn invalid(message: String) -> UpdateInstanceMetadataOptionsError {
+    UpdateInstanceMetadataOptionsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The request names an instance this account does not hold: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the
+/// requested name.
+fn not_found(name: &str) -> UpdateInstanceMetadataOptionsError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_INSTANCE,
+        name,
+    )
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> UpdateInstanceMetadataOptionsError {
+    UpdateInstanceMetadataOptionsErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail instance store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

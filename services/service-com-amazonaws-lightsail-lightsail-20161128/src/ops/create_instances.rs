@@ -344,6 +344,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // `CreateGUISessionAccessDetails` creates one, and nothing
                     // has called it for an instance this call just created.
                     gui_session: None,
+                    // The metadata service of a new instance is configured the
+                    // way Lightsail creates one;
+                    // `UpdateInstanceMetadataOptions` is what changes it.
+                    metadata_options: crate::state::StoredMetadataOptions::default(),
                 });
                 operations.push(
                     store

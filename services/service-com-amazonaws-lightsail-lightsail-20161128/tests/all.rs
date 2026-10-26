@@ -143,6 +143,8 @@ mod instance_error_envelope;
 mod instance_https_setup;
 #[path = "all/instance_lifecycle.rs"]
 mod instance_lifecycle;
+#[path = "all/instance_metadata_options.rs"]
+mod instance_metadata_options;
 #[path = "all/instance_metric_data.rs"]
 mod instance_metric_data;
 #[path = "all/instance_public_ports.rs"]

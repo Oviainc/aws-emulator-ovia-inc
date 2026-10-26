@@ -770,6 +770,10 @@ pub const OPERATION_TYPE_ENABLE_ADD_ON: &str = "EnableAddOn";
 /// The `operationType` the log entry of a `SetIpAddressType` call carries, the
 /// modelled `OperationType` enum's own `SetIpAddressType` member.
 pub const OPERATION_TYPE_SET_IP_ADDRESS_TYPE: &str = "SetIpAddressType";
+/// The `operationType` the log entry of an `UpdateInstanceMetadataOptions` call
+/// carries, the modelled `OperationType` enum's own
+/// `UpdateInstanceMetadataOptions` member.
+pub const OPERATION_TYPE_UPDATE_INSTANCE_METADATA_OPTIONS: &str = "UpdateInstanceMetadataOptions";
 
 // ---------------------------------------------------------------------------
 // Store bounds
@@ -4730,6 +4734,117 @@ pub struct StoredInstance {
     /// the instance, so it lives on the instance's own record: deleting the
     /// instance takes its session with it.
     pub gui_session: Option<StoredGuiSession>,
+    /// How this instance's metadata service is configured — what
+    /// `UpdateInstanceMetadataOptions` sets and `Instance$metadataOptions`
+    /// reports.
+    pub metadata_options: StoredMetadataOptions,
+}
+
+/// The state of an instance's metadata options while the service is still
+/// putting a new selection in place: "`pending` - The metadata options are being
+/// updated. The instance is not yet ready to process metadata traffic with the
+/// new selection" (the modelled `InstanceMetadataOptions$state`).
+pub const INSTANCE_METADATA_STATE_PENDING: &str = "pending";
+/// The state once the selection is in place: "`applied` - The metadata options
+/// have been successfully applied to the instance" (same member).
+pub const INSTANCE_METADATA_STATE_APPLIED: &str = "applied";
+
+/// The `HttpTokens` value a metadata request needs no signed token under, and
+/// the value this setting takes when a request names none:
+/// "If the parameter is not specified in the request, the default state is
+/// `optional`" (the modelled `UpdateInstanceMetadataOptionsRequest$httpTokens`).
+pub const HTTP_TOKENS_OPTIONAL: &str = "optional";
+
+/// The `HttpEndpoint` value an instance's metadata endpoint answers on, which is
+/// how Lightsail creates an instance: the endpoint serves, and
+/// `UpdateInstanceMetadataOptions` is what turns it off.
+pub const HTTP_ENDPOINT_ENABLED: &str = "enabled";
+
+/// The `HttpProtocolIpv6` values the metadata service's IPv6 endpoint takes.
+pub const HTTP_PROTOCOL_IPV6_ENABLED: &str = "enabled";
+/// See [`HTTP_PROTOCOL_IPV6_ENABLED`].
+pub const HTTP_PROTOCOL_IPV6_DISABLED: &str = "disabled";
+
+/// The hop limit an instance's metadata service is created with: a metadata
+/// response reaches the instance itself and goes no further, which is the one
+/// hop a request from the instance needs.
+pub const DEFAULT_HTTP_PUT_RESPONSE_HOP_LIMIT: i32 = 1;
+
+/// The smallest hop limit the metadata service accepts.
+///
+/// The hop limit is the IP time-to-live of the metadata service's PUT response,
+/// so a response has to be allowed at least the ONE hop that reaches the
+/// requesting instance; a limit of zero would let no response arrive at all.
+pub const MIN_HTTP_PUT_RESPONSE_HOP_LIMIT: i32 = 1;
+
+/// The largest hop limit the metadata service accepts — the ceiling the instance
+/// metadata service publishes for this setting, "Possible values: Integers from
+/// 1 to 64" (the EC2 instance metadata service's own
+/// `HttpPutResponseHopLimit`, which a Lightsail instance's metadata service is).
+pub const MAX_HTTP_PUT_RESPONSE_HOP_LIMIT: i32 = 64;
+
+/// One instance's metadata service configuration: the values
+/// `UpdateInstanceMetadataOptions` sets, and the instant the clock owes the
+/// instance a selection that is still being put in place.
+#[derive(Debug, Clone)]
+pub struct StoredMetadataOptions {
+    pub http_tokens: String,
+    pub http_endpoint: String,
+    pub http_put_response_hop_limit: i32,
+    /// What a caller has set the IPv6 metadata endpoint to, and `None` while no
+    /// caller has set it: an instance nobody has configured reaches that
+    /// endpoint exactly when it has IPv6 addressing at all, so the value
+    /// reported then follows the instance's own address type.
+    pub http_protocol_ipv6: Option<String>,
+    /// The instant the selection now being put in place is applied, while one
+    /// is: until then the options report `pending`, and from then on `applied`.
+    pub applied_at_ms: Option<i64>,
+}
+
+impl Default for StoredMetadataOptions {
+    /// The configuration Lightsail creates an instance's metadata service with:
+    /// the endpoint serving, no signed token required, and the one hop that
+    /// reaches the instance. Nothing is in flight, so it is `applied` already.
+    fn default() -> Self {
+        Self {
+            http_tokens: HTTP_TOKENS_OPTIONAL.to_string(),
+            http_endpoint: HTTP_ENDPOINT_ENABLED.to_string(),
+            http_put_response_hop_limit: DEFAULT_HTTP_PUT_RESPONSE_HOP_LIMIT,
+            http_protocol_ipv6: None,
+            applied_at_ms: None,
+        }
+    }
+}
+
+impl StoredMetadataOptions {
+    /// This configuration as the modelled `InstanceMetadataOptions`, for an
+    /// instance whose own addressing is `ip_address_type`.
+    ///
+    /// `state` is read from what is outstanding rather than stored twice: a
+    /// selection the clock still owes the instance is `pending`, and one it has
+    /// nothing left to do for is `applied`.
+    pub fn view(&self, ip_address_type: &str) -> InstanceMetadataOptions {
+        InstanceMetadataOptions {
+            state: Some(
+                if self.applied_at_ms.is_some() {
+                    INSTANCE_METADATA_STATE_PENDING
+                } else {
+                    INSTANCE_METADATA_STATE_APPLIED
+                }
+                .to_string(),
+            ),
+            http_tokens: Some(self.http_tokens.clone()),
+            http_endpoint: Some(self.http_endpoint.clone()),
+            http_put_response_hop_limit: Some(self.http_put_response_hop_limit),
+            http_protocol_ipv6: Some(self.http_protocol_ipv6.clone().unwrap_or_else(|| {
+                if ip_address_type_has_ipv6(ip_address_type) {
+                    HTTP_PROTOCOL_IPV6_ENABLED.to_string()
+                } else {
+                    HTTP_PROTOCOL_IPV6_DISABLED.to_string()
+                }
+            })),
+        }
+    }
 }
 
 /// The device path an instance's system disk is exposed at.
@@ -4791,7 +4906,7 @@ impl StoredInstance {
             }),
             username: blueprint_username(&self.blueprint_id).map(str::to_string),
             ssh_key_name: Some(self.ssh_key_name.clone()),
-            metadata_options: Some(self.metadata_options()),
+            metadata_options: Some(self.metadata_options.view(&self.ip_address_type)),
         }
     }
 
@@ -4918,30 +5033,55 @@ impl StoredInstance {
         }
     }
 
-    /// The instance metadata service's configuration.
+    /// Put `selection` in place on this instance's metadata service, answering
+    /// the instant the clock owes the instance the applied options — `None` when
+    /// they are applied already.
     ///
-    /// `state` is `applied` because nothing is mid-update:
-    /// `UpdateInstanceMetadataOptions` is not part of this slice, so the options
-    /// an instance carries are the ones it was created with. `httpProtocolIpv6`
-    /// follows the instance's own IP address type — an instance without an IPv6
-    /// address cannot reach an IPv6 metadata endpoint. `httpTokens` is `optional`
-    /// and the hop limit is 1, the values Lightsail creates an instance with and
-    /// that `UpdateInstanceMetadataOptions` exists to change.
-    fn metadata_options(&self) -> InstanceMetadataOptions {
-        InstanceMetadataOptions {
-            state: Some("applied".to_string()),
-            http_tokens: Some("optional".to_string()),
-            http_endpoint: Some("enabled".to_string()),
-            http_put_response_hop_limit: Some(1),
-            http_protocol_ipv6: Some(
-                if ip_address_type_has_ipv6(&self.ip_address_type) {
-                    "enabled".to_string()
-                } else {
-                    "disabled".to_string()
-                },
-            ),
+    /// A RUNNING instance is serving metadata traffic under the options it has,
+    /// so a new selection is `pending` until the service has it in place: "When
+    /// you modify the parameters on a running instance, the GetInstance or
+    /// GetInstances API operation initially responds with a state of pending.
+    /// After the parameter modifications are successfully applied, the state
+    /// changes to applied" (the modelled `UpdateInstanceMetadataOptions`
+    /// documentation). An instance that is not running is processing no metadata
+    /// traffic at all, so there is nothing to put in place: the options it will
+    /// serve under are already the new ones.
+    pub fn apply_metadata_options(
+        &mut self,
+        selection: MetadataOptionsSelection,
+        now_ms: i64,
+    ) -> Option<i64> {
+        // "If the parameter is not specified in the request, the default state is
+        // `optional`" — the one member of this input whose absence is a value
+        // rather than "the existing state is maintained".
+        self.metadata_options.http_tokens = selection
+            .http_tokens
+            .unwrap_or_else(|| HTTP_TOKENS_OPTIONAL.to_string());
+        if let Some(http_endpoint) = selection.http_endpoint {
+            self.metadata_options.http_endpoint = http_endpoint;
         }
+        if let Some(hop_limit) = selection.http_put_response_hop_limit {
+            self.metadata_options.http_put_response_hop_limit = hop_limit;
+        }
+        if let Some(http_protocol_ipv6) = selection.http_protocol_ipv6 {
+            self.metadata_options.http_protocol_ipv6 = Some(http_protocol_ipv6);
+        }
+        let applied_at_ms = (self.state == RUNNING)
+            .then(|| now_ms.saturating_add(STATE_TRANSITION_MILLIS));
+        self.metadata_options.applied_at_ms = applied_at_ms;
+        applied_at_ms
     }
+}
+
+/// What one `UpdateInstanceMetadataOptions` request asks of an instance's
+/// metadata service: a member it carries is what that setting becomes, and one
+/// it leaves out is the caller naming no value for it.
+#[derive(Debug, Clone, Default)]
+pub struct MetadataOptionsSelection {
+    pub http_tokens: Option<String>,
+    pub http_endpoint: Option<String>,
+    pub http_put_response_hop_limit: Option<i32>,
+    pub http_protocol_ipv6: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -13544,6 +13684,14 @@ impl ComAmazonawsLightsailLightsail20161128State {
                 if due.at_ms <= now_ms {
                     instance.state = due.state;
                     instance.due = None;
+                }
+            }
+            // A metadata-options selection the service was still putting in
+            // place is in place once its instant has come: the options were
+            // applied then whether or not anybody asked.
+            if let Some(applied_at_ms) = instance.metadata_options.applied_at_ms {
+                if applied_at_ms <= now_ms {
+                    instance.metadata_options.applied_at_ms = None;
                 }
             }
             // An Amazon DCV session runs ON the instance, so it does not survive

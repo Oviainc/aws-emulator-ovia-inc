@@ -491,6 +491,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // created by `CreateGUISessionAccessDetails`, not carried
                     // over from the snapshot.
                     gui_session: None,
+                    // No member of `InstanceSnapshot` reports a metadata
+                    // service configuration, so a restored instance's is the
+                    // one Lightsail creates an instance with, exactly as a
+                    // directly created one's is.
+                    metadata_options: crate::state::StoredMetadataOptions::default(),
                 });
                 // Each mapped disk is restored as a block storage disk of its
                 // own and attached to the new instance at the device path it was
