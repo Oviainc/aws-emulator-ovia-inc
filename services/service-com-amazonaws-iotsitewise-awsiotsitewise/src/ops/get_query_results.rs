@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetQueryResults
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetQueryResults`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation answers the paginated rows of a query a workspace
+//! holds, computed by this service's one query engine
+//! ([`crate::ops::execute_query::run_statement`]) from the statement the query was
+//! started with; this is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetQueryResults::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A query's rows are read, never stored twice: the store keeps the statement of
+//! every query `StartQuery` started, and the rows of that query are what that
+//! statement answers over the same views, through the same entry point the run
+//! itself went through — so the synchronous and the asynchronous query paths cannot
+//! disagree about which statements they admit or which rows they read. The status
+//! this read respects is the one the CLOCK has made due, and nothing here writes:
+//! a query that has not reached `COMPLETED` carries no rows to page.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +93,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::ops::execute_query::QueryFailure;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,20 +165,218 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetQueryResults` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetQueryResultsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            internal_failure("the IoT SiteWise store is unavailable".to_string())
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // Everything this read needs off the store, taken under the lock and
+        // nothing more: the statement of the addressed query, when that query has
+        // results at all. The lock is released before the engine runs, because the
+        // engine takes it itself for as long as it reads the views.
+        let statement = {
+            let store = state.lock();
+            // The results belong to a query OF a workspace, so the workspace the
+            // path names is resolved first, as every handler in this crate
+            // resolves the resource its path names before anything else: a request
+            // that is wrong in both ways reports the resource that is absent.
+            if !store.workspaces.contains_key(&input.workspace_name) {
+                return Err(not_found(crate::state::not_found_message(
+                    crate::state::RESOURCE_WORKSPACE,
+                    &input.workspace_name,
+                )));
+            }
+            let record = store
+                .queries
+                .get(&crate::state::query_key(
+                    &input.workspace_name,
+                    &input.query_id,
+                ))
+                .ok_or_else(|| {
+                    not_found(crate::state::not_found_message(
+                        crate::state::RESOURCE_QUERY,
+                        &input.query_id,
+                    ))
+                })?;
+            // "Returns empty rows if the query is not yet complete": only a query
+            // the clock has taken to `COMPLETED` answered rows, and one that failed
+            // or was cancelled answered none either. The status compared against is
+            // the one the clock has made due — the same one a read of the query
+            // reports — so this read moves nothing on.
+            (record.status(now) == crate::state::QUERY_COMPLETED)
+                .then(|| record.query_statement.clone())
+        };
+
+        // The rows are COMPUTED by this service's one query engine, from the
+        // statement the query was started with, over the same views the run read.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetQueryResults"))
+        // A query's result is therefore a function of two things the store holds —
+        // its statement and the rows the views hold — and of nothing else, so it is
+        // the same for every reader of the same store and no second copy of it can
+        // go stale. What that costs is stated plainly: a write that lands between
+        // two pages of one result changes the rows behind it, exactly as it changes
+        // what the synchronous query path answers, so a client that pages a result
+        // while ingesting into the views it reads is paging over a moving result.
+        let result = match &statement {
+            Some(statement) => Some(
+                crate::ops::execute_query::run_statement(&state, statement)
+                    .await
+                    .map_err(from_engine)?,
+            ),
+            None => None,
+        };
+        // How many rows the result HOLDS, taken from the rows themselves, so every
+        // bound below — the token's range and the page's end — is exact against
+        // what the next step slices.
+        let held = result.as_ref().map_or(0, |run| run.rows_held());
+
+        // `nextToken` is the index of the first row of the next page, in the one
+        // opaque form the engine that issues it owns ([`encode_row_offset`] /
+        // [`decode_row_offset`]), so the two operations that page a query's rows
+        // cannot drift about the form they emit or the text they read back. WHICH
+        // offsets this operation accepts is its own question, answered below: a
+        // token is issued only for a row this result HAS, so an offset at or past
+        // the end is one it never issued, and a query with no rows has no resume
+        // point at all.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                // A token is issued only for a row this result HAS, so an offset at
+                // or past the end is not one this operation issued — including
+                // every offset at all for a query that has no rows to page.
+                if resume >= held {
+                    return Err(invalid_token());
+                }
+                resume
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..10000, which the runtime
+        // validates BEFORE this handler runs, so a value that arrives here is
+        // already in range and nothing is being coerced; `max(1)` only keeps the
+        // slice arithmetic below total.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+        let end = start.saturating_add(max_results).min(held);
+
+        Ok(GetQueryResultsOutput {
+            // "Present when the query status is COMPLETED": the columns the
+            // statement projects, each under the name the result reports it by and
+            // with its type named in this operation's own vocabulary.
+            column_info: result.as_ref().map(|run| {
+                run.columns()
+                    .iter()
+                    .map(|(name, scalar_type)| ColumnInformation {
+                        name: name.clone(),
+                        r#type: column_data_type(scalar_type).to_string(),
+                    })
+                    .collect()
+            }),
+            rows: Some(
+                result
+                    .as_ref()
+                    .map(|run| {
+                        run.text_rows(start..end)
+                            .into_iter()
+                            // A row is modelled as a list of string-encoded column
+                            // values, "positional to match the columnInfo order",
+                            // and the list is `@sparse` — a null cell is a null
+                            // element. The generated row carries a `String` per
+                            // cell, so an absent value is reported as the empty
+                            // string, which `ColumnValue` (length 0..1048576)
+                            // admits, and the position is kept either way.
+                            .map(|row| row.into_iter().map(Option::unwrap_or_default).collect())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            ),
+            next_token: (end < held)
+                .then(|| crate::ops::execute_query::encode_row_offset(end)),
+        })
     }
+}
+
+/// How many rows one page carries when the caller gives no `maxResults`.
+///
+/// CHOSEN, not documented: the member is documented only as "The maximum number of
+/// results to return for each paginated request". It is the ONE constant the
+/// synchronous query path answers with, referenced rather than restated, so a client
+/// paging the rows of a query sees one page size whichever path it read them through
+/// and the two cannot drift. Everything past a page is reachable through
+/// `nextToken`.
+const DEFAULT_MAX_RESULTS: i32 = crate::ops::execute_query::DEFAULT_MAX_RESULTS;
+
+/// The `ScalarType` value the query engine names an integer column's type by.
+const SCALAR_TYPE_INT: &str = "INT";
+
+/// The `ColumnDataType` value this operation names that same type by.
+const COLUMN_DATA_TYPE_INTEGER: &str = "INTEGER";
+
+/// The `ColumnDataType` this result reports for a column the engine typed as
+/// `scalar_type`.
+///
+/// Two vocabularies for one notion, so the translation is stated once, here:
+/// `smithy_query(query="shape", shape="ScalarType")` lists BOOLEAN | INT | DOUBLE |
+/// TIMESTAMP | STRING, and `ColumnDataType` is documented as "The data type of a
+/// column. Valid values are STRING, DOUBLE, BOOLEAN, INTEGER, TIMESTAMP, and
+/// VARIANT". Only the integer type is spelled differently in the two; every other
+/// value is the same word in both, so it is reported as the engine named it.
+fn column_data_type(scalar_type: &str) -> &str {
+    match scalar_type {
+        SCALAR_TYPE_INT => COLUMN_DATA_TYPE_INTEGER,
+        same_in_both => same_in_both,
+    }
+}
+
+/// Decode a `nextToken` back into the row offset it resumes from — through the one
+/// decoder the engine that issues this token form owns, so the two operations that
+/// page a query's rows cannot drift about which tokens they accept.
+fn decode_token(token: &str) -> Result<usize, GetQueryResultsError> {
+    crate::ops::execute_query::decode_row_offset(token).ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never
+/// issued: text that is not one of its tokens, or an offset at or past the end of
+/// the result it was issued for.
+fn invalid_token() -> GetQueryResultsError {
+    invalid_request("The nextToken is not a token this operation issued.".to_string())
+}
+
+/// The query engine's failure in this operation's error channel.
+///
+/// The engine answers in `ExecuteQuery`'s channel, so the kind of failure is read
+/// back from it rather than re-decided here: a statement the engine cannot answer
+/// is this request being invalid, a construct it has not written is the 501 the
+/// emulator reserves for exactly that, and a run that could not be carried out is
+/// the server failure this operation models.
+fn from_engine(error: crate::ops::execute_query::ExecuteQueryError) -> GetQueryResultsError {
+    match crate::ops::execute_query::classify(&error) {
+        QueryFailure::Invalid(message) => invalid_request(message.to_string()),
+        QueryFailure::Unsupported(message) => {
+            GetQueryResultsError::NotImplemented(crate::scaffolded::NotImplemented {
+                message: message.to_string(),
+            })
+        }
+        QueryFailure::Timeout(message) | QueryFailure::Internal(message) => {
+            internal_failure(message.to_string())
+        }
+    }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> GetQueryResultsError {
+    GetQueryResultsErrorModeled::InvalidRequestException(InvalidRequestException { message }).into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> GetQueryResultsError {
+    GetQueryResultsErrorModeled::ResourceNotFoundException(ResourceNotFoundException { message })
+        .into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> GetQueryResultsError {
+    GetQueryResultsErrorModeled::InternalFailureException(InternalFailureException { message })
+        .into()
 }
