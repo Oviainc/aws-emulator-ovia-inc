@@ -101,7 +101,7 @@ use super::types::*;
 // `parentIdentifiers` is matched with `selected_optional`, because a control
 // `EnableControl` applies directly to its target inherits from nothing and so has no
 // parent value for a filter to match.
-use crate::state::{filter_set, selected, selected_optional};
+use crate::state::{filter_set, resolve_control, selected, selected_optional, selected_resolved};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -217,7 +217,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .target_identifier
                     .as_deref()
                     .is_none_or(|target| control.target_identifier == target)
-                    && selected(&control_identifiers, &control.control_identifier)
+                    // A control is selected by the catalog entry a filter value resolves
+                    // to, so an enablement is found by either of the ARN forms that name
+                    // its control, not only by the one the enabling call sent.
+                    && selected_resolved(
+                        &control_identifiers,
+                        &control.control_identifier,
+                        resolve_control,
+                    )
                     && selected_optional(&parent_identifiers, control.parent_identifier.as_deref())
                     && selected(&statuses, control.status.as_wire())
                     && selected(&drift_statuses, control.drift_status.as_wire())
