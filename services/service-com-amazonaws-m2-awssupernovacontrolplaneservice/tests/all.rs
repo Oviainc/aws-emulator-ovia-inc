@@ -15,7 +15,13 @@
 mod application_lifecycle;
 #[path = "all/pre_handler_refusals.rs"]
 mod pre_handler_refusals;
+#[path = "all/refusal_message_rules.rs"]
+mod refusal_message_rules;
 #[path = "all/signed_bluinsights_url.rs"]
 mod signed_bluinsights_url;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+// Not a suite: the wire harness `pre_handler_refusals` and `refusal_message_rules` drive m2
+// through.
+#[path = "all/wire.rs"]
+mod wire;

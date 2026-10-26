@@ -35,13 +35,10 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_m2_awssupernovacontrolplaneservice::EmulatedService;
-use smithy_server_runtime::MultiServiceRouter;
 
-/// The region every request here signs for.
-const REGION: &str = "eu-west-1";
+// The one wire harness of this crate's suites: the router, the request and the answer.
+use super::wire::{call, router, AUTHORIZATION};
 
 /// The error code m2's ARN layer refuses a value that is not an ARN with. Written out
 /// here rather than read from the service's own constant so the value itself is under
@@ -58,95 +55,6 @@ const VALIDATION: &str = "ValidationException";
 /// The code and status m2 denies an unauthorized caller with: the modelled
 /// `AccessDeniedException`, `@httpError(403)`.
 const ACCESS_DENIED: &str = "AccessDeniedException";
-
-/// A SigV4 `Authorization` header naming m2 in [`REGION`]: it is what routes the
-/// request to this service. Signatures are not checked unless a test turns
-/// authentication on, so the signature bytes are filler.
-const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
-     Credential=AKIDTESTM2EXAMPLE/20260101/eu-west-1/m2/aws4_request, \
-     SignedHeaders=host;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000";
-
-/// One answer off the wire: the status, the `x-amzn-errortype` header restJson1
-/// resolves an error shape from, and the parsed body.
-struct Answer {
-    status: u16,
-    error_type: String,
-    body: Value,
-}
-
-impl Answer {
-    /// The error code the body carries (`__type`), which must agree with the header.
-    fn body_type(&self) -> &str {
-        self.body
-            .get("__type")
-            .and_then(Value::as_str)
-            .unwrap_or("<no __type>")
-    }
-
-    /// The `message` member, or a marker when the body carries none.
-    fn message(&self) -> &str {
-        self.body
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("<no message>")
-    }
-}
-
-/// A router serving ONE m2 service over ONE shared engine — the assembly
-/// `core/router` performs, minus the other services. `authenticated` turns request
-/// authentication on, which is what rule 3 needs.
-fn router(authenticated: bool) -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(authenticated);
-    router.register_service(EmulatedService::new(engine));
-    router
-}
-
-/// Dispatch one request. `authorization` is the header value to send, if any — absent
-/// is itself a case for rule 3, and the request still reaches m2 because the `Host`
-/// header names its endpoint.
-async fn call(
-    router: &MultiServiceRouter,
-    method: &str,
-    path_and_query: &str,
-    body: Option<Value>,
-    authorization: Option<&str>,
-) -> Answer {
-    let mut request = http::Request::builder()
-        .method(method)
-        .uri(format!("https://m2.{REGION}.amazonaws.com{path_and_query}"))
-        .header("host", format!("m2.{REGION}.amazonaws.com"));
-    if let Some(value) = authorization {
-        request = request.header("authorization", value);
-    }
-    if body.is_some() {
-        request = request.header("content-type", "application/json");
-    }
-    let bytes = body.map_or_else(Bytes::new, |value| {
-        Bytes::from(serde_json::to_vec(&value).expect("a test body always serializes"))
-    });
-    let response = router
-        .dispatch(request.body(bytes).expect("a valid test request"))
-        .await;
-    let status = response.status().as_u16();
-    let error_type = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("<no x-amzn-errortype>")
-        .to_string();
-    let parsed = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-    };
-    Answer {
-        status,
-        error_type,
-        body: parsed,
-    }
-}
 
 /// The three operations the model binds `resourceArn` on, as (label, method, how the
 /// request carries the rest of the input). Source:
@@ -461,12 +369,8 @@ async fn an_unauthorized_caller_is_denied_with_the_modelled_shape() {
 #[tokio::test]
 async fn a_denied_create_persists_nothing() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut authenticated = MultiServiceRouter::new();
-    authenticated.set_request_authentication(true);
-    authenticated.register_service(EmulatedService::new(engine.clone()));
-    let mut open = MultiServiceRouter::new();
-    open.set_request_authentication(false);
-    open.register_service(EmulatedService::new(engine));
+    let authenticated = super::wire::router_over(engine.clone(), true);
+    let open = super::wire::router_over(engine, false);
 
     let denied = call(
         &authenticated,

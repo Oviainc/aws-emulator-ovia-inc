@@ -158,7 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 GetApplicationVersionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!("no application with the id {}", input.application_id),
+                        message: crate::state::VERSION_LOOKUP_NOT_FOUND.to_string(),
                         resource_id: Some(input.application_id.clone()),
                         resource_type: Some("application".to_string()),
                     },
@@ -170,10 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 GetApplicationVersionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "application {} has no version {}",
-                            input.application_id, input.application_version
-                        ),
+                        message: crate::state::VERSION_LOOKUP_NOT_FOUND.to_string(),
                         resource_id: Some(input.application_id.clone()),
                         resource_type: Some("application-version".to_string()),
                     },

@@ -24,6 +24,10 @@ tracing = { workspace = true }
 # Minting opaque resource identifiers and encoding opaque pagination tokens.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The tree's ONE resource-ARN parse, and the ONE collecting half of a pre-handler
+# constraint refusal (the framework's violations with each echoed value restored to the
+# bytes the caller sent).
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -354,6 +354,40 @@ pub fn definition_content(definition: &crate::ops::types::Definition) -> Option<
     }
 }
 
+/// The message an operation that addresses an APPLICATION by its id refuses an id naming
+/// no application with: `app <applicationId> not found`, built from the id the request
+/// asked for.
+///
+/// m2 words a not-found refusal per LOOKUP, and the lookup of an application by its id is
+/// the one every application-addressed operation performs, so the sentence lives here
+/// rather than in each of them — a caller that reads the id back out of the message gets
+/// the one it sent, whichever operation refused. Recorded behaviour (corpus
+/// `simparity-wire-aws-v1`, fixture `m2-application-not-found-errors` step `task#1`):
+/// `GET /applications/<unknown id>` is answered 404 `ResourceNotFoundException` with
+/// exactly this sentence.
+///
+/// The id is interpolated as the request spelled it; nothing else of the request reaches
+/// the message, and the modelled `Identifier` pattern (`^\S{1,80}$`) is what the boundary
+/// admitted it on.
+pub fn application_not_found_message(application_id: &str) -> String {
+    format!("app {application_id} not found")
+}
+
+/// The message `GetApplicationVersion` refuses a lookup it cannot answer with.
+///
+/// That operation words its not-found as a FIXED sentence rather than the id-bearing form
+/// [`application_not_found_message`] builds — two operations reaching for the same
+/// application state it differently, and each states what the service states (recorded
+/// behaviour: corpus `simparity-wire-aws-v1`, fixture `m2-application-not-found-errors`
+/// step `task#2`, where `GET /applications/<unknown id>/versions/1` is answered 404
+/// `ResourceNotFoundException: Application not found.`).
+///
+/// It covers BOTH ways that lookup fails — an application that is not there and a version
+/// that application never recorded — because the sentence names neither the application
+/// nor the version: the service reports that the version asked for could not be reached,
+/// and nothing in it distinguishes which half was missing.
+pub const VERSION_LOOKUP_NOT_FOUND: &str = "Application not found.";
+
 /// How a definition the emulator cannot read is refused, named once so Create and Update
 /// refuse it identically.
 pub const S3_DEFINITION_UNSUPPORTED: &str =

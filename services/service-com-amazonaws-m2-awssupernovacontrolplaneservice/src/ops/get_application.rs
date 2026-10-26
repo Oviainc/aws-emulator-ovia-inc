@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let application = store.applications.get(&input.application_id).ok_or_else(|| {
             GetApplicationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("no application with the id {}", input.application_id),
+                message: crate::state::application_not_found_message(&input.application_id),
                 resource_id: Some(input.application_id.clone()),
                 resource_type: Some("application".to_string()),
             })
