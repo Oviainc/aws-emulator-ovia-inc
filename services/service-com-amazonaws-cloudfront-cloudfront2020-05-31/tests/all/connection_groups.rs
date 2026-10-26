@@ -239,9 +239,9 @@ impl Create {
     }
 }
 
-/// Two Anycast static IP list ids in the shape CloudFront writes one in. This emulator
-/// holds NO Anycast static IP list (`CreateAnycastIpList` is still a scaffold), so neither
-/// resolves to one — which is what the cases below assert.
+/// Two Anycast static IP list ids in the shape CloudFront writes one in. Nothing in these
+/// cases creates an Anycast static IP list, so this emulator holds none that either id
+/// names - which is what the cases below assert.
 const ANYCAST_LIST_ABSENT: &str = "ipl-08d1a1b2c3d4e5f67";
 const ANYCAST_LIST_ALSO_ABSENT: &str = "ipl-0999888777666555";
 

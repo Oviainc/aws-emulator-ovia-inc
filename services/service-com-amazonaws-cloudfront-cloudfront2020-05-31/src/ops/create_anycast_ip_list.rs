@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAnycastIpList
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAnycastIpList`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAnycastIpList::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an Anycast static IP list: allocates its id, its ARN, the static IP addresses
+//! the list holds and its first version token, stores the submitted name, address type,
+//! IPAM CIDR configurations and tags, and reports the record it stored. The list starts
+//! `Deploying`, and the clock owes it `Deployed`.
+//!
+//! A list NAME identifies one list for its whole life, so a name the store already holds
+//! is refused with `EntityAlreadyExists` rather than creating a second list, and an
+//! `IpCount` outside the value set the member documents is refused with `InvalidArgument`
+//! before anything is allocated.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +86,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::StoredAnycastIpList;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -158,18 +163,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAnycastIpList` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAnycastIpListErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAnycastIpList"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // A tag set no resource can carry (one key named twice, or more tags than a
+        // resource may hold) is refused before anything is allocated. The rule is the
+        // service's one tagging rule, shared with every tagged resource; this operation
+        // models `InvalidTagging` for it, so that is the refusal it reports.
+        let tags = input
+            .tags
+            .as_ref()
+            .map(crate::state::tag_set)
+            .transpose()
+            .map_err(|reason| {
+                CreateAnycastIpListErrorModeled::InvalidTagging(crate::state::invalid_tagging(
+                    reason,
+                ))
+            })?
+            .unwrap_or_default();
+
+        // "The number of static IP addresses that are allocated to the Anycast static IP
+        // list. Valid values: 21 or 3." The member carries no `@range`, so the documented
+        // value set is refused here rather than before the handler runs.
+        if !crate::state::ANYCAST_IP_COUNTS.contains(&input.ip_count) {
+            return Err(CreateAnycastIpListErrorModeled::InvalidArgument(
+                crate::state::invalid_anycast_ip_count(input.ip_count),
+            )
+            .into());
+        }
+
+        // A name identifies ONE Anycast static IP list for its whole life, so a name the
+        // store already holds cannot name a second one. Checked BEFORE anything is minted.
+        if store.anycast_ip_list_named(&input.name).is_some() {
+            return Err(CreateAnycastIpListErrorModeled::EntityAlreadyExists(
+                crate::state::anycast_ip_list_already_exists(&input.name),
+            )
+            .into());
+        }
+
+        // "The IP address type for the Anycast static IP list": the family the addresses
+        // are allocated from. A create that named none allocates IPv4 ones, which is the
+        // family every Anycast static IP list carries.
+        let ip_address_type = input
+            .ip_address_type
+            .unwrap_or_else(|| crate::state::IP_ADDRESS_TYPE_IPV4.to_string());
+
+        // "The static IP addresses that are allocated to the Anycast static IP list":
+        // allocated once, here, and stable for the list's whole life. A pool that cannot
+        // serve this many more addresses is the entity limit this emulator has.
+        let Some(anycast_ips) = store.allocate_anycast_ips(&ip_address_type, input.ip_count) else {
+            return Err(CreateAnycastIpListErrorModeled::EntityLimitExceeded(
+                crate::state::anycast_ip_pool_exhausted(),
+            )
+            .into());
+        };
+
+        // "A list of IPAM CIDR configurations that specify the IP address ranges and IPAM
+        // pool settings for creating the Anycast static IP list": the ranges are stored as
+        // submitted, and their `Status` is the SERVICE's — a range CloudFront has just been
+        // asked for is still being provisioned, and the clock owes it the provisioned
+        // status on the same deadline it owes the list its deployment.
+        let ipam_cidr_configs = input
+            .ipam_cidr_configs
+            .unwrap_or_default()
+            .into_iter()
+            .map(|config| IpamCidrConfig {
+                status: Some(crate::state::IPAM_CIDR_STATUS_PROVISIONING.to_string()),
+                ..config
+            })
+            .collect();
+
+        let id = store.allocate_anycast_ip_list_id();
+        let etag = store.next_etag();
+        let stored = StoredAnycastIpList {
+            arn: crate::state::anycast_ip_list_arn(&id),
+            id: id.clone(),
+            name: input.name,
+            // A list CloudFront has just accepted has not finished deploying its
+            // addresses, so it reports the transient status until the clock owes it the
+            // terminal one.
+            status: crate::state::ANYCAST_IP_LIST_STATUS_DEPLOYING.to_string(),
+            deployed_due: now + crate::state::PROPAGATION_DELAY,
+            ip_address_type,
+            // "The number of IP addresses in the Anycast static IP list" — as many as were
+            // allocated for it.
+            ip_count: input.ip_count,
+            anycast_ips,
+            ipam_cidr_configs,
+            last_modified_time: now,
+            etag: etag.clone(),
+            // Held as the one tag representation every tagged resource uses, so a later
+            // tag read answers from this record rather than from the request that is being
+            // served.
+            tags,
+        };
+        let anycast_ip_list = stored.to_anycast_ip_list();
+        store.anycast_ip_lists.insert(id, stored);
+
+        Ok(CreateAnycastIpListOutput {
+            // "A response structure that includes the version identifier (ETag) and the
+            // created AnycastIpList structure."
+            anycast_ip_list: Some(anycast_ip_list),
+            // "The version identifier for the current version of the Anycast static IP
+            // list" — the token an `If-Match` against this list is checked against.
+            e_tag: Some(etag),
+        })
     }
 }

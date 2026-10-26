@@ -10,7 +10,8 @@
 //! created under it — so a create or update followed by a get, a list, a tag read or a
 //! delete answers from the one record rather than from the request that is being served.
 //!
-//! The same holds for every other resource kind this store carries — a key value store, a
+//! The same holds for every other resource kind this store carries — a key value store, an
+//! Anycast static IP list, a
 //! response headers policy, an origin request policy, a cache policy, an origin access
 //! control, a CloudFront function, a connection function, a public key, a real-time log
 //! configuration: each record is put
@@ -35,7 +36,10 @@
 //! * a distribution tenant CloudFront has just created is `InProgress` until its
 //!   configuration has propagated, and `Deployed` after ([`PROPAGATION_DELAY`]);
 //! * a connection group CloudFront has just created is `InProgress` until its routing
-//!   endpoint has propagated, and `Deployed` after ([`PROPAGATION_DELAY`]).
+//!   endpoint has propagated, and `Deployed` after ([`PROPAGATION_DELAY`]);
+//! * an Anycast static IP list CloudFront has just created is `Deploying` until its
+//!   allocated addresses have been deployed, and `Deployed` after ([`PROPAGATION_DELAY`]),
+//!   and each of its IPAM CIDR configurations is provisioned on the same deadline.
 //!
 //! Each of them is materialised by
 //! [`ComAmazonawsCloudfrontCloudfront20200531State::settle`],
@@ -53,8 +57,8 @@ use std::time::{Duration, SystemTime};
 // their use sites through their full `crate::ops::types::` path rather than added to
 // this list, which every operation added to this service edits.
 use crate::ops::types::{
-    ActiveTrustedKeyGroups, ActiveTrustedSigners, Aliases, AllowedMethods, CacheBehavior,
-    CacheBehaviors,
+    ActiveTrustedKeyGroups, ActiveTrustedSigners, Aliases, AllowedMethods, AnycastIpList,
+    CacheBehavior, CacheBehaviors,
     CachePolicy, CachePolicyAlreadyExists, CachePolicyConfig,
     CachedMethods, CloudFrontOriginAccessIdentity, CloudFrontOriginAccessIdentityConfig,
     CloudFrontOriginAccessIdentitySummary,
@@ -67,7 +71,8 @@ use crate::ops::types::{
     EntityNotFound, FieldLevelEncryptionProfile, FieldLevelEncryptionProfileConfig,
     ForwardedValues,
     FunctionAssociations, GeoRestriction, Invalidation, InvalidationBatch, InvalidationSummary,
-    InvalidTagging, KGKeyPairIds, KeyPairIds, KeyValueStore, LambdaFunctionAssociations,
+    InvalidTagging, IpamCidrConfig, IpamConfig, KGKeyPairIds, KeyPairIds, KeyValueStore,
+    LambdaFunctionAssociations,
     LoggingConfig, ManagedCertificateDetails, ManagedCertificateRequest, MonitoringSubscription,
     NoSuchCachePolicy,
     NoSuchCloudFrontOriginAccessIdentity, NoSuchDistribution, NoSuchInvalidation,
@@ -398,6 +403,73 @@ pub const KVS_STATUS_READY: &str = "READY";
 /// [`KVS_STATUS_PROVISIONING`], short enough that a caller that waits observes the
 /// terminal one. The instant is stored on the record; nothing ever sleeps for it.
 pub const KVS_PROVISIONING_DELAY: Duration = Duration::from_millis(500);
+
+/// `AnycastIpList$Status` while the list's addresses are still being deployed.
+///
+/// The member documents its own values — "The status of the Anycast static IP list. Valid
+/// values: `Deployed`, `Deploying`, or `Failed`." — so a list CloudFront has just accepted
+/// is in this non-terminal one and the clock, not a later call, owes it
+/// [`STATUS_DEPLOYED`]. `Failed` is reachable only by an allocation this emulator never
+/// performs, so nothing here ever reports it.
+pub const ANYCAST_IP_LIST_STATUS_DEPLOYING: &str = "Deploying";
+
+/// What an `AnycastIpList$Id` starts with: the shape CloudFront writes one in, as the
+/// ids in this crate's `ListConnectionGroups` cases show (`ipl-08d1a1b2c3d4e5f67`). The
+/// model puts no pattern on the member, so this is the one place the shape is stated.
+pub const ANYCAST_IP_LIST_ID_PREFIX: &str = "ipl-";
+
+/// How many lowercase hex digits follow [`ANYCAST_IP_LIST_ID_PREFIX`] in an
+/// `AnycastIpList$Id`, from the same ids: one mint draw (64 bits, 16 digits) zero-padded to
+/// this width, so every id this service mints is the width a client reads.
+pub const ANYCAST_IP_LIST_ID_HEX_LEN: usize = 17;
+
+/// The `IpCount` values a create may allocate an Anycast static IP list for:
+/// `CreateAnycastIpListRequest$IpCount` is "The number of static IP addresses that are
+/// allocated to the Anycast static IP list. Valid values: 21 or 3." The member carries no
+/// `@range` in the model, so the documented value set is what admits an `IpCount` and
+/// anything else is an argument CloudFront cannot allocate for
+/// ([`invalid_anycast_ip_count`]).
+pub const ANYCAST_IP_COUNTS: [i32; 2] = [3, 21];
+
+/// `IpAddressType` "ipv4" — "`ipv4` only"
+/// (`smithy_query(query="shape",shape="IpAddressType")`). Also what a create that names no
+/// address type allocates from: the list has to report the family its addresses came from,
+/// and IPv4 is the one every Anycast static IP list carries.
+pub const IP_ADDRESS_TYPE_IPV4: &str = "ipv4";
+
+/// `IpAddressType` "ipv6" — "`ipv6` only".
+pub const IP_ADDRESS_TYPE_IPV6: &str = "ipv6";
+
+/// `IpAddressType` "dualstack" — "`dualstack` - Allocate a list of both IPv4 and IPv6
+/// addresses", so a list of this type carries addresses of BOTH families.
+pub const IP_ADDRESS_TYPE_DUALSTACK: &str = "dualstack";
+
+/// `IpamCidrStatus` while an IPAM CIDR configuration's range is still being provisioned
+/// (`smithy_query(query="shape",shape="IpamCidrStatus")`), which is where a configuration
+/// a create just submitted starts: the status is the service's, never the caller's.
+pub const IPAM_CIDR_STATUS_PROVISIONING: &str = "provisioning";
+
+/// `IpamCidrStatus` once the range has been provisioned — owed by the same clock that owes
+/// the list its deployment, since the provisioning is part of that deployment.
+pub const IPAM_CIDR_STATUS_PROVISIONED: &str = "provisioned";
+
+/// The IPv4 block an Anycast static IP is allocated from: TEST-NET-2, the
+/// `198.51.100.0/24` block reserved for documentation (RFC 5737). The addresses CloudFront
+/// allocates are globally routable ones this emulator cannot hand out, so it allocates from
+/// a block reserved for exactly this purpose rather than from address space that belongs to
+/// somebody.
+pub const ANYCAST_IPV4_PREFIX: &str = "198.51.100.";
+
+/// How many addresses [`ANYCAST_IPV4_PREFIX`]'s block can serve: a `/24` holds 256
+/// addresses, of which the network and broadcast ones are no host address, so host numbers
+/// run 1..=254. It is also the bound on the whole Anycast static IP surface of this
+/// emulator — a create that cannot be served an address from the block is refused with the
+/// modelled `EntityLimitExceeded` ([`anycast_ip_pool_exhausted`]).
+pub const ANYCAST_IP_POOL: u32 = 254;
+
+/// The IPv6 block an Anycast static IP is allocated from: `2001:db8::/32`, reserved for
+/// documentation (RFC 3849), for the reason [`ANYCAST_IPV4_PREFIX`]'s block is.
+pub const ANYCAST_IPV6_PREFIX: &str = "2001:db8::";
 
 /// `ManagedCertificateStatus` while the domains of a CloudFront managed ACM certificate
 /// are still being validated
@@ -1152,7 +1224,7 @@ impl StoredDistribution {
     /// A standard distribution reports the edge domain allocated to it at creation; a
     /// multi-tenant one has no domain of its own and reports
     /// [`MULTI_TENANT_DOMAIN_NAME`]. Read from the STORED configuration, so every
-    /// projection of one record \u2014 `Distribution` and `DistributionSummary` alike \u2014 reports
+    /// projection of one record — `Distribution` and `DistributionSummary` alike — reports
     /// the same value, and a configuration change is reflected by all of them at once.
     pub fn reported_domain_name(&self) -> String {
         if is_multi_tenant(&self.config) {
@@ -1585,6 +1657,107 @@ impl StoredKeyValueStore {
     }
 }
 
+/// One CloudFront Anycast static IP list, as this emulator persists it.
+///
+/// The record is the single source of truth for the list's id, ARN, name, status, address
+/// type, the addresses ALLOCATED to it, its IPAM CIDR configurations, its
+/// `LastModifiedTime` and its version token, so the create, a later read and a later
+/// mutation all answer from it rather than from the request being served.
+#[derive(Debug, Clone)]
+pub struct StoredAnycastIpList {
+    /// `AnycastIpList$Id`, minted at creation. Also the key this list is held under and
+    /// the path segment `GetAnycastIpList` addresses it by.
+    pub id: String,
+    /// `AnycastIpList$Name` — "The name of the Anycast static IP list", as submitted.
+    pub name: String,
+    /// `AnycastIpList$Arn`. CloudFront is a global service, so the ARN carries no region.
+    pub arn: String,
+    /// [`ANYCAST_IP_LIST_STATUS_DEPLOYING`] until
+    /// [`StoredAnycastIpList::deployed_due`], then [`STATUS_DEPLOYED`].
+    pub status: String,
+    /// The instant this list is owed [`STATUS_DEPLOYED`]. Stored rather than slept for.
+    pub deployed_due: SystemTime,
+    /// `AnycastIpList$IpAddressType` — the family the addresses below were allocated
+    /// from, [`IP_ADDRESS_TYPE_IPV4`] when the create named none.
+    pub ip_address_type: String,
+    /// `AnycastIpList$IpCount` — "The number of IP addresses in the Anycast static IP
+    /// list", so it is the length of [`StoredAnycastIpList::anycast_ips`].
+    pub ip_count: i32,
+    /// `AnycastIpList$AnycastIps` — "The static IP addresses that are allocated to the
+    /// Anycast static IP list": allocated ONCE, by the create, and stable for the list's
+    /// whole life, so every later read reports the same addresses.
+    pub anycast_ips: Vec<String>,
+    /// The IPAM CIDR configurations this list was created or updated with, each carrying
+    /// the status the SERVICE put on it. Empty when none were named, which is what makes
+    /// `AnycastIpList$IpamConfig` absent rather than an element describing nothing.
+    pub ipam_cidr_configs: Vec<IpamCidrConfig>,
+    /// `AnycastIpList$LastModifiedTime` — "The last time the Anycast static IP list was
+    /// modified."
+    pub last_modified_time: SystemTime,
+    /// The version token the last mutation handed back, and the single source of truth for
+    /// every `If-Match` check against this list.
+    pub etag: String,
+    /// The tags submitted with the create, in the SAME representation every other tagged
+    /// resource of this service uses, so one tagging rule covers them all.
+    pub tags: TagSet,
+}
+
+impl StoredAnycastIpList {
+    /// Apply the deployment transition the clock owes at `now`.
+    ///
+    /// Idempotent and monotonic, for the reason [`StoredKeyValueStore::settle`] is: it only
+    /// ever moves a non-terminal status to the terminal one, and only once the deadline has
+    /// passed, so a read that calls it cannot change what a later caller sees. An IPAM CIDR
+    /// configuration is provisioned as part of that deployment, so its own status settles
+    /// on the same deadline.
+    pub fn settle(&mut self, now: SystemTime) {
+        if now < self.deployed_due {
+            return;
+        }
+        if self.status == ANYCAST_IP_LIST_STATUS_DEPLOYING {
+            self.status = STATUS_DEPLOYED.to_string();
+        }
+        for config in &mut self.ipam_cidr_configs {
+            if config.status.as_deref() == Some(IPAM_CIDR_STATUS_PROVISIONING) {
+                config.status = Some(IPAM_CIDR_STATUS_PROVISIONED.to_string());
+            }
+        }
+    }
+
+    /// `AnycastIpList$IpamConfig` — "The IPAM configuration for the Anycast static IP
+    /// list, that contains the quantity and list of IPAM CIDR configurations."
+    ///
+    /// `None` for a list created without any: the member is optional, so a list that has no
+    /// IPAM configuration reports none rather than a wrapper stating a quantity of zero.
+    /// `IpamConfig$Quantity` is "The number of IPAM CIDR configurations in the
+    /// `IpamCidrConfigs` list", so it is read off that list rather than stored beside it.
+    pub fn to_ipam_config(&self) -> Option<IpamConfig> {
+        if self.ipam_cidr_configs.is_empty() {
+            return None;
+        }
+        Some(IpamConfig {
+            quantity: i32::try_from(self.ipam_cidr_configs.len()).unwrap_or(i32::MAX),
+            ipam_cidr_configs: self.ipam_cidr_configs.clone(),
+        })
+    }
+
+    /// The `AnycastIpList` projection every Anycast static IP list operation returns, read
+    /// from the one stored record.
+    pub fn to_anycast_ip_list(&self) -> AnycastIpList {
+        AnycastIpList {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            status: self.status.clone(),
+            arn: self.arn.clone(),
+            ip_address_type: Some(self.ip_address_type.clone()),
+            ipam_config: self.to_ipam_config(),
+            anycast_ips: self.anycast_ips.clone(),
+            ip_count: self.ip_count,
+            last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_time),
+        }
+    }
+}
+
 /// One CloudFront continuous deployment policy, as this emulator persists it.
 ///
 /// The record is the single source of truth for the policy's id, its configuration as
@@ -1764,23 +1937,23 @@ pub struct StoredDistributionTenant {
     /// `DistributionTenant$Arn`. CloudFront is a global service, so the ARN carries no
     /// region.
     pub arn: String,
-    /// `DistributionTenant$Name` \u2014 "unique within your Amazon Web Services account. This
+    /// `DistributionTenant$Name` — "unique within your Amazon Web Services account. This
     /// name can't be updated after you create the distribution tenant."
     pub name: String,
-    /// `DistributionTenant$DistributionId` \u2014 the multi-tenant distribution this tenant
+    /// `DistributionTenant$DistributionId` — the multi-tenant distribution this tenant
     /// was created under.
     pub distribution_id: String,
     /// The domains associated with this tenant, in the order the create listed them. Each
     /// is reported as a `DomainResult` in [`DOMAIN_STATUS_ACTIVE`].
     pub domains: Vec<String>,
-    /// `DistributionTenant$ConnectionGroupId` \u2014 the connection group the tenant's viewers
+    /// `DistributionTenant$ConnectionGroupId` — the connection group the tenant's viewers
     /// are routed through: the one the create named, or the account's default one.
     pub connection_group_id: String,
     /// `DistributionTenant$Customizations`, exactly as submitted: these are "specific
     /// values that you can override or disable from the multi-tenant distribution", so the
     /// service supplies nothing of its own here.
     pub customizations: Option<Customizations>,
-    /// `DistributionTenant$Parameters`, exactly as submitted \u2014 the values that fill in the
+    /// `DistributionTenant$Parameters`, exactly as submitted — the values that fill in the
     /// distribution's `TenantConfig$ParameterDefinitions`.
     pub parameters: Vec<Parameter>,
     /// The CloudFront managed ACM certificate requested for this tenant, or `None` when
@@ -1791,7 +1964,7 @@ pub struct StoredDistributionTenant {
     /// The tags submitted with the create, in the one representation every tagged
     /// resource in this store uses.
     pub tags: TagSet,
-    /// `DistributionTenant$Enabled` \u2014 whether the tenant serves traffic.
+    /// `DistributionTenant$Enabled` — whether the tenant serves traffic.
     pub enabled: bool,
     /// [`STATUS_IN_PROGRESS`] until [`StoredDistributionTenant::deployed_due`], then
     /// [`STATUS_DEPLOYED`]: a tenant's configuration reaches the edge locations the same
@@ -3168,6 +3341,19 @@ pub struct ComAmazonawsCloudfrontCloudfront20200531State {
     /// and a repeated name an `EntityAlreadyExists`. A `BTreeMap` for the same reason as
     /// `distributions`: one stable total order for a listing to page through.
     pub key_value_stores: BTreeMap<String, StoredKeyValueStore>,
+    /// Every Anycast static IP list this emulator holds, keyed by its minted id — the
+    /// identifier every Anycast static IP list operation addresses one by, and the id a
+    /// connection group's `AnycastIpListId` resolves against
+    /// ([`ComAmazonawsCloudfrontCloudfront20200531State::holds_anycast_ip_list`]). A
+    /// `BTreeMap` for the same reason as `distributions`: one stable total order for
+    /// `ListAnycastIpLists`'s `Marker` to index into.
+    pub anycast_ip_lists: BTreeMap<String, StoredAnycastIpList>,
+    /// The host number of the next Anycast static IP this store allocates, within the
+    /// blocks [`ANYCAST_IPV4_PREFIX`] and [`ANYCAST_IPV6_PREFIX`] name. One counter for
+    /// both families, so no two addresses this store allocates — of either family — are
+    /// ever rendered from the same number, and the addresses of a list are stable for its
+    /// whole life because nothing ever re-allocates them.
+    pub next_anycast_ip: u32,
     /// Every continuous deployment policy this emulator holds, keyed by its id — the
     /// identifier `GetContinuousDeploymentPolicy` addresses one by. A `BTreeMap` for the
     /// same reason as `distributions`: one stable total order for
@@ -3254,6 +3440,9 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         }
         for key_value_store in self.key_value_stores.values_mut() {
             key_value_store.settle(now);
+        }
+        for anycast_ip_list in self.anycast_ip_lists.values_mut() {
+            anycast_ip_list.settle(now);
         }
         for tenant in self.distribution_tenants.values_mut() {
             tenant.settle(now);
@@ -3538,15 +3727,31 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
 
     /// Whether `id` names an Anycast static IP list this store holds.
     ///
-    /// The Anycast static IP list surface is still a scaffold (`CreateAnycastIpList`), so
-    /// this store holds NONE and no id resolves to one — which is what the
+    /// Every list in the store was put there by `CreateAnycastIpList`, so an id no stored
+    /// list carries is no argument this service can resolve — which is what the
     /// `InvalidArgument` the connection group create and listing answer for one says
-    /// ([`invalid_anycast_ip_list`]). When that create lands it extends this lookup with
-    /// its own store rather than replacing the rule: an `AnycastIpListId` no Anycast
-    /// static IP list carries is no argument this service can resolve. It is also the ONE
-    /// place that will make the filter-matching branch of `ListConnectionGroups` live.
-    pub fn holds_anycast_ip_list(&self, _id: &str) -> bool {
-        false
+    /// ([`invalid_anycast_ip_list`]). The ONE place that resolves an `AnycastIpListId`, so
+    /// every operation that takes one agrees on which ids exist.
+    pub fn holds_anycast_ip_list(&self, id: &str) -> bool {
+        self.anycast_ip_lists.contains_key(id)
+    }
+
+    /// The Anycast static IP list `id` names, or `None` when the store holds none.
+    pub fn anycast_ip_list(&self, id: &str) -> Option<&StoredAnycastIpList> {
+        self.anycast_ip_lists.get(id)
+    }
+
+    /// The Anycast static IP list whose STORED name is `name`, or `None` when none is.
+    ///
+    /// A scan over the stored records rather than a second index beside them, for the
+    /// reason [`ComAmazonawsCloudfrontCloudfront20200531State::origin_access_identity_by_caller_reference`]
+    /// is one: the records are the single source of truth for which names are taken, and
+    /// the collection is bounded by the address pool every list is allocated from
+    /// ([`ANYCAST_IP_POOL`]).
+    pub fn anycast_ip_list_named(&self, name: &str) -> Option<&StoredAnycastIpList> {
+        self.anycast_ip_lists
+            .values()
+            .find(|list| list.name == name)
     }
 
     /// The connection group `identifier` names, or `None` when the store holds none.
@@ -3870,6 +4075,9 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         if let Some(function) = self.connection_function_by_arn(arn) {
             return Some(&function.tags);
         }
+        if let Some(list) = self.anycast_ip_lists.values().find(|list| list.arn == arn) {
+            return Some(&list.tags);
+        }
         self.distribution_tenants
             .values()
             .find(|tenant| tenant.arn == arn)
@@ -3923,6 +4131,15 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .find(|function| function.arn == arn)
         {
             return Some(&mut function.tags);
+        }
+        // The Anycast static IP list arm: a list carries the tags its create submitted, so
+        // it is one of the resource kinds a tagging call addresses by ARN.
+        if let Some(list) = self
+            .anycast_ip_lists
+            .values_mut()
+            .find(|list| list.arn == arn)
+        {
+            return Some(&mut list.tags);
         }
         // The distribution tenant arm, so a tagging call and a tag read agree about every
         // resource kind this store holds and tags.
@@ -4115,6 +4332,73 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
                 break candidate;
             }
         }
+    }
+
+    /// Allocate an Anycast static IP list id no stored list holds.
+    ///
+    /// `AnycastIpList$Id` is "The ID of the Anycast static IP list", and the model puts no
+    /// pattern on it, so the shape is the one CloudFront writes such an id in:
+    /// [`ANYCAST_IP_LIST_ID_PREFIX`] followed by [`ANYCAST_IP_LIST_ID_HEX_LEN`] lowercase
+    /// hex digits. It is rendered from ONE draw of the mint, zero-padded to that width, so
+    /// distinct draws render distinctly and no two lists are minted the same id.
+    pub fn allocate_anycast_ip_list_id(&mut self) -> String {
+        loop {
+            let candidate = format!(
+                "{ANYCAST_IP_LIST_ID_PREFIX}{:0width$x}",
+                self.mint_u64(),
+                width = ANYCAST_IP_LIST_ID_HEX_LEN
+            );
+            if !self.anycast_ip_lists.contains_key(&candidate) {
+                break candidate;
+            }
+        }
+    }
+
+    /// Allocate `ip_count` Anycast static IP addresses of `ip_address_type`, or `None` when
+    /// the pool cannot serve that many more.
+    ///
+    /// "The static IP addresses that are allocated to the Anycast static IP list": the
+    /// addresses are allocated ONCE, here, and the list reports exactly as many of them as
+    /// its `IpCount` — "The number of IP addresses in the Anycast static IP list". The
+    /// families follow the address type: `ipv4` allocates IPv4 addresses, `ipv6` allocates
+    /// IPv6 ones, and `dualstack` is "a list of both IPv4 and IPv6 addresses", so it draws
+    /// alternately from the two blocks and holds at least one of each.
+    ///
+    /// Each address comes off [`ComAmazonawsCloudfrontCloudfront20200531State::next_anycast_ip`],
+    /// so no address is allocated to two lists; `None` once that counter has walked the
+    /// whole of [`ANYCAST_IP_POOL`], which the caller reports as the modelled
+    /// `EntityLimitExceeded`.
+    ///
+    /// The count a caller asks for never sizes the allocation on its own: the pool check
+    /// below runs BEFORE anything is allocated, so the loop that follows runs at most
+    /// [`ANYCAST_IP_POOL`] times whatever the request named, and a count that does not even
+    /// fit the counter is refused there rather than allocated for.
+    pub fn allocate_anycast_ips(
+        &mut self,
+        ip_address_type: &str,
+        ip_count: i32,
+    ) -> Option<Vec<String>> {
+        let wanted = u32::try_from(ip_count).ok()?;
+        if self.next_anycast_ip.checked_add(wanted)? > ANYCAST_IP_POOL {
+            return None;
+        }
+        let addresses = (0..wanted)
+            .map(|offset| {
+                self.next_anycast_ip += 1;
+                let host = self.next_anycast_ip;
+                let ipv6 = match ip_address_type {
+                    IP_ADDRESS_TYPE_IPV6 => true,
+                    IP_ADDRESS_TYPE_DUALSTACK => offset % 2 == 1,
+                    _ => false,
+                };
+                if ipv6 {
+                    format!("{ANYCAST_IPV6_PREFIX}{host:x}")
+                } else {
+                    format!("{ANYCAST_IPV4_PREFIX}{host}")
+                }
+            })
+            .collect();
+        Some(addresses)
     }
 
     /// Allocate a continuous deployment policy id no stored policy holds.
@@ -5076,6 +5360,13 @@ pub fn key_value_store_arn(id: &str) -> String {
 /// recording is what distinguishes them.
 pub fn key_value_store_path(identifier: &str) -> String {
     format!("/2020-05-31/key-value-store/{identifier}")
+}
+
+/// The ARN of an Anycast static IP list. CloudFront is a GLOBAL service, so the ARN's
+/// region segment is empty: `arn:aws:cloudfront::<account>:anycast-ip-list/<Id>`, the
+/// resource type this service's own `/anycast-ip-list` routes name.
+pub fn anycast_ip_list_arn(id: &str) -> String {
+    ::engine::emulator_arn("cloudfront", "", &format!("anycast-ip-list/{id}"))
 }
 
 /// The path of a continuous deployment policy resource under this service's API version.
@@ -7097,6 +7388,64 @@ pub fn invalid_anycast_ip_list(id: &str) -> crate::ops::types::InvalidArgument {
             "An argument is invalid: AnycastIpListId {id} is not an Anycast static IP list of \
              this account"
         )),
+    }
+}
+
+/// The modelled `EntityNotFound` (HTTP 404) for an Anycast static IP list id no stored
+/// list carries — "The entity was not found."
+pub fn anycast_ip_list_not_found(id: &str) -> EntityNotFound {
+    EntityNotFound {
+        message: Some(format!(
+            "The specified Anycast static IP list does not exist: {id}"
+        )),
+    }
+}
+
+/// The modelled `EntityAlreadyExists` (HTTP 409) for an Anycast static IP list name that is
+/// already taken: a name identifies ONE list for its whole life, worded as every other
+/// already-taken name of this service is.
+pub fn anycast_ip_list_already_exists(name: &str) -> EntityAlreadyExists {
+    EntityAlreadyExists {
+        message: Some(format!(
+            "An Anycast static IP list with the name {name} already exists in this account"
+        )),
+    }
+}
+
+/// The modelled `InvalidArgument` (HTTP 400) for an `IpCount` no Anycast static IP list can
+/// be allocated for.
+///
+/// What the refusal states is the CONSTRAINT on the parameter — the value set the member
+/// documents ([`ANYCAST_IP_COUNTS`]) — which a caller cannot work out from the model alone,
+/// since the member carries no `@range`. The value submitted is named beside it, as every
+/// other `InvalidArgument` here names the argument it refused, so a caller that sent
+/// several learns which one broke.
+pub fn invalid_anycast_ip_count(ip_count: i32) -> crate::ops::types::InvalidArgument {
+    let admitted: Vec<String> = ANYCAST_IP_COUNTS.iter().map(i32::to_string).collect();
+    crate::ops::types::InvalidArgument {
+        message: Some(format!(
+            "An argument is invalid: IpCount must be one of {}, not {ip_count}",
+            admitted.join(", ")
+        )),
+    }
+}
+
+/// The modelled `EntityLimitExceeded` (HTTP 400) for a create there are no Anycast static
+/// IP addresses left to allocate for.
+///
+/// CloudFront words a quota refusal as the condition the request would cause — its
+/// `TooManyDistributions` is "Processing your request would cause you to exceed the maximum
+/// number of distributions allowed" — so this states the same thing about what the create
+/// could not be served: the static IP ADDRESSES it asked to have allocated, which is the
+/// condition the caller actually hit. WHY the allocation runs out here is
+/// [`ANYCAST_IP_POOL`]'s doc, which a client never reads.
+pub fn anycast_ip_pool_exhausted() -> crate::ops::types::EntityLimitExceeded {
+    crate::ops::types::EntityLimitExceeded {
+        message: Some(
+            "Processing your request would cause you to exceed the maximum number of \
+             Anycast static IP addresses allowed"
+                .to_string(),
+        ),
     }
 }
 
