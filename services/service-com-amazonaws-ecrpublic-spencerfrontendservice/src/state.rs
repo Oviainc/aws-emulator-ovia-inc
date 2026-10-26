@@ -162,6 +162,14 @@ pub const MAX_PAGE_SIZE: i32 = 1000;
 /// 50." The modelled `TagList` length (0..200) is wider, so this bound is enforced here.
 pub const MAX_TAGS_PER_REPOSITORY: usize = 50;
 
+/// The tag-key namespace AWS keeps for its own tags: a tag under it is a system tag,
+/// which an API caller may neither write nor change.
+///
+/// AWS's resource-tagging rules state the prefix is for AWS use, so a tagging call that
+/// names a key under it is refused rather than stored. `TagKey` carries no `@pattern` in
+/// this model, so a key under it reaches a handler and is refused there.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
 /// The ceiling on how many repositories this store holds, how many images one repository
 /// holds, and how many image tags point into one repository: the three caps that bound
 /// caller-driven growth.
@@ -571,6 +579,31 @@ impl StoredRepository {
         }
     }
 
+    /// Associate `requested` with this repository, keyed by tag key.
+    ///
+    /// `TagResource` documents the merge: "if existing tags on a resource aren't
+    /// specified in the request parameters, they aren't changed" — so a key the request
+    /// names takes the requested value, a key it does not name keeps the value it had,
+    /// and the repository ends up carrying the union of the two sets.
+    ///
+    /// The limit is on what the repository ENDS UP carrying, not on the size of one
+    /// request: re-tagging a key the repository already holds replaces it rather than
+    /// adding to it. Past the limit nothing is written at all, so a refused call leaves
+    /// the repository exactly as it was.
+    pub fn apply_tags(&mut self, requested: BTreeMap<String, String>) -> Result<(), TagProblem> {
+        let resulting = self
+            .tags
+            .keys()
+            .chain(requested.keys())
+            .collect::<BTreeSet<&String>>()
+            .len();
+        if resulting > MAX_TAGS_PER_REPOSITORY {
+            return Err(TagProblem::TooManyTags(TOO_MANY_TAGS_MESSAGE.to_string()));
+        }
+        self.tags.extend(requested);
+        Ok(())
+    }
+
     /// This repository's resource tags as the modelled `TagList`.
     ///
     /// The stored map is keyed by tag key, so the list comes out in key order: a stable
@@ -790,21 +823,49 @@ impl ComAmazonawsEcrpublicSpencerfrontendserviceState {
         &self,
         resource_arn: &str,
     ) -> Result<&StoredRepository, ResourceArnProblem> {
+        let name = self.repository_name_by_arn(resource_arn)?;
+        self.repositories
+            .get(&name)
+            .ok_or_else(|| self.arn_not_found(&name))
+    }
+
+    /// The repository a `resourceArn` names, for a caller that writes to it; the same
+    /// resolution [`Self::repository_by_arn`] makes for a caller that reads it.
+    pub fn repository_by_arn_mut(
+        &mut self,
+        resource_arn: &str,
+    ) -> Result<&mut StoredRepository, ResourceArnProblem> {
+        let name = self.repository_name_by_arn(resource_arn)?;
+        let absent = self.arn_not_found(&name);
+        self.repositories.get_mut(&name).ok_or(absent)
+    }
+
+    /// The NAME of the repository a `resourceArn` names: the one resolution both
+    /// [`Self::repository_by_arn`] and [`Self::repository_by_arn_mut`] are built on, so a
+    /// reader and a writer never disagree about which repository an ARN names.
+    pub fn repository_name_by_arn(
+        &self,
+        resource_arn: &str,
+    ) -> Result<String, ResourceArnProblem> {
         let arn = parse_repository_arn(resource_arn)?;
-        let not_found = || {
-            ResourceArnProblem::RepositoryNotFound(format!(
-                "The repository with name '{}' does not exist in the registry with id '{}'",
-                arn.name, arn.registry_id
-            ))
-        };
         // The ARN this registry mints for the same name, so neither the partition nor
         // the account id is written out here: both come from `engine::emulator_arn`.
         let minted = parse_repository_arn(&self.repository_arn(&arn.name))
-            .map_err(|_| not_found())?;
+            .map_err(|_| self.arn_not_found(&arn.name))?;
         if arn.partition != minted.partition || arn.registry_id != minted.registry_id {
-            return Err(not_found());
+            return Err(self.arn_not_found(&arn.name));
         }
-        self.repositories.get(&arn.name).ok_or_else(not_found)
+        if !self.repositories.contains_key(&arn.name) {
+            return Err(self.arn_not_found(&arn.name));
+        }
+        Ok(arn.name)
+    }
+
+    /// What a tagging call is told about a `resourceArn` no repository of this registry
+    /// answers to: the name asked for and the registry it was looked for in
+    /// ([`Self::repository_not_found_message`]).
+    fn arn_not_found(&self, repository_name: &str) -> ResourceArnProblem {
+        ResourceArnProblem::RepositoryNotFound(self.repository_not_found_message(repository_name))
     }
 }
 
@@ -1236,24 +1297,92 @@ pub fn catalog_data_of(
     }
 }
 
-/// The tags a request supplied, keyed by key.
+/// Why a request's `tags` cannot be applied to a repository.
 ///
-/// `Err` carries the `InvalidTagParameterException` message for a tag that carries no
-/// key: a tag is a key-value pair whose key "acts like a category" (`Tag$Key`), so
-/// there is nothing to store without one. The modelled 1..128 / 0..256 lengths are
-/// already refused before a handler runs.
-pub fn stored_tags(tags: Option<&Vec<Tag>>) -> Result<BTreeMap<String, String>, String> {
+/// Each variant is one of the modelled refusals every tagging operation declares, so a
+/// handler maps a variant onto its own error enum rather than deciding for itself which
+/// error a tag problem is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagProblem {
+    /// A tag this registry cannot store as a pair at all (one carrying no key), or a tag
+    /// key no caller may write (one under the namespace AWS keeps for its own tags,
+    /// [`RESERVED_TAG_KEY_PREFIX`]). Answered as `InvalidTagParameterException`.
+    InvalidTagParameter(String),
+    /// A write that would leave the repository carrying more than
+    /// [`MAX_TAGS_PER_REPOSITORY`] tags. Answered as `TooManyTagsException`.
+    TooManyTags(String),
+}
+
+impl TagProblem {
+    /// The text the refusal carries.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::InvalidTagParameter(message) | Self::TooManyTags(message) => message,
+        }
+    }
+}
+
+/// What a caller is told about a tag key in the namespace AWS keeps for its own tags
+/// ([`RESERVED_TAG_KEY_PREFIX`]): a tag under it belongs to the system rather than to the
+/// caller, so neither writing one nor changing one is something an API caller may do.
+///
+/// The text is the service's own, fixed and request-independent: it states who may not
+/// make the change rather than which key was asked for, so it has no variable part to
+/// fill and never echoes the rejected key.
+pub const SYSTEM_TAG_KEY_MESSAGE: &str =
+    "Caller is an end user and not allowed to mutate system tags";
+
+/// What `TooManyTagsException` states for a write that would leave a repository over the
+/// tag limit ([`MAX_TAGS_PER_REPOSITORY`]).
+///
+/// Fixed and request-independent, like [`SYSTEM_TAG_KEY_MESSAGE`]: it states that the
+/// limit was passed and names neither the limit nor how far past it the request went, so
+/// there is nothing in it to fill from the request.
+pub const TOO_MANY_TAGS_MESSAGE: &str = "The number of tags exceeds the limit";
+
+/// What a tagging WRITE is told about a `resourceArn` that is not a well-formed ECR
+/// Public repository ARN: the parameter-constraint form this service words every refused
+/// parameter in, naming `resourceArn` and the step that could not be completed.
+///
+/// The tag READ words the same member's refusal as [`INVALID_ARN_MESSAGE`]: the two paths
+/// state the clause differently, so neither message is shared between them.
+pub const UNPARSEABLE_ARN_MESSAGE: &str =
+    "Invalid parameter at 'resourceArn' failed to satisfy constraint: 'Unable to parse ARN'";
+
+/// The tags a request supplied, keyed by key, once every one of them is a tag a caller
+/// may write.
+///
+/// A tag is a key-value pair whose key "acts like a category" (`Tag$Key`), so a pair with
+/// no key is nothing this registry can store; a key in the namespace AWS keeps for its own
+/// tags ([`RESERVED_TAG_KEY_PREFIX`]) names a system tag, which an API caller may not
+/// write ([`SYSTEM_TAG_KEY_MESSAGE`]). The modelled 1..128 / 0..256 lengths are already
+/// refused before a handler runs. Two tags sharing a key are one tag of that key: the
+/// request's last value for it is what gets stored.
+pub fn stored_tags(tags: Option<&Vec<Tag>>) -> Result<BTreeMap<String, String>, TagProblem> {
     let mut stored = BTreeMap::new();
     for tag in tags.map(Vec::as_slice).unwrap_or_default() {
         let Some(key) = tag.key.as_deref().filter(|key| !key.is_empty()) else {
-            return Err("Invalid tag: a tag must specify a Key".to_string());
+            return Err(TagProblem::InvalidTagParameter(
+                "Invalid tag: a tag must specify a Key".to_string(),
+            ));
         };
-        stored.insert(
-            key.to_string(),
-            tag.value.clone().unwrap_or_default(),
-        );
+        if is_system_tag_key(key) {
+            return Err(TagProblem::InvalidTagParameter(
+                SYSTEM_TAG_KEY_MESSAGE.to_string(),
+            ));
+        }
+        stored.insert(key.to_string(), tag.value.clone().unwrap_or_default());
     }
     Ok(stored)
+}
+
+/// Whether `key` names a system tag: one in the namespace AWS keeps for its own tags
+/// ([`RESERVED_TAG_KEY_PREFIX`]).
+///
+/// The prefix is a literal, so it is matched case-sensitively: a key spelled with any
+/// other casing is an ordinary key of the caller's own.
+pub fn is_system_tag_key(key: &str) -> bool {
+    key.starts_with(RESERVED_TAG_KEY_PREFIX)
 }
 
 /// One page of a listing, and the token that resumes after it.

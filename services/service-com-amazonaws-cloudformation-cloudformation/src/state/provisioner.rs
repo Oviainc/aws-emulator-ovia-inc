@@ -718,7 +718,10 @@ impl Provisioner {
     /// run — and Amazon Data Firehose's `CreateDeliveryStream`, whose `TagKey` shape is
     /// modelled with the reserved prefix excluded, the same check its `TagDeliveryStream`
     /// makes. CodeCommit's `CreateRepository` is in the same position: a tag key in that
-    /// namespace is its `InvalidSystemTagUsageException`. AWS WAF's four WAFv2 entity
+    /// namespace is its `InvalidSystemTagUsageException`, and Amazon ECR Public's
+    /// `CreateRepository` is the same case: a key in that namespace is the
+    /// `InvalidTagParameterException` its own crate's tag validation answers, the one check
+    /// its `TagResource` runs too. AWS WAF's four WAFv2 entity
     /// creates are the same case again: each takes a `TagList` and refuses a key in the
     /// reserved namespace in its own crate's tag validation, the one check `TagResource`
     /// runs too.
@@ -728,6 +731,7 @@ impl Provisioner {
             Self::IamRole
                 | Self::CodePipelinePipeline
                 | Self::EcsCluster
+                | Self::EcrPublicRepository
                 | Self::FirehoseDeliveryStream
                 | Self::S3VectorsVectorBucket
                 | Self::S3VectorsIndex

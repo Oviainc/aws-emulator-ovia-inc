@@ -1503,17 +1503,12 @@ async fn the_operations_this_slice_does_not_cover_still_answer_501() {
     // The remaining operations are filed as their own gap issues; a stub must answer 501
     // `NotImplemented`, never an empty 200 that a client cannot tell from a real answer.
     // (`DescribeImageTags` left this list when it was implemented —
-    // `tests/all/image_tag_details.rs` drives it now.)
-    for (operation, body) in [
-        (
-            "TagResource",
-            json!({"resourceArn": format!("{ARN_PREFIX}team/app"), "tags": []}),
-        ),
-        (
-            "UntagResource",
-            json!({"resourceArn": format!("{ARN_PREFIX}team/app"), "tagKeys": []}),
-        ),
-    ] {
+    // `tests/all/image_tag_details.rs` drives it now; `TagResource` left it the same way —
+    // `tests/all/tag_resource.rs` drives it.)
+    for (operation, body) in [(
+        "UntagResource",
+        json!({"resourceArn": format!("{ARN_PREFIX}team/app"), "tagKeys": []}),
+    )] {
         let (status, parsed) = call(&router, operation, body).await;
         assert_eq!(
             status, 501,

@@ -178,11 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if requested_tags > crate::state::MAX_TAGS_PER_REPOSITORY {
             return Err(CreateRepositoryErrorModeled::TooManyTagsException(
                 TooManyTagsException {
-                    message: Some(format!(
-                        "Too many tags: {requested_tags} were supplied, and the maximum \
-                         number of tags that can be applied to a repository is {}",
-                        crate::state::MAX_TAGS_PER_REPOSITORY
-                    )),
+                    message: Some(crate::state::TOO_MANY_TAGS_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -190,14 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let tags = match crate::state::stored_tags(input.tags.as_ref()) {
             Ok(tags) => tags,
-            Err(message) => {
-                return Err(CreateRepositoryErrorModeled::InvalidTagParameterException(
-                    InvalidTagParameterException {
-                        message: Some(message),
-                    },
-                )
-                .into())
-            }
+            Err(problem) => return Err(tag_error(problem)),
         };
 
         let catalog_data =
@@ -264,6 +253,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(output)
     }
+}
+
+/// The modelled refusal for a `tags` list this registry cannot apply, each
+/// [`crate::state::TagProblem`] on the error this operation models for it.
+fn tag_error(problem: crate::state::TagProblem) -> CreateRepositoryError {
+    let message = Some(problem.message().to_string());
+    match problem {
+        crate::state::TagProblem::InvalidTagParameter(_) => {
+            CreateRepositoryErrorModeled::InvalidTagParameterException(
+                InvalidTagParameterException { message },
+            )
+        }
+        crate::state::TagProblem::TooManyTags(_) => {
+            CreateRepositoryErrorModeled::TooManyTagsException(TooManyTagsException { message })
+        }
+    }
+    .into()
 }
 
 /// The modelled server fault for a state store this service could not reach.
