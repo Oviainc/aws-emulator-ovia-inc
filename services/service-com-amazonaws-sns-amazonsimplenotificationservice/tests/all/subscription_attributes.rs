@@ -160,13 +160,13 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
             false,
             &[
                 "ConfirmationWasAuthenticated",
-                "EffectiveDeliveryPolicy",
                 "Endpoint",
                 "Owner",
                 "PendingConfirmation",
                 "Protocol",
                 "RawMessageDelivery",
                 "SubscriptionArn",
+                "SubscriptionPrincipal",
                 "TopicArn",
             ],
         ),
@@ -179,7 +179,6 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
             false,
             &[
                 "ConfirmationWasAuthenticated",
-                "EffectiveDeliveryPolicy",
                 "Endpoint",
                 "FilterPolicy",
                 // A filter policy is applied under a scope, so the documented default
@@ -190,6 +189,7 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
                 "Protocol",
                 "RawMessageDelivery",
                 "SubscriptionArn",
+                "SubscriptionPrincipal",
                 "TopicArn",
             ],
         ),
@@ -202,13 +202,13 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
             false,
             &[
                 "ConfirmationWasAuthenticated",
-                "EffectiveDeliveryPolicy",
                 "Endpoint",
                 "Owner",
                 "PendingConfirmation",
                 "Protocol",
                 "RawMessageDelivery",
                 "SubscriptionArn",
+                "SubscriptionPrincipal",
                 "TopicArn",
             ],
         ),
@@ -221,7 +221,8 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
             true,
             &[
                 "ConfirmationWasAuthenticated",
-                // Every subscription delivers under an effective policy: the account
+                // A delivery policy retries a failed delivery to an HTTP/S endpoint, so
+                // such a subscription reports the one it is run under: the account
                 // system defaults with the topic's and its own laid over them.
                 "EffectiveDeliveryPolicy",
                 "Endpoint",
@@ -230,6 +231,7 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
                 "Protocol",
                 "RawMessageDelivery",
                 "SubscriptionArn",
+                "SubscriptionPrincipal",
                 "TopicArn",
             ],
         ),
@@ -250,6 +252,7 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
                 "Protocol",
                 "RawMessageDelivery",
                 "SubscriptionArn",
+                "SubscriptionPrincipal",
                 "TopicArn",
             ],
         ),
@@ -262,14 +265,17 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
             false,
             &[
                 "ConfirmationWasAuthenticated",
+                // The policy its owner SET is reported because its owner set it; the
+                // effective one is not, because no delivery to a queue is retried under
+                // a delivery policy.
                 "DeliveryPolicy",
-                "EffectiveDeliveryPolicy",
                 "Endpoint",
                 "Owner",
                 "PendingConfirmation",
                 "Protocol",
                 "RawMessageDelivery",
                 "SubscriptionArn",
+                "SubscriptionPrincipal",
                 "TopicArn",
             ],
         ),
@@ -282,13 +288,13 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
             true,
             &[
                 "ConfirmationWasAuthenticated",
-                "EffectiveDeliveryPolicy",
                 "Endpoint",
                 "Owner",
                 "PendingConfirmation",
                 "Protocol",
                 "RawMessageDelivery",
                 "SubscriptionArn",
+                "SubscriptionPrincipal",
                 "TopicArn",
             ],
         ),
@@ -307,13 +313,13 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
             false,
             &[
                 "ConfirmationWasAuthenticated",
-                "EffectiveDeliveryPolicy",
                 "Endpoint",
                 "Owner",
                 "PendingConfirmation",
                 "Protocol",
                 "RawMessageDelivery",
                 "SubscriptionArn",
+                "SubscriptionPrincipal",
                 "SubscriptionRoleArn",
                 "TopicArn",
             ],
@@ -327,7 +333,6 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
             false,
             &[
                 "ConfirmationWasAuthenticated",
-                "EffectiveDeliveryPolicy",
                 "Endpoint",
                 "Owner",
                 "PendingConfirmation",
@@ -335,6 +340,7 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
                 "RawMessageDelivery",
                 "RedrivePolicy",
                 "SubscriptionArn",
+                "SubscriptionPrincipal",
                 "TopicArn",
             ],
         ),
@@ -355,12 +361,16 @@ async fn subscription_attributes_are_projected_from_the_persisted_subscription()
         // Each key carries its OWN value: the identity and routing the subscription was
         // minted with, read back out of the persisted record.
         let held = attribute_map(&answer);
+        let principal = format!("arn:aws:iam::{}:user/emulator", account_of(&arn));
         for (name, expected) in [
             ("SubscriptionArn", arn.as_str()),
             ("TopicArn", topic.as_str()),
             ("Protocol", *protocol),
             ("Endpoint", *endpoint),
             ("Owner", account_of(&arn).as_str()),
+            // The principal that created the subscription: the identity this emulator's
+            // credentials present, which is what `sts:GetCallerIdentity` reports too.
+            ("SubscriptionPrincipal", principal.as_str()),
         ] {
             assert_eq!(
                 held.get(name).map(String::as_str),

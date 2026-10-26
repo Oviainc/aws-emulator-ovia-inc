@@ -7,18 +7,18 @@
 //! The rule under test: `PublishBatch` publishes each entry of the batch to the topic
 //! its `TopicArn` names, in request order, reporting EVERY entry's own result
 //! individually — a `Successful` member carrying that entry's `Id`, a freshly minted
-//! `MessageId` and (for a FIFO topic only) an increasing `SequenceNumber`, or a `Failed`
-//! member carrying that entry's `Id` and the error code a single `Publish` of that
-//! message would have been refused with — and refusing the request as a whole only on
-//! the batch-level conditions the model names: no entries
-//! (`EmptyBatchRequestException`), more than ten (`TooManyEntriesInBatchRequestException`),
-//! an `Id` outside its documented form (`InvalidBatchEntryIdException`), two entries
-//! sharing an `Id` (`BatchEntryIdsNotDistinctException`), a combined size over the
-//! topic's ceiling (`BatchRequestTooLongException`) and a topic that is not stored
-//! (`NotFoundException`).
+//! `MessageId` and (for a FIFO topic only) an increasing `SequenceNumber` — and refusing
+//! the request AS A WHOLE both on the batch-level conditions the model names (no entries,
+//! `EmptyBatchRequestException`; more than ten,
+//! `TooManyEntriesInBatchRequestException`; an `Id` outside its documented form,
+//! `InvalidBatchEntryIdException`; two entries sharing an `Id`,
+//! `BatchEntryIdsNotDistinctException`; a combined size over the topic's ceiling,
+//! `BatchRequestTooLongException`; a topic that is not stored, `NotFoundException`) and
+//! when ANY ONE entry breaks a per-message rule a single `Publish` of it would be refused
+//! for (`InvalidParameterException`) — in which case no entry of the batch is published.
 //!
 //! The rows differ in entry count, body size and form, which members an entry carries,
-//! topic type and which entries of one batch are acceptable — what the rule generalises
+//! topic type and which entry of one batch is unacceptable — what the rule generalises
 //! over. The recorded `PublishBatch` call is one row of the first table.
 
 use std::collections::{HashMap, HashSet};
@@ -472,11 +472,11 @@ async fn publish_batch_refuses_the_batch_level_failures_the_model_names() {
     );
 }
 
-/// An entry SNS would refuse a single `Publish` for fails on its own: the call is still
-/// answered 200, the entry is reported under `Failed` with the single-publish error
-/// code, and every other entry of the same batch is published.
+/// An entry SNS would refuse a single `Publish` for refuses the WHOLE request: the
+/// per-message rules are judged for every entry before any of them is published, the call
+/// answers 400 `InvalidParameter`, and not one sibling of the refused entry is published.
 #[tokio::test]
-async fn publish_batch_reports_a_failed_entry_beside_the_published_ones() {
+async fn publish_batch_refuses_the_whole_request_for_an_entry_publish_would_refuse() {
     let sns = Sns::new();
     let topic = sns.topic("batch-mixed-topic").await;
     let subscription = sns
@@ -530,8 +530,9 @@ async fn publish_batch_reports_a_failed_entry_beside_the_published_ones() {
         .filter(|(_, _, publishes)| *publishes)
         .map(|(_, entry, _)| entry.clone())
         .collect();
-    // One batch per refused entry, each paired with the two publishable ones, so a
-    // refused entry is never the whole batch and the ten-entry maximum still holds.
+    // One batch per refused entry, each paired with the two publishable ones, so the
+    // refused entry is never the whole batch: what the rows show is that a sibling AWS
+    // would never have accepted the batch for is not published either.
     for (case, entry, publishes) in &cases {
         if *publishes {
             continue;
@@ -540,51 +541,32 @@ async fn publish_batch_reports_a_failed_entry_beside_the_published_ones() {
         batch.insert(1, entry.clone());
         let answer = publish_batch(&sns, &topic, &batch).await;
         assert_eq!(
-            answer.status, 200,
-            "case {case:?}: a per-entry failure must still answer 200, got {} / {}",
+            answer.status, 400,
+            "case {case:?}: one unpublishable entry must refuse the whole request, got {} / {}",
             answer.status, answer.body
         );
         assert_eq!(
-            ids(&answer, "Successful"),
-            vec!["ok-first".to_string(), "ok-last".to_string()],
-            "case {case:?}: the acceptable entries must still be published, got {}",
+            answer.code(),
+            "InvalidParameter",
+            "case {case:?}: expected the single-publish error code, got {}",
             answer.body
-        );
-        let failed = result_entries(&answer, "Failed");
-        assert_eq!(
-            failed.len(),
-            1,
-            "case {case:?}: exactly the refused entry must fail, got {}",
-            answer.body
-        );
-        assert_eq!(
-            failed[0].get("Id").map(String::as_str),
-            Some(entry.id.as_str()),
-            "case {case:?}: the failure must name its own entry, got {:?}",
-            failed[0]
-        );
-        assert_eq!(
-            failed[0].get("Code").map(String::as_str),
-            Some("InvalidParameter"),
-            "case {case:?}: expected the single-publish error code, got {:?}",
-            failed[0]
-        );
-        assert_eq!(
-            failed[0].get("SenderFault").map(String::as_str),
-            Some("true"),
-            "case {case:?}: a per-message rule is the caller's, got {:?}",
-            failed[0]
         );
         assert!(
-            failed[0]
-                .get("Message")
-                .is_some_and(|message| !message.is_empty()),
-            "case {case:?}: the failure must say why, got {:?}",
-            failed[0]
+            ids(&answer, "Successful").is_empty() && ids(&answer, "Failed").is_empty(),
+            "case {case:?}: a refused request reports no per-entry result, got {}",
+            answer.body
         );
     }
 
-    let refused = cases.iter().filter(|(_, _, ok)| !*ok).count();
+    // The batch of the publishable entries ALONE is published, so each row above was
+    // refused for the entry it added and not for the siblings it shares with this one.
+    let answer = publish_batch(&sns, &topic, &entries).await;
+    assert_eq!(
+        answer.status, 200,
+        "the publishable entries alone must be accepted, got {} / {}",
+        answer.status, answer.body
+    );
+
     let stored = sns.state();
     let stored = stored.lock();
     let delivered = stored
@@ -594,15 +576,15 @@ async fn publish_batch_reports_a_failed_entry_beside_the_published_ones() {
         .unwrap_or_default();
     assert_eq!(
         delivered.len(),
-        refused * 2,
-        "only the publishable entries of each batch must be delivered, got {}",
+        entries.len(),
+        "only the one accepted batch must have been delivered, got {}",
         delivered.len()
     );
     assert!(
         delivered
             .iter()
             .all(|message| ["first body", "last body"].contains(&&*message.message)),
-        "a refused entry must deliver nothing"
+        "a refused request must deliver nothing"
     );
 }
 
@@ -648,8 +630,9 @@ async fn publish_batch_to_a_fifo_topic_sequences_its_entries_in_request_order() 
         );
     }
 
-    // (case, topic, entries, the ids the batch publishes, the ids it refuses)
-    type FifoCase<'a> = (&'a str, &'a str, Vec<Entry>, Vec<&'a str>, Vec<&'a str>);
+    // (case, topic, entries, the ids the batch publishes — none when the whole request
+    // is refused for an entry of it)
+    type FifoCase<'a> = (&'a str, &'a str, Vec<Entry>, Option<Vec<&'a str>>);
     let cases: Vec<FifoCase<'_>> = vec![
         (
             "explicit ordering ids",
@@ -659,28 +642,26 @@ async fn publish_batch_to_a_fifo_topic_sequences_its_entries_in_request_order() 
                 Entry::new("two", "m2").group("g1").deduplication("d2"),
                 Entry::new("three", "m3").group("g2").deduplication("d3"),
             ],
-            vec!["one", "two", "three"],
-            Vec::new(),
+            Some(vec!["one", "two", "three"]),
         ),
         (
-            "an entry with no group id fails on its own",
+            "an entry with no group id refuses the whole request",
             &plain_fifo,
             vec![
                 Entry::new("grouped", "m1").group("g1").deduplication("d4"),
                 Entry::new("ungrouped", "m2").deduplication("d5"),
             ],
-            vec!["grouped"],
-            vec!["ungrouped"],
+            None,
         ),
         (
-            "an entry with no deduplication id fails on a topic that derives none",
+            "an entry with no deduplication id refuses the request on a topic that \
+             derives none",
             &plain_fifo,
             vec![
                 Entry::new("explicit", "m1").group("g1").deduplication("d6"),
                 Entry::new("derived", "m2").group("g1"),
             ],
-            vec!["explicit"],
-            vec!["derived"],
+            None,
         ),
         (
             "a content based topic derives the deduplication ids",
@@ -689,8 +670,7 @@ async fn publish_batch_to_a_fifo_topic_sequences_its_entries_in_request_order() 
                 Entry::new("hashed-one", "m1").group("g1"),
                 Entry::new("hashed-two", "m2").group("g1"),
             ],
-            vec!["hashed-one", "hashed-two"],
-            Vec::new(),
+            Some(vec!["hashed-one", "hashed-two"]),
         ),
         (
             "a content based topic still needs each entry's group id",
@@ -699,14 +679,26 @@ async fn publish_batch_to_a_fifo_topic_sequences_its_entries_in_request_order() 
                 Entry::new("hashed-three", "m3").group("g1"),
                 Entry::new("ungrouped", "m4"),
             ],
-            vec!["hashed-three"],
-            vec!["ungrouped"],
+            None,
         ),
     ];
 
     let mut sequence_numbers: Vec<String> = Vec::new();
-    for (case, topic, entries, expected_ok, expected_failed) in &cases {
+    for (case, topic, entries, expected_ok) in &cases {
         let answer = publish_batch(&sns, topic, entries).await;
+        let Some(expected_ok) = expected_ok else {
+            assert_eq!(
+                answer.status, 400,
+                "case {case:?}: expected the whole request to be refused, got {} / {}",
+                answer.status, answer.body
+            );
+            assert!(
+                ids(&answer, "Successful").is_empty(),
+                "case {case:?}: a refused request publishes no entry, got {}",
+                answer.body
+            );
+            continue;
+        };
         assert_eq!(
             answer.status, 200,
             "case {case:?}: expected 200, got {} / {}",
@@ -721,13 +713,9 @@ async fn publish_batch_to_a_fifo_topic_sequences_its_entries_in_request_order() 
             "case {case:?}: unexpected successful entries, got {}",
             answer.body
         );
-        assert_eq!(
-            ids(&answer, "Failed"),
-            expected_failed
-                .iter()
-                .map(|id| (*id).to_string())
-                .collect::<Vec<_>>(),
-            "case {case:?}: unexpected failed entries, got {}",
+        assert!(
+            ids(&answer, "Failed").is_empty(),
+            "case {case:?}: no entry of an accepted request fails, got {}",
             answer.body
         );
         for fields in result_entries(&answer, "Successful") {

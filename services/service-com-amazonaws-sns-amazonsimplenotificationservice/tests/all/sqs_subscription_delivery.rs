@@ -56,8 +56,13 @@ pub(crate) fn emulator() -> Emulator {
     Emulator { router }
 }
 
-/// One awsQuery form call against SNS.
-pub(crate) async fn sns(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> String {
+/// One awsQuery form call against SNS, with whatever status it answered: the call every
+/// SNS request in this module goes through, and the one a REFUSED call is read from.
+pub(crate) async fn sns_call(
+    emulator: &Emulator,
+    action: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
     let mut body = format!("Action={action}&Version=2010-03-31");
     for (name, value) in params {
         body.push('&');
@@ -83,6 +88,12 @@ pub(crate) async fn sns(emulator: &Emulator, action: &str, params: &[(&str, &str
     let response = emulator.router.dispatch(request).await;
     let status = response.status().as_u16();
     let text = String::from_utf8_lossy(response.body()).to_string();
+    (status, text)
+}
+
+/// One awsQuery form call against SNS that must SUCCEED.
+pub(crate) async fn sns(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> String {
+    let (status, text) = sns_call(emulator, action, params).await;
     assert_eq!(
         status, 200,
         "{action}: expected HTTP 200, got {status} / {text}"
@@ -378,13 +389,11 @@ async fn a_batched_publish_reaches_the_subscribed_queue_once_per_entry() {
 
     // The rule the batched form must satisfy is the same one a single publish does: every
     // confirmed queue subscription receives one message per PUBLISHED message. Rows differ in
-    // how many entries the batch carries and whether an entry is refused on its own ("an
-    // entry that breaks a per-message rule fails on its own, and the rest are still
-    // published") — a refused entry delivers nothing.
+    // how many entries the batch carries.
     let rows: &[(&str, &[&str], usize)] = &[
         ("one entry", &["first"], 1),
         ("three entries", &["a", "b", "c"], 3),
-        ("one entry refused for an empty message", &["kept", ""], 1),
+        ("ten entries, the documented maximum", &["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"], 10),
     ];
 
     for (case, messages, expected) in rows {
@@ -417,6 +426,30 @@ async fn a_batched_publish_reaches_the_subscribed_queue_once_per_entry() {
             );
         }
     }
+
+    // A batch holding an entry a single `Publish` would be refused for is refused WHOLE,
+    // so not one of its siblings reaches the queue.
+    let (status, body) = sns_call(
+        &emulator,
+        "PublishBatch",
+        &[
+            ("TopicArn", &topic),
+            ("PublishBatchRequestEntries.member.1.Id", "kept"),
+            ("PublishBatchRequestEntries.member.1.Message", "kept"),
+            ("PublishBatchRequestEntries.member.2.Id", "empty"),
+            ("PublishBatchRequestEntries.member.2.Message", ""),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a batch with an entry carrying no message must be refused, got {status} / {body}"
+    );
+    let delivered = drain(&emulator, &url).await;
+    assert!(
+        delivered.is_empty(),
+        "a refused batch must deliver nothing, got {delivered:?}"
+    );
 }
 
 #[tokio::test]

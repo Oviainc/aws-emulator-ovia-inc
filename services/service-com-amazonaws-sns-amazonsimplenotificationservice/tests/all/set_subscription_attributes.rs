@@ -104,6 +104,46 @@ async fn set(sns: &Sns, arn: &str, name: &str, value: Option<&str>) -> Answer {
 /// written: a flag in lower case, a delivery policy normalized).
 type WriteCase<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str);
 
+/// The archive policy an archiving topic holds: a retention period of one day.
+const ARCHIVE_POLICY: &str = r#"{"MessageRetentionPeriod":"1"}"#;
+
+/// The topic a row writes its attribute against.
+///
+/// A plain topic, unless the attribute only applies to a topic that ARCHIVES its
+/// messages: a `ReplayPolicy` names a window of the topic's message archive, and
+/// "the following attributes apply only to FIFO topics: ArchivePolicy"
+/// (`CreateTopicInput$Attributes` doc), so that row gets a FIFO topic with one.
+async fn given_topic(sns: &Sns, name: &str, attribute: &str) -> String {
+    if attribute != "ReplayPolicy" {
+        return sns.topic(name).await;
+    }
+    let fifo_name = format!("{name}.fifo");
+    sns.call(
+        "CreateTopic",
+        &[
+            ("Name", fifo_name.as_str()),
+            ("Attributes.entry.1.key", "ArchivePolicy"),
+            ("Attributes.entry.1.value", ARCHIVE_POLICY),
+        ],
+    )
+    .await
+    .element("TopicArn")
+    .expect("the archiving topic ARN")
+}
+
+/// The attributes the subscription of a row is created with.
+///
+/// None, unless the attribute the row writes is only REPORTED beside another: a
+/// `FilterPolicyScope` says which part of a message the filter policy is applied to, so
+/// it is reported only while the subscription holds a policy to apply.
+fn given_attributes(attribute: &str) -> &'static [(&'static str, &'static str)] {
+    if attribute == "FilterPolicyScope" {
+        &[("FilterPolicy", FILTER_POLICY)]
+    } else {
+        &[]
+    }
+}
+
 /// One refused write: the case, the subscription's protocol, the attribute and the
 /// value.
 type RefusalCase<'a> = (&'a str, &'a str, &'a str, &'a str);
@@ -292,14 +332,14 @@ async fn setting_a_documented_subscription_attribute_persists_and_round_trips() 
     }
 
     for (index, (case, protocol, name, value, reads_back)) in cases.iter().enumerate() {
-        let topic = sns.topic(&format!("set-sub-attr-{index:02}")).await;
+        let topic = given_topic(&sns, &format!("set-sub-attr-{index:02}"), name).await;
         let arn = subscribe(
             &sns,
             case,
             &topic,
             protocol,
             endpoint_for(protocol),
-            &[],
+            given_attributes(name),
         )
         .await;
         let before = attribute_entries(&read(&sns, case, &arn).await);
@@ -454,6 +494,14 @@ async fn setting_a_subscription_attribute_sns_does_not_accept_is_refused() {
         ("a redrive policy that is a list", "sqs", "RedrivePolicy", "[]"),
         // A replay policy is a document too.
         ("a replay policy that is a string", "sqs", "ReplayPolicy", r#""now""#),
+        // A replay policy names a window of the TOPIC's message archive, so it cannot be
+        // set on a subscription to a topic that archives nothing.
+        (
+            "a replay policy on a subscription to a topic with no archive policy",
+            "sqs",
+            "ReplayPolicy",
+            r#"{"PointType":"Timestamp","StartingPoint":"2026-01-01T00:00:00Z"}"#,
+        ),
         // A subscription role is an ARN, and applies to Firehose subscriptions alone.
         (
             "a subscription role that is not an ARN",
