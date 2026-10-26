@@ -31,6 +31,8 @@ mod ses_identity_policies;
 mod ses_identity_send_loop;
 #[path = "all/ses_receipt_filters.rs"]
 mod ses_receipt_filters;
+#[path = "all/ses_receipt_rule_set_creation.rs"]
+mod ses_receipt_rule_set_creation;
 #[path = "all/ses_receipt_rule_set_listing.rs"]
 mod ses_receipt_rule_set_listing;
 #[path = "all/ses_receipt_rule_sets.rs"]
