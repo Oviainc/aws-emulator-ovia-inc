@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/asset_types.rs"]
 mod asset_types;
+#[path = "all/batch_delete_connection.rs"]
+mod batch_delete_connection;
 #[path = "all/batch_get_jobs.rs"]
 mod batch_get_jobs;
 #[path = "all/batch_get_partition.rs"]
@@ -31,6 +33,8 @@ mod column_statistics_task_runs;
 mod connection_deletion;
 #[path = "all/connection_listing.rs"]
 mod connection_listing;
+#[path = "all/connection_not_found.rs"]
+mod connection_not_found;
 #[path = "all/connection_updates.rs"]
 mod connection_updates;
 #[path = "all/crawler_event_queue.rs"]

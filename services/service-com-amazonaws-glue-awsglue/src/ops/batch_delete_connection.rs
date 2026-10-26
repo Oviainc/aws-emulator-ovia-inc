@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDeleteConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDeleteConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: deletes each connection definition `ConnectionNameList` names from the
+//! addressed Data Catalog — the same records `CreateConnection` wrote and
+//! [`crate::ops::get_connection`] reads — and reports the outcome PER ENTRY: a name the
+//! catalog held is reported in `Succeeded` and is gone for every later reader, and a name
+//! it does not hold fails only its own entry, under `Errors` ("a map of the names of
+//! connections that were not successfully deleted to error details") carrying this
+//! batch's own per-entry error code and the miss wording the single-connection read
+//! answers.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDeleteConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A duplicate name in one request is therefore reported as deleted once and as a miss
+//! afterwards, because the second entry addresses a connection the first one removed.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +77,20 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The `ErrorDetail$ErrorCode` this batch reports for a name the addressed catalog holds
+/// no connection under.
+///
+/// RECORDED for THIS batch by the behavioural unit
+/// `glue.batch-delete-connection-per-entry-errors-and-valid-deletes-land`: its recorded
+/// answer is HTTP 200 carrying the requested name under `Errors` with an `ErrorCode` of
+/// `InternalException` and the connection-miss sentence as that entry's `ErrorMessage`,
+/// and its per-entry assertion REJECTS the entity-miss code before it reads the message.
+/// So this batch deliberately does not classify a per-entry connection miss the way the
+/// single-connection read — or this crate's other per-item batches
+/// (`batch_delete_table`, `batch_stop_job_run`) — classify theirs: which name failed and
+/// why is read off the message rather than off the code.
+const CONNECTION_MISS_ERROR_CODE: &str = "InternalException";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -86,9 +102,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 // here — hence the `BatchDeleteConnectionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.glue#BatchDeleteConnection")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.glue#BatchDeleteConnection",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum BatchDeleteConnectionErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServiceException(InternalServiceException),
     OperationTimeoutException(OperationTimeoutException),
 }
@@ -144,18 +164,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDeleteConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDeleteConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDeleteConnection"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchDeleteConnectionErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // Whether the caller may address this catalog at all is decided BEFORE any entry
+        // is looked up: a `CatalogId` of another account is reachable only through that
+        // catalog's own resource policy (see `crate::state::foreign_catalog_refusal`), so
+        // such a request is refused as a whole rather than reported as 25 misses.
+        if let Some(message) = crate::state::foreign_catalog_refusal(
+            &catalog_id,
+            &crate::state::request_region(ctx.parts()),
+            Self::NAME,
+        ) {
+            return Err(BatchDeleteConnectionErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // A connection definition is stored under its name exactly as sent (the model
+        // documents no case fold for `Connection$Name`), so each entry is looked up the
+        // same way the single-connection read looks one up.
+        let mut succeeded: Vec<String> = Vec::new();
+        let mut errors: ::std::collections::HashMap<String, ErrorDetail> =
+            ::std::collections::HashMap::new();
+        for name in &input.connection_name_list {
+            // The same removal the single-connection `DeleteConnection` performs, so a
+            // name this batch deletes is gone for every later reader and frees its tags
+            // with it.
+            if store.remove_connection(&catalog_id, name).is_some() {
+                succeeded.push(name.clone());
+            } else {
+                // The per-entry failure carries this batch's own per-entry code
+                // (`CONNECTION_MISS_ERROR_CODE`) and the sentence the single-connection
+                // READ answers for the same miss — not the write sentence
+                // `DeleteConnection` answers, even though this is a delete: the recorded
+                // `Errors` entry of this batch carries the read sentence, so that is what
+                // a client matching on the message sees here.
+                errors.insert(
+                    name.clone(),
+                    crate::state::catalog_error_detail(
+                        CONNECTION_MISS_ERROR_CODE,
+                        crate::state::messages::connection_not_found(name, &catalog_id),
+                    ),
+                );
+            }
+        }
+        ::tracing::info!(
+            operation = "BatchDeleteConnection",
+            catalog_id = %catalog_id,
+            deleted = succeeded.len(),
+            failed = errors.len(),
+            "deleted Glue connection definitions in a batch"
+        );
+
+        // Both members are reported whether or not anything failed: an empty `Errors` is
+        // the positive statement that every named connection was deleted, which is what a
+        // client checks before treating the batch as done.
+        Ok(BatchDeleteConnectionOutput {
+            succeeded: Some(succeeded),
+            errors: Some(errors),
+        })
     }
 }

@@ -95,6 +95,48 @@ async fn list_jobs_in(router: &MultiServiceRouter, region: &str) -> Vec<String> 
         .collect()
 }
 
+/// Every name a PAGED `ListJobs` sweep of `region`'s endpoint reports, following
+/// `NextToken` to exhaustion with pages of `page_size` (absent when `None`).
+async fn sweep_jobs_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    page_size: Option<i32>,
+) -> Vec<String> {
+    let case = format!("{region} / MaxResults {page_size:?}");
+    let mut seen: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let mut body = json!({});
+        if let Some(size) = page_size {
+            body["MaxResults"] = json!(size);
+        }
+        if let Some(cursor) = token.as_ref() {
+            body["NextToken"] = json!(cursor);
+        }
+        let (status, answer) = call_in_region(router, region, "ListJobs", &body).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: ListJobs must answer 200, got {status} with {answer}"
+        );
+        let page = answer["JobNames"].as_array().expect("JobNames is a list");
+        if let Some(size) = page_size {
+            assert!(
+                page.len() <= usize::try_from(size).expect("a positive page size"),
+                "case {case}: a page must hold at most {size} names, got {}",
+                page.len()
+            );
+        }
+        for name in page {
+            seen.push(name.as_str().expect("a name is a string").to_string());
+        }
+        token = answer["NextToken"].as_str().map(str::to_string);
+        if token.is_none() {
+            break;
+        }
+    }
+    seen
+}
+
 /// A job created in one Region does not exist in any other: every operation that
 /// addresses it by name answers for THAT Region's namespace, and the job stays served
 /// where it was created.
@@ -181,6 +223,46 @@ async fn a_job_exists_only_in_the_region_it_was_created_in() {
         missing.is_empty(),
         "the owning Region misses nothing, got {missing:?}"
     );
+}
+
+/// A per-endpoint, PAGED `ListJobs` sweep locates a job only where it was created: with
+/// a differently-named job created through each Region's endpoint, each endpoint's sweep
+/// enumerates its own jobs and never another Region's, at every page size.
+///
+/// The rows differ along the page size — the axis the pagination generalises over, from
+/// one name per page up to one past the number of jobs one endpoint holds — and along
+/// which endpoint is swept.
+#[tokio::test]
+async fn a_paged_sweep_of_one_endpoint_names_only_that_regions_jobs() {
+    let router = emulator();
+
+    // Two jobs per Region, differently named everywhere, so a leak is visible whichever
+    // endpoint is swept and whatever the page size.
+    let mut owned: Vec<(&str, Vec<String>)> = Vec::new();
+    for region in [REGION].into_iter().chain(OTHER_REGIONS) {
+        let mut names = vec![
+            format!("etl-usage-events-{region}"),
+            format!("RoleReport-{region}"),
+        ];
+        for name in &names {
+            create_job_in(&router, region, name).await;
+        }
+        names.sort();
+        owned.push((region, names));
+    }
+
+    for (region, names) in &owned {
+        for page_size in [None, Some(1), Some(2), Some(3)] {
+            let case = format!("{region} / MaxResults {page_size:?}");
+            let mut swept = sweep_jobs_in(&router, region, page_size).await;
+            swept.sort();
+            assert_eq!(
+                &swept, names,
+                "case {case}: the endpoint must enumerate its own jobs and no other \
+                 Region's, got {swept:?}"
+            );
+        }
+    }
 }
 
 /// `StartJobRun` against a Region that does not hold the job is refused as the service
