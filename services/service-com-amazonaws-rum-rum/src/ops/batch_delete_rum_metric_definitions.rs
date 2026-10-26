@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDeleteRumMetricDefinitions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDeleteRumMetricDefinitions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDeleteRumMetricDefinitions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes metric definitions from ONE extended-metrics destination of the app monitor the
+//! request names, in this service's persisted state: each id the destination holds a
+//! definition under is deleted from the map `BatchCreateRumMetricDefinitions` wrote and
+//! reported back under `MetricDefinitionIds`, and each id it holds nothing under is
+//! reported in `Errors` while the rest of the batch is still deleted, which is what the
+//! model asks for: "If some metric definition IDs specified in a
+//! BatchDeleteRumMetricDefinitions operations are not valid, those metric definitions fail
+//! and return errors, but all valid metric definition IDs in the same operation are still
+//! deleted." `BatchGetRumMetricDefinitions` reads the same map back, so what this call
+//! removed is observable there.
+//!
+//! A request that binds NO `metricDefinitionIds` value names the empty id list the model
+//! admits, and is read as that rather than as a request missing a member (see
+//! [`BatchDeleteRumMetricDefinitionsWireInput`]); `crate::service` is what routes it here,
+//! since the protocol's routing key cannot name an operation for it.
 //!
 //! ## Shape of an operation
 //!
@@ -99,6 +106,104 @@ use super::types::*;
 // `BatchDeleteRumMetricDefinitionsError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-rum-rum.json");
 
+/// The Smithy member names of `BatchDeleteRumMetricDefinitionsRequest`, as
+/// `smithy_query(query="operation", operation="BatchDeleteRumMetricDefinitions")` lists
+/// them: `AppMonitorName` (`@httpLabel`, `@required`), `Destination`
+/// (`@httpQuery("destination")`, `@required`), `DestinationArn`
+/// (`@httpQuery("destinationArn")`) and `MetricDefinitionIds`
+/// (`@httpQuery("metricDefinitionIds")`, `@required`).
+const APP_MONITOR_NAME_MEMBER: &str = "AppMonitorName";
+const DESTINATION_MEMBER: &str = "Destination";
+const DESTINATION_ARN_MEMBER: &str = "DestinationArn";
+const METRIC_DEFINITION_IDS_MEMBER: &str = "MetricDefinitionIds";
+
+/// This operation's input, read with an ABSENT `metricDefinitionIds` query taken as the
+/// EMPTY id list rather than as a missing member.
+///
+/// `MetricDefinitionIds` is `@required`, so the generated
+/// `BatchDeleteRumMetricDefinitionsInput` deserializer refuses a request that binds no
+/// `metricDefinitionIds` value — but the member targets `MetricDefinitionIds`, a list with
+/// no `@length` at all, so the empty list is a value the model admits, and a client sending
+/// `MetricDefinitionIds=[]` sends exactly that: a `DELETE
+/// /rummetrics/{AppMonitorName}/metrics` with no `metricDefinitionIds` in the query string,
+/// because a list binds to the query string one value per element. Such a call names no
+/// definition and so deletes none. The request therefore carries the member — as its empty
+/// value — and the only question is how an empty list is spelled on the wire, which for a
+/// query-bound list is "no values at all".
+///
+/// Only the ABSENT list is defaulted; everything else is read exactly as the generated
+/// deserializer reads it, including `AppMonitorName` and `Destination`, which are still
+/// refused when absent (the framework's own missing-member refusal), and the
+/// `@length`/`@pattern` constraints, which the centralized walk validates after this step
+/// against the SAME input schema.
+#[derive(Debug, Clone)]
+pub struct BatchDeleteRumMetricDefinitionsWireInput(pub BatchDeleteRumMetricDefinitionsInput);
+
+impl ::aws_smithy_schema_server::DeserializableStruct for BatchDeleteRumMetricDefinitionsWireInput {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut app_monitor_name: Option<String> = None;
+        let mut destination: Option<String> = None;
+        let mut destination_arn: Option<String> = None;
+        // The empty list the model admits: left as it is when the request binds no
+        // `metricDefinitionIds` value, which is how a query-bound list spells "no
+        // elements".
+        let mut metric_definition_ids: Vec<String> = Vec::new();
+        deserializer.read_struct(
+            super::types::BATCH_DELETE_RUM_METRIC_DEFINITIONS_INPUT_SCHEMA,
+            &mut |member, member_deserializer| {
+                match member.member_name() {
+                    Some(APP_MONITOR_NAME_MEMBER) => {
+                        app_monitor_name = Some(member_deserializer.read_string(member)?);
+                    }
+                    Some(DESTINATION_MEMBER) => {
+                        destination = Some(member_deserializer.read_string(member)?);
+                    }
+                    Some(DESTINATION_ARN_MEMBER) => {
+                        destination_arn = Some(member_deserializer.read_string(member)?);
+                    }
+                    Some(METRIC_DEFINITION_IDS_MEMBER) => {
+                        let mut ids: Vec<String> = Vec::new();
+                        member_deserializer.read_list(member, &mut |element| {
+                            ids.push(element.read_string(member)?);
+                            Ok(())
+                        })?;
+                        metric_definition_ids = ids;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        )?;
+        Ok(Self(BatchDeleteRumMetricDefinitionsInput {
+            // `AppMonitorName` is a path label and `Destination` a single query value:
+            // either is absent only from a request that named no target at all, which
+            // stays the framework's refusal.
+            app_monitor_name: app_monitor_name.ok_or_else(|| {
+                ::aws_smithy_schema_server::missing_member(APP_MONITOR_NAME_MEMBER)
+            })?,
+            destination: destination
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member(DESTINATION_MEMBER))?,
+            destination_arn,
+            metric_definition_ids,
+        }))
+    }
+}
+
+/// The modelled input's own member writing, so the centralized walk's constraint
+/// validation — which drives the input as a serializer over
+/// `BATCH_DELETE_RUM_METRIC_DEFINITIONS_INPUT_SCHEMA` — sees exactly the members the model
+/// declares.
+impl ::aws_smithy_schema::serde::SerializableStruct for BatchDeleteRumMetricDefinitionsWireInput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        ::aws_smithy_schema::serde::SerializableStruct::serialize_members(&self.0, serializer)
+    }
+}
+
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `BatchDeleteRumMetricDefinitionsError` alias below. An operation that models no errors
@@ -152,7 +257,7 @@ impl<Eng> BatchDeleteRumMetricDefinitions<Eng> {
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for BatchDeleteRumMetricDefinitions<Eng>
 {
-    type Input = BatchDeleteRumMetricDefinitionsInput;
+    type Input = BatchDeleteRumMetricDefinitionsWireInput;
     type Output = BatchDeleteRumMetricDefinitionsOutput;
     type Error = BatchDeleteRumMetricDefinitionsError;
 
@@ -166,18 +271,165 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDeleteRumMetricDefinitions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDeleteRumMetricDefinitionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDeleteRumMetricDefinitions"))
+        // The wrapper exists only to read an absent `metricDefinitionIds` as the empty
+        // list (see [`BatchDeleteRumMetricDefinitionsWireInput`]); everything below is the
+        // modelled input.
+        let BatchDeleteRumMetricDefinitionsWireInput(input) = input;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchDeleteRumMetricDefinitionsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::NO_STORE.to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // An empty `DestinationArn` (the member is modelled `length 0..2048`) names no
+        // experiment, so it is the same input as an absent one.
+        let destination_arn = input
+            .destination_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|arn| !arn.is_empty());
+
+        // The prose-only pairing every metrics call of this service shares: an Evidently
+        // destination is identified by an experiment ARN and a CloudWatch one carries
+        // none.
+        if let Some(message) =
+            crate::state::metric_destination_choice_refusal(&input.destination, destination_arn)
+        {
+            return Err(
+                BatchDeleteRumMetricDefinitionsErrorModeled::ValidationException(
+                    ValidationException { message },
+                )
+                .into(),
+            );
+        }
+        // The BATCH's own documented bound. Past it the whole call is refused rather than
+        // part of the list being deleted: the request as a whole is the thing that is too
+        // large.
+        if input.metric_definition_ids.len() > crate::state::MAX_METRIC_DEFINITIONS_PER_BATCH {
+            return Err(
+                BatchDeleteRumMetricDefinitionsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "A BatchDeleteRumMetricDefinitions request can specify at most {} \
+                             metric definitions; this one specifies {}.",
+                            crate::state::MAX_METRIC_DEFINITIONS_PER_BATCH,
+                            input.metric_definition_ids.len()
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // May this caller delete THIS app monitor's metrics? Decided per call from the
+        // caller's identity-based policies and the monitor's resource policy, with the
+        // monitor and the policy in force read under a SHORT lock.
+        let (resource_arn, held_policy) = {
+            let store = state.lock();
+            let Some(record) = store.app_monitors.get(&input.app_monitor_name) else {
+                return Err(
+                    BatchDeleteRumMetricDefinitionsErrorModeled::ResourceNotFoundException(
+                        crate::state::app_monitor_not_found(&input.app_monitor_name),
+                    )
+                    .into(),
+                );
+            };
+            (record.arn.clone(), record.resource_policy_document())
+        };
+        if let Err(denial) = crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::BATCH_DELETE_RUM_METRIC_DEFINITIONS,
+            &resource_arn,
+            held_policy.as_deref(),
+            &[],
+        ) {
+            return Err(
+                BatchDeleteRumMetricDefinitionsErrorModeled::AccessDeniedException(
+                    crate::state::access_denied(&denial),
+                )
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+        let Some(monitor) = store.app_monitors.get_mut(&input.app_monitor_name) else {
+            return Err(
+                BatchDeleteRumMetricDefinitionsErrorModeled::ResourceNotFoundException(
+                    crate::state::app_monitor_not_found(&input.app_monitor_name),
+                )
+                .into(),
+            );
+        };
+        // A definition lives under the destination it was created for, so a pair naming a
+        // destination this monitor does not have addresses no definition at all — a
+        // missing destination, not a batch of missing definitions, so the whole call is
+        // refused rather than every id being reported as its own error.
+        if !monitor.has_metric_destination(&input.destination, destination_arn) {
+            return Err(
+                BatchDeleteRumMetricDefinitionsErrorModeled::ResourceNotFoundException(
+                    crate::state::metric_destination_not_found(
+                        &input.app_monitor_name,
+                        &input.destination,
+                        destination_arn,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // Each id is answered on its own: one the destination holds a definition under is
+        // deleted and reported deleted, and one it holds nothing under fails as that id's
+        // own error while the rest of the batch is still deleted. A repeated id names the
+        // ONE definition it identifies, so it is carried out once and answered once rather
+        // than being deleted and then reported missing by its own earlier removal.
+        let mut deleted: Vec<String> = Vec::new();
+        let mut errors: Vec<BatchDeleteRumMetricDefinitionsError2> = Vec::new();
+        let mut answered: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
+        for metric_definition_id in &input.metric_definition_ids {
+            if !answered.insert(metric_definition_id.as_str()) {
+                continue;
+            }
+            if monitor
+                .remove_metric_definition(&input.destination, destination_arn, metric_definition_id)
+                .is_some()
+            {
+                deleted.push(metric_definition_id.clone());
+            } else {
+                errors.push(BatchDeleteRumMetricDefinitionsError2 {
+                    metric_definition_id: metric_definition_id.clone(),
+                    error_code: NOT_FOUND_ERROR_CODE.to_string(),
+                    error_message: crate::state::metric_definition_not_found(
+                        &input.app_monitor_name,
+                        metric_definition_id,
+                    )
+                    .message,
+                });
+            }
+        }
+
+        Ok(BatchDeleteRumMetricDefinitionsOutput {
+            // `Errors` is `@required`, so a call that refused nothing reports the EMPTY
+            // list rather than leaving the member off the wire.
+            errors,
+            // "The IDs of the metric definitions that were deleted" — the ids this call
+            // actually removed from the store, not the ids the request named.
+            metric_definition_ids: Some(deleted),
+        })
     }
 }
+
+/// The `ErrorCode` this operation reports for an id the destination holds no definition
+/// under.
+///
+/// `BatchDeleteRumMetricDefinitionsError$ErrorCode` is modelled as a bare `String` with no
+/// catalog, and that id addresses a definition that is not there — which the
+/// single-definition `UpdateRumMetricDefinition` answers `ResourceNotFoundException` for —
+/// so the per-id error reports that modelled error's name.
+const NOT_FOUND_ERROR_CODE: &str = "ResourceNotFoundException";

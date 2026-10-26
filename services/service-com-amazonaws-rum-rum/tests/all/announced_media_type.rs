@@ -13,8 +13,8 @@
 //! NO payload declared none, so its answer falls back to RUM's own JSON type,
 //! `application/x-amz-json-1.1` (`crate::state::RESPONSE_CONTENT_TYPE`). That holds
 //! whatever the operation, whatever the status, and whoever produced the answer — a
-//! handler's success, a handler's modelled error, a refusal the request boundary raised,
-//! or a scaffolded operation's 501. The `restJson1` protocol the model declares announces
+//! handler's success, a handler's modelled error, or a refusal the request boundary
+//! raised. The `restJson1` protocol the model declares announces
 //! `application/json` on every JSON body, so the fallback is recorded behaviour the
 //! service applies on top of the codec; the BODY is the same JSON either way, which is
 //! what the second and third tests check.
@@ -23,8 +23,8 @@
 //! both halves of the rule (a request with a payload and one without, on the SAME method
 //! and on the same operation group), all four HTTP methods RUM binds, every operation
 //! group (app monitor, resource policy, metrics destinations, tagging, the data plane),
-//! the 200 / 400 / 404 / 409 / 501 status classes, outputs that model members and outputs
-//! that model none, and both an implemented operation and a scaffolded one.
+//! the 200 / 400 / 404 / 409 status classes, and outputs that model members as well as
+//! outputs that model none.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_rum_rum::state::{JSON_CONTENT_TYPE, RESPONSE_CONTENT_TYPE};
@@ -285,18 +285,19 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             expected: Body::Members,
         },
         Case {
-            // Still a scaffold, so still the 501 channel — which announces the service's
-            // media type like every other answer. `MetricDefinitionIds` is a required
-            // `@httpQuery` member, so the refusal is reached with no payload at all.
-            case: "BatchDeleteRumMetricDefinitions 501 (scaffolded operation)",
+            // Implemented, and answered per id: `MetricDefinitionIds` is a required
+            // `@httpQuery` member, so the call is reached with no payload at all, and the
+            // destination holds no definition under the id it names, so the answer carries
+            // that id's own error beside the empty list of ids deleted.
+            case: "BatchDeleteRumMetricDefinitions 200 (DELETE, members, no payload)",
             method: "DELETE",
             path: format!(
                 "/rummetrics/{live}/metrics?destination=CloudWatch&metricDefinitionIds=none"
             ),
             body: None,
-            status: 501,
+            status: 200,
             announces: RESPONSE_CONTENT_TYPE,
-            expected: Body::Error("NotImplemented"),
+            expected: Body::Members,
         },
         Case {
             case: "DeleteAppMonitor 200 (DELETE, no members)",
