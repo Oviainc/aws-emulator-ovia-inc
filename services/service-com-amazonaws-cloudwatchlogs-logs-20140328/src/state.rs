@@ -2043,10 +2043,10 @@ pub struct DeliveryDestinationRecord {
     /// so a destination carrying none reports no member at all.
     pub tags: BTreeMap<String, String>,
     /// `Policy$deliveryDestinationPolicy` — "The contents of the delivery destination
-    /// policy", the IAM policy `PutDeliveryDestinationPolicy` assigns to this destination and
-    /// `GetDeliveryDestinationPolicy` reports. `None` for a destination no policy has been
-    /// assigned to, which is what makes a get on one report no policy at all rather than
-    /// refuse.
+    /// policy", the IAM policy `PutDeliveryDestinationPolicy` assigns to this destination,
+    /// `GetDeliveryDestinationPolicy` reports and `DeleteDeliveryDestinationPolicy` takes back
+    /// off. `None` for a destination no policy has been assigned to, which is what makes a get
+    /// on one report no policy at all rather than refuse.
     ///
     /// It is NOT one of the "delivery destination parameters" a later put overwrites: the
     /// policy is assigned by its own operation, so a put that updates the destination's
