@@ -34,12 +34,16 @@ const ROLE_ARN: &str = "arn:aws:iam::111122223333:role/HealthScribeAccess";
 
 /// Every value of `VocabularyFilterMethod` (`smithy_query(query="shape",
 /// shape="VocabularyFilterMethod")`), so a filter row is not pinned to one of them.
-const FILTER_METHODS: &[&str] = &["remove", "mask", "tag"];
+///
+/// `pub(crate)` so the suite that drives a filter through every member that NAMES one
+/// (`crate::vocabulary_filter_file_uri`) cycles the same methods from one home.
+pub(crate) const FILTER_METHODS: &[&str] = &["remove", "mask", "tag"];
 
 /// The word this service's refusals use for a custom vocabulary, and for a custom
-/// vocabulary filter.
+/// vocabulary filter — the latter `pub(crate)` for the same reason as
+/// [`FILTER_METHODS`].
 const KIND_VOCABULARY: &str = "vocabulary";
-const KIND_VOCABULARY_FILTER: &str = "vocabulary filter";
+pub(crate) const KIND_VOCABULARY_FILTER: &str = "vocabulary filter";
 
 /// `CreateVocabulary` for `name`, so this account holds a custom vocabulary of that
 /// name.

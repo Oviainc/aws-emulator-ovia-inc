@@ -259,6 +259,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `CreateWebApp` models no customization member: a new web app carries no
             // title, logo or icon until `UpdateWebAppCustomization` assigns one.
             customization: st::WebAppCustomization::default(),
+            // A new web app is applying no update yet — see `state::WEB_APP_UPDATE_SPAN`.
+            update_due: None,
         };
         guard.web_apps.insert(web_app_id.clone(), web_app);
         drop(guard);

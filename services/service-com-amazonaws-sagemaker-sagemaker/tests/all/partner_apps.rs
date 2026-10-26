@@ -7,10 +7,10 @@
 //! shared harness in `tests/all/inference_deployment_lifecycle.rs`, so what these tests
 //! exercise is what a real SDK client gets.
 //!
-//! `CreatePartnerApp` is still a scaffold stub (it answers 501), so the apps a case lists
-//! are seeded into the ONE shared store the handler reads — `engine.state::<...>()`, the
-//! same store a create will write once it is implemented — rather than through a second
-//! copy of the state.
+//! The apps a case lists are seeded into the ONE shared store the handler reads —
+//! `engine.state::<...>()`, the same store `CreatePartnerApp` writes — rather than through
+//! a second copy of the state, so a row can place an app in any status and at any point of
+//! its clock without driving the create path (which `partner_app_creation.rs` covers).
 //!
 //! The tests assert RULES over a TABLE of inputs rather than one recorded call: the
 //! summary each stored app is reported as, for every documented `PartnerAppType` and
@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 
 use service_com_amazonaws_sagemaker_sagemaker::state::{
-    ComAmazonawsSagemakerSagemakerState, PartnerApp, MAX_PAGE_SIZE,
+    ComAmazonawsSagemakerSagemakerState, PartnerApp, PartnerAppSettings, MAX_PAGE_SIZE,
     PARTNER_APP_DEFAULT_PAGE_SIZE,
 };
 
@@ -66,7 +66,10 @@ const PARTNER_APP_STATUSES: [&str; 7] = [
 /// `created_ago` places the app's `CreationTime` in the past so an ordering is
 /// unambiguous, and `available_in` is the instant the `Creating` -> `Available`
 /// transition falls due (`None` keeps it in the future, i.e. not yet owed).
-fn stored_app(
+///
+/// Shared with `partner_app_creation.rs`, whose store-bound case needs the same record
+/// rather than a second way of building one.
+pub(crate) fn stored_app(
     index: usize,
     name: &str,
     app_type: &str,
@@ -96,6 +99,11 @@ fn stored_app(
             Some(span) => now + span,
             None => now + Duration::from_secs(3_600),
         },
+        // The configuration a create carries is not what the listing reports, so a seeded
+        // app holds the empty one; nor does a seeded app have an idempotency token or tags.
+        settings: PartnerAppSettings::default(),
+        client_token: None,
+        tags: Vec::new(),
         // No presigned URL has been minted for a freshly stored app.
         grants: Vec::new(),
     }

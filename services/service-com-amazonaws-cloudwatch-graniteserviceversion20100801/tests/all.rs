@@ -65,5 +65,7 @@ mod resource_tags;
 mod sns_action_queue_policy;
 #[path = "all/sns_action_topic_policy.rs"]
 mod sns_action_topic_policy;
+#[path = "all/start_metric_streams.rs"]
+mod start_metric_streams;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

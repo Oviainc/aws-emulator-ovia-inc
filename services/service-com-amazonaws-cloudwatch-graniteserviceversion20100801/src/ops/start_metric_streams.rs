@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartMetricStreams
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartMetricStreams`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartMetricStreams::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Puts every metric stream this request names into the `running` state. Implemented here,
+//! and the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -135,23 +128,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::START_METRIC_STREAMS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// "Starts the streaming of metrics for one or more of your metric streams."
+    ///
+    /// The whole effect is on each named stream's `State`, which this operation moves to
+    /// `running` ("The state of the metric stream. The possible values are `running` and
+    /// `stopped`.", `GetMetricStreamOutput$State`). Nothing else about a stream changes:
+    /// `LastUpdateDate` is "the date of the most recent update to the metric stream's
+    /// configuration" (`GetMetricStreamOutput$LastUpdateDate`), and starting a stream updates
+    /// no configuration member, so the date the last configuration write left stands.
+    ///
+    /// A name no stream exists under is accepted and changes nothing, the way
+    /// `DeleteMetricStream` accepts one: this operation's whole error list is
+    /// `InternalServiceFault`, `InvalidParameterValueException` and
+    /// `MissingRequiredParameterException`, so the model gives it no way to report a stream
+    /// that is not there — unlike `GetMetricStream`, which declares
+    /// `ResourceNotFoundException`. An empty list names no stream and so starts none.
+    ///
+    /// The "all or nothing" clause the input documents is about authorization ("If you do not
+    /// have permission to access all of the metric streams that you list here, then none of
+    /// the streams that you list in the operation will start streaming."), and every stream in
+    /// this store is accessible to its caller, so no subset of a batch is ever refused. The
+    /// batch is still applied under ONE hold of the store, so a concurrent reader sees either
+    /// none or all of this request's streams started.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartMetricStreams` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartMetricStreamsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartMetricStreams"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartMetricStreamsErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch metric stream store is unavailable".into()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        for name in &input.names {
+            if let Some(stored) = store.metric_streams.get_mut(name) {
+                stored.stream.state = Some(crate::state::METRIC_STREAM_RUNNING.to_string());
+            }
+        }
+
+        Ok(StartMetricStreamsOutput {})
     }
 }

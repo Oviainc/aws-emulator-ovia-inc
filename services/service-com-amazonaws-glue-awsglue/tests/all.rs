@@ -69,6 +69,8 @@ mod jobs;
 mod partitions;
 #[path = "all/registries.rs"]
 mod registries;
+#[path = "all/resource_policies.rs"]
+mod resource_policies;
 #[path = "all/schema_registry.rs"]
 mod schema_registry;
 #[path = "all/search_tables.rs"]

@@ -31,7 +31,15 @@ pub struct ListModelInvocationJobsOutput {
     pub invocation_job_summaries: Option<Vec<ModelInvocationJobSummary>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#ModelInvocationJobSummary")]
+/// `ModelInvocationJobSummary`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `submitTime`, `lastModifiedTime`, `endTime` and `jobExpirationTime` all carry
+/// `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape",shape="ModelInvocationJobSummary")`), which the derive does
+/// not put on a member schema — see `types/date_time_wire.rs` for that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct ModelInvocationJobSummary {
     pub job_arn: String,
@@ -55,4 +63,116 @@ pub struct ModelInvocationJobSummary {
     pub success_record_count: Option<i64>,
     pub error_record_count: Option<i64>,
 }
+
+bedrock_schema_and_codec!(
+    ModelInvocationJobSummary,
+    MODEL_INVOCATION_JOB_SUMMARY_SCHEMA,
+    "com.amazonaws.bedrock#ModelInvocationJobSummary",
+    "com.amazonaws.bedrock",
+    "ModelInvocationJobSummary",
+    (M_JOB_ARN, job_arn, "jobArn", 0, req, string),
+    (M_JOB_NAME, job_name, "jobName", 1, req, string),
+    (M_MODEL_ID, model_id, "modelId", 2, req, string),
+    (
+        M_CLIENT_REQUEST_TOKEN,
+        client_request_token,
+        "clientRequestToken",
+        3,
+        opt,
+        string
+    ),
+    (M_ROLE_ARN, role_arn, "roleArn", 4, req, string),
+    (M_STATUS, status, "status", 5, opt, string),
+    (M_MESSAGE, message, "message", 6, opt, string),
+    (M_SUBMIT_TIME, submit_time, "submitTime", 7, req, date_time),
+    (
+        M_LAST_MODIFIED_TIME,
+        last_modified_time,
+        "lastModifiedTime",
+        8,
+        opt,
+        date_time
+    ),
+    (M_END_TIME, end_time, "endTime", 9, opt, date_time),
+    (
+        M_INPUT_DATA_CONFIG,
+        input_data_config,
+        "inputDataConfig",
+        10,
+        req,
+        union_of(ModelInvocationJobInputDataConfig)
+    ),
+    (
+        M_OUTPUT_DATA_CONFIG,
+        output_data_config,
+        "outputDataConfig",
+        11,
+        req,
+        union_of(ModelInvocationJobOutputDataConfig)
+    ),
+    (
+        M_VPC_CONFIG,
+        vpc_config,
+        "vpcConfig",
+        12,
+        opt,
+        struct_of(VpcConfig)
+    ),
+    (
+        M_TIMEOUT_DURATION_IN_HOURS,
+        timeout_duration_in_hours,
+        "timeoutDurationInHours",
+        13,
+        opt,
+        integer
+    ),
+    (
+        M_JOB_EXPIRATION_TIME,
+        job_expiration_time,
+        "jobExpirationTime",
+        14,
+        opt,
+        date_time
+    ),
+    (
+        M_MODEL_INVOCATION_TYPE,
+        model_invocation_type,
+        "modelInvocationType",
+        15,
+        opt,
+        string
+    ),
+    (
+        M_TOTAL_RECORD_COUNT,
+        total_record_count,
+        "totalRecordCount",
+        16,
+        opt,
+        long
+    ),
+    (
+        M_PROCESSED_RECORD_COUNT,
+        processed_record_count,
+        "processedRecordCount",
+        17,
+        opt,
+        long
+    ),
+    (
+        M_SUCCESS_RECORD_COUNT,
+        success_record_count,
+        "successRecordCount",
+        18,
+        opt,
+        long
+    ),
+    (
+        M_ERROR_RECORD_COUNT,
+        error_record_count,
+        "errorRecordCount",
+        19,
+        opt,
+        long
+    ),
+);
 

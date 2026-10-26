@@ -191,9 +191,9 @@ async fn every_refused_request_carries_its_documented_error_message() {
                 code: "NotImplemented",
                 message: "",
             },
-            // `?logging` is still a scaffold; `?requestPayment` is implemented now, so
-            // this row names an operation that is genuinely unwritten.
-            send(&router, "GET", "/message-bucket?logging", &[], "").await,
+            // `?object-lock` is still a scaffold; `?logging` is implemented now, so this
+            // row names an operation that is genuinely unwritten.
+            send(&router, "GET", "/message-bucket?object-lock", &[], "").await,
         ),
     ];
 

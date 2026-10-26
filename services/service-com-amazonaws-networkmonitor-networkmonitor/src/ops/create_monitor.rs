@@ -355,11 +355,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             modified_at: now,
         };
-        // Nothing is due for a probe-free monitor; one created with probes is
-        // owed its activation.
-        if !monitor.probes.is_empty() {
-            monitor.schedule_activation(now);
-        }
+        // Nothing is due for a monitor with nothing in service; one created
+        // with probes is owed its activation. The same rule every later call
+        // applies, read off the probes the record holds.
+        monitor.follow_probe_states(now);
         if let Some(token) = input.client_token {
             store.record_client_token(
                 &region,

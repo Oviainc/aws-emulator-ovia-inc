@@ -93,6 +93,11 @@
 //! mints, `ops/get_inference_profile.rs` reads back and `ops/delete_inference_profile.rs`
 //! removes, each holding the foundation models that profile tracks metrics and costs for.
 //!
+//! And it holds the batch inference jobs `ops/create_model_invocation_job.rs` submits,
+//! `ops/get_model_invocation_job.rs` reads back and `ops/list_model_invocation_jobs.rs`
+//! reports, together with the instant each job's non-terminal `status` is owed its next
+//! move and the instant the job would time out.
+//!
 //! And it holds the published foundation model catalog — the base models
 //! `ops/list_foundation_models.rs` reports and `ops/get_foundation_model.rs` resolves one
 //! row of — which is seeded with the store and never written, because no operation of this
@@ -123,6 +128,8 @@ use crate::ops::types::{
     AutomatedReasoningPolicyDefinition, AutomatedReasoningPolicyTestCase, CustomModelDataSource,
     CustomModelDeploymentSummary,
     CustomModelSummary, CustomizationConfig, EndpointConfig, EvaluationConfig,
+    ModelInvocationJobInputDataConfig, ModelInvocationJobOutputDataConfig,
+    ModelInvocationJobSummary,
     EvaluationInferenceConfig, EvaluationOutputDataConfig, FoundationModelDetails,
     FoundationModelLifecycle, FoundationModelSummary, GuardrailAutomatedReasoningPolicy,
     GuardrailAutomatedReasoningPolicyConfig,
@@ -1487,6 +1494,143 @@ impl ModelCustomizationJobRecord {
     }
 }
 
+/// `ModelInvocationJobStatus` — a batch inference job that has been submitted: "Submitted
+/// – This job has been submitted to a queue for validation"
+/// (`smithy_query(query="doc",shape="ModelInvocationJobSummary",member="status")`). The
+/// status every job this emulator mints carries from the call that submits it until the
+/// clock moves it on.
+pub const MODEL_INVOCATION_JOB_STATUS_SUBMITTED: &str = "Submitted";
+
+/// `ModelInvocationJobStatus` — a batch inference job that has begun: "InProgress – This
+/// job has begun. You can start viewing the results in the output S3 location".
+pub const MODEL_INVOCATION_JOB_STATUS_IN_PROGRESS: &str = "InProgress";
+
+/// `ModelInvocationJobStatus` — the terminal status of a batch inference job that ran to
+/// the end of its input: "Completed – This job has successfully completed".
+pub const MODEL_INVOCATION_JOB_STATUS_COMPLETED: &str = "Completed";
+
+/// How long after it was submitted a batch inference job is owed its move from
+/// [`MODEL_INVOCATION_JOB_STATUS_SUBMITTED`] to
+/// [`MODEL_INVOCATION_JOB_STATUS_IN_PROGRESS`].
+///
+/// The emulator's own span, chosen like [`IMPORT_JOB_COMPLETE_AFTER`] rather than read off
+/// any published figure: the queueing and validation a real submission waits through is
+/// not something this emulator performs, and the span is non-zero so a caller reading the
+/// job straight after the create still sees the status the create answered with.
+pub const MODEL_INVOCATION_JOB_BEGINS_AFTER: Duration = Duration::from_millis(500);
+
+/// How long after it began a batch inference job is owed its move from
+/// [`MODEL_INVOCATION_JOB_STATUS_IN_PROGRESS`] to
+/// [`MODEL_INVOCATION_JOB_STATUS_COMPLETED`]. Chosen for the same reason
+/// [`MODEL_INVOCATION_JOB_BEGINS_AFTER`] is.
+pub const MODEL_INVOCATION_JOB_COMPLETE_AFTER: Duration = Duration::from_millis(500);
+
+/// The seconds in the hour a `timeoutDurationInHours` counts, so the instant a job times
+/// out is computed on one scale wherever it is needed.
+pub const SECONDS_PER_HOUR: u64 = 60 * 60;
+
+/// The most batch inference jobs this account may hold at once, across every region it has
+/// submitted one in, past which a create is refused with `ServiceQuotaExceededException`.
+///
+/// The emulator's own bound rather than a published quota, for the reason
+/// [`MAX_MODEL_CUSTOMIZATION_JOBS_PER_ACCOUNT`] is one: without a server-side cap a caller
+/// could grow this part of the store with nothing but further submissions.
+pub const MAX_MODEL_INVOCATION_JOBS_PER_ACCOUNT: usize = 100;
+
+/// One batch inference job, as `CreateModelInvocationJob` submitted it and
+/// `GetModelInvocationJob` and `ListModelInvocationJobs` report it.
+///
+/// `status` and `model_invocation_type` are `&'static str` for the reason
+/// [`ModelCustomizationJobRecord::status`] is: the statuses are the ones this emulator's
+/// lifecycle passes through, and the invocation type is resolved against the modelled enum
+/// ([`model_invocation_type_of`]) rather than kept as whatever text arrived.
+#[derive(Debug, Clone)]
+pub struct ModelInvocationJobRecord {
+    /// The `ModelInvocationJobArn` this job is addressed by, minted by
+    /// [`model_invocation_job_arn`].
+    pub arn: String,
+    /// `jobName`, as the create request spelled it. NOT an identifier: a
+    /// `ModelInvocationJobIdentifier` is the job ARN or the minted job id alone
+    /// (`smithy_query(query="operation",operation="GetModelInvocationJob")`), so a name is
+    /// reported and filtered on rather than resolved through.
+    pub name: String,
+    /// The region the create addressed, which [`Self::arn`] also carries. Kept beside it so
+    /// a listing is per region without re-parsing an ARN, exactly as
+    /// [`ModelCustomizationJobRecord::region`] is.
+    pub region: String,
+    /// `clientRequestToken`, as the create request carried it — a member both reads report
+    /// back.
+    pub client_request_token: Option<String>,
+    /// `roleArn` — the service role Amazon Bedrock assumes to read the input and write the
+    /// output of this job.
+    pub role_arn: String,
+    /// `modelId`, as the create request spelled it: the identifier admits a bare model id,
+    /// a foundation model ARN, a custom model ARN and an inference profile ARN, and the
+    /// reads report the spelling the submission carried.
+    pub model_id: String,
+    /// `inputDataConfig` — where the job reads its records from.
+    pub input_data_config: ModelInvocationJobInputDataConfig,
+    /// `outputDataConfig` — where the job writes its records to.
+    pub output_data_config: ModelInvocationJobOutputDataConfig,
+    /// `vpcConfig`, as the create request carried it (absent when it carried none).
+    pub vpc_config: Option<VpcConfig>,
+    /// `timeoutDurationInHours`, as the create request carried it (absent when it carried
+    /// none, which is a job with no timeout to report).
+    pub timeout_duration_in_hours: Option<i32>,
+    /// `jobExpirationTime` — "the time at which the batch inference job times or timed
+    /// out": [`Self::submit_time`] plus [`Self::timeout_duration_in_hours`], and `None` for
+    /// a job the request set no timeout for.
+    pub job_expiration_time: Option<SystemTime>,
+    /// `ModelInvocationType` — the invocation endpoint this job runs against.
+    pub model_invocation_type: &'static str,
+    /// `tags` — the tags the submission attached to the job.
+    ///
+    /// Kept for the reason [`ProvisionedModelThroughputRecord::tags`] is: it is part of the
+    /// request that minted the record, and the job's own reads report no tag member.
+    pub tags: Vec<Tag>,
+    /// `ModelInvocationJobStatus`.
+    pub status: &'static str,
+    /// When [`Self::status`] is owed its move to
+    /// [`MODEL_INVOCATION_JOB_STATUS_IN_PROGRESS`], or `None` once the job has begun.
+    ///
+    /// The due INSTANT, not a timer, for the same reason
+    /// [`ModelImportJobRecord::completed_due_at`] is one.
+    pub in_progress_due_at: Option<SystemTime>,
+    /// When [`Self::status`] is owed its move to
+    /// [`MODEL_INVOCATION_JOB_STATUS_COMPLETED`], or `None` while the job has not begun yet
+    /// or has already reached a terminal status.
+    pub completed_due_at: Option<SystemTime>,
+    /// `submitTime` — when the job was submitted.
+    pub submit_time: SystemTime,
+    /// `lastModifiedTime`: the submission instant until something changes the job, and the
+    /// instant a transition was owed once the status has moved.
+    pub last_modified_at: SystemTime,
+    /// `endTime` — when the job reached a terminal status, or `None` while it has not.
+    pub ended_at: Option<SystemTime>,
+}
+
+impl ModelInvocationJobRecord {
+    /// Materialise the status transitions the clock has already made due at `now`.
+    ///
+    /// Both moves are owed at their due instant even if nobody called, which is why that
+    /// instant — not `now` — is the one the job reports as its last modification and its
+    /// end, and why settling twice at different instants reports the same instants.
+    pub fn settle(&mut self, now: SystemTime) {
+        if let Some(due) = self.in_progress_due_at.filter(|due| now >= *due) {
+            self.status = MODEL_INVOCATION_JOB_STATUS_IN_PROGRESS;
+            self.in_progress_due_at = None;
+            self.completed_due_at = Some(due + MODEL_INVOCATION_JOB_COMPLETE_AFTER);
+            self.last_modified_at = due;
+        }
+        if let Some(due) = self.completed_due_at.filter(|due| now >= *due) {
+            self.status = MODEL_INVOCATION_JOB_STATUS_COMPLETED;
+            self.completed_due_at = None;
+            self.ended_at = Some(due);
+            self.last_modified_at = due;
+        }
+    }
+}
+
 /// The most Automated Reasoning policies this account may hold at once, across every
 /// region it has created one in, past which a create is refused with
 /// `ServiceQuotaExceededException`.
@@ -1849,6 +1993,12 @@ pub struct AccountDataRetention {
 ///   `custom_model_deployment_create_tokens` holds at most one entry per live deployment
 ///   for the same reason `create_tokens` does.
 ///
+/// * `model_invocation_jobs` holds one entry per submitted batch inference job, capped at
+///   [`MAX_MODEL_INVOCATION_JOBS_PER_ACCOUNT`] by the quota `CreateModelInvocationJob`
+///   enforces (the entry is keyed by the job ARN, which carries a freshly minted id, so no
+///   two submissions can address one entry), and `model_invocation_job_create_tokens`
+///   holds at most one entry per stored job for the same reason `create_tokens` does.
+///
 /// * `automated_reasoning_policies` and `automated_reasoning_policy_names` hold one entry
 ///   per live Automated Reasoning policy, capped at
 ///   [`MAX_AUTOMATED_REASONING_POLICIES_PER_ACCOUNT`] by the quota
@@ -2065,6 +2215,17 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// How many model customization job ids this store has minted; the uniqueness half of
     /// a minted id.
     pub minted_model_customization_jobs: u64,
+    /// Every submitted batch inference job, keyed by its `ModelInvocationJobArn` — one of
+    /// the two spellings a `ModelInvocationJobIdentifier` carries, the other being the
+    /// minted job id, which that ARN itself carries.
+    pub model_invocation_jobs: HashMap<String, ModelInvocationJobRecord>,
+    /// `CreateModelInvocationJob` idempotency: `(region, clientRequestToken)` -> the
+    /// `jobArn` that token minted. Scoped to that one operation, and to the region the
+    /// request addressed, the way the model customization job index is.
+    pub model_invocation_job_create_tokens: HashMap<(String, String), String>,
+    /// How many batch inference job ids this store has minted; the uniqueness half of a
+    /// minted id.
+    pub minted_model_invocation_jobs: u64,
     /// Every stored Automated Reasoning policy, keyed by its
     /// `AutomatedReasoningPolicyArn` — the one identifier
     /// `GetAutomatedReasoningPolicy` addresses a policy by, which carries the region too,
@@ -2798,6 +2959,61 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
         let arns: Vec<String> = self.model_customization_jobs.keys().cloned().collect();
         for arn in arns {
             self.settle_model_customization_job(&arn, now);
+        }
+    }
+
+    /// Mint a fresh batch inference job id: the resource half of a
+    /// `model-invocation-job/<id>` ARN, unique within this store.
+    ///
+    /// Built like a guardrail id, and for the same two reasons; `ModelInvocationJobArn`
+    /// admits exactly `[a-z0-9]{12}` there, which is what two [`ID_HALF_WIDTH`] base-36
+    /// halves spell, and `ModelInvocationJobIdentifier`'s bare alternative is that same
+    /// `[a-z0-9]{12}`.
+    pub fn mint_model_invocation_job_id(&mut self, now: SystemTime) -> String {
+        self.minted_model_invocation_jobs += 1;
+        minted_id(self.minted_model_invocation_jobs, now)
+    }
+
+    /// The `ModelInvocationJobArn` a `ModelInvocationJobIdentifier` names: the identifier
+    /// itself when it is the ARN of a stored job, otherwise the ARN the job of that ID
+    /// carries in `region`.
+    ///
+    /// The identifier's pattern is that ARN with its `model-invocation-job/<id>` tail, or
+    /// the bare `<id>` alone
+    /// (`smithy_query(query="operation",operation="GetModelInvocationJob")`), so both
+    /// spellings address the same job — resolved exactly as
+    /// [`Self::model_customization_job_arn_of`] resolves a customization job's two
+    /// spellings, except that the bare spelling here is the minted id rather than a name.
+    #[must_use]
+    pub fn model_invocation_job_arn_of(&self, identifier: &str, region: &str) -> Option<String> {
+        if self.model_invocation_jobs.contains_key(identifier) {
+            return Some(identifier.to_string());
+        }
+        let arn = model_invocation_job_arn(region, identifier);
+        self.model_invocation_jobs.contains_key(&arn).then_some(arn)
+    }
+
+    /// The batch inference job a `ModelInvocationJobIdentifier` names, with every status
+    /// transition the clock has made due at `now` materialised first — so every caller
+    /// reads the status the job holds at `now`, whichever operation asked.
+    pub fn model_invocation_job(
+        &mut self,
+        identifier: &str,
+        region: &str,
+        now: SystemTime,
+    ) -> Option<&mut ModelInvocationJobRecord> {
+        let arn = self.model_invocation_job_arn_of(identifier, region)?;
+        let record = self.model_invocation_jobs.get_mut(&arn)?;
+        record.settle(now);
+        Some(record)
+    }
+
+    /// Materialise every batch inference job transition the clock has made due at `now`, so
+    /// a listing reports — and its `statusEquals` filters on — the status each job holds at
+    /// `now`, which is the status a read of that one job reports at the same instant.
+    pub fn settle_model_invocation_jobs(&mut self, now: SystemTime) {
+        for record in self.model_invocation_jobs.values_mut() {
+            record.settle(now);
         }
     }
 
@@ -3721,6 +3937,65 @@ pub fn supports_customization(model: &FoundationModel, customization_type: &str)
     model
         .customizations_supported
         .contains(&customization_type)
+}
+
+/// The ARN of a batch inference job in `region`:
+/// `arn:aws:bedrock:<region>:<account>:model-invocation-job/<id>`, as
+/// `ModelInvocationJobArn`
+/// (`^arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:model-invocation-job/[a-z0-9]{12}$`)
+/// spells it.
+pub fn model_invocation_job_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn("bedrock", region, &format!("model-invocation-job/{id}"))
+}
+
+/// The `ModelInvocationType` a create request's `modelInvocationType` names; `None` for a
+/// value the modelled enum does not carry.
+///
+/// Resolved against `crate::ops::types::MODEL_INVOCATION_TYPE_VALUES` — the enum's own
+/// value list — so a stored record carries one of the modelled values rather than whatever
+/// text arrived, exactly as [`customization_type_of`] does for a customization.
+#[must_use]
+pub fn model_invocation_type_of(requested: &str) -> Option<&'static str> {
+    crate::ops::types::MODEL_INVOCATION_TYPE_VALUES
+        .iter()
+        .find(|value| **value == requested)
+        .copied()
+}
+
+/// The `ModelInvocationJobSummary` a listing reports for a stored batch inference job.
+///
+/// Lives here rather than in `ops/list_model_invocation_jobs.rs` because every member it
+/// carries is also a member `GetModelInvocationJob` reports, and the two must agree about
+/// them: a listed summary is the same record the read of that one job finds.
+#[must_use]
+pub fn model_invocation_job_summary(record: &ModelInvocationJobRecord) -> ModelInvocationJobSummary {
+    ModelInvocationJobSummary {
+        job_arn: record.arn.clone(),
+        job_name: record.name.clone(),
+        model_id: record.model_id.clone(),
+        client_request_token: record.client_request_token.clone(),
+        role_arn: record.role_arn.clone(),
+        status: Some(record.status.to_string()),
+        // "If the batch inference job failed, this field contains a message describing why
+        // the job failed": no job of this store fails, so there is no message to report.
+        message: None,
+        submit_time: date_time(record.submit_time),
+        last_modified_time: Some(date_time(record.last_modified_at)),
+        end_time: record.ended_at.map(date_time),
+        input_data_config: record.input_data_config.clone(),
+        output_data_config: record.output_data_config.clone(),
+        vpc_config: record.vpc_config.clone(),
+        timeout_duration_in_hours: record.timeout_duration_in_hours,
+        job_expiration_time: record.job_expiration_time.map(date_time),
+        model_invocation_type: Some(record.model_invocation_type.to_string()),
+        // The record counts are counted BY the inference run over the input in S3; this
+        // emulator reads no input and runs no inference, so none of them is reported rather
+        // than reported as a fabricated count.
+        total_record_count: None,
+        processed_record_count: None,
+        success_record_count: None,
+        error_record_count: None,
+    }
 }
 
 /// The `CustomModelSummary` a listing reports for a stored custom model.

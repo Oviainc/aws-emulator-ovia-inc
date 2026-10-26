@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPoliciesGrantingServiceAccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPoliciesGrantingServiceAccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPoliciesGrantingServiceAccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -120,11 +111,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-iam-awsidentitymanageme
 // here — hence the `ListPoliciesGrantingServiceAccessError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.iam#ListPoliciesGrantingServiceAccess")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.iam#ListPoliciesGrantingServiceAccess",
+    extra_errors = ["ServiceFailureException"]
+)]
 #[derive(Debug)]
 pub enum ListPoliciesGrantingServiceAccessErrorModeled {
     InvalidInputException(InvalidInputException),
     NoSuchEntityException(NoSuchEntityException),
+    ServiceFailureException(ServiceFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -178,18 +173,224 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPoliciesGrantingServiceAccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPoliciesGrantingServiceAccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPoliciesGrantingServiceAccess"))
+        // `ctx` carries the request metadata the decision below is made from (the
+        // signing access key id); everything reported comes from the store and the
+        // request's own ARN, namespaces and marker.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListPoliciesGrantingServiceAccessErrorModeled::ServiceFailureException(
+                    ServiceFailureException {
+                        message: Some("the IAM store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // An ARN that is not a user's, a group's or a role's names no identity whose
+        // policies could be listed, which is an invalid input rather than a missing
+        // entity — the refusal `GetContextKeysForPrincipalPolicy` and
+        // `SimulatePrincipalPolicy` answer for the same ARN.
+        if crate::state::parse_entity_arn(&input.arn).is_none() {
+            return Err(
+                ListPoliciesGrantingServiceAccessErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "ARN {} is not valid: Arn must be the ARN of an IAM user, group \
+                             or role",
+                            input.arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The page resumes strictly at the POSITION the marker names in the
+        // namespaces this request asks about, so a token this service's encoding
+        // cannot have produced is refused as an "invalid … value … supplied for an
+        // input parameter" rather than read as the start of the list.
+        let resume_at = match &input.marker {
+            Some(marker) => match crate::state::decode_marker(
+                crate::state::MARKER_SCOPE_POLICIES_GRANTING_SERVICE_ACCESS,
+                marker,
+            )
+            .and_then(|key| key.parse::<usize>().ok())
+            {
+                Some(position) => position,
+                None => {
+                    return Err(
+                        ListPoliciesGrantingServiceAccessErrorModeled::InvalidInputException(
+                            InvalidInputException {
+                                message: Some(
+                                    "Invalid Marker: the value is not a marker this service \
+                                     issued"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => 0,
+        };
+
+        // A read: it reports what the stored policies grant and writes nothing. The
+        // lock is held only for the collection, so nothing else waits on it while the
+        // documents below are read.
+        let carried = {
+            let store = state.lock();
+
+            // IAM authorizes its own API: the signing principal's identity-based
+            // policies are evaluated before anything is reported, so a caller the
+            // policies in force do not permit learns nothing about the identity it
+            // asked about. The resource the decision is made on is that identity —
+            // the ARN this request addresses.
+            crate::state::authorization::authorize(
+                &store,
+                ctx,
+                crate::state::authorization::LIST_POLICIES_GRANTING_SERVICE_ACCESS,
+                &input.arn,
+            )?;
+
+            let Some(carried) = store.principal_sourced_policies(&input.arn) else {
+                return Err(
+                    ListPoliciesGrantingServiceAccessErrorModeled::NoSuchEntityException(
+                        NoSuchEntityException {
+                            // "The error message describes the resource", and the
+                            // resource this operation is addressed by is the ARN
+                            // itself, so the refusal names that ARN and says it names
+                            // nothing.
+                            message: Some(format!("ARN {} does not exist.", input.arn)),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            carried
+        };
+
+        // An attached policy AWS owns whose document this emulator's catalog is short
+        // of: what it grants is not held, so whether it grants access to a service
+        // cannot be answered, and the honest answer is that nobody has written that
+        // entry down yet — never a list that silently leaves it out.
+        if let Some(uncarried) =
+            carried
+                .iter()
+                .find_map(|policy| match (&policy.document, &policy.source) {
+                    (None, crate::state::PolicySource::Managed { policy_arn, .. }) => {
+                        Some(policy_arn)
+                    }
+                    _ => None,
+                })
+        {
+            return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                crate::state::uncarried_aws_managed_policy(uncarried, "document"),
+            ));
+        }
+
+        // One entry per namespace the request asks about, in the order it asked —
+        // `serviceNamespaceListType` bounds that list at 200 members, and a page
+        // carries at most the number of items an IAM list operation reports by
+        // default, so a request asking about more of them is reported over two pages.
+        let total = input.service_namespaces.len();
+        let page: Vec<ListPoliciesGrantingServiceAccessEntry> = input
+            .service_namespaces
+            .iter()
+            .skip(resume_at)
+            .take(PAGE_SIZE)
+            .map(|service_namespace| ListPoliciesGrantingServiceAccessEntry {
+                service_namespace: Some(service_namespace.clone()),
+                // A namespace nothing in force grants access to is reported with an
+                // empty list: the request asked about it, so the answer for it is
+                // "no policy", not the absence of an answer.
+                policies: Some(
+                    carried
+                        .iter()
+                        .filter(|policy| {
+                            policy.document.as_deref().is_some_and(|document| {
+                                crate::state::grants_service_access(document, service_namespace)
+                            })
+                        })
+                        .map(|policy| reported_policy(&policy.source))
+                        .collect(),
+                ),
+            })
+            .collect();
+
+        let next = resume_at.saturating_add(page.len());
+        let is_truncated = next < total;
+        Ok(ListPoliciesGrantingServiceAccessOutput {
+            policies_granting_service_access: page,
+            is_truncated,
+            marker: is_truncated.then(|| {
+                crate::state::encode_marker(
+                    crate::state::MARKER_SCOPE_POLICIES_GRANTING_SERVICE_ACCESS,
+                    &next.to_string(),
+                )
+            }),
+        })
     }
 }
+
+/// How many namespaces ONE page reports on.
+///
+/// The request may name up to 200 of them (`serviceNamespaceListType`, len 1..200)
+/// and the operation takes no `MaxItems`, so the page is bounded by the number of
+/// items IAM's list operations report when a request supplies none
+/// ([`crate::state::DEFAULT_MAX_ITEMS`]); the namespaces that do not fit are
+/// reported on the next page, which the response's `Marker` names.
+const PAGE_SIZE: usize = crate::state::DEFAULT_MAX_ITEMS as usize;
+
+/// How ONE identity-based policy in force on the identity is reported.
+///
+/// "For each managed policy, this operation returns the ARN and policy name. For
+/// each inline policy, it returns the policy name and the entity to which it is
+/// attached. Inline policies do not have an ARN." A managed policy's name is the
+/// friendly name its ARN ends in, which is the same name every other reader of an
+/// attachment reports it under; an inline policy's entity is the identity it is
+/// embedded in, reported as its type and its friendly name.
+fn reported_policy(source: &crate::state::PolicySource) -> PolicyGrantingServiceAccess {
+    match source {
+        crate::state::PolicySource::Inline {
+            policy_name,
+            attachment_type,
+            attachment_name,
+        } => PolicyGrantingServiceAccess {
+            policy_name: policy_name.clone(),
+            policy_type: POLICY_TYPE_INLINE.to_string(),
+            policy_arn: None,
+            // `policyOwnerEntityType`'s three values are the three `AttachmentType`
+            // values in upper case (`ops::types::POLICY_OWNER_ENTITY_TYPE_VALUES`
+            // beside `ops::types::ATTACHMENT_TYPE_VALUES`), which is the one
+            // difference between the two spellings of an entity's type.
+            entity_type: Some(attachment_type.to_ascii_uppercase()),
+            entity_name: Some(attachment_name.clone()),
+        },
+        crate::state::PolicySource::Managed { policy_arn, .. } => PolicyGrantingServiceAccess {
+            // An attachment is made with an ARN the attach refused unless it named a
+            // managed policy, so the name is always there to read; an ARN that
+            // somehow does not carry one is reported with none rather than dropping
+            // the policy from the list.
+            policy_name: crate::state::parse_policy_arn(policy_arn)
+                .map(|parsed| parsed.policy_name)
+                .unwrap_or_default(),
+            policy_type: POLICY_TYPE_MANAGED.to_string(),
+            policy_arn: Some(policy_arn.clone()),
+            // A managed policy is attached rather than embedded, so it belongs to no
+            // entity: "inline policies do not have an ARN", and only an inline policy
+            // carries the entity it is attached to.
+            entity_type: None,
+            entity_name: None,
+        },
+    }
+}
+
+/// The `policyType` value of a policy EMBEDDED in the identity — one of the two the
+/// enum declares, which `ops::types::POLICY_TYPE_VALUES` records.
+const POLICY_TYPE_INLINE: &str = "INLINE";
+
+/// The `policyType` value of a managed policy ATTACHED to the identity. See
+/// [`POLICY_TYPE_INLINE`].
+const POLICY_TYPE_MANAGED: &str = "MANAGED";

@@ -372,6 +372,12 @@ pub const MARKER_SCOPE_ROLES: &str = "roles";
 /// issued while paging groups is not read as a position among the users or roles.
 pub const MARKER_SCOPE_GROUPS: &str = "groups";
 
+/// The marker scope of the account's instance profile collection, which
+/// `ListInstanceProfiles` pages over. It is its OWN scope, exactly as the user and
+/// role collections are, so a marker issued while paging another collection is not
+/// read as a position among the instance profiles.
+pub const MARKER_SCOPE_INSTANCE_PROFILES: &str = "instance-profiles";
+
 /// The marker scope of the managed policies an account can read — the ones it holds
 /// itself and the ones AWS owns ([`AWS_MANAGED_POLICIES`]) — which `ListPolicies`
 /// pages over. It is its OWN scope, like the user and role collections, and ONE
@@ -448,6 +454,14 @@ pub const MARKER_SCOPE_ACCESS_KEYS: &str = "access-keys";
 /// position in a list the request itself determines (its actions and resources), so
 /// the key the marker carries is the INDEX of the next result rather than a store key.
 pub const MARKER_SCOPE_SIMULATION_RESULTS: &str = "simulation-results";
+
+/// The marker scope of the service namespaces ONE
+/// `ListPoliciesGrantingServiceAccess` request asks about. Like
+/// [`MARKER_SCOPE_SIMULATION_RESULTS`] this one names a position in a list the
+/// REQUEST determines (its `ServiceNamespaces`) rather than in a store, so the key
+/// the marker carries is the index of the next namespace to report on.
+pub const MARKER_SCOPE_POLICIES_GRANTING_SERVICE_ACCESS: &str =
+    "policies-granting-service-access";
 
 /// The marker scope of the tag set of ONE tagged entity, which IAM's tag-listing
 /// operations page over. The entity's handle follows it, so a marker issued while
@@ -2267,6 +2281,115 @@ pub fn context_keys_in_policies<'a, I: IntoIterator<Item = &'a str>>(documents: 
     keys.into_values().collect()
 }
 
+/// The `Effect` value that makes a statement a GRANT rather than a refusal, as the
+/// IAM policy grammar spells it.
+const EFFECT_ALLOW: &str = "Allow";
+
+/// The character separating a service namespace from an action name in an action
+/// element's value (`iam:CreateUser`).
+const ACTION_SEPARATOR: char = ':';
+
+/// The whole-element wildcard: the value that stands for every action, and the one
+/// action element the grammar admits with no service namespace in front of it.
+const ANY_ACTION: &str = "*";
+
+/// Whether the IAM policy document `document` grants access to the service whose
+/// namespace is `service_namespace` — that is, whether one of its statements ALLOWS
+/// at least one action belonging to that service.
+///
+/// A policy grants access to a service when it permits an action of that service:
+/// an action element's value is `<namespace>:<action>` (or the whole-element `*`),
+/// so the namespace a value reaches is the part before the separator, matched with
+/// IAM's `*` and `?` wildcards and without regard to case — the comparison
+/// [`::service_common::iam_authorization::wildcard_match`] makes for every action
+/// name in the tree. A `NotAction` element permits everything its values do NOT, so
+/// it reaches the namespace unless one of its values covers EVERY action of it.
+///
+/// Only a statement's EFFECT and its action element decide this: what the policy
+/// grants access to is a property of the policy, so a statement's resource scope
+/// narrows which resources of the service it reaches rather than whether it reaches
+/// the service, and a `Deny` — in this document or another — refuses access rather
+/// than granting it. A document that is not JSON grants nothing, the reading
+/// [`context_keys_in_policies`] gives such a document, and `Statement` is read both
+/// as the list and as the single statement the grammar admits.
+pub fn grants_service_access(document: &str, service_namespace: &str) -> bool {
+    let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(document) else {
+        return false;
+    };
+    let Some(statement) = parsed.get("Statement") else {
+        return false;
+    };
+    let statements = match statement.as_array() {
+        Some(statements) => statements.as_slice(),
+        None => ::std::slice::from_ref(statement),
+    };
+    statements.iter().any(|statement| {
+        let allows = statement
+            .get("Effect")
+            .and_then(::serde_json::Value::as_str)
+            .is_some_and(|effect| effect == EFFECT_ALLOW);
+        if !allows {
+            return false;
+        }
+        if let Some(permitted) = statement.get("Action") {
+            return element_values(permitted)
+                .into_iter()
+                .any(|value| reaches_namespace(value, service_namespace));
+        }
+        if let Some(excluded) = statement.get("NotAction") {
+            return !element_values(excluded)
+                .into_iter()
+                .any(|value| covers_namespace(value, service_namespace));
+        }
+        // A statement with neither element is about no action at all.
+        false
+    })
+}
+
+/// The string values one policy element carries: the IAM grammar writes
+/// `Action`/`NotAction` either as one string or as a list of them.
+fn element_values(element: &::serde_json::Value) -> Vec<&str> {
+    match element.as_array() {
+        Some(values) => values.as_slice(),
+        None => ::std::slice::from_ref(element),
+    }
+    .iter()
+    .filter_map(::serde_json::Value::as_str)
+    .collect()
+}
+
+/// Whether the action-element value `value` names at least ONE action of the service
+/// whose namespace is `service_namespace`.
+fn reaches_namespace(value: &str, service_namespace: &str) -> bool {
+    match value.split_once(ACTION_SEPARATOR) {
+        Some((namespace, _action)) => ::service_common::iam_authorization::wildcard_match(
+            namespace,
+            service_namespace,
+            false,
+        ),
+        // Without a separator the only value that names an action is the
+        // whole-element wildcard, which names every action of every service.
+        None => value == ANY_ACTION,
+    }
+}
+
+/// Whether the action-element value `value` names EVERY action of the service whose
+/// namespace is `service_namespace` — what a `NotAction` value has to do to put the
+/// whole service outside the statement's grant.
+fn covers_namespace(value: &str, service_namespace: &str) -> bool {
+    match value.split_once(ACTION_SEPARATOR) {
+        Some((namespace, action)) => {
+            action == ANY_ACTION
+                && ::service_common::iam_authorization::wildcard_match(
+                    namespace,
+                    service_namespace,
+                    false,
+                )
+        }
+        None => value == ANY_ACTION,
+    }
+}
+
 /// One entry of AWS's own catalog of managed policies — a policy AWS owns and
 /// every account can read and attach, addressed under the
 /// `arn:aws:iam::aws:policy/` namespace ([`AWS_MANAGED_POLICY_ACCOUNT`]).
@@ -2593,6 +2716,22 @@ pub fn listed_policy(policy: &Policy) -> Policy {
         description: None,
         tags: None,
         ..policy.clone()
+    }
+}
+
+/// One stored instance profile as a resource-LISTING operation reports it, for the
+/// same reason [`listed_role`] exists.
+///
+/// `ListInstanceProfiles`' documentation: "IAM resource-listing operations return a
+/// subset of the available attributes for the resource. For example, this operation
+/// does not return tags, even though they are an attribute of the returned object. To
+/// view all of the information for an instance profile, see GetInstanceProfile." Every
+/// other member — including `Roles`, which the resolution fills from the roles the
+/// account holds — is reported as it stands.
+pub fn listed_instance_profile(instance_profile: InstanceProfile) -> InstanceProfile {
+    InstanceProfile {
+        tags: None,
+        ..instance_profile
     }
 }
 

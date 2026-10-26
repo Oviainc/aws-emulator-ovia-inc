@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateModelInvocationJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateModelInvocationJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Submits a batch inference job: the job is minted `Submitted` — "this job has been
+//! submitted to a queue for validation" — and the clock owes it its move to `InProgress`
+//! and then to `Completed`. The record this operation writes is the one
+//! `ops/get_model_invocation_job.rs` reads back and `ops/list_model_invocation_jobs.rs`
+//! reports, so the job this call submits is the job every later request sees.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateModelInvocationJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `timeoutDurationInHours` is reported as the instant the job WOULD time out
+//! (`jobExpirationTime`) and nothing more: the member is modelled `range 24..168`, so the
+//! earliest timeout a request can ask for stands a day after the submission, while a job
+//! here is owed its completion within a second of it — no request can reach its own
+//! expiration instant, so no timeout transition is ever due.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +188,163 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateModelInvocationJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateModelInvocationJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateModelInvocationJob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateModelInvocationJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "batch inference job state is not available on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // The invocation endpoint the job runs against: one of the modelled enum's values,
+        // resolved rather than kept as whatever text arrived.
+        let Some(model_invocation_type) =
+            crate::state::model_invocation_type_of(&input.model_invocation_type)
+        else {
+            return Err(CreateModelInvocationJobErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "modelInvocationType {} is not an invocation endpoint Amazon Bedrock \
+                         offers",
+                        input.model_invocation_type
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // `@idempotencyToken`: a replay answers with what the first request submitted.
+        let replayed = input
+            .client_request_token
+            .as_ref()
+            .and_then(|token| {
+                store
+                    .model_invocation_job_create_tokens
+                    .get(&(region.clone(), token.clone()))
+            })
+            .cloned();
+        if let Some(minted) = replayed {
+            if let Some(job) = store.model_invocation_jobs.get(&minted) {
+                return Ok(CreateModelInvocationJobOutput {
+                    job_arn: job.arn.clone(),
+                });
+            }
+        }
+
+        // `modelId` admits a foundation model — by its bare id or by its ARN — a
+        // `custom-model` ARN and an inference profile ARN
+        // (`smithy_query(query="operation",operation="CreateModelInvocationJob")`: its
+        // pattern carries all three), so each of those families is asked in turn, through
+        // the very index its own reads resolve an identifier through. A value naming none of
+        // them names no model there is anything to invoke, reported absent exactly as
+        // `ops/create_model_customization_job.rs` reports a base model the catalog does not
+        // carry.
+        let names_a_model = store
+            .foundation_models
+            .qualified_model(crate::state::base_model_id_of(&input.model_id))
+            .is_some()
+            || store.custom_model(&input.model_id, &region, now).is_some()
+            || store
+                .inference_profile_arn_of(&input.model_id, &region)
+                .is_some();
+        if !names_a_model {
+            return Err(
+                CreateModelInvocationJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "modelId {} does not name a model in this account in {region}",
+                            input.model_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The account's batch inference job quota. Enforcing it here is also what bounds
+        // this part of the store: without a server-side cap a caller could grow it with
+        // nothing but further submissions.
+        if store.model_invocation_jobs.len() >= crate::state::MAX_MODEL_INVOCATION_JOBS_PER_ACCOUNT
+        {
+            return Err(
+                CreateModelInvocationJobErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} batch inference jobs; \
+                             request a quota increase",
+                            crate::state::MAX_MODEL_INVOCATION_JOBS_PER_ACCOUNT
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let job_id = store.mint_model_invocation_job_id(now);
+        let arn = crate::state::model_invocation_job_arn(&region, &job_id);
+        let job = crate::state::ModelInvocationJobRecord {
+            arn: arn.clone(),
+            name: input.job_name,
+            region: region.clone(),
+            client_request_token: input.client_request_token.clone(),
+            role_arn: input.role_arn,
+            model_id: input.model_id,
+            input_data_config: input.input_data_config,
+            output_data_config: input.output_data_config,
+            vpc_config: input.vpc_config,
+            timeout_duration_in_hours: input.timeout_duration_in_hours,
+            // "The number of hours after which to force the batch inference job to time
+            // out", counted from the instant it was submitted — so the instant it times out
+            // is that submission plus those hours, and a job the request set no timeout for
+            // has none. The conversion cannot narrow a value the modelled `range 24..168`
+            // admits; one outside it reports no expiration instant rather than one AT the
+            // submission.
+            job_expiration_time: input
+                .timeout_duration_in_hours
+                .and_then(|hours| u64::try_from(hours).ok())
+                .map(|hours| {
+                    now + ::std::time::Duration::from_secs(hours * crate::state::SECONDS_PER_HOUR)
+                }),
+            model_invocation_type,
+            tags: input.tags.unwrap_or_default(),
+            // The inference runs after this call returns, so the job is reported as queued
+            // for validation now and is owed its start once the span has passed.
+            status: crate::state::MODEL_INVOCATION_JOB_STATUS_SUBMITTED,
+            in_progress_due_at: Some(now + crate::state::MODEL_INVOCATION_JOB_BEGINS_AFTER),
+            completed_due_at: None,
+            submit_time: now,
+            last_modified_at: now,
+            ended_at: None,
+        };
+
+        if let Some(token) = input.client_request_token {
+            store
+                .model_invocation_job_create_tokens
+                .insert((region, token), arn.clone());
+        }
+        store.model_invocation_jobs.insert(arn.clone(), job);
+
+        // Read the response back out of the STORED record, so what the caller is told is
+        // exactly what a later GetModelInvocationJob will find. A store that does not hold
+        // it is reported as a server error rather than panicked on, so no request can take
+        // the process down.
+        let Some(stored) = store.model_invocation_jobs.get(&arn) else {
+            return Err(CreateModelInvocationJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the submitted batch inference job was not stored".to_string()),
+                },
+            )
+            .into());
+        };
+        Ok(CreateModelInvocationJobOutput {
+            job_arn: stored.arn.clone(),
+        })
     }
 }

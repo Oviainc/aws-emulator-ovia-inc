@@ -23,6 +23,8 @@ mod collection_cap_constraint_reports;
 mod continuous_backups;
 #[path = "all/contributor_insights.rs"]
 mod contributor_insights;
+#[path = "all/describe_contributor_insights_reports.rs"]
+mod describe_contributor_insights_reports;
 #[path = "all/emulator.rs"]
 mod emulator;
 #[path = "all/endpoint_discovery.rs"]

@@ -2,8 +2,9 @@
 
 //! @op GetGateway
 //! Returns the gateway an ARN names, built from the record persisted in
-//! [`crate::state`]. @readonly: it writes nothing. This is the ONLY file to touch for
-//! this operation.
+//! [`crate::state`] as of the clock ([`crate::state::StoredGateway::details_as_of`], so an
+//! appliance software update the clock has made due is reported as in effect). @readonly:
+//! it writes nothing. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -164,7 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetGatewayOutput {
-            gateway: Some(gateway.details()),
+            gateway: Some(gateway.details_as_of(::std::time::SystemTime::now())),
         })
     }
 }

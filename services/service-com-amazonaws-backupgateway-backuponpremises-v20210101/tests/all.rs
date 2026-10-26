@@ -21,6 +21,8 @@ mod gateway_lifecycle;
 mod gateway_server_association;
 #[path = "all/gateway_server_disassociation.rs"]
 mod gateway_server_disassociation;
+#[path = "all/gateway_software_update.rs"]
+mod gateway_software_update;
 #[path = "all/hypervisor_configuration_test.rs"]
 mod hypervisor_configuration_test;
 #[path = "all/hypervisor_host_is_not_a_key.rs"]

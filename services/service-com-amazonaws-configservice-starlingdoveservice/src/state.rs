@@ -2254,12 +2254,18 @@ impl DiscoveredResourceEntry {
     /// blocks a recorder captures beside the configuration itself — carries the ones
     /// recorded for this resource, and is absent when none was.
     ///
-    /// Three members stay unset because nothing in this emulator knows them: the
-    /// resource's own `arn` and `availabilityZone` belong to the service that owns the
-    /// resource, and `resourceCreationTime` is the instant that service created it,
-    /// none of which a recorded configuration item carries
-    /// (`PutResourceConfig` records the type, the id, the name, the schema version and
-    /// the configuration document, and nothing else).
+    /// The resource's own `arn` is the ARN of the resource this item records, derived
+    /// from the type and the id that identify it in the Region the item is reported
+    /// under ([`recorded_resource_arn`]) — it is the only member of the item that
+    /// carries the resource's ARN, since `resourceId` and `resourceName` carry the bare
+    /// id and name.
+    ///
+    /// Two members stay unset because nothing in this emulator knows them:
+    /// `availabilityZone` belongs to the service that owns the resource, and
+    /// `resourceCreationTime` is the instant that service created it, neither of which
+    /// a recorded configuration item carries (`PutResourceConfig` records the type, the
+    /// id, the name, the schema version and the configuration document, and nothing
+    /// else).
     pub fn to_base_configuration_item(
         &self,
         aws_region: &str,
@@ -2281,7 +2287,7 @@ impl DiscoveredResourceEntry {
             configuration_item_capture_time: self.last_recorded_at.map(timestamp),
             configuration_item_status: Some(self.configuration_item_status().to_string()),
             configuration_state_id: self.configuration_state_id(),
-            arn: None,
+            arn: recorded_resource_arn(&self.resource_type, &self.resource_id, aws_region),
             resource_type: Some(self.resource_type.clone()),
             resource_id: Some(self.resource_id.clone()),
             resource_name: self.resource_name.clone(),
@@ -3533,6 +3539,12 @@ pub use select_query::*;
 // its names as `crate::state::<name>`.
 pub mod recording;
 pub use recording::*;
+
+// How a RECORDED resource is resolved to its own ARN — the one member of a
+// configuration item that carries it — lives in `state/resource_arn.rs`, re-exported
+// here like the modules above so a handler reaches its names as `crate::state::<name>`.
+pub mod resource_arn;
+pub use resource_arn::*;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

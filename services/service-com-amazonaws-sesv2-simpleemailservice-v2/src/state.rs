@@ -3,9 +3,10 @@
 //! Engine state for the com-amazonaws-sesv2-simpleemailservice-v2 service.
 //!
 //! Everything the implemented operations answer with is computed from the records
-//! below: the email-identity table, the contact-list table, the outbound-message log
-//! and the per-account send counters. Nothing here is per-request scratch — the whole
-//! struct lives in the one shared engine (see [`service_state`]).
+//! below: the email-identity table, the contact-list table, the outbound-message log,
+//! the per-account send counters and the account-level attributes. Nothing here is
+//! per-request scratch — the whole struct lives in the one shared engine (see
+//! [`service_state`]).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -86,6 +87,11 @@ pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
     pub sent_messages: Vec<SentMessage>,
     /// Per-account send counters, bumped by `SendEmail`.
     pub send_counters: SendQuotaState,
+    /// The account-level attributes of this account in this Region: the sending
+    /// and dedicated-IP switches, the reputation status, the suppression, VDM and
+    /// pricing attributes and the account details, as the account operations left
+    /// them.
+    pub account: AccountState,
     /// Monotonic counter feeding [`Self::next_message_id`], so two sends in the
     /// same microsecond still get different message ids.
     pub message_sequence: u64,
@@ -630,6 +636,18 @@ pub struct SendQuotaState {
     pub max_send_rate: f64,
 }
 
+impl SendQuotaState {
+    /// The modelled `SendQuota` view of these counters, as the operations that
+    /// report the account's sending limits answer it.
+    pub fn send_quota(&self) -> crate::ops::types::SendQuota {
+        crate::ops::types::SendQuota {
+            max24_hour_send: self.max_24h,
+            max_send_rate: self.max_send_rate,
+            sent_last24_hours: self.sent_last_24h,
+        }
+    }
+}
+
 impl Default for SendQuotaState {
     /// The limits a new account has in the SES sandbox: 200 messages per 24-hour
     /// period at 1 message per second.
@@ -638,6 +656,135 @@ impl Default for SendQuotaState {
             sent_last_24h: 0.0,
             max_24h: 200.0,
             max_send_rate: 1.0,
+        }
+    }
+}
+
+/// The reputation status of an account nothing has acted against.
+///
+/// `GetAccount`'s `EnforcementStatus` documents it as "HEALTHY – There are no
+/// reputation-related issues that currently impact your account", which is the
+/// status of an account whose sending nobody has reviewed or paused.
+pub const ENFORCEMENT_STATUS_HEALTHY: &str = "HEALTHY";
+
+/// `FeatureStatus`'s value for a feature that is on, as the model spells it (see
+/// `crate::ops::types::FEATURE_STATUS_VALUES`).
+pub const FEATURE_ENABLED: &str = "ENABLED";
+
+/// `FeatureStatus`'s value for a feature that is off.
+pub const FEATURE_DISABLED: &str = "DISABLED";
+
+/// `PricingPlan`'s value for an account on no paid plan, one of the four values
+/// `PutAccountPricingAttributesRequest$Plan` documents.
+pub const PRICING_PLAN_NONE: &str = "NONE";
+
+/// The account-level attributes of one SES account in one Region.
+///
+/// A single record rather than a table: every member of it is per account and
+/// Region, and the emulator serves one account in one Region, so the account
+/// operations all read and write this one record.
+#[derive(Debug, Clone)]
+pub struct AccountState {
+    /// `SendingEnabled`: whether email sending is enabled for the account.
+    pub sending_enabled: bool,
+    /// `DedicatedIpAutoWarmupEnabled`: whether dedicated IPs associated with the
+    /// account are warmed up automatically.
+    pub dedicated_ip_auto_warmup_enabled: bool,
+    /// `ProductionAccessEnabled`: false while the account is in the sandbox, where
+    /// it may only send to verified identities.
+    pub production_access_enabled: bool,
+    /// `EnforcementStatus`: the account's reputation status.
+    pub enforcement_status: String,
+    /// `SuppressionAttributes$SuppressedReasons`: the reasons for which an address
+    /// is added to the account-level suppression list automatically.
+    pub suppressed_reasons: Vec<String>,
+    /// `SuppressionAttributes$ValidationAttributes`, once a request has set them.
+    pub suppression_validation: Option<crate::ops::types::SuppressionValidationAttributes>,
+    /// `VdmAttributes$VdmEnabled`: the status of the account's VDM configuration.
+    pub vdm_enabled: String,
+    /// `DashboardAttributes$EngagementMetrics`, once a request has set it.
+    pub vdm_engagement_metrics: Option<String>,
+    /// `GuardianAttributes$OptimizedSharedDelivery`, once a request has set it.
+    pub vdm_optimized_shared_delivery: Option<String>,
+    /// `PricingAttributes$CurrentPlan`: the plan currently active on the account.
+    pub pricing_plan: String,
+    /// `PricingAttributes$NextPlan`: the plan a scheduled change will activate.
+    /// `NextPlan` "is empty when no scheduled change is pending", so it is absent
+    /// until a change is scheduled.
+    pub next_pricing_plan: Option<String>,
+    /// `Details`: the account details a request supplied, absent until one does.
+    pub details: Option<crate::ops::types::AccountDetails>,
+}
+
+impl Default for AccountState {
+    /// The attributes of an account nobody has configured yet.
+    ///
+    /// Email sending and dedicated-IP auto warm-up are on — SES turns both on for
+    /// an account and the account operations are what switch them off — the account
+    /// is in the sandbox (which is what the sandbox [`SendQuotaState::default`]
+    /// limits go with), its reputation is unenforced, and the account-level
+    /// suppression list is on for both of its documented reasons. VDM is off until
+    /// a request enables it, no pricing plan is active, and no account details have
+    /// been supplied.
+    fn default() -> Self {
+        Self {
+            sending_enabled: true,
+            dedicated_ip_auto_warmup_enabled: true,
+            production_access_enabled: false,
+            enforcement_status: ENFORCEMENT_STATUS_HEALTHY.to_string(),
+            suppressed_reasons: crate::ops::types::SUPPRESSION_LIST_REASON_VALUES
+                .iter()
+                .map(|reason| (*reason).to_string())
+                .collect(),
+            suppression_validation: None,
+            vdm_enabled: FEATURE_DISABLED.to_string(),
+            vdm_engagement_metrics: None,
+            vdm_optimized_shared_delivery: None,
+            pricing_plan: PRICING_PLAN_NONE.to_string(),
+            next_pricing_plan: None,
+            details: None,
+        }
+    }
+}
+
+impl AccountState {
+    /// The modelled `SuppressionAttributes` view of this record.
+    ///
+    /// One projection shared by every operation that reports the account's
+    /// suppression preferences, so a write and the read after it cannot disagree.
+    pub fn suppression_attributes(&self) -> crate::ops::types::SuppressionAttributes {
+        crate::ops::types::SuppressionAttributes {
+            suppressed_reasons: Some(self.suppressed_reasons.clone()),
+            validation_attributes: self.suppression_validation.clone(),
+        }
+    }
+
+    /// The modelled `VdmAttributes` view of this record.
+    ///
+    /// The nested dashboard and guardian attributes carry one feature status each,
+    /// and an attribute nothing has set is reported as absent rather than as a
+    /// status this account does not hold.
+    pub fn vdm_attributes(&self) -> crate::ops::types::VdmAttributes {
+        crate::ops::types::VdmAttributes {
+            vdm_enabled: self.vdm_enabled.clone(),
+            dashboard_attributes: self.vdm_engagement_metrics.clone().map(|engagement_metrics| {
+                crate::ops::types::DashboardAttributes {
+                    engagement_metrics: Some(engagement_metrics),
+                }
+            }),
+            guardian_attributes: self.vdm_optimized_shared_delivery.clone().map(
+                |optimized_shared_delivery| crate::ops::types::GuardianAttributes {
+                    optimized_shared_delivery: Some(optimized_shared_delivery),
+                },
+            ),
+        }
+    }
+
+    /// The modelled `PricingAttributes` view of this record.
+    pub fn pricing_attributes(&self) -> crate::ops::types::PricingAttributes {
+        crate::ops::types::PricingAttributes {
+            current_plan: Some(self.pricing_plan.clone()),
+            next_plan: self.next_pricing_plan.clone(),
         }
     }
 }

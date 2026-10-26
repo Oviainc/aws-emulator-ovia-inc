@@ -99,10 +99,14 @@ use super::put_rest_api::{put_mode, PutModeKind};
 /// import reads them back out of. A body that writes the list at its own top level is
 /// read too, so a caller that sends just the documentation set is not refused for the
 /// envelope it left off.
-const DOCUMENTATION_EXTENSION: &str = "x-amazon-apigateway-documentation";
+///
+/// Shared with the EXPORT side (`GetExport` renders a stage's documentation set under this
+/// same key), so the spelling cannot drift between the two halves of the round trip.
+pub const DOCUMENTATION_EXTENSION: &str = "x-amazon-apigateway-documentation";
 
-/// The member of [`DOCUMENTATION_EXTENSION`] holding the documentation parts.
-const DOCUMENTATION_PARTS_MEMBER: &str = "documentationParts";
+/// The member of [`DOCUMENTATION_EXTENSION`] holding the documentation parts, shared with
+/// the export side for the same reason.
+pub const DOCUMENTATION_PARTS_MEMBER: &str = "documentationParts";
 
 /// Emulator resource guard, NOT an AWS quota: the largest import body this emulator
 /// reads.

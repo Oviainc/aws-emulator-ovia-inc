@@ -14,11 +14,13 @@
 //!
 //! `HostKey` rotates the server's host key when the emulator can read the material:
 //! an OpenSSH private key becomes the server's host key, so `HostKeyFingerprint`
-//! reports that key's own fingerprint. Material in a format it cannot read changes
-//! nothing — the server keeps the key it has and reports that key's genuine
-//! fingerprint rather than one invented for material nothing read (see
-//! `state::supplied_host_key_fingerprint`). A host key the HOST KEY operations manage
-//! as a resource arrives through `ImportHostKey`, not here.
+//! reports that key's own fingerprint and the key itself becomes one of the server's
+//! host-key resources (`state::materialise_host_key`), which is what keeps the
+//! fingerprint a server reports among the keys its own readers report. Material in a
+//! format it cannot read changes nothing — the server keeps the key it has and reports
+//! that key's genuine fingerprint rather than one invented for material nothing read
+//! (see `state::read_host_key`). A host key a caller ADDS beside the server's own
+//! arrives through `ImportHostKey`, not here.
 //!
 //! ## Shape of an operation
 //!
@@ -362,6 +364,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut guard = state.lock();
+
+        // The host key this update would ROTATE to, read out of the material before
+        // anything is written: the key becomes one of the server's host keys
+        // (`state::materialise_host_key`), and a server's key set is BOUNDED, so a
+        // rotation the server has no room for is refused here rather than applied
+        // without the key it names being readable. A key the server already holds needs
+        // no room — it is the same key. The refusal is the modelled
+        // `InvalidRequestException`, as it is for an import past the same bound, and the
+        // capacity is released by `DeleteHostKey`.
+        let rotation = input.host_key.as_deref().and_then(st::read_host_key);
+        if let Some((fingerprint, _)) = rotation.as_ref() {
+            let holds_it = guard
+                .host_keys_of(&input.server_id)
+                .any(|host_key| &host_key.fingerprint == fingerprint);
+            if guard.servers.contains_key(&input.server_id)
+                && !holds_it
+                && !guard.server_has_host_key_capacity(&input.server_id)
+            {
+                return Err(UpdateServerErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: format!(
+                            "server {} already holds the maximum of {} host keys; \
+                             delete one before rotating to another",
+                            input.server_id,
+                            st::MAX_HOST_KEYS_PER_SERVER
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
         let Some(stored) = guard.servers.get_mut(&input.server_id) else {
             return Err(st::not_found(
                 UpdateServerErrorModeled::ResourceNotFoundException(st::unknown_server(
@@ -504,16 +538,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stored.ip_address_type = ip_address_type;
         }
         // A readable host key replaces the server's own, so the fingerprint it reports
-        // becomes that key's.
-        if let Some(fingerprint) = input
-            .host_key
-            .as_deref()
-            .and_then(st::supplied_host_key_fingerprint)
-        {
-            stored.host_key_fingerprint = fingerprint;
-        }
+        // becomes that key's — and that key is then one of the server's HOST KEYS, on
+        // the rule `state::materialise_host_key` states, so a client enumerating them
+        // still finds the one the server serves with. The room for it was checked above,
+        // before anything was written.
+        let rotated = rotation.map(|(fingerprint, key_type)| {
+            stored.host_key_fingerprint = fingerprint.clone();
+            (fingerprint, key_type)
+        });
 
         let server_id = stored.server_id.clone();
+        if let Some((fingerprint, key_type)) = rotated {
+            let region = st::request_region(ctx.parts());
+            guard.materialise_host_key(&region, &server_id, &fingerprint, &key_type);
+        }
         drop(guard);
 
         Ok(UpdateServerOutput { server_id })

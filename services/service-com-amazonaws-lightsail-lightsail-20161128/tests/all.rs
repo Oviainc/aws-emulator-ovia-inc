@@ -163,6 +163,8 @@ mod relational_database_events;
 mod relational_database_lifecycle;
 #[path = "all/relational_database_listing.rs"]
 mod relational_database_listing;
+#[path = "all/relational_database_log_events.rs"]
+mod relational_database_log_events;
 #[path = "all/relational_database_log_streams.rs"]
 mod relational_database_log_streams;
 #[path = "all/relational_database_parameter_updates.rs"]

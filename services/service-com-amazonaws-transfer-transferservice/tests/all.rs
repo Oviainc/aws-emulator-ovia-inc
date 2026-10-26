@@ -27,6 +27,8 @@ mod connector_connection_test;
 mod connector_listing;
 #[path = "all/connector_updates.rs"]
 mod connector_updates;
+#[path = "all/connector_transfers.rs"]
+mod connector_transfers;
 #[path = "all/error_message_rules.rs"]
 mod error_message_rules;
 // `workflow_step_contract` is declared HERE rather than in its alphabetical place at the
@@ -39,6 +41,8 @@ mod error_message_rules;
 mod workflow_step_contract;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/host_key_material_formats.rs"]
+mod host_key_material_formats;
 #[path = "all/host_key_lifecycle.rs"]
 mod host_key_lifecycle;
 #[path = "all/host_key_listing.rs"]
@@ -47,6 +51,8 @@ mod host_key_listing;
 mod host_keys;
 #[path = "all/identity_and_authorization.rs"]
 mod identity_and_authorization;
+#[path = "all/identity_provider_tests.rs"]
+mod identity_provider_tests;
 #[path = "all/input_validation.rs"]
 mod input_validation;
 #[path = "all/not_found_errors.rs"]
@@ -67,6 +73,8 @@ mod security_policy_catalog;
 mod security_policy_listing;
 #[path = "all/server_config_and_state.rs"]
 mod server_config_and_state;
+#[path = "all/server_host_key_resource.rs"]
+mod server_host_key_resource;
 #[path = "all/server_logging_configuration.rs"]
 mod server_logging_configuration;
 #[path = "all/server_user_lifecycle.rs"]
@@ -85,6 +93,8 @@ mod web_app_deletion;
 mod web_app_lifecycle;
 #[path = "all/web_app_listing.rs"]
 mod web_app_listing;
+#[path = "all/web_app_updates.rs"]
+mod web_app_updates;
 #[path = "all/workflow_execution_listing.rs"]
 mod workflow_execution_listing;
 #[path = "all/workflow_lifecycle.rs"]

@@ -33,7 +33,15 @@ pub fn field(name: impl Into<String>, value: impl Into<String>) -> Field {
 /// A router holding only this service, over a fresh engine — the same
 /// construction `router/src/lib.rs` performs for every service.
 pub fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    emulator_over(Arc::new(engine::InMemoryEngine::new()))
+}
+
+/// A router holding only this service, over an engine the CALLER holds, so a
+/// suite can read or seed this service's store ([`state::service_state`]) beside
+/// the calls it makes over the wire.
+///
+/// [`state::service_state`]: service_com_amazonaws_ses_simpleemailservice::state::service_state
+pub fn emulator_over(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.register_service(EmulatedService::new(engine));
     router

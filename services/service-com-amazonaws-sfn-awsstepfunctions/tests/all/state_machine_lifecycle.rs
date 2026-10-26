@@ -107,6 +107,32 @@ impl Emulator {
     /// Call one operation and return `(status, body)`. The `Authorization` header is
     /// what routes the request to this service and names the region its ARNs carry.
     pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+        let response = self.dispatch(operation, body).await;
+        let status = response.status().as_u16();
+        let bytes = response.into_body();
+        let parsed = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+                panic!(
+                    "case {operation}: expected a JSON body, got {error} for {:?}",
+                    String::from_utf8_lossy(&bytes)
+                )
+            })
+        };
+        (status, parsed)
+    }
+
+    /// Call one operation and return the WHOLE response, headers included.
+    ///
+    /// `call` above reads the status and the body off it; a suite asserting something
+    /// about a response that is not in its body — the header a response names the
+    /// request it answers in — drives this one instead.
+    pub(crate) async fn dispatch(
+        &self,
+        operation: &str,
+        body: &Value,
+    ) -> http::Response<Bytes> {
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{}/{SIGNING_NAME}/aws4_request, \
              SignedHeaders=host;x-amz-target, Signature=0123456789abcdef",
@@ -123,20 +149,7 @@ impl Emulator {
             ))
             .expect("a well-formed request");
 
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let bytes = response.into_body();
-        let parsed = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap_or_else(|error| {
-                panic!(
-                    "case {operation}: expected a JSON body, got {error} for {:?}",
-                    String::from_utf8_lossy(&bytes)
-                )
-            })
-        };
-        (status, parsed)
+        self.router.dispatch(request).await
     }
 
     /// Call one operation, requiring a 200, and return the body.

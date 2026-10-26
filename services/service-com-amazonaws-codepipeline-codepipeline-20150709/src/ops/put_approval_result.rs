@@ -276,11 +276,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 PutApprovalResultErrorModeled::ApprovalAlreadyCompletedException(
                     ApprovalAlreadyCompletedException {
-                        message: Some(format!(
-                            "The approval action '{}' in stage '{}' of pipeline '{}' has \
-                             already received a response",
-                            input.action_name, input.stage_name, input.pipeline_name
-                        )),
+                        // Invariant text: see
+                        // `crate::state::APPROVAL_ALREADY_COMPLETED_MESSAGE`. This class
+                        // of refusal is worded the same way for every approval, so no
+                        // request or state value is interpolated into it.
+                        message: Some(
+                            crate::state::APPROVAL_ALREADY_COMPLETED_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),
