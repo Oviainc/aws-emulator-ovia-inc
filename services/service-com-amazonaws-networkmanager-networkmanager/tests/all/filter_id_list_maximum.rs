@@ -14,10 +14,11 @@
 //! member="ConnectionIds"`): that filter takes the class's bound, not a sentence of its
 //! own.
 //!
-//! The table below spans every id-list filter this crate's implemented listings take, with
-//! rows differing along the NUMBER of ids the filter carries: none, a few, the bound
+//! The table of lengths is the shared one `crate::filter_maximum_table` defines, with rows
+//! differing along the NUMBER of ids the filter carries: none, a few, the bound
 //! itself, one past it and far past it, plus a row whose values repeat (the bound counts
-//! the values the list carries, not the distinct resources they name).
+//! the values the list carries, not the distinct resources they name). This suite spans
+//! every id-list filter this crate's implemented listings take over those rows.
 //!
 //! The harness is the one `global_network_lifecycle` defines — one shared engine, this
 //! service, the production dispatch.
@@ -26,19 +27,9 @@ use serde_json::json;
 
 use crate::connection_lifecycle::{create_connection_ok, id_of};
 use crate::device_lifecycle::create_device_ok;
+use crate::filter_maximum_table::{assert_filter_refusal, FIXTURE_COUNT, MAX_FILTER_VALUES, ROWS};
 use crate::global_network_lifecycle::{error_code, ids_of, Emulator};
 use crate::link_lifecycle::{create_link_ok, plain_link};
-
-/// The documented maximum number of ids one of these filters may name: "The IDs of one or
-/// more global networks. The maximum is 10."
-/// (`smithy_query query="doc" shape="DescribeGlobalNetworksRequest"
-/// member="GlobalNetworkIds"`), and the same sentence on `GetSitesRequest$SiteIds`,
-/// `GetLinksRequest$LinkIds` and `GetDevicesRequest$DeviceIds`.
-const MAX_FILTER_IDS: usize = 10;
-
-/// How many resources of each kind the fixture creates: two more than the bound, so a row
-/// at the bound, a row one past it and a row past it with distinct ids are all expressible.
-const FIXTURE_COUNT: usize = MAX_FILTER_IDS + 2;
 
 /// One listing operation that takes a documented id-list filter.
 struct Filter {
@@ -55,86 +46,6 @@ struct Filter {
     uri: String,
     /// Every id of the kind this filter names, in the order the listing answers them.
     ids: Vec<String>,
-}
-
-/// One row of the table: how many filter values the request carries, and whether the
-/// values repeat.
-struct Row {
-    name: &'static str,
-    /// `None` for a request that omits the filter entirely.
-    count: Option<usize>,
-    /// Whether the row cycles the available ids to reach `count` (so values repeat).
-    repeating: bool,
-}
-
-/// The rows, spanning the whole class the rule generalises over: the filter absent, well
-/// inside the bound, exactly at it, one past it, far past it, and past it with repeated
-/// values.
-const ROWS: [Row; 8] = [
-    Row {
-        name: "filter absent",
-        count: None,
-        repeating: false,
-    },
-    Row {
-        name: "one id",
-        count: Some(1),
-        repeating: false,
-    },
-    Row {
-        name: "two ids",
-        count: Some(2),
-        repeating: false,
-    },
-    Row {
-        name: "one below the maximum",
-        count: Some(MAX_FILTER_IDS - 1),
-        repeating: false,
-    },
-    Row {
-        name: "exactly the maximum",
-        count: Some(MAX_FILTER_IDS),
-        repeating: false,
-    },
-    Row {
-        name: "one past the maximum",
-        count: Some(MAX_FILTER_IDS + 1),
-        repeating: false,
-    },
-    Row {
-        name: "two past the maximum",
-        count: Some(MAX_FILTER_IDS + 2),
-        repeating: false,
-    },
-    Row {
-        name: "far past the maximum, with repeated ids",
-        count: Some(MAX_FILTER_IDS * 3),
-        repeating: true,
-    },
-];
-
-impl Row {
-    /// The ids this row sends, taken from `available`: a prefix of it, or — when the row
-    /// repeats — as many values as the row asks for, cycling through it.
-    fn values(&self, available: &[String]) -> Vec<String> {
-        let count = self.count.unwrap_or(0);
-        if self.repeating {
-            available
-                .iter()
-                .cycle()
-                .take(count)
-                .map(String::clone)
-                .collect()
-        } else {
-            assert!(
-                count <= available.len(),
-                "case {}: the fixture holds {} ids, too few for {count}",
-                self.name,
-                available.len()
-            );
-            available[..count].to_vec()
-        }
-    }
 }
 
 /// The URI a row addresses: the listing plus one query parameter per filter value, the way
@@ -261,45 +172,16 @@ async fn id_list_filters_are_honoured_up_to_the_documented_maximum_and_refused_p
         );
 
         for row in &ROWS {
-            let case = row.name;
+            let case = format!("{operation}/{}", row.name);
             let values = row.values(&filter.ids);
             let uri = uri_for(filter, &values);
             let (status, body) = emulator.get(&uri).await;
 
-            if values.len() > MAX_FILTER_IDS {
+            if values.len() > MAX_FILTER_VALUES {
                 // Past the documented maximum: the modelled ValidationException, naming the
-                // member that carried the list, and no page at all.
-                assert_eq!(
-                    status, 400,
-                    "case {operation}/{case} ({} ids): expected 400, got {status} with {body}",
-                    values.len()
-                );
-                assert_eq!(
-                    error_code(&body),
-                    "ValidationException",
-                    "case {operation}/{case}: expected ValidationException, got {body}"
-                );
-                assert_eq!(
-                    body["Reason"],
-                    json!("FieldValidationFailed"),
-                    "case {operation}/{case}: expected a field-level Reason, got {body}"
-                );
-                assert_eq!(
-                    body["Fields"][0]["Name"],
-                    json!(member),
-                    "case {operation}/{case}: the refusal must name {member}, got {body}"
-                );
-                assert!(
-                    body["Message"]
-                        .as_str()
-                        .is_some_and(|text| text.contains(member)
-                            && text.contains(&MAX_FILTER_IDS.to_string())),
-                    "case {operation}/{case}: the message must name {member} and the maximum, got {body}"
-                );
-                assert!(
-                    body[filter.list].is_null(),
-                    "case {operation}/{case}: a refused request must carry no page, got {body}"
-                );
+                // member that carried the list, and no page at all — as
+                // `crate::filter_maximum_table` states it for every member of this class.
+                assert_filter_refusal(&case, status, &body, member, filter.list);
                 continue;
             }
 
@@ -307,7 +189,7 @@ async fn id_list_filters_are_honoured_up_to_the_documented_maximum_and_refused_p
             // request named. An absent filter matches everything.
             assert_eq!(
                 status, 200,
-                "case {operation}/{case} ({} ids): expected 200, got {status} with {body}",
+                "case {case} ({} ids): expected 200, got {status} with {body}",
                 values.len()
             );
             let expected: Vec<String> = if values.is_empty() {
@@ -318,7 +200,7 @@ async fn id_list_filters_are_honoured_up_to_the_documented_maximum_and_refused_p
             assert_eq!(
                 ids_of(&body, filter.list, filter.id_member),
                 expected,
-                "case {operation}/{case}: expected exactly {expected:?}, got {body}"
+                "case {case}: expected exactly {expected:?}, got {body}"
             );
         }
     }
@@ -334,7 +216,7 @@ async fn a_filter_past_the_maximum_is_refused_before_the_listing_is_computed() {
     // the refusal: no listing runs.
     // Ids of the minted shape (`<kind>-<17 lowercase hex>`) that name nothing: the leading
     // `f` puts them above anything the monotonic id counter can mint.
-    let unknown: Vec<String> = (0..=MAX_FILTER_IDS)
+    let unknown: Vec<String> = (0..=MAX_FILTER_VALUES)
         .map(|index| format!("global-network-f{index:016x}"))
         .collect();
     let query: Vec<String> = unknown
@@ -360,7 +242,7 @@ async fn a_filter_past_the_maximum_is_refused_before_the_listing_is_computed() {
     // LENGTH and nothing else: one id fewer and the very same values are served.
     let query: Vec<String> = unknown
         .iter()
-        .take(MAX_FILTER_IDS)
+        .take(MAX_FILTER_VALUES)
         .map(|id| format!("globalNetworkIds={id}"))
         .collect();
     let (status, body) = emulator
