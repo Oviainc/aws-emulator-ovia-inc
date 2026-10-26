@@ -47,7 +47,9 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::distribution_lifecycle::{
     batch_xml, call, emulator, is_invalidation_id, Answer, Node, API_VERSION,
 };
-use crate::distribution_tenant_lifecycle::{create_distribution_tenant, multi_tenant_distribution};
+use crate::distribution_tenant_lifecycle::{
+    create_distribution_tenant, managed_certificate_request, multi_tenant_distribution,
+};
 
 // ---------------------------------------------------------------------------
 // Calling the tenant invalidation surface
@@ -121,7 +123,8 @@ async fn tenant(router: &MultiServiceRouter, distribution_id: &str, name: &str) 
          <DistributionId>{distribution_id}</DistributionId><Name>{name}</Name>\
          <Domains><member><Domain>{name}.example.com</Domain></member></Domains>\
          <Parameters><member><Name>tenantName</Name><Value>{name}</Value></member>\
-         </Parameters></CreateDistributionTenantRequest>"
+         </Parameters>{}</CreateDistributionTenantRequest>",
+        managed_certificate_request()
     );
     let created = create_distribution_tenant(router, &body).await;
     assert_eq!(

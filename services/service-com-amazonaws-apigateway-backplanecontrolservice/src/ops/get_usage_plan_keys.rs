@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetUsagePlanKeys
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetUsagePlanKeys`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetUsagePlanKeys::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +76,57 @@ use super::types::*;
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
 // `GetUsagePlanKeysError` enum is never produced.
+/// The API key ids `usage_plan_id` meters, in the order the associations were ADDED: the
+/// stable sequence a `position` cursor walks and [`crate::state::page_of`] cuts a page out
+/// of.
+///
+/// The rank is the `sequence` `CreateUsagePlanKey` stamps on each association (the same
+/// rank every other collection of this service is ordered by), so the listing reports the
+/// order keys were added in rather than the id order the store's map happens to hold; the
+/// key id breaks a tie no create can actually produce, which keeps the order total.
+///
+/// Each association is joined against the API key record it names
+/// (`ComAmazonawsApigatewayBackplanecontrolserviceState::usage_plan_key`), so one whose API
+/// key is no longer stored is on no page — exactly as that pair's own `GetUsagePlanKey`
+/// read reports it.
+fn metered_key_ids_in_added_order(
+    store: &crate::state::ComAmazonawsApigatewayBackplanecontrolserviceState,
+    usage_plan_id: &str,
+    name_query: Option<&str>,
+) -> Vec<String> {
+    let Some(plan) = store.usage_plans.get(usage_plan_id) else {
+        return Vec::new();
+    };
+    let mut ordered: Vec<(u64, &str)> = plan
+        .keys
+        .values()
+        .filter_map(|entry| {
+            let (_, api_key) = store.usage_plan_key(usage_plan_id, &entry.key_id)?;
+            // `nameQuery` is "a query parameter specifying the name of the to-be-returned
+            // usage plan keys" (`smithy_query(query="doc",
+            // shape="GetUsagePlanKeysRequest", member="nameQuery")`), and a usage plan
+            // key's name is the API KEY's own name. The query selects by NAME PREFIX — the
+            // rule the sibling `GetApiKeys$nameQuery` filter applies — so a key with no
+            // name at all is selected by no query.
+            if let Some(query) = name_query {
+                if !api_key
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.starts_with(query))
+                {
+                    return None;
+                }
+            }
+            Some((entry.sequence, entry.key_id.as_str()))
+        })
+        .collect();
+    ordered.sort_unstable();
+    ordered
+        .into_iter()
+        .map(|(_, key_id)| key_id.to_string())
+        .collect()
+}
+
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-apigateway-backplanecontrolservice.json");
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
@@ -152,18 +194,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetUsagePlanKeys` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetUsagePlanKeysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetUsagePlanKeys"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // A report of an existing collection, so this takes a shared read of the store and
+        // writes nothing: a listing must not change what a later caller sees.
+        let store = state.lock();
+        // The plan is the resource the request's URI addresses, so it is resolved first,
+        // the way the path itself reads: a plan the store does not hold meters nothing and
+        // is refused as the missing plan it is rather than served an empty page.
+        if !store.usage_plans.contains_key(&input.usage_plan_id) {
+            return Err(GetUsagePlanKeysErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::NO_SUCH_USAGE_PLAN.to_string()),
+                },
+            )
+            .into());
+        }
+        // `nameQuery` narrows the sequence BEFORE the page is cut, so paging a filtered
+        // listing walks the filtered sequence rather than cutting pages out of the whole
+        // collection and emptying them afterwards.
+        let ordered = metered_key_ids_in_added_order(
+            &store,
+            &input.usage_plan_id,
+            input.name_query.as_deref(),
+        );
+        // `page_of` applies the documented default and maximum page size and refuses a
+        // cursor naming no metered key of this plan.
+        let page = crate::state::page_of(&ordered, input.position.as_deref(), input.limit)
+            .map_err(|message| {
+                GetUsagePlanKeysErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+            })?;
+        // Each listed association is rendered by the one `UsagePlanKey` body this crate
+        // owns, so a listed association and its own `GetUsagePlanKey` read cannot report a
+        // record differently.
+        let items = page
+            .ids
+            .iter()
+            .filter_map(|key_id| store.usage_plan_key(&input.usage_plan_id, key_id))
+            .map(|(entry, api_key)| {
+                super::create_usage_plan_key::usage_plan_key_body(entry, api_key)
+            })
+            .collect();
+        Ok(GetUsagePlanKeysOutput {
+            // Always reported, and empty for a plan that meters no key: "the current page
+            // of elements from this collection" is an answer a client can read.
+            items: Some(items),
+            position: page.next_position,
+        })
     }
 }

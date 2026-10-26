@@ -48,7 +48,8 @@ use crate::distribution_lifecycle::{
     call, config, create_distribution, emulator, Answer, Node, API_VERSION,
 };
 use crate::distribution_tenant_lifecycle::{
-    create_distribution_tenant, encode_label, escape, longest_domain, multi_tenant_distribution,
+    create_distribution_tenant, encode_label, escape, longest_domain,
+    managed_certificate_request, multi_tenant_distribution,
 };
 use crate::response_headers_policy_lifecycle::text;
 
@@ -209,8 +210,9 @@ async fn distribution_tenant(
     body.push_str(&format!(
         "</Domains>\
          <Parameters><member><Name>tenantName</Name><Value>{name}</Value></member></Parameters>\
-         <ConnectionGroupId>{connection_group_id}</ConnectionGroupId>\
-         </CreateDistributionTenantRequest>"
+         <ConnectionGroupId>{connection_group_id}</ConnectionGroupId>{}\
+         </CreateDistributionTenantRequest>",
+        managed_certificate_request()
     ));
     let created = create_distribution_tenant(router, &body).await;
     assert_eq!(

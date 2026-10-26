@@ -846,7 +846,7 @@ async fn a_batch_s_statements_count_against_the_retained_statement_bound() {
             .call("DescribeStatement", &json!({"Id": id}))
             .await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "the oldest batch and its statements are gone: {id} got {status} {response}"
         );
     }
@@ -1011,10 +1011,11 @@ async fn batch_execute_statement_refuses_a_request_it_cannot_run() {
     );
 }
 
-/// An `Id` whose `:<n>` suffix names no statement of a batch is not found, and
-/// neither is a suffix on a statement that is not a batch at all.
+/// An `Id` whose `:<n>` suffix names no statement of a batch is refused as a
+/// query the service does not hold, and so is a suffix on a statement that is not
+/// a batch at all.
 #[tokio::test]
-async fn an_id_naming_no_statement_of_a_batch_is_not_found() {
+async fn an_id_naming_no_statement_of_a_batch_is_refused() {
     let emulator = Emulator::new();
     let batch_id = id_of(&emulator.batch_and_wait(&batch(&["SELECT 1"], None)).await);
     let single = emulator.run("SELECT 2").await;
@@ -1029,8 +1030,8 @@ async fn an_id_naming_no_statement_of_a_batch_is_not_found() {
         for operation in ["DescribeStatement", "GetStatementResult", "CancelStatement"] {
             let (status, response) = emulator.call(operation, &json!({"Id": id})).await;
             assert_eq!(
-                status, 404,
-                "case {label} on {operation}: expected 404, got {status} {response}"
+                status, 400,
+                "case {label} on {operation}: expected 400, got {status} {response}"
             );
             assert_eq!(
                 error_code(&response),

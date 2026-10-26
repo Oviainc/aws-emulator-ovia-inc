@@ -127,8 +127,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    decode_cursor, encode_cursor, non_empty, ConnectionRequest, CURSOR_COLUMNS,
-    DEFAULT_COLUMN_PAGE_SIZE, DEFAULT_SCHEMA,
+    decode_cursor, encode_cursor, non_empty, ConnectionRequest, ABSENT_ENDPOINT_MESSAGE,
+    CURSOR_COLUMNS, DEFAULT_COLUMN_PAGE_SIZE, DEFAULT_SCHEMA, INVALID_TOKEN_MESSAGE,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -203,7 +203,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DescribeTableErrorModeled::InternalServerException(
                 InternalServerException {
@@ -220,23 +219,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ConnectedDatabase` names the one the credentials connect to, which
         // this emulator does not need to tell apart because a statement reaches
         // exactly the database it names.
-        let connection = match (ConnectionRequest {
+        let requested = ConnectionRequest {
             cluster_identifier: input.cluster_identifier.as_ref(),
             workgroup_name: input.workgroup_name.as_ref(),
             session_id: None,
             database: Some(&input.database),
             db_user: input.db_user.as_ref(),
             secret_arn: input.secret_arn.as_ref(),
-        })
-        .resolve()
-        {
+        };
+        let connection = match requested.resolve() {
             Ok(connection) => connection,
             // Every other combination — both warehouses, neither of them, no
             // database, two authorization methods — is a malformed request.
             // `DescribeTable` takes no `SessionId`, so no connection of its
             // own can live on a session.
-            Err(problem) => return Err(validation(problem.message())),
+            Err(problem) => {
+                // The endpoint a request NAMED is resolved before its SELECTION
+                // is judged, exactly as the submit operations do it.
+                if problem.is_target_selection()
+                    && crate::state::warehouse::names_absent_warehouse(ctx, requested).await
+                {
+                    return Err(validation(ABSENT_ENDPOINT_MESSAGE));
+                }
+                return Err(validation(problem.message()));
+            }
         };
+
+        // A table lives in a database of a data warehouse, so the target this
+        // request named is resolved against the service that owns it before its
+        // catalog is read: a cluster or workgroup that does not exist in this
+        // Region has no catalog to describe, and that is the same refusal the
+        // submit operations give. A target the owner could not be asked about is
+        // UNDECIDED, and is read rather than refused.
+        if crate::state::warehouse::resolve_target(ctx, &connection.target).await
+            == crate::state::warehouse::TargetResolution::Absent
+        {
+            return Err(validation(ABSENT_ENDPOINT_MESSAGE));
+        }
 
         let schema = non_empty(input.schema.as_ref());
         let table = non_empty(input.table.as_ref());
@@ -256,12 +275,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .and_then(|position| usize::try_from(position).ok())
             {
                 Some(offset) => offset,
-                None => {
-                    return Err(validation(
-                        "NextToken is not a continuation token this operation issued for this \
-                         table",
-                    ))
-                }
+                None => return Err(validation(INVALID_TOKEN_MESSAGE)),
             },
         };
 
@@ -355,9 +369,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .flat_map(|described| described.columns.iter().cloned())
             .collect();
         if offset > columns.len() {
-            return Err(validation(
-                "NextToken is not a continuation token this operation issued for this table",
-            ));
+            return Err(validation(INVALID_TOKEN_MESSAGE));
         }
 
         let page_size = usize::try_from(input.max_results)

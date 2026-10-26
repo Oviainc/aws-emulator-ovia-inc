@@ -16,8 +16,8 @@
 //!   `GetStatementResult`, `ListStatements` and `CancelStatement`;
 //! * `ListStatements` enumerates newest-first, honours each filter and resumes
 //!   exactly where the previous page stopped;
-//! * an `Id` no statement carries is `ResourceNotFoundException` (404) on every
-//!   operation that takes one.
+//! * an `Id` no statement carries is refused with the missing-resource error at
+//!   HTTP 400 on every operation that takes one.
 
 use serde_json::{json, Value};
 
@@ -1244,24 +1244,30 @@ async fn get_statement_result_pages_the_rows_it_produced() {
 // Refusals
 // ---------------------------------------------------------------------------
 
-/// Every operation that takes an `Id` answers `ResourceNotFoundException` (404)
-/// for an `Id` no statement carries.
+/// Every operation that takes an `Id` refuses an `Id` no statement carries with
+/// the missing-resource error at HTTP 400, in the service's fixed words.
 #[tokio::test]
-async fn an_id_no_statement_carries_is_not_found() {
+async fn an_id_no_statement_carries_is_refused() {
     let emulator = Emulator::new();
-    // A statement exists, so a 404 is about this `Id` and not about empty state.
+    // A statement exists, so the refusal is about this `Id` and not about empty
+    // state.
     emulator.run("SELECT 1").await;
 
     for operation in ["DescribeStatement", "GetStatementResult", "CancelStatement"] {
         let (status, response) = emulator.call(operation, &json!({"Id": ABSENT_ID})).await;
         assert_eq!(
-            status, 404,
-            "case {operation}: expected 404 for an unknown Id, got {status} {response}"
+            status, 400,
+            "case {operation}: expected 400 for an unknown Id, got {status} {response}"
         );
         assert_eq!(
             error_code(&response),
             "ResourceNotFoundException",
             "case {operation}: expected ResourceNotFoundException, got {response}"
+        );
+        assert_eq!(
+            response["Message"].as_str(),
+            Some("Query does not exist."),
+            "case {operation}: expected the service's fixed wording, got {response}"
         );
     }
 }
@@ -1634,10 +1640,11 @@ async fn a_session_identifier_is_carried_on_the_statement() {
         "a minted SessionId must match the modelled UUID pattern, got {session:?}"
     );
 
+    // A statement submitted into a session names the SESSION: the connection
+    // comes off the session, which is why the reused statement still reports the
+    // workgroup and database the session was opened with.
     let reused = emulator
         .execute_and_wait(&json!({
-            "WorkgroupName": "my-workgroup",
-            "Database": "dev",
             "Sql": "SELECT 2",
             "SessionId": session,
         }))
@@ -1645,6 +1652,14 @@ async fn a_session_identifier_is_carried_on_the_statement() {
     assert_eq!(
         reused["SessionId"], session,
         "a supplied SessionId must be carried through: {reused}"
+    );
+    assert_eq!(
+        (
+            reused["WorkgroupName"].as_str(),
+            reused["Database"].as_str()
+        ),
+        (Some("my-workgroup"), Some("dev")),
+        "a statement in a session runs on the connection the session was opened with: {reused}"
     );
     let described = emulator
         .ok("DescribeStatement", &json!({"Id": id_of(&reused)}))
@@ -1954,7 +1969,7 @@ async fn the_statement_history_is_bounded() {
     for (index, id) in ids.iter().take(overflow).enumerate() {
         let (status, response) = emulator.call("DescribeStatement", &json!({"Id": id})).await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "statement {index} is past the retention bound and must be evicted, got {response}"
         );
     }

@@ -371,6 +371,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A source and an output reference the flow's own media streams and VPC interfaces
+        // BY NAME, and a flow being created holds exactly what THIS request creates — so
+        // each such name is resolved against the request's own `MediaStreams` /
+        // `VpcInterfaces`, through the one place this crate resolves such a reference
+        // (`crate::state`). Checked before anything is stored, so a request that names a
+        // media stream or VPC interface it does not create stores no flow at all.
+        let requested_media_stream_names: ::std::collections::BTreeSet<String> = input
+            .media_streams
+            .iter()
+            .flatten()
+            .map(|media_stream| media_stream.media_stream_name.clone())
+            .collect();
+        let requested_vpc_interface_names: ::std::collections::BTreeSet<String> = input
+            .vpc_interfaces
+            .iter()
+            .flatten()
+            .map(|vpc_interface| vpc_interface.name.clone())
+            .collect();
+        for (index, source) in requested_sources.iter().enumerate() {
+            if let Some(rejection) = crate::state::source_request_reference_rejection(
+                &format!("Sources[{index}]"),
+                source,
+                &requested_media_stream_names,
+                &requested_vpc_interface_names,
+            ) {
+                return Err(bad_request(rejection));
+            }
+        }
+        for (index, output) in input.outputs.iter().flatten().enumerate() {
+            if let Some(rejection) = crate::state::output_request_reference_rejection(
+                &format!("Outputs[{index}]"),
+                output,
+                &requested_media_stream_names,
+                &requested_vpc_interface_names,
+            ) {
+                return Err(bad_request(rejection));
+            }
+        }
+
         let region = crate::state::request_region(ctx.parts());
 
         // "The Availability Zone that you want to create the flow in. These options are

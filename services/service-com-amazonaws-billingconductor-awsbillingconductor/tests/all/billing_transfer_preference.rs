@@ -13,12 +13,13 @@
 //! preference has never been set for the billing transfer", and otherwise the last
 //! recorded preference with the instant it was recorded. Around that core loop:
 //!
-//! * a billing transfer is an AWS Organizations resource whose ARN carries the
-//!   management account of the organization that owns it, and Billing Conductor answers
-//!   for the one organization whose management account is the payer — so an ARN owned by
-//!   any other account names a transfer this organization does not have, and both
-//!   operations answer the modelled 404 `ResourceNotFoundException` for it, writing
-//!   nothing;
+//! * a billing transfer is an AWS Organizations resource Billing Conductor never
+//!   creates, so an operation addressing one resolves it in the set of transfers the
+//!   organization HAS (recorded here by [`Emulator::designate_transfer`], standing in for
+//!   the Organizations surface that mints them) — an ARN that names no transfer of the
+//!   organization, this account's or another's, is answered by both operations with the
+//!   modelled 404 `ResourceNotFoundException`, writing nothing. Which segment of the ARN
+//!   makes it a stranger is pinned in `tests/all/billing_transfer_identity.rs`;
 //! * `AutoTransferBillingGroupCreationPreference.PricingPlanArn` "is required when
 //!   `Enabled` is `true`, and must be omitted when `Enabled` is `false`", and an enabled
 //!   preference's plan has to exist — each refused with the modelled 400
@@ -83,6 +84,9 @@ const AWS_MANAGED_PLAN_IDS: &[&str] = &["BasicPricingPlan", "Passthrough"];
 /// A live emulator holding only this service.
 struct Emulator {
     router: MultiServiceRouter,
+    /// The engine the service was built on, kept so the suite can record the billing
+    /// transfers the organization has — see [`Emulator::designate_transfer`].
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -102,8 +106,14 @@ impl Emulator {
             .lock()
             .payer_account_id = Some(::engine::emulator_account_id().to_string());
         let mut router = MultiServiceRouter::new();
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// Record a billing transfer the organization HAS, and hand its ARN back — the shared
+    /// seam [`crate::billing_transfer_identity::designate_transfer`].
+    fn designate_transfer(&self, arn: &str) -> String {
+        crate::billing_transfer_identity::designate_transfer(&self.engine, arn)
     }
 
     /// Send one request over the wire and return the status plus the parsed body.
@@ -416,6 +426,13 @@ async fn get_reports_the_preference_the_last_update_persisted() {
         ),
     ];
 
+    // The transfers this organization has, as the Organizations surface that minted them
+    // would have recorded: an operation addressing a transfer the organization does not
+    // have answers 404 instead.
+    for (_, transfer, _) in &rows {
+        em.designate_transfer(transfer);
+    }
+
     for (case, transfer, settings) in &rows {
         // Before anything sets it: the documented default, and NO `LastModifiedTime` —
         // "this value is empty if the preference has never been set for the billing
@@ -496,6 +513,7 @@ async fn a_billing_transfer_of_another_organization_is_not_found() {
     let em = Emulator::new();
     let plan = em.create_plan("setup", "ForeignTransferPlan").await;
     let ours = transfer_arn("ourorgabcd", "inbound", "abcd1234");
+    em.designate_transfer(&ours);
 
     // The rows differ in which account owns the transfer and in the form of the ARN; the
     // last two are this organization's own id with a digit changed, so the only
@@ -577,6 +595,7 @@ async fn an_enabled_preference_requires_a_pricing_plan_that_exists() {
     let em = Emulator::new();
     let plan = em.create_plan("setup", "PreferenceValidationPlan").await;
     let transfer = transfer_arn("validateorg", "inbound", "11223344");
+    em.designate_transfer(&transfer);
 
     // The rows differ in which half of the conditional rule they break, in how the plan
     // is spelled, and in why a named plan resolves nowhere (never minted, another
@@ -706,6 +725,7 @@ async fn a_pricing_plan_an_enabled_preference_names_cannot_be_deleted() {
             .map(|index| transfer_arn(&format!("conflictor{index}"), "inbound", "5566778899"))
             .collect();
         for transfer in &arns {
+            em.designate_transfer(transfer);
             let preference = if enabled {
                 json!({ "Enabled": true, "PricingPlanArn": &named })
             } else {
@@ -805,6 +825,7 @@ async fn a_retried_client_token_performs_no_further_action() {
 
     for (index, (case, token, first, retry)) in rows.iter().enumerate() {
         let transfer = transfer_arn(&format!("idempotent{index}"), "outbound", "a1b2c3d4");
+        em.designate_transfer(&transfer);
         let written = em.set(case, &transfer, first, Some(token.as_str())).await;
         let stamped = assert_reports(
             case,
@@ -901,6 +922,8 @@ async fn a_client_token_replays_only_for_the_transfer_it_recorded() {
             "outbound",
             "0123456789abcdef0123456789abcdef",
         );
+        em.designate_transfer(&first);
+        em.designate_transfer(&second);
 
         let here_plan = expected_plan(here);
         let there_plan = expected_plan(there);

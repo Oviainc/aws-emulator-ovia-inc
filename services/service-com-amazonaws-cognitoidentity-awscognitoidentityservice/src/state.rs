@@ -14,9 +14,10 @@
 pub mod authorization;
 
 use crate::ops::types::{CognitoIdentityProvider, RoleMapping};
+use emulator_server::CredentialStore;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// The region an id is minted in when the request carries no SigV4 credential scope to
 /// read one from (`GetId` and `GetCredentialsForIdentity` are modelled `@optionalAuth`,
@@ -276,6 +277,19 @@ pub struct IdentityPoolRoles {
 }
 
 impl IdentityPoolRoles {
+    /// The role a vend assumes when the request names no `CustomRoleArn`: this pool's
+    /// `authenticated` role for a request that presented a login, its `unauthenticated`
+    /// role for one that did not. `None` when the pool configured no role for that flow,
+    /// which is a pool that can vend no session at all for it.
+    pub fn role_for(&self, authenticated: bool) -> Option<&str> {
+        let role_type = if authenticated {
+            AUTHENTICATED_ROLE_TYPE
+        } else {
+            UNAUTHENTICATED_ROLE_TYPE
+        };
+        self.roles.get(role_type).map(String::as_str)
+    }
+
     /// Whether this configuration names `role_arn` — as one of the pool's two roles, or
     /// as the role a mapping rule resolves to. This is the set of roles the pool can vend
     /// credentials for, which is what a `CustomRoleArn` has to be drawn from.
@@ -351,6 +365,10 @@ pub struct IssuedCredentials {
     pub secret_key: String,
     pub session_token: String,
     pub expiration: SystemTime,
+    /// The ARN of the pool role this session was assumed of, so a later vend hands the
+    /// same session back only while it still stands for the role THAT call resolves — a
+    /// vend for another role is another session.
+    pub role_arn: String,
 }
 
 /// Per-service state for com-amazonaws-cognitoidentity-awscognitoidentityservice. A handler reaches it through [`service_state`].
@@ -943,4 +961,493 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsCognitoidentityAwscognitoidentityserviceState>)
+}
+
+// ---------------------------------------------------------------------------
+// The role session a pool vends: the web-identity assume behind
+// `GetCredentialsForIdentity`.
+// ---------------------------------------------------------------------------
+
+/// The `RoleSessionName` every role session an identity pool vends carries, and so the
+/// last field of the assumed-role ARN a vended session speaks for.
+///
+/// The caller of `GetCredentialsForIdentity` names no session: the pool's own exchange
+/// does, with one name for every identity it vends for.
+pub const VENDED_ROLE_SESSION_NAME: &str = "CognitoIdentityCredentials";
+
+/// The key of the pool role a vend assumes for a request that PRESENTED a login, from the
+/// modelled `RoleType` pattern `^(un)?authenticated$` and the `Roles` doc ("the key will
+/// be either \"authenticated\" or \"unauthenticated\"").
+pub const AUTHENTICATED_ROLE_TYPE: &str = "authenticated";
+
+/// The key of the pool role a vend assumes for a request that presented NO login; see
+/// [`AUTHENTICATED_ROLE_TYPE`].
+pub const UNAUTHENTICATED_ROLE_TYPE: &str = "unauthenticated";
+
+/// The IAM action a role's trust policy has to grant the Cognito Identity principal for a
+/// pool to be able to vend a session of it: "Your role trust policy must grant
+/// AssumeRoleWithWebIdentity permissions to cognito-identity.amazonaws.com"
+/// (`InvalidIdentityPoolConfigurationException`, this service's model).
+pub const ASSUME_ROLE_WITH_WEB_IDENTITY_ACTION: &str = "sts:AssumeRoleWithWebIdentity";
+
+/// The condition key carrying the identity pool a vended session is being assumed FOR —
+/// `<the Cognito Identity principal>:aud`. A role's trust policy conditions the assume on
+/// it, which is what keeps one identity pool from federating into another pool's role
+/// (`AssumeRoleWithWebIdentityRequest$RoleArn`: the trust policies of these roles "must
+/// contain the cognito-identity.amazonaws.com:aud condition key to restrict role
+/// assumption to users from your intended identity pools").
+pub const AUDIENCE_CONDITION_KEY: &str = "cognito-identity.amazonaws.com:aud";
+
+/// The condition key carrying the identity the session is vended for: the `sub` claim of
+/// the token the exchange is made with.
+pub const SUBJECT_CONDITION_KEY: &str = "cognito-identity.amazonaws.com:sub";
+
+/// The condition key carrying the authentication methods the exchange was made under —
+/// `authenticated` or `unauthenticated`, beside the providers that authenticated the user.
+/// Multi-valued, so a trust policy decides it under one of IAM's set qualifiers.
+pub const AUTHENTICATION_METHODS_CONDITION_KEY: &str = "cognito-identity.amazonaws.com:amr";
+
+/// The condition keys a vend publishes about the assume it makes, so a trust-policy clause
+/// over one of them is read as "the request carried no value" rather than as a key this
+/// emulator does not model; every other key stays undecided and withholds the grant.
+pub const WEB_IDENTITY_PUBLISHED_CONDITION_KEYS: &[&str] = &[
+    AUDIENCE_CONDITION_KEY,
+    SUBJECT_CONDITION_KEY,
+    AUTHENTICATION_METHODS_CONDITION_KEY,
+];
+
+/// How AWS words the refusal of a vend the pool's role configuration cannot serve: the
+/// pool names no role for the request, the role it names is not one the account holds, or
+/// that role's trust policy does not admit an assume by this pool's users.
+///
+/// One fixed sentence for all three, naming neither the role nor the pool: the caller of
+/// `GetCredentialsForIdentity` is an unauthenticated one, so the refusal reports nothing
+/// about the pool's configuration beyond the fact that it is the configuration at fault.
+pub const INVALID_POOL_CONFIGURATION_MESSAGE: &str =
+    "Invalid identity pool configuration. Check assigned IAM roles for this pool.";
+
+/// A role as the IAM store in the same engine holds it, reduced to the facts an assume
+/// decides on.
+///
+/// STS's OWN type, read through STS's own reader, so a role this service assumes is the
+/// very record `sts:AssumeRole` would resolve for the same ARN.
+pub type ResolvedRole =
+    ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state::ResolvedRole;
+
+/// The STS session registry in the SAME shared engine: where the sessions
+/// `sts:GetCallerIdentity` resolves live.
+///
+/// STS's own accessor is called rather than copied, so a session this service mints is
+/// recorded in the very registry that service reports from. `None` means the engine
+/// carries no such store.
+pub fn sts_state<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state::ComAmazonawsStsAwssecuritytokenservicev20110615State>>
+{
+    ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state::service_state(engine)
+}
+
+/// The role `role_arn` names, as the IAM store in the same engine holds it, or `None` when
+/// the account holds no such role — which is also the answer for an ARN of another account,
+/// and for an engine that carries no IAM store at all.
+pub fn resolve_role<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    role_arn: &str,
+) -> Option<ResolvedRole> {
+    let iam = ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state::iam_state(
+        engine,
+    )?;
+    let iam = iam.lock();
+    ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state::resolve_role(
+        &iam, role_arn,
+    )
+}
+
+/// The condition keys a vend publishes about the assume it is making, for a trust policy's
+/// `Condition` to be decided against: the pool the session is vended for, the identity it
+/// is vended to, and the authentication methods the exchange was made under.
+///
+/// `providers` are the `Logins` provider names the request presented, which is what makes
+/// the exchange an authenticated one. Nothing is invented: every pair comes from the
+/// request and from the stored identity it names.
+pub fn web_identity_condition_context(
+    identity_pool_id: &str,
+    identity_id: &str,
+    providers: &[String],
+) -> Vec<(String, String)> {
+    let authenticated = !providers.is_empty();
+    let mut context = vec![
+        (
+            AUDIENCE_CONDITION_KEY.to_string(),
+            identity_pool_id.to_string(),
+        ),
+        (SUBJECT_CONDITION_KEY.to_string(), identity_id.to_string()),
+        (
+            AUTHENTICATION_METHODS_CONDITION_KEY.to_string(),
+            if authenticated {
+                AUTHENTICATED_ROLE_TYPE.to_string()
+            } else {
+                UNAUTHENTICATED_ROLE_TYPE.to_string()
+            },
+        ),
+    ];
+    if authenticated {
+        context.push((
+            AUTHENTICATION_METHODS_CONDITION_KEY.to_string(),
+            COGNITO_IDENTITY_PRINCIPAL.to_string(),
+        ));
+        for provider in providers {
+            context.push((
+                AUTHENTICATION_METHODS_CONDITION_KEY.to_string(),
+                provider.clone(),
+            ));
+        }
+    }
+    context
+}
+
+/// Whether `role`'s trust policy admits the web-identity assume `context` describes.
+///
+/// The DECISION is [`::service_common::iam_authorization`], the tree's one evaluation of
+/// IAM policy documents, read as the RESOURCE-based policy a trust policy is: its
+/// statements name the principals they grant to — here the Cognito Identity service
+/// principal, the `Principal.Federated` spelling an identity pool's users are admitted by
+/// — and a statement naming no resource covers the role itself. A role carrying no trust
+/// policy, or one this cannot read as a policy, admits nobody: nothing is assumed on
+/// evidence the account does not hold.
+pub fn role_admits_web_identity(role: &ResolvedRole, context: &[(String, String)]) -> bool {
+    let Some(document) = role.trust_policy.as_deref() else {
+        return false;
+    };
+    let principals = [COGNITO_IDENTITY_PRINCIPAL.to_string()];
+    let request = ::service_common::iam_authorization::Request::new(
+        ASSUME_ROLE_WITH_WEB_IDENTITY_ACTION,
+        &role.arn,
+        &principals,
+    )
+    .with_context(context)
+    .with_published_keys(WEB_IDENTITY_PUBLISHED_CONDITION_KEYS);
+    ::service_common::iam_authorization::resource_decision(document, &request)
+        == ::service_common::iam_authorization::Decision::Allowed
+}
+
+/// The session a vend hands back: the credential the caller signs with, and the
+/// assumed-role identity it speaks for.
+#[derive(Debug, Clone)]
+pub struct VendedSession {
+    pub access_key_id: String,
+    pub secret_key: String,
+    pub session_token: String,
+    pub expiration: SystemTime,
+    /// `arn:<partition>:sts::<account>:assumed-role/<role>/<session>`, what
+    /// `sts:GetCallerIdentity` answers for a request signed with this credential.
+    pub assumed_role_arn: String,
+    /// `<RoleId>:<RoleSessionName>`, the `AssumedRoleUser$AssumedRoleId` of the assume.
+    pub assumed_role_id: String,
+}
+
+/// Mint the role session a vend hands back: an assumed-role session of `role`, recorded in
+/// the STS session registry in the same engine ([`sts_state`]) by STS's own mint, so
+/// `sts:GetCallerIdentity` under the credential reports the assumed-role ARN and anything
+/// correlating the session back to its role matches.
+///
+/// The session lasts `validity`, capped by the role's own `MaxSessionDuration` — a session
+/// is never minted for longer than the role admits.
+///
+/// `Err` says why no session could be minted — this engine carries no STS registry, or the
+/// registry is full of sessions that have not expired — so the caller refuses the request
+/// rather than answering with a credential that stands for nothing.
+pub fn mint_vended_role_session<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    store: &CredentialStore,
+    role: &ResolvedRole,
+    now: SystemTime,
+    validity: Duration,
+) -> Result<VendedSession, String> {
+    use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts;
+
+    let Some(registry) = sts_state(engine) else {
+        return Err(
+            "the session registry the vended credentials are recorded in is unavailable"
+                .to_string(),
+        );
+    };
+    let duration_seconds = i32::try_from(validity.as_secs())
+        .unwrap_or(i32::MAX)
+        .min(role.max_session_duration);
+    let assumed_role_id = format!("{}:{VENDED_ROLE_SESSION_NAME}", role.role_id);
+    let assumed_role_arn = sts::sts_arn(
+        &role.account,
+        &format!("assumed-role/{}/{VENDED_ROLE_SESSION_NAME}", role.role_name),
+    );
+    let identity = sts::Identity {
+        user_id: assumed_role_id.clone(),
+        account: role.account.clone(),
+        arn: assumed_role_arn.clone(),
+    };
+    let mut registry = registry.lock();
+    let minted = sts::mint_session(
+        store,
+        &mut registry,
+        now,
+        sts::NewSession {
+            role_arn: Some(role.arn.clone()),
+            ..sts::NewSession::new(identity, sts::SessionKind::AssumedRole, duration_seconds)
+        },
+    )
+    .map_err(|why| why.message())?;
+    Ok(VendedSession {
+        access_key_id: minted.credentials.access_key_id,
+        secret_key: minted.credentials.secret_access_key,
+        session_token: minted.credentials.session_token,
+        expiration: minted.session.expires_at,
+        assumed_role_arn,
+        assumed_role_id,
+    })
+}
+
+/// Forget a session this service vended, in both stores that hold it: the credential store
+/// (so a request still presenting it no longer verifies) and the STS session registry (so
+/// it names no identity either).
+pub fn discard_vended_role_session<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    store: &CredentialStore,
+    access_key_id: &str,
+) {
+    match sts_state(engine) {
+        Some(registry) => registry.lock().discard(access_key_id, store),
+        None => {
+            let _ = store.delete(access_key_id);
+        }
+    }
+}
+
+/// What the audit record of one vended assume reports.
+pub struct VendedAssume<'a> {
+    /// The role the session was assumed of.
+    pub role: &'a ResolvedRole,
+    /// The session that was minted.
+    pub session: &'a VendedSession,
+    /// The identity pool the assume was made for: the `aud` of the exchanged token.
+    pub identity_pool_id: &'a str,
+    /// The identity it was made for: the `sub` of the exchanged token.
+    pub identity_id: &'a str,
+    /// The Region the vend was served in.
+    pub region: &'a str,
+    /// How long the minted session lasts.
+    pub duration_seconds: i32,
+}
+
+/// `userIdentity.type` of a call made by a user a web identity provider authenticated,
+/// which is who an identity pool's exchange assumes the role on behalf of.
+const WEB_IDENTITY_PRINCIPAL_TYPE: &str = "WebIdentityUser";
+
+/// The resource type an assume's audit record names the role by.
+const ROLE_RESOURCE_TYPE: &str = "AWS::IAM::Role";
+
+/// Record the web-identity assume a vend made in the account's management-event log, so
+/// CloudTrail's `LookupEvents` reports it — the event is STS's, because the assume is: the
+/// pool exchanges the token for a role session through `sts:AssumeRoleWithWebIdentity`.
+///
+/// Only a vend that was SERVED is recorded: a vend the role's trust policy refused assumed
+/// nothing, so there is no assume to report.
+///
+/// Recording is best-effort by design, as every other recorder in this tree: an engine
+/// carrying no log (a unit test over a bare engine) still serves the call, because failing
+/// a caller because the audit log is unreachable would be a worse answer than serving it
+/// unrecorded. No secret is written — the record carries the session's access key id and
+/// expiry, never its secret key or session token.
+pub fn record_vended_assume<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    parts: &http::request::Parts,
+    assume: &VendedAssume<'_>,
+) {
+    let Some(log) = management_event_log(engine) else {
+        ::tracing::warn!(
+            "the engine carries no management-event log: the vended assume was served \
+             unrecorded"
+        );
+        return;
+    };
+    let expiration = ::aws_smithy_types::DateTime::from(assume.session.expiration)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default();
+    log.lock().record(
+        ::service_common::management_events::ServedApiCall {
+            event_name: "AssumeRoleWithWebIdentity".to_string(),
+            event_source: STS_EVENT_SOURCE.to_string(),
+            aws_region: assume.region.to_string(),
+            read_only: false,
+            // The assume is made for a federated user, which holds no access key of its
+            // own: what names it is the identity the token carries.
+            access_key_id: None,
+            user_name: Some(assume.identity_id.to_string()),
+            principal_type: WEB_IDENTITY_PRINCIPAL_TYPE.to_string(),
+            account_id: ::engine::emulator_account_id().to_string(),
+            user_agent: parts
+                .headers
+                .get(http::header::USER_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            resources: vec![::service_common::management_events::AuditedResource::new(
+                ROLE_RESOURCE_TYPE,
+                assume.role.arn.clone(),
+            )],
+            request_parameters: ::serde_json::json!({
+                "roleArn": assume.role.arn,
+                "roleSessionName": VENDED_ROLE_SESSION_NAME,
+                "durationSeconds": assume.duration_seconds,
+            }),
+            response_elements: Some(::serde_json::json!({
+                "credentials": {
+                    "accessKeyId": assume.session.access_key_id,
+                    "expiration": expiration,
+                },
+                "assumedRoleUser": {
+                    "assumedRoleId": assume.session.assumed_role_id,
+                    "arn": assume.session.assumed_role_arn,
+                },
+                "provider": COGNITO_IDENTITY_PRINCIPAL,
+                "audience": assume.identity_pool_id,
+                "subjectFromWebIdentityToken": assume.identity_id,
+            })),
+            error_code: None,
+            error_message: None,
+        },
+        SystemTime::now(),
+    );
+}
+
+/// The `eventSource` an assume's audit record carries: STS's endpoint prefix in the
+/// `<prefix>.amazonaws.com` form CloudTrail stamps on every event, because the assume is a
+/// call to STS however it was reached.
+pub const STS_EVENT_SOURCE: &str = "sts.amazonaws.com";
+
+/// This service's own `eventSource`: its endpoint prefix (`smithy_query(query="service_info")`
+/// -> `endpointPrefix: cognito-identity`) in the same form.
+pub const EVENT_SOURCE: &str = "cognito-identity.amazonaws.com";
+
+/// What a vend reports about itself for its own audit record.
+pub struct ServedVend<'a> {
+    /// The identity the vend was asked for.
+    pub identity_id: &'a str,
+    /// The `Logins` provider NAMES the request presented. The tokens they carry are the
+    /// caller's secrets and are never recorded.
+    pub providers: &'a [String],
+    /// The `CustomRoleArn` the request named, if any.
+    pub custom_role_arn: Option<&'a str>,
+}
+
+/// The CloudFormation-style type name of the resource a vend's audit record refers to.
+const IDENTITY_POOL_RESOURCE_TYPE_NAME: &str = "AWS::Cognito::IdentityPool";
+
+/// Record the vend itself in the account's management-event log, whatever it answered, so
+/// CloudTrail's `LookupEvents` reports the call — with the error code and message its
+/// caller was answered with when it was refused.
+///
+/// No secret is written: the provider TOKENS the request carried and the session the
+/// response carried are both left out, which is why the record carries no
+/// `responseElements` at all.
+///
+/// The caller of this operation presents no credential — "This is a public API. You do not
+/// need any credentials to call this API" (this operation's own doc) — so the record names
+/// no access key and no principal this emulator could resolve.
+pub fn record_vend<Eng: Send + Sync + 'static, T, E>(
+    engine: &Eng,
+    parts: &http::request::Parts,
+    vend: &ServedVend<'_>,
+    outcome: &Result<T, E>,
+) where
+    E: ::smithy_server_runtime::OperationError + ::std::fmt::Display,
+{
+    let Some(log) = management_event_log(engine) else {
+        ::tracing::warn!("the engine carries no management-event log: the vend was served unrecorded");
+        return;
+    };
+    let (error_code, error_message) = match outcome {
+        Ok(_) => (None, None),
+        Err(error) => {
+            // The modelled error's `Display` prefixes its shape name, which the record
+            // already carries as its `errorCode`, so the message is recorded alone.
+            let rendered = error.to_string();
+            let message = rendered
+                .strip_prefix(&format!("{}: ", error.shape_name()))
+                .unwrap_or(&rendered)
+                .to_string();
+            (Some(error.shape_name().to_string()), Some(message))
+        }
+    };
+    let mut request_parameters = ::serde_json::Map::new();
+    request_parameters.insert(
+        "identityId".to_string(),
+        ::serde_json::Value::from(vend.identity_id),
+    );
+    if !vend.providers.is_empty() {
+        request_parameters.insert(
+            "logins".to_string(),
+            ::serde_json::Value::from(vend.providers.to_vec()),
+        );
+    }
+    if let Some(custom_role_arn) = vend.custom_role_arn {
+        request_parameters.insert(
+            "customRoleArn".to_string(),
+            ::serde_json::Value::from(custom_role_arn),
+        );
+    }
+    // The resource the call acted on is the pool the identity belongs to, whatever the
+    // call answered. A request naming an identity this service does not hold acted on no
+    // pool at all, so such a record names no resource rather than one built from an id
+    // nothing resolves.
+    let identity_pool_id = service_state(engine).and_then(|state| {
+        state
+            .lock()
+            .identities
+            .get(vend.identity_id)
+            .map(|identity| identity.identity_pool_id.clone())
+    });
+    log.lock().record(
+        ::service_common::management_events::ServedApiCall {
+            event_name: "GetCredentialsForIdentity".to_string(),
+            event_source: EVENT_SOURCE.to_string(),
+            // The Region the call was served in is the identity's own, which its
+            // `REGION:GUID` id carries: the request names none, being unsigned.
+            aws_region: region_of(vend.identity_id).to_string(),
+            // A vend mints and stores a session, so it is not a reporting call.
+            read_only: false,
+            access_key_id: None,
+            user_name: None,
+            principal_type: ::service_common::management_events::PRINCIPAL_TYPE_UNKNOWN
+                .to_string(),
+            account_id: ::engine::emulator_account_id().to_string(),
+            user_agent: parts
+                .headers
+                .get(http::header::USER_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            resources: identity_pool_id
+                .map(|identity_pool_id| {
+                    ::service_common::management_events::AuditedResource::new(
+                        IDENTITY_POOL_RESOURCE_TYPE_NAME,
+                        identity_pool_arn(&identity_pool_id),
+                    )
+                })
+                .into_iter()
+                .collect(),
+            request_parameters: request_parameters.into(),
+            response_elements: None,
+            error_code,
+            error_message,
+        },
+        SystemTime::now(),
+    );
+}
+
+/// The account's management-event (audit) log in the SAME shared engine, the one store
+/// CloudTrail's `LookupEvents` reads. `None` means the engine carries no such log.
+pub fn management_event_log<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::management_events::ManagementEventLog>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<::service_common::management_events::ManagementEventLog>)
 }

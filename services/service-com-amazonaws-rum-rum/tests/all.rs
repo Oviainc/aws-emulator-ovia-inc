@@ -27,6 +27,8 @@ mod batch_delete_metric_definitions;
 mod create_app_monitor_tags;
 #[path = "all/cw_log_delivery.rs"]
 mod cw_log_delivery;
+#[path = "all/cw_log_event_copies.rs"]
+mod cw_log_event_copies;
 #[path = "all/list_app_monitors_page_size.rs"]
 mod list_app_monitors_page_size;
 #[path = "all/list_tags_for_resource.rs"]

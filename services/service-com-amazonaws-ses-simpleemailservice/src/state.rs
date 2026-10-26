@@ -707,6 +707,10 @@ pub fn is_receipt_rule_set_name(value: &str) -> bool {
 /// from the template list cannot resume another listing of this service.
 pub const LISTING_TEMPLATES: &str = "ListTemplates";
 
+/// The listing name stamped into a `ListReceiptRuleSets` page token, for the same
+/// reason: a cursor cut from the receipt rule set list resumes only that listing.
+pub const LISTING_RECEIPT_RULE_SETS: &str = "ListReceiptRuleSets";
+
 /// The bytes every page token of this service digests before the listing and the
 /// key, so a token of this service is not a token of any other.
 const PAGE_TOKEN_DOMAIN: &[u8] = b"com.amazonaws.ses#page-token\0";

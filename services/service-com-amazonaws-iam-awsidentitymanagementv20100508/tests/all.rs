@@ -101,6 +101,8 @@ mod role_policy_listing;
 mod role_policy_removal;
 #[path = "all/role_settings.rs"]
 mod role_settings;
+#[path = "all/role_tag_listing.rs"]
+mod role_tag_listing;
 #[path = "all/role_tag_removal.rs"]
 mod role_tag_removal;
 #[path = "all/role_tags.rs"]

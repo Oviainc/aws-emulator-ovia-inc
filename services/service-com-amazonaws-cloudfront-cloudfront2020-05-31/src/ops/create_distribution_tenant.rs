@@ -10,7 +10,10 @@
 //!   here and never derived from the request;
 //! * `Domains` is where the tenant's viewers reach it, so every domain is checked for
 //!   shape, for a conflict with any domain or alias another CloudFront resource in this
-//!   emulator already claims, and against the documented per-tenant domain quota;
+//!   emulator already claims, against the documented per-tenant domain quota, and for a
+//!   PROOF that the account controls it — a tenant is bound to a domain only when this
+//!   call asks CloudFront to validate it (a `ManagedCertificateRequest`) or the domain
+//!   already resolves to a CloudFront resource in this account;
 //! * `Parameters` has to satisfy the multi-tenant distribution's
 //!   `TenantConfig$ParameterDefinitions`, and every caller-chosen list the request carries
 //!   (`Domains`, `Parameters`, a customization's locations, `Tags`) is count-bounded
@@ -360,6 +363,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+        }
+
+        // A tenant's domains are where its viewers reach it, so CloudFront binds one only to
+        // a domain the account's control of which it can see PROVEN: either this call asks
+        // CloudFront to validate the domain — which is what a `ManagedCertificateRequest`
+        // does, whichever host serves the validation token — or the domain already resolves
+        // to a CloudFront resource in this account, the one proof this service's DNS view
+        // holds. A certificate named in `Customizations` is no proof: an ARN says nothing
+        // about whether the certificate's domains were ever validated. Unproven, the domain
+        // is no domain this tenant can be reached at, which is what `InvalidArgument` ("An
+        // argument is invalid") answers, worded with the sentence CloudFront states the
+        // condition in.
+        if input.managed_certificate_request.is_none()
+            && store
+                .unproven_domain(domains.iter().map(String::as_str))
+                .is_some()
+        {
+            return Err(CreateDistributionTenantErrorModeled::InvalidArgument(
+                crate::state::invalid_domain_name(),
+            )
+            .into());
         }
 
         // "The configuration for the CloudFront managed ACM certificate request": a request

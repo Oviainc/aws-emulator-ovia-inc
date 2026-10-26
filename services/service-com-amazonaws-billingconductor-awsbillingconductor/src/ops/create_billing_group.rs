@@ -20,7 +20,7 @@
 //! (`PRIMARY_NOT_ASSOCIATED`), and a `ResponsibilityTransferArn` must name a billing
 //! transfer of this organization — the same predicate
 //! `GetBillingTransferPreference` resolves one with
-//! ([`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::transfer_belongs_to_this_organization`]).
+//! ([`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::billing_transfer_exists`]).
 //!
 //! ## Shape of an operation
 //!
@@ -310,17 +310,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // organization HAS: the ARN "identifies the transfer relationship owned by the
         // Bill Transfer account (caller account)", and the same predicate
         // `GetBillingTransferPreference` and `UpdateBillingTransferPreference` decide a
-        // transfer's existence with answers it here
-        // (`crate::state::transfer_belongs_to_this_organization`). This operation models
-        // no `ResourceNotFoundException`, so a transfer no reader of this store can
-        // resolve is a fault in the INPUT: the modelled 400 `ValidationException` with
-        // the reason the model enumerates for an ARN that names no such resource.
+        // transfer's existence with answers it here — a billing transfer is an AWS
+        // Organizations resource this API never creates, so only one the store holds a
+        // record of exists (`billing_transfer_exists`). This operation models no
+        // `ResourceNotFoundException`, so a transfer no reader of this store can resolve
+        // is a fault in the INPUT: the modelled 400 `ValidationException` with the reason
+        // the model enumerates for an ARN that names no such resource.
         if let Some(transfer_arn) = input
             .account_grouping
             .responsibility_transfer_arn
             .as_deref()
         {
-            if !state.transfer_belongs_to_this_organization(transfer_arn) {
+            if !state.billing_transfer_exists(transfer_arn) {
                 return Err(validation(
                     "INVALID_ARN",
                     "AccountGrouping.ResponsibilityTransferArn",
