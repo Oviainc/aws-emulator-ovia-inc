@@ -24,7 +24,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request in this suite signs for. Not `us-east-1`, so a region read
 /// from the request cannot be confused with a hardcoded default.
-const REGION: &str = "us-west-2";
+///
+/// `pub(crate)` because the other suites in this test target sign for the same region and
+/// drive the same front door; see [`call`].
+pub(crate) const REGION: &str = "us-west-2";
 
 /// A router with this service mounted on one shared engine — what the production router
 /// builds, narrowed to the service under test.
@@ -45,7 +48,7 @@ fn router_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
 /// The `Authorization` header carries the SigV4 credential scope the router routes on and
 /// the handlers read the region from; it is not a real signature (this emulator verifies
 /// signatures only with authentication switched on).
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -88,7 +91,7 @@ async fn call(
 }
 
 /// The error code a failure response carries, from restJson1's `__type`.
-fn error_code(body: &serde_json::Value) -> String {
+pub(crate) fn error_code(body: &serde_json::Value) -> String {
     body.get("__type")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("<no __type>")
@@ -101,7 +104,7 @@ fn error_code(body: &serde_json::Value) -> String {
 /// Percent-encode a path label the way an AWS SDK encodes a non-greedy `@httpLabel`:
 /// everything outside the unreserved set, so an ARN's `:` and `/` stay inside one segment
 /// instead of inventing path segments.
-fn encode_label(label: &str) -> String {
+pub(crate) fn encode_label(label: &str) -> String {
     let mut encoded = String::with_capacity(label.len());
     for byte in label.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
@@ -124,7 +127,7 @@ fn json_at(body: &serde_json::Value, pointer: &str) -> serde_json::Value {
         .clone()
 }
 
-fn as_str(body: &serde_json::Value, pointer: &str) -> String {
+pub(crate) fn as_str(body: &serde_json::Value, pointer: &str) -> String {
     body.pointer(pointer)
         .and_then(serde_json::Value::as_str)
         .unwrap_or_else(|| panic!("expected a string at {pointer} in {body}"))

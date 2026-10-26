@@ -238,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resources: std::collections::BTreeSet::new(),
             // The key-value pair AppRegistry identifies this application's resources by.
             application_tag: std::collections::BTreeMap::from([(
-                "awsApplication".to_string(),
+                crate::state::APPLICATION_TAG_KEY.to_string(),
                 arn.clone(),
             )]),
         };

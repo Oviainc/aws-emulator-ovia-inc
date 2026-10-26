@@ -36,6 +36,21 @@ pub const APPLICATION_QUOTA: usize = 1000;
 /// See [`APPLICATION_QUOTA`] — the same bound for the attribute-group store.
 pub const ATTRIBUTE_GROUP_QUOTA: usize = 1000;
 
+/// The key of the AppRegistry system tag that says which application a resource belongs
+/// to: the pair `CreateApplication` publishes as an application's `applicationTag`, and the
+/// tag `SyncResource` reconciles on a resource.
+pub const APPLICATION_TAG_KEY: &str = "awsApplication";
+
+/// The most resources whose system-tag sync this emulator remembers.
+///
+/// A sync records, per resource, what it last left on that resource's AppRegistry system
+/// tag, and the resources a caller can sync are not bounded by this service's own stores —
+/// so without a cap this map would grow once per distinct resource ever synced. Beyond the
+/// cap the OLDEST record is forgotten first: forgetting one only means the next sync of
+/// that resource reconciles from the tag the resource itself reports, which is where a
+/// first sync starts from anyway.
+pub const SYNCED_RESOURCE_LIMIT: usize = 1024;
+
 /// The most idempotency tokens this emulator remembers.
 ///
 /// A token's key is caller-chosen, so this map would otherwise grow once per distinct
@@ -105,6 +120,17 @@ pub struct IdempotentResult {
     pub recorded: u64,
 }
 
+/// What the last sync of one resource left on its AppRegistry system tag.
+#[derive(Debug, Clone)]
+pub struct SyncedApplicationTag {
+    /// The value the sync applied, which is the associated application's ARN — `None` where
+    /// the sync removed the tag because the resource is associated with no application.
+    pub value: Option<String>,
+    /// When this record was written, on the store's own monotonic sequence. The oldest
+    /// record is the one [`SYNCED_RESOURCE_LIMIT`] forgets first.
+    recorded: u64,
+}
+
 /// Per-service state for com-amazonaws-servicecatalogappregistry-aws242appregistry. A handler reaches it through [`service_state`].
 ///
 /// One store serves one account and region: the emulator presents a single account id
@@ -122,6 +148,10 @@ pub struct ComAmazonawsServicecatalogappregistryAws242appregistryState {
     pub attribute_group_names: HashMap<String, String>,
     /// Idempotency tokens that already created something.
     pub idempotency: HashMap<String, IdempotentResult>,
+    /// What the last sync left on a resource's AppRegistry system tag, by the resource's
+    /// ARN — the record a later sync reconciles against. Ordered, so the listing of what
+    /// has been synced has one total order.
+    pub synced_application_tags: BTreeMap<String, SyncedApplicationTag>,
     /// Feeds the id mint, so two mints in the same nanosecond still differ.
     mint_counter: u64,
 }
@@ -178,6 +208,64 @@ impl ComAmazonawsServicecatalogappregistryAws242appregistryState {
     fn next_sequence(&mut self) -> u64 {
         self.mint_counter = self.mint_counter.wrapping_add(1);
         self.mint_counter
+    }
+
+    /// The application a resource of `resource_type` addressed by any of `specifiers` is
+    /// associated with, or `None` when no stored application holds that association.
+    ///
+    /// A resource is addressable by name, by id or by ARN, and an association records the
+    /// specifier the caller used — so every specifier that names the SAME resource is
+    /// tried, rather than only the one this request carried.
+    pub fn application_associated_with(
+        &self,
+        resource_type: &str,
+        specifiers: &[String],
+    ) -> Option<&ApplicationRecord> {
+        self.applications.values().find(|application| {
+            specifiers.iter().any(|specifier| {
+                application
+                    .resources
+                    .contains(&(resource_type.to_string(), specifier.clone()))
+            })
+        })
+    }
+
+    /// The AppRegistry system tag the resource `resource_arn` names currently carries: the
+    /// value the last sync of it left, or — where no sync has run — the one the resource
+    /// itself reports in `resource_tags`.
+    pub fn application_tag_on(
+        &self,
+        resource_arn: &str,
+        resource_tags: &BTreeMap<String, String>,
+    ) -> Option<String> {
+        match self.synced_application_tags.get(resource_arn) {
+            Some(synced) => synced.value.clone(),
+            None => resource_tags.get(APPLICATION_TAG_KEY).cloned(),
+        }
+    }
+
+    /// Record what a sync of `resource_arn` leaves on that resource's AppRegistry system
+    /// tag, forgetting the oldest records once more than [`SYNCED_RESOURCE_LIMIT`] are
+    /// held.
+    pub fn record_application_tag_sync(&mut self, resource_arn: &str, value: Option<String>) {
+        let recorded = self.next_sequence();
+        self.synced_application_tags.insert(
+            resource_arn.to_string(),
+            SyncedApplicationTag { value, recorded },
+        );
+        while self.synced_application_tags.len() > SYNCED_RESOURCE_LIMIT {
+            let oldest = self
+                .synced_application_tags
+                .iter()
+                .min_by_key(|(_, held)| held.recorded)
+                .map(|(resource, _)| resource.clone());
+            match oldest {
+                Some(resource) => {
+                    self.synced_application_tags.remove(&resource);
+                }
+                None => break,
+            }
+        }
     }
 
     /// Whether the application store is full, so `CreateApplication` must answer
@@ -267,6 +355,11 @@ impl ApplicationRecord {
     /// `applicationTag`, the key-value pair identifying resources of this application.
     pub fn application_tag_out(&self) -> Option<HashMap<String, String>> {
         map_out(&self.application_tag)
+    }
+
+    /// The value a resource of this application carries under [`APPLICATION_TAG_KEY`].
+    pub fn application_tag_value(&self) -> Option<String> {
+        self.application_tag.get(APPLICATION_TAG_KEY).cloned()
     }
 }
 

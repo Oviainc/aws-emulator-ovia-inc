@@ -27,9 +27,20 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Encodes the opaque pagination cursor and decodes it back in src/state.rs.
 hex = { workspace = true }
+# The AWS SDK for CloudFormation, driven over the in-process callback
+# (`OperationContext::callback`): `SyncResource` reads the stack it syncs — its stack id
+# and its tags — from CloudFormation itself, which is what that operation's documented
+# `cloudformation:DescribeStacks` permission is for. Only the generated client is needed;
+# the emulator supplies the transport.
+aws-sdk-cloudformation = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# CloudFormation is mounted beside AppRegistry on one engine in the SyncResource suite:
+# without a stack there is nothing to sync.
+service-com-amazonaws-cloudformation-cloudformation = { workspace = true }
 
 [lints]
 workspace = true

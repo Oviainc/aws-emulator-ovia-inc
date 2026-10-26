@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SyncResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SyncResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reconciles the AppRegistry system tag of the resource a request names with what this
+//! service's records say that resource is associated with: where the two already agree
+//! nothing is written and the answer is `NO_ACTION`, and where they differ the sync is
+//! started — the associated application's tag applied, or a tag no association backs
+//! removed — and the answer is `START_SYNC`. Either way the answer carries the resource's
+//! own ARN and, when it is associated, that application's ARN.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SyncResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The resource is a CloudFormation stack, read from CloudFormation itself over the
+//! in-process callback ([`smithy_server_runtime::OperationContext::callback`]) — which is
+//! what the operation's documented `cloudformation:DescribeStacks` permission is for — so
+//! the stack id this answers with is the one CloudFormation holds rather than one composed
+//! here, and a stack CloudFormation does not hold is a `ResourceNotFoundException`.
+//!
+//! A sync is asynchronous — `START_SYNC` says one was STARTED — so what a sync leaves on a
+//! resource's system tag is recorded in this service's own state
+//! ([`crate::state::ComAmazonawsServicecatalogappregistryAws242appregistryState::record_application_tag_sync`]),
+//! which is what a later sync of the same resource reconciles against and what makes a
+//! repeated sync answer `NO_ACTION`.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +94,130 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeMap;
+
+/// The resource type a sync is defined for. `ResourceType` is `CFN_STACK |
+/// RESOURCE_TAG_VALUE` (`smithy_query(query="shape", shape="ResourceType")`), and only a
+/// stack is a resource whose own tags AppRegistry reconciles: the other value names a tag
+/// VALUE that resources are associated by, not a resource that carries tags.
+const CFN_STACK: &str = "CFN_STACK";
+
+/// `actionTaken` where the sync had something to do, so one was started. `SyncAction` is
+/// `START_SYNC | NO_ACTION` (`smithy_query(query="shape", shape="SyncAction")`).
+const START_SYNC: &str = "START_SYNC";
+
+/// `actionTaken` where the resource's system tag already matched its association, so
+/// nothing was changed. See [`START_SYNC`].
+const NO_ACTION: &str = "NO_ACTION";
+
+/// The error code CloudFormation answers for a stack it does not hold ("Stack with id
+/// <name> does not exist"), which to AppRegistry is a resource that is not there.
+const STACK_DOES_NOT_EXIST_CODE: &str = "ValidationError";
+
+/// What this operation needs to know about the stack a request names: the stack id, which
+/// IS the stack's ARN, the name it also answers to, and the tags it carries.
+struct StackRecord {
+    arn: String,
+    name: String,
+    tags: BTreeMap<String, String>,
+}
+
+/// The CloudFormation client this operation reads a stack through.
+///
+/// NOTHING here opens a socket or leaves the host: the transport is `ctx.callback()`, the
+/// framework's seam into this same emulator, so the request is served by the router that
+/// serves a client's own call and the host in `endpoint_url` is only how the SDK addresses
+/// it. That is also why no network client is configured here and this service names no
+/// other service's crate. `region` is this request's own signing region, so the stack read
+/// is the one in the region the caller addressed.
+fn cloudformation_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_cloudformation::Client {
+    let config = ::aws_sdk_cloudformation::Config::builder()
+        .behavior_version(::aws_sdk_cloudformation::config::BehaviorVersion::latest())
+        .region(::aws_sdk_cloudformation::config::Region::new(
+            region.to_string(),
+        ))
+        .endpoint_url(format!("https://cloudformation.{region}.amazonaws.com"))
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(ctx.callback().http_client())
+        // The transport is in-process: there is nothing to retry, time out or watch for a
+        // stalled stream, and each of those would need a sleep implementation this client
+        // is not given. The same goes for caching the identity: the credentials the
+        // callback hands over are used directly.
+        .retry_config(::aws_sdk_cloudformation::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_cloudformation::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_cloudformation::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_cloudformation::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    ::aws_sdk_cloudformation::Client::from_conf(config)
+}
+
+/// The stack `specifier` names — by name or by stack id, which is what CloudFormation's own
+/// `StackName` takes — as CloudFormation holds it.
+async fn stack_record(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    specifier: &str,
+) -> Result<StackRecord, SyncResourceError> {
+    let answer = cloudformation_client(ctx, region)
+        .describe_stacks()
+        .stack_name(specifier)
+        .send()
+        .await
+        .map_err(|error| {
+            match ::aws_sdk_cloudformation::error::ProvideErrorMetadata::code(&error) {
+                Some(STACK_DOES_NOT_EXIST_CODE) => no_such_resource(specifier),
+                // Anything else is this emulator failing to ASK, which is not the same
+                // claim as a stack that is not there.
+                _ => unavailable(format!(
+                    "CloudFormation could not be asked about {specifier}: {}",
+                    ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+                )),
+            }
+        })?;
+    let stack = answer
+        .stacks()
+        .first()
+        .ok_or_else(|| no_such_resource(specifier))?;
+    let arn = stack
+        .stack_id()
+        .ok_or_else(|| unavailable(format!("CloudFormation reported no id for {specifier}")))?
+        .to_string();
+    let name = stack
+        .stack_name()
+        .ok_or_else(|| unavailable(format!("CloudFormation reported no name for {specifier}")))?
+        .to_string();
+    let tags = stack
+        .tags()
+        .iter()
+        .filter_map(|tag| Some((tag.key()?.to_string(), tag.value()?.to_string())))
+        .collect();
+    Ok(StackRecord { arn, name, tags })
+}
+
+/// The modelled 404 for a resource this service cannot address.
+fn no_such_resource(specifier: &str) -> SyncResourceError {
+    SyncResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "no resource of type {CFN_STACK} named, identified by or addressed as \
+             {specifier} exists"
+        )),
+    })
+    .into()
+}
+
+/// The modelled 500 for this emulator not being able to read what the answer needs.
+fn unavailable(message: impl Into<String>) -> SyncResourceError {
+    SyncResourceErrorModeled::InternalServerException(InternalServerException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -157,18 +290,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SyncResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SyncResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SyncResource"))
+        // A tag value is not a resource that carries tags, so there is nothing of it to
+        // reconcile: the request is refused rather than answered with an action nothing
+        // took. The model admits the value for the member, so the restriction to the one
+        // type a sync is defined for is the service's own rule, and the refusal states it.
+        if input.resource_type != CFN_STACK {
+            return Err(SyncResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "Sync resource is only supported with resource type {CFN_STACK}."
+                )),
+            })
+            .into());
+        }
+
+        // The resource is read BEFORE the store is locked: the stack is read over the
+        // in-process callback, and no lock is held across that await.
+        let region = crate::state::request_region(ctx.parts());
+        let stack = stack_record(ctx, &region, &input.resource).await?;
+
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| unavailable("the AppRegistry store is unavailable"))?;
+        let mut store = state.lock();
+
+        // An association records the specifier the caller used, and the same stack answers
+        // to its name and to its id — so the association is looked up under every
+        // specifier this stack answers to, not only the one this request carried.
+        let specifiers = [
+            input.resource.clone(),
+            stack.name.clone(),
+            stack.arn.clone(),
+        ];
+        let associated = store
+            .application_associated_with(CFN_STACK, &specifiers)
+            .map(|application| (application.arn.clone(), application.application_tag_value()));
+        let (application_arn, wanted) = match associated {
+            Some((arn, application_tag)) => (Some(arn), application_tag),
+            None => (None, None),
+        };
+
+        // What the resource carries now against what its association says it should carry:
+        // equal means the sync has nothing to do, so nothing is written.
+        let carried = store.application_tag_on(&stack.arn, &stack.tags);
+        let action_taken = if carried == wanted {
+            NO_ACTION
+        } else {
+            store.record_application_tag_sync(&stack.arn, wanted);
+            START_SYNC
+        };
+        drop(store);
+
+        // Audit record for a state-changing operation: who asked, what changed, how it
+        // ended — wire metadata and the stored ARNs only.
+        tracing::info!(
+            audit = true,
+            operation = "SyncResource",
+            outcome = action_taken,
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            resource_arn = %stack.arn,
+            application_arn = application_arn.as_deref().unwrap_or("none"),
+            "resource synced with its AppRegistry records"
+        );
+
+        Ok(SyncResourceOutput {
+            application_arn,
+            resource_arn: Some(stack.arn),
+            action_taken: Some(action_taken.to_string()),
+        })
     }
 }
