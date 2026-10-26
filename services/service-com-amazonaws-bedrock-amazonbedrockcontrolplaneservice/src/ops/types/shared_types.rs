@@ -354,7 +354,16 @@ bedrock_schema_and_codec!(
     ),
 );
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#AutomatedReasoningPolicyTestResult")]
+/// `AutomatedReasoningPolicyTestResult`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]` for
+/// the reason [`AutomatedReasoningPolicyTestCase`]'s do: `updatedAt` carries
+/// `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="AutomatedReasoningPolicyTestResult")`), which the
+/// derive does not put on a member schema — see `types/date_time_wire.rs` for that whole
+/// story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct AutomatedReasoningPolicyTestResult {
     pub test_case: AutomatedReasoningPolicyTestCase,
@@ -365,6 +374,56 @@ pub struct AutomatedReasoningPolicyTestResult {
     pub aggregated_test_findings_result: Option<String>,
     pub updated_at: ::aws_smithy_types::DateTime,
 }
+
+bedrock_schema_and_codec!(
+    AutomatedReasoningPolicyTestResult,
+    AUTOMATED_REASONING_POLICY_TEST_RESULT_SCHEMA,
+    "com.amazonaws.bedrock#AutomatedReasoningPolicyTestResult",
+    "com.amazonaws.bedrock",
+    "AutomatedReasoningPolicyTestResult",
+    (
+        M_TEST_CASE,
+        test_case,
+        "testCase",
+        0,
+        req,
+        struct_of(AutomatedReasoningPolicyTestCase)
+    ),
+    (M_POLICY_ARN, policy_arn, "policyArn", 1, req, string),
+    (
+        M_TEST_RUN_STATUS,
+        test_run_status,
+        "testRunStatus",
+        2,
+        req,
+        string
+    ),
+    (
+        M_TEST_FINDINGS,
+        test_findings,
+        "testFindings",
+        3,
+        opt,
+        list_of_struct(AutomatedReasoningCheckFinding)
+    ),
+    (
+        M_TEST_RUN_RESULT,
+        test_run_result,
+        "testRunResult",
+        4,
+        opt,
+        string
+    ),
+    (
+        M_AGGREGATED_TEST_FINDINGS_RESULT,
+        aggregated_test_findings_result,
+        "aggregatedTestFindingsResult",
+        5,
+        opt,
+        string
+    ),
+    (M_UPDATED_AT, updated_at, "updatedAt", 6, req, date_time),
+);
 
 #[smithy_macros::smithy(union_for = "com.amazonaws.bedrock#AutomatedReasoningCheckFinding")]
 #[allow(clippy::large_enum_variant)]

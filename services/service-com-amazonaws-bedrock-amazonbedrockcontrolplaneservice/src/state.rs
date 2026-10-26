@@ -93,6 +93,12 @@
 //! was created under, so a test created by one request is the test every later request
 //! sees.
 //!
+//! And it holds the runs of those tests —
+//! `ops/start_automated_reasoning_policy_test_workflow.rs` schedules them against a built
+//! build workflow and `ops/get_automated_reasoning_policy_test_result.rs` reads each one
+//! back — each keyed by the policy, the build workflow and the test it runs, with the
+//! instant its non-terminal `testRunStatus` is owed its move to `COMPLETED`.
+//!
 //! And it holds the account's acknowledged use case for model access — the single form
 //! `ops/put_use_case_for_model_access.rs` submits and `ops/get_use_case_for_model_access.rs`
 //! reads back, so the form one request submits is the form the next request gets.
@@ -143,7 +149,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AdvancedPromptOptimizationInputConfig, AdvancedPromptOptimizationOutputConfig,
-    AutomatedReasoningPolicyDefinition, AutomatedReasoningPolicyTestCase, CustomModelDataSource,
+    AutomatedReasoningPolicyDefinition, AutomatedReasoningPolicyTestCase,
+    AutomatedReasoningPolicyTestResult, CustomModelDataSource,
     CustomModelDeploymentSummary,
     CustomModelSummary, CustomizationConfig, EndpointConfig, EvaluationConfig,
     ModelInvocationJobInputDataConfig, ModelInvocationJobOutputDataConfig,
@@ -2216,6 +2223,141 @@ pub struct AutomatedReasoningPolicyTestCaseRecord {
     pub updated_at: SystemTime,
 }
 
+/// `AutomatedReasoningPolicyTestRunStatus$SCHEDULED` — the status a test run that a test
+/// workflow has just accepted carries, before the clock owes it its completion
+/// (`smithy_query(query="shape",shape="AutomatedReasoningPolicyTestRunStatus")`).
+pub const TEST_RUN_STATUS_SCHEDULED: &str = "SCHEDULED";
+
+/// `AutomatedReasoningPolicyTestRunStatus$COMPLETED` — the terminal status the clock owes a
+/// scheduled test run [`TEST_RUN_COMPLETE_AFTER`] from the workflow that scheduled it.
+pub const TEST_RUN_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// `AutomatedReasoningPolicyTestRunStatus$FAILED` — the other terminal status the enum
+/// admits. Nothing in this emulator moves a run to it, and it is named here so
+/// [`AutomatedReasoningPolicyTestRunRecord::is_active`] decides on the whole set of
+/// terminal statuses rather than on the one this emulator produces.
+pub const TEST_RUN_STATUS_FAILED: &str = "FAILED";
+
+/// How long after `StartAutomatedReasoningPolicyTestWorkflow` accepts a test run its
+/// `testRunStatus` is owed its move to [`TEST_RUN_STATUS_COMPLETED`].
+///
+/// The emulator's own span, chosen like [`BUILD_WORKFLOW_COMPLETE_AFTER`] rather than
+/// documented by AWS: a run the workflow answers in a non-terminal status is owed a
+/// transition, and the span is non-zero so a caller reading straight after the start still
+/// sees the status that start recorded.
+pub const TEST_RUN_COMPLETE_AFTER: Duration = Duration::from_millis(500);
+
+/// One run of one stored test against one build workflow of its policy: what
+/// `StartAutomatedReasoningPolicyTestWorkflow` schedules and
+/// `GetAutomatedReasoningPolicyTestResult` reports.
+///
+/// A run is keyed by the TRIPLE `(policyArn, buildWorkflowId, testCaseId)` its read is
+/// addressed by (`smithy_query(query="operation",operation="GetAutomatedReasoningPolicyTestResult")`),
+/// so running the same test against two build workflows of a policy is two runs and
+/// re-running it against one build workflow replaces that build workflow's run of it.
+///
+/// The test's own content is not copied here: a result reports the stored test
+/// ([`AutomatedReasoningPolicyTestCaseRecord`]) beside the run, so there is only ever one
+/// copy of a test whichever operation reads it.
+///
+/// `status` is a `&'static str` for the reason
+/// [`AutomatedReasoningPolicyBuildWorkflowRecord::status`] is: it is a value this emulator
+/// derives rather than one a request names.
+#[derive(Debug, Clone)]
+pub struct AutomatedReasoningPolicyTestRunRecord {
+    /// The `AutomatedReasoningPolicyArn` of the policy whose test this run ran — the first
+    /// third of the key this family's store is keyed by.
+    pub policy_arn: String,
+    /// The `buildWorkflowId` of the build workflow this run tested — the second third of
+    /// that key.
+    pub build_workflow_id: String,
+    /// The `testCaseId` of the test this run ran — the last third of that key.
+    pub test_case_id: String,
+    /// `testRunStatus` (`AutomatedReasoningPolicyTestRunStatus`).
+    pub status: &'static str,
+    /// When [`Self::status`] is owed its move to [`TEST_RUN_STATUS_COMPLETED`], or `None`
+    /// once it is terminal.
+    ///
+    /// The due INSTANT, not a timer, for the same reason
+    /// [`AutomatedReasoningPolicyBuildWorkflowRecord::completed_due_at`] is one.
+    pub completed_due_at: Option<SystemTime>,
+    /// `updatedAt` — when this run last changed: the instant the workflow scheduled it
+    /// until the clock moves its status.
+    pub updated_at: SystemTime,
+}
+
+/// The test workflow a build workflow last accepted: the `clientRequestToken` that request
+/// carried and the `testCaseIds` it selected (`None` when it named none, which selects
+/// every test of the policy).
+///
+/// What `StartAutomatedReasoningPolicyTestWorkflow` recognises a request it has already
+/// accepted by, which is why the selection is held beside the token: a request naming other
+/// tests asks for other work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedAutomatedReasoningPolicyTestWorkflow {
+    /// `clientRequestToken`, as the accepted request carried it.
+    pub client_request_token: String,
+    /// `testCaseIds`, as that request carried it.
+    pub test_case_ids: Option<Vec<String>>,
+}
+
+impl AutomatedReasoningPolicyTestRunRecord {
+    /// One run of `test_case_id` against `build_workflow_id`, as the test workflow that
+    /// accepted it at `now` leaves it: the ONE place a run's initial state is written, so a
+    /// fresh run and a re-run start alike (both go on through [`Self::schedule`]).
+    #[must_use]
+    pub fn scheduled(
+        policy_arn: &str,
+        build_workflow_id: &str,
+        test_case_id: &str,
+        now: SystemTime,
+    ) -> Self {
+        let mut record = Self {
+            policy_arn: policy_arn.to_string(),
+            build_workflow_id: build_workflow_id.to_string(),
+            test_case_id: test_case_id.to_string(),
+            status: TEST_RUN_STATUS_SCHEDULED,
+            completed_due_at: None,
+            updated_at: now,
+        };
+        record.schedule(now);
+        record
+    }
+
+    /// Whether this run is still running, so the build workflow it is testing is in use by
+    /// it: only a terminal status frees that build workflow for another test workflow.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        !matches!(
+            self.status,
+            TEST_RUN_STATUS_COMPLETED | TEST_RUN_STATUS_FAILED
+        )
+    }
+
+    /// Materialise the status transition the clock has already made due at `now`: the
+    /// completion the workflow that scheduled this run owes it.
+    ///
+    /// The only write a reporting operation on this resource makes: it was owed at the due
+    /// instant even if nobody had called, which is why that instant — not `now` — is the
+    /// one the run reports as its last update.
+    pub fn settle(&mut self, now: SystemTime) {
+        if let Some(due) = self.completed_due_at.filter(|due| now >= *due) {
+            self.status = TEST_RUN_STATUS_COMPLETED;
+            self.completed_due_at = None;
+            self.updated_at = due;
+        }
+    }
+
+    /// Schedule this run as of `now`: the write
+    /// `StartAutomatedReasoningPolicyTestWorkflow` makes, for a run it has just accepted
+    /// and for one it is re-running.
+    pub fn schedule(&mut self, now: SystemTime) {
+        self.status = TEST_RUN_STATUS_SCHEDULED;
+        self.completed_due_at = Some(now + TEST_RUN_COMPLETE_AFTER);
+        self.updated_at = now;
+    }
+}
+
 /// One stored application inference profile: the identity `CreateInferenceProfile`
 /// minted, the model source that request named, and what a read reports.
 ///
@@ -2429,6 +2571,13 @@ pub struct AccountDataRetention {
 ///   off are themselves capped — and
 ///   `automated_reasoning_policy_test_case_create_tokens` holds at most one entry per
 ///   stored test for the same reason `create_tokens` does.
+///
+/// * `automated_reasoning_policy_test_runs` holds one entry per `(policy, build workflow,
+///   test)` triple a test workflow has scheduled, so it is bounded by the product of the
+///   tests and the build workflows those two quotas already admit — a test workflow re-run
+///   replaces the entry it scheduled before rather than adding one — while
+///   `automated_reasoning_policy_test_workflow_tokens` holds at most ONE entry per build
+///   workflow, which is bounded by that same build workflow quota.
 ///
 /// * `inference_profiles` holds one entry per live application inference profile, capped
 ///   at [`MAX_INFERENCE_PROFILES_PER_ACCOUNT`] by the quota `CreateInferenceProfile`
@@ -2695,6 +2844,29 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// How many Automated Reasoning policy test ids this store has minted; the uniqueness
     /// half of a minted id.
     pub minted_automated_reasoning_policy_test_cases: u64,
+    /// Every run of a stored test, keyed by the
+    /// `(AutomatedReasoningPolicyArn, buildWorkflowId, testCaseId)` triple
+    /// `GetAutomatedReasoningPolicyTestResult` addresses a result by, because a run belongs
+    /// to the build workflow it tested and to the test it ran.
+    pub automated_reasoning_policy_test_runs:
+        HashMap<(String, String, String), AutomatedReasoningPolicyTestRunRecord>,
+    /// `StartAutomatedReasoningPolicyTestWorkflow` idempotency:
+    /// `(AutomatedReasoningPolicyArn, buildWorkflowId)` -> the `clientRequestToken` of the
+    /// test workflow that build workflow last accepted, with the `testCaseIds` that request
+    /// carried (`None` when it named none, which selects every test of the policy), so the
+    /// request that token and that selection already started schedules nothing new.
+    ///
+    /// The SELECTION is part of the entry because a request naming other tests asks for
+    /// other work, which a stored token must not answer as already done.
+    ///
+    /// ONE entry per build workflow rather than one per token, which is what keeps this
+    /// index bounded by the build workflows the quota already admits: an accepted test
+    /// workflow re-runs the runs it finds rather than minting a record a token could be
+    /// counted against, so a per-token index would grow with nothing but fresh tokens. A
+    /// token the next accepted test workflow of that build workflow supersedes is therefore
+    /// no longer a replay.
+    pub automated_reasoning_policy_test_workflow_tokens:
+        HashMap<(String, String), AcceptedAutomatedReasoningPolicyTestWorkflow>,
     /// Every stored application inference profile, keyed by its `InferenceProfileArn` —
     /// one of the two spellings an `InferenceProfileIdentifier` carries.
     pub inference_profiles: HashMap<String, InferenceProfileRecord>,
@@ -2959,6 +3131,66 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
             .keys()
             .filter(|(arn, _)| arn == policy_arn)
             .count()
+    }
+
+    /// The run of the test `test_case_id` against the build workflow `build_workflow_id` of
+    /// the policy `policy_arn` names, with any status transition the clock has made due at
+    /// `now` materialised first — so every caller reads the status the run holds at `now`,
+    /// whichever operation asked.
+    pub fn automated_reasoning_policy_test_run(
+        &mut self,
+        policy_arn: &str,
+        build_workflow_id: &str,
+        test_case_id: &str,
+        now: SystemTime,
+    ) -> Option<&mut AutomatedReasoningPolicyTestRunRecord> {
+        let record = self.automated_reasoning_policy_test_runs.get_mut(&(
+            policy_arn.to_string(),
+            build_workflow_id.to_string(),
+            test_case_id.to_string(),
+        ))?;
+        record.settle(now);
+        Some(record)
+    }
+
+    /// Materialise every test run transition of the build workflow `build_workflow_id` of
+    /// the policy `policy_arn` names that the clock has made due at `now`, so a caller
+    /// asking about the BUILD WORKFLOW sees the same runs a read of each one would.
+    pub fn settle_automated_reasoning_policy_test_runs(
+        &mut self,
+        policy_arn: &str,
+        build_workflow_id: &str,
+        now: SystemTime,
+    ) {
+        for ((arn, workflow, _), record) in &mut self.automated_reasoning_policy_test_runs {
+            if arn == policy_arn && workflow == build_workflow_id {
+                record.settle(now);
+            }
+        }
+    }
+
+    /// Every run scheduled against the build workflow `build_workflow_id` of the policy
+    /// `policy_arn` names, in `testCaseId` order (settle first, with
+    /// [`Self::settle_automated_reasoning_policy_test_runs`], to read them as of an
+    /// instant).
+    ///
+    /// The order is the test id's, which is a TOTAL order over
+    /// `AutomatedReasoningPolicyTestCaseId` (`^[0-9A-Z]{12}$`), exactly as the tests
+    /// themselves are ordered.
+    #[must_use]
+    pub fn automated_reasoning_policy_test_runs_of(
+        &self,
+        policy_arn: &str,
+        build_workflow_id: &str,
+    ) -> Vec<&AutomatedReasoningPolicyTestRunRecord> {
+        let mut records: Vec<&AutomatedReasoningPolicyTestRunRecord> = self
+            .automated_reasoning_policy_test_runs
+            .iter()
+            .filter(|((arn, workflow, _), _)| arn == policy_arn && workflow == build_workflow_id)
+            .map(|(_, record)| record)
+            .collect();
+        records.sort_unstable_by(|left, right| left.test_case_id.cmp(&right.test_case_id));
+        records
     }
 
     /// Mint a fresh inference profile id: the resource half of an
@@ -4243,6 +4475,36 @@ pub fn automated_reasoning_policy_test_case(
         confidence_threshold: record.confidence_threshold,
         created_at: date_time(record.created_at),
         updated_at: date_time(record.updated_at),
+    }
+}
+
+/// The `AutomatedReasoningPolicyTestResult` a stored run of a stored test is reported as.
+///
+/// ONE mapping, so the read of a single result and a listing of a build workflow's results
+/// report the same run the same way. The test it ran is reported through
+/// [`automated_reasoning_policy_test_case`], so a result carries exactly the test a read of
+/// that test reports.
+///
+/// `testFindings`, `aggregatedTestFindingsResult` and `testRunResult` are reported only
+/// once something has checked the test's content against the policy's logic. Nothing in
+/// this emulator does, so a run reports its lifecycle — the status it holds and when it
+/// last changed — and none of the three: every one of them is an OPTIONAL member
+/// (`smithy_query(query="shape",shape="AutomatedReasoningPolicyTestResult")`), so a result
+/// that carries no finding is one the shape admits, and inventing a finding or a verdict
+/// here would report an outcome no check produced.
+#[must_use]
+pub fn automated_reasoning_policy_test_result(
+    run: &AutomatedReasoningPolicyTestRunRecord,
+    test_case: &AutomatedReasoningPolicyTestCaseRecord,
+) -> AutomatedReasoningPolicyTestResult {
+    AutomatedReasoningPolicyTestResult {
+        test_case: automated_reasoning_policy_test_case(test_case),
+        policy_arn: run.policy_arn.clone(),
+        test_run_status: run.status.to_string(),
+        test_findings: None,
+        test_run_result: None,
+        aggregated_test_findings_result: None,
+        updated_at: date_time(run.updated_at),
     }
 }
 

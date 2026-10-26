@@ -23,6 +23,8 @@ mod automated_reasoning_policies;
 mod automated_reasoning_policy_build_workflows;
 #[path = "all/automated_reasoning_policy_test_cases.rs"]
 mod automated_reasoning_policy_test_cases;
+#[path = "all/automated_reasoning_policy_test_workflows.rs"]
+mod automated_reasoning_policy_test_workflows;
 #[path = "all/automated_reasoning_policy_updates.rs"]
 mod automated_reasoning_policy_updates;
 #[path = "all/automated_reasoning_policy_versions.rs"]
