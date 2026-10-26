@@ -408,6 +408,21 @@ impl DeploymentParameterRecord {
             .is_some_and(|at| timestamp_epoch_nanos(at) <= system_time_epoch_nanos(now))
     }
 
+    /// The key this record is stored under: the identity [`ParameterKey`]
+    /// defines, read off the record itself.
+    ///
+    /// The one place a stored record's identity is spelled out, so a caller that
+    /// has to decide whether a record IS the one a request names compares key
+    /// values rather than restating which members make up the identity.
+    pub fn key(&self) -> ParameterKey {
+        (
+            self.catalog.clone(),
+            self.product_id.clone(),
+            self.agreement_id.clone(),
+            self.name.clone(),
+        )
+    }
+
     /// The tag map as the modelled `TagsMap` / `Tags` wire shape.
     pub fn tags_map(&self) -> HashMap<String, String> {
         self.tags

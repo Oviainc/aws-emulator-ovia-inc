@@ -303,9 +303,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The identity this request names, resolved ONCE: a deployment parameter is
+        // keyed on (catalog, productId, agreementId, deploymentParameter.name)
+        // (`crate::state::ParameterKey`), and every judgement below that asks
+        // "which parameter is this request about?" — the `clientToken` replay
+        // check and the identity-index lookup — compares this one value, so the two
+        // cannot come to judge different identities.
+        let key: crate::state::ParameterKey = (
+            input.catalog.clone(),
+            input.product_id.clone(),
+            input.agreement_id.clone(),
+            input.deployment_parameter.name.clone(),
+        );
+
         // `clientToken` is the `@idempotencyToken`: a token already bound to a write
         // replays that write rather than performing it again, and the SAME token aimed
-        // at a DIFFERENT parameter is a conflicting request.
+        // at a DIFFERENT parameter is a conflicting request. Whether the bound record
+        // IS the parameter this request names is the identity above, read off the
+        // record by `crate::state::DeploymentParameterRecord::key`.
         //
         // Resolved AFTER the target above, deliberately: the target is a judgement on
         // THIS request's (catalog, productId, agreementId), so it is answered before
@@ -316,11 +331,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token.as_deref() {
             if let Some(arn) = store.client_tokens.get(token).cloned() {
                 if let Some(record) = store.parameters.get(&arn) {
-                    if record.catalog == input.catalog
-                        && record.product_id == input.product_id
-                        && record.agreement_id == input.agreement_id
-                        && record.name == input.deployment_parameter.name
-                    {
+                    if record.key() == key {
                         return Ok(output_of(record));
                     }
                     return Err(PutDeploymentParameterErrorModeled::ConflictException(
@@ -333,13 +344,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
         }
-
-        let key: crate::state::ParameterKey = (
-            input.catalog.clone(),
-            input.product_id.clone(),
-            input.agreement_id.clone(),
-            input.deployment_parameter.name.clone(),
-        );
 
         let resource_arn = match store.by_name.get(&key).cloned() {
             // The parameter already exists: this call rewrites its content in place.

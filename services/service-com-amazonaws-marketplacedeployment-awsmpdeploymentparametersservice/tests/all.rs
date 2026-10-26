@@ -17,6 +17,8 @@ mod boundary_validation_field_name;
 mod catalog_allowed_values;
 #[path = "all/deployment_parameter_expiry.rs"]
 mod deployment_parameter_expiry;
+#[path = "all/deployment_parameter_identity_key.rs"]
+mod deployment_parameter_identity_key;
 #[path = "all/deployment_parameters.rs"]
 mod deployment_parameters;
 #[path = "all/expiration_date_wire_form.rs"]
