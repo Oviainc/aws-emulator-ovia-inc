@@ -10,7 +10,9 @@
 //! certificates, so a repeat of the same call is the same list.
 //!
 //! An ARN this store holds no listener for is the modelled `ListenerNotFoundException`,
-//! and a list past this store's own bound on it is `TooManyCertificatesException`.
+//! and a list past this store's own bound on it is `TooManyCertificatesException`. A
+//! `CertificateArn` that names no certificate resolves to none of the account's, which is
+//! the modelled `CertificateNotFoundException` and leaves the list untouched.
 //!
 //! ## Shape of an operation
 //!
@@ -209,6 +211,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // Each certificate the request names is RESOLVED before the list is touched: a
+        // value that is no certificate ARN names no certificate of the account, so the
+        // call is the modelled refusal and the listener's list is left as it was, rather
+        // than carrying an entry no certificate backs.
+        if let Some(arn) = crate::state::unresolvable_certificate(&input.certificates) {
+            return Err(certificate_not_found(arn));
+        }
+
         // What the call actually adds: the requested certificates the list does not hold
         // already. Both sides are bounded by `CERTIFICATES_PER_LISTENER`, and the whole
         // request is checked before the first write, so a refused call adds nothing.
@@ -239,6 +249,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         })
     }
+}
+
+/// The modelled refusal for a certificate ARN that resolves to no certificate, which is
+/// what a value that is no certificate ARN at all does ([`crate::state::names_a_certificate`]).
+fn certificate_not_found(arn: &str) -> AddListenerCertificatesError {
+    AddListenerCertificatesErrorModeled::CertificateNotFoundException(
+        CertificateNotFoundException {
+            message: Some(crate::state::certificate_not_found_message(arn)),
+        },
+    )
+    .into()
 }
 
 /// The modelled refusal for a call that would take a listener's certificate list past

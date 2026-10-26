@@ -687,6 +687,80 @@ pub fn terminates_tls(protocol: Option<&str>) -> bool {
 /// record, so it is released with the listener.
 pub const CERTIFICATES_PER_LISTENER: usize = 25;
 
+/// A server certificate uploaded to IAM, `arn:aws:iam::<account>:server-certificate/<name>`
+/// — the second place the certificates a TLS-terminating listener serves live, beside
+/// Certificate Manager. Stated as a requirement of the shared ARN reader, which already
+/// carries the Certificate Manager one (`service_common::arn::ACM_CERTIFICATE`), so both
+/// forms are read by the workspace's one parse of a caller-supplied ARN.
+const IAM_SERVER_CERTIFICATE: ::service_common::arn::Requirement =
+    ::service_common::arn::Requirement {
+        vendor: "iam",
+        resource_type: Some("server-certificate"),
+        label: "an IAM server certificate",
+    };
+
+/// Whether `arn` NAMES a certificate at all — the ARN of a Certificate Manager
+/// certificate or of a server certificate uploaded to IAM, which are the forms
+/// `Certificate$CertificateArn` ("The Amazon Resource Name (ARN) of the certificate")
+/// carries.
+///
+/// A value of no other form resolves to no certificate of the account whatever those
+/// services hold, so the operation that named it answers the modelled
+/// `CertificateNotFoundException` with [`certificate_not_found_message`] and stores
+/// nothing. The partition, Region and account are deliberately NOT checked, exactly as
+/// [`check_listener_arn`] leaves them: a certificate of another Region is well formed.
+pub fn names_a_certificate(arn: &str) -> bool {
+    ::service_common::arn::ACM_CERTIFICATE.admits(arn) || IAM_SERVER_CERTIFICATE.admits(arn)
+}
+
+/// The refusal a certificate ARN that resolves to no certificate earns, naming the value
+/// the request carried — the only thing the caller can act on.
+pub fn certificate_not_found_message(arn: &str) -> String {
+    format!("Certificate '{arn}' not found")
+}
+
+/// The first `CertificateArn` of `certificates` that names no certificate, if any: what
+/// an operation resolving a requested certificate refuses on, read off the request in the
+/// order it listed them.
+///
+/// An entry carrying NO ARN, or an empty one, names no certificate either — but that is a
+/// missing MEMBER rather than an unresolvable certificate, and each operation states that
+/// refusal itself, so it is passed over here.
+pub fn unresolvable_certificate(certificates: &[Certificate]) -> Option<&str> {
+    certificates
+        .iter()
+        .filter_map(|certificate| certificate.certificate_arn.as_deref())
+        .filter(|arn| !arn.is_empty())
+        .find(|arn| !names_a_certificate(arn))
+}
+
+/// The redirect-action protocol that sends the client to cleartext, from
+/// `RedirectActionConfig$Protocol`: "You can specify HTTP, HTTPS, or #{protocol}."
+pub const HTTP_REDIRECT_PROTOCOL: &str = "HTTP";
+
+/// Whether an action list attached to a listener on `listener_protocol` redirects to
+/// cleartext HTTP from a listener that terminates TLS — the one combination
+/// `RedirectActionConfig$Protocol` rules out: "You can redirect HTTP to HTTP, HTTP to
+/// HTTPS, and HTTPS to HTTPS. You can't redirect HTTPS to HTTP."
+///
+/// The judgement is a RELATIONSHIP between the action and the listener the action is
+/// attached to, not a constraint on the request alone: the same configuration is admitted
+/// on a listener that terminates no TLS. A redirect naming no protocol keeps the
+/// request's own (`#{protocol}`), and `HTTPS` is no downgrade, so neither is judged here.
+pub fn downgrades_to_http(listener_protocol: Option<&str>, actions: &[Action]) -> bool {
+    terminates_tls(listener_protocol)
+        && actions.iter().any(|action| {
+            action
+                .redirect_config
+                .as_ref()
+                .is_some_and(|config| config.protocol.as_deref() == Some(HTTP_REDIRECT_PROTOCOL))
+        })
+}
+
+/// The refusal such a redirect earns. Fixed text: the rule is about the two protocols
+/// themselves, so there is nothing of the request to name in it.
+pub const HTTPS_TO_HTTP_REDIRECT_MESSAGE: &str = "You cannot redirect HTTPS to HTTP.";
+
 /// Every listener attribute this service models, with the load balancer families whose
 /// listeners carry it, the values it accepts and its documented default — each one a
 /// sentence of the model's own `ListenerAttribute$Key` documentation
@@ -2481,9 +2555,10 @@ impl RuleRecord {
             priority: Some(self.priority.to_string()),
             // Each condition is reported under every spelling the model gives its
             // field, which is not always the spelling the create used
-            // ([`reported_condition`]).
+            // ([`reported_condition`]), and a redirect reports the components it leaves
+            // unmodified as the keywords that retain them ([`reported_action`]).
             conditions: Some(self.conditions.iter().map(reported_condition).collect()),
-            actions: Some(self.actions.clone()),
+            actions: Some(reported_actions(&self.actions)),
             // Only the rule a listener mints with itself is the default one.
             is_default: Some(false),
             transforms: (!self.transforms.is_empty()).then(|| self.transforms.clone()),
@@ -2624,7 +2699,7 @@ impl ListenerRecord {
                     .collect(),
             ),
             ssl_policy: self.ssl_policy.clone(),
-            default_actions: Some(self.default_actions.clone()),
+            default_actions: Some(reported_actions(&self.default_actions)),
             alpn_policy: Some(self.alpn_policy.clone()),
             mutual_authentication: None,
         }
@@ -2686,7 +2761,7 @@ impl ListenerRecord {
             // number.
             priority: Some("default".to_string()),
             conditions: Some(Vec::new()),
-            actions: Some(self.default_actions.clone()),
+            actions: Some(reported_actions(&self.default_actions)),
             is_default: Some(true),
             transforms: None,
         }
@@ -2770,6 +2845,54 @@ fn action_summary(actions: &[Action]) -> Vec<(String, Option<i32>, Vec<String>)>
             )
         })
         .collect()
+}
+
+/// The reserved keyword each component of a redirect action's target URI is REPORTED as
+/// when the request did not modify that component, from `RedirectActionConfig`'s own
+/// documentation: "A URI consists of the following components:
+/// protocol://hostname:port/path?query. … Any components that you do not modify retain
+/// their original values. You can reuse URI components using the following reserved
+/// keywords: #{protocol}, #{host}, #{port}, #{path} (the leading "/" is removed),
+/// #{query}."
+///
+/// So a component left out keeps the request's own value, and the keyword for it is what
+/// says so. `Path` is the one with a form of its own: the keyword drops the leading "/",
+/// which the member itself must carry ("The absolute path, starting with the leading
+/// "/""), so the path that retains its original value is `/#{path}`.
+const KEEP_PROTOCOL: &str = "#{protocol}";
+const KEEP_HOST: &str = "#{host}";
+const KEEP_PORT: &str = "#{port}";
+const KEEP_PATH: &str = "/#{path}";
+const KEEP_QUERY: &str = "#{query}";
+
+/// One action as a read reports it: a redirect's unmodified components answered as the
+/// keywords that retain them ([`KEEP_PROTOCOL`] and the rest), every other action exactly
+/// as it was given.
+///
+/// The ONE normalisation of an action, so a rule's actions, a listener's default actions
+/// and the default rule carrying them all report the same configuration — the stored
+/// action is what the caller gave, and this is what a read makes of it, exactly as
+/// [`reported_condition`] does for a condition's two spellings.
+fn reported_action(action: &Action) -> Action {
+    let mut reported = action.clone();
+    if let Some(config) = reported.redirect_config.as_mut() {
+        let kept = |value: &mut Option<String>, keyword: &str| {
+            if value.is_none() {
+                *value = Some(keyword.to_string());
+            }
+        };
+        kept(&mut config.protocol, KEEP_PROTOCOL);
+        kept(&mut config.host, KEEP_HOST);
+        kept(&mut config.port, KEEP_PORT);
+        kept(&mut config.path, KEEP_PATH);
+        kept(&mut config.query, KEEP_QUERY);
+    }
+    reported
+}
+
+/// Every action of a list as a read reports it ([`reported_action`]).
+pub fn reported_actions(actions: &[Action]) -> Vec<Action> {
+    actions.iter().map(reported_action).collect()
 }
 
 /// The kind of Elastic Load Balancing resource an ARN names.

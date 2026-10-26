@@ -16,7 +16,10 @@
 //! "[HTTPS and TLS listeners] The default certificate for the listener. You must
 //! provide exactly one certificate." — so one of those listeners is refused when it
 //! carries no certificate (or more than one), and any other listener is refused when
-//! it carries one. See [`check_default_certificate`].
+//! it carries one. See [`check_default_certificate`]. A certificate ARN that names no
+//! certificate is `CertificateNotFoundException`, and a default action redirecting to
+//! cleartext HTTP on a listener that terminates TLS is
+//! `InvalidLoadBalancerActionException`.
 //!
 //! ## Shape of an operation
 //!
@@ -236,6 +239,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and only to those. Checked before anything is looked up, because it reads
         // the request alone.
         check_default_certificate(input.protocol.as_deref(), input.certificates.as_deref())?;
+
+        // The certificate the request names is RESOLVED: a value that is no certificate
+        // ARN names no certificate of the account, so no listener is created for it.
+        if let Some(arn) =
+            crate::state::unresolvable_certificate(input.certificates.as_deref().unwrap_or_default())
+        {
+            return Err(CreateListenerErrorModeled::CertificateNotFoundException(
+                CertificateNotFoundException {
+                    message: Some(crate::state::certificate_not_found_message(arn)),
+                },
+            )
+            .into());
+        }
+
+        // A redirect action is judged against the protocol of the listener it is attached
+        // to — here the one this listener is created on — so a listener that terminates
+        // TLS cannot carry a default action redirecting to cleartext.
+        if crate::state::downgrades_to_http(input.protocol.as_deref(), &input.default_actions) {
+            return Err(
+                CreateListenerErrorModeled::InvalidLoadBalancerActionException(
+                    InvalidLoadBalancerActionException {
+                        message: Some(crate::state::HTTPS_TO_HTTP_REDIRECT_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
 
         let candidate = ListenerRecord {
             arn: String::new(),

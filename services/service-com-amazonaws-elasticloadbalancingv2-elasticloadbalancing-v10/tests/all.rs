@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/catalog_reads.rs"]
 mod catalog_reads;
+#[path = "all/certificate_resolution_and_redirect_protocol.rs"]
+mod certificate_resolution_and_redirect_protocol;
 #[path = "all/ip_targets.rs"]
 mod ip_targets;
 #[path = "all/listener_lifecycle_certificates_and_rules.rs"]

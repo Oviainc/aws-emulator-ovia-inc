@@ -69,9 +69,11 @@ const TARGET_GROUP_NOT_FOUND: &str = "TargetGroupNotFound";
 /// The awsQuery code of `RuleNotFoundException`.
 const RULE_NOT_FOUND: &str = "RuleNotFound";
 
-/// Certificate ARNs to hand a listener. This service does not resolve a certificate
-/// against ACM, so any well-formed ACM ARN does: the rules under test are about which
-/// listener takes certificates and how the list is managed.
+/// Certificate ARNs to hand a listener. Any Certificate Manager certificate ARN does:
+/// this service resolves the ARN FORM of a requested certificate (pinned in
+/// `all/certificate_resolution_and_redirect_protocol.rs`) and not the certificate itself
+/// against ACM, so the rules under test here are about which listener takes certificates
+/// and how the list is managed.
 const CERT_DEFAULT: &str =
     "arn:aws:acm:us-west-2:000000000000:certificate/00000000-0000-0000-0000-000000000000";
 const CERT_ONE: &str =

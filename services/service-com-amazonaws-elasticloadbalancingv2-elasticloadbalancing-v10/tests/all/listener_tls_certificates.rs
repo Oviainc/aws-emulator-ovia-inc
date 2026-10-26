@@ -53,9 +53,10 @@ const PROTOCOLS: &[&str] = &[
 /// `Certificates` documentation brackets ("[HTTPS and TLS listeners]").
 const TLS_TERMINATING: &[&str] = &["HTTPS", "TLS"];
 
-/// A certificate ARN to hand a listener. Any ARN does: this service does not resolve a
-/// certificate against ACM, and the rule under test is about how MANY certificates a
-/// protocol takes.
+/// A certificate ARN to hand a listener. Any Certificate Manager certificate ARN does:
+/// this service resolves the ARN FORM of a requested certificate (pinned in
+/// `all/certificate_resolution_and_redirect_protocol.rs`) and not the certificate itself
+/// against ACM, and the rule under test is about how MANY certificates a protocol takes.
 const CERT_ONE: &str = "arn:aws:acm:us-west-2:000000000000:certificate/11111111-1111-1111-1111-111111111111";
 
 /// A second certificate ARN, for the "more than one" rows.

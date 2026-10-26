@@ -11,9 +11,10 @@
 //! The rule is stored on its listener's record, which is the one rule store
 //! `DescribeRules` walks, so a rule this operation persists is the rule that read
 //! reports; releasing the listener releases its rules with it. An action may forward
-//! only to a target group that exists (`TargetGroupNotFoundException`), and what one
-//! load balancer's rules grow to is bounded by
-//! [`crate::state::RULES_PER_LOAD_BALANCER`] (`TooManyRulesException`).
+//! only to a target group that exists (`TargetGroupNotFoundException`), may not redirect
+//! to cleartext HTTP from a listener that terminates TLS
+//! (`InvalidLoadBalancerActionException`), and what one load balancer's rules grow to is
+//! bounded by [`crate::state::RULES_PER_LOAD_BALANCER`] (`TooManyRulesException`).
 //!
 //! ## Shape of an operation
 //!
@@ -243,6 +244,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let load_balancer_arn = listener.load_balancer_arn.clone();
+        // A redirect action is judged against the protocol of the LISTENER it is attached
+        // to, so a rule on a listener that terminates TLS cannot redirect to cleartext;
+        // the same action on a listener that does not is admitted.
+        if crate::state::downgrades_to_http(listener.protocol.as_deref(), &input.actions) {
+            return Err(
+                CreateRuleErrorModeled::InvalidLoadBalancerActionException(
+                    InvalidLoadBalancerActionException {
+                        message: Some(crate::state::HTTPS_TO_HTTP_REDIRECT_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
         // "A listener can't have multiple rules with the same priority." The priority
         // lives in its listener's own namespace: the same number on another listener is
         // free.

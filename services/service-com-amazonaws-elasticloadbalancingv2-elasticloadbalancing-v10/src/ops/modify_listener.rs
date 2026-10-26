@@ -18,7 +18,9 @@
 //!
 //! Moving the listener to a port its load balancer already listens on is
 //! `DuplicateListenerException`, and a default action may forward only to a target group
-//! that exists.
+//! that exists. A certificate ARN that names no certificate is
+//! `CertificateNotFoundException`, and a default action redirecting to cleartext HTTP on
+//! a listener left terminating TLS is `InvalidLoadBalancerActionException`.
 //!
 //! ## Shape of an operation
 //!
@@ -266,6 +268,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         apply_certificate_rules(&mut updated, input.certificates.as_deref())?;
 
+        // A redirect action is judged against the protocol of the listener it is attached
+        // to — here the protocol this call LEAVES the listener on, since a request may
+        // change both at once — so a listener that terminates TLS cannot be left with a
+        // default action redirecting to cleartext.
+        if crate::state::downgrades_to_http(updated.protocol.as_deref(), &updated.default_actions) {
+            return Err(
+                ModifyListenerErrorModeled::InvalidLoadBalancerActionException(
+                    InvalidLoadBalancerActionException {
+                        message: Some(crate::state::HTTPS_TO_HTTP_REDIRECT_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // One listener per port on a load balancer: moving this one onto a port another
         // of its load balancer's listeners holds is the modelled duplicate.
         if updated.port != stored.port {
@@ -382,6 +399,17 @@ fn apply_certificate_rules(
                 "CertificateArn must be set on the certificate of {named}"
             )));
         };
+        // The certificate is RESOLVED before it replaces the stored one: a value that is
+        // no certificate ARN names no certificate of the account, so the listener keeps
+        // the certificate it had.
+        if !crate::state::names_a_certificate(arn) {
+            return Err(ModifyListenerErrorModeled::CertificateNotFoundException(
+                CertificateNotFoundException {
+                    message: Some(crate::state::certificate_not_found_message(arn)),
+                },
+            )
+            .into());
+        }
         listener.certificate_arns = vec![arn.to_string()];
     }
     if listener.certificate_arns.is_empty() {
