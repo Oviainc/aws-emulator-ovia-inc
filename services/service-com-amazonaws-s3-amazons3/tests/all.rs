@@ -113,6 +113,8 @@ mod object_retention;
 mod object_restore;
 #[path = "all/object_storage.rs"]
 mod object_storage;
+#[path = "all/object_tag_set_removal.rs"]
+mod object_tag_set_removal;
 #[path = "all/object_tagging.rs"]
 mod object_tagging;
 #[path = "all/object_tagging_on_put.rs"]

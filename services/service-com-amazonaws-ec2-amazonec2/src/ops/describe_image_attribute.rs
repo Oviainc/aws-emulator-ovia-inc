@@ -1,15 +1,39 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeImageAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeImageAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports ONE attribute of one stored AMI, read off the image
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::images`] holds — this is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeImageAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What it does
+//!
+//! "Describes the specified attribute of the specified AMI. You can specify only one
+//! attribute at a time", so the response carries the ONE member `Attribute` names beside
+//! the image's own id, and every other member is left out. Each value is read off the
+//! stored [`Image`] member of the same name — the shape `DescribeImages` reports — so an
+//! attribute read and an image read can never disagree about the same AMI, and nothing is
+//! recomputed here.
+//!
+//! A reporting operation: it writes nothing at all, an AMI having no clock-owed transition
+//! in this slice.
+//!
+//! Four facts decide what it answers:
+//!
+//! 1. The AMI is resolved FIRST, because every member of the response is a fact of that
+//!    image, and by THIS operation's own validator: an image id it cannot resolve is
+//!    answered `InvalidAMIID.Malformed` whether or not the value reads like the long
+//!    `ami-` id form, which is what the recorded unit `ec2-image-describes#task#4` pins for
+//!    this operation (see [`require_describable_image`], which records why the shared
+//!    [`crate::state::require_visible_image`] — the malformed-before-not-found helper the
+//!    describes use — is NOT what answers here).
+//! 2. An `Attribute` outside the modelled catalog is refused `InvalidParameterValue`, the
+//!    way every other attribute report of this crate refuses one.
+//! 3. "The blockDeviceMapping attribute is deprecated. Using this attribute returns the
+//!    Client.AuthFailure error" (`Attribute`), so that one attribute is refused
+//!    ([`image_attribute_deprecated`]) rather than served, and the modelled
+//!    `BlockDeviceMappings` member is therefore never reported.
+//! 4. `DryRun` sits after everything that would refuse the request, because the flag asks
+//!    whether the request WOULD have succeeded.
 //!
 //! ## Shape of an operation
 //!
@@ -100,6 +124,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    ComAmazonawsEc2Amazonec2State, EXECUTABLE_BY_ALL, INVALID_AMI_ID_MALFORMED,
+    dry_run_operation, image_is_visible, internal_error, invalid_parameter_value,
+    require_service_state,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -168,18 +197,236 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeImageAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeImageAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeImageAttribute"))
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        let state = require_service_state(&*self.engine)?;
+        // A read, and only a read: the guard is taken to report what the store holds, an
+        // AMI having no clock-owed transition in this slice, so two calls answer the same
+        // attribute and a read cannot change what a later caller sees.
+        let store = state.lock();
+
+        // "Describes the specified attribute of the specified AMI": the image first, since
+        // every member of the response is a fact of it, through this operation's own
+        // validator.
+        let image = require_describable_image(&store, &input.image_id)?;
+
+        // "You can specify only one attribute at a time" — `Attribute` is one
+        // `ImageAttributeName`, and the response carries only the member it names. The
+        // modelled enum constraint is already refused by the request walk before this
+        // handler runs, so this is the same belt-and-braces check `DescribeVolumeAttribute`
+        // keeps: without it an attribute no result member corresponds to would be answered
+        // with a response carrying no attribute at all.
+        let attribute = input.attribute.as_str();
+        if !IMAGE_ATTRIBUTE_NAME_VALUES.contains(&attribute) {
+            return Err(invalid_parameter_value(format!(
+                "Value ({attribute}) for parameter attribute is invalid. \
+                 Unknown attribute."
+            )));
+        }
+
+        // "The blockDeviceMapping attribute is deprecated. Using this attribute returns the
+        // Client.AuthFailure error. To get information about the block device mappings for
+        // an AMI, describe the image instead" (`Attribute`): the one attribute of the
+        // catalog this operation refuses instead of serving, which is why the modelled
+        // `BlockDeviceMappings` member of the result is never reported.
+        if attribute == IMAGE_ATTRIBUTE_BLOCK_DEVICE_MAPPING {
+            return Err(image_attribute_deprecated(attribute));
+        }
+
+        // `DryRun` sits AFTER everything that would refuse the request: the flag asks
+        // whether the request WOULD have succeeded, so one that would have been refused is
+        // refused with that reason instead.
+        if input.dry_run.unwrap_or(false) {
+            return Err(dry_run_operation());
+        }
+
+        reported_attribute(attribute, image).ok_or_else(|| {
+            // Unreachable: the catalog check above admits only the attributes
+            // `reported_attribute` answers, and the deprecated one is refused before it.
+            internal_error(format!(
+                "'{attribute}' is an AMI attribute this emulator holds no value for"
+            ))
+        })
     }
+}
+
+/// The `ImageAttributeName` member AWS no longer serves: "The blockDeviceMapping attribute
+/// is deprecated" (`DescribeImageAttributeRequest$Attribute`), one of the values
+/// [`IMAGE_ATTRIBUTE_NAME_VALUES`] carries.
+const IMAGE_ATTRIBUTE_BLOCK_DEVICE_MAPPING: &str = "blockDeviceMapping";
+
+/// "The name of the group" a PUBLIC image's launch permission names
+/// (`LaunchPermission$Group`): the `PermissionGroup` enum's only member (the generated
+/// catalog [`PERMISSION_GROUP_VALUES`]), which is the same term `DescribeImages` selects
+/// public AMIs with through its `ExecutableUsers` member. DEFINED as that one
+/// ([`crate::state::EXECUTABLE_BY_ALL`]), so the group a launch permission reports and the
+/// term that selects on it cannot drift apart.
+const LAUNCH_PERMISSION_GROUP_ALL: &str = EXECUTABLE_BY_ALL;
+
+/// The code EC2 answers for an AMI attribute it no longer serves: "The blockDeviceMapping
+/// attribute is deprecated. Using this attribute returns the Client.AuthFailure error"
+/// (`DescribeImageAttributeRequest$Attribute`).
+///
+/// The `Client.`-prefixed spelling of EC2's authorization refusal, which is the spelling the
+/// model names for THIS refusal, rather than the bare code an unauthorized RESOURCE is
+/// refused with ([`crate::scaffolded::Scaffolded::auth_failure`]).
+const CLIENT_AUTH_FAILURE: &str = "Client.AuthFailure";
+
+/// Refuse an AMI attribute the service no longer serves: HTTP 400 [`CLIENT_AUTH_FAILURE`].
+///
+/// `blockDeviceMapping` is the one attribute of an AMI this is answered for, and the message
+/// names the attribute the request asked for together with the read that replaces it, as the
+/// member documents it: "To get information about the block device mappings for an AMI,
+/// describe the image instead" (`DescribeImageAttributeRequest$Attribute`).
+///
+/// WHERE THE WORDING COMES FROM: the model's own sentence about this attribute, which is the
+/// only statement of this refusal available — no unit of the corpus this crate replays
+/// exercises it, so there is no recorded message to match. The CODE is the one that same
+/// sentence states; the variable part of the message is the attribute the request sent. A
+/// later fixer who finds a recording of it should align the text with that recording and cite
+/// it here.
+///
+/// It lives in this file rather than in `crate::state` because `DescribeImageAttribute` is
+/// the only operation that answers it — the same reason
+/// `crate::ops::copy_fpga_image::unresolvable_source_fpga_image_id` lives in its own
+/// operation's file.
+fn image_attribute_deprecated<E>(attribute: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        CLIENT_AUTH_FAILURE,
+        400,
+        format!(
+            "The {attribute} attribute is deprecated. To get information about the block \
+             device mappings for an AMI, describe the image instead"
+        ),
+    )
+}
+
+/// Refuse an image id THIS operation cannot resolve: HTTP 400 `InvalidAMIID.Malformed`
+/// ([`crate::state::INVALID_AMI_ID_MALFORMED`], the one code every AMI-id refusal of this
+/// service names for a value it cannot read as an id).
+///
+/// The same CODE as the crate's syntax-only [`crate::state::invalid_ami_id_malformed`] in a
+/// different WORDING: EC2's per-operation validators do not agree about an id they cannot
+/// resolve, and this operation answers "The image ID '<id>' is malformed" where a describe of
+/// the account's images answers "Invalid id: '<id>'". It lives in this file, beside the one
+/// caller that answers it, for the same reason
+/// `crate::ops::copy_fpga_image::unresolvable_source_fpga_image_id` does — the wording
+/// belongs to the operation, not to the id — and the message is built from the request's own
+/// id, which is the only part of it that varies.
+fn image_id_is_malformed<E>(image_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_AMI_ID_MALFORMED,
+        400,
+        format!("The image ID '{image_id}' is malformed"),
+    )
+}
+
+/// Resolve the AMI `DescribeImageAttribute` is asked about, or refuse the id: HTTP 400
+/// `InvalidAMIID.Malformed`.
+///
+/// The images this account can be told about are the ones it can see at all — "public
+/// images, private images that you own, and private images owned by other Amazon Web
+/// Services accounts for which you have explicit launch permissions" (`DescribeImages`) —
+/// read through the crate's one definition of that question
+/// ([`crate::state::image_is_visible`]), so this operation and the describes agree about
+/// which AMIs exist for a caller.
+///
+/// EC2's per-operation validators do NOT agree about an image id they cannot resolve, and
+/// this operation's is the strict one: it checks the id against the image id space and
+/// answers `InvalidAMIID.Malformed` for anything it does not recognise as an id naming an
+/// image of this account — including a value in the long `ami-` form that names none. The
+/// recorded unit `ec2-image-describes#task#4` probes an id of exactly that shape and
+/// `DescribeImageAttribute` answers `InvalidAMIID.Malformed`, "The image ID '<id>' is
+/// malformed", where `DescribeImages` answers the same id `InvalidAMIID.NotFound`. So the
+/// choice belongs to the OPERATION rather than to the id, which is why this lives here and
+/// not in [`crate::state::require_visible_image`] — the shared malformed-before-not-found
+/// helper the operations that DO draw the distinction keep using. The refusal itself is
+/// [`image_id_is_malformed`] above, which records where its wording comes from.
+///
+/// The resolved image is handed back, so the handler reads it ONCE rather than looking the
+/// same id up again behind an unreachable branch.
+fn require_describable_image<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    image_id: &str,
+) -> Result<&'store Image, crate::scaffolded::Scaffolded<E>> {
+    store
+        .images
+        .get(image_id)
+        .filter(|image| image_is_visible(image, ::engine::emulator_account_id()))
+        .ok_or_else(|| image_id_is_malformed(image_id))
+}
+
+/// "The launch permissions" of `image` (`ImageAttribute$LaunchPermissions`), out of what the
+/// store holds about it.
+///
+/// "The value is `true` if this image has public launch permissions" (`Image$Public`) is the
+/// one launch permission this slice records, and a public image's permission is the one AWS
+/// reports as a GROUP — the `PermissionGroup` enum's single member
+/// ([`LAUNCH_PERMISSION_GROUP_ALL`]). An explicit per-account permission is
+/// granted through `ModifyImageAttribute`, which is still a scaffold, so no stored image
+/// carries one and none can be reported for one; that is the same reading `DescribeImages`'
+/// `ExecutableUsers` matcher gives the same store.
+fn launch_permissions(image: &Image) -> Vec<LaunchPermission> {
+    if !image.public.unwrap_or(false) {
+        return Vec::new();
+    }
+    vec![LaunchPermission {
+        group: Some(LAUNCH_PERMISSION_GROUP_ALL.to_string()),
+        ..LaunchPermission::default()
+    }]
+}
+
+/// `image` as the result of asking for its `attribute`: the ONE member that attribute names,
+/// read off the stored image, beside the image's own id. `None` for an attribute no member
+/// of the result corresponds to, which the handler's catalog check has already refused.
+///
+/// Each arm names the `ImageAttributeName` value the model publishes
+/// ([`IMAGE_ATTRIBUTE_NAME_VALUES`]) and reads the `Image` member AWS documents that
+/// attribute as, so the mapping from attribute to value lives in one place:
+///
+/// ```text
+/// smithy_query(query="shape",shape="ImageAttributeName,Image",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// The member asked about is always REPORTED, carrying no `Value` when the image holds none
+/// — an image with no kernel is an image whose kernel attribute has no value, which is a
+/// different answer from "this AMI has no such attribute" — and a list attribute is
+/// reported as the list the image carries, empty or not, the way `DescribeVolumeAttribute`
+/// reports a volume's product codes.
+fn reported_attribute(attribute: &str, image: &Image) -> Option<DescribeImageAttributeOutput> {
+    let text = |value: Option<&String>| {
+        Some(AttributeValue {
+            value: value.cloned(),
+        })
+    };
+    let mut reported = DescribeImageAttributeOutput {
+        image_id: image.image_id.clone(),
+        ..DescribeImageAttributeOutput::default()
+    };
+    match attribute {
+        "description" => reported.description = text(image.description.as_ref()),
+        "kernel" => reported.kernel_id = text(image.kernel_id.as_ref()),
+        "ramdisk" => reported.ramdisk_id = text(image.ramdisk_id.as_ref()),
+        "sriovNetSupport" => reported.sriov_net_support = text(image.sriov_net_support.as_ref()),
+        "bootMode" => reported.boot_mode = text(image.boot_mode.as_ref()),
+        "tpmSupport" => reported.tpm_support = text(image.tpm_support.as_ref()),
+        "imdsSupport" => reported.imds_support = text(image.imds_support.as_ref()),
+        "lastLaunchedTime" => reported.last_launched_time = text(image.last_launched_time.as_ref()),
+        "deregistrationProtection" => {
+            reported.deregistration_protection = text(image.deregistration_protection.as_ref());
+        }
+        // "Base64 representation of the non-volatile UEFI variable store"
+        // (`ImageAttribute$UefiData`): a value only a register of an AMI can give it, and
+        // `RegisterImage` is still a scaffold, so no stored image holds one and the
+        // attribute is reported with no value rather than with one this emulator invented.
+        "uefiData" => reported.uefi_data = Some(AttributeValue::default()),
+        "launchPermission" => reported.launch_permissions = Some(launch_permissions(image)),
+        "productCodes" => {
+            reported.product_codes = Some(image.product_codes.clone().unwrap_or_default());
+        }
+        _ => return None,
+    }
+    Some(reported)
 }

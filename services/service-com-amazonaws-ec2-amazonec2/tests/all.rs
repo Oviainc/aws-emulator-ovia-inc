@@ -171,6 +171,13 @@ mod fleet_instances;
 mod fpga_image_tasks_and_volume_io;
 #[path = "all/get_password_data.rs"]
 mod get_password_data;
+// Which ONE attribute of a stored AMI `DescribeImageAttribute` reports, and what it
+// refuses. Declared HERE rather than in sorted position or at the tail, for the reason the
+// header note gives: both the sorted `image_*` neighbourhood and the tail of this list are
+// where concurrent ec2 landings insert their two lines, and these two have already lost
+// several serialized squash merges there.
+#[path = "all/image_attributes.rs"]
+mod image_attributes;
 #[path = "all/host_reservation_offerings.rs"]
 mod host_reservation_offerings;
 #[path = "all/image_references.rs"]

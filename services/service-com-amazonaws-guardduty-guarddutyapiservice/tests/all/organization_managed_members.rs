@@ -2,7 +2,9 @@
 
 //! The organization precondition on the operations that take a member relationship
 //! away from a GuardDuty administrator: `DisassociateMembers` and
-//! `StopMonitoringMembers`.
+//! `StopMonitoringMembers`. `DeleteMembers` carries the same precondition and is
+//! covered by the suite that owns it (`member_deletion`), over the table and the
+//! message this one exports.
 //!
 //! Every request goes over the wire through `MultiServiceRouter::dispatch`, the same
 //! path the production router uses, so these tests exercise routing, restJson1
@@ -70,7 +72,8 @@ const OTHER_REGION: &str = "us-west-2";
 /// relationship of the accounts ALREADY in it. Only `ALL` auto-enables those, so
 /// only `ALL` refuses a call that would take one of them away: `NEW` covers the
 /// accounts that join from then on, and `NONE` none at all.
-const AUTO_ENABLE_MEMBERS: [(&str, bool); 3] = [("NONE", false), ("NEW", false), ("ALL", true)];
+pub(crate) const AUTO_ENABLE_MEMBERS: [(&str, bool); 3] =
+    [("NONE", false), ("NEW", false), ("ALL", true)];
 
 /// The operations the precondition spans.
 #[derive(Debug, Clone, Copy)]
@@ -114,7 +117,7 @@ impl Operation {
 
 /// The message a call that would take a member relationship away is refused with
 /// while the organization auto-enables GuardDuty for all of its accounts.
-fn organization_managed(action: &str) -> String {
+pub(crate) fn organization_managed(action: &str) -> String {
     format!(
         "The request is rejected because the current account cannot {action} the given member account ID while autoEnableOrganizationMembers is set to ALL for the organization. Remove the account from the organization first."
     )

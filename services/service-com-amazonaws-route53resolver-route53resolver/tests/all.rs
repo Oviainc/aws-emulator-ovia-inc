@@ -27,6 +27,8 @@ mod harness;
 mod outpost_resolvers;
 #[path = "all/resolver_dnssec_configs.rs"]
 mod resolver_dnssec_configs;
+#[path = "all/resolver_endpoint_ip_address_association.rs"]
+mod resolver_endpoint_ip_address_association;
 #[path = "all/resolver_endpoints.rs"]
 mod resolver_endpoints;
 #[path = "all/resolver_rule_deletion.rs"]

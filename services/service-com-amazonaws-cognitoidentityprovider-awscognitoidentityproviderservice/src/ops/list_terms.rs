@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTerms
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTerms`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTerms::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a page of the terms documents STORED in one user pool, every app
+//! client's together, as the summary view `TermsDescriptionType` declares. The
+//! page is taken in the pool's stable `TermsId` order, holds at most
+//! `MaxResults` entries, and carries a `NextToken` the next page resumes at
+//! while documents remain. An unknown pool is a `ResourceNotFoundException`, a
+//! `NextToken` from no page of this listing an `InvalidParameterException`.
+//! This operation only reports: it stores nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -169,20 +167,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTerms` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTermsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTerms"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let guard = state.lock();
+        let pool = guard
+            .pool(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // "all terms documents for the requested user pool" (`ListTerms`), so
+        // every app client's documents are listed together, keyed by their
+        // minted `TermsId` in ascending order — the stable order the page token
+        // indexes into.
+        let terms_ids: Vec<String> = pool.terms.keys().cloned().collect();
+
+        // The listing a page token belongs to: this operation over the terms
+        // documents of this pool, so a token one pool's listing issued names no
+        // page of another pool's listing or of another operation's.
+        let scope = format!("{}|{}", Self::NAME, pool.id);
+        let page = crate::state::page_of(
+            &scope,
+            &terms_ids,
+            input.max_results,
+            input.next_token.as_deref(),
+        )
+        .ok_or_else(invalid_next_token)?;
+
+        // Rendered from the STORED documents: this read changes nothing.
+        let terms: Vec<TermsDescriptionType> = page
+            .keys
+            .iter()
+            .filter_map(|terms_id| pool.terms.get(terms_id))
+            .map(crate::state::Terms::to_terms_description_type)
+            .collect();
+
+        // `Terms` is a REQUIRED output member, so it is present and empty when
+        // the pool holds no terms documents, which is what a paginating client
+        // reads.
+        Ok(ListTermsOutput {
+            terms,
+            next_token: page.next_token,
+        })
     }
 }
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> ListTermsError {
+    ListTermsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException` for a `NextToken` that names no
+/// page of this listing.
+fn invalid_next_token() -> ListTermsError {
+    ListTermsErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(
+            "NextToken is not a pagination token this operation issued for this user pool"
+                .to_string(),
+        ),
+        // `reasonCode` is AWS's own classification of the bad parameter and this
+        // service's model documents no value for it, so nothing is invented here.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> ListTermsError {
+    ListTermsErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
+}
+

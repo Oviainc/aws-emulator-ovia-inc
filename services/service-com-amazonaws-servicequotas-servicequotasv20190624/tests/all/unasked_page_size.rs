@@ -28,10 +28,12 @@ use service_com_amazonaws_servicequotas_servicequotasv20190624::state::MAX_PAGE_
 
 use crate::quota_workflow::{client, emulator, walk_pages, Client};
 
-/// Comfortably past `crate::state::REQUEST_DECISION_DELAY` (500 ms), so a request made
-/// before this wait is due for its decision afterwards and two reads of the history
-/// are comparable record for record.
-const PAST_DECISION: Duration = Duration::from_millis(1_200);
+/// Comfortably past BOTH steps the clock owes a quota increase request
+/// (`crate::state::SUPPORT_CASE_OPEN_DELAY`, then
+/// `crate::state::REQUEST_DECISION_DELAY` once its support case is open), so a request
+/// made before this wait has settled afterwards and two reads of the history are
+/// comparable record for record.
+const PAST_DECISION: Duration = Duration::from_millis(1_800);
 
 /// The account-wide request history, whose name is too long to repeat in every row.
 const HISTORY: &str = "ListRequestedServiceQuotaChangeHistory";

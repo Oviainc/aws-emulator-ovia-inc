@@ -185,8 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         // A DELETED image set's pixel data went with it, so what is absent is the image
-        // set itself, not one frame of it.
-        if image_set.latest_version.image_set_state == crate::state::ImageSetState::Deleted {
+        // set itself, not one frame of it — decided by the one helper that owns the rule
+        // ([`crate::state::ImageSet::is_deleted`]), as the sibling `GetImageSetMetadata`
+        // decides the identical question.
+        if image_set.is_deleted() {
             return Err(GetImageFrameErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::IMAGE_SET_NOT_FOUND_MESSAGE.to_string(),
@@ -217,10 +219,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instant: that is the event `lastAccessedAt` reports, and it is recorded on the
         // image SET because content belongs to the image set rather than to one version
         // of it. Reached again mutably only now, past every refusal, so a call that
-        // served nothing recorded nothing.
+        // served nothing recorded nothing — and reached through the REGION this request
+        // was addressed to, by the same id-keyed accessor the read above used, so the
+        // record written is the one that was read.
         if let Some(image_set) = store
-            .datastores
-            .get_mut(&input.datastore_id)
+            .datastore_in_mut(&region, &input.datastore_id)
             .and_then(|datastore| datastore.image_sets.get_mut(&input.image_set_id))
         {
             image_set.record_access(now);

@@ -17,8 +17,9 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     FirewallConfig, FirewallDomainList, FirewallDomainListMetadata, InvalidRequestException,
-    IpAddressResponse, OutpostResolver, ResolverDnssecConfig, ResolverEndpoint, ResolverRule,
-    ResolverRuleAssociation, ResourceInUseException, ResourceNotFoundException, Tag, TargetAddress,
+    IpAddressResponse, IpAddressUpdate, LimitExceededException, OutpostResolver,
+    ResolverDnssecConfig, ResolverEndpoint, ResolverRule, ResolverRuleAssociation,
+    ResourceExistsException, ResourceInUseException, ResourceNotFoundException, Tag, TargetAddress,
     ValidationException,
 };
 
@@ -64,6 +65,18 @@ pub const OUTPOST_RESOLVER_INSTANCE_COUNT_DEFAULT: i32 = 4;
 pub const IP_STATUS_CREATING: &str = "CREATING";
 pub const IP_STATUS_ATTACHED: &str = "ATTACHED";
 pub const IP_STATUS_UPDATING: &str = "UPDATING";
+
+/// How many IP addresses one Resolver endpoint may hold, from the model's
+/// `IpAddressesRequest` length (2..20,
+/// `smithy_query(query="shape",shape="IpAddressesRequest")`): the list
+/// `CreateResolverEndpoint` takes is the endpoint's address set, so the bounds
+/// the model puts on that list are the bounds the set keeps afterwards. The
+/// operations that add and remove one address at a time enforce them here,
+/// because no modelled constraint covers an endpoint that already exists.
+pub const MIN_ENDPOINT_IP_ADDRESSES: usize = 2;
+
+/// See [`MIN_ENDPOINT_IP_ADDRESSES`].
+pub const MAX_ENDPOINT_IP_ADDRESSES: usize = 20;
 
 /// `ResolverEndpointDirection` value for an endpoint that "forwards DNS queries
 /// from the DNS service for a VPC to your network", from the model's enum
@@ -174,6 +187,18 @@ const PAGE_TOKEN_DOMAIN: &str = "route53resolver/page-token/v1";
 /// no message text, so this code comes from the recorded responses of the
 /// endpoint operations that raise `ResourceNotFoundException`.
 pub const RSLVR_CODE_ENDPOINT_NOT_FOUND: &str = "RSLVR-00501";
+
+/// The Route 53 Resolver service error code reported when a request asks a
+/// Resolver endpoint to give up an IP address it is not allowed to lose,
+/// because the endpoint would be left with fewer than the fewest addresses one
+/// may hold.
+///
+/// Carried for the same reason as [`RSLVR_CODE_ENDPOINT_NOT_FOUND`]: the HTTP
+/// status (400) and the exception shape name together do not say which Resolver
+/// fault occurred, and the model states no message text, so this code comes
+/// from the recorded responses of the operation that raises
+/// `InvalidRequestException` for it.
+pub const RSLVR_CODE_ENDPOINT_IP_BELOW_MINIMUM: &str = "RSLVR-00505";
 
 /// The Route 53 Resolver service error code reported when a request asks for a
 /// rule of a type Resolver answers itself, yet still names where the rule should
@@ -374,6 +399,94 @@ pub fn resolver_endpoint_not_found(resolver_endpoint_id: &str) -> ResourceNotFou
             &format!(r#"Resolver endpoint with ID "{resolver_endpoint_id}" does not exist"#),
         )),
         resource_type: Some(RESOURCE_TYPE_RESOLVER_ENDPOINT.to_string()),
+    }
+}
+
+/// `ResourceNotFoundException$ResourceType` and
+/// `ResourceExistsException$ResourceType` for one IP address of a Resolver
+/// endpoint: the modelled shape name of the resource, as for
+/// [`RESOURCE_TYPE_RESOLVER_ENDPOINT`].
+pub const RESOURCE_TYPE_ENDPOINT_IP_ADDRESS: &str = "IpAddressResponse";
+
+/// The `ResourceNotFoundException` an endpoint IP-address operation answers for
+/// an address the named endpoint does not hold.
+///
+/// Built here so `AssociateResolverEndpointIpAddress`,
+/// `DisassociateResolverEndpointIpAddress` and `UpdateResolverEndpoint` cannot
+/// drift apart. `address` is how the message names the address that was asked
+/// for, from [`describe_requested_ip_address`].
+pub fn endpoint_ip_address_not_found(
+    resolver_endpoint_id: &str,
+    address: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Resolver endpoint '{resolver_endpoint_id}' has no IP address {address}"
+        )),
+        resource_type: Some(RESOURCE_TYPE_ENDPOINT_IP_ADDRESS.to_string()),
+    }
+}
+
+/// How a message names the IP address an `IpAddressUpdate` pointed at: its
+/// `IpId` when the request carried one ("Only when removing an IP address from
+/// a Resolver endpoint: The ID of the IP address that you want to remove"),
+/// otherwise the address literal, otherwise the subnet that holds it.
+pub fn describe_requested_ip_address(requested: &IpAddressUpdate) -> String {
+    if let Some(ip_id) = &requested.ip_id {
+        return format!("with ID '{ip_id}'");
+    }
+    if let Some(ip) = &requested.ip {
+        return format!("'{ip}'");
+    }
+    if let Some(ipv6) = &requested.ipv6 {
+        return format!("'{ipv6}'");
+    }
+    match &requested.subnet_id {
+        Some(subnet_id) => format!("in subnet '{subnet_id}'"),
+        None => "to remove".to_string(),
+    }
+}
+
+/// The `ResourceExistsException` `AssociateResolverEndpointIpAddress` answers
+/// for an address the endpoint already holds: "The resource that you tried to
+/// create already exists."
+pub fn endpoint_ip_address_exists(
+    resolver_endpoint_id: &str,
+    address: &str,
+) -> ResourceExistsException {
+    ResourceExistsException {
+        message: Some(format!(
+            "Resolver endpoint '{resolver_endpoint_id}' already has IP address {address}"
+        )),
+        resource_type: Some(RESOURCE_TYPE_ENDPOINT_IP_ADDRESS.to_string()),
+    }
+}
+
+/// The `LimitExceededException` `AssociateResolverEndpointIpAddress` answers for
+/// an endpoint that already holds [`MAX_ENDPOINT_IP_ADDRESSES`] addresses.
+pub fn endpoint_ip_address_limit_exceeded() -> LimitExceededException {
+    LimitExceededException {
+        message: Some(format!(
+            "A Resolver endpoint can have at most {MAX_ENDPOINT_IP_ADDRESSES} IP addresses"
+        )),
+        resource_type: Some(RESOURCE_TYPE_RESOLVER_ENDPOINT.to_string()),
+    }
+}
+
+/// The `InvalidRequestException` `DisassociateResolverEndpointIpAddress`
+/// answers for a removal that would leave the endpoint with fewer than
+/// [`MIN_ENDPOINT_IP_ADDRESSES`] addresses.
+///
+/// The sentence states the minimum and nothing from the request, so neither the
+/// endpoint nor the address that was asked for is echoed back.
+pub fn endpoint_ip_address_below_minimum() -> InvalidRequestException {
+    InvalidRequestException {
+        message: Some(rslvr_message(
+            RSLVR_CODE_ENDPOINT_IP_BELOW_MINIMUM,
+            &format!(
+                "Can only remove IP from resolver endpoints with more than {MIN_ENDPOINT_IP_ADDRESSES} IP addresses"
+            ),
+        )),
     }
 }
 
@@ -911,6 +1024,39 @@ impl IpAddressRecord {
         } else {
             IP_STATUS_ATTACHED
         }
+    }
+
+    /// Whether this is the address an `IpAddressUpdate` NAMES, as
+    /// `DisassociateResolverEndpointIpAddress` reads one: its `IpId` identifies
+    /// an address on its own, and otherwise the address literal does, narrowed
+    /// by `SubnetId` when the request carries one. A request that carries only a
+    /// subnet names the address stored in that subnet.
+    pub fn is_named_by(&self, requested: &IpAddressUpdate) -> bool {
+        if let Some(ip_id) = &requested.ip_id {
+            return &self.ip_id == ip_id;
+        }
+        let subnet_matches = requested
+            .subnet_id
+            .as_ref()
+            .is_none_or(|subnet_id| &self.subnet_id == subnet_id);
+        if let Some(ip) = &requested.ip {
+            return subnet_matches && self.ip.as_ref() == Some(ip);
+        }
+        if let Some(ipv6) = &requested.ipv6 {
+            return subnet_matches && self.ipv6.as_ref() == Some(ipv6);
+        }
+        requested.subnet_id.is_some() && subnet_matches
+    }
+
+    /// Whether this stored address IS the address an `IpAddressUpdate` carries,
+    /// which is what `AssociateResolverEndpointIpAddress` consults before adding
+    /// one: an IP address is unique within the VPC the endpoint is in, so one
+    /// the endpoint already holds cannot be added again. Unlike
+    /// [`Self::is_named_by`] the subnet alone decides nothing — an endpoint may
+    /// hold several addresses in one subnet.
+    pub fn holds_same_address(&self, requested: &IpAddressUpdate) -> bool {
+        (requested.ip.is_some() && self.ip == requested.ip)
+            || (requested.ipv6.is_some() && self.ipv6 == requested.ipv6)
     }
 
     /// Project the record onto the modelled `IpAddressResponse`.

@@ -248,6 +248,10 @@ pub struct ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// cursor a stable boundary. Bounded at [`MAX_EXCLUSION_WINDOWS_PER_SLO`] per SLO by the
     /// only writer, and the entry is dropped once an SLO holds no windows — holding none and
     /// holding an empty set are the same state, exactly as for `tags`.
+    ///
+    /// Every STORED window carries a concrete `StartTime`, whether or not the addition stated
+    /// one ([`stored_exclusion_window`]), so the set a read reports is a set of windows that
+    /// each start at a known instant.
     pub exclusion_windows: BTreeMap<String, Vec<ExclusionWindow>>,
     /// This account's grouping configuration, or `None` while none is configured.
     ///
@@ -1690,6 +1694,10 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     ///
     /// The whole update is applied to a COPY of the set and stored only once every window has
     /// been applied, so an SLO that earns a failure is left exactly as it was.
+    ///
+    /// Every window in `add` must already be in the form the service stores
+    /// ([`stored_exclusion_window`]): the server-defaulted members are settled once per call,
+    /// so every SLO one request names gains the same window.
     pub fn update_exclusion_windows(
         &mut self,
         id: &str,
@@ -1733,6 +1741,33 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     }
 }
 
+/// `window` in the form this service STORES it: every member as the addition stated it, and a
+/// `StartTime` the addition omitted settled to the instant the call is served.
+///
+/// `ExclusionWindow.StartTime` is optional and "defaults to current time if not specified"
+/// (`smithy_query(query="doc", shape="ExclusionWindow", member="StartTime")`), so an
+/// omission is a request for the time of the call rather than for a window with no start: the
+/// stored window — and so every later read of it — reports when the exclusion begins, and the
+/// period it excludes is anchored at that instant.
+///
+/// The defaulted instant is the whole SECOND the call was served in, which is the resolution
+/// `StartTime` crosses the wire at (a `Timestamp` the JSON protocols carry as epoch seconds)
+/// and finer than any `Window.DurationUnit` the model admits. That keeps the set a
+/// `ListServiceLevelObjectiveExclusionWindows` reports a set a `RemoveExclusionWindows` can
+/// name back member for member, which is the identity rule [`same_exclusion_window`] applies.
+/// A STATED `StartTime` is stored exactly as sent — the default settles an omission, it never
+/// re-times an instant the caller chose.
+pub fn stored_exclusion_window(window: &ExclusionWindow, served_at: DateTime) -> ExclusionWindow {
+    ExclusionWindow {
+        start_time: Some(
+            window
+                .start_time
+                .unwrap_or_else(|| DateTime::from_secs(served_at.secs())),
+        ),
+        ..window.clone()
+    }
+}
+
 /// Whether two exclusion windows are the same window: the configuration a removal names one
 /// by, member for member.
 ///
@@ -1741,7 +1776,9 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
 /// (`Reason`). An omitted optional member is part of the configuration too \u2014 it matches an
 /// omission, not an arbitrary value \u2014 so the window a caller added is named by exactly the
 /// configuration they sent, and the set a `ListServiceLevelObjectiveExclusionWindows` reports
-/// is the set a `RemoveExclusionWindows` can address. `Window` and `RecurrenceRule` carry no
+/// is the set a `RemoveExclusionWindows` can address — and since every stored window carries
+/// the `StartTime` it was added at ([`stored_exclusion_window`]), a removal names the window
+/// it means by the start time the read reported for it. `Window` and `RecurrenceRule` carry no
 /// `PartialEq`, so those members are compared out, as [`same_dependency`] is; `StartTime` uses
 /// `DateTime`'s own, which compares the seconds and the sub-second fields \u2014 exactly "the same
 /// instant at the resolution a `Timestamp` carries", and never the float seconds, where two

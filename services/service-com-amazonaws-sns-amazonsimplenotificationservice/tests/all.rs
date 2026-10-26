@@ -20,6 +20,12 @@ mod data_protection_policy;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 
+#[path = "all/fifo_topic_deduplication_attribute.rs"]
+mod fifo_topic_deduplication_attribute;
+
+#[path = "all/filter_policy_parse_diagnostic.rs"]
+mod filter_policy_parse_diagnostic;
+
 #[path = "all/list_subscriptions.rs"]
 mod list_subscriptions;
 
@@ -34,6 +40,9 @@ mod platform_endpoint_deletion;
 
 #[path = "all/publish_batch.rs"]
 mod publish_batch;
+
+#[path = "all/publish_destination_exclusivity.rs"]
+mod publish_destination_exclusivity;
 
 #[path = "all/put_data_protection_policy.rs"]
 mod put_data_protection_policy;
@@ -64,6 +73,9 @@ mod state_roundtrip;
 
 #[path = "all/subscription_attributes.rs"]
 mod subscription_attributes;
+
+#[path = "all/subscription_dead_letter_queue.rs"]
+mod subscription_dead_letter_queue;
 
 #[path = "all/subscription_pending_confirmation.rs"]
 mod subscription_pending_confirmation;

@@ -32,9 +32,11 @@ use serde_json::{json, Value};
 use crate::error_envelope::error_of;
 use crate::quota_workflow::{base64_of, client, emulator, walk_pages, Client};
 
-/// Comfortably past `crate::state::REQUEST_DECISION_DELAY` (500 ms), so a request made
-/// before this wait is due for its decision afterwards.
-const PAST_DECISION: Duration = Duration::from_millis(1_200);
+/// Comfortably past BOTH steps the clock owes a quota increase request
+/// (`crate::state::SUPPORT_CASE_OPEN_DELAY`, then
+/// `crate::state::REQUEST_DECISION_DELAY` once its support case is open), so a request
+/// made before this wait has settled afterwards.
+const PAST_DECISION: Duration = Duration::from_millis(1_800);
 
 /// The account-wide history listing, whose name is too long to repeat in every row.
 const HISTORY: &str = "ListRequestedServiceQuotaChangeHistory";
