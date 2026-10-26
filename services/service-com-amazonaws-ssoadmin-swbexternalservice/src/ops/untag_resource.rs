@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes from the tag set of the resource `ResourceArn` names, in this
+//! service's state (`crate::state`), every tag whose key `TagKeys` lists. This is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A tag set is keyed by `Tag$Key`, so this write is a KEYED REMOVAL: a key the request
+//! names is gone whatever value it held, a key the resource does not carry removes
+//! nothing rather than failing, and every key the request does not name is left alone —
+//! which is what makes repeating the same call answer the same and change nothing
+//! further. The resource is whichever of the four kinds the model's `TaggableResourceArn`
+//! admits the ARN names (an instance, a permission set, an application or a trusted token
+//! issuer); an ARN this account holds nothing under — or holds under an instance other
+//! than the `InstanceArn` the request carried — is refused with the modelled
+//! `ResourceNotFoundException`, exactly as `TagResource` refuses it.
+//! `ListTagsForResource` reports what is left.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +162,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the SSO Admin state store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // What every handler does before it resolves anything: enable the account's
+        // ambient instance if nothing has decided its enablement yet, and apply what the
+        // CLOCK already owes (an instance whose deletion instant has passed is gone, and
+        // the resources held inside it with it).
+        store.on_request(&region, ::std::time::SystemTime::now());
+
+        // `InstanceArn` is optional on this operation, but when a caller sends one it
+        // names the instance the resource is expected to live under: an ARN this account
+        // holds no instance for can hold no resource either.
+        if input
+            .instance_arn
+            .as_deref()
+            .is_some_and(|instance_arn| store.instance(instance_arn).is_none())
+        {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::instance_not_found_message(
+                        input.instance_arn.as_deref().unwrap_or_default(),
+                    )),
+                    // The model's `ResourceNotFoundExceptionReason` enum carries only KMS
+                    // key states, none of which this refusal is.
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        // Never created, already deleted, gone with its instance, or held under another
+        // instance than the one the request named — the same answer either way: there is
+        // no such resource to untag.
+        let stored = store
+            .taggable_resource_tags_mut(input.instance_arn.as_deref(), &input.resource_arn)
+            .ok_or_else(|| {
+                UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::taggable_resource_not_found_message(
+                        &input.resource_arn,
+                    )),
+                    reason: None,
+                })
+            })?;
+
+        // A removal crosses no ceiling: it only ever leaves the resource carrying fewer
+        // keys than it did.
+        crate::state::remove_tags(stored, &input.tag_keys);
+        Ok(UntagResourceOutput {})
     }
 }

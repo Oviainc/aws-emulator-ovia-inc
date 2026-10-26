@@ -742,6 +742,19 @@ pub fn merge_tags(stored: &mut Vec<Tag>, requested: &[Tag]) {
     }
 }
 
+/// Remove from the tag set `stored` every entry whose `Tag$Key` is one of `keys`, which
+/// is what an untagging write does to what a resource already carries: a key named is
+/// gone whatever value it held, a key not named is left untouched.
+///
+/// A key the resource does not carry removes nothing rather than failing, so repeating
+/// the same call answers the same and changes nothing further. The model declares no
+/// `@uniqueItems` on `TagList`, so a key may be held more than once (a create that stored
+/// its `Tags` as the caller sent them); naming it removes EVERY entry for it, leaving the
+/// read with no value for that key at all.
+pub fn remove_tags(stored: &mut Vec<Tag>, keys: &[String]) {
+    stored.retain(|held| !keys.iter().any(|key| key == &held.key));
+}
+
 /// How many DISTINCT keys `stored` would hold once `requested` had been merged into it
 /// ([`merge_tags`]).
 ///
