@@ -314,8 +314,14 @@ fn force_state(
     };
 
     let Some((alarm_type, previous, updated)) = transition else {
+        // "The named resource does not exist." (`ResourceNotFound`, HTTP 404) — a name no
+        // metric alarm and no composite alarm in the account carries. CloudWatch answers this
+        // refusal with its error CODE alone: the shape's `message` member documents no text,
+        // and none is sent, so none is set here — and because that member is constrained to
+        // 1..255 characters, the empty message is an ABSENT member rather than an empty one.
+        // A sentence naming the alarm would be text the service never puts on the wire.
         return Err(SetAlarmStateErrorModeled::ResourceNotFound(ResourceNotFound {
-            message: Some(format!("alarm {} does not exist", input.alarm_name)),
+            message: None,
         })
         .into());
     };

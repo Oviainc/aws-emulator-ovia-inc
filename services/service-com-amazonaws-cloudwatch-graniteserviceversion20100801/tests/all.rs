@@ -63,6 +63,8 @@ mod metric_math;
 mod metric_streams;
 #[path = "all/metrics_and_alarms.rs"]
 mod metrics_and_alarms;
+#[path = "all/not_found_messages.rs"]
+mod not_found_messages;
 #[path = "all/otel_enrichment.rs"]
 mod otel_enrichment;
 #[path = "all/put_metric_data_validation.rs"]

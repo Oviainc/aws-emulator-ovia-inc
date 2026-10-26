@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let held = store
             .resource_tags_mut(&resource)
-            .ok_or_else(|| unknown_resource(&input.resource_arn, &resource))?;
+            .ok_or_else(|| unknown_resource(&input.resource_arn, resource))?;
 
         // Merged into a copy first, so a request that would take the resource past the tags
         // it may carry is refused having changed nothing. Both lists are at most
@@ -226,12 +226,12 @@ fn validate_tag_count(tags: &[Tag]) -> Result<(), TagResourceError> {
 }
 
 /// Report an ARN this store holds no resource for through this operation's modelled
-/// `ResourceNotFoundException` (HTTP 404): "The named resource does not exist."
-fn unknown_resource(arn: &str, resource: &crate::state::TaggableResource<'_>) -> TagResourceError {
-    TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        resource_type: Some(resource.kind.resource_type().to_string()),
-        resource_id: Some(arn.to_string()),
-        message: Some(crate::state::unknown_resource_message(arn)),
-    })
+/// `ResourceNotFoundException` (HTTP 404): "The named resource does not exist." The body —
+/// including its empty message — comes from `crate::state`, so this operation,
+/// `ListTagsForResource` and `UntagResource` refuse an unheld ARN identically.
+fn unknown_resource(arn: &str, resource: crate::state::TaggableResource<'_>) -> TagResourceError {
+    TagResourceErrorModeled::ResourceNotFoundException(crate::state::unknown_taggable_resource(
+        arn, resource,
+    ))
     .into()
 }

@@ -52,7 +52,8 @@ use crate::ops::types::{
     ActionConfiguration, AlarmHistoryItem, AnomalyDetector, CompositeAlarm, Dimension,
     EvaluationCriteria, EvaluationWindow, GetMetricStreamOutput, InsightRule, LogAlarm,
     MetricAlarm, MetricDataQuery, MetricMathAnomalyDetector, OTelEnrichmentMetricSelector,
-    ScheduledQueryConfiguration, SingleMetricAnomalyDetector, Tag, WarmUpConfiguration,
+    ResourceNotFoundException, ScheduledQueryConfiguration, SingleMetricAnomalyDetector, Tag,
+    WarmUpConfiguration,
 };
 
 /// The action notifications an alarm state transition owes, and how they are delivered to
@@ -1965,10 +1966,25 @@ pub fn taggable_resource(arn: &str) -> Result<TaggableResource<'_>, String> {
     })
 }
 
-/// Why a resource this store does not hold cannot carry tags. The caller reports it through
-/// its modelled `ResourceNotFoundException` ("The named resource does not exist").
-pub fn unknown_resource_message(arn: &str) -> String {
-    format!("the CloudWatch resource {arn} does not exist")
+/// The `ResourceNotFoundException` body ("The named resource does not exist") an operation
+/// taking a `ResourceARN` refuses an ARN this store holds no resource for with.
+///
+/// The resource is identified by the error's own `ResourceType` and `ResourceId` members, and
+/// the refusal's `Message` is EMPTY: this error class is answered by its code alone, so there
+/// is no text to reproduce and inventing a sentence would put text on the wire the service
+/// never sends. The member is present and empty, as the recorded refusal of this class
+/// carries it — `FaultDescription` bounds no length, so an empty value is one it can hold.
+/// Every operation that resolves a `ResourceARN` builds the body here, so they cannot
+/// disagree about it.
+pub fn unknown_taggable_resource(
+    arn: &str,
+    resource: TaggableResource<'_>,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        resource_type: Some(resource.kind.resource_type().to_string()),
+        resource_id: Some(arn.to_string()),
+        message: Some(String::new()),
+    }
 }
 
 /// Apply one request's `tags` to a resource's tag set.

@@ -16,7 +16,7 @@
 //!   alarm writer refuses it with HTTP 400 `ValidationError` and leaves the alarm already
 //!   there untouched.
 
-use crate::harness::{build_router, call, error_code, ok};
+use crate::harness::{build_router, call, error_code, error_message, ok};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -66,14 +66,6 @@ fn log_alarm(name: &str) -> Value {
 /// One row of the no-op delete table: the case, the alarms to create first as (kind, name),
 /// the names one call deletes, and the alarm names left afterwards.
 type DeleteCase<'a> = (&'a str, Vec<(&'a str, &'a str)>, Vec<&'a str>, Vec<&'a str>);
-
-/// The `message` of a failure body, as the awsJson error envelope carries it.
-fn error_message(body: &Value) -> String {
-    body.get("message")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
-}
 
 /// Every alarm name `DescribeAlarms` reports, over all three kinds, sorted.
 async fn remaining_alarm_names(router: &MultiServiceRouter) -> Vec<String> {

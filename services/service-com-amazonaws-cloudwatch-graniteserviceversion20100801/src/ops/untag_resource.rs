@@ -165,7 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let held = store
             .resource_tags_mut(&resource)
-            .ok_or_else(|| unknown_resource(&input.resource_arn, &resource))?;
+            .ok_or_else(|| unknown_resource(&input.resource_arn, resource))?;
         // Removal is idempotent: a key the resource does not carry removes nothing, and the
         // call still succeeds.
         crate::state::remove_tags(held, &input.tag_keys);
@@ -187,15 +187,15 @@ fn taggable_resource(arn: &str) -> Result<crate::state::TaggableResource<'_>, Un
 }
 
 /// Report an ARN this store holds no resource for through this operation's modelled
-/// `ResourceNotFoundException` (HTTP 404): "The named resource does not exist."
+/// `ResourceNotFoundException` (HTTP 404): "The named resource does not exist." The body —
+/// including its empty message — comes from `crate::state`, so this operation,
+/// `ListTagsForResource` and `TagResource` refuse an unheld ARN identically.
 fn unknown_resource(
     arn: &str,
-    resource: &crate::state::TaggableResource<'_>,
+    resource: crate::state::TaggableResource<'_>,
 ) -> UntagResourceError {
-    UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        resource_type: Some(resource.kind.resource_type().to_string()),
-        resource_id: Some(arn.to_string()),
-        message: Some(crate::state::unknown_resource_message(arn)),
-    })
+    UntagResourceErrorModeled::ResourceNotFoundException(crate::state::unknown_taggable_resource(
+        arn, resource,
+    ))
     .into()
 }

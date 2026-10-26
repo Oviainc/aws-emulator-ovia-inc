@@ -419,6 +419,20 @@ pub async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> V
     parsed
 }
 
+/// The text a client reads off a refusal body.
+///
+/// The modelled error shapes spell the member `message` (`ResourceNotFound`,
+/// `DashboardNotFoundError`) or `Message` (`ResourceNotFoundException`), and a refusal the
+/// service answers with its error code alone leaves the member out, which a client reads as
+/// the empty string — so one reader answers for every refusal this service makes.
+pub fn error_message(body: &Value) -> String {
+    ["message", "Message"]
+        .iter()
+        .find_map(|member| body.get(*member).and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// The wire error code of a failure body (`__type` on the awsJson protocols), without any
 /// namespace prefix.
 pub fn error_code(body: &Value) -> String {

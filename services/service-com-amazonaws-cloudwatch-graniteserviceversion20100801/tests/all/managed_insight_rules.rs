@@ -18,7 +18,7 @@
 //! and how many rules a page holds), so the happy path is one row among many rather than the
 //! specification.
 
-use crate::harness::{build_router, call, error_code, ok};
+use crate::harness::{build_router, call, error_code, error_message, ok};
 use serde_json::{json, Value};
 
 /// The `Schema` a managed rule carries: "For managed rules, this is `{"Name":
@@ -52,11 +52,6 @@ fn member(description: &Value, name: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
-}
-
-/// The `message` of a failure body, as the awsJson error envelope carries it.
-fn error_message(body: &Value) -> String {
-    member(body, "message")
 }
 
 /// The rule `DescribeInsightRules` reported under `name`, if any.
