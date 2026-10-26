@@ -17156,15 +17156,58 @@ impl ComAmazonawsEc2Amazonec2State {
             .collect()
     }
 
+    /// The EC2 Instance Connect Endpoints that still hold the network they were created in:
+    /// the ones no delete has been asked for yet.
+    ///
+    /// A stored endpoint names its subnet, its VPC and its security groups for as long as it
+    /// is stored, so it occupies them exactly as a stored network interface does — which is
+    /// also how the real service accounts for one: "the ID of the elastic network interface
+    /// that Amazon EC2 automatically created when creating the EC2 Instance Connect
+    /// Endpoint" (`Ec2InstanceConnectEndpoint$NetworkInterfaceIds`). This crate holds no
+    /// interface record for that interface, so the endpoint record is what the dependency is
+    /// read from. Once its deletion HAS been asked for
+    /// ([`Self::begin_instance_connect_endpoint_deletion`]) there is nothing left for the
+    /// caller to take away: the endpoint is on its way out, and the record only stays behind
+    /// to report the delete states the model gives it.
+    fn held_by_instance_connect_endpoints<Holds>(&self, holds: Holds) -> Vec<String>
+    where
+        Holds: Fn(&crate::ops::types::Ec2InstanceConnectEndpoint) -> bool,
+    {
+        self.instance_connect_endpoints
+            .iter()
+            .filter(|(_, record)| record.delete_complete_at.is_none() && holds(&record.view))
+            .map(|(endpoint_id, _)| endpoint_id.clone())
+            .collect()
+    }
+
+    /// The EC2 Instance Connect Endpoints that still hold a place in `subnet_id`.
+    pub fn instance_connect_endpoints_in_subnet(&self, subnet_id: &str) -> Vec<String> {
+        self.held_by_instance_connect_endpoints(|endpoint| {
+            endpoint.subnet_id.as_deref() == Some(subnet_id)
+        })
+    }
+
+    /// The EC2 Instance Connect Endpoints that still hold the security group `group_id`.
+    pub fn instance_connect_endpoints_with_security_group(&self, group_id: &str) -> Vec<String> {
+        self.held_by_instance_connect_endpoints(|endpoint| {
+            endpoint
+                .security_group_ids
+                .iter()
+                .flatten()
+                .any(|held| held == group_id)
+        })
+    }
+
     /// What still depends on the subnet `subnet_id`, as the ids of the depending resources.
     ///
     /// "You must terminate all running instances in the subnet before you can delete the
-    /// subnet" (`DeleteSubnet`), and an interface created in the subnet holds a place in it
-    /// the same way an instance does — the delete is refused while either is still stored,
+    /// subnet" (`DeleteSubnet`), and a record created IN the subnet holds a place in it the
+    /// same way an instance does — the delete is refused while any of them is still stored,
     /// rather than leaving a stored record naming a subnet that no longer exists.
     pub fn subnet_dependencies(&self, subnet_id: &str) -> Vec<String> {
         let mut found = self.instances_in_subnet(subnet_id);
         found.extend(self.network_interfaces_in_subnet(subnet_id));
+        found.extend(self.instance_connect_endpoints_in_subnet(subnet_id));
         found.sort();
         found
     }
@@ -17200,6 +17243,9 @@ impl ComAmazonawsEc2Amazonec2State {
         // instance, which lets go of its groups once it has reached `terminated`, an
         // interface is a dependency until it is deleted.
         found.extend(self.network_interfaces_with_security_group(group_id));
+        // And so does an EC2 Instance Connect Endpoint, whose stored record names the groups
+        // it was created with ([`Self::instance_connect_endpoints_with_security_group`]).
+        found.extend(self.instance_connect_endpoints_with_security_group(group_id));
         for (other_id, other) in &self.security_groups {
             if other_id == group_id || other.vpc_id != vpc_id {
                 continue;
@@ -17234,6 +17280,11 @@ impl ComAmazonawsEc2Amazonec2State {
     /// A route server ASSOCIATION is not one: a recorded `DeleteVpc` of a VPC a route
     /// server had been associated with succeeded, so the connection is not something the
     /// caller has to take away first — [`Self::remove_vpc`] takes it with the VPC instead.
+    ///
+    /// A record that sits in a SUBNET of the VPC rather than in the VPC itself — an EC2
+    /// Instance Connect Endpoint ([`Self::instance_connect_endpoints_in_subnet`]) — needs no
+    /// entry of its own: its subnet is a dependency of the VPC here, and that subnet cannot
+    /// be deleted while the record is in it, so the VPC is held for as long as it is.
     pub fn vpc_dependencies(&self, vpc_id: &str) -> Vec<String> {
         let mut found: Vec<String> = Vec::new();
         for (subnet_id, subnet) in &self.subnets {

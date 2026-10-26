@@ -4,7 +4,8 @@
 //! speaks (`Action=<Operation>` in an `application/x-www-form-urlencoded` POST, answered
 //! with XML — README.md / OPERATIONS.md "Wire protocol").
 //!
-//! Two rules, one per suite below.
+//! Two rules. RULE 1 is asserted over two tables — one of the resources a stored RECORD
+//! holds, one of the resources an INSTANCE holds through its state.
 //!
 //! RULE 1 — a delete of a resource something stored still holds is refused with HTTP 400
 //! `DependencyViolation`, performs nothing, and the refusal carries the message AWS words
@@ -23,11 +24,15 @@
 //! nothing else to stop on.
 //!
 //! The rows of each suite vary what the rule generalises over: which resource kind is
-//! deleted, which kind of stored record holds it, and which call reads it back.
+//! deleted, which kind of stored record holds it, which instance state holds it, and which
+//! call reads it back.
 
+use std::time::Duration;
+
+use service_com_amazonaws_ec2_amazonec2::state::TRANSITION_DELAY;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{element, error_code, error_message, indexed};
+use super::ec2_query::{described_instance_state, element, error_code, error_message, indexed};
 use super::wire::{document, param, Param};
 
 /// The Region every call here is signed for: the Region the default network is seeded for.
@@ -150,6 +155,20 @@ async fn create_network_interface(
     reported(case, &body, "networkInterfaceId")
 }
 
+/// An EC2 Instance Connect Endpoint in `subnet_id` holding `groups` — or, when `groups` is
+/// empty, the default group of the subnet's VPC, which the create resolves itself.
+async fn create_instance_connect_endpoint(
+    case: &str,
+    router: &MultiServiceRouter,
+    subnet_id: &str,
+    groups: &[&str],
+) -> String {
+    let mut params = vec![param("SubnetId", subnet_id)];
+    params.extend(indexed("SecurityGroupId", groups));
+    let body = ok(case, router, "CreateInstanceConnectEndpoint", &params).await;
+    reported(case, &body, "instanceConnectEndpointId")
+}
+
 /// A carrier gateway attached to `vpc_id`, as its id.
 async fn create_carrier_gateway(case: &str, router: &MultiServiceRouter, vpc_id: &str) -> String {
     let body = ok(
@@ -204,6 +223,11 @@ enum HeldBy {
     GroupByInterface,
     /// A group another group of the same VPC references in an INBOUND rule.
     GroupByReferencingRule,
+    /// A subnet an EC2 Instance Connect Endpoint was created in, whose stored record names
+    /// that subnet for as long as the endpoint is stored.
+    SubnetByInstanceConnectEndpoint,
+    /// A group an EC2 Instance Connect Endpoint was created with.
+    GroupByInstanceConnectEndpoint,
 }
 
 /// One row of the dependency table.
@@ -237,12 +261,72 @@ struct Plan {
     release: Vec<(&'static str, Vec<Param>)>,
 }
 
+/// Pin that `plan`'s delete is refused with `DependencyViolation` carrying the message AWS
+/// words for that error class, and that it performed nothing: the resource is still
+/// readable afterwards.
+///
+/// Shared by both dependency suites below, so a delete refused because a stored record
+/// holds the resource and one refused because an instance does are read the same way.
+async fn refusal_is_a_dependency_violation(case: &str, router: &MultiServiceRouter, plan: &Plan) {
+    let target = &plan.target;
+    let (status, body) = call(router, plan.delete, &[param(plan.id_param, target)]).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: the delete of {target} must be refused while it is held, got {status} \
+         with body {body}"
+    );
+    let code = error_code(&body);
+    assert_eq!(
+        code, DEPENDENCY_VIOLATION,
+        "case {case:?}: expected {DEPENDENCY_VIOLATION} for {target}, got {code:?} in body \
+         {body}"
+    );
+    let answered = error_message(&body);
+    assert_eq!(
+        answered, plan.message,
+        "case {case:?}: expected the refusal of {target} to read {expected:?}, got {answered:?}",
+        expected = plan.message
+    );
+    assert!(
+        is_stored(
+            case,
+            router,
+            plan.describe,
+            plan.describe_param,
+            target,
+            plan.not_found
+        )
+        .await,
+        "case {case:?}: a refused delete must leave {target} stored"
+    );
+}
+
+/// Pin that `plan`'s delete now succeeds and that the resource is gone from the describe
+/// that reported it — the other half of the rule, once nothing holds the resource.
+async fn delete_now_succeeds(case: &str, router: &MultiServiceRouter, plan: &Plan) {
+    let target = &plan.target;
+    ok(case, router, plan.delete, &[param(plan.id_param, target)]).await;
+    assert!(
+        !is_stored(
+            case,
+            router,
+            plan.describe,
+            plan.describe_param,
+            target,
+            plan.not_found
+        )
+        .await,
+        "case {case:?}: {target} must be gone once its delete succeeded"
+    );
+}
+
 /// RULE 1: a delete is refused with `DependencyViolation` — carrying the message AWS words
 /// for that error class, which names only the resource the request named — while a stored
 /// record still holds the resource, performs nothing, and succeeds once nothing holds it.
 ///
 /// The rows differ in the resource deleted (VPC, subnet, security group) and in what holds
-/// it (a subnet, a carrier gateway, a network interface, another group's inbound rule).
+/// it (a subnet, a carrier gateway, a network interface, another group's inbound rule, an
+/// EC2 Instance Connect Endpoint).
 #[tokio::test]
 async fn a_delete_is_refused_while_a_stored_record_holds_the_resource() {
     let router = emulator();
@@ -276,6 +360,18 @@ async fn a_delete_is_refused_while_a_stored_record_holds_the_resource() {
             held_by: HeldBy::GroupByReferencingRule,
             vpc_cidr: "10.124.0.0/16",
             subnet_cidr: "10.124.1.0/24",
+        },
+        Refused {
+            case: "a subnet an EC2 Instance Connect Endpoint sits in",
+            held_by: HeldBy::SubnetByInstanceConnectEndpoint,
+            vpc_cidr: "10.131.0.0/16",
+            subnet_cidr: "10.131.1.0/24",
+        },
+        Refused {
+            case: "a group an EC2 Instance Connect Endpoint holds",
+            held_by: HeldBy::GroupByInstanceConnectEndpoint,
+            vpc_cidr: "10.132.0.0/16",
+            subnet_cidr: "10.132.1.0/24",
         },
     ];
 
@@ -392,51 +488,51 @@ async fn a_delete_is_refused_while_a_stored_record_holds_the_resource() {
                     )],
                 }
             }
+            HeldBy::SubnetByInstanceConnectEndpoint => {
+                let endpoint = create_instance_connect_endpoint(case, &router, &subnet_id, &[]).await;
+                Plan {
+                    delete: "DeleteSubnet",
+                    id_param: "SubnetId",
+                    target: subnet_id.clone(),
+                    message: format!(
+                        "The subnet '{subnet_id}' has dependencies and cannot be deleted."
+                    ),
+                    describe: "DescribeSubnets",
+                    describe_param: "SubnetId",
+                    not_found: "InvalidSubnetID.NotFound",
+                    release: vec![(
+                        "DeleteInstanceConnectEndpoint",
+                        vec![param("InstanceConnectEndpointId", &endpoint)],
+                    )],
+                }
+            }
+            HeldBy::GroupByInstanceConnectEndpoint => {
+                let group_id = create_security_group(case, &router, &vpc_id, "held-group").await;
+                let endpoint =
+                    create_instance_connect_endpoint(case, &router, &subnet_id, &[group_id.as_str()])
+                        .await;
+                Plan {
+                    delete: "DeleteSecurityGroup",
+                    id_param: "GroupId",
+                    target: group_id.clone(),
+                    message: format!("resource {group_id} has a dependent object"),
+                    describe: "DescribeSecurityGroups",
+                    describe_param: "GroupId",
+                    not_found: "InvalidGroup.NotFound",
+                    release: vec![(
+                        "DeleteInstanceConnectEndpoint",
+                        vec![param("InstanceConnectEndpointId", &endpoint)],
+                    )],
+                }
+            }
         };
-        let Plan {
-            delete,
-            id_param,
-            target,
-            message,
-            describe,
-            describe_param,
-            not_found,
-            release,
-        } = plan;
-
-        let delete_params = vec![param(id_param, &target)];
-        let (status, body) = call(&router, delete, &delete_params).await;
-        assert_eq!(
-            status, 400,
-            "case {case:?}: the delete of {target} must be refused while it is held, got \
-             {status} with body {body}"
-        );
-        let code = error_code(&body);
-        assert_eq!(
-            code, DEPENDENCY_VIOLATION,
-            "case {case:?}: expected {DEPENDENCY_VIOLATION} for {target}, got {code:?} in \
-             body {body}"
-        );
-        let answered = error_message(&body);
-        assert_eq!(
-            answered, message,
-            "case {case:?}: expected the refusal of {target} to read {message:?}, got \
-             {answered:?}"
-        );
-        assert!(
-            is_stored(case, &router, describe, describe_param, &target, not_found).await,
-            "case {case:?}: a refused delete must leave {target} stored"
-        );
+        refusal_is_a_dependency_violation(case, &router, &plan).await;
 
         // And the same delete succeeds once nothing holds the resource any more.
-        for (action, params) in &release {
+        for (action, params) in &plan.release {
             ok(case, &router, action, params).await;
         }
-        ok(case, &router, delete, &delete_params).await;
-        assert!(
-            !is_stored(case, &router, describe, describe_param, &target, not_found).await,
-            "case {case:?}: {target} must be gone once its delete succeeded"
-        );
+        delete_now_succeeds(case, &router, &plan).await;
     }
 }
 
@@ -889,5 +985,210 @@ async fn authorize_security_group_ingress_stores_the_rules_the_request_describes
             code, "InvalidPermission.Duplicate",
             "case {case:?}: expected InvalidPermission.Duplicate, got {code:?} in body {body}"
         );
+    }
+}
+
+/// The image id every launch below names: `RunInstances` requires one
+/// (`RunInstancesRequest$ImageId`), and which image an instance was launched from has no
+/// bearing on what that instance holds.
+const AMI: &str = "ami-0123456789abcdef0";
+
+/// Wait until every move the clock already owed has certainly fallen due. Derived from the
+/// service's own span rather than a literal of its own, so the two cannot drift.
+async fn past_the_transition() {
+    tokio::time::sleep(TRANSITION_DELAY + Duration::from_millis(200)).await;
+}
+
+/// One instance launched into `subnet_id` holding the security group `group_id`, as its id.
+async fn launch_instance(
+    case: &str,
+    router: &MultiServiceRouter,
+    subnet_id: &str,
+    group_id: &str,
+) -> String {
+    let body = ok(
+        case,
+        router,
+        "RunInstances",
+        &[
+            param("ImageId", AMI),
+            param("MinCount", "1"),
+            param("MaxCount", "1"),
+            param("SubnetId", subnet_id),
+            param("SecurityGroupId.1", group_id),
+        ],
+    )
+    .await;
+    reported(case, &body, "instanceId")
+}
+
+/// One lifecycle call on `instance_id` that has to succeed, for the calls that park an
+/// instance in the state a row names.
+async fn lifecycle(case: &str, router: &MultiServiceRouter, action: &str, instance_id: &str) {
+    ok(case, router, action, &[param("InstanceId.1", instance_id)]).await;
+}
+
+/// What the instance of a row holds, and so what that row's delete names.
+#[derive(Debug, Clone, Copy)]
+enum HeldByInstance {
+    /// The security group the instance was launched with: a group "associated with an
+    /// instance" (`DeleteSecurityGroup`).
+    SecurityGroup,
+    /// The subnet the instance was launched into.
+    Subnet,
+}
+
+/// The state the row's instance is parked in when its delete is tried. Every one of them is
+/// a state short of `terminated`, which is the only state that lets go.
+#[derive(Debug, Clone, Copy)]
+enum Parked {
+    /// Straight after the launch, before the clock has moved the instance on from
+    /// `pending`.
+    JustLaunched,
+    /// Past the launch's own span, so the instance is `running`.
+    Running,
+    /// `stopped`: an instance that has been stopped has not been terminated, and still
+    /// holds its place and its groups.
+    Stopped,
+}
+
+/// One row of the instance-dependency table.
+#[derive(Debug)]
+struct InstanceHolds {
+    case: &'static str,
+    holds: HeldByInstance,
+    parked: Parked,
+    /// The `/16` the row's own VPC is created with, so rows cannot collide.
+    vpc_cidr: &'static str,
+    subnet_cidr: &'static str,
+}
+
+/// RULE 1 again, over the dependency EC2 tracks through an instance's STATE rather than
+/// through a stored record of its own: a delete is refused with `DependencyViolation` while
+/// an instance that has not reached `terminated` still holds the resource — "you must
+/// terminate all running instances in the subnet before you can delete the subnet"
+/// (`DeleteSubnet`), "if you attempt to delete a security group that is associated with an
+/// instance … the operation fails with `DependencyViolation`" (`DeleteSecurityGroup`) — and
+/// succeeds once that instance HAS reached `terminated`, which is the one state in which it
+/// holds nothing.
+///
+/// The rows vary what the instance holds (its security group, its subnet) and which
+/// non-terminal state it is parked in when the delete is tried (`pending` straight after
+/// the launch, `running` once the clock has moved it on, `stopped`).
+#[tokio::test]
+async fn a_delete_is_refused_while_an_instance_short_of_terminated_holds_the_resource() {
+    let router = emulator();
+    let rows = [
+        InstanceHolds {
+            case: "a group a just-launched instance holds",
+            holds: HeldByInstance::SecurityGroup,
+            parked: Parked::JustLaunched,
+            vpc_cidr: "10.127.0.0/16",
+            subnet_cidr: "10.127.1.0/24",
+        },
+        InstanceHolds {
+            case: "a subnet a just-launched instance sits in",
+            holds: HeldByInstance::Subnet,
+            parked: Parked::JustLaunched,
+            vpc_cidr: "10.128.0.0/16",
+            subnet_cidr: "10.128.1.0/24",
+        },
+        InstanceHolds {
+            case: "a subnet a running instance sits in",
+            holds: HeldByInstance::Subnet,
+            parked: Parked::Running,
+            vpc_cidr: "10.129.0.0/16",
+            subnet_cidr: "10.129.1.0/24",
+        },
+        InstanceHolds {
+            case: "a group a stopped instance holds",
+            holds: HeldByInstance::SecurityGroup,
+            parked: Parked::Stopped,
+            vpc_cidr: "10.130.0.0/16",
+            subnet_cidr: "10.130.1.0/24",
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let vpc_id = create_vpc(case, &router, row.vpc_cidr).await;
+        let subnet_id = create_subnet(case, &router, &vpc_id, row.subnet_cidr).await;
+        let group_id = create_security_group(case, &router, &vpc_id, "instance-group").await;
+        let instance_id = launch_instance(case, &router, &subnet_id, &group_id).await;
+
+        // Park the instance in the row's state, and pin the state it actually holds before
+        // the delete, so the refusal below is answered for the state the row names. A
+        // just-launched instance may be `pending` or already `running`: the clock owes that
+        // move, and which side of it the delete falls on is exactly what this row does not
+        // care about.
+        let states: &[&str] = match row.parked {
+            Parked::JustLaunched => &["pending", "running"],
+            Parked::Running => {
+                past_the_transition().await;
+                &["running"]
+            }
+            Parked::Stopped => {
+                lifecycle(case, &router, "StopInstances", &instance_id).await;
+                past_the_transition().await;
+                &["stopped"]
+            }
+        };
+        let state = described_instance_state(&router, REGION, &instance_id).await;
+        assert!(
+            states.contains(&state.as_str()),
+            "case {case:?}: expected {instance_id} in one of {states:?} before the delete, got \
+             {state:?}"
+        );
+
+        let plan = match row.holds {
+            HeldByInstance::SecurityGroup => Plan {
+                delete: "DeleteSecurityGroup",
+                id_param: "GroupId",
+                target: group_id.clone(),
+                message: format!("resource {group_id} has a dependent object"),
+                describe: "DescribeSecurityGroups",
+                describe_param: "GroupId",
+                not_found: "InvalidGroup.NotFound",
+                release: vec![(
+                    "TerminateInstances",
+                    vec![param("InstanceId.1", &instance_id)],
+                )],
+            },
+            HeldByInstance::Subnet => Plan {
+                delete: "DeleteSubnet",
+                id_param: "SubnetId",
+                target: subnet_id.clone(),
+                message: format!("The subnet '{subnet_id}' has dependencies and cannot be deleted."),
+                describe: "DescribeSubnets",
+                describe_param: "SubnetId",
+                not_found: "InvalidSubnetID.NotFound",
+                release: vec![(
+                    "TerminateInstances",
+                    vec![param("InstanceId.1", &instance_id)],
+                )],
+            },
+        };
+
+        refusal_is_a_dependency_violation(case, &router, &plan).await;
+
+        // Terminating is what lets the resource go — but only once the instance has ARRIVED
+        // at `terminated`: while it is still `shutting-down` it holds what it was launched
+        // with, so the delete is refused again.
+        for (action, params) in &plan.release {
+            ok(case, &router, action, params).await;
+        }
+        let shutting_down = described_instance_state(&router, REGION, &instance_id).await;
+        if shutting_down == "shutting-down" {
+            refusal_is_a_dependency_violation(case, &router, &plan).await;
+        }
+        past_the_transition().await;
+        let terminated = described_instance_state(&router, REGION, &instance_id).await;
+        assert_eq!(
+            terminated, "terminated",
+            "case {case:?}: expected {instance_id} terminated once its span had passed, got \
+             {terminated:?}"
+        );
+
+        delete_now_succeeds(case, &router, &plan).await;
     }
 }
